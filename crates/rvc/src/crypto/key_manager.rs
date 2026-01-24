@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+use secrecy::{ExposeSecret, SecretString};
 use tracing::warn;
 
 use super::bls::{PublicKey, SecretKey, PUBLIC_KEY_BYTES_LEN};
+use super::decryption_tracker::DecryptionAttemptTracker;
 use super::error::KeyManagerError;
 use super::keystore::Keystore;
 
@@ -20,12 +22,166 @@ impl KeyManager {
     /// Loads all keystore files from a directory.
     ///
     /// The `passwords` map uses public key hex strings (without 0x prefix) as keys
-    /// and the corresponding password strings as values.
+    /// and `SecretString` values for secure password handling.
     ///
+    /// Passwords are automatically zeroized when the HashMap is dropped.
     /// Corrupted or unreadable keystores are logged and skipped.
+    /// Files outside the directory boundary (e.g., via symlinks) are also skipped
+    /// to prevent directory traversal attacks.
     pub fn load_from_directory<P: AsRef<Path>>(
         path: P,
+        passwords: &HashMap<String, SecretString>,
+    ) -> Result<Self, KeyManagerError> {
+        let dir_path = path.as_ref();
+
+        if !dir_path.exists() {
+            return Err(KeyManagerError::DirectoryNotFound(dir_path.to_path_buf()));
+        }
+
+        if !dir_path.is_dir() {
+            return Err(KeyManagerError::DirectoryNotFound(dir_path.to_path_buf()));
+        }
+
+        let canonical_dir = dir_path.canonicalize().map_err(KeyManagerError::Io)?;
+
+        let mut manager = Self::new();
+        let mut found_any_keystore = false;
+
+        let entries = fs::read_dir(&canonical_dir)?;
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("Failed to read directory entry: {}", e);
+                    continue;
+                }
+            };
+
+            let file_path = entry.path();
+
+            let canonical_file = match file_path.canonicalize() {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Failed to canonicalize {:?}: {}", file_path, e);
+                    continue;
+                }
+            };
+
+            if !canonical_file.starts_with(&canonical_dir) {
+                warn!(
+                    "Skipping file outside keystore directory (possible symlink attack): {:?}",
+                    file_path
+                );
+                continue;
+            }
+
+            if !canonical_file.is_file() {
+                continue;
+            }
+
+            let extension = file_path.extension().and_then(|ext| ext.to_str());
+            if extension != Some("json") {
+                continue;
+            }
+
+            found_any_keystore = true;
+
+            let keystore = match Keystore::from_file(&file_path) {
+                Ok(k) => k,
+                Err(e) => {
+                    warn!("Failed to load keystore from {:?}: {}", file_path, e);
+                    continue;
+                }
+            };
+
+            let pubkey_hex = match &keystore.pubkey {
+                Some(pk) => pk.clone(),
+                None => {
+                    warn!("Keystore {:?} has no public key field, skipping", file_path);
+                    continue;
+                }
+            };
+
+            let password = match passwords.get(&pubkey_hex) {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        "No password found for public key {} in {:?}, skipping",
+                        pubkey_hex, file_path
+                    );
+                    continue;
+                }
+            };
+
+            let secret_key = match keystore.decrypt(password.expose_secret().as_bytes()) {
+                Ok(sk) => sk,
+                Err(e) => {
+                    warn!(
+                        pubkey = %pubkey_hex,
+                        file = ?file_path,
+                        error = %e,
+                        "Failed decryption attempt for keystore"
+                    );
+                    continue;
+                }
+            };
+
+            let derived_pubkey = secret_key.public_key();
+
+            let expected_pubkey_bytes = match hex::decode(&pubkey_hex) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    warn!(
+                        "Invalid public key hex format in keystore {:?}: {}",
+                        file_path, pubkey_hex
+                    );
+                    continue;
+                }
+            };
+
+            let expected_pubkey = match PublicKey::from_bytes(&expected_pubkey_bytes) {
+                Ok(pk) => pk,
+                Err(_) => {
+                    warn!("Invalid public key format in keystore {:?}: {}", file_path, pubkey_hex);
+                    continue;
+                }
+            };
+
+            if derived_pubkey.to_bytes() != expected_pubkey.to_bytes() {
+                warn!(
+                    "Public key mismatch in keystore {:?}: declared {} but derived {}",
+                    file_path,
+                    pubkey_hex,
+                    hex::encode(derived_pubkey.to_bytes())
+                );
+                continue;
+            }
+
+            manager.keys.insert(derived_pubkey.to_bytes(), secret_key);
+        }
+
+        if !found_any_keystore {
+            return Err(KeyManagerError::NoKeystoreFiles);
+        }
+
+        Ok(manager)
+    }
+
+    /// Loads all keystore files from a directory with decryption attempt tracking.
+    ///
+    /// This method is similar to `load_from_directory` but accepts a mutable reference
+    /// to a `DecryptionAttemptTracker` for rate limiting and auditing failed decryption
+    /// attempts.
+    ///
+    /// The tracker will:
+    /// - Record all decryption attempts
+    /// - Log warnings for failed attempts
+    /// - Block attempts when rate limit is exceeded
+    pub fn load_from_directory_with_tracker<P: AsRef<Path>>(
+        path: P,
         passwords: &HashMap<String, String>,
+        tracker: &mut DecryptionAttemptTracker,
     ) -> Result<Self, KeyManagerError> {
         let dir_path = path.as_ref();
 
@@ -80,6 +236,16 @@ impl KeyManager {
                 }
             };
 
+            // Check rate limit before attempting decryption
+            if !tracker.check_and_record(&pubkey_hex) {
+                warn!(
+                    pubkey = %pubkey_hex,
+                    file = ?file_path,
+                    "Skipping keystore due to rate limit"
+                );
+                continue;
+            }
+
             let password = match passwords.get(&pubkey_hex) {
                 Some(p) => p,
                 None => {
@@ -94,43 +260,19 @@ impl KeyManager {
             let secret_key = match keystore.decrypt(password.as_bytes()) {
                 Ok(sk) => sk,
                 Err(e) => {
-                    warn!("Failed to decrypt keystore {:?}: {}", file_path, e);
-                    continue;
-                }
-            };
-
-            let derived_pubkey = secret_key.public_key();
-
-            let expected_pubkey_bytes = match hex::decode(&pubkey_hex) {
-                Ok(bytes) => bytes,
-                Err(_) => {
+                    tracker.record_failure(&pubkey_hex);
                     warn!(
-                        "Invalid public key hex format in keystore {:?}: {}",
-                        file_path, pubkey_hex
+                        pubkey = %pubkey_hex,
+                        file = ?file_path,
+                        error = %e,
+                        "Failed decryption attempt for keystore"
                     );
                     continue;
                 }
             };
 
-            let expected_pubkey = match PublicKey::from_bytes(&expected_pubkey_bytes) {
-                Ok(pk) => pk,
-                Err(_) => {
-                    warn!("Invalid public key format in keystore {:?}: {}", file_path, pubkey_hex);
-                    continue;
-                }
-            };
-
-            if derived_pubkey.to_bytes() != expected_pubkey.to_bytes() {
-                warn!(
-                    "Public key mismatch in keystore {:?}: declared {} but derived {}",
-                    file_path,
-                    pubkey_hex,
-                    hex::encode(derived_pubkey.to_bytes())
-                );
-                continue;
-            }
-
-            manager.keys.insert(derived_pubkey.to_bytes(), secret_key);
+            let public_key = secret_key.public_key();
+            manager.keys.insert(public_key.to_bytes(), secret_key);
         }
 
         if !found_any_keystore {
@@ -168,6 +310,7 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
 
+    use secrecy::SecretString;
     use tempfile::TempDir;
 
     use super::*;
@@ -224,6 +367,10 @@ mod tests {
         String::from_utf8(TEST_PASSWORD.to_vec()).unwrap()
     }
 
+    fn test_password_secret() -> SecretString {
+        SecretString::from(test_password_string())
+    }
+
     #[test]
     fn test_new_key_manager_is_empty() {
         let manager = KeyManager::new();
@@ -252,7 +399,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
         assert_eq!(manager.len(), 1);
@@ -265,7 +412,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
 
@@ -285,7 +432,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
 
@@ -301,7 +448,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
 
@@ -319,7 +466,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
         assert_eq!(manager.len(), 1);
@@ -331,7 +478,8 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), "wrong_password".to_string());
+        passwords
+            .insert(TEST_PUBKEY_HEX.to_string(), SecretString::from("wrong_password".to_string()));
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
         assert!(manager.is_empty());
@@ -355,7 +503,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
         assert_eq!(manager.len(), 1);
@@ -381,7 +529,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
         assert_eq!(manager.len(), 1);
@@ -399,7 +547,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
 
@@ -411,6 +559,77 @@ mod tests {
         let signature = secret_key.sign(message);
 
         assert!(signature.verify(&pubkey, message).is_ok());
+    }
+
+    #[test]
+    fn test_load_with_tracker_success() {
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+
+        let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
+
+        let manager =
+            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker)
+                .unwrap();
+
+        assert_eq!(manager.len(), 1);
+        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 1);
+    }
+
+    #[test]
+    fn test_load_with_tracker_records_failure() {
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), "wrong_password".to_string());
+
+        let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
+
+        let manager =
+            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker)
+                .unwrap();
+
+        assert!(manager.is_empty());
+        // Attempt was recorded
+        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 1);
+    }
+
+    #[test]
+    fn test_load_with_tracker_rate_limit() {
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), "wrong_password".to_string());
+
+        // Only allow 2 attempts
+        let mut tracker = DecryptionAttemptTracker::new(2, Duration::from_secs(60));
+
+        // First load - will fail decryption but record attempt
+        let _ =
+            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker);
+        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 1);
+
+        // Second load - will fail decryption but record attempt
+        let _ =
+            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker);
+        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 2);
+
+        // Third load - should be rate limited, no new attempt recorded
+        let _ =
+            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker);
+        // Still 2 because the third attempt was blocked
+        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 2);
     }
 
     #[test]
@@ -460,7 +679,7 @@ mod tests {
 
         let mut passwords = HashMap::new();
         // We provide the password for the DECLARED (wrong) pubkey
-        passwords.insert(wrong_pubkey_hex.to_string(), test_password_string());
+        passwords.insert(wrong_pubkey_hex.to_string(), SecretString::from(test_password_string()));
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
 
@@ -511,11 +730,94 @@ mod tests {
         create_test_keystore_file(&temp_dir, "invalid_pubkey.json", keystore_with_invalid_pubkey);
 
         let mut passwords = HashMap::new();
-        passwords.insert(invalid_pubkey_hex.to_string(), test_password_string());
+        passwords
+            .insert(invalid_pubkey_hex.to_string(), SecretString::from(test_password_string()));
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
 
         // The keystore should be skipped because the pubkey hex is invalid
         assert!(manager.is_empty());
+    }
+
+    #[cfg(unix)]
+    mod symlink_tests {
+        use super::*;
+        use std::os::unix::fs::symlink;
+        use std::path::PathBuf;
+
+        fn create_keystore_file_at_path(path: &PathBuf, content: &str) {
+            let mut file = File::create(path).unwrap();
+            file.write_all(content.as_bytes()).unwrap();
+        }
+
+        #[test]
+        fn test_symlink_outside_directory_is_skipped() {
+            let keystore_dir = TempDir::new().unwrap();
+            let outside_dir = TempDir::new().unwrap();
+
+            let outside_keystore = outside_dir.path().join("secret_keystore.json");
+            create_keystore_file_at_path(&outside_keystore, TEST_KEYSTORE_PBKDF2);
+
+            let symlink_path = keystore_dir.path().join("malicious_link.json");
+            symlink(&outside_keystore, &symlink_path).unwrap();
+
+            let mut passwords = HashMap::new();
+            passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+            let result = KeyManager::load_from_directory(keystore_dir.path(), &passwords);
+
+            assert!(
+                matches!(result, Err(KeyManagerError::NoKeystoreFiles)),
+                "Symlink pointing outside directory should be skipped"
+            );
+        }
+
+        #[test]
+        fn test_symlink_within_directory_is_allowed() {
+            let keystore_dir = TempDir::new().unwrap();
+
+            let actual_keystore = keystore_dir.path().join("actual_keystore.json");
+            create_keystore_file_at_path(&actual_keystore, TEST_KEYSTORE_PBKDF2);
+
+            let symlink_path = keystore_dir.path().join("link_to_keystore.json");
+            symlink(&actual_keystore, &symlink_path).unwrap();
+
+            let mut passwords = HashMap::new();
+            passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+            let manager = KeyManager::load_from_directory(keystore_dir.path(), &passwords).unwrap();
+
+            assert_eq!(manager.len(), 1, "Symlink within directory should be allowed");
+        }
+
+        #[test]
+        fn test_symlink_to_parent_directory_is_skipped() {
+            let parent_dir = TempDir::new().unwrap();
+            let keystore_dir_path = parent_dir.path().join("keystores");
+            fs::create_dir(&keystore_dir_path).unwrap();
+
+            let parent_keystore = parent_dir.path().join("parent_keystore.json");
+            create_keystore_file_at_path(&parent_keystore, TEST_KEYSTORE_PBKDF2);
+
+            let symlink_path = keystore_dir_path.join("parent_link.json");
+            symlink(&parent_keystore, &symlink_path).unwrap();
+
+            let mut passwords = HashMap::new();
+            passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+            let result = KeyManager::load_from_directory(&keystore_dir_path, &passwords);
+
+            assert!(
+                matches!(result, Err(KeyManagerError::NoKeystoreFiles)),
+                "Symlink pointing to parent directory should be skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_secret_string_password_is_not_exposed_in_debug() {
+        let secret = test_password_secret();
+        let debug_output = format!("{:?}", secret);
+        assert!(!debug_output.contains(&test_password_string()));
     }
 }

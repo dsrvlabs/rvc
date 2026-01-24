@@ -1,4 +1,5 @@
 mod bls;
+mod decryption_tracker;
 mod error;
 mod key_manager;
 mod keystore;
@@ -9,6 +10,7 @@ pub use bls::{
     PublicKey, SecretKey, Signature, PUBLIC_KEY_BYTES_LEN, SECRET_KEY_BYTES_LEN,
     SIGNATURE_BYTES_LEN,
 };
+pub use decryption_tracker::DecryptionAttemptTracker;
 pub use error::{BlsError, KeyManagerError, KeystoreError};
 pub use key_manager::KeyManager;
 pub use keystore::{KdfParams, Keystore, Pbkdf2Params, ScryptParams};

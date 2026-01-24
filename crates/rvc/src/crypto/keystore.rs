@@ -156,6 +156,32 @@ impl Keystore {
             }
         };
 
+        // Validate scrypt parameters to prevent DoS attacks
+        if params.n > MAX_SCRYPT_N {
+            return Err(KeystoreError::InvalidScryptParams(format!(
+                "n ({}) exceeds maximum ({})",
+                params.n, MAX_SCRYPT_N
+            )));
+        }
+        if params.r > MAX_SCRYPT_R {
+            return Err(KeystoreError::InvalidScryptParams(format!(
+                "r ({}) exceeds maximum ({})",
+                params.r, MAX_SCRYPT_R
+            )));
+        }
+        if params.p > MAX_SCRYPT_P {
+            return Err(KeystoreError::InvalidScryptParams(format!(
+                "p ({}) exceeds maximum ({})",
+                params.p, MAX_SCRYPT_P
+            )));
+        }
+        if params.dklen > MAX_SCRYPT_DKLEN {
+            return Err(KeystoreError::InvalidScryptParams(format!(
+                "dklen ({}) exceeds maximum ({})",
+                params.dklen, MAX_SCRYPT_DKLEN
+            )));
+        }
+
         if params.n == 0 || !params.n.is_power_of_two() {
             return Err(KeystoreError::InvalidScryptParams(
                 "n must be a positive power of 2".to_string(),
