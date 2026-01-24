@@ -28,7 +28,21 @@ tonic = "0.12"
 prost = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# Crypto
+blst = "0.3"
+hex = "0.4"
+rand = "0.8"
+ssz = { package = "ethereum_ssz", version = "0.9" }
+ssz_derive = { package = "ethereum_ssz_derive", version = "0.9" }
+sha2 = "0.10"
+scrypt = "0.11"
+pbkdf2 = "0.12"
+aes = "0.8"
+ctr = "0.9"
+uuid = { version = "1", features = ["v4", "serde"] }
+
 # Dev dependencies
+tempfile = "3"
 wiremock = "0.6"
 
 [workspace.dependencies.tonic-build]
