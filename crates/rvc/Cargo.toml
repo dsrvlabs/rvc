@@ -27,6 +27,8 @@ pbkdf2.workspace = true
 aes.workspace = true
 ctr.workspace = true
 uuid.workspace = true
+prometheus.workspace = true
+lazy_static.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
