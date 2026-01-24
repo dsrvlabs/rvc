@@ -25,6 +25,8 @@ impl KeyManager {
     ///
     /// Passwords are automatically zeroized when the HashMap is dropped.
     /// Corrupted or unreadable keystores are logged and skipped.
+    /// Files outside the directory boundary (e.g., via symlinks) are also skipped
+    /// to prevent directory traversal attacks.
     pub fn load_from_directory<P: AsRef<Path>>(
         path: P,
         passwords: &HashMap<String, SecretString>,
@@ -39,10 +41,12 @@ impl KeyManager {
             return Err(KeyManagerError::DirectoryNotFound(dir_path.to_path_buf()));
         }
 
+        let canonical_dir = dir_path.canonicalize().map_err(KeyManagerError::Io)?;
+
         let mut manager = Self::new();
         let mut found_any_keystore = false;
 
-        let entries = fs::read_dir(dir_path)?;
+        let entries = fs::read_dir(&canonical_dir)?;
 
         for entry in entries {
             let entry = match entry {
@@ -55,7 +59,23 @@ impl KeyManager {
 
             let file_path = entry.path();
 
-            if !file_path.is_file() {
+            let canonical_file = match file_path.canonicalize() {
+                Ok(p) => p,
+                Err(e) => {
+                    warn!("Failed to canonicalize {:?}: {}", file_path, e);
+                    continue;
+                }
+            };
+
+            if !canonical_file.starts_with(&canonical_dir) {
+                warn!(
+                    "Skipping file outside keystore directory (possible symlink attack): {:?}",
+                    file_path
+                );
+                continue;
+            }
+
+            if !canonical_file.is_file() {
                 continue;
             }
 
@@ -389,6 +409,81 @@ mod tests {
         let signature = secret_key.sign(message);
 
         assert!(signature.verify(&pubkey, message).is_ok());
+    }
+
+    #[cfg(unix)]
+    mod symlink_tests {
+        use super::*;
+        use std::os::unix::fs::symlink;
+        use std::path::PathBuf;
+
+        fn create_keystore_file_at_path(path: &PathBuf, content: &str) {
+            let mut file = File::create(path).unwrap();
+            file.write_all(content.as_bytes()).unwrap();
+        }
+
+        #[test]
+        fn test_symlink_outside_directory_is_skipped() {
+            let keystore_dir = TempDir::new().unwrap();
+            let outside_dir = TempDir::new().unwrap();
+
+            let outside_keystore = outside_dir.path().join("secret_keystore.json");
+            create_keystore_file_at_path(&outside_keystore, TEST_KEYSTORE_PBKDF2);
+
+            let symlink_path = keystore_dir.path().join("malicious_link.json");
+            symlink(&outside_keystore, &symlink_path).unwrap();
+
+            let mut passwords = HashMap::new();
+            passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+            let result = KeyManager::load_from_directory(keystore_dir.path(), &passwords);
+
+            assert!(
+                matches!(result, Err(KeyManagerError::NoKeystoreFiles)),
+                "Symlink pointing outside directory should be skipped"
+            );
+        }
+
+        #[test]
+        fn test_symlink_within_directory_is_allowed() {
+            let keystore_dir = TempDir::new().unwrap();
+
+            let actual_keystore = keystore_dir.path().join("actual_keystore.json");
+            create_keystore_file_at_path(&actual_keystore, TEST_KEYSTORE_PBKDF2);
+
+            let symlink_path = keystore_dir.path().join("link_to_keystore.json");
+            symlink(&actual_keystore, &symlink_path).unwrap();
+
+            let mut passwords = HashMap::new();
+            passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+            let manager = KeyManager::load_from_directory(keystore_dir.path(), &passwords).unwrap();
+
+            assert_eq!(manager.len(), 1, "Symlink within directory should be allowed");
+        }
+
+        #[test]
+        fn test_symlink_to_parent_directory_is_skipped() {
+            let parent_dir = TempDir::new().unwrap();
+            let keystore_dir_path = parent_dir.path().join("keystores");
+            fs::create_dir(&keystore_dir_path).unwrap();
+
+            let parent_keystore = parent_dir.path().join("parent_keystore.json");
+            create_keystore_file_at_path(&parent_keystore, TEST_KEYSTORE_PBKDF2);
+
+            let symlink_path = keystore_dir_path.join("parent_link.json");
+            symlink(&parent_keystore, &symlink_path).unwrap();
+
+            let mut passwords = HashMap::new();
+            passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+            let result = KeyManager::load_from_directory(&keystore_dir_path, &passwords);
+
+            assert!(
+                matches!(result, Err(KeyManagerError::NoKeystoreFiles)),
+                "Symlink pointing to parent directory should be skipped"
+            );
+        }
     }
 
     #[test]
