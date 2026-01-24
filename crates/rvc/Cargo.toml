@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+beacon-client.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -17,5 +18,3 @@ prost.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
-
-[dev-dependencies]
