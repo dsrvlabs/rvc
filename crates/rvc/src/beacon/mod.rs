@@ -6,5 +6,6 @@ pub use client::{BeaconClient, BeaconClientConfig};
 pub use error::BeaconError;
 pub use types::{
     Attestation, AttestationData, AttestationDataResponse, AttesterDutiesResponse, AttesterDuty,
-    BeaconBlockHeader, Checkpoint, DataResponse, DependentRootResponse,
+    BeaconBlockHeader, Checkpoint, DataResponse, DependentRootResponse, IndexedAttestationError,
+    SubmitAttestationResult,
 };
