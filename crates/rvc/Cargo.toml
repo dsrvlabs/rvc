@@ -27,6 +27,7 @@ pbkdf2.workspace = true
 aes.workspace = true
 ctr.workspace = true
 uuid.workspace = true
+secrecy.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
