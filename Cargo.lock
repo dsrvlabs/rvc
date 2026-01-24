@@ -176,6 +176,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "beacon-client"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1349,8 +1362,8 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 name = "rvc"
 version = "0.1.0"
 dependencies = [
+ "beacon-client",
  "prost",
- "reqwest",
  "serde",
  "serde_json",
  "thiserror",
@@ -1358,7 +1371,6 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tracing",
- "wiremock",
 ]
 
 [[package]]

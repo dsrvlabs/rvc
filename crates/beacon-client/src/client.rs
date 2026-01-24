@@ -4,7 +4,7 @@ use reqwest::Client;
 use serde::{de::DeserializeOwned, Serialize};
 use tracing::{debug, warn};
 
-use super::BeaconError;
+use crate::BeaconError;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_RETRIES: u32 = 3;
