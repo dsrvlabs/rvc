@@ -5,6 +5,7 @@ use std::path::Path;
 use tracing::warn;
 
 use super::bls::{PublicKey, SecretKey, PUBLIC_KEY_BYTES_LEN};
+use super::decryption_tracker::DecryptionAttemptTracker;
 use super::error::KeyManagerError;
 use super::keystore::Keystore;
 
@@ -94,7 +95,126 @@ impl KeyManager {
             let secret_key = match keystore.decrypt(password.as_bytes()) {
                 Ok(sk) => sk,
                 Err(e) => {
-                    warn!("Failed to decrypt keystore {:?}: {}", file_path, e);
+                    warn!(
+                        pubkey = %pubkey_hex,
+                        file = ?file_path,
+                        error = %e,
+                        "Failed decryption attempt for keystore"
+                    );
+                    continue;
+                }
+            };
+
+            let public_key = secret_key.public_key();
+            manager.keys.insert(public_key.to_bytes(), secret_key);
+        }
+
+        if !found_any_keystore {
+            return Err(KeyManagerError::NoKeystoreFiles);
+        }
+
+        Ok(manager)
+    }
+
+    /// Loads all keystore files from a directory with decryption attempt tracking.
+    ///
+    /// This method is similar to `load_from_directory` but accepts a mutable reference
+    /// to a `DecryptionAttemptTracker` for rate limiting and auditing failed decryption
+    /// attempts.
+    ///
+    /// The tracker will:
+    /// - Record all decryption attempts
+    /// - Log warnings for failed attempts
+    /// - Block attempts when rate limit is exceeded
+    pub fn load_from_directory_with_tracker<P: AsRef<Path>>(
+        path: P,
+        passwords: &HashMap<String, String>,
+        tracker: &mut DecryptionAttemptTracker,
+    ) -> Result<Self, KeyManagerError> {
+        let dir_path = path.as_ref();
+
+        if !dir_path.exists() {
+            return Err(KeyManagerError::DirectoryNotFound(dir_path.to_path_buf()));
+        }
+
+        if !dir_path.is_dir() {
+            return Err(KeyManagerError::DirectoryNotFound(dir_path.to_path_buf()));
+        }
+
+        let mut manager = Self::new();
+        let mut found_any_keystore = false;
+
+        let entries = fs::read_dir(dir_path)?;
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!("Failed to read directory entry: {}", e);
+                    continue;
+                }
+            };
+
+            let file_path = entry.path();
+
+            if !file_path.is_file() {
+                continue;
+            }
+
+            let extension = file_path.extension().and_then(|ext| ext.to_str());
+            if extension != Some("json") {
+                continue;
+            }
+
+            found_any_keystore = true;
+
+            let keystore = match Keystore::from_file(&file_path) {
+                Ok(k) => k,
+                Err(e) => {
+                    warn!("Failed to load keystore from {:?}: {}", file_path, e);
+                    continue;
+                }
+            };
+
+            let pubkey_hex = match &keystore.pubkey {
+                Some(pk) => pk.clone(),
+                None => {
+                    warn!("Keystore {:?} has no public key field, skipping", file_path);
+                    continue;
+                }
+            };
+
+            // Check rate limit before attempting decryption
+            if !tracker.check_and_record(&pubkey_hex) {
+                warn!(
+                    pubkey = %pubkey_hex,
+                    file = ?file_path,
+                    "Skipping keystore due to rate limit"
+                );
+                continue;
+            }
+
+            let password = match passwords.get(&pubkey_hex) {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        "No password found for public key {} in {:?}, skipping",
+                        pubkey_hex, file_path
+                    );
+                    continue;
+                }
+            };
+
+            let secret_key = match keystore.decrypt(password.as_bytes()) {
+                Ok(sk) => sk,
+                Err(e) => {
+                    tracker.record_failure(&pubkey_hex);
+                    warn!(
+                        pubkey = %pubkey_hex,
+                        file = ?file_path,
+                        error = %e,
+                        "Failed decryption attempt for keystore"
+                    );
                     continue;
                 }
             };
@@ -381,5 +501,76 @@ mod tests {
         let signature = secret_key.sign(message);
 
         assert!(signature.verify(&pubkey, message).is_ok());
+    }
+
+    #[test]
+    fn test_load_with_tracker_success() {
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+
+        let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
+
+        let manager =
+            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker)
+                .unwrap();
+
+        assert_eq!(manager.len(), 1);
+        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 1);
+    }
+
+    #[test]
+    fn test_load_with_tracker_records_failure() {
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), "wrong_password".to_string());
+
+        let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
+
+        let manager =
+            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker)
+                .unwrap();
+
+        assert!(manager.is_empty());
+        // Attempt was recorded
+        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 1);
+    }
+
+    #[test]
+    fn test_load_with_tracker_rate_limit() {
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), "wrong_password".to_string());
+
+        // Only allow 2 attempts
+        let mut tracker = DecryptionAttemptTracker::new(2, Duration::from_secs(60));
+
+        // First load - will fail decryption but record attempt
+        let _ =
+            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker);
+        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 1);
+
+        // Second load - will fail decryption but record attempt
+        let _ =
+            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker);
+        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 2);
+
+        // Third load - should be rate limited, no new attempt recorded
+        let _ =
+            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker);
+        // Still 2 because the third attempt was blocked
+        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 2);
     }
 }
