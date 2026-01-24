@@ -1,5 +1,6 @@
 mod bls;
 mod error;
+mod keystore;
 mod signing;
 mod types;
 
@@ -7,7 +8,8 @@ pub use bls::{
     PublicKey, SecretKey, Signature, PUBLIC_KEY_BYTES_LEN, SECRET_KEY_BYTES_LEN,
     SIGNATURE_BYTES_LEN,
 };
-pub use error::BlsError;
+pub use error::{BlsError, KeystoreError};
+pub use keystore::{KdfParams, Keystore, Pbkdf2Params, ScryptParams};
 pub use signing::{
     compute_domain, compute_fork_data_root, compute_signing_root, sign_attestation,
     DOMAIN_BEACON_ATTESTER,
