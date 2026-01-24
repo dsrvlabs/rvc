@@ -1,6 +1,8 @@
+mod client;
 mod error;
 mod types;
 
+pub use client::{BeaconClient, BeaconClientConfig};
 pub use error::BeaconError;
 pub use types::{
     Attestation, AttestationData, AttesterDuty, BeaconBlockHeader, Checkpoint, DataResponse,
