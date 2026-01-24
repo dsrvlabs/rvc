@@ -32,6 +32,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 blst = "0.3"
 hex = "0.4"
 rand = "0.8"
+ssz = { package = "ethereum_ssz", version = "0.9" }
+ssz_derive = { package = "ethereum_ssz_derive", version = "0.9" }
+sha2 = "0.10"
 
 # Dev dependencies
 wiremock = "0.6"
