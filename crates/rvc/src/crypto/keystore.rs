@@ -19,6 +19,11 @@ const CHECKSUM_SHA256: &str = "sha256";
 const DERIVED_KEY_LEN: usize = 32;
 const AES_KEY_LEN: usize = 16;
 
+const MAX_SCRYPT_N: u32 = 1 << 22;
+const MAX_SCRYPT_R: u32 = 16;
+const MAX_SCRYPT_P: u32 = 16;
+const MAX_SCRYPT_DKLEN: u32 = 64;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Keystore {
     pub crypto: Crypto,
@@ -150,8 +155,38 @@ impl Keystore {
             }
         };
 
+        if params.n > MAX_SCRYPT_N {
+            return Err(KeystoreError::InvalidScryptParams(format!(
+                "n={} exceeds maximum {}",
+                params.n, MAX_SCRYPT_N
+            )));
+        }
+        if params.r > MAX_SCRYPT_R {
+            return Err(KeystoreError::InvalidScryptParams(format!(
+                "r={} exceeds maximum {}",
+                params.r, MAX_SCRYPT_R
+            )));
+        }
+        if params.p > MAX_SCRYPT_P {
+            return Err(KeystoreError::InvalidScryptParams(format!(
+                "p={} exceeds maximum {}",
+                params.p, MAX_SCRYPT_P
+            )));
+        }
+        if params.dklen > MAX_SCRYPT_DKLEN {
+            return Err(KeystoreError::InvalidScryptParams(format!(
+                "dklen={} exceeds maximum {}",
+                params.dklen, MAX_SCRYPT_DKLEN
+            )));
+        }
+        if params.n == 0 || !params.n.is_power_of_two() {
+            return Err(KeystoreError::InvalidScryptParams(
+                "n must be a positive power of 2".to_string(),
+            ));
+        }
+
         let salt = hex::decode(&params.salt)?;
-        let log_n = (params.n as f64).log2() as u8;
+        let log_n = params.n.trailing_zeros() as u8;
 
         let scrypt_params = scrypt::Params::new(log_n, params.r, params.p, params.dklen as usize)
             .map_err(|e| KeystoreError::InvalidScryptParams(e.to_string()))?;
@@ -551,5 +586,82 @@ mod tests {
         let signature = secret_key.sign(message);
         let public_key = secret_key.public_key();
         assert!(signature.verify(&public_key, message).is_ok());
+    }
+
+    #[test]
+    fn test_scrypt_n_exceeds_max() {
+        let json = r#"{"crypto":{"kdf":{"function":"scrypt","params":{"dklen":32,"n":1073741824,"p":1,"r":8,"salt":"aa"},"message":""},"checksum":{"function":"sha256","params":{},"message":"aa"},"cipher":{"function":"aes-128-ctr","params":{"iv":"aa"},"message":"aa"}},"path":"m/12381/60/0/0","uuid":"00000000-0000-0000-0000-000000000000","version":4}"#;
+        let keystore = Keystore::from_json(json).expect("should parse json");
+        let result = keystore.decrypt(b"test");
+        assert!(
+            matches!(result, Err(KeystoreError::InvalidScryptParams(ref msg)) if msg.contains("exceeds maximum"))
+        );
+    }
+
+    #[test]
+    fn test_scrypt_r_exceeds_max() {
+        let json = r#"{"crypto":{"kdf":{"function":"scrypt","params":{"dklen":32,"n":262144,"p":1,"r":100,"salt":"aa"},"message":""},"checksum":{"function":"sha256","params":{},"message":"aa"},"cipher":{"function":"aes-128-ctr","params":{"iv":"aa"},"message":"aa"}},"path":"m/12381/60/0/0","uuid":"00000000-0000-0000-0000-000000000000","version":4}"#;
+        let keystore = Keystore::from_json(json).expect("should parse json");
+        let result = keystore.decrypt(b"test");
+        assert!(
+            matches!(result, Err(KeystoreError::InvalidScryptParams(ref msg)) if msg.contains("exceeds maximum"))
+        );
+    }
+
+    #[test]
+    fn test_scrypt_p_exceeds_max() {
+        let json = r#"{"crypto":{"kdf":{"function":"scrypt","params":{"dklen":32,"n":262144,"p":100,"r":8,"salt":"aa"},"message":""},"checksum":{"function":"sha256","params":{},"message":"aa"},"cipher":{"function":"aes-128-ctr","params":{"iv":"aa"},"message":"aa"}},"path":"m/12381/60/0/0","uuid":"00000000-0000-0000-0000-000000000000","version":4}"#;
+        let keystore = Keystore::from_json(json).expect("should parse json");
+        let result = keystore.decrypt(b"test");
+        assert!(
+            matches!(result, Err(KeystoreError::InvalidScryptParams(ref msg)) if msg.contains("exceeds maximum"))
+        );
+    }
+
+    #[test]
+    fn test_scrypt_dklen_exceeds_max() {
+        let json = r#"{"crypto":{"kdf":{"function":"scrypt","params":{"dklen":128,"n":262144,"p":1,"r":8,"salt":"aa"},"message":""},"checksum":{"function":"sha256","params":{},"message":"aa"},"cipher":{"function":"aes-128-ctr","params":{"iv":"aa"},"message":"aa"}},"path":"m/12381/60/0/0","uuid":"00000000-0000-0000-0000-000000000000","version":4}"#;
+        let keystore = Keystore::from_json(json).expect("should parse json");
+        let result = keystore.decrypt(b"test");
+        assert!(
+            matches!(result, Err(KeystoreError::InvalidScryptParams(ref msg)) if msg.contains("exceeds maximum"))
+        );
+    }
+
+    #[test]
+    fn test_scrypt_n_not_power_of_two() {
+        let json = r#"{"crypto":{"kdf":{"function":"scrypt","params":{"dklen":32,"n":3,"p":1,"r":8,"salt":"aa"},"message":""},"checksum":{"function":"sha256","params":{},"message":"aa"},"cipher":{"function":"aes-128-ctr","params":{"iv":"aa"},"message":"aa"}},"path":"m/12381/60/0/0","uuid":"00000000-0000-0000-0000-000000000000","version":4}"#;
+        let keystore = Keystore::from_json(json).expect("should parse json");
+        let result = keystore.decrypt(b"test");
+        assert!(
+            matches!(result, Err(KeystoreError::InvalidScryptParams(ref msg)) if msg.contains("power of 2"))
+        );
+    }
+
+    #[test]
+    fn test_scrypt_n_zero() {
+        let json = r#"{"crypto":{"kdf":{"function":"scrypt","params":{"dklen":32,"n":0,"p":1,"r":8,"salt":"aa"},"message":""},"checksum":{"function":"sha256","params":{},"message":"aa"},"cipher":{"function":"aes-128-ctr","params":{"iv":"aa"},"message":"aa"}},"path":"m/12381/60/0/0","uuid":"00000000-0000-0000-0000-000000000000","version":4}"#;
+        let keystore = Keystore::from_json(json).expect("should parse json");
+        let result = keystore.decrypt(b"test");
+        assert!(
+            matches!(result, Err(KeystoreError::InvalidScryptParams(ref msg)) if msg.contains("power of 2"))
+        );
+    }
+
+    #[test]
+    fn test_scrypt_default_params_valid() {
+        let keystore = Keystore::from_json(EIP2335_SCRYPT_TEST_VECTOR).expect("should parse");
+        match &keystore.crypto.kdf.params {
+            KdfParams::Scrypt(params) => {
+                assert!(params.n <= MAX_SCRYPT_N);
+                assert!(params.r <= MAX_SCRYPT_R);
+                assert!(params.p <= MAX_SCRYPT_P);
+                assert!(params.dklen <= MAX_SCRYPT_DKLEN);
+                assert!(params.n.is_power_of_two());
+            }
+            _ => panic!("expected scrypt params"),
+        }
+        let result = keystore.decrypt(EIP2335_PASSWORD);
+        assert!(result.is_ok());
     }
 }
