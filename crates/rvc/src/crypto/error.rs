@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -54,6 +56,32 @@ pub enum KeystoreError {
     Io(#[from] std::io::Error),
 }
 
+#[derive(Error, Debug)]
+pub enum KeyManagerError {
+    #[error("Directory not found: {0}")]
+    DirectoryNotFound(PathBuf),
+
+    #[error("No keystore files found in directory")]
+    NoKeystoreFiles,
+
+    #[error("Failed to load keystore from {path}: {source}")]
+    KeystoreLoadFailed {
+        path: PathBuf,
+        #[source]
+        source: KeystoreError,
+    },
+
+    #[error("Failed to decrypt keystore from {path}: {source}")]
+    DecryptionFailed {
+        path: PathBuf,
+        #[source]
+        source: KeystoreError,
+    },
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +126,17 @@ mod tests {
     fn test_keystore_checksum_mismatch() {
         let err = KeystoreError::ChecksumMismatch;
         assert_eq!(err.to_string(), "Checksum mismatch: decryption failed");
+    }
+
+    #[test]
+    fn test_key_manager_directory_not_found() {
+        let err = KeyManagerError::DirectoryNotFound(PathBuf::from("/nonexistent/path"));
+        assert_eq!(err.to_string(), "Directory not found: /nonexistent/path");
+    }
+
+    #[test]
+    fn test_key_manager_no_keystore_files() {
+        let err = KeyManagerError::NoKeystoreFiles;
+        assert_eq!(err.to_string(), "No keystore files found in directory");
     }
 }
