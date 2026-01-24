@@ -7,6 +7,7 @@ use blst::min_pk::{
 };
 use blst::BLST_ERROR;
 use rand::RngCore;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::error::BlsError;
 
@@ -49,35 +50,57 @@ impl Hash for PublicKey {
     }
 }
 
-#[derive(Clone)]
-pub struct SecretKey(BlstSecretKey);
+pub struct SecretKey {
+    inner: BlstSecretKey,
+    raw_bytes: [u8; SECRET_KEY_BYTES_LEN],
+}
 
 impl SecretKey {
     pub fn generate() -> Self {
-        let mut ikm = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut ikm);
-        SecretKey(
-            BlstSecretKey::key_gen(&ikm, &[])
-                .expect("key generation should not fail with valid IKM"),
-        )
+        let mut ikm = Zeroizing::new([0u8; 32]);
+        rand::thread_rng().fill_bytes(ikm.as_mut());
+
+        let inner = BlstSecretKey::key_gen(ikm.as_ref(), &[])
+            .expect("key generation should not fail with valid IKM");
+        let raw_bytes = inner.to_bytes();
+
+        Self { inner, raw_bytes }
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BlsError> {
-        BlstSecretKey::from_bytes(bytes)
-            .map(SecretKey)
-            .map_err(|_| BlsError::InvalidSecretKey("invalid secret key bytes".to_string()))
+        let inner = BlstSecretKey::from_bytes(bytes)
+            .map_err(|_| BlsError::InvalidSecretKey("invalid secret key bytes".to_string()))?;
+
+        let mut raw_bytes = [0u8; SECRET_KEY_BYTES_LEN];
+        if bytes.len() == SECRET_KEY_BYTES_LEN {
+            raw_bytes.copy_from_slice(bytes);
+        } else {
+            raw_bytes = inner.to_bytes();
+        }
+
+        Ok(Self { inner, raw_bytes })
     }
 
     pub fn to_bytes(&self) -> [u8; SECRET_KEY_BYTES_LEN] {
-        self.0.to_bytes()
+        self.inner.to_bytes()
+    }
+
+    pub fn raw_bytes(&self) -> &[u8; SECRET_KEY_BYTES_LEN] {
+        &self.raw_bytes
     }
 
     pub fn public_key(&self) -> PublicKey {
-        PublicKey(self.0.sk_to_pk())
+        PublicKey(self.inner.sk_to_pk())
     }
 
     pub fn sign(&self, message: &[u8]) -> Signature {
-        Signature(self.0.sign(message, DST, &[]))
+        Signature(self.inner.sign(message, DST, &[]))
+    }
+}
+
+impl Drop for SecretKey {
+    fn drop(&mut self) {
+        self.raw_bytes.zeroize();
     }
 }
 
@@ -112,9 +135,7 @@ impl Signature {
 
     pub fn aggregate(signatures: &[&Signature]) -> Result<Self, BlsError> {
         if signatures.is_empty() {
-            return Err(BlsError::InvalidSignature(
-                "cannot aggregate empty list".to_string(),
-            ));
+            return Err(BlsError::InvalidSignature("cannot aggregate empty list".to_string()));
         }
 
         let blst_sigs: Vec<&BlstSignature> = signatures.iter().map(|s| &s.0).collect();
@@ -291,6 +312,42 @@ mod tests {
     fn test_aggregate_empty_fails() {
         let result = Signature::aggregate(&[]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_secret_key_has_raw_bytes() {
+        let sk = SecretKey::generate();
+        let raw = sk.raw_bytes();
+        let expected = sk.to_bytes();
+        assert_eq!(raw, &expected);
+    }
+
+    #[test]
+    fn test_secret_key_zeroized_on_drop() {
+        use std::ptr;
+
+        let raw_ptr: *const [u8; SECRET_KEY_BYTES_LEN];
+        {
+            let sk = SecretKey::generate();
+            raw_ptr = sk.raw_bytes() as *const [u8; SECRET_KEY_BYTES_LEN];
+            let bytes_before_drop = sk.to_bytes();
+            assert_ne!(bytes_before_drop, [0u8; SECRET_KEY_BYTES_LEN]);
+        }
+        // After drop, the memory at raw_ptr should be zeroed
+        // Note: This is a best-effort test - memory may be reused
+        // The actual zeroization happens via the Zeroize trait
+        unsafe {
+            let zeroed = ptr::read_volatile(raw_ptr);
+            assert_eq!(zeroed, [0u8; SECRET_KEY_BYTES_LEN]);
+        }
+    }
+
+    #[test]
+    fn test_secret_key_from_bytes_stores_raw() {
+        let original = SecretKey::generate();
+        let bytes = original.to_bytes();
+        let restored = SecretKey::from_bytes(&bytes).expect("valid bytes");
+        assert_eq!(restored.raw_bytes(), &bytes);
     }
 
     #[test]

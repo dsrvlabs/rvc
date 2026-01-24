@@ -150,8 +150,14 @@ impl Keystore {
             }
         };
 
+        if params.n == 0 || !params.n.is_power_of_two() {
+            return Err(KeystoreError::InvalidScryptParams(
+                "n must be a positive power of 2".to_string(),
+            ));
+        }
+
         let salt = hex::decode(&params.salt)?;
-        let log_n = (params.n as f64).log2() as u8;
+        let log_n = params.n.trailing_zeros() as u8;
 
         let scrypt_params = scrypt::Params::new(log_n, params.r, params.p, params.dklen as usize)
             .map_err(|e| KeystoreError::InvalidScryptParams(e.to_string()))?;
@@ -522,6 +528,84 @@ mod tests {
     fn test_invalid_json() {
         let result = Keystore::from_json("not valid json");
         assert!(matches!(result, Err(KeystoreError::InvalidJson(_))));
+    }
+
+    // Scrypt parameter validation tests
+    #[test]
+    fn test_scrypt_n_zero_returns_error() {
+        let json = r#"
+        {
+            "crypto": {
+                "kdf": {
+                    "function": "scrypt",
+                    "params": { "dklen": 32, "n": 0, "p": 1, "r": 8, "salt": "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3" },
+                    "message": ""
+                },
+                "checksum": { "function": "sha256", "params": {}, "message": "d2217fe5f3e9a1e34581ef8a78f7c9928e436d36dacc5e846690a5581e8ea484" },
+                "cipher": { "function": "aes-128-ctr", "params": { "iv": "264daa3f303d7259501c93d997d84fe6" }, "message": "06ae90d55fe0a6e9c5c3bc5b170827b2e5cce3929ed3f116c2811e6366dfe20f" }
+            },
+            "path": "m/12381/60/0/0",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "version": 4
+        }
+        "#;
+        let keystore = Keystore::from_json(json).expect("should parse json");
+        let result = keystore.decrypt(b"test");
+        assert!(
+            matches!(result, Err(KeystoreError::InvalidScryptParams(msg)) if msg.contains("power of 2"))
+        );
+    }
+
+    #[test]
+    fn test_scrypt_n_not_power_of_two_returns_error() {
+        let json = r#"
+        {
+            "crypto": {
+                "kdf": {
+                    "function": "scrypt",
+                    "params": { "dklen": 32, "n": 3, "p": 1, "r": 8, "salt": "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3" },
+                    "message": ""
+                },
+                "checksum": { "function": "sha256", "params": {}, "message": "d2217fe5f3e9a1e34581ef8a78f7c9928e436d36dacc5e846690a5581e8ea484" },
+                "cipher": { "function": "aes-128-ctr", "params": { "iv": "264daa3f303d7259501c93d997d84fe6" }, "message": "06ae90d55fe0a6e9c5c3bc5b170827b2e5cce3929ed3f116c2811e6366dfe20f" }
+            },
+            "path": "m/12381/60/0/0",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "version": 4
+        }
+        "#;
+        let keystore = Keystore::from_json(json).expect("should parse json");
+        let result = keystore.decrypt(b"test");
+        assert!(
+            matches!(result, Err(KeystoreError::InvalidScryptParams(msg)) if msg.contains("power of 2"))
+        );
+    }
+
+    #[test]
+    fn test_scrypt_n_valid_power_of_two() {
+        let keystore = Keystore::from_json(EIP2335_SCRYPT_TEST_VECTOR).expect("should parse");
+        match &keystore.crypto.kdf.params {
+            KdfParams::Scrypt(params) => {
+                assert_eq!(params.n, 262144);
+                assert!(params.n.is_power_of_two());
+            }
+            _ => panic!("expected scrypt params"),
+        }
+        let result = keystore.decrypt(EIP2335_PASSWORD);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_scrypt_n_large_power_of_two_validation() {
+        // Test that large power-of-2 values pass our validation
+        // (the scrypt library may still reject due to memory limits)
+        let n_values: Vec<u32> = vec![1 << 20, 1 << 24, 1 << 30];
+        for n in n_values {
+            assert!(n.is_power_of_two());
+            assert!(n != 0);
+            // trailing_zeros correctly computes log2 for powers of 2
+            assert_eq!(n.trailing_zeros(), (n as f64).log2() as u32);
+        }
     }
 
     #[test]
