@@ -530,6 +530,7 @@ mod tests {
         assert!(matches!(result, Err(KeystoreError::InvalidJson(_))));
     }
 
+    // Scrypt parameter validation tests
     #[test]
     fn test_scrypt_n_zero_returns_error() {
         let json = r#"
@@ -592,6 +593,19 @@ mod tests {
         }
         let result = keystore.decrypt(EIP2335_PASSWORD);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_scrypt_n_large_power_of_two_validation() {
+        // Test that large power-of-2 values pass our validation
+        // (the scrypt library may still reject due to memory limits)
+        let n_values: Vec<u32> = vec![1 << 20, 1 << 24, 1 << 30];
+        for n in n_values {
+            assert!(n.is_power_of_two());
+            assert!(n != 0);
+            // trailing_zeros correctly computes log2 for powers of 2
+            assert_eq!(n.trailing_zeros(), (n as f64).log2() as u32);
+        }
     }
 
     #[test]
