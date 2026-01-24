@@ -4,6 +4,7 @@ use reqwest::Client;
 use serde::{de::DeserializeOwned, Serialize};
 use tracing::{debug, warn};
 
+use super::types::AttesterDutiesResponse;
 use super::BeaconError;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -100,6 +101,19 @@ impl BeaconClient {
     ) -> Result<T, BeaconError> {
         let url = format!("{}{}", self.config.endpoint, path);
         self.execute_with_retry(|| async { self.client.post(&url).json(body).send().await }).await
+    }
+
+    /// Fetches attester duties for the given epoch and validator indices.
+    ///
+    /// Returns duties with a dependent root that can be used for cache invalidation.
+    /// If the dependent root changes, cached duties should be invalidated.
+    pub async fn get_attester_duties(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<AttesterDutiesResponse, BeaconError> {
+        let path = format!("/eth/v1/validator/duties/attester/{}", epoch);
+        self.post(&path, &validator_indices).await
     }
 
     async fn execute_with_retry<F, Fut, T>(&self, request_fn: F) -> Result<T, BeaconError>
@@ -435,5 +449,258 @@ mod tests {
         let result: Result<TestData, _> = client.get("/eth/v1/test").await;
 
         assert!(matches!(result, Err(BeaconError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn test_get_attester_duties_success() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "dependent_root": "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+            "execution_optimistic": false,
+            "data": [
+                {
+                    "pubkey": "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a",
+                    "validator_index": "1234",
+                    "committee_index": "1",
+                    "committee_length": "128",
+                    "committees_at_slot": "64",
+                    "validator_committee_index": "25",
+                    "slot": "10000"
+                },
+                {
+                    "pubkey": "0xa1234f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74b",
+                    "validator_index": "5678",
+                    "committee_index": "2",
+                    "committee_length": "128",
+                    "committees_at_slot": "64",
+                    "validator_committee_index": "50",
+                    "slot": "10001"
+                }
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/100"))
+            .and(body_json(&["1234", "5678"]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let validator_indices = vec!["1234".to_string(), "5678".to_string()];
+        let result = client.get_attester_duties(100, &validator_indices).await.unwrap();
+
+        assert_eq!(
+            result.dependent_root,
+            "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab"
+        );
+        assert!(!result.execution_optimistic);
+        assert_eq!(result.data.len(), 2);
+        assert_eq!(result.data[0].validator_index, "1234");
+        assert_eq!(result.data[0].slot, "10000");
+        assert_eq!(result.data[1].validator_index, "5678");
+        assert_eq!(result.data[1].slot, "10001");
+    }
+
+    #[tokio::test]
+    async fn test_get_attester_duties_empty_indices() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "dependent_root": "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+            "execution_optimistic": false,
+            "data": []
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/100"))
+            .and(body_json::<Vec<String>>(vec![]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let validator_indices: Vec<String> = vec![];
+        let result = client.get_attester_duties(100, &validator_indices).await.unwrap();
+
+        assert_eq!(
+            result.dependent_root,
+            "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab"
+        );
+        assert!(result.data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_attester_duties_with_execution_optimistic() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "dependent_root": "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+            "execution_optimistic": true,
+            "data": [
+                {
+                    "pubkey": "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a",
+                    "validator_index": "1234",
+                    "committee_index": "1",
+                    "committee_length": "128",
+                    "committees_at_slot": "64",
+                    "validator_committee_index": "25",
+                    "slot": "10000"
+                }
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let validator_indices = vec!["1234".to_string()];
+        let result = client.get_attester_duties(200, &validator_indices).await.unwrap();
+
+        assert!(result.execution_optimistic);
+    }
+
+    #[tokio::test]
+    async fn test_get_attester_duties_api_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/999"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid epoch"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let validator_indices = vec!["1234".to_string()];
+        let result = client.get_attester_duties(999, &validator_indices).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert_eq!(message, "Invalid epoch");
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_attester_duties_server_error_with_retry() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/100"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(2)
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+
+        let response_body = serde_json::json!({
+            "dependent_root": "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+            "execution_optimistic": false,
+            "data": []
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1));
+        let client = BeaconClient::new(config).unwrap();
+
+        let validator_indices: Vec<String> = vec![];
+        let result = client.get_attester_duties(100, &validator_indices).await.unwrap();
+
+        assert_eq!(
+            result.dependent_root,
+            "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_attester_duties_dependent_root_changes() {
+        let mock_server = MockServer::start().await;
+
+        let response_body_1 = serde_json::json!({
+            "dependent_root": "0xroot_a_1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a",
+                "validator_index": "1234",
+                "committee_index": "1",
+                "committee_length": "128",
+                "committees_at_slot": "64",
+                "validator_committee_index": "25",
+                "slot": "10000"
+            }]
+        });
+
+        let response_body_2 = serde_json::json!({
+            "dependent_root": "0xroot_b_1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a",
+                "validator_index": "1234",
+                "committee_index": "2",
+                "committee_length": "128",
+                "committees_at_slot": "64",
+                "validator_committee_index": "30",
+                "slot": "10001"
+            }]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body_1))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body_2))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let validator_indices = vec!["1234".to_string()];
+
+        let result_1 = client.get_attester_duties(100, &validator_indices).await.unwrap();
+        let result_2 = client.get_attester_duties(100, &validator_indices).await.unwrap();
+
+        assert_ne!(result_1.dependent_root, result_2.dependent_root);
+        assert_eq!(
+            result_1.dependent_root,
+            "0xroot_a_1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        );
+        assert_eq!(
+            result_2.dependent_root,
+            "0xroot_b_1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        );
     }
 }
