@@ -42,6 +42,7 @@ pbkdf2 = "0.12"
 aes = "0.8"
 ctr = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
+secrecy = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }
 
 # Dev dependencies
