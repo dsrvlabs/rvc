@@ -14,8 +14,10 @@ thiserror.workspace = true
 tracing.workspace = true
 tonic.workspace = true
 prost.workspace = true
+reqwest.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
 
 [dev-dependencies]
+wiremock.workspace = true
