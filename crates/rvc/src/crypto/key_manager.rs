@@ -105,8 +105,38 @@ impl KeyManager {
                 }
             };
 
-            let public_key = secret_key.public_key();
-            manager.keys.insert(public_key.to_bytes(), secret_key);
+            let derived_pubkey = secret_key.public_key();
+
+            let expected_pubkey_bytes = match hex::decode(&pubkey_hex) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    warn!(
+                        "Invalid public key hex format in keystore {:?}: {}",
+                        file_path, pubkey_hex
+                    );
+                    continue;
+                }
+            };
+
+            let expected_pubkey = match PublicKey::from_bytes(&expected_pubkey_bytes) {
+                Ok(pk) => pk,
+                Err(_) => {
+                    warn!("Invalid public key format in keystore {:?}: {}", file_path, pubkey_hex);
+                    continue;
+                }
+            };
+
+            if derived_pubkey.to_bytes() != expected_pubkey.to_bytes() {
+                warn!(
+                    "Public key mismatch in keystore {:?}: declared {} but derived {}",
+                    file_path,
+                    pubkey_hex,
+                    hex::encode(derived_pubkey.to_bytes())
+                );
+                continue;
+            }
+
+            manager.keys.insert(derived_pubkey.to_bytes(), secret_key);
         }
 
         if !found_any_keystore {
@@ -572,5 +602,111 @@ mod tests {
             KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker);
         // Still 2 because the third attempt was blocked
         assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 2);
+    }
+
+    #[test]
+    fn test_keystore_with_mismatched_pubkey_is_skipped() {
+        // This keystore has a WRONG pubkey field - it declares a different public key
+        // than what the secret key actually derives to.
+        // The declared pubkey is all zeros (a valid hex string but wrong key).
+        let keystore_with_wrong_pubkey = r#"
+        {
+            "crypto": {
+                "kdf": {
+                    "function": "pbkdf2",
+                    "params": {
+                        "dklen": 32,
+                        "c": 262144,
+                        "prf": "hmac-sha256",
+                        "salt": "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"
+                    },
+                    "message": ""
+                },
+                "checksum": {
+                    "function": "sha256",
+                    "params": {},
+                    "message": "8a9f5d9912ed7e75ea794bc5a89bca5f193721d30868ade6f73043c6ea6febf1"
+                },
+                "cipher": {
+                    "function": "aes-128-ctr",
+                    "params": {
+                        "iv": "264daa3f303d7259501c93d997d84fe6"
+                    },
+                    "message": "cee03fde2af33149775b7223e7845e4fb2c8ae1792e5f99fe9ecf474cc8c16ad"
+                }
+            },
+            "description": "Test keystore with wrong pubkey",
+            "pubkey": "a99a76ed7796f7be22d5b7e85deeb7c5677e88e511e0b337618f8c4eb61349b4bf2d153f649f7b53359fe8b94a38e44c",
+            "path": "m/12381/60/0/0",
+            "uuid": "64625def-3331-4eea-ab6f-782f3ed16a84",
+            "version": 4
+        }
+        "#;
+
+        let wrong_pubkey_hex =
+            "a99a76ed7796f7be22d5b7e85deeb7c5677e88e511e0b337618f8c4eb61349b4bf2d153f649f7b53359fe8b94a38e44c";
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "wrong_pubkey.json", keystore_with_wrong_pubkey);
+
+        let mut passwords = HashMap::new();
+        // We provide the password for the DECLARED (wrong) pubkey
+        passwords.insert(wrong_pubkey_hex.to_string(), test_password_string());
+
+        let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
+
+        // The keystore should be skipped because the derived pubkey doesn't match the declared one
+        assert!(manager.is_empty());
+    }
+
+    #[test]
+    fn test_keystore_with_invalid_pubkey_hex_is_skipped() {
+        // This keystore has an invalid pubkey hex string (not valid hex / wrong length)
+        let keystore_with_invalid_pubkey = r#"
+        {
+            "crypto": {
+                "kdf": {
+                    "function": "pbkdf2",
+                    "params": {
+                        "dklen": 32,
+                        "c": 262144,
+                        "prf": "hmac-sha256",
+                        "salt": "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"
+                    },
+                    "message": ""
+                },
+                "checksum": {
+                    "function": "sha256",
+                    "params": {},
+                    "message": "8a9f5d9912ed7e75ea794bc5a89bca5f193721d30868ade6f73043c6ea6febf1"
+                },
+                "cipher": {
+                    "function": "aes-128-ctr",
+                    "params": {
+                        "iv": "264daa3f303d7259501c93d997d84fe6"
+                    },
+                    "message": "cee03fde2af33149775b7223e7845e4fb2c8ae1792e5f99fe9ecf474cc8c16ad"
+                }
+            },
+            "description": "Test keystore with invalid pubkey hex",
+            "pubkey": "invalid_hex_string_not_valid_zzz",
+            "path": "m/12381/60/0/0",
+            "uuid": "64625def-3331-4eea-ab6f-782f3ed16a85",
+            "version": 4
+        }
+        "#;
+
+        let invalid_pubkey_hex = "invalid_hex_string_not_valid_zzz";
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "invalid_pubkey.json", keystore_with_invalid_pubkey);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(invalid_pubkey_hex.to_string(), test_password_string());
+
+        let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
+
+        // The keystore should be skipped because the pubkey hex is invalid
+        assert!(manager.is_empty());
     }
 }

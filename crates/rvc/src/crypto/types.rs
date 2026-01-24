@@ -1,4 +1,5 @@
 use ssz_derive::{Decode, Encode};
+use tree_hash_derive::TreeHash;
 
 pub type Slot = u64;
 pub type Epoch = u64;
@@ -8,13 +9,13 @@ pub type Root = [u8; 32];
 pub type Domain = [u8; 32];
 pub type DomainType = [u8; 4];
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, TreeHash)]
 pub struct Checkpoint {
     pub epoch: Epoch,
     pub root: Root,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, TreeHash)]
 pub struct AttestationData {
     pub slot: Slot,
     pub index: CommitteeIndex,
@@ -23,20 +24,20 @@ pub struct AttestationData {
     pub target: Checkpoint,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, TreeHash)]
 pub struct Fork {
     pub previous_version: Version,
     pub current_version: Version,
     pub epoch: Epoch,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, TreeHash)]
 pub struct ForkData {
     pub current_version: Version,
     pub genesis_validators_root: Root,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode)]
+#[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, TreeHash)]
 pub struct SigningData {
     pub object_root: Root,
     pub domain: Domain,
