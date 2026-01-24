@@ -1,70 +1,12 @@
-use ssz::Encode;
+use tree_hash::TreeHash;
 
 use super::bls::{SecretKey, Signature};
 use super::types::{AttestationData, Domain, DomainType, Fork, ForkData, Root, SigningData};
 
 pub const DOMAIN_BEACON_ATTESTER: DomainType = [0x01, 0x00, 0x00, 0x00];
 
-fn hash(data: &[u8]) -> Root {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    let mut root = [0u8; 32];
-    root.copy_from_slice(&result);
-    root
-}
-
-fn hash_tree_root<T: Encode>(object: &T) -> Root {
-    let encoded = object.as_ssz_bytes();
-    let chunks = pad_to_chunks(&encoded);
-    merkleize(&chunks)
-}
-
-fn pad_to_chunks(data: &[u8]) -> Vec<[u8; 32]> {
-    let num_chunks = data.len().div_ceil(32);
-    let mut chunks = Vec::with_capacity(num_chunks.max(1));
-
-    for i in 0..num_chunks {
-        let mut chunk = [0u8; 32];
-        let start = i * 32;
-        let end = (start + 32).min(data.len());
-        chunk[..end - start].copy_from_slice(&data[start..end]);
-        chunks.push(chunk);
-    }
-
-    if chunks.is_empty() {
-        chunks.push([0u8; 32]);
-    }
-
-    chunks
-}
-
-fn merkleize(chunks: &[[u8; 32]]) -> Root {
-    if chunks.is_empty() {
-        return [0u8; 32];
-    }
-
-    if chunks.len() == 1 {
-        return chunks[0];
-    }
-
-    let next_power_of_two = chunks.len().next_power_of_two();
-    let mut layer: Vec<[u8; 32]> = chunks.to_vec();
-    layer.resize(next_power_of_two, [0u8; 32]);
-
-    while layer.len() > 1 {
-        let mut next_layer = Vec::with_capacity(layer.len() / 2);
-        for i in (0..layer.len()).step_by(2) {
-            let mut combined = [0u8; 64];
-            combined[..32].copy_from_slice(&layer[i]);
-            combined[32..].copy_from_slice(&layer[i + 1]);
-            next_layer.push(hash(&combined));
-        }
-        layer = next_layer;
-    }
-
-    layer[0]
+fn hash_tree_root<T: TreeHash>(object: &T) -> Root {
+    object.tree_hash_root().0
 }
 
 pub fn compute_fork_data_root(current_version: [u8; 4], genesis_validators_root: Root) -> Root {
@@ -84,7 +26,7 @@ pub fn compute_domain(
     domain
 }
 
-pub fn compute_signing_root<T: Encode>(ssz_object: &T, domain: Domain) -> Root {
+pub fn compute_signing_root<T: TreeHash>(ssz_object: &T, domain: Domain) -> Root {
     let object_root = hash_tree_root(ssz_object);
     let signing_data = SigningData { object_root, domain };
     hash_tree_root(&signing_data)
@@ -112,6 +54,50 @@ pub fn sign_attestation(
 mod tests {
     use super::*;
     use crate::crypto::types::Checkpoint;
+    use tree_hash::TreeHash;
+
+    #[test]
+    fn test_hash_tree_root_uses_spec_compliant_tree_hash() {
+        let fork_data = ForkData {
+            current_version: [0x00, 0x00, 0x00, 0x00],
+            genesis_validators_root: [0x00; 32],
+        };
+
+        let expected = fork_data.tree_hash_root();
+        let actual = hash_tree_root(&fork_data);
+
+        assert_eq!(actual, expected.0);
+    }
+
+    #[test]
+    fn test_checkpoint_tree_hash_root() {
+        let checkpoint = Checkpoint { epoch: 100, root: [0xab; 32] };
+
+        let expected = checkpoint.tree_hash_root();
+        let actual = hash_tree_root(&checkpoint);
+
+        assert_eq!(actual, expected.0);
+    }
+
+    #[test]
+    fn test_attestation_data_tree_hash_root() {
+        let data = create_test_attestation_data();
+
+        let expected = data.tree_hash_root();
+        let actual = hash_tree_root(&data);
+
+        assert_eq!(actual, expected.0);
+    }
+
+    #[test]
+    fn test_signing_data_tree_hash_root() {
+        let signing_data = SigningData { object_root: [0x11; 32], domain: [0x22; 32] };
+
+        let expected = signing_data.tree_hash_root();
+        let actual = hash_tree_root(&signing_data);
+
+        assert_eq!(actual, expected.0);
+    }
 
     #[test]
     fn test_domain_beacon_attester_value() {
