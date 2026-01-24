@@ -4,7 +4,7 @@ use reqwest::Client;
 use serde::{de::DeserializeOwned, Serialize};
 use tracing::{debug, warn};
 
-use super::types::AttesterDutiesResponse;
+use super::types::{AttestationDataResponse, AttesterDutiesResponse};
 use super::BeaconError;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
@@ -114,6 +114,25 @@ impl BeaconClient {
     ) -> Result<AttesterDutiesResponse, BeaconError> {
         let path = format!("/eth/v1/validator/duties/attester/{}", epoch);
         self.post(&path, &validator_indices).await
+    }
+
+    /// Fetches attestation data for the given slot and committee index.
+    ///
+    /// The beacon node will return attestation data that validators can use
+    /// to create their attestations for the specified slot and committee.
+    ///
+    /// Returns an error if the slot is in the past or too far in the future,
+    /// or if the beacon node is still syncing.
+    pub async fn get_attestation_data(
+        &self,
+        slot: u64,
+        committee_index: u64,
+    ) -> Result<AttestationDataResponse, BeaconError> {
+        let path = format!(
+            "/eth/v1/validator/attestation_data?slot={}&committee_index={}",
+            slot, committee_index
+        );
+        self.get(&path).await
     }
 
     async fn execute_with_retry<F, Fut, T>(&self, request_fn: F) -> Result<T, BeaconError>
@@ -702,5 +721,239 @@ mod tests {
             result_2.dependent_root,
             "0xroot_b_1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_data_success() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "data": {
+                "slot": "1000",
+                "index": "1",
+                "beacon_block_root": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                "source": {
+                    "epoch": "100",
+                    "root": "0x1111111111111111111111111111111111111111111111111111111111111111"
+                },
+                "target": {
+                    "epoch": "101",
+                    "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                }
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(wiremock::matchers::query_param("slot", "1000"))
+            .and(wiremock::matchers::query_param("committee_index", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_attestation_data(1000, 1).await.unwrap();
+
+        assert_eq!(result.data.slot, "1000");
+        assert_eq!(result.data.index, "1");
+        assert_eq!(
+            result.data.beacon_block_root,
+            "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        );
+        assert_eq!(result.data.source.epoch, "100");
+        assert_eq!(result.data.target.epoch, "101");
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_data_different_committee_index() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "data": {
+                "slot": "2000",
+                "index": "5",
+                "beacon_block_root": "0xdeadbeef1234567890abcdef1234567890abcdef1234567890abcdef12345678",
+                "source": {
+                    "epoch": "200",
+                    "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                },
+                "target": {
+                    "epoch": "201",
+                    "root": "0x4444444444444444444444444444444444444444444444444444444444444444"
+                }
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(wiremock::matchers::query_param("slot", "2000"))
+            .and(wiremock::matchers::query_param("committee_index", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_attestation_data(2000, 5).await.unwrap();
+
+        assert_eq!(result.data.slot, "2000");
+        assert_eq!(result.data.index, "5");
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_data_slot_too_early() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string("Slot requested is in the future"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_attestation_data(999999999, 0).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert!(message.contains("future"));
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_data_slot_in_past() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Slot is in the past"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_attestation_data(1, 0).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert!(message.contains("past"));
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_data_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_string("Attestation data not available for requested slot"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_attestation_data(500, 0).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 404);
+                assert!(message.contains("not available"));
+            }
+            _ => panic!("Expected ApiError with status 404"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_data_server_error_with_retry() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(2)
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+
+        let response_body = serde_json::json!({
+            "data": {
+                "slot": "1000",
+                "index": "0",
+                "beacon_block_root": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                "source": {
+                    "epoch": "100",
+                    "root": "0x1111111111111111111111111111111111111111111111111111111111111111"
+                },
+                "target": {
+                    "epoch": "101",
+                    "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                }
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1));
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_attestation_data(1000, 0).await.unwrap();
+
+        assert_eq!(result.data.slot, "1000");
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_data_beacon_syncing() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Beacon node is syncing"))
+            .expect(4)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1));
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_attestation_data(1000, 0).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 503);
+                assert!(message.contains("syncing"));
+            }
+            _ => panic!("Expected ApiError with status 503"),
+        }
     }
 }

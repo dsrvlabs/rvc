@@ -1,6 +1,6 @@
 //! rvc - Rust Validator Client
 
-pub use beacon_client as beacon;
+pub mod beacon;
 pub mod duty_tracker;
 
 pub mod proto {
