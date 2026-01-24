@@ -30,6 +30,7 @@ aes.workspace = true
 ctr.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+subtle = "2.6"
 
 [build-dependencies]
 tonic-build.workspace = true
