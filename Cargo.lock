@@ -1364,6 +1364,7 @@ version = "0.1.0"
 dependencies = [
  "beacon-client",
  "prost",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror",
@@ -1371,6 +1372,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
