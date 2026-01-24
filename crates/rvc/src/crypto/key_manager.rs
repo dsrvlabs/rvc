@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+use secrecy::{ExposeSecret, SecretString};
 use tracing::warn;
 
 use super::bls::{PublicKey, SecretKey, PUBLIC_KEY_BYTES_LEN};
@@ -20,14 +21,15 @@ impl KeyManager {
     /// Loads all keystore files from a directory.
     ///
     /// The `passwords` map uses public key hex strings (without 0x prefix) as keys
-    /// and the corresponding password strings as values.
+    /// and `SecretString` values for secure password handling.
     ///
+    /// Passwords are automatically zeroized when the HashMap is dropped.
     /// Corrupted or unreadable keystores are logged and skipped.
     /// Files outside the directory boundary (e.g., via symlinks) are also skipped
     /// to prevent directory traversal attacks.
     pub fn load_from_directory<P: AsRef<Path>>(
         path: P,
-        passwords: &HashMap<String, String>,
+        passwords: &HashMap<String, SecretString>,
     ) -> Result<Self, KeyManagerError> {
         let dir_path = path.as_ref();
 
@@ -111,7 +113,7 @@ impl KeyManager {
                 }
             };
 
-            let secret_key = match keystore.decrypt(password.as_bytes()) {
+            let secret_key = match keystore.decrypt(password.expose_secret().as_bytes()) {
                 Ok(sk) => sk,
                 Err(e) => {
                     warn!("Failed to decrypt keystore {:?}: {}", file_path, e);
@@ -158,6 +160,7 @@ mod tests {
     use std::fs::File;
     use std::io::Write;
 
+    use secrecy::SecretString;
     use tempfile::TempDir;
 
     use super::*;
@@ -214,6 +217,10 @@ mod tests {
         String::from_utf8(TEST_PASSWORD.to_vec()).unwrap()
     }
 
+    fn test_password_secret() -> SecretString {
+        SecretString::from(test_password_string())
+    }
+
     #[test]
     fn test_new_key_manager_is_empty() {
         let manager = KeyManager::new();
@@ -242,7 +249,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
         assert_eq!(manager.len(), 1);
@@ -255,7 +262,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
 
@@ -275,7 +282,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
 
@@ -291,7 +298,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
 
@@ -309,7 +316,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
         assert_eq!(manager.len(), 1);
@@ -321,7 +328,8 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), "wrong_password".to_string());
+        passwords
+            .insert(TEST_PUBKEY_HEX.to_string(), SecretString::from("wrong_password".to_string()));
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
         assert!(manager.is_empty());
@@ -345,7 +353,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
         assert_eq!(manager.len(), 1);
@@ -371,7 +379,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
         assert_eq!(manager.len(), 1);
@@ -389,7 +397,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
         let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
 
@@ -426,7 +434,7 @@ mod tests {
             symlink(&outside_keystore, &symlink_path).unwrap();
 
             let mut passwords = HashMap::new();
-            passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+            passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
             let result = KeyManager::load_from_directory(keystore_dir.path(), &passwords);
 
@@ -447,7 +455,7 @@ mod tests {
             symlink(&actual_keystore, &symlink_path).unwrap();
 
             let mut passwords = HashMap::new();
-            passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+            passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
             let manager = KeyManager::load_from_directory(keystore_dir.path(), &passwords).unwrap();
 
@@ -467,7 +475,7 @@ mod tests {
             symlink(&parent_keystore, &symlink_path).unwrap();
 
             let mut passwords = HashMap::new();
-            passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+            passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
 
             let result = KeyManager::load_from_directory(&keystore_dir_path, &passwords);
 
@@ -476,5 +484,12 @@ mod tests {
                 "Symlink pointing to parent directory should be skipped"
             );
         }
+    }
+
+    #[test]
+    fn test_secret_string_password_is_not_exposed_in_debug() {
+        let secret = test_password_secret();
+        let debug_output = format!("{:?}", secret);
+        assert!(!debug_output.contains(&test_password_string()));
     }
 }
