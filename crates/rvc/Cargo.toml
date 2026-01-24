@@ -16,6 +16,9 @@ tracing.workspace = true
 tonic.workspace = true
 prost.workspace = true
 reqwest.workspace = true
+blst.workspace = true
+hex.workspace = true
+rand.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
