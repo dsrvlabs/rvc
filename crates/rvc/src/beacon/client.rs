@@ -482,7 +482,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v1/validator/duties/attester/100"))
-            .and(body_json(&["1234", "5678"]))
+            .and(body_json(["1234", "5678"]))
             .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
             .expect(1)
             .mount(&mock_server)
