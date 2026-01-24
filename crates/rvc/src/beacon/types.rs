@@ -61,6 +61,9 @@ pub struct DependentRootResponse<T> {
     pub data: T,
 }
 
+/// Response type for attester duties endpoint.
+pub type AttesterDutiesResponse = DependentRootResponse<Vec<AttesterDuty>>;
+
 #[cfg(test)]
 mod tests {
     use super::*;
