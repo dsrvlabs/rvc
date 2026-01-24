@@ -73,7 +73,7 @@ impl KeyManager {
                 continue;
             }
 
-            if !file_path.is_file() {
+            if !canonical_file.is_file() {
                 continue;
             }
 
