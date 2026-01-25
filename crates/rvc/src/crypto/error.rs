@@ -54,6 +54,9 @@ pub enum KeystoreError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Rate limit exceeded for keystore decryption: {0}")]
+    RateLimitExceeded(String),
 }
 
 #[derive(Error, Debug)]
@@ -138,5 +141,11 @@ mod tests {
     fn test_key_manager_no_keystore_files() {
         let err = KeyManagerError::NoKeystoreFiles;
         assert_eq!(err.to_string(), "No keystore files found in directory");
+    }
+
+    #[test]
+    fn test_keystore_rate_limit_exceeded() {
+        let err = KeystoreError::RateLimitExceeded("abc123".to_string());
+        assert_eq!(err.to_string(), "Rate limit exceeded for keystore decryption: abc123");
     }
 }
