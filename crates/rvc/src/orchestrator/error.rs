@@ -2,11 +2,11 @@
 
 use thiserror::Error;
 
-use crate::beacon::BeaconError;
 use crate::duty_tracker::DutyTrackerError;
 use crate::propagator::PropagatorError;
 use crate::signer::SignerError;
 use crate::timing::TimingError;
+use beacon_client::BeaconError;
 
 /// Errors that can occur during duty orchestration.
 #[derive(Debug, Error)]

@@ -1,10 +1,20 @@
 use std::time::Duration;
 
 use reqwest::Client;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::types::{
+    Attestation, AttestationDataResponse, AttesterDutiesResponse, IndexedAttestationError,
+    SubmitAttestationResult,
+};
 use crate::BeaconError;
+
+#[derive(Debug, Deserialize)]
+struct AttestationSubmissionError {
+    #[serde(default)]
+    failures: Vec<IndexedAttestationError>,
+}
 
 const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_MAX_RETRIES: u32 = 3;
@@ -100,6 +110,120 @@ impl BeaconClient {
     ) -> Result<T, BeaconError> {
         let url = format!("{}{}", self.config.endpoint, path);
         self.execute_with_retry(|| async { self.client.post(&url).json(body).send().await }).await
+    }
+
+    /// Fetches attester duties for the given epoch and validator indices.
+    ///
+    /// Returns duties with a dependent root that can be used for cache invalidation.
+    /// If the dependent root changes, cached duties should be invalidated.
+    pub async fn get_attester_duties(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<AttesterDutiesResponse, BeaconError> {
+        let path = format!("/eth/v1/validator/duties/attester/{}", epoch);
+        self.post(&path, &validator_indices).await
+    }
+
+    /// Fetches attestation data for the given slot and committee index.
+    ///
+    /// The beacon node will return attestation data that validators can use
+    /// to create their attestations for the specified slot and committee.
+    ///
+    /// Returns an error if the slot is in the past or too far in the future,
+    /// or if the beacon node is still syncing.
+    pub async fn get_attestation_data(
+        &self,
+        slot: u64,
+        committee_index: u64,
+    ) -> Result<AttestationDataResponse, BeaconError> {
+        let path = format!(
+            "/eth/v1/validator/attestation_data?slot={}&committee_index={}",
+            slot, committee_index
+        );
+        self.get(&path).await
+    }
+
+    /// Submits signed attestations to the beacon node.
+    ///
+    /// Accepts an array of attestations and submits them to the beacon pool.
+    /// Returns success if all attestations were accepted, or partial failure
+    /// with details about which attestations failed validation.
+    ///
+    /// Server errors (5xx) will trigger retry logic with exponential backoff.
+    pub async fn submit_attestation(
+        &self,
+        attestations: &[Attestation],
+    ) -> Result<SubmitAttestationResult, BeaconError> {
+        let url = format!("{}/eth/v1/beacon/pool/attestations", self.config.endpoint);
+        let mut last_error = None;
+
+        for attempt in 0..=self.config.max_retries {
+            if attempt > 0 {
+                let backoff = self.calculate_backoff(attempt - 1);
+                debug!(attempt = attempt, backoff_ms = ?backoff.as_millis(), "Retrying request");
+                tokio::time::sleep(backoff).await;
+            }
+
+            match self.client.post(&url).json(attestations).send().await {
+                Ok(response) => {
+                    let status = response.status();
+
+                    if status.is_success() {
+                        return Ok(SubmitAttestationResult::Success);
+                    }
+
+                    if status.as_u16() == 400 {
+                        let body = response.text().await.unwrap_or_default();
+                        if let Ok(error_response) =
+                            serde_json::from_str::<AttestationSubmissionError>(&body)
+                        {
+                            return Ok(SubmitAttestationResult::PartialFailure {
+                                failures: error_response.failures,
+                            });
+                        }
+                        return Err(BeaconError::ApiError { status: 400, message: body });
+                    }
+
+                    if status.is_client_error() {
+                        let message = response.text().await.unwrap_or_default();
+                        return Err(BeaconError::ApiError { status: status.as_u16(), message });
+                    }
+
+                    if status.is_server_error() {
+                        let message = response.text().await.unwrap_or_default();
+                        last_error =
+                            Some(BeaconError::ApiError { status: status.as_u16(), message });
+                        warn!(
+                            attempt = attempt,
+                            status = status.as_u16(),
+                            "Server error, will retry"
+                        );
+                        continue;
+                    }
+
+                    let message = response.text().await.unwrap_or_default();
+                    return Err(BeaconError::ApiError { status: status.as_u16(), message });
+                }
+                Err(e) => {
+                    if e.is_timeout() {
+                        last_error = Some(BeaconError::Timeout);
+                        warn!(attempt = attempt, "Request timeout, will retry");
+                        continue;
+                    }
+
+                    if e.is_connect() || e.is_request() {
+                        last_error = Some(BeaconError::HttpError(e.to_string()));
+                        warn!(attempt = attempt, error = %e, "Connection error, will retry");
+                        continue;
+                    }
+
+                    return Err(BeaconError::HttpError(e.to_string()));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string())))
     }
 
     async fn execute_with_retry<F, Fut, T>(&self, request_fn: F) -> Result<T, BeaconError>
@@ -489,5 +613,765 @@ mod tests {
         let result: Result<TestData, _> = client.get("/eth/v1/test").await;
 
         assert!(matches!(result, Err(BeaconError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn test_get_attester_duties_success() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "dependent_root": "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+            "execution_optimistic": false,
+            "data": [
+                {
+                    "pubkey": "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a",
+                    "validator_index": "1234",
+                    "committee_index": "1",
+                    "committee_length": "128",
+                    "committees_at_slot": "64",
+                    "validator_committee_index": "25",
+                    "slot": "10000"
+                },
+                {
+                    "pubkey": "0xa1234f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74b",
+                    "validator_index": "5678",
+                    "committee_index": "2",
+                    "committee_length": "128",
+                    "committees_at_slot": "64",
+                    "validator_committee_index": "50",
+                    "slot": "10001"
+                }
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/100"))
+            .and(body_json(["1234", "5678"]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let validator_indices = vec!["1234".to_string(), "5678".to_string()];
+        let result = client.get_attester_duties(100, &validator_indices).await.unwrap();
+
+        assert_eq!(
+            result.dependent_root,
+            "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab"
+        );
+        assert!(!result.execution_optimistic);
+        assert_eq!(result.data.len(), 2);
+        assert_eq!(result.data[0].validator_index, "1234");
+        assert_eq!(result.data[0].slot, "10000");
+        assert_eq!(result.data[1].validator_index, "5678");
+        assert_eq!(result.data[1].slot, "10001");
+    }
+
+    #[tokio::test]
+    async fn test_get_attester_duties_empty_indices() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "dependent_root": "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+            "execution_optimistic": false,
+            "data": []
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/100"))
+            .and(body_json::<Vec<String>>(vec![]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let validator_indices: Vec<String> = vec![];
+        let result = client.get_attester_duties(100, &validator_indices).await.unwrap();
+
+        assert_eq!(
+            result.dependent_root,
+            "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab"
+        );
+        assert!(result.data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_attester_duties_with_execution_optimistic() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "dependent_root": "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+            "execution_optimistic": true,
+            "data": [
+                {
+                    "pubkey": "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a",
+                    "validator_index": "1234",
+                    "committee_index": "1",
+                    "committee_length": "128",
+                    "committees_at_slot": "64",
+                    "validator_committee_index": "25",
+                    "slot": "10000"
+                }
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/200"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let validator_indices = vec!["1234".to_string()];
+        let result = client.get_attester_duties(200, &validator_indices).await.unwrap();
+
+        assert!(result.execution_optimistic);
+    }
+
+    #[tokio::test]
+    async fn test_get_attester_duties_api_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/999"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid epoch"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let validator_indices = vec!["1234".to_string()];
+        let result = client.get_attester_duties(999, &validator_indices).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert_eq!(message, "Invalid epoch");
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_attester_duties_server_error_with_retry() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/100"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(2)
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+
+        let response_body = serde_json::json!({
+            "dependent_root": "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+            "execution_optimistic": false,
+            "data": []
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1));
+        let client = BeaconClient::new(config).unwrap();
+
+        let validator_indices: Vec<String> = vec![];
+        let result = client.get_attester_duties(100, &validator_indices).await.unwrap();
+
+        assert_eq!(
+            result.dependent_root,
+            "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_attester_duties_dependent_root_changes() {
+        let mock_server = MockServer::start().await;
+
+        let response_body_1 = serde_json::json!({
+            "dependent_root": "0xroot_a_1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a",
+                "validator_index": "1234",
+                "committee_index": "1",
+                "committee_length": "128",
+                "committees_at_slot": "64",
+                "validator_committee_index": "25",
+                "slot": "10000"
+            }]
+        });
+
+        let response_body_2 = serde_json::json!({
+            "dependent_root": "0xroot_b_1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a",
+                "validator_index": "1234",
+                "committee_index": "2",
+                "committee_length": "128",
+                "committees_at_slot": "64",
+                "validator_committee_index": "30",
+                "slot": "10001"
+            }]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body_1))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/100"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body_2))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let validator_indices = vec!["1234".to_string()];
+
+        let result_1 = client.get_attester_duties(100, &validator_indices).await.unwrap();
+        let result_2 = client.get_attester_duties(100, &validator_indices).await.unwrap();
+
+        assert_ne!(result_1.dependent_root, result_2.dependent_root);
+        assert_eq!(
+            result_1.dependent_root,
+            "0xroot_a_1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        );
+        assert_eq!(
+            result_2.dependent_root,
+            "0xroot_b_1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_data_success() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "data": {
+                "slot": "1000",
+                "index": "1",
+                "beacon_block_root": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                "source": {
+                    "epoch": "100",
+                    "root": "0x1111111111111111111111111111111111111111111111111111111111111111"
+                },
+                "target": {
+                    "epoch": "101",
+                    "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                }
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(wiremock::matchers::query_param("slot", "1000"))
+            .and(wiremock::matchers::query_param("committee_index", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_attestation_data(1000, 1).await.unwrap();
+
+        assert_eq!(result.data.slot, "1000");
+        assert_eq!(result.data.index, "1");
+        assert_eq!(
+            result.data.beacon_block_root,
+            "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+        );
+        assert_eq!(result.data.source.epoch, "100");
+        assert_eq!(result.data.target.epoch, "101");
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_data_different_committee_index() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "data": {
+                "slot": "2000",
+                "index": "5",
+                "beacon_block_root": "0xdeadbeef1234567890abcdef1234567890abcdef1234567890abcdef12345678",
+                "source": {
+                    "epoch": "200",
+                    "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                },
+                "target": {
+                    "epoch": "201",
+                    "root": "0x4444444444444444444444444444444444444444444444444444444444444444"
+                }
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(wiremock::matchers::query_param("slot", "2000"))
+            .and(wiremock::matchers::query_param("committee_index", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_attestation_data(2000, 5).await.unwrap();
+
+        assert_eq!(result.data.slot, "2000");
+        assert_eq!(result.data.index, "5");
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_data_slot_too_early() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_string("Slot requested is in the future"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_attestation_data(999999999, 0).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert!(message.contains("future"));
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_data_slot_in_past() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Slot is in the past"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_attestation_data(1, 0).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert!(message.contains("past"));
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_data_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_string("Attestation data not available for requested slot"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_attestation_data(500, 0).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 404);
+                assert!(message.contains("not available"));
+            }
+            _ => panic!("Expected ApiError with status 404"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_data_server_error_with_retry() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(2)
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+
+        let response_body = serde_json::json!({
+            "data": {
+                "slot": "1000",
+                "index": "0",
+                "beacon_block_root": "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+                "source": {
+                    "epoch": "100",
+                    "root": "0x1111111111111111111111111111111111111111111111111111111111111111"
+                },
+                "target": {
+                    "epoch": "101",
+                    "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                }
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1));
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_attestation_data(1000, 0).await.unwrap();
+
+        assert_eq!(result.data.slot, "1000");
+    }
+
+    #[tokio::test]
+    async fn test_get_attestation_data_beacon_syncing() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Beacon node is syncing"))
+            .expect(4)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1));
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_attestation_data(1000, 0).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 503);
+                assert!(message.contains("syncing"));
+            }
+            _ => panic!("Expected ApiError with status 503"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/pool/attestations"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let attestation = crate::types::Attestation {
+            aggregation_bits: "0x01".to_string(),
+            data: crate::types::AttestationData {
+                slot: "1000".to_string(),
+                index: "1".to_string(),
+                beacon_block_root:
+                    "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string(),
+                source: crate::types::Checkpoint {
+                    epoch: "100".to_string(),
+                    root: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                        .to_string(),
+                },
+                target: crate::types::Checkpoint {
+                    epoch: "101".to_string(),
+                    root: "0x2222222222222222222222222222222222222222222222222222222222222222"
+                        .to_string(),
+                },
+            },
+            signature: "0xsignature".to_string(),
+        };
+
+        let result = client.submit_attestation(&[attestation]).await.unwrap();
+        assert!(result.is_success());
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_invalid_attestation() {
+        let mock_server = MockServer::start().await;
+
+        let error_response = serde_json::json!({
+            "code": 400,
+            "message": "Invalid attestation",
+            "failures": [
+                {
+                    "index": 0,
+                    "message": "Invalid signature"
+                }
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/pool/attestations"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(&error_response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let attestation = crate::types::Attestation {
+            aggregation_bits: "0x01".to_string(),
+            data: crate::types::AttestationData {
+                slot: "1000".to_string(),
+                index: "1".to_string(),
+                beacon_block_root: "0xabcdef".to_string(),
+                source: crate::types::Checkpoint {
+                    epoch: "100".to_string(),
+                    root: "0x1111".to_string(),
+                },
+                target: crate::types::Checkpoint {
+                    epoch: "101".to_string(),
+                    root: "0x2222".to_string(),
+                },
+            },
+            signature: "0xinvalid".to_string(),
+        };
+
+        let result = client.submit_attestation(&[attestation]).await.unwrap();
+        assert!(!result.is_success());
+        assert_eq!(result.failures().len(), 1);
+        assert_eq!(result.failures()[0].index, 0);
+        assert!(result.failures()[0].message.contains("Invalid signature"));
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_server_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/pool/attestations"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .expect(4)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1));
+        let client = BeaconClient::new(config).unwrap();
+
+        let attestation = crate::types::Attestation {
+            aggregation_bits: "0x01".to_string(),
+            data: crate::types::AttestationData {
+                slot: "1000".to_string(),
+                index: "1".to_string(),
+                beacon_block_root: "0xabcdef".to_string(),
+                source: crate::types::Checkpoint {
+                    epoch: "100".to_string(),
+                    root: "0x1111".to_string(),
+                },
+                target: crate::types::Checkpoint {
+                    epoch: "101".to_string(),
+                    root: "0x2222".to_string(),
+                },
+            },
+            signature: "0xsignature".to_string(),
+        };
+
+        let result = client.submit_attestation(&[attestation]).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, .. }) => {
+                assert_eq!(status, 500);
+            }
+            _ => panic!("Expected ApiError with status 500"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_multiple_attestations() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/pool/attestations"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let attestation1 = crate::types::Attestation {
+            aggregation_bits: "0x01".to_string(),
+            data: crate::types::AttestationData {
+                slot: "1000".to_string(),
+                index: "1".to_string(),
+                beacon_block_root: "0xabcdef".to_string(),
+                source: crate::types::Checkpoint {
+                    epoch: "100".to_string(),
+                    root: "0x1111".to_string(),
+                },
+                target: crate::types::Checkpoint {
+                    epoch: "101".to_string(),
+                    root: "0x2222".to_string(),
+                },
+            },
+            signature: "0xsignature1".to_string(),
+        };
+
+        let attestation2 = crate::types::Attestation {
+            aggregation_bits: "0x02".to_string(),
+            data: crate::types::AttestationData {
+                slot: "1000".to_string(),
+                index: "2".to_string(),
+                beacon_block_root: "0xabcdef".to_string(),
+                source: crate::types::Checkpoint {
+                    epoch: "100".to_string(),
+                    root: "0x1111".to_string(),
+                },
+                target: crate::types::Checkpoint {
+                    epoch: "101".to_string(),
+                    root: "0x2222".to_string(),
+                },
+            },
+            signature: "0xsignature2".to_string(),
+        };
+
+        let result = client.submit_attestation(&[attestation1, attestation2]).await.unwrap();
+        assert!(result.is_success());
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_partial_failure() {
+        let mock_server = MockServer::start().await;
+
+        let error_response = serde_json::json!({
+            "code": 400,
+            "message": "Some attestations failed validation",
+            "failures": [
+                {
+                    "index": 1,
+                    "message": "Invalid signature"
+                }
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/pool/attestations"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(&error_response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let attestation1 = crate::types::Attestation {
+            aggregation_bits: "0x01".to_string(),
+            data: crate::types::AttestationData {
+                slot: "1000".to_string(),
+                index: "1".to_string(),
+                beacon_block_root: "0xabcdef".to_string(),
+                source: crate::types::Checkpoint {
+                    epoch: "100".to_string(),
+                    root: "0x1111".to_string(),
+                },
+                target: crate::types::Checkpoint {
+                    epoch: "101".to_string(),
+                    root: "0x2222".to_string(),
+                },
+            },
+            signature: "0xvalid".to_string(),
+        };
+
+        let attestation2 = crate::types::Attestation {
+            aggregation_bits: "0x02".to_string(),
+            data: crate::types::AttestationData {
+                slot: "1000".to_string(),
+                index: "2".to_string(),
+                beacon_block_root: "0xabcdef".to_string(),
+                source: crate::types::Checkpoint {
+                    epoch: "100".to_string(),
+                    root: "0x1111".to_string(),
+                },
+                target: crate::types::Checkpoint {
+                    epoch: "101".to_string(),
+                    root: "0x2222".to_string(),
+                },
+            },
+            signature: "0xinvalid".to_string(),
+        };
+
+        let result = client.submit_attestation(&[attestation1, attestation2]).await.unwrap();
+        assert!(!result.is_success());
+        assert_eq!(result.failures().len(), 1);
+        assert_eq!(result.failures()[0].index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_empty_array() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/pool/attestations"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let attestations: Vec<crate::types::Attestation> = vec![];
+        let result = client.submit_attestation(&attestations).await.unwrap();
+        assert!(result.is_success());
     }
 }

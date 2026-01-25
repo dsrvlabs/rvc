@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::beacon::BeaconError;
+use beacon_client::BeaconError;
 
 #[derive(Error, Debug)]
 pub enum DutyTrackerError {

@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use tracing::info;
 
-use crate::beacon::{BeaconClient, BeaconClientConfig};
 use crate::crypto::{Fork, KeyManager, PublicKey, Root};
 use crate::duty_tracker::DutyTracker;
 use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle};
@@ -17,6 +16,7 @@ use crate::propagator::{AttestationSubmitter, Propagator};
 use crate::signer::SignerService;
 use crate::slashing::SlashingDb;
 use crate::timing::{SlotClock, SystemSlotClock};
+use beacon_client::{BeaconClient, BeaconClientConfig};
 
 use super::error::ConfigError;
 use super::types::Config;

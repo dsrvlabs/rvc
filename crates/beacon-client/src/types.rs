@@ -61,6 +61,39 @@ pub struct DependentRootResponse<T> {
     pub data: T,
 }
 
+/// Response type for attester duties endpoint.
+pub type AttesterDutiesResponse = DependentRootResponse<Vec<AttesterDuty>>;
+
+/// Response type for attestation data endpoint.
+pub type AttestationDataResponse = DataResponse<AttestationData>;
+
+/// Error details for a single attestation that failed validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedAttestationError {
+    pub index: u32,
+    pub message: String,
+}
+
+/// Result of submitting attestations to the beacon node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitAttestationResult {
+    Success,
+    PartialFailure { failures: Vec<IndexedAttestationError> },
+}
+
+impl SubmitAttestationResult {
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success)
+    }
+
+    pub fn failures(&self) -> &[IndexedAttestationError] {
+        match self {
+            Self::Success => &[],
+            Self::PartialFailure { failures } => failures,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +246,41 @@ mod tests {
         assert!(!response.execution_optimistic);
         assert_eq!(response.data.len(), 1);
         assert_eq!(response.data[0].validator_index, "1");
+    }
+
+    #[test]
+    fn test_indexed_attestation_error_deserialize() {
+        let json = r#"{
+            "index": 0,
+            "message": "Invalid signature"
+        }"#;
+
+        let error: IndexedAttestationError = serde_json::from_str(json).unwrap();
+        assert_eq!(error.index, 0);
+        assert_eq!(error.message, "Invalid signature");
+    }
+
+    #[test]
+    fn test_submit_attestation_result_success() {
+        let result = SubmitAttestationResult::Success;
+        assert!(result.is_success());
+        assert!(result.failures().is_empty());
+    }
+
+    #[test]
+    fn test_submit_attestation_result_partial_failure() {
+        let result = SubmitAttestationResult::PartialFailure {
+            failures: vec![
+                IndexedAttestationError { index: 0, message: "Invalid signature".to_string() },
+                IndexedAttestationError {
+                    index: 2,
+                    message: "Attestation already known".to_string(),
+                },
+            ],
+        };
+        assert!(!result.is_success());
+        assert_eq!(result.failures().len(), 2);
+        assert_eq!(result.failures()[0].index, 0);
+        assert_eq!(result.failures()[1].index, 2);
     }
 }

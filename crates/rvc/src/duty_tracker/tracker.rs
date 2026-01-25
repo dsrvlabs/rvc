@@ -4,8 +4,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::beacon::{AttesterDuty, BeaconClient};
 use crate::metrics::definitions::RVC_DUTIES_FETCHED_TOTAL;
+use beacon_client::{AttesterDuty, BeaconClient};
 
 use super::error::DutyTrackerError;
 
@@ -193,7 +193,7 @@ mod tests {
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use crate::beacon::BeaconClientConfig;
+    use beacon_client::BeaconClientConfig;
 
     use super::*;
 

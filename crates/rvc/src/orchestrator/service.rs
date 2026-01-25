@@ -7,7 +7,6 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::beacon::{Attestation, AttesterDuty, BeaconClient};
 use crate::crypto::{Fork, PublicKey, Root, Slot};
 use crate::duty_tracker::DutyTracker;
 use crate::metrics::definitions::{
@@ -18,6 +17,7 @@ use crate::metrics::definitions::{
 use crate::propagator::{AttestationSubmitter, Propagator};
 use crate::signer::SignerService;
 use crate::timing::{SlotClock, SLOTS_PER_EPOCH};
+use beacon_client::{Attestation, AttesterDuty, BeaconClient};
 
 use super::error::OrchestratorError;
 
@@ -524,7 +524,7 @@ where
     }
 
     fn convert_attestation_data(
-        beacon_data: &crate::beacon::AttestationData,
+        beacon_data: &beacon_client::AttestationData,
     ) -> Result<crate::crypto::AttestationData, OrchestratorError> {
         let slot: u64 = beacon_data
             .slot
@@ -609,10 +609,10 @@ where
 #[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
-    use crate::beacon::BeaconClientConfig;
     use crate::crypto::{KeyManager, SecretKey};
     use crate::slashing::SlashingDb;
     use crate::timing::MockSlotClock;
+    use beacon_client::BeaconClientConfig;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -663,8 +663,8 @@ mod tests {
             Box<
                 dyn Future<
                         Output = Result<
-                            crate::beacon::SubmitAttestationResult,
-                            crate::beacon::BeaconError,
+                            beacon_client::SubmitAttestationResult,
+                            beacon_client::BeaconError,
                         >,
                     > + Send
                     + 'a,
@@ -674,9 +674,9 @@ mod tests {
             let should_succeed = self.should_succeed.load(Ordering::SeqCst);
             Box::pin(async move {
                 if should_succeed {
-                    Ok(crate::beacon::SubmitAttestationResult::Success)
+                    Ok(beacon_client::SubmitAttestationResult::Success)
                 } else {
-                    Err(crate::beacon::BeaconError::Timeout)
+                    Err(beacon_client::BeaconError::Timeout)
                 }
             })
         }
@@ -750,17 +750,17 @@ mod tests {
 
     #[test]
     fn test_convert_attestation_data_success() {
-        let beacon_data = crate::beacon::AttestationData {
+        let beacon_data = beacon_client::AttestationData {
             slot: "1000".to_string(),
             index: "5".to_string(),
             beacon_block_root: "0x1111111111111111111111111111111111111111111111111111111111111111"
                 .to_string(),
-            source: crate::beacon::Checkpoint {
+            source: beacon_client::Checkpoint {
                 epoch: "100".to_string(),
                 root: "0x2222222222222222222222222222222222222222222222222222222222222222"
                     .to_string(),
             },
-            target: crate::beacon::Checkpoint {
+            target: beacon_client::Checkpoint {
                 epoch: "101".to_string(),
                 root: "0x3333333333333333333333333333333333333333333333333333333333333333"
                     .to_string(),
@@ -784,17 +784,17 @@ mod tests {
 
     #[test]
     fn test_convert_attestation_data_invalid_slot() {
-        let beacon_data = crate::beacon::AttestationData {
+        let beacon_data = beacon_client::AttestationData {
             slot: "invalid".to_string(),
             index: "5".to_string(),
             beacon_block_root: "0x1111111111111111111111111111111111111111111111111111111111111111"
                 .to_string(),
-            source: crate::beacon::Checkpoint {
+            source: beacon_client::Checkpoint {
                 epoch: "100".to_string(),
                 root: "0x2222222222222222222222222222222222222222222222222222222222222222"
                     .to_string(),
             },
-            target: crate::beacon::Checkpoint {
+            target: beacon_client::Checkpoint {
                 epoch: "101".to_string(),
                 root: "0x3333333333333333333333333333333333333333333333333333333333333333"
                     .to_string(),
