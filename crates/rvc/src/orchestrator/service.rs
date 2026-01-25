@@ -328,10 +328,8 @@ where
 
     /// Normalizes a pubkey to lowercase without 0x/0X prefix for comparison.
     fn normalize_pubkey(pubkey: &str) -> String {
-        let without_prefix = pubkey
-            .strip_prefix("0x")
-            .or_else(|| pubkey.strip_prefix("0X"))
-            .unwrap_or(pubkey);
+        let without_prefix =
+            pubkey.strip_prefix("0x").or_else(|| pubkey.strip_prefix("0X")).unwrap_or(pubkey);
         without_prefix.to_lowercase()
     }
 
