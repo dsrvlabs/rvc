@@ -5,7 +5,10 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use super::error::{AttestationSlashingViolation, SlashingError};
-use super::types::{SignedAttestation, SignedBlock};
+use super::types::{
+    InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata,
+    SignedAttestation, SignedBlock, ValidatorRecord,
+};
 use crate::crypto::Epoch;
 
 /// SQLite-backed database for storing slashing protection data.
@@ -207,6 +210,125 @@ impl SlashingDb {
             }
         }
 
+        Ok(())
+    }
+
+    fn get_all_pubkeys(&self) -> Result<Vec<String>, SlashingError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT pubkey FROM attestations
+             UNION
+             SELECT DISTINCT pubkey FROM blocks",
+        )?;
+
+        let rows = stmt.query_map([], |row| row.get(0))?;
+
+        let mut pubkeys = Vec::new();
+        for row in rows {
+            pubkeys.push(row?);
+        }
+        Ok(pubkeys)
+    }
+
+    pub fn export(
+        &self,
+        genesis_validators_root: &str,
+    ) -> Result<InterchangeFormat, SlashingError> {
+        let pubkeys = self.get_all_pubkeys()?;
+
+        let mut data = Vec::new();
+        for pubkey in pubkeys {
+            let attestations = self.get_attestations(&pubkey)?;
+            let blocks = self.get_blocks(&pubkey)?;
+
+            let signed_attestations: Vec<InterchangeAttestation> = attestations
+                .into_iter()
+                .map(|a| InterchangeAttestation {
+                    source_epoch: a.source_epoch.to_string(),
+                    target_epoch: a.target_epoch.to_string(),
+                    signing_root: a.signing_root,
+                })
+                .collect();
+
+            let signed_blocks: Vec<InterchangeBlock> = blocks
+                .into_iter()
+                .map(|b| InterchangeBlock {
+                    slot: b.slot.to_string(),
+                    signing_root: b.signing_root,
+                })
+                .collect();
+
+            data.push(ValidatorRecord { pubkey, signed_blocks, signed_attestations });
+        }
+
+        Ok(InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_validators_root.to_string(),
+            },
+            data,
+        })
+    }
+
+    pub fn import(
+        &self,
+        interchange: &InterchangeFormat,
+        expected_genesis_validators_root: &str,
+    ) -> Result<(), SlashingError> {
+        if interchange.metadata.genesis_validators_root != expected_genesis_validators_root {
+            return Err(SlashingError::GenesisValidatorsRootMismatch {
+                expected: expected_genesis_validators_root.to_string(),
+                actual: interchange.metadata.genesis_validators_root.clone(),
+            });
+        }
+
+        for validator in &interchange.data {
+            for attestation in &validator.signed_attestations {
+                let source_epoch: Epoch = attestation.source_epoch.parse().map_err(|_| {
+                    SlashingError::InvalidInterchangeFormat(format!(
+                        "invalid source_epoch: {}",
+                        attestation.source_epoch
+                    ))
+                })?;
+
+                let target_epoch: Epoch = attestation.target_epoch.parse().map_err(|_| {
+                    SlashingError::InvalidInterchangeFormat(format!(
+                        "invalid target_epoch: {}",
+                        attestation.target_epoch
+                    ))
+                })?;
+
+                self.record_attestation(
+                    &validator.pubkey,
+                    source_epoch,
+                    target_epoch,
+                    attestation.signing_root.clone(),
+                )?;
+            }
+
+            for block in &validator.signed_blocks {
+                let slot: u64 = block.slot.parse().map_err(|_| {
+                    SlashingError::InvalidInterchangeFormat(format!("invalid slot: {}", block.slot))
+                })?;
+
+                let signed_block = SignedBlock {
+                    pubkey: validator.pubkey.clone(),
+                    slot,
+                    signing_root: block.signing_root.clone(),
+                };
+
+                self.record_block(&signed_block)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn record_block(&self, block: &SignedBlock) -> Result<(), SlashingError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO blocks (pubkey, slot, signing_root)
+             VALUES (?1, ?2, ?3)",
+            (&block.pubkey, block.slot as i64, &block.signing_root),
+        )?;
         Ok(())
     }
 }
@@ -795,6 +917,315 @@ mod tests {
         // New: source=4, target=21 - surrounds both
         let result = db.is_safe_to_sign("0x1234", 4, 21);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_export_empty_db() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        let interchange = db.export(genesis_root).expect("export should succeed");
+
+        assert_eq!(interchange.metadata.interchange_format_version, "5");
+        assert_eq!(interchange.metadata.genesis_validators_root, genesis_root);
+        assert!(interchange.data.is_empty());
+    }
+
+    #[test]
+    fn test_export_with_attestations() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+        db.record_attestation(pubkey, 100, 101, Some("0xabcd".to_string()))
+            .expect("record should succeed");
+        db.record_attestation(pubkey, 101, 102, None).expect("record should succeed");
+
+        let interchange = db.export(genesis_root).expect("export should succeed");
+
+        assert_eq!(interchange.data.len(), 1);
+        let validator = &interchange.data[0];
+        assert_eq!(validator.pubkey, pubkey);
+        assert_eq!(validator.signed_attestations.len(), 2);
+        assert_eq!(validator.signed_attestations[0].source_epoch, "100");
+        assert_eq!(validator.signed_attestations[0].target_epoch, "101");
+        assert_eq!(validator.signed_attestations[0].signing_root, Some("0xabcd".to_string()));
+        assert_eq!(validator.signed_attestations[1].source_epoch, "101");
+        assert_eq!(validator.signed_attestations[1].target_epoch, "102");
+        assert!(validator.signed_attestations[1].signing_root.is_none());
+    }
+
+    #[test]
+    fn test_export_with_blocks() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+        let block = SignedBlock {
+            pubkey: pubkey.to_string(),
+            slot: 1000,
+            signing_root: Some("0xefgh".to_string()),
+        };
+        db.insert_block(&block).expect("insert should succeed");
+
+        let interchange = db.export(genesis_root).expect("export should succeed");
+
+        assert_eq!(interchange.data.len(), 1);
+        let validator = &interchange.data[0];
+        assert_eq!(validator.pubkey, pubkey);
+        assert_eq!(validator.signed_blocks.len(), 1);
+        assert_eq!(validator.signed_blocks[0].slot, "1000");
+        assert_eq!(validator.signed_blocks[0].signing_root, Some("0xefgh".to_string()));
+    }
+
+    #[test]
+    fn test_export_multiple_validators() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        let pubkey1 = "0x1111";
+        let pubkey2 = "0x2222";
+
+        db.record_attestation(pubkey1, 100, 101, None).expect("record should succeed");
+        db.record_attestation(pubkey2, 200, 201, None).expect("record should succeed");
+
+        let interchange = db.export(genesis_root).expect("export should succeed");
+
+        assert_eq!(interchange.data.len(), 2);
+    }
+
+    #[test]
+    fn test_import_empty_interchange() {
+        use super::super::types::{InterchangeFormat, InterchangeMetadata};
+
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data: vec![],
+        };
+
+        let result = db.import(&interchange, genesis_root);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_import_genesis_root_mismatch() {
+        use super::super::types::{InterchangeFormat, InterchangeMetadata};
+
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let expected_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let actual_root = "0xdifferent00000000000000000000000000000000000000000000000000000000";
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: actual_root.to_string(),
+            },
+            data: vec![],
+        };
+
+        let result = db.import(&interchange, expected_root);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            SlashingError::GenesisValidatorsRootMismatch { expected, actual } => {
+                assert_eq!(expected, expected_root);
+                assert_eq!(actual, actual_root);
+            }
+            _ => panic!("expected GenesisValidatorsRootMismatch error"),
+        }
+    }
+
+    #[test]
+    fn test_import_with_attestations() {
+        use super::super::types::{
+            InterchangeAttestation, InterchangeFormat, InterchangeMetadata, ValidatorRecord,
+        };
+
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data: vec![ValidatorRecord {
+                pubkey: pubkey.to_string(),
+                signed_blocks: vec![],
+                signed_attestations: vec![
+                    InterchangeAttestation {
+                        source_epoch: "100".to_string(),
+                        target_epoch: "101".to_string(),
+                        signing_root: Some("0xabcd".to_string()),
+                    },
+                    InterchangeAttestation {
+                        source_epoch: "101".to_string(),
+                        target_epoch: "102".to_string(),
+                        signing_root: None,
+                    },
+                ],
+            }],
+        };
+
+        db.import(&interchange, genesis_root).expect("import should succeed");
+
+        let attestations = db.get_attestations(pubkey).expect("get should succeed");
+        assert_eq!(attestations.len(), 2);
+        assert_eq!(attestations[0].source_epoch, 100);
+        assert_eq!(attestations[0].target_epoch, 101);
+        assert_eq!(attestations[0].signing_root, Some("0xabcd".to_string()));
+        assert_eq!(attestations[1].source_epoch, 101);
+        assert_eq!(attestations[1].target_epoch, 102);
+        assert!(attestations[1].signing_root.is_none());
+    }
+
+    #[test]
+    fn test_import_with_blocks() {
+        use super::super::types::{
+            InterchangeBlock, InterchangeFormat, InterchangeMetadata, ValidatorRecord,
+        };
+
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data: vec![ValidatorRecord {
+                pubkey: pubkey.to_string(),
+                signed_blocks: vec![InterchangeBlock {
+                    slot: "1000".to_string(),
+                    signing_root: Some("0xefgh".to_string()),
+                }],
+                signed_attestations: vec![],
+            }],
+        };
+
+        db.import(&interchange, genesis_root).expect("import should succeed");
+
+        let blocks = db.get_blocks(pubkey).expect("get should succeed");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].slot, 1000);
+        assert_eq!(blocks[0].signing_root, Some("0xefgh".to_string()));
+    }
+
+    #[test]
+    fn test_roundtrip_export_import() {
+        use super::super::types::InterchangeFormat;
+
+        let db1 = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+
+        db1.record_attestation(pubkey, 100, 101, Some("0xabcd".to_string()))
+            .expect("record should succeed");
+        db1.record_attestation(pubkey, 101, 102, None).expect("record should succeed");
+
+        let block = SignedBlock {
+            pubkey: pubkey.to_string(),
+            slot: 1000,
+            signing_root: Some("0xefgh".to_string()),
+        };
+        db1.insert_block(&block).expect("insert should succeed");
+
+        let interchange = db1.export(genesis_root).expect("export should succeed");
+
+        let json =
+            serde_json::to_string_pretty(&interchange).expect("serialization should succeed");
+        let parsed: InterchangeFormat =
+            serde_json::from_str(&json).expect("deserialization should succeed");
+
+        let db2 = SlashingDb::open_in_memory().expect("failed to open db");
+        db2.import(&parsed, genesis_root).expect("import should succeed");
+
+        let attestations = db2.get_attestations(pubkey).expect("get should succeed");
+        assert_eq!(attestations.len(), 2);
+        assert_eq!(attestations[0].source_epoch, 100);
+        assert_eq!(attestations[0].target_epoch, 101);
+        assert_eq!(attestations[1].source_epoch, 101);
+        assert_eq!(attestations[1].target_epoch, 102);
+
+        let blocks = db2.get_blocks(pubkey).expect("get should succeed");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].slot, 1000);
+    }
+
+    #[test]
+    fn test_import_idempotent() {
+        use super::super::types::{
+            InterchangeAttestation, InterchangeFormat, InterchangeMetadata, ValidatorRecord,
+        };
+
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data: vec![ValidatorRecord {
+                pubkey: pubkey.to_string(),
+                signed_blocks: vec![],
+                signed_attestations: vec![InterchangeAttestation {
+                    source_epoch: "100".to_string(),
+                    target_epoch: "101".to_string(),
+                    signing_root: None,
+                }],
+            }],
+        };
+
+        db.import(&interchange, genesis_root).expect("first import should succeed");
+        db.import(&interchange, genesis_root).expect("second import should succeed");
+
+        let attestations = db.get_attestations(pubkey).expect("get should succeed");
+        assert_eq!(attestations.len(), 1);
+    }
+
+    #[test]
+    fn test_import_invalid_epoch_format() {
+        use super::super::types::{
+            InterchangeAttestation, InterchangeFormat, InterchangeMetadata, ValidatorRecord,
+        };
+
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data: vec![ValidatorRecord {
+                pubkey: pubkey.to_string(),
+                signed_blocks: vec![],
+                signed_attestations: vec![InterchangeAttestation {
+                    source_epoch: "not_a_number".to_string(),
+                    target_epoch: "101".to_string(),
+                    signing_root: None,
+                }],
+            }],
+        };
+
+        let result = db.import(&interchange, genesis_root);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            SlashingError::InvalidInterchangeFormat(_) => {}
+            _ => panic!("expected InvalidInterchangeFormat error"),
+        }
     }
 
     #[test]
