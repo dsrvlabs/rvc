@@ -10,14 +10,19 @@ use tracing::{debug, error, info, warn};
 use crate::beacon::{Attestation, AttesterDuty, BeaconClient};
 use crate::crypto::{Fork, PublicKey, Root, Slot};
 use crate::duty_tracker::DutyTracker;
-use crate::metrics::definitions::{attestation_status, RVC_ATTESTATIONS_TOTAL};
+use crate::metrics::definitions::{
+    attestation_status, orchestrator_result, RVC_ATTESTATIONS_TOTAL,
+    RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
+    RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL, RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
+};
 use crate::propagator::{AttestationSubmitter, Propagator};
 use crate::signer::SignerService;
-use crate::timing::SlotClock;
+use crate::timing::{SlotClock, SLOTS_PER_EPOCH};
 
 use super::error::OrchestratorError;
 
-const SLOTS_PER_EPOCH: u64 = 32;
+/// Default timeout for beacon client API calls in seconds.
+const BEACON_CALL_TIMEOUT_SECS: u64 = 4;
 
 /// Configuration for the duty orchestrator.
 #[derive(Clone)]
@@ -44,7 +49,11 @@ pub struct OrchestratorHandle {
 }
 
 impl OrchestratorHandle {
-    /// Signal the orchestrator to shut down gracefully.
+    /// Signals the orchestrator to shut down gracefully.
+    ///
+    /// The orchestrator will complete processing of the current slot (if any)
+    /// before stopping. The signal is delivered via a watch channel, ensuring
+    /// the orchestrator receives it even if waiting for the next slot.
     pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
     }
@@ -204,15 +213,23 @@ where
     }
 
     /// Processes all attestation duties for a given slot.
+    ///
+    /// Validators are processed sequentially within each slot to work with
+    /// the non-Send/Sync `SlashingDb`. For high validator counts, consider
+    /// making `SlashingDb` thread-safe with proper locking for concurrent processing.
     pub async fn process_slot(
         &self,
         slot: Slot,
     ) -> Result<Vec<AttestationResult>, OrchestratorError> {
+        let _timer =
+            RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS.with_label_values(&[]).start_timer();
+
         info!(slot = slot, "Processing attestation duties for slot");
 
         let current_slot = self.clock.current_slot()?;
 
         if current_slot > slot {
+            RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL.with_label_values(&[]).inc();
             return Err(OrchestratorError::SlotMissed { slot, current_slot });
         }
 
@@ -220,10 +237,14 @@ where
 
         if duties.is_empty() {
             debug!(slot = slot, "No attestation duties for this slot");
+            RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL
+                .with_label_values(&[orchestrator_result::NO_DUTIES])
+                .inc();
             return Err(OrchestratorError::NoDutiesForSlot { slot });
         }
 
         info!(slot = slot, duty_count = duties.len(), "Found attestation duties");
+        RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS.set(duties.len() as f64);
 
         let mut results = Vec::new();
 
@@ -247,8 +268,20 @@ where
             results.push(result);
         }
 
+        RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS.set(0.0);
+
         let success_count = results.iter().filter(|r| r.success).count();
         let failure_count = results.len() - success_count;
+
+        if failure_count > 0 {
+            RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL
+                .with_label_values(&[orchestrator_result::FAILED])
+                .inc();
+        } else {
+            RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL
+                .with_label_values(&[orchestrator_result::SUCCESS])
+                .inc();
+        }
 
         info!(
             slot = slot,
@@ -275,15 +308,17 @@ where
             self.duty_tracker.fetch_duties_for_epoch(epoch).await?;
         }
 
+        // Normalize all pubkeys to lowercase without 0x prefix for efficient lookup
+        let normalized_pubkeys: std::collections::HashSet<String> =
+            self.pubkey_map.keys().map(|k| Self::normalize_pubkey(k)).collect();
+
         let mut duties = Vec::new();
-        for pubkey_hex in self.pubkey_map.keys() {
-            for committee_index in 0..64 {
-                if let Ok(duty) = self.duty_tracker.get_duty(slot, committee_index).await {
-                    if duty.pubkey.to_lowercase().contains(&pubkey_hex.to_lowercase()[2..])
-                        || pubkey_hex.to_lowercase().contains(&duty.pubkey.to_lowercase()[2..])
-                    {
-                        duties.push(duty);
-                    }
+        // Check a reasonable range of committee indices (typical max is 64 per slot)
+        for committee_index in 0..64 {
+            if let Ok(duty) = self.duty_tracker.get_duty(slot, committee_index).await {
+                let normalized_duty_pubkey = Self::normalize_pubkey(&duty.pubkey);
+                if normalized_pubkeys.contains(&normalized_duty_pubkey) {
+                    duties.push(duty);
                 }
             }
         }
@@ -291,10 +326,44 @@ where
         Ok(duties)
     }
 
+    /// Normalizes a pubkey to lowercase without 0x/0X prefix for comparison.
+    fn normalize_pubkey(pubkey: &str) -> String {
+        let without_prefix = pubkey
+            .strip_prefix("0x")
+            .or_else(|| pubkey.strip_prefix("0X"))
+            .unwrap_or(pubkey);
+        without_prefix.to_lowercase()
+    }
+
     async fn process_attestation_duty(&self, duty: AttesterDuty) -> AttestationResult {
-        let slot: Slot = duty.slot.parse().unwrap_or(0);
-        let committee_index: u64 = duty.committee_index.parse().unwrap_or(0);
         let validator_index = duty.validator_index.clone();
+
+        let slot: Slot = match duty.slot.parse() {
+            Ok(s) => s,
+            Err(_) => {
+                return AttestationResult {
+                    validator_index,
+                    slot: 0,
+                    success: false,
+                    error: Some(format!("Invalid slot in duty: {}", duty.slot)),
+                };
+            }
+        };
+
+        let committee_index: u64 = match duty.committee_index.parse() {
+            Ok(c) => c,
+            Err(_) => {
+                return AttestationResult {
+                    validator_index,
+                    slot,
+                    success: false,
+                    error: Some(format!(
+                        "Invalid committee_index in duty: {}",
+                        duty.committee_index
+                    )),
+                };
+            }
+        };
 
         debug!(
             validator = %validator_index,
@@ -315,18 +384,32 @@ where
             }
         };
 
-        let attestation_data_response =
-            match self.beacon_client.get_attestation_data(slot, committee_index).await {
-                Ok(response) => response,
-                Err(e) => {
-                    return AttestationResult {
-                        validator_index,
-                        slot,
-                        success: false,
-                        error: Some(format!("Failed to get attestation data: {}", e)),
-                    };
-                }
-            };
+        // Apply timeout to beacon client call to prevent blocking
+        let attestation_data_result = tokio::time::timeout(
+            Duration::from_secs(BEACON_CALL_TIMEOUT_SECS),
+            self.beacon_client.get_attestation_data(slot, committee_index),
+        )
+        .await;
+
+        let attestation_data_response = match attestation_data_result {
+            Ok(Ok(response)) => response,
+            Ok(Err(e)) => {
+                return AttestationResult {
+                    validator_index,
+                    slot,
+                    success: false,
+                    error: Some(format!("Failed to get attestation data: {}", e)),
+                };
+            }
+            Err(_) => {
+                return AttestationResult {
+                    validator_index,
+                    slot,
+                    success: false,
+                    error: Some("Timeout getting attestation data from beacon node".to_string()),
+                };
+            }
+        };
 
         let beacon_attestation_data = attestation_data_response.data;
 
@@ -360,8 +443,35 @@ where
             }
         };
 
-        let committee_length: u64 = duty.committee_length.parse().unwrap_or(128);
-        let validator_committee_index: u64 = duty.validator_committee_index.parse().unwrap_or(0);
+        let committee_length: u64 = match duty.committee_length.parse() {
+            Ok(c) => c,
+            Err(_) => {
+                return AttestationResult {
+                    validator_index,
+                    slot,
+                    success: false,
+                    error: Some(format!(
+                        "Invalid committee_length in duty: {}",
+                        duty.committee_length
+                    )),
+                };
+            }
+        };
+
+        let validator_committee_index: u64 = match duty.validator_committee_index.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                return AttestationResult {
+                    validator_index,
+                    slot,
+                    success: false,
+                    error: Some(format!(
+                        "Invalid validator_committee_index in duty: {}",
+                        duty.validator_committee_index
+                    )),
+                };
+            }
+        };
 
         let aggregation_bits =
             Self::create_aggregation_bits(committee_length, validator_committee_index);
@@ -383,11 +493,16 @@ where
         }
     }
 
+    /// Finds a public key by matching against duty pubkey.
+    ///
+    /// Pubkeys are matched case-insensitively and with/without "0x" prefix.
     fn find_pubkey(&self, duty_pubkey: &str) -> Option<PublicKey> {
+        // Try exact match first
         if let Some(pk) = self.pubkey_map.get(duty_pubkey) {
             return Some(pk.clone());
         }
 
+        // Try with/without 0x prefix
         let normalized_pubkey = if duty_pubkey.starts_with("0x") {
             duty_pubkey.to_string()
         } else {
@@ -398,10 +513,11 @@ where
             return Some(pk.clone());
         }
 
+        // Normalize for case-insensitive matching
+        let duty_normalized = Self::normalize_pubkey(duty_pubkey);
+
         for (key, pk) in &self.pubkey_map {
-            if key.to_lowercase() == duty_pubkey.to_lowercase()
-                || key.to_lowercase() == normalized_pubkey.to_lowercase()
-            {
+            if Self::normalize_pubkey(key) == duty_normalized {
                 return Some(pk.clone());
             }
         }
@@ -467,6 +583,14 @@ where
         Ok(root)
     }
 
+    /// Creates an SSZ-encoded aggregation bitfield with a single bit set.
+    ///
+    /// The bitfield uses little-endian bit ordering within each byte:
+    /// - Validator 0 sets bit 0 of byte 0 (0x01)
+    /// - Validator 7 sets bit 7 of byte 0 (0x80)
+    /// - Validator 8 sets bit 0 of byte 1 (0x0001)
+    ///
+    /// Returns a hex string with "0x" prefix.
     fn create_aggregation_bits(committee_length: u64, validator_index: u64) -> String {
         let byte_length = committee_length.div_ceil(8);
         let mut bits = vec![0u8; byte_length as usize];
