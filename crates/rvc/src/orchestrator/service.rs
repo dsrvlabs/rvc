@@ -17,7 +17,7 @@ use crate::metrics::definitions::{
 use crate::propagator::{AttestationSubmitter, Propagator};
 use crate::signer::SignerService;
 use crate::timing::{SlotClock, SLOTS_PER_EPOCH};
-use beacon_client::{Attestation, AttesterDuty, BeaconClient};
+use beacon::{Attestation, AttesterDuty, BeaconClient};
 
 use super::error::OrchestratorError;
 
@@ -78,7 +78,7 @@ where
     duty_tracker: Arc<DutyTracker>,
     signer: Arc<SignerService>,
     propagator: Arc<Propagator<S>>,
-    beacon_client: Arc<BeaconClient>,
+    beacon: Arc<BeaconClient>,
     config: OrchestratorConfig,
     pubkey_map: HashMap<String, PublicKey>,
     shutdown_rx: watch::Receiver<bool>,
@@ -95,7 +95,7 @@ where
         duty_tracker: Arc<DutyTracker>,
         signer: Arc<SignerService>,
         propagator: Arc<Propagator<S>>,
-        beacon_client: Arc<BeaconClient>,
+        beacon: Arc<BeaconClient>,
         config: OrchestratorConfig,
         pubkey_map: HashMap<String, PublicKey>,
     ) -> (Self, OrchestratorHandle) {
@@ -106,7 +106,7 @@ where
             duty_tracker,
             signer,
             propagator,
-            beacon_client,
+            beacon,
             config,
             pubkey_map,
             shutdown_rx,
@@ -385,7 +385,7 @@ where
         // Apply timeout to beacon client call to prevent blocking
         let attestation_data_result = tokio::time::timeout(
             Duration::from_secs(BEACON_CALL_TIMEOUT_SECS),
-            self.beacon_client.get_attestation_data(slot, committee_index),
+            self.beacon.get_attestation_data(slot, committee_index),
         )
         .await;
 
@@ -524,7 +524,7 @@ where
     }
 
     fn convert_attestation_data(
-        beacon_data: &beacon_client::AttestationData,
+        beacon_data: &beacon::AttestationData,
     ) -> Result<crate::crypto::AttestationData, OrchestratorError> {
         let slot: u64 = beacon_data
             .slot
@@ -612,7 +612,7 @@ mod tests {
     use crate::crypto::{KeyManager, SecretKey};
     use crate::slashing::SlashingDb;
     use crate::timing::MockSlotClock;
-    use beacon_client::BeaconClientConfig;
+    use beacon::BeaconClientConfig;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -661,12 +661,8 @@ mod tests {
             _attestations: &'a [Attestation],
         ) -> Pin<
             Box<
-                dyn Future<
-                        Output = Result<
-                            beacon_client::SubmitAttestationResult,
-                            beacon_client::BeaconError,
-                        >,
-                    > + Send
+                dyn Future<Output = Result<beacon::SubmitAttestationResult, beacon::BeaconError>>
+                    + Send
                     + 'a,
             >,
         > {
@@ -674,9 +670,9 @@ mod tests {
             let should_succeed = self.should_succeed.load(Ordering::SeqCst);
             Box::pin(async move {
                 if should_succeed {
-                    Ok(beacon_client::SubmitAttestationResult::Success)
+                    Ok(beacon::SubmitAttestationResult::Success)
                 } else {
-                    Err(beacon_client::BeaconError::Timeout)
+                    Err(beacon::BeaconError::Timeout)
                 }
             })
         }
@@ -750,17 +746,17 @@ mod tests {
 
     #[test]
     fn test_convert_attestation_data_success() {
-        let beacon_data = beacon_client::AttestationData {
+        let beacon_data = beacon::AttestationData {
             slot: "1000".to_string(),
             index: "5".to_string(),
             beacon_block_root: "0x1111111111111111111111111111111111111111111111111111111111111111"
                 .to_string(),
-            source: beacon_client::Checkpoint {
+            source: beacon::Checkpoint {
                 epoch: "100".to_string(),
                 root: "0x2222222222222222222222222222222222222222222222222222222222222222"
                     .to_string(),
             },
-            target: beacon_client::Checkpoint {
+            target: beacon::Checkpoint {
                 epoch: "101".to_string(),
                 root: "0x3333333333333333333333333333333333333333333333333333333333333333"
                     .to_string(),
@@ -784,17 +780,17 @@ mod tests {
 
     #[test]
     fn test_convert_attestation_data_invalid_slot() {
-        let beacon_data = beacon_client::AttestationData {
+        let beacon_data = beacon::AttestationData {
             slot: "invalid".to_string(),
             index: "5".to_string(),
             beacon_block_root: "0x1111111111111111111111111111111111111111111111111111111111111111"
                 .to_string(),
-            source: beacon_client::Checkpoint {
+            source: beacon::Checkpoint {
                 epoch: "100".to_string(),
                 root: "0x2222222222222222222222222222222222222222222222222222222222222222"
                     .to_string(),
             },
-            target: beacon_client::Checkpoint {
+            target: beacon::Checkpoint {
                 epoch: "101".to_string(),
                 root: "0x3333333333333333333333333333333333333333333333333333333333333333"
                     .to_string(),
@@ -813,10 +809,9 @@ mod tests {
         clock.set_slot(100);
 
         let beacon_config = BeaconClientConfig::new("http://localhost:5052");
-        let beacon_client = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
 
-        let duty_tracker =
-            Arc::new(DutyTracker::new(beacon_client.clone(), vec!["1234".to_string()]));
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
 
         let key_manager = Arc::new(KeyManager::new());
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
@@ -833,7 +828,7 @@ mod tests {
             duty_tracker,
             signer,
             propagator,
-            beacon_client,
+            beacon,
             config,
             pubkey_map,
         );
@@ -851,9 +846,9 @@ mod tests {
         clock.set_slot(100);
 
         let beacon_config = BeaconClientConfig::new("http://localhost:5052");
-        let beacon_client = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
 
-        let duty_tracker = Arc::new(DutyTracker::new(beacon_client.clone(), vec![]));
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
         let key_manager = Arc::new(KeyManager::new());
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
@@ -870,7 +865,7 @@ mod tests {
             duty_tracker,
             signer,
             propagator,
-            beacon_client,
+            beacon,
             config,
             pubkey_map,
         );
@@ -886,10 +881,9 @@ mod tests {
         clock.set_slot(105);
 
         let beacon_config = BeaconClientConfig::new("http://localhost:5052");
-        let beacon_client = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
 
-        let duty_tracker =
-            Arc::new(DutyTracker::new(beacon_client.clone(), vec!["1234".to_string()]));
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
 
         let key_manager = Arc::new(KeyManager::new());
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
@@ -906,7 +900,7 @@ mod tests {
             duty_tracker,
             signer,
             propagator,
-            beacon_client,
+            beacon,
             config,
             pubkey_map,
         );
@@ -946,14 +940,13 @@ mod tests {
         clock.set_slot(100);
 
         let beacon_config = BeaconClientConfig::new("http://localhost:5052");
-        let beacon_client = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
 
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
         let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
 
-        let duty_tracker =
-            Arc::new(DutyTracker::new(beacon_client.clone(), vec!["1234".to_string()]));
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
 
         let mut key_manager = KeyManager::new();
         key_manager.insert(secret_key);
@@ -974,7 +967,7 @@ mod tests {
             duty_tracker,
             signer,
             propagator,
-            beacon_client,
+            beacon,
             config,
             pubkey_map,
         );
@@ -988,8 +981,8 @@ mod tests {
     async fn test_find_pubkey_exact_match() {
         let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
         let beacon_config = BeaconClientConfig::new("http://localhost:5052");
-        let beacon_client = Arc::new(BeaconClient::new(beacon_config).unwrap());
-        let duty_tracker = Arc::new(DutyTracker::new(beacon_client.clone(), vec![]));
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
         let key_manager = Arc::new(KeyManager::new());
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
@@ -1011,7 +1004,7 @@ mod tests {
             duty_tracker,
             signer,
             propagator,
-            beacon_client,
+            beacon,
             config,
             pubkey_map,
         );
@@ -1025,8 +1018,8 @@ mod tests {
     async fn test_find_pubkey_case_insensitive() {
         let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
         let beacon_config = BeaconClientConfig::new("http://localhost:5052");
-        let beacon_client = Arc::new(BeaconClient::new(beacon_config).unwrap());
-        let duty_tracker = Arc::new(DutyTracker::new(beacon_client.clone(), vec![]));
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
         let key_manager = Arc::new(KeyManager::new());
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
@@ -1048,7 +1041,7 @@ mod tests {
             duty_tracker,
             signer,
             propagator,
-            beacon_client,
+            beacon,
             config,
             pubkey_map,
         );
@@ -1061,8 +1054,8 @@ mod tests {
     async fn test_find_pubkey_not_found() {
         let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
         let beacon_config = BeaconClientConfig::new("http://localhost:5052");
-        let beacon_client = Arc::new(BeaconClient::new(beacon_config).unwrap());
-        let duty_tracker = Arc::new(DutyTracker::new(beacon_client.clone(), vec![]));
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
         let key_manager = Arc::new(KeyManager::new());
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
@@ -1079,7 +1072,7 @@ mod tests {
             duty_tracker,
             signer,
             propagator,
-            beacon_client,
+            beacon,
             config,
             pubkey_map,
         );

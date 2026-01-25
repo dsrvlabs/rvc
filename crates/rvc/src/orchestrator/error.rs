@@ -6,7 +6,7 @@ use crate::duty_tracker::DutyTrackerError;
 use crate::propagator::PropagatorError;
 use crate::signer::SignerError;
 use crate::timing::TimingError;
-use beacon_client::BeaconError;
+use beacon::BeaconError;
 
 /// Errors that can occur during duty orchestration.
 #[derive(Debug, Error)]

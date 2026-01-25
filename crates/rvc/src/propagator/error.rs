@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use beacon_client::BeaconError;
+use beacon::BeaconError;
 
 /// Errors that can occur during attestation propagation.
 #[derive(Error, Debug)]

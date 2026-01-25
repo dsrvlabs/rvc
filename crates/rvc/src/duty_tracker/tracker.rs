@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::metrics::definitions::RVC_DUTIES_FETCHED_TOTAL;
-use beacon_client::{AttesterDuty, BeaconClient};
+use beacon::{AttesterDuty, BeaconClient};
 
 use super::error::DutyTrackerError;
 
@@ -38,14 +38,14 @@ impl EpochDutyCache {
 }
 
 pub struct DutyTracker {
-    beacon_client: Arc<BeaconClient>,
+    beacon: Arc<BeaconClient>,
     validator_indices: Vec<String>,
     cache: RwLock<HashMap<u64, EpochDutyCache>>,
 }
 
 impl DutyTracker {
-    pub fn new(beacon_client: Arc<BeaconClient>, validator_indices: Vec<String>) -> Self {
-        Self { beacon_client, validator_indices, cache: RwLock::new(HashMap::new()) }
+    pub fn new(beacon: Arc<BeaconClient>, validator_indices: Vec<String>) -> Self {
+        Self { beacon, validator_indices, cache: RwLock::new(HashMap::new()) }
     }
 
     pub async fn fetch_duties_for_epoch(
@@ -55,7 +55,7 @@ impl DutyTracker {
         debug!(epoch = epoch, "Fetching duties for epoch");
 
         let response = self
-            .beacon_client
+            .beacon
             .get_attester_duties(epoch, &self.validator_indices)
             .await
             .map_err(DutyTrackerError::BeaconError)?;
@@ -131,7 +131,7 @@ impl DutyTracker {
         }
 
         let response = self
-            .beacon_client
+            .beacon
             .get_attester_duties(epoch, &self.validator_indices)
             .await
             .map_err(DutyTrackerError::BeaconError)?;
@@ -193,11 +193,11 @@ mod tests {
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use beacon_client::BeaconClientConfig;
+    use beacon::BeaconClientConfig;
 
     use super::*;
 
-    async fn setup_mock_beacon_client() -> (MockServer, Arc<BeaconClient>) {
+    async fn setup_mock_beacon() -> (MockServer, Arc<BeaconClient>) {
         let mock_server = MockServer::start().await;
         let config = BeaconClientConfig::new(mock_server.uri())
             .with_timeout(Duration::from_secs(5))
@@ -235,17 +235,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_duty_tracker_new() {
-        let (_, beacon_client) = setup_mock_beacon_client().await;
+        let (_, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string(), "5678".to_string()];
 
-        let tracker = DutyTracker::new(beacon_client, validator_indices);
+        let tracker = DutyTracker::new(beacon, validator_indices);
 
         assert!(!tracker.is_epoch_cached(0).await);
     }
 
     #[tokio::test]
     async fn test_fetch_duties_for_epoch_success() {
-        let (mock_server, beacon_client) = setup_mock_beacon_client().await;
+        let (mock_server, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string()];
 
         let response = create_mock_duty_response(
@@ -262,7 +262,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let tracker = DutyTracker::new(beacon_client, validator_indices);
+        let tracker = DutyTracker::new(beacon, validator_indices);
         let duties = tracker.fetch_duties_for_epoch(10).await.unwrap();
 
         assert_eq!(duties.len(), 2);
@@ -273,7 +273,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_duty_from_cache() {
-        let (mock_server, beacon_client) = setup_mock_beacon_client().await;
+        let (mock_server, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string()];
 
         let response = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xdeproot_abc123");
@@ -285,7 +285,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let tracker = DutyTracker::new(beacon_client, validator_indices);
+        let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_duties_for_epoch(10).await.unwrap();
 
         let duty = tracker.get_duty(320, 1).await.unwrap();
@@ -296,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_duty_not_found() {
-        let (mock_server, beacon_client) = setup_mock_beacon_client().await;
+        let (mock_server, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string()];
 
         let response = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xdeproot_abc123");
@@ -308,7 +308,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let tracker = DutyTracker::new(beacon_client, validator_indices);
+        let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_duties_for_epoch(10).await.unwrap();
 
         let result = tracker.get_duty(320, 99).await;
@@ -317,10 +317,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_duty_epoch_not_cached() {
-        let (_, beacon_client) = setup_mock_beacon_client().await;
+        let (_, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string()];
 
-        let tracker = DutyTracker::new(beacon_client, validator_indices);
+        let tracker = DutyTracker::new(beacon, validator_indices);
 
         let result = tracker.get_duty(320, 1).await;
         assert!(matches!(result, Err(DutyTrackerError::DutyNotFound { .. })));
@@ -328,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dependent_root_change_detection() {
-        let (mock_server, beacon_client) = setup_mock_beacon_client().await;
+        let (mock_server, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string()];
 
         let response1 = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xroot_first");
@@ -350,7 +350,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let tracker = DutyTracker::new(beacon_client, validator_indices);
+        let tracker = DutyTracker::new(beacon, validator_indices);
 
         tracker.fetch_duties_for_epoch(10).await.unwrap();
         let root1 = tracker.get_cached_dependent_root(10).await;
@@ -365,7 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dependent_root_no_change() {
-        let (mock_server, beacon_client) = setup_mock_beacon_client().await;
+        let (mock_server, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string()];
 
         let response = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xroot_same");
@@ -377,7 +377,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let tracker = DutyTracker::new(beacon_client, validator_indices);
+        let tracker = DutyTracker::new(beacon, validator_indices);
 
         tracker.fetch_duties_for_epoch(10).await.unwrap();
 
@@ -387,7 +387,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_clear_epoch_cache() {
-        let (mock_server, beacon_client) = setup_mock_beacon_client().await;
+        let (mock_server, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string()];
 
         let response = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xdeproot");
@@ -399,7 +399,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let tracker = DutyTracker::new(beacon_client, validator_indices);
+        let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_duties_for_epoch(10).await.unwrap();
 
         assert!(tracker.is_epoch_cached(10).await);
@@ -432,7 +432,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_multiple_validators() {
-        let (mock_server, beacon_client) = setup_mock_beacon_client().await;
+        let (mock_server, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string(), "5678".to_string()];
 
         let response =
@@ -446,7 +446,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let tracker = DutyTracker::new(beacon_client, validator_indices);
+        let tracker = DutyTracker::new(beacon, validator_indices);
         let duties = tracker.fetch_duties_for_epoch(10).await.unwrap();
 
         assert_eq!(duties.len(), 2);
@@ -460,7 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_duties_beacon_error() {
-        let (mock_server, beacon_client) = setup_mock_beacon_client().await;
+        let (mock_server, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string()];
 
         Mock::given(method("POST"))
@@ -470,7 +470,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let tracker = DutyTracker::new(beacon_client, validator_indices);
+        let tracker = DutyTracker::new(beacon, validator_indices);
         let result = tracker.fetch_duties_for_epoch(10).await;
 
         assert!(matches!(result, Err(DutyTrackerError::BeaconError(_))));
@@ -478,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_next_epoch_while_current_cached() {
-        let (mock_server, beacon_client) = setup_mock_beacon_client().await;
+        let (mock_server, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string()];
 
         let response10 = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xroot_epoch10");
@@ -498,7 +498,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let tracker = DutyTracker::new(beacon_client, validator_indices);
+        let tracker = DutyTracker::new(beacon, validator_indices);
 
         tracker.fetch_duties_for_epoch(10).await.unwrap();
         tracker.fetch_duties_for_epoch(11).await.unwrap();

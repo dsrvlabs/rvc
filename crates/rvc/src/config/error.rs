@@ -49,5 +49,5 @@ pub enum ConfigError {
     SlashingDbError(#[from] crate::slashing::SlashingError),
 
     #[error("beacon client error: {0}")]
-    BeaconClientError(#[from] beacon_client::BeaconError),
+    BeaconClientError(#[from] beacon::BeaconError),
 }

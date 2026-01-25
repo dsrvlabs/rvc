@@ -1,5 +1,5 @@
 [package]
-name = "beacon-client"
+name = "beacon"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

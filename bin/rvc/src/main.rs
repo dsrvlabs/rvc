@@ -166,7 +166,7 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
 
     let builder = ServiceBuilder::new(config.clone());
 
-    let beacon_client = match builder.build_beacon_client() {
+    let beacon_client = match builder.build_beacon() {
         Ok(client) => {
             update_health_beacon_connected(&health_status, true).await;
             client

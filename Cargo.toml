@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/rvc", "crates/rvc", "crates/beacon-client"]
+members = ["bin/rvc", "crates/rvc", "crates/beacon"]
 default-members = ["bin/rvc"]
 resolver = "2"
 
@@ -13,7 +13,7 @@ repository = "https://github.com/rootwarp/rvc"
 [workspace.dependencies]
 # Internal
 rvc = { path = "crates/rvc" }
-beacon-client = { path = "crates/beacon-client" }
+beacon = { path = "crates/beacon" }
 
 # External
 axum = "0.7"
