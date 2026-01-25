@@ -170,7 +170,11 @@ impl BeaconClient {
     }
 
     fn calculate_backoff(&self, attempt: u32) -> Duration {
-        self.config.initial_backoff * 2u32.pow(attempt)
+        // Cap the exponent to prevent overflow. 2^20 is about 1 million,
+        // which when multiplied by a 100ms initial backoff gives ~27 hours max.
+        let capped_attempt = attempt.min(20);
+        let multiplier = 2u32.saturating_pow(capped_attempt);
+        self.config.initial_backoff.saturating_mul(multiplier)
     }
 }
 
@@ -270,6 +274,56 @@ mod tests {
         assert_eq!(client.calculate_backoff(1), Duration::from_millis(200));
         assert_eq!(client.calculate_backoff(2), Duration::from_millis(400));
         assert_eq!(client.calculate_backoff(3), Duration::from_millis(800));
+    }
+
+    #[test]
+    fn test_calculate_backoff_high_attempt_values_no_panic() {
+        let config = BeaconClientConfig::new("http://localhost:5052")
+            .with_initial_backoff(Duration::from_millis(100));
+        let client = BeaconClient::new(config).unwrap();
+
+        // These should not panic - they would overflow with the naive implementation
+        let _ = client.calculate_backoff(20);
+        let _ = client.calculate_backoff(31);
+        let _ = client.calculate_backoff(32);
+        let _ = client.calculate_backoff(100);
+    }
+
+    #[test]
+    fn test_calculate_backoff_capped_at_maximum() {
+        let config = BeaconClientConfig::new("http://localhost:5052")
+            .with_initial_backoff(Duration::from_millis(100));
+        let client = BeaconClient::new(config).unwrap();
+
+        // Max backoff at attempt 20: 100ms * 2^20 = 104,857,600ms (~29 hours)
+        let max_backoff = Duration::from_millis(100 * (1 << 20));
+
+        // All attempts >= 20 should return the same maximum backoff
+        assert_eq!(client.calculate_backoff(20), max_backoff);
+        assert_eq!(client.calculate_backoff(31), max_backoff);
+        assert_eq!(client.calculate_backoff(32), max_backoff);
+        assert_eq!(client.calculate_backoff(100), max_backoff);
+    }
+
+    #[test]
+    fn test_calculate_backoff_monotonically_increasing() {
+        let config = BeaconClientConfig::new("http://localhost:5052")
+            .with_initial_backoff(Duration::from_millis(100));
+        let client = BeaconClient::new(config).unwrap();
+
+        // Backoff should be monotonically increasing up to the cap
+        let mut prev_backoff = Duration::ZERO;
+        for attempt in 0..=25 {
+            let backoff = client.calculate_backoff(attempt);
+            assert!(
+                backoff >= prev_backoff,
+                "Backoff should be monotonically increasing: attempt {} gave {:?}, previous was {:?}",
+                attempt,
+                backoff,
+                prev_backoff
+            );
+            prev_backoff = backoff;
+        }
     }
 
     #[tokio::test]
