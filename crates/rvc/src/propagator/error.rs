@@ -1,7 +1,10 @@
+//! Error types for the propagator service.
+
 use thiserror::Error;
 
 use crate::beacon::BeaconError;
 
+/// Errors that can occur during attestation propagation.
 #[derive(Error, Debug)]
 pub enum PropagatorError {
     #[error("Beacon client error: {0}")]

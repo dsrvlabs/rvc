@@ -1,3 +1,8 @@
+//! Propagator service for submitting attestations to the beacon node.
+//!
+//! This module provides the [`Propagator`] service which handles submitting
+//! signed attestations to the beacon node's attestation pool.
+
 mod error;
 
 use std::future::Future;
