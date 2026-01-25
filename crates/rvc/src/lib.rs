@@ -5,6 +5,7 @@ pub mod crypto;
 pub mod duty_tracker;
 pub mod metrics;
 pub mod slashing;
+pub mod timing;
 
 pub mod proto {
     pub mod duty_tracker {
