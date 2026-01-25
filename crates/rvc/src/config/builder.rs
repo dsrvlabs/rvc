@@ -167,6 +167,9 @@ impl ServiceBuilder {
     }
 
     pub fn build_fork(&self) -> Fork {
+        // TODO: Implement proper fork version handling
+        // Fork versions should be fetched from beacon node or included in network presets
+        // (Bellatrix, Capella, Deneb have different fork versions)
         Fork {
             previous_version: [0x00, 0x00, 0x00, 0x00],
             current_version: [0x00, 0x00, 0x00, 0x00],

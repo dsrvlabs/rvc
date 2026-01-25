@@ -109,6 +109,14 @@ impl Config {
             return Err(ConfigError::InvalidPort(self.grpc_port));
         }
 
+        if let Some(ref graffiti) = self.graffiti {
+            if graffiti.len() > 32 {
+                return Err(ConfigError::InvalidGraffiti(
+                    "graffiti must be 32 bytes or less".to_string(),
+                ));
+            }
+        }
+
         self.effective_genesis_time()?;
         self.effective_genesis_validators_root()?;
 
@@ -323,6 +331,24 @@ log_level = "debug"
     fn test_validate_invalid_port() {
         let config = Config { metrics_port: 0, ..Default::default() };
         assert!(matches!(config.validate(), Err(ConfigError::InvalidPort(_))));
+    }
+
+    #[test]
+    fn test_validate_graffiti_too_long() {
+        let config = Config {
+            graffiti: Some("a".repeat(33)), // 33 bytes, exceeds 32 byte limit
+            ..Default::default()
+        };
+        assert!(matches!(config.validate(), Err(ConfigError::InvalidGraffiti(_))));
+    }
+
+    #[test]
+    fn test_validate_graffiti_valid() {
+        let config = Config {
+            graffiti: Some("rvc".to_string()), // Valid graffiti
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]

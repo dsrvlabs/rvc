@@ -178,6 +178,9 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
         }
     };
 
+    // Allow starting without validators for testing/monitoring purposes.
+    // Unlike beacon client and slashing DB, missing keys is not a fatal error
+    // since operators may want to run the client to verify connectivity first.
     let key_manager = match builder.build_key_manager() {
         Ok(km) => {
             let validator_count = km.len();
@@ -281,7 +284,12 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
+    // Gracefully shut down metrics server with a brief timeout
     metrics_handle.abort();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        metrics_handle.await.ok()
+    })
+    .await;
 
     info!("Validator client shut down complete");
     Ok(())
@@ -313,6 +321,9 @@ async fn shutdown_signal() {
     }
 }
 
+// Health status update functions.
+// These are called sequentially during startup before concurrent access begins,
+// so the read-modify-write pattern is safe in this context.
 async fn update_health_beacon_connected(health_status: &SharedHealthStatus, connected: bool) {
     let mut status = health_status.write().await;
     status.beacon_connected = connected;

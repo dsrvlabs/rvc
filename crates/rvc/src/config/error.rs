@@ -33,6 +33,9 @@ pub enum ConfigError {
     #[error("invalid port number: {0}")]
     InvalidPort(u16),
 
+    #[error("invalid graffiti: {0}")]
+    InvalidGraffiti(String),
+
     #[error("password file not found: {0}")]
     PasswordFileNotFound(PathBuf),
 

@@ -13,6 +13,7 @@ keystore_path = "./keystores"
 # Path to the password file (optional)
 # Format: one password per line, or pubkey=password per line
 # If not specified, passwords will be prompted interactively
+# WARNING: Ensure password files have restrictive permissions (chmod 600)
 # password_file = "./passwords.txt"
 
 # Path to the slashing protection database
