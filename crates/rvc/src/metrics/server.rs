@@ -213,10 +213,12 @@ mod tests {
 
     #[test]
     fn test_health_status_update_healthy() {
-        let mut status = HealthStatus::default();
-        status.beacon_connected = true;
-        status.validators_loaded = 5;
-        status.slashing_db_initialized = true;
+        let mut status = HealthStatus {
+            beacon_connected: true,
+            validators_loaded: 5,
+            slashing_db_initialized: true,
+            ..Default::default()
+        };
         status.update_healthy();
 
         assert!(status.healthy);
@@ -224,10 +226,12 @@ mod tests {
 
     #[test]
     fn test_health_status_update_unhealthy_no_beacon() {
-        let mut status = HealthStatus::default();
-        status.beacon_connected = false;
-        status.validators_loaded = 5;
-        status.slashing_db_initialized = true;
+        let mut status = HealthStatus {
+            beacon_connected: false,
+            validators_loaded: 5,
+            slashing_db_initialized: true,
+            ..Default::default()
+        };
         status.update_healthy();
 
         assert!(!status.healthy);
@@ -235,10 +239,12 @@ mod tests {
 
     #[test]
     fn test_health_status_update_unhealthy_no_validators() {
-        let mut status = HealthStatus::default();
-        status.beacon_connected = true;
-        status.validators_loaded = 0;
-        status.slashing_db_initialized = true;
+        let mut status = HealthStatus {
+            beacon_connected: true,
+            validators_loaded: 0,
+            slashing_db_initialized: true,
+            ..Default::default()
+        };
         status.update_healthy();
 
         assert!(!status.healthy);
