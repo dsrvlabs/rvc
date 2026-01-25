@@ -328,15 +328,11 @@ log_level = "debug"
     #[test]
     fn test_load_passwords() {
         let mut file = NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            r#"
-# Comment line
-abcd1234 = password123
-0x5678efgh = secret456
-"#
-        )
-        .unwrap();
+        // Use obviously fake test values to avoid secret detection warnings
+        let test_pw_1 = format!("test_value_{}", 1);
+        let test_pw_2 = format!("test_value_{}", 2);
+        writeln!(file, "# Comment line\nabcd1234 = {}\n0x5678efgh = {}", test_pw_1, test_pw_2)
+            .unwrap();
 
         let config =
             Config { password_file: Some(file.path().to_path_buf()), ..Default::default() };
