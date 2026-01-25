@@ -21,12 +21,19 @@ hex.workspace = true
 rand.workspace = true
 ssz.workspace = true
 ssz_derive.workspace = true
+tree_hash.workspace = true
+tree_hash_derive.workspace = true
 sha2.workspace = true
 scrypt.workspace = true
 pbkdf2.workspace = true
 aes.workspace = true
 ctr.workspace = true
 uuid.workspace = true
+prometheus.workspace = true
+lazy_static.workspace = true
+secrecy.workspace = true
+zeroize.workspace = true
+subtle = "2.6"
 
 [build-dependencies]
 tonic-build.workspace = true
