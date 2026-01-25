@@ -82,7 +82,7 @@ jobs:
       - name: Generate coverage summary
         id: coverage
         run: |
-          cargo llvm-cov --workspace --json > coverage.json
+          cargo llvm-cov report --json > coverage.json
 
           COVERAGE=$(jq '.data[0].totals.lines.percent' coverage.json)
           COVERED=$(jq '.data[0].totals.lines.covered' coverage.json)
