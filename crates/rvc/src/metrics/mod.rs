@@ -6,6 +6,11 @@
 pub mod definitions;
 pub mod server;
 
+pub use server::{
+    create_metrics_router, create_metrics_router_with_health, new_health_status, serve_metrics,
+    serve_metrics_with_health, HealthStatus, SharedHealthStatus,
+};
+
 use lazy_static::lazy_static;
 use prometheus::{Counter, Gauge, Histogram, HistogramOpts, Opts, Registry};
 
