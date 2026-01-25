@@ -3,6 +3,7 @@
 //! This module provides a global metrics registry and helper macros for
 //! registering and using prometheus metrics.
 
+pub mod definitions;
 pub mod server;
 
 use lazy_static::lazy_static;
