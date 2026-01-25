@@ -37,6 +37,46 @@ lazy_static! {
         counter
     };
 
+    /// Counter for duty cache operations.
+    /// Labels: operation (hit, miss, invalidation)
+    pub static ref RVC_DUTY_CACHE_OPERATIONS_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_duty_cache_operations_total",
+            "Total number of duty cache operations"
+        );
+        let counter = IntCounterVec::new(opts, &["operation"])
+            .expect("Failed to create rvc_duty_cache_operations_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_duty_cache_operations_total metric");
+        counter
+    };
+
+    /// Counter for dependent root changes.
+    pub static ref RVC_DEPENDENT_ROOT_CHANGES_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_dependent_root_changes_total",
+            "Total number of dependent root changes detected"
+        );
+        let counter = IntCounterVec::new(opts, &[])
+            .expect("Failed to create rvc_dependent_root_changes_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_dependent_root_changes_total metric");
+        counter
+    };
+
+    /// Histogram for duty fetch latency in seconds.
+    pub static ref RVC_DUTY_FETCH_DURATION_SECONDS: HistogramVec = {
+        let opts = HistogramOpts::new(
+            "rvc_duty_fetch_duration_seconds",
+            "Duration of duty fetch operations in seconds"
+        ).buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]);
+        let histogram = HistogramVec::new(opts, &[])
+            .expect("Failed to create rvc_duty_fetch_duration_seconds metric");
+        REGISTRY.register(Box::new(histogram.clone()))
+            .expect("Failed to register rvc_duty_fetch_duration_seconds metric");
+        histogram
+    };
+
     /// Histogram for signing operation latency in seconds.
     pub static ref RVC_SIGNING_DURATION_SECONDS: HistogramVec = {
         let opts = HistogramOpts::new(
@@ -84,6 +124,9 @@ lazy_static! {
 pub fn init_metrics() {
     lazy_static::initialize(&RVC_ATTESTATIONS_TOTAL);
     lazy_static::initialize(&RVC_DUTIES_FETCHED_TOTAL);
+    lazy_static::initialize(&RVC_DUTY_CACHE_OPERATIONS_TOTAL);
+    lazy_static::initialize(&RVC_DEPENDENT_ROOT_CHANGES_TOTAL);
+    lazy_static::initialize(&RVC_DUTY_FETCH_DURATION_SECONDS);
     lazy_static::initialize(&RVC_SIGNING_DURATION_SECONDS);
     lazy_static::initialize(&RVC_BEACON_REQUESTS_TOTAL);
     lazy_static::initialize(&RVC_SLASHING_PROTECTION_CHECKS_TOTAL);
@@ -106,6 +149,13 @@ pub mod slashing_result {
 pub mod request_status {
     pub const SUCCESS: &str = "success";
     pub const FAILED: &str = "failed";
+}
+
+/// Duty cache operation label values.
+pub mod cache_operation {
+    pub const HIT: &str = "hit";
+    pub const MISS: &str = "miss";
+    pub const INVALIDATION: &str = "invalidation";
 }
 
 #[cfg(test)]
@@ -177,11 +227,50 @@ mod tests {
     }
 
     #[test]
+    fn test_duty_cache_operations_total_increments() {
+        RVC_DUTY_CACHE_OPERATIONS_TOTAL.with_label_values(&[cache_operation::HIT]).inc();
+        let hit_value =
+            RVC_DUTY_CACHE_OPERATIONS_TOTAL.with_label_values(&[cache_operation::HIT]).get();
+        assert!(hit_value >= 1, "Hit counter should be at least 1 after increment");
+
+        RVC_DUTY_CACHE_OPERATIONS_TOTAL.with_label_values(&[cache_operation::MISS]).inc();
+        let miss_value =
+            RVC_DUTY_CACHE_OPERATIONS_TOTAL.with_label_values(&[cache_operation::MISS]).get();
+        assert!(miss_value >= 1, "Miss counter should be at least 1 after increment");
+
+        RVC_DUTY_CACHE_OPERATIONS_TOTAL.with_label_values(&[cache_operation::INVALIDATION]).inc();
+        let invalidation_value = RVC_DUTY_CACHE_OPERATIONS_TOTAL
+            .with_label_values(&[cache_operation::INVALIDATION])
+            .get();
+        assert!(
+            invalidation_value >= 1,
+            "Invalidation counter should be at least 1 after increment"
+        );
+    }
+
+    #[test]
+    fn test_dependent_root_changes_total_increments() {
+        RVC_DEPENDENT_ROOT_CHANGES_TOTAL.with_label_values(&[]).inc();
+        let value = RVC_DEPENDENT_ROOT_CHANGES_TOTAL.with_label_values(&[]).get();
+        assert!(value >= 1, "Counter should be at least 1 after increment");
+    }
+
+    #[test]
+    fn test_duty_fetch_duration_observes() {
+        RVC_DUTY_FETCH_DURATION_SECONDS.with_label_values(&[]).observe(0.1);
+        let count = RVC_DUTY_FETCH_DURATION_SECONDS.with_label_values(&[]).get_sample_count();
+        assert!(count >= 1, "Histogram should have at least 1 observation");
+    }
+
+    #[test]
     fn test_init_metrics_registers_all() {
         init_metrics();
 
         RVC_ATTESTATIONS_TOTAL.with_label_values(&[attestation_status::SUCCESS]).inc();
         RVC_DUTIES_FETCHED_TOTAL.with_label_values(&[]).inc();
+        RVC_DUTY_CACHE_OPERATIONS_TOTAL.with_label_values(&[cache_operation::HIT]).inc();
+        RVC_DEPENDENT_ROOT_CHANGES_TOTAL.with_label_values(&[]).inc();
+        RVC_DUTY_FETCH_DURATION_SECONDS.with_label_values(&[]).observe(0.001);
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[]).observe(0.001);
         RVC_BEACON_REQUESTS_TOTAL.with_label_values(&["/test", request_status::SUCCESS]).inc();
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
@@ -196,6 +285,18 @@ mod tests {
         assert!(
             metric_names.contains(&"rvc_duties_fetched_total"),
             "rvc_duties_fetched_total should be registered"
+        );
+        assert!(
+            metric_names.contains(&"rvc_duty_cache_operations_total"),
+            "rvc_duty_cache_operations_total should be registered"
+        );
+        assert!(
+            metric_names.contains(&"rvc_dependent_root_changes_total"),
+            "rvc_dependent_root_changes_total should be registered"
+        );
+        assert!(
+            metric_names.contains(&"rvc_duty_fetch_duration_seconds"),
+            "rvc_duty_fetch_duration_seconds should be registered"
         );
         assert!(
             metric_names.contains(&"rvc_signing_duration_seconds"),
