@@ -70,6 +70,26 @@ impl SlashingDb {
         Ok(())
     }
 
+    /// Record a signed attestation with idempotent behavior.
+    ///
+    /// If an attestation with the same pubkey and target_epoch already exists,
+    /// the operation silently succeeds without modifying the existing record.
+    /// This makes the operation safe to retry.
+    pub fn record_attestation(
+        &self,
+        pubkey: &str,
+        source_epoch: Epoch,
+        target_epoch: Epoch,
+        signing_root: Option<String>,
+    ) -> Result<(), SlashingError> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO attestations (pubkey, source_epoch, target_epoch, signing_root)
+             VALUES (?1, ?2, ?3, ?4)",
+            (pubkey, source_epoch as i64, target_epoch as i64, &signing_root),
+        )?;
+        Ok(())
+    }
+
     /// Get all attestations for a given public key.
     pub fn get_attestations(&self, pubkey: &str) -> Result<Vec<SignedAttestation>, SlashingError> {
         let mut stmt = self.conn.prepare(
@@ -775,5 +795,91 @@ mod tests {
         // New: source=4, target=21 - surrounds both
         let result = db.is_safe_to_sign("0x1234", 4, 21);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_record_attestation_new() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.record_attestation("0x1234", 100, 101, Some("0xabcd".to_string()))
+            .expect("record should succeed");
+
+        let attestations = db.get_attestations("0x1234").expect("failed to get");
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(attestations[0].pubkey, "0x1234");
+        assert_eq!(attestations[0].source_epoch, 100);
+        assert_eq!(attestations[0].target_epoch, 101);
+        assert_eq!(attestations[0].signing_root, Some("0xabcd".to_string()));
+    }
+
+    #[test]
+    fn test_record_attestation_without_signing_root() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.record_attestation("0x1234", 100, 101, None).expect("record should succeed");
+
+        let attestations = db.get_attestations("0x1234").expect("failed to get");
+        assert_eq!(attestations.len(), 1);
+        assert!(attestations[0].signing_root.is_none());
+    }
+
+    #[test]
+    fn test_record_attestation_idempotent_exact_duplicate() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.record_attestation("0x1234", 100, 101, Some("0xabcd".to_string()))
+            .expect("first record should succeed");
+
+        db.record_attestation("0x1234", 100, 101, Some("0xabcd".to_string()))
+            .expect("duplicate record should also succeed (idempotent)");
+
+        let attestations = db.get_attestations("0x1234").expect("failed to get");
+        assert_eq!(attestations.len(), 1);
+    }
+
+    #[test]
+    fn test_record_attestation_idempotent_same_target_different_source() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.record_attestation("0x1234", 100, 101, None).expect("first record should succeed");
+
+        // Same pubkey and target_epoch but different source_epoch
+        // Due to UNIQUE(pubkey, target_epoch), this should be ignored
+        db.record_attestation("0x1234", 99, 101, None)
+            .expect("duplicate target should succeed (idempotent)");
+
+        let attestations = db.get_attestations("0x1234").expect("failed to get");
+        assert_eq!(attestations.len(), 1);
+        // Original source_epoch should be preserved
+        assert_eq!(attestations[0].source_epoch, 100);
+    }
+
+    #[test]
+    fn test_record_attestation_multiple_different_targets() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.record_attestation("0x1234", 100, 101, None).expect("first record should succeed");
+        db.record_attestation("0x1234", 101, 102, None).expect("second record should succeed");
+        db.record_attestation("0x1234", 102, 103, None).expect("third record should succeed");
+
+        let attestations = db.get_attestations("0x1234").expect("failed to get");
+        assert_eq!(attestations.len(), 3);
+        assert_eq!(attestations[0].target_epoch, 101);
+        assert_eq!(attestations[1].target_epoch, 102);
+        assert_eq!(attestations[2].target_epoch, 103);
+    }
+
+    #[test]
+    fn test_record_attestation_different_pubkeys() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.record_attestation("0x1111", 100, 101, None).expect("record should succeed");
+        db.record_attestation("0x2222", 100, 101, None).expect("record should succeed");
+
+        let att1 = db.get_attestations("0x1111").expect("failed to get");
+        let att2 = db.get_attestations("0x2222").expect("failed to get");
+
+        assert_eq!(att1.len(), 1);
+        assert_eq!(att2.len(), 1);
     }
 }
