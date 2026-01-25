@@ -49,6 +49,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 secrecy = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }
 
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # Dev dependencies
 tempfile = "3"
 wiremock = "0.6"
