@@ -1,0 +1,51 @@
+# rvc - Rust Validator Client Configuration
+# This is an example configuration file.
+# Copy this file to config.toml and customize as needed.
+
+# Beacon node URL
+# The HTTP endpoint of your beacon node (Prysm, Lighthouse, Teku, Nimbus, Lodestar)
+beacon_url = "http://localhost:5052"
+
+# Path to the keystore directory
+# This directory should contain EIP-2335 keystore files (keystore-*.json)
+keystore_path = "./keystores"
+
+# Path to the password file (optional)
+# Format: one password per line, or pubkey=password per line
+# If not specified, passwords will be prompted interactively
+# password_file = "./passwords.txt"
+
+# Path to the slashing protection database
+# This SQLite database stores attestation history to prevent slashing
+slashing_db_path = "./slashing_protection.sqlite"
+
+# Metrics HTTP server port
+# Exposes /metrics (Prometheus format), /health, /livez, /readyz endpoints
+metrics_port = 8080
+
+# gRPC server port
+# For duty tracker service
+grpc_port = 50051
+
+# Network preset
+# Options: mainnet, goerli, sepolia, holesky, custom
+# Each preset provides default genesis_time and genesis_validators_root
+network = "mainnet"
+
+# Genesis time override (optional)
+# Unix timestamp of chain genesis
+# Only required if network = "custom"
+# genesis_time = 1606824023
+
+# Genesis validators root override (optional)
+# 32-byte hex string with 0x prefix
+# Only required if network = "custom"
+# genesis_validators_root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+
+# Graffiti string for blocks (optional)
+# Maximum 32 bytes
+# graffiti = "rvc"
+
+# Log level
+# Options: trace, debug, info, warn, error
+log_level = "info"
