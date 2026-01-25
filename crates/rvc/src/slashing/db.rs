@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use super::error::SlashingError;
+use super::error::{AttestationSlashingViolation, SlashingError};
 use super::types::{SignedAttestation, SignedBlock};
 use crate::crypto::Epoch;
 
@@ -127,6 +127,67 @@ impl SlashingDb {
             blocks.push(row?);
         }
         Ok(blocks)
+    }
+
+    /// Check if it is safe to sign an attestation with the given epochs.
+    ///
+    /// Returns `Ok(())` if safe, or `Err(SlashingError::SlashableAttestation(_))`
+    /// with details about the violation type.
+    ///
+    /// Per EIP-3076, the following conditions are checked:
+    /// - Double voting: signing two attestations for the same target epoch
+    /// - Surrounding vote: new attestation surrounds an existing one
+    /// - Surrounded vote: new attestation is surrounded by an existing one
+    pub fn is_safe_to_sign(
+        &self,
+        pubkey: &str,
+        source_epoch: Epoch,
+        target_epoch: Epoch,
+    ) -> Result<(), SlashingError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source_epoch, target_epoch
+             FROM attestations
+             WHERE pubkey = ?1",
+        )?;
+
+        let rows = stmt.query_map([pubkey], |row| {
+            Ok((row.get::<_, i64>(0)? as Epoch, row.get::<_, i64>(1)? as Epoch))
+        })?;
+
+        for row in rows {
+            let (existing_source, existing_target) = row?;
+
+            // Check for double voting (same target epoch)
+            if target_epoch == existing_target {
+                return Err(AttestationSlashingViolation::DoubleVote { target_epoch }.into());
+            }
+
+            // Check for surrounding vote: new attestation surrounds existing
+            // new_source < existing_source AND new_target > existing_target
+            if source_epoch < existing_source && target_epoch > existing_target {
+                return Err(AttestationSlashingViolation::SurroundingVote {
+                    new_source: source_epoch,
+                    new_target: target_epoch,
+                    existing_source,
+                    existing_target,
+                }
+                .into());
+            }
+
+            // Check for surrounded vote: new attestation is surrounded by existing
+            // existing_source < new_source AND existing_target > new_target
+            if existing_source < source_epoch && existing_target > target_epoch {
+                return Err(AttestationSlashingViolation::SurroundedVote {
+                    new_source: source_epoch,
+                    new_target: target_epoch,
+                    existing_source,
+                    existing_target,
+                }
+                .into());
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -398,5 +459,321 @@ mod tests {
             assert_eq!(attestations.len(), 1);
             assert_eq!(attestations[0].target_epoch, 101);
         }
+    }
+
+    #[test]
+    fn test_is_safe_to_sign_empty_db() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        let result = db.is_safe_to_sign("0x1234", 100, 101);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_is_safe_to_sign_no_conflict() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        let attestation = SignedAttestation {
+            pubkey: "0x1234".to_string(),
+            source_epoch: 100,
+            target_epoch: 101,
+            signing_root: None,
+        };
+        db.insert_attestation(&attestation).expect("failed to insert");
+
+        let result = db.is_safe_to_sign("0x1234", 101, 102);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_is_safe_to_sign_double_vote() {
+        use super::super::error::AttestationSlashingViolation;
+
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        let attestation = SignedAttestation {
+            pubkey: "0x1234".to_string(),
+            source_epoch: 100,
+            target_epoch: 101,
+            signing_root: None,
+        };
+        db.insert_attestation(&attestation).expect("failed to insert");
+
+        let result = db.is_safe_to_sign("0x1234", 99, 101);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            SlashingError::SlashableAttestation(violation) => {
+                assert_eq!(
+                    violation,
+                    AttestationSlashingViolation::DoubleVote { target_epoch: 101 }
+                );
+            }
+            _ => panic!("expected SlashableAttestation error"),
+        }
+    }
+
+    #[test]
+    fn test_is_safe_to_sign_surrounding_vote() {
+        use super::super::error::AttestationSlashingViolation;
+
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        // Existing: source=5, target=10
+        let attestation = SignedAttestation {
+            pubkey: "0x1234".to_string(),
+            source_epoch: 5,
+            target_epoch: 10,
+            signing_root: None,
+        };
+        db.insert_attestation(&attestation).expect("failed to insert");
+
+        // New: source=4, target=11 (surrounds existing)
+        let result = db.is_safe_to_sign("0x1234", 4, 11);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            SlashingError::SlashableAttestation(violation) => {
+                assert_eq!(
+                    violation,
+                    AttestationSlashingViolation::SurroundingVote {
+                        new_source: 4,
+                        new_target: 11,
+                        existing_source: 5,
+                        existing_target: 10,
+                    }
+                );
+            }
+            _ => panic!("expected SlashableAttestation error"),
+        }
+    }
+
+    #[test]
+    fn test_is_safe_to_sign_surrounded_vote() {
+        use super::super::error::AttestationSlashingViolation;
+
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        // Existing: source=4, target=11
+        let attestation = SignedAttestation {
+            pubkey: "0x1234".to_string(),
+            source_epoch: 4,
+            target_epoch: 11,
+            signing_root: None,
+        };
+        db.insert_attestation(&attestation).expect("failed to insert");
+
+        // New: source=5, target=10 (surrounded by existing)
+        let result = db.is_safe_to_sign("0x1234", 5, 10);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            SlashingError::SlashableAttestation(violation) => {
+                assert_eq!(
+                    violation,
+                    AttestationSlashingViolation::SurroundedVote {
+                        new_source: 5,
+                        new_target: 10,
+                        existing_source: 4,
+                        existing_target: 11,
+                    }
+                );
+            }
+            _ => panic!("expected SlashableAttestation error"),
+        }
+    }
+
+    #[test]
+    fn test_is_safe_to_sign_different_pubkey_no_conflict() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        let attestation = SignedAttestation {
+            pubkey: "0x1111".to_string(),
+            source_epoch: 100,
+            target_epoch: 101,
+            signing_root: None,
+        };
+        db.insert_attestation(&attestation).expect("failed to insert");
+
+        // Different pubkey should not conflict
+        let result = db.is_safe_to_sign("0x2222", 100, 101);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_is_safe_to_sign_multiple_attestations_no_conflict() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        let attestations = vec![
+            SignedAttestation {
+                pubkey: "0x1234".to_string(),
+                source_epoch: 10,
+                target_epoch: 11,
+                signing_root: None,
+            },
+            SignedAttestation {
+                pubkey: "0x1234".to_string(),
+                source_epoch: 11,
+                target_epoch: 12,
+                signing_root: None,
+            },
+            SignedAttestation {
+                pubkey: "0x1234".to_string(),
+                source_epoch: 12,
+                target_epoch: 13,
+                signing_root: None,
+            },
+        ];
+
+        for a in &attestations {
+            db.insert_attestation(a).expect("failed to insert");
+        }
+
+        // New attestation continuing the sequence
+        let result = db.is_safe_to_sign("0x1234", 13, 14);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_is_safe_to_sign_edge_case_same_source_different_target() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        let attestation = SignedAttestation {
+            pubkey: "0x1234".to_string(),
+            source_epoch: 100,
+            target_epoch: 101,
+            signing_root: None,
+        };
+        db.insert_attestation(&attestation).expect("failed to insert");
+
+        // Same source, different target - should be safe if not surrounding/surrounded
+        let result = db.is_safe_to_sign("0x1234", 100, 102);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_is_safe_to_sign_edge_case_boundary_not_surrounding() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        // Existing: source=5, target=10
+        let attestation = SignedAttestation {
+            pubkey: "0x1234".to_string(),
+            source_epoch: 5,
+            target_epoch: 10,
+            signing_root: None,
+        };
+        db.insert_attestation(&attestation).expect("failed to insert");
+
+        // New: source=5, target=11 - same source, not surrounding (need source < existing_source)
+        let result = db.is_safe_to_sign("0x1234", 5, 11);
+        assert!(result.is_ok());
+
+        // New: source=4, target=10 - same target (double vote)
+        let result = db.is_safe_to_sign("0x1234", 4, 10);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_safe_to_sign_edge_case_boundary_not_surrounded() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        // Existing: source=4, target=11
+        let attestation = SignedAttestation {
+            pubkey: "0x1234".to_string(),
+            source_epoch: 4,
+            target_epoch: 11,
+            signing_root: None,
+        };
+        db.insert_attestation(&attestation).expect("failed to insert");
+
+        // New: source=4, target=10 - same source, not surrounded (need existing_source < new_source)
+        let result = db.is_safe_to_sign("0x1234", 4, 10);
+        assert!(result.is_ok());
+
+        // New: source=5, target=11 - same target (double vote)
+        let result = db.is_safe_to_sign("0x1234", 5, 11);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_safe_to_sign_surrounding_vote_minimal() {
+        use super::super::error::AttestationSlashingViolation;
+
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        // Existing: source=5, target=6
+        let attestation = SignedAttestation {
+            pubkey: "0x1234".to_string(),
+            source_epoch: 5,
+            target_epoch: 6,
+            signing_root: None,
+        };
+        db.insert_attestation(&attestation).expect("failed to insert");
+
+        // New: source=4, target=7 (minimal surrounding)
+        let result = db.is_safe_to_sign("0x1234", 4, 7);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            SlashingError::SlashableAttestation(
+                AttestationSlashingViolation::SurroundingVote { .. },
+            ) => {}
+            _ => panic!("expected SurroundingVote"),
+        }
+    }
+
+    #[test]
+    fn test_is_safe_to_sign_surrounded_vote_minimal() {
+        use super::super::error::AttestationSlashingViolation;
+
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        // Existing: source=4, target=7
+        let attestation = SignedAttestation {
+            pubkey: "0x1234".to_string(),
+            source_epoch: 4,
+            target_epoch: 7,
+            signing_root: None,
+        };
+        db.insert_attestation(&attestation).expect("failed to insert");
+
+        // New: source=5, target=6 (minimal surrounded)
+        let result = db.is_safe_to_sign("0x1234", 5, 6);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            SlashingError::SlashableAttestation(AttestationSlashingViolation::SurroundedVote {
+                ..
+            }) => {}
+            _ => panic!("expected SurroundedVote"),
+        }
+    }
+
+    #[test]
+    fn test_is_safe_to_sign_detects_first_violation_in_multiple() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        let attestations = vec![
+            SignedAttestation {
+                pubkey: "0x1234".to_string(),
+                source_epoch: 5,
+                target_epoch: 10,
+                signing_root: None,
+            },
+            SignedAttestation {
+                pubkey: "0x1234".to_string(),
+                source_epoch: 15,
+                target_epoch: 20,
+                signing_root: None,
+            },
+        ];
+
+        for a in &attestations {
+            db.insert_attestation(a).expect("failed to insert");
+        }
+
+        // New: source=4, target=21 - surrounds both
+        let result = db.is_safe_to_sign("0x1234", 4, 21);
+        assert!(result.is_err());
     }
 }
