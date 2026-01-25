@@ -15,6 +15,12 @@ pub enum SlashingError {
 
     #[error("attestation slashable: {0}")]
     SlashableAttestation(#[from] AttestationSlashingViolation),
+
+    #[error("genesis validators root mismatch: expected {expected}, got {actual}")]
+    GenesisValidatorsRootMismatch { expected: String, actual: String },
+
+    #[error("invalid interchange format: {0}")]
+    InvalidInterchangeFormat(String),
 }
 
 /// Specific types of attestation slashing violations per EIP-3076.
