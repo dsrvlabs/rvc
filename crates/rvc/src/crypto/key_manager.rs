@@ -297,6 +297,14 @@ impl KeyManager {
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
+
+    /// Inserts a secret key into the key manager.
+    /// This is only available for testing purposes.
+    #[cfg(test)]
+    pub fn insert(&mut self, secret_key: SecretKey) {
+        let pubkey = secret_key.public_key();
+        self.keys.insert(pubkey.to_bytes(), secret_key);
+    }
 }
 
 impl Default for KeyManager {
