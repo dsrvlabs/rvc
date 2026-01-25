@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::beacon::BeaconError;
+use beacon::BeaconError;
 
 /// Errors that can occur during attestation propagation.
 #[derive(Error, Debug)]

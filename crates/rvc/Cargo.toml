@@ -9,7 +9,7 @@ repository.workspace = true
 [dependencies]
 aes.workspace = true
 axum.workspace = true
-beacon-client.workspace = true
+beacon.workspace = true
 blst.workspace = true
 ctr.workspace = true
 hex.workspace = true

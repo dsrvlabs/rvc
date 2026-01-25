@@ -9,7 +9,6 @@ use std::time::Duration;
 
 use tracing::info;
 
-use crate::beacon::{BeaconClient, BeaconClientConfig};
 use crate::crypto::{Fork, KeyManager, PublicKey, Root};
 use crate::duty_tracker::DutyTracker;
 use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle};
@@ -17,6 +16,7 @@ use crate::propagator::{AttestationSubmitter, Propagator};
 use crate::signer::SignerService;
 use crate::slashing::SlashingDb;
 use crate::timing::{SlotClock, SystemSlotClock};
+use beacon::{BeaconClient, BeaconClientConfig};
 
 use super::error::ConfigError;
 use super::types::Config;
@@ -27,7 +27,7 @@ where
     C: SlotClock + 'static,
     S: AttestationSubmitter + 'static,
 {
-    pub beacon_client: Arc<BeaconClient>,
+    pub beacon: Arc<BeaconClient>,
     pub key_manager: Arc<KeyManager>,
     pub slashing_db: Arc<SlashingDb>,
     pub signer: Arc<SignerService>,
@@ -49,7 +49,7 @@ impl ServiceBuilder {
         Self { config }
     }
 
-    pub fn build_beacon_client(&self) -> Result<Arc<BeaconClient>, ConfigError> {
+    pub fn build_beacon(&self) -> Result<Arc<BeaconClient>, ConfigError> {
         let beacon_config = BeaconClientConfig::new(&self.config.beacon_url)
             .with_timeout(Duration::from_secs(30))
             .with_max_retries(3);
@@ -110,10 +110,10 @@ impl ServiceBuilder {
 
     pub fn build_duty_tracker(
         &self,
-        beacon_client: Arc<BeaconClient>,
+        beacon: Arc<BeaconClient>,
         validator_indices: Vec<String>,
     ) -> Arc<DutyTracker> {
-        let tracker = DutyTracker::new(beacon_client, validator_indices);
+        let tracker = DutyTracker::new(beacon, validator_indices);
         info!("Created duty tracker");
         Arc::new(tracker)
     }
@@ -199,22 +199,22 @@ impl ServiceBuilder {
         ),
         ConfigError,
     > {
-        let beacon_client = self.build_beacon_client()?;
+        let beacon = self.build_beacon()?;
         let key_manager = self.build_key_manager()?;
         let slashing_db = self.build_slashing_db()?;
         let signer = self.build_signer(key_manager.clone(), slashing_db.clone());
-        let propagator = self.build_propagator(beacon_client.clone());
+        let propagator = self.build_propagator(beacon.clone());
         let slot_clock = self.build_slot_clock()?;
         let pubkey_map = self.build_pubkey_map(&key_manager);
 
         let validator_indices: Vec<String> = pubkey_map.keys().cloned().collect();
-        let duty_tracker = self.build_duty_tracker(beacon_client.clone(), validator_indices);
+        let duty_tracker = self.build_duty_tracker(beacon.clone(), validator_indices);
 
         let genesis_validators_root = self.parse_genesis_validators_root()?;
         let fork = self.build_fork();
 
         let services = BuiltServices {
-            beacon_client,
+            beacon,
             key_manager,
             slashing_db,
             signer,
@@ -235,7 +235,7 @@ impl ServiceBuilder {
                 services.duty_tracker,
                 services.signer,
                 services.propagator,
-                services.beacon_client,
+                services.beacon,
                 config,
                 services.pubkey_map,
             )
@@ -266,10 +266,10 @@ mod tests {
     }
 
     #[test]
-    fn test_build_beacon_client() {
+    fn test_build_beacon() {
         let config = create_minimal_config();
         let builder = ServiceBuilder::new(config);
-        let result = builder.build_beacon_client();
+        let result = builder.build_beacon();
         assert!(result.is_ok());
     }
 
@@ -386,8 +386,8 @@ mod tests {
         let config = create_minimal_config();
         let builder = ServiceBuilder::new(config);
 
-        let beacon_client = builder.build_beacon_client().unwrap();
-        let tracker = builder.build_duty_tracker(beacon_client, vec!["1234".to_string()]);
+        let beacon = builder.build_beacon().unwrap();
+        let tracker = builder.build_duty_tracker(beacon, vec!["1234".to_string()]);
 
         assert!(Arc::strong_count(&tracker) > 0);
     }

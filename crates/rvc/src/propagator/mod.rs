@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
-use crate::beacon::{Attestation, BeaconClient, BeaconError, SubmitAttestationResult};
 use crate::metrics::definitions::{attestation_status, RVC_ATTESTATIONS_TOTAL};
+use beacon::{Attestation, BeaconClient, BeaconError, SubmitAttestationResult};
 
 pub use error::PropagatorError;
 
@@ -130,7 +130,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::beacon::{AttestationData, Checkpoint, IndexedAttestationError};
+    use beacon::{AttestationData, Checkpoint, IndexedAttestationError};
 
     struct MockSubmitter {
         result: tokio::sync::Mutex<SubmitAttestationResult>,
