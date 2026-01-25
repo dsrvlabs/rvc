@@ -8,7 +8,7 @@ mod error;
 mod types;
 
 pub use db::SlashingDb;
-pub use error::SlashingError;
+pub use error::{AttestationSlashingViolation, SlashingError};
 pub use types::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata,
     SignedAttestation, SignedBlock, ValidatorRecord,
