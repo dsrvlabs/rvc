@@ -20,6 +20,9 @@ const CHECKSUM_SHA256: &str = "sha256";
 const DERIVED_KEY_LEN: usize = 32;
 const AES_KEY_LEN: usize = 16;
 
+const MIN_PBKDF2_C: u32 = 10_000;
+const MAX_PBKDF2_C: u32 = 10_000_000;
+
 const MAX_SCRYPT_N: u32 = 1 << 22;
 const MAX_SCRYPT_R: u32 = 16;
 const MAX_SCRYPT_P: u32 = 16;
@@ -215,6 +218,19 @@ impl Keystore {
             return Err(KeystoreError::KeyDerivationFailed(format!(
                 "unsupported PRF: {}",
                 params.prf
+            )));
+        }
+
+        if params.c < MIN_PBKDF2_C {
+            return Err(KeystoreError::InvalidPbkdf2Params(format!(
+                "iteration count ({}) below minimum ({})",
+                params.c, MIN_PBKDF2_C
+            )));
+        }
+        if params.c > MAX_PBKDF2_C {
+            return Err(KeystoreError::InvalidPbkdf2Params(format!(
+                "iteration count ({}) exceeds maximum ({})",
+                params.c, MAX_PBKDF2_C
             )));
         }
 
@@ -671,6 +687,84 @@ mod tests {
         let public_key = secret_key.public_key();
         assert!(signature.verify(&public_key, message).is_ok());
     }
+
+    // ========== PBKDF2 iteration count validation tests ==========
+
+    #[test]
+    fn test_pbkdf2_c_below_minimum() {
+        let json = r#"
+        {
+            "crypto": {
+                "kdf": {
+                    "function": "pbkdf2",
+                    "params": {
+                        "dklen": 32,
+                        "c": 1,
+                        "prf": "hmac-sha256",
+                        "salt": "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"
+                    },
+                    "message": ""
+                },
+                "checksum": { "function": "sha256", "params": {}, "message": "aa" },
+                "cipher": { "function": "aes-128-ctr", "params": { "iv": "aa" }, "message": "aa" }
+            },
+            "path": "m/12381/60/0/0",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "version": 4
+        }
+        "#;
+        let keystore = Keystore::from_json(json).expect("should parse");
+        let result = keystore.decrypt(b"test");
+        assert!(
+            matches!(result, Err(KeystoreError::InvalidPbkdf2Params(ref msg)) if msg.contains("below minimum"))
+        );
+    }
+
+    #[test]
+    fn test_pbkdf2_c_above_maximum() {
+        let json = r#"
+        {
+            "crypto": {
+                "kdf": {
+                    "function": "pbkdf2",
+                    "params": {
+                        "dklen": 32,
+                        "c": 100000000,
+                        "prf": "hmac-sha256",
+                        "salt": "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"
+                    },
+                    "message": ""
+                },
+                "checksum": { "function": "sha256", "params": {}, "message": "aa" },
+                "cipher": { "function": "aes-128-ctr", "params": { "iv": "aa" }, "message": "aa" }
+            },
+            "path": "m/12381/60/0/0",
+            "uuid": "00000000-0000-0000-0000-000000000000",
+            "version": 4
+        }
+        "#;
+        let keystore = Keystore::from_json(json).expect("should parse");
+        let result = keystore.decrypt(b"test");
+        assert!(
+            matches!(result, Err(KeystoreError::InvalidPbkdf2Params(ref msg)) if msg.contains("exceeds maximum"))
+        );
+    }
+
+    #[test]
+    fn test_pbkdf2_default_params_valid() {
+        let keystore = Keystore::from_json(EIP2335_PBKDF2_TEST_VECTOR).expect("should parse");
+        match &keystore.crypto.kdf.params {
+            KdfParams::Pbkdf2(params) => {
+                assert!(params.c >= MIN_PBKDF2_C, "default c should be above minimum");
+                assert!(params.c <= MAX_PBKDF2_C, "default c should be below maximum");
+            }
+            _ => panic!("expected pbkdf2 params"),
+        }
+        let result = keystore.decrypt(EIP2335_PASSWORD);
+        assert!(result.is_ok(), "EIP-2335 default params should work: {:?}", result.err());
+    }
+
+    // ========== Scrypt DoS protection tests ==========
 
     #[test]
     fn test_scrypt_n_exceeds_max() {

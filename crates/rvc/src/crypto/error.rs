@@ -43,6 +43,9 @@ pub enum KeystoreError {
     #[error("Invalid scrypt parameters: {0}")]
     InvalidScryptParams(String),
 
+    #[error("Invalid PBKDF2 parameters: {0}")]
+    InvalidPbkdf2Params(String),
+
     #[error("Key derivation failed: {0}")]
     KeyDerivationFailed(String),
 
