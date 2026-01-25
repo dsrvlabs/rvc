@@ -3,6 +3,8 @@
 //! This module provides a global metrics registry and helper macros for
 //! registering and using prometheus metrics.
 
+pub mod server;
+
 use lazy_static::lazy_static;
 use prometheus::{Counter, Gauge, Histogram, HistogramOpts, Opts, Registry};
 
