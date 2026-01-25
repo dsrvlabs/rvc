@@ -251,7 +251,8 @@ mod tests {
             ],
         };
 
-        let json = serde_json::to_string_pretty(&interchange).expect("serialization should succeed");
+        let json =
+            serde_json::to_string_pretty(&interchange).expect("serialization should succeed");
         let deserialized: InterchangeFormat =
             serde_json::from_str(&json).expect("deserialization should succeed");
 
@@ -325,8 +326,7 @@ mod tests {
             metadata: InterchangeMetadata {
                 interchange_format_version: "5".to_string(),
                 genesis_validators_root:
-                    "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673"
-                        .to_string(),
+                    "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673".to_string(),
             },
             data: vec![],
         };
@@ -363,8 +363,7 @@ mod tests {
             metadata: InterchangeMetadata {
                 interchange_format_version: "5".to_string(),
                 genesis_validators_root:
-                    "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673"
-                        .to_string(),
+                    "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673".to_string(),
             },
             data: vec![
                 ValidatorRecord {
