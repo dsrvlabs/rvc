@@ -5,7 +5,7 @@
 //! and slashing protection.
 
 use lazy_static::lazy_static;
-use prometheus::{HistogramOpts, HistogramVec, IntCounterVec, Opts};
+use prometheus::{Gauge, HistogramOpts, HistogramVec, IntCounterVec, Opts};
 
 use super::REGISTRY;
 
@@ -117,6 +117,58 @@ lazy_static! {
             .expect("Failed to register rvc_slashing_protection_checks_total metric");
         counter
     };
+
+    /// Counter for slots processed by the orchestrator.
+    pub static ref RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_orchestrator_slots_processed_total",
+            "Total number of slots processed by the orchestrator"
+        );
+        let counter = IntCounterVec::new(opts, &["result"])
+            .expect("Failed to create rvc_orchestrator_slots_processed_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_orchestrator_slots_processed_total metric");
+        counter
+    };
+
+    /// Counter for missed slots.
+    pub static ref RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_orchestrator_missed_slots_total",
+            "Total number of missed attestation slots"
+        );
+        let counter = IntCounterVec::new(opts, &[])
+            .expect("Failed to create rvc_orchestrator_missed_slots_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_orchestrator_missed_slots_total metric");
+        counter
+    };
+
+    /// Gauge for currently active attestation tasks.
+    pub static ref RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS: Gauge = {
+        let opts = Opts::new(
+            "rvc_orchestrator_active_attestations",
+            "Number of currently active attestation tasks"
+        );
+        let gauge = Gauge::with_opts(opts)
+            .expect("Failed to create rvc_orchestrator_active_attestations metric");
+        REGISTRY.register(Box::new(gauge.clone()))
+            .expect("Failed to register rvc_orchestrator_active_attestations metric");
+        gauge
+    };
+
+    /// Histogram for slot processing duration in seconds.
+    pub static ref RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS: HistogramVec = {
+        let opts = HistogramOpts::new(
+            "rvc_orchestrator_slot_processing_duration_seconds",
+            "Duration of slot processing operations in seconds"
+        ).buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0]);
+        let histogram = HistogramVec::new(opts, &[])
+            .expect("Failed to create rvc_orchestrator_slot_processing_duration_seconds metric");
+        REGISTRY.register(Box::new(histogram.clone()))
+            .expect("Failed to register rvc_orchestrator_slot_processing_duration_seconds metric");
+        histogram
+    };
 }
 
 /// Initializes all core metrics by accessing the lazy_static variables.
@@ -130,6 +182,10 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_SIGNING_DURATION_SECONDS);
     lazy_static::initialize(&RVC_BEACON_REQUESTS_TOTAL);
     lazy_static::initialize(&RVC_SLASHING_PROTECTION_CHECKS_TOTAL);
+    lazy_static::initialize(&RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL);
+    lazy_static::initialize(&RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL);
+    lazy_static::initialize(&RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS);
+    lazy_static::initialize(&RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS);
 }
 
 /// Attestation status label values.
@@ -156,6 +212,13 @@ pub mod cache_operation {
     pub const HIT: &str = "hit";
     pub const MISS: &str = "miss";
     pub const INVALIDATION: &str = "invalidation";
+}
+
+/// Orchestrator slot processing result label values.
+pub mod orchestrator_result {
+    pub const SUCCESS: &str = "success";
+    pub const FAILED: &str = "failed";
+    pub const NO_DUTIES: &str = "no_duties";
 }
 
 #[cfg(test)]
