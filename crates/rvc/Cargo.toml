@@ -33,6 +33,7 @@ prometheus.workspace = true
 lazy_static.workspace = true
 secrecy.workspace = true
 zeroize.workspace = true
+rusqlite.workspace = true
 subtle = "2.6"
 
 [build-dependencies]
