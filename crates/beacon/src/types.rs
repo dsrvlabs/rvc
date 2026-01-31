@@ -17,10 +17,11 @@ pub struct AttestationData {
     pub target: Checkpoint,
 }
 
-/// A signed attestation containing aggregation bits, data, and signature.
+/// A single attestation in the Electra (v2) `SingleAttestation` format.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attestation {
-    pub aggregation_bits: String,
+    pub committee_index: u64,
+    pub attester_index: u64,
     pub data: AttestationData,
     pub signature: String,
 }
@@ -66,6 +67,23 @@ pub type AttesterDutiesResponse = DependentRootResponse<Vec<AttesterDuty>>;
 
 /// Response type for attestation data endpoint.
 pub type AttestationDataResponse = DataResponse<AttestationData>;
+
+/// Validator information from the beacon state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatorData {
+    pub index: String,
+    pub status: String,
+    pub validator: ValidatorInfo,
+}
+
+/// Public key information for a validator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatorInfo {
+    pub pubkey: String,
+}
+
+/// Response type for the validators state endpoint.
+pub type ValidatorsResponse = DataResponse<Vec<ValidatorData>>;
 
 /// Error details for a single attestation that failed validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,7 +166,8 @@ mod tests {
     #[test]
     fn test_attestation_deserialize() {
         let json = r#"{
-            "aggregation_bits": "0x01",
+            "committee_index": 1,
+            "attester_index": 42,
             "data": {
                 "slot": "1000",
                 "index": "1",
@@ -166,7 +185,8 @@ mod tests {
         }"#;
 
         let attestation: Attestation = serde_json::from_str(json).unwrap();
-        assert_eq!(attestation.aggregation_bits, "0x01");
+        assert_eq!(attestation.committee_index, 1);
+        assert_eq!(attestation.attester_index, 42);
         assert_eq!(attestation.data.slot, "1000");
         assert_eq!(attestation.signature, "0xsignature");
     }

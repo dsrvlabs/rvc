@@ -11,10 +11,16 @@ name = "rvc"
 path = "src/main.rs"
 
 [dependencies]
+beacon.workspace = true
 rvc.workspace = true
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow.workspace = true
 tonic.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+libc = "0.2"
