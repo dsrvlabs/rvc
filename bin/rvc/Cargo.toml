@@ -11,6 +11,7 @@ name = "rvc"
 path = "src/main.rs"
 
 [dependencies]
+beacon.workspace = true
 rvc.workspace = true
 tokio.workspace = true
 clap.workspace = true

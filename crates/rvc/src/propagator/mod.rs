@@ -100,6 +100,14 @@ impl<S: AttestationSubmitter> Propagator<S> {
                 let failure_count = failures.len();
                 let success_count = total.saturating_sub(failure_count);
 
+                if failure_count == 0 {
+                    info!(count = total, "Successfully propagated all attestations");
+                    RVC_ATTESTATIONS_TOTAL
+                        .with_label_values(&[attestation_status::SUCCESS])
+                        .inc_by(total as u64);
+                    return Ok(PropagationResult { total, success_count: total, failure_count: 0 });
+                }
+
                 for failure in &failures {
                     warn!(
                         index = failure.index,
@@ -190,7 +198,8 @@ mod tests {
 
     fn create_test_attestation(slot: &str, index: &str) -> Attestation {
         Attestation {
-            aggregation_bits: "0x01".to_string(),
+            committee_index: index.parse().unwrap_or(0),
+            attester_index: 0,
             data: AttestationData {
                 slot: slot.to_string(),
                 index: index.to_string(),
@@ -385,6 +394,22 @@ mod tests {
         assert!(!result.is_success());
         assert!(!result.is_partial_success());
         assert!(!result.is_complete_failure());
+    }
+
+    #[tokio::test]
+    async fn test_propagate_batch_partial_failure_with_empty_failures() {
+        let submitter = Arc::new(MockSubmitter::new(SubmitAttestationResult::PartialFailure {
+            failures: vec![],
+        }));
+        let propagator = Propagator::new(submitter.clone());
+
+        let attestations = vec![create_test_attestation("1000", "1")];
+        let result = propagator.propagate_batch(&attestations).await.unwrap();
+
+        assert!(result.is_success());
+        assert_eq!(result.total, 1);
+        assert_eq!(result.success_count, 1);
+        assert_eq!(result.failure_count, 0);
     }
 
     #[tokio::test]

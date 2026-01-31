@@ -187,8 +187,13 @@ impl ServiceBuilder {
     }
 
     /// Builds all services and returns them along with the orchestrator handle.
+    ///
+    /// The `validator_indices` parameter should contain numeric validator indices
+    /// resolved from the beacon node. Callers should use `BeaconClient::get_validators`
+    /// to resolve public keys to indices before calling this method.
     pub fn build_all(
         self,
+        validator_indices: Vec<String>,
     ) -> Result<
         (
             BuiltServices<SystemSlotClock, BeaconClient>,
@@ -207,7 +212,6 @@ impl ServiceBuilder {
         let slot_clock = self.build_slot_clock()?;
         let pubkey_map = self.build_pubkey_map(&key_manager);
 
-        let validator_indices: Vec<String> = pubkey_map.keys().cloned().collect();
         let duty_tracker = self.build_duty_tracker(beacon.clone(), validator_indices);
 
         let genesis_validators_root = self.parse_genesis_validators_root()?;

@@ -6,7 +6,7 @@ use tracing::{debug, warn};
 
 use crate::types::{
     Attestation, AttestationDataResponse, AttesterDutiesResponse, IndexedAttestationError,
-    SubmitAttestationResult,
+    SubmitAttestationResult, ValidatorsResponse,
 };
 use crate::BeaconError;
 
@@ -125,6 +125,20 @@ impl BeaconClient {
         self.post(&path, &validator_indices).await
     }
 
+    /// Resolves public keys to validator data including numeric indices.
+    ///
+    /// Calls the beacon state validators endpoint with the given public keys
+    /// to retrieve their validator indices, status, and other metadata.
+    pub async fn get_validators(
+        &self,
+        pubkeys: &[String],
+    ) -> Result<ValidatorsResponse, BeaconError> {
+        let ids: String =
+            pubkeys.iter().map(|pk| format!("id={}", pk)).collect::<Vec<_>>().join("&");
+        let path = format!("/eth/v1/beacon/states/head/validators?{}", ids);
+        self.get(&path).await
+    }
+
     /// Fetches attestation data for the given slot and committee index.
     ///
     /// The beacon node will return attestation data that validators can use
@@ -155,7 +169,7 @@ impl BeaconClient {
         &self,
         attestations: &[Attestation],
     ) -> Result<SubmitAttestationResult, BeaconError> {
-        let url = format!("{}/eth/v1/beacon/pool/attestations", self.config.endpoint);
+        let url = format!("{}/eth/v2/beacon/pool/attestations", self.config.endpoint);
         let mut last_error = None;
 
         for attempt in 0..=self.config.max_retries {
@@ -178,6 +192,9 @@ impl BeaconClient {
                         if let Ok(error_response) =
                             serde_json::from_str::<AttestationSubmissionError>(&body)
                         {
+                            if error_response.failures.is_empty() {
+                                return Err(BeaconError::ApiError { status: 400, message: body });
+                            }
                             return Ok(SubmitAttestationResult::PartialFailure {
                                 failures: error_response.failures,
                             });
@@ -1107,7 +1124,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/eth/v1/beacon/pool/attestations"))
+            .and(path("/eth/v2/beacon/pool/attestations"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock_server)
@@ -1117,7 +1134,7 @@ mod tests {
         let client = BeaconClient::new(config).unwrap();
 
         let attestation = crate::types::Attestation {
-            aggregation_bits: "0x01".to_string(),
+            attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
                 index: "1".to_string(),
@@ -1134,6 +1151,7 @@ mod tests {
                         .to_string(),
                 },
             },
+            committee_index: 0,
             signature: "0xsignature".to_string(),
         };
 
@@ -1157,7 +1175,7 @@ mod tests {
         });
 
         Mock::given(method("POST"))
-            .and(path("/eth/v1/beacon/pool/attestations"))
+            .and(path("/eth/v2/beacon/pool/attestations"))
             .respond_with(ResponseTemplate::new(400).set_body_json(&error_response))
             .expect(1)
             .mount(&mock_server)
@@ -1167,7 +1185,7 @@ mod tests {
         let client = BeaconClient::new(config).unwrap();
 
         let attestation = crate::types::Attestation {
-            aggregation_bits: "0x01".to_string(),
+            attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
                 index: "1".to_string(),
@@ -1181,6 +1199,7 @@ mod tests {
                     root: "0x2222".to_string(),
                 },
             },
+            committee_index: 0,
             signature: "0xinvalid".to_string(),
         };
 
@@ -1196,7 +1215,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/eth/v1/beacon/pool/attestations"))
+            .and(path("/eth/v2/beacon/pool/attestations"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
             .expect(4)
             .mount(&mock_server)
@@ -1208,7 +1227,7 @@ mod tests {
         let client = BeaconClient::new(config).unwrap();
 
         let attestation = crate::types::Attestation {
-            aggregation_bits: "0x01".to_string(),
+            attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
                 index: "1".to_string(),
@@ -1222,6 +1241,7 @@ mod tests {
                     root: "0x2222".to_string(),
                 },
             },
+            committee_index: 0,
             signature: "0xsignature".to_string(),
         };
 
@@ -1240,7 +1260,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/eth/v1/beacon/pool/attestations"))
+            .and(path("/eth/v2/beacon/pool/attestations"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock_server)
@@ -1250,7 +1270,7 @@ mod tests {
         let client = BeaconClient::new(config).unwrap();
 
         let attestation1 = crate::types::Attestation {
-            aggregation_bits: "0x01".to_string(),
+            attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
                 index: "1".to_string(),
@@ -1264,11 +1284,12 @@ mod tests {
                     root: "0x2222".to_string(),
                 },
             },
+            committee_index: 0,
             signature: "0xsignature1".to_string(),
         };
 
         let attestation2 = crate::types::Attestation {
-            aggregation_bits: "0x02".to_string(),
+            attester_index: 1,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
                 index: "2".to_string(),
@@ -1282,6 +1303,7 @@ mod tests {
                     root: "0x2222".to_string(),
                 },
             },
+            committee_index: 0,
             signature: "0xsignature2".to_string(),
         };
 
@@ -1305,7 +1327,7 @@ mod tests {
         });
 
         Mock::given(method("POST"))
-            .and(path("/eth/v1/beacon/pool/attestations"))
+            .and(path("/eth/v2/beacon/pool/attestations"))
             .respond_with(ResponseTemplate::new(400).set_body_json(&error_response))
             .expect(1)
             .mount(&mock_server)
@@ -1315,7 +1337,7 @@ mod tests {
         let client = BeaconClient::new(config).unwrap();
 
         let attestation1 = crate::types::Attestation {
-            aggregation_bits: "0x01".to_string(),
+            attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
                 index: "1".to_string(),
@@ -1329,11 +1351,12 @@ mod tests {
                     root: "0x2222".to_string(),
                 },
             },
+            committee_index: 0,
             signature: "0xvalid".to_string(),
         };
 
         let attestation2 = crate::types::Attestation {
-            aggregation_bits: "0x02".to_string(),
+            attester_index: 1,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
                 index: "2".to_string(),
@@ -1347,6 +1370,7 @@ mod tests {
                     root: "0x2222".to_string(),
                 },
             },
+            committee_index: 0,
             signature: "0xinvalid".to_string(),
         };
 
@@ -1357,11 +1381,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_submit_attestation_400_with_empty_failures() {
+        let mock_server = MockServer::start().await;
+
+        let error_response = serde_json::json!({
+            "code": 400,
+            "message": "Bad request",
+            "failures": []
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/pool/attestations"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(&error_response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let attestation = crate::types::Attestation {
+            attester_index: 0,
+            data: crate::types::AttestationData {
+                slot: "1000".to_string(),
+                index: "1".to_string(),
+                beacon_block_root: "0xabcdef".to_string(),
+                source: crate::types::Checkpoint {
+                    epoch: "100".to_string(),
+                    root: "0x1111".to_string(),
+                },
+                target: crate::types::Checkpoint {
+                    epoch: "101".to_string(),
+                    root: "0x2222".to_string(),
+                },
+            },
+            committee_index: 0,
+            signature: "0xsignature".to_string(),
+        };
+
+        let result = client.submit_attestation(&[attestation]).await;
+        match result {
+            Err(BeaconError::ApiError { status, .. }) => {
+                assert_eq!(status, 400);
+            }
+            _ => panic!("Expected ApiError for 400 with empty failures"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_submit_attestation_empty_array() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/eth/v1/beacon/pool/attestations"))
+            .and(path("/eth/v2/beacon/pool/attestations"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock_server)

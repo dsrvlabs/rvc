@@ -441,41 +441,23 @@ where
             }
         };
 
-        let committee_length: u64 = match duty.committee_length.parse() {
-            Ok(c) => c,
-            Err(_) => {
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!(
-                        "Invalid committee_length in duty: {}",
-                        duty.committee_length
-                    )),
-                };
-            }
-        };
-
-        let validator_committee_index: u64 = match duty.validator_committee_index.parse() {
+        let attester_index: u64 = match validator_index.parse() {
             Ok(v) => v,
             Err(_) => {
+                let error =
+                    format!("Invalid validator_index in duty: {}", validator_index);
                 return AttestationResult {
                     validator_index,
                     slot,
                     success: false,
-                    error: Some(format!(
-                        "Invalid validator_committee_index in duty: {}",
-                        duty.validator_committee_index
-                    )),
+                    error: Some(error),
                 };
             }
         };
 
-        let aggregation_bits =
-            Self::create_aggregation_bits(committee_length, validator_committee_index);
-
         let attestation = Attestation {
-            aggregation_bits,
+            committee_index,
+            attester_index,
             data: beacon_attestation_data,
             signature: format!("0x{}", hex::encode(signature.to_bytes())),
         };
@@ -581,28 +563,6 @@ where
         Ok(root)
     }
 
-    /// Creates an SSZ-encoded aggregation bitfield with a single bit set.
-    ///
-    /// The bitfield uses little-endian bit ordering within each byte:
-    /// - Validator 0 sets bit 0 of byte 0 (0x01)
-    /// - Validator 7 sets bit 7 of byte 0 (0x80)
-    /// - Validator 8 sets bit 0 of byte 1 (0x0001)
-    ///
-    /// Returns a hex string with "0x" prefix.
-    fn create_aggregation_bits(committee_length: u64, validator_index: u64) -> String {
-        let byte_length = committee_length.div_ceil(8);
-        let mut bits = vec![0u8; byte_length as usize];
-
-        if validator_index < committee_length {
-            let byte_index = (validator_index / 8) as usize;
-            let bit_index = validator_index % 8;
-            if byte_index < bits.len() {
-                bits[byte_index] |= 1 << bit_index;
-            }
-        }
-
-        format!("0x{}", hex::encode(bits))
-    }
 }
 
 #[cfg(test)]
@@ -690,27 +650,6 @@ mod tests {
         let config = OrchestratorConfig::new([0xcc; 32], create_test_fork())
             .with_shutdown_timeout(Duration::from_secs(60));
         assert_eq!(config.shutdown_timeout, Duration::from_secs(60));
-    }
-
-    #[test]
-    fn test_create_aggregation_bits_first_validator() {
-        let bits =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter>::create_aggregation_bits(128, 0);
-        assert_eq!(bits, "0x01000000000000000000000000000000");
-    }
-
-    #[test]
-    fn test_create_aggregation_bits_eighth_validator() {
-        let bits =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter>::create_aggregation_bits(128, 7);
-        assert_eq!(bits, "0x80000000000000000000000000000000");
-    }
-
-    #[test]
-    fn test_create_aggregation_bits_ninth_validator() {
-        let bits =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter>::create_aggregation_bits(128, 8);
-        assert_eq!(bits, "0x00010000000000000000000000000000");
     }
 
     #[test]

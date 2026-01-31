@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use rvc::config::{CliOverrides, Config, Network, ServiceBuilder};
+use rvc::crypto::PublicKey;
 use rvc::duty_tracker::DutyTrackerService;
 use rvc::metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
 use rvc::DutyTrackerServer;
@@ -211,7 +212,7 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
     let propagator = builder.build_propagator(beacon_client.clone());
 
     let pubkey_map = builder.build_pubkey_map(&key_manager);
-    let validator_indices: Vec<String> = pubkey_map.keys().cloned().collect();
+    let validator_indices = resolve_validator_indices(&beacon_client, &pubkey_map).await;
     let duty_tracker = builder.build_duty_tracker(beacon_client.clone(), validator_indices);
 
     let slot_clock = match builder.build_slot_clock() {
@@ -293,6 +294,35 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
 
     info!("Validator client shut down complete");
     Ok(())
+}
+
+async fn resolve_validator_indices(
+    beacon_client: &beacon::BeaconClient,
+    pubkey_map: &std::collections::HashMap<String, PublicKey>,
+) -> Vec<String> {
+    if pubkey_map.is_empty() {
+        return Vec::new();
+    }
+
+    let pubkeys: Vec<String> = pubkey_map.keys().cloned().collect();
+    match beacon_client.get_validators(&pubkeys).await {
+        Ok(response) => {
+            let indices: Vec<String> = response.data.iter().map(|v| v.index.clone()).collect();
+            if indices.len() < pubkeys.len() {
+                warn!(
+                    resolved = indices.len(),
+                    total = pubkeys.len(),
+                    "Some validator public keys could not be resolved to indices"
+                );
+            }
+            info!(count = indices.len(), "Resolved validator indices");
+            indices
+        }
+        Err(e) => {
+            error!("Failed to resolve validator indices from beacon node: {}", e);
+            Vec::new()
+        }
+    }
 }
 
 async fn shutdown_signal() {

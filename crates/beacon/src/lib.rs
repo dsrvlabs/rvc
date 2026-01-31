@@ -11,5 +11,5 @@ pub use error::BeaconError;
 pub use types::{
     Attestation, AttestationData, AttestationDataResponse, AttesterDutiesResponse, AttesterDuty,
     BeaconBlockHeader, Checkpoint, DataResponse, DependentRootResponse, IndexedAttestationError,
-    SubmitAttestationResult,
+    SubmitAttestationResult, ValidatorData, ValidatorInfo, ValidatorsResponse,
 };
