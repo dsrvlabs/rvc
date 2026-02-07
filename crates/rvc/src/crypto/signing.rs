@@ -1,7 +1,7 @@
 use tree_hash::TreeHash;
 
 use super::bls::{SecretKey, Signature};
-use super::types::{AttestationData, Domain, DomainType, Fork, ForkData, Root, SigningData};
+use eth_types::{AttestationData, Domain, DomainType, Fork, ForkData, Root, SigningData};
 
 pub const DOMAIN_BEACON_ATTESTER: DomainType = [0x01, 0x00, 0x00, 0x00];
 
@@ -53,7 +53,7 @@ pub fn sign_attestation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::types::Checkpoint;
+    use eth_types::Checkpoint;
     use tree_hash::TreeHash;
 
     #[test]

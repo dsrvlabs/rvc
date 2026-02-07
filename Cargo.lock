@@ -2673,6 +2673,7 @@ dependencies = [
  "rand 0.8.5",
  "reqwest",
  "rusqlite",
+ "rvc-eth-types",
  "scrypt",
  "secrecy",
  "serde",
@@ -2709,6 +2710,16 @@ dependencies = [
  "tonic",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rvc-eth-types"
+version = "0.1.0"
+dependencies = [
+ "ethereum_ssz 0.9.1",
+ "ethereum_ssz_derive",
+ "tree_hash",
+ "tree_hash_derive",
 ]
 
 [[package]]
