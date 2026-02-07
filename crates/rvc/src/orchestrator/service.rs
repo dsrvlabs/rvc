@@ -444,8 +444,7 @@ where
         let attester_index: u64 = match validator_index.parse() {
             Ok(v) => v,
             Err(_) => {
-                let error =
-                    format!("Invalid validator_index in duty: {}", validator_index);
+                let error = format!("Invalid validator_index in duty: {}", validator_index);
                 return AttestationResult {
                     validator_index,
                     slot,
@@ -562,7 +561,6 @@ where
         root.copy_from_slice(&bytes);
         Ok(root)
     }
-
 }
 
 #[cfg(test)]

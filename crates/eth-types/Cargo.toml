@@ -1,0 +1,13 @@
+[package]
+name = "rvc-eth-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ssz.workspace = true
+ssz_derive.workspace = true
+tree_hash.workspace = true
+tree_hash_derive.workspace = true
