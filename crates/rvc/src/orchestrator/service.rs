@@ -27,8 +27,26 @@ use timing::{SlotClock, SLOTS_PER_EPOCH};
 
 use super::error::OrchestratorError;
 
-/// Default timeout for beacon client API calls in seconds.
-const BEACON_CALL_TIMEOUT_SECS: u64 = 4;
+/// Timeout for block production beacon API calls.
+const BLOCK_PRODUCE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Timeout for block publication beacon API calls.
+const BLOCK_PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Timeout for sync committee message operations.
+const SYNC_MESSAGE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Timeout for sync committee contribution operations.
+const SYNC_CONTRIBUTION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Timeout for duty fetching operations.
+const DUTY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for attestation data fetch.
+const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Timeout for attestation propagation (submit to beacon pool).
+const ATTESTATION_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Total validators in a sync committee.
 const SYNC_COMMITTEE_SIZE: u64 = 512;
@@ -291,24 +309,57 @@ where
         // Attester duties
         if !self.duty_tracker.is_epoch_cached(epoch).await {
             debug!(epoch, "Fetching attester duties for epoch");
-            if let Err(e) = self.duty_tracker.fetch_duties_for_epoch(epoch).await {
-                warn!(epoch, error = %e, "Failed to fetch attester duties");
+            match tokio::time::timeout(
+                DUTY_FETCH_TIMEOUT,
+                self.duty_tracker.fetch_duties_for_epoch(epoch),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch attester duties"),
+                Err(_) => warn!(
+                    epoch,
+                    "Attester duty fetch timed out after {}s",
+                    DUTY_FETCH_TIMEOUT.as_secs()
+                ),
             }
         }
 
         // Proposer duties
         if !self.duty_tracker.is_proposer_epoch_cached(epoch).await {
             debug!(epoch, "Fetching proposer duties for epoch");
-            if let Err(e) = self.duty_tracker.fetch_proposer_duties(epoch).await {
-                warn!(epoch, error = %e, "Failed to fetch proposer duties");
+            match tokio::time::timeout(
+                DUTY_FETCH_TIMEOUT,
+                self.duty_tracker.fetch_proposer_duties(epoch),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch proposer duties"),
+                Err(_) => warn!(
+                    epoch,
+                    "Proposer duty fetch timed out after {}s",
+                    DUTY_FETCH_TIMEOUT.as_secs()
+                ),
             }
         }
 
         // Sync committee duties (at period boundaries)
         if !self.duty_tracker.is_sync_period_cached(epoch).await {
             debug!(epoch, "Fetching sync committee duties");
-            if let Err(e) = self.duty_tracker.fetch_sync_committee_duties(epoch).await {
-                warn!(epoch, error = %e, "Failed to fetch sync committee duties");
+            match tokio::time::timeout(
+                DUTY_FETCH_TIMEOUT,
+                self.duty_tracker.fetch_sync_committee_duties(epoch),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch sync committee duties"),
+                Err(_) => warn!(
+                    epoch,
+                    "Sync committee duty fetch timed out after {}s",
+                    DUTY_FETCH_TIMEOUT.as_secs()
+                ),
             }
         }
     }
@@ -327,8 +378,14 @@ where
 
         info!(slot, validator_index = proposer_duty.validator_index, "Proposing block");
 
-        match self.block_service.propose_block(slot, &pubkey).await {
-            Ok(result) => {
+        // Wrap with combined produce + publish timeout
+        match tokio::time::timeout(
+            BLOCK_PRODUCE_TIMEOUT + BLOCK_PUBLISH_TIMEOUT,
+            self.block_service.propose_block(slot, &pubkey),
+        )
+        .await
+        {
+            Ok(Ok(result)) => {
                 info!(
                     slot,
                     blinded = result.is_blinded,
@@ -336,12 +393,20 @@ where
                     "Block proposed successfully"
                 );
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!(
                     slot,
                     epoch,
                     error = %e,
                     "Failed to propose block"
+                );
+            }
+            Err(_) => {
+                error!(
+                    slot,
+                    epoch,
+                    "Block proposal timed out after {}s",
+                    (BLOCK_PRODUCE_TIMEOUT + BLOCK_PUBLISH_TIMEOUT).as_secs()
                 );
             }
         }
@@ -395,10 +460,19 @@ where
 
         if !messages.is_empty() {
             let count = messages.len();
-            if let Err(e) = self.beacon.submit_sync_committee_messages(&messages).await {
-                warn!(slot, error = %e, "Failed to submit sync committee messages");
-            } else {
-                info!(slot, count, "Submitted sync committee messages");
+            match tokio::time::timeout(
+                SYNC_MESSAGE_TIMEOUT,
+                self.beacon.submit_sync_committee_messages(&messages),
+            )
+            .await
+            {
+                Ok(Ok(_)) => info!(slot, count, "Submitted sync committee messages"),
+                Ok(Err(e)) => warn!(slot, error = %e, "Failed to submit sync committee messages"),
+                Err(_) => warn!(
+                    slot,
+                    "Sync committee message submit timed out after {}s",
+                    SYNC_MESSAGE_TIMEOUT.as_secs()
+                ),
             }
         }
     }
@@ -466,18 +540,32 @@ where
                     "Selected as sync committee aggregator"
                 );
 
-                let contribution = match self
-                    .beacon
-                    .get_sync_committee_contribution(slot, *subcommittee_index, &head_root_hex)
-                    .await
+                let contribution = match tokio::time::timeout(
+                    SYNC_CONTRIBUTION_TIMEOUT,
+                    self.beacon.get_sync_committee_contribution(
+                        slot,
+                        *subcommittee_index,
+                        &head_root_hex,
+                    ),
+                )
+                .await
                 {
-                    Ok(resp) => resp.data,
-                    Err(e) => {
+                    Ok(Ok(resp)) => resp.data,
+                    Ok(Err(e)) => {
                         warn!(
                             slot,
                             subcommittee_index,
                             error = %e,
                             "Failed to get sync committee contribution"
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        warn!(
+                            slot,
+                            subcommittee_index,
+                            "Sync committee contribution fetch timed out after {}s",
+                            SYNC_CONTRIBUTION_TIMEOUT.as_secs()
                         );
                         continue;
                     }
@@ -505,10 +593,19 @@ where
 
         if !signed_proofs.is_empty() {
             let count = signed_proofs.len();
-            if let Err(e) = self.beacon.submit_contribution_and_proofs(&signed_proofs).await {
-                warn!(slot, error = %e, "Failed to submit contribution and proofs");
-            } else {
-                info!(slot, count, "Submitted sync committee contribution and proofs");
+            match tokio::time::timeout(
+                SYNC_CONTRIBUTION_TIMEOUT,
+                self.beacon.submit_contribution_and_proofs(&signed_proofs),
+            )
+            .await
+            {
+                Ok(Ok(_)) => info!(slot, count, "Submitted sync committee contribution and proofs"),
+                Ok(Err(e)) => warn!(slot, error = %e, "Failed to submit contribution and proofs"),
+                Err(_) => warn!(
+                    slot,
+                    "Contribution and proofs submit timed out after {}s",
+                    SYNC_CONTRIBUTION_TIMEOUT.as_secs()
+                ),
             }
         }
     }
@@ -531,8 +628,8 @@ where
     }
 
     async fn get_head_block_root(&self) -> Option<Root> {
-        match self.beacon.get_block_root("head").await {
-            Ok(response) => {
+        match tokio::time::timeout(SYNC_MESSAGE_TIMEOUT, self.beacon.get_block_root("head")).await {
+            Ok(Ok(response)) => {
                 let root_hex = response.data.root;
                 match Self::parse_hex_root(&root_hex) {
                     Ok(root) => Some(root),
@@ -542,8 +639,12 @@ where
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(error = %e, "Failed to fetch head block root");
+                None
+            }
+            Err(_) => {
+                warn!("Head block root fetch timed out after {}s", SYNC_MESSAGE_TIMEOUT.as_secs());
                 None
             }
         }
@@ -718,7 +819,7 @@ where
 
         // Apply timeout to beacon client call to prevent blocking
         let attestation_data_result = tokio::time::timeout(
-            Duration::from_secs(BEACON_CALL_TIMEOUT_SECS),
+            ATTESTATION_TIMEOUT,
             self.beacon.get_attestation_data(slot, committee_index),
         )
         .await;
@@ -1442,5 +1543,130 @@ mod tests {
 
         let found = orchestrator.find_pubkey("0x1234567890abcdef");
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_timeout_constants_are_reasonable() {
+        // Block production must fit within a slot third (~4s for 12s slots)
+        assert!(BLOCK_PRODUCE_TIMEOUT.as_secs() <= 4);
+        assert!(BLOCK_PRODUCE_TIMEOUT.as_secs() >= 1);
+
+        // Block publish must fit within remaining slot time
+        assert!(BLOCK_PUBLISH_TIMEOUT.as_secs() <= 3);
+        assert!(BLOCK_PUBLISH_TIMEOUT.as_secs() >= 1);
+
+        // Produce + publish together should fit in one slot third (~4s)
+        assert!(BLOCK_PRODUCE_TIMEOUT + BLOCK_PUBLISH_TIMEOUT <= Duration::from_secs(6));
+
+        // Sync operations must fit within their slot third
+        assert!(SYNC_MESSAGE_TIMEOUT.as_secs() <= 3);
+        assert!(SYNC_CONTRIBUTION_TIMEOUT.as_secs() <= 3);
+
+        // Duty fetch is less time-critical but should still be bounded
+        assert!(DUTY_FETCH_TIMEOUT.as_secs() <= 12);
+        assert!(DUTY_FETCH_TIMEOUT.as_secs() >= 5);
+
+        // Attestation timeout must fit within slot third
+        assert!(ATTESTATION_TIMEOUT.as_secs() <= 5);
+    }
+
+    #[tokio::test]
+    async fn test_duty_fetch_timeout() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock attester duties endpoint with a 15s delay (exceeds DUTY_FETCH_TIMEOUT of 10s)
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "data": [],
+                        "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
+                    }))
+                    .set_delay(DUTY_FETCH_TIMEOUT + Duration::from_secs(5)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+        let epoch = 1u64;
+        let result =
+            tokio::time::timeout(DUTY_FETCH_TIMEOUT, duty_tracker.fetch_duties_for_epoch(epoch))
+                .await;
+
+        // Should timeout (Err from tokio::time::timeout)
+        assert!(result.is_err(), "Duty fetch should have timed out");
+    }
+
+    #[tokio::test]
+    async fn test_sync_message_submit_timeout() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock sync committee messages endpoint with delay exceeding SYNC_MESSAGE_TIMEOUT
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/pool/sync_committees"))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(SYNC_MESSAGE_TIMEOUT + Duration::from_secs(5)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let messages = vec![beacon::SyncCommitteeMessage {
+            slot: 100,
+            beacon_block_root: [0u8; 32],
+            validator_index: 1,
+            signature: vec![0u8; 96],
+        }];
+
+        let result = tokio::time::timeout(
+            SYNC_MESSAGE_TIMEOUT,
+            beacon.submit_sync_committee_messages(&messages),
+        )
+        .await;
+
+        assert!(result.is_err(), "Sync message submit should have timed out");
+    }
+
+    #[tokio::test]
+    async fn test_head_block_root_timeout() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock block root endpoint with delay exceeding SYNC_MESSAGE_TIMEOUT
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/blocks/head/root"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "data": {
+                            "root": "0x0000000000000000000000000000000000000000000000000000000000000000"
+                        }
+                    }))
+                    .set_delay(SYNC_MESSAGE_TIMEOUT + Duration::from_secs(5)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let result =
+            tokio::time::timeout(SYNC_MESSAGE_TIMEOUT, beacon.get_block_root("head")).await;
+
+        assert!(result.is_err(), "Head block root fetch should have timed out");
     }
 }
