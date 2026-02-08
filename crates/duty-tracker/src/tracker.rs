@@ -4,11 +4,14 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use beacon::{AttesterDuty, BeaconClient};
-use eth_types::SLOTS_PER_EPOCH;
+use beacon::{AttesterDuty, BeaconClient, ProposerDuty};
+use eth_types::{SyncCommitteeDuty, SLOTS_PER_EPOCH};
 use metrics::definitions::RVC_DUTIES_FETCHED_TOTAL;
 
 use crate::error::DutyTrackerError;
+
+/// Epochs per sync committee period (256 epochs ~ 27 hours).
+const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64 = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DutyCacheKey {
@@ -40,11 +43,21 @@ pub struct DutyTracker {
     beacon: Arc<BeaconClient>,
     validator_indices: Vec<String>,
     cache: RwLock<HashMap<u64, EpochDutyCache>>,
+    /// Proposer duties keyed by epoch -> slot -> ProposerDuty.
+    proposer_cache: RwLock<HashMap<u64, HashMap<u64, ProposerDuty>>>,
+    /// Sync committee duties keyed by sync committee period.
+    sync_committee_cache: RwLock<HashMap<u64, Vec<SyncCommitteeDuty>>>,
 }
 
 impl DutyTracker {
     pub fn new(beacon: Arc<BeaconClient>, validator_indices: Vec<String>) -> Self {
-        Self { beacon, validator_indices, cache: RwLock::new(HashMap::new()) }
+        Self {
+            beacon,
+            validator_indices,
+            cache: RwLock::new(HashMap::new()),
+            proposer_cache: RwLock::new(HashMap::new()),
+            sync_committee_cache: RwLock::new(HashMap::new()),
+        }
     }
 
     pub async fn fetch_duties_for_epoch(
@@ -174,6 +187,90 @@ impl DutyTracker {
     pub async fn get_cached_dependent_root(&self, epoch: u64) -> Option<String> {
         let cache = self.cache.read().await;
         cache.get(&epoch).map(|c| c.dependent_root.clone())
+    }
+
+    pub async fn fetch_proposer_duties(
+        &self,
+        epoch: u64,
+    ) -> Result<Vec<ProposerDuty>, DutyTrackerError> {
+        debug!(epoch = epoch, "Fetching proposer duties for epoch");
+
+        let response = self
+            .beacon
+            .get_proposer_duties(epoch)
+            .await
+            .map_err(DutyTrackerError::BeaconError)?;
+
+        let mut slot_map = HashMap::new();
+        for duty in &response.data {
+            let slot: u64 = duty.slot.parse().unwrap_or(0);
+            slot_map.insert(slot, duty.clone());
+        }
+
+        info!(epoch = epoch, count = response.data.len(), "Cached proposer duties for epoch");
+
+        let mut cache = self.proposer_cache.write().await;
+        cache.insert(epoch, slot_map);
+
+        Ok(response.data)
+    }
+
+    pub async fn get_proposer_duty(&self, slot: u64) -> Option<ProposerDuty> {
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let cache = self.proposer_cache.read().await;
+        cache.get(&epoch).and_then(|m| m.get(&slot)).cloned()
+    }
+
+    pub async fn is_proposer_epoch_cached(&self, epoch: u64) -> bool {
+        let cache = self.proposer_cache.read().await;
+        cache.contains_key(&epoch)
+    }
+
+    pub async fn fetch_sync_committee_duties(
+        &self,
+        epoch: u64,
+    ) -> Result<Vec<SyncCommitteeDuty>, DutyTrackerError> {
+        let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        debug!(epoch = epoch, period = period, "Fetching sync committee duties");
+
+        let response = self
+            .beacon
+            .post_sync_committee_duties(epoch, &self.validator_indices)
+            .await
+            .map_err(DutyTrackerError::BeaconError)?;
+
+        info!(
+            epoch = epoch,
+            period = period,
+            count = response.data.len(),
+            "Cached sync committee duties for period"
+        );
+
+        let mut cache = self.sync_committee_cache.write().await;
+        cache.insert(period, response.data.clone());
+
+        Ok(response.data)
+    }
+
+    pub async fn get_sync_committee_duties(&self, slot: u64) -> Vec<SyncCommitteeDuty> {
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        let cache = self.sync_committee_cache.read().await;
+        cache.get(&period).cloned().unwrap_or_default()
+    }
+
+    pub async fn is_sync_period_cached(&self, epoch: u64) -> bool {
+        let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        let cache = self.sync_committee_cache.read().await;
+        cache.contains_key(&period)
+    }
+
+    pub fn sync_committee_period(epoch: u64) -> u64 {
+        epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+    }
+
+    pub fn is_sync_committee_period_boundary(epoch: u64) -> bool {
+        epoch % EPOCHS_PER_SYNC_COMMITTEE_PERIOD == 0
     }
 
     pub fn is_epoch_boundary_slot(slot: u64) -> bool {
@@ -527,5 +624,197 @@ mod tests {
         map.insert(key1.clone(), "value1");
         assert!(map.contains_key(&key2));
         assert!(!map.contains_key(&key3));
+    }
+
+    // --- Proposer duty tests ---
+
+    fn create_mock_proposer_response(duties: Vec<(u64, &str, &str)>) -> serde_json::Value {
+        let data: Vec<serde_json::Value> = duties
+            .into_iter()
+            .map(|(slot, validator_index, pubkey)| {
+                serde_json::json!({
+                    "pubkey": pubkey,
+                    "validator_index": validator_index,
+                    "slot": slot.to_string()
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "dependent_root": "0xdeproot",
+            "execution_optimistic": false,
+            "data": data
+        })
+    }
+
+    #[tokio::test]
+    async fn test_fetch_proposer_duties_success() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        let response =
+            create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234"), (325, "5678", "0xpubkey_5678")]);
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/duties/proposer/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        let duties = tracker.fetch_proposer_duties(10).await.unwrap();
+
+        assert_eq!(duties.len(), 2);
+        assert!(tracker.is_proposer_epoch_cached(10).await);
+    }
+
+    #[tokio::test]
+    async fn test_get_proposer_duty_found() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        let response = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/duties/proposer/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        tracker.fetch_proposer_duties(10).await.unwrap();
+
+        let duty = tracker.get_proposer_duty(320).await;
+        assert!(duty.is_some());
+        assert_eq!(duty.unwrap().validator_index, "1234");
+    }
+
+    #[tokio::test]
+    async fn test_get_proposer_duty_not_found() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        let response = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/duties/proposer/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        tracker.fetch_proposer_duties(10).await.unwrap();
+
+        let duty = tracker.get_proposer_duty(321).await;
+        assert!(duty.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_get_proposer_duty_epoch_not_cached() {
+        let (_, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+
+        let duty = tracker.get_proposer_duty(320).await;
+        assert!(duty.is_none());
+    }
+
+    // --- Sync committee duty tests ---
+
+    fn create_mock_sync_committee_response(
+        duties: Vec<(u64, &str, Vec<u64>)>,
+    ) -> serde_json::Value {
+        let data: Vec<serde_json::Value> = duties
+            .into_iter()
+            .map(|(validator_index, pubkey, indices)| {
+                serde_json::json!({
+                    "pubkey": pubkey,
+                    "validator_index": validator_index,
+                    "validator_sync_committee_indices": indices.iter().map(|i| i.to_string()).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        serde_json::json!({
+            "execution_optimistic": false,
+            "data": data
+        })
+    }
+
+    #[tokio::test]
+    async fn test_fetch_sync_committee_duties_success() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        let response =
+            create_mock_sync_committee_response(vec![(1234, "0xpubkey_1234", vec![10, 20])]);
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/sync/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        let duties = tracker.fetch_sync_committee_duties(10).await.unwrap();
+
+        assert_eq!(duties.len(), 1);
+        assert!(tracker.is_sync_period_cached(10).await);
+    }
+
+    #[tokio::test]
+    async fn test_get_sync_committee_duties_cached() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        let response =
+            create_mock_sync_committee_response(vec![(1234, "0xpubkey_1234", vec![10, 20])]);
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/sync/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        tracker.fetch_sync_committee_duties(10).await.unwrap();
+
+        let duties = tracker.get_sync_committee_duties(320).await; // slot 320 = epoch 10
+        assert_eq!(duties.len(), 1);
+        assert_eq!(duties[0].validator_index, 1234);
+    }
+
+    #[tokio::test]
+    async fn test_get_sync_committee_duties_not_cached() {
+        let (_, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+
+        let duties = tracker.get_sync_committee_duties(320).await;
+        assert!(duties.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_sync_committee_period_boundary() {
+        assert!(DutyTracker::is_sync_committee_period_boundary(0));
+        assert!(DutyTracker::is_sync_committee_period_boundary(256));
+        assert!(DutyTracker::is_sync_committee_period_boundary(512));
+        assert!(!DutyTracker::is_sync_committee_period_boundary(1));
+        assert!(!DutyTracker::is_sync_committee_period_boundary(255));
+    }
+
+    #[tokio::test]
+    async fn test_sync_committee_period() {
+        assert_eq!(DutyTracker::sync_committee_period(0), 0);
+        assert_eq!(DutyTracker::sync_committee_period(255), 0);
+        assert_eq!(DutyTracker::sync_committee_period(256), 1);
+        assert_eq!(DutyTracker::sync_committee_period(512), 2);
     }
 }
