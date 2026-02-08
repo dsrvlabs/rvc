@@ -1,6 +1,9 @@
 use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
+mod fork;
+pub use fork::{ForkName, ForkSchedule};
+
 pub type Slot = u64;
 pub type Epoch = u64;
 pub type CommitteeIndex = u64;
