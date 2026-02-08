@@ -9,7 +9,9 @@ use eth_types::ForkSchedule;
 use crate::types::{
     parse_fork_schedule, Attestation, AttestationDataResponse, AttesterDutiesResponse,
     ConfigSpecResponse, GenesisResponse, IndexedAttestationError, ProduceBlockResponse,
-    ProposerDutiesResponse, StateForkResponse, SubmitAttestationResult, ValidatorsResponse,
+    ProposerDutiesResponse, SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    ValidatorsResponse,
 };
 use crate::BeaconError;
 
@@ -113,6 +115,11 @@ impl BeaconClient {
     ) -> Result<T, BeaconError> {
         let url = format!("{}{}", self.config.endpoint, path);
         self.execute_with_retry(|| async { self.client.post(&url).json(body).send().await }).await
+    }
+
+    /// Performs a POST request expecting an empty success response.
+    pub async fn post_empty<B: Serialize>(&self, path: &str, body: &B) -> Result<(), BeaconError> {
+        self.post_empty_with_headers(path, body, &[]).await
     }
 
     /// Fetches attester duties for the given epoch and validator indices.
@@ -279,6 +286,46 @@ impl BeaconClient {
             &[("Eth-Consensus-Version", consensus_version)],
         )
         .await
+    }
+
+    /// Fetches sync committee duties for the given epoch and validator indices.
+    pub async fn post_sync_committee_duties(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
+        let path = format!("/eth/v1/validator/duties/sync/{}", epoch);
+        self.post(&path, &validator_indices).await
+    }
+
+    /// Submits sync committee messages to the beacon node pool.
+    pub async fn submit_sync_committee_messages(
+        &self,
+        messages: &[SyncCommitteeMessage],
+    ) -> Result<(), BeaconError> {
+        self.post_empty("/eth/v1/beacon/pool/sync_committees", &messages).await
+    }
+
+    /// Fetches a sync committee contribution for the given slot, subcommittee index, and block root.
+    pub async fn get_sync_committee_contribution(
+        &self,
+        slot: u64,
+        subcommittee_index: u64,
+        beacon_block_root: &str,
+    ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
+        let path = format!(
+            "/eth/v1/validator/sync_committee_contribution?slot={}&subcommittee_index={}&beacon_block_root={}",
+            slot, subcommittee_index, beacon_block_root
+        );
+        self.get(&path).await
+    }
+
+    /// Submits signed contribution and proofs to the beacon node.
+    pub async fn submit_contribution_and_proofs(
+        &self,
+        proofs: &[SignedContributionAndProof],
+    ) -> Result<(), BeaconError> {
+        self.post_empty("/eth/v1/validator/contribution_and_proofs", &proofs).await
     }
 
     /// Submits signed attestations to the beacon node.
@@ -2478,5 +2525,255 @@ mod tests {
 
         let signed_block = serde_json::json!({"message": {}});
         client.publish_block(&signed_block, "deneb").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_post_sync_committee_duties_success() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "execution_optimistic": false,
+            "data": [
+                {
+                    "pubkey": "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a",
+                    "validator_index": "1234",
+                    "validator_sync_committee_indices": ["0", "128", "256"]
+                }
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/sync/100"))
+            .and(body_json(["1234"]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let indices = vec!["1234".to_string()];
+        let result = client.post_sync_committee_duties(100, &indices).await.unwrap();
+
+        assert!(!result.execution_optimistic);
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0].validator_index, 1234);
+        assert_eq!(result.data[0].validator_sync_committee_indices, vec![0, 128, 256]);
+    }
+
+    #[tokio::test]
+    async fn test_post_sync_committee_duties_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/sync/999"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid epoch"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let indices = vec!["1234".to_string()];
+        let result = client.post_sync_committee_duties(999, &indices).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert_eq!(message, "Invalid epoch");
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_sync_committee_messages_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/pool/sync_committees"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let messages = vec![eth_types::SyncCommitteeMessage {
+            slot: 100,
+            beacon_block_root: [1u8; 32],
+            validator_index: 42,
+            signature: vec![0xaa; 96],
+        }];
+
+        let result = client.submit_sync_committee_messages(&messages).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_submit_sync_committee_messages_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/pool/sync_committees"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid message"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let messages = vec![eth_types::SyncCommitteeMessage {
+            slot: 100,
+            beacon_block_root: [1u8; 32],
+            validator_index: 42,
+            signature: vec![0xaa; 96],
+        }];
+
+        let result = client.submit_sync_committee_messages(&messages).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert_eq!(message, "Invalid message");
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_sync_committee_contribution_success() {
+        let mock_server = MockServer::start().await;
+
+        let contribution = eth_types::SyncCommitteeContribution {
+            slot: 100,
+            beacon_block_root: [1u8; 32],
+            subcommittee_index: 2,
+            aggregation_bits: vec![0xff; 16],
+            signature: vec![0xbb; 96],
+        };
+        let response_body = serde_json::json!({
+            "data": serde_json::to_value(&contribution).unwrap()
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/sync_committee_contribution"))
+            .and(wiremock::matchers::query_param("slot", "100"))
+            .and(wiremock::matchers::query_param("subcommittee_index", "2"))
+            .and(wiremock::matchers::query_param("beacon_block_root", "0xbeefbeef"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_sync_committee_contribution(100, 2, "0xbeefbeef").await.unwrap();
+
+        assert_eq!(result.data.slot, 100);
+        assert_eq!(result.data.subcommittee_index, 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_sync_committee_contribution_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/sync_committee_contribution"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Contribution not available"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_sync_committee_contribution(100, 2, "0xbeefbeef").await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 404);
+                assert!(message.contains("not available"));
+            }
+            _ => panic!("Expected ApiError with status 404"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_contribution_and_proofs_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/contribution_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let proofs = vec![eth_types::SignedContributionAndProof {
+            message: eth_types::ContributionAndProof {
+                aggregator_index: 42,
+                contribution: eth_types::SyncCommitteeContribution {
+                    slot: 100,
+                    beacon_block_root: [1u8; 32],
+                    subcommittee_index: 2,
+                    aggregation_bits: vec![0xff; 16],
+                    signature: vec![0xbb; 96],
+                },
+                selection_proof: vec![0xcc; 96],
+            },
+            signature: vec![0xdd; 96],
+        }];
+
+        let result = client.submit_contribution_and_proofs(&proofs).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_submit_contribution_and_proofs_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/contribution_and_proofs"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid proof"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let proofs = vec![eth_types::SignedContributionAndProof {
+            message: eth_types::ContributionAndProof {
+                aggregator_index: 42,
+                contribution: eth_types::SyncCommitteeContribution {
+                    slot: 100,
+                    beacon_block_root: [1u8; 32],
+                    subcommittee_index: 2,
+                    aggregation_bits: vec![0xff; 16],
+                    signature: vec![0xbb; 96],
+                },
+                selection_proof: vec![0xcc; 96],
+            },
+            signature: vec![0xdd; 96],
+        }];
+
+        let result = client.submit_contribution_and_proofs(&proofs).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert_eq!(message, "Invalid proof");
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
     }
 }

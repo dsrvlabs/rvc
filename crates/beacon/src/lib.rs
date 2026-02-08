@@ -11,7 +11,9 @@ pub use error::BeaconError;
 pub use types::{
     parse_fork_schedule, Attestation, AttestationData, AttestationDataResponse,
     AttesterDutiesResponse, AttesterDuty, BeaconBlockHeader, Checkpoint, ConfigSpecResponse,
-    DataResponse, DependentRootResponse, GenesisData, GenesisResponse, IndexedAttestationError,
-    ProduceBlockResponse, ProposerDutiesResponse, ProposerDuty, StateFork, StateForkResponse,
-    StateResponse, SubmitAttestationResult, ValidatorData, ValidatorInfo, ValidatorsResponse,
+    DataResponse, DependentRootResponse, ExecutionOptimisticResponse, GenesisData, GenesisResponse,
+    IndexedAttestationError, ProduceBlockResponse, ProposerDutiesResponse, ProposerDuty,
+    SignedContributionAndProof, StateFork, StateForkResponse, StateResponse,
+    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, ValidatorData, ValidatorInfo, ValidatorsResponse,
 };

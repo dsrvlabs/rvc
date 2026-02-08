@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use eth_types::{BlindedBeaconBlock, BlockContents, Epoch, ForkSchedule, Version};
+use eth_types::{
+    BlindedBeaconBlock, BlockContents, Epoch, ForkSchedule, SyncCommitteeContribution,
+    SyncCommitteeDuty, Version,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::BeaconError;
@@ -67,6 +70,13 @@ pub struct DependentRootResponse<T> {
     pub data: T,
 }
 
+/// Wrapper for beacon API responses with execution optimistic flag (no dependent root).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionOptimisticResponse<T> {
+    pub execution_optimistic: bool,
+    pub data: T,
+}
+
 /// Response type for attester duties endpoint.
 pub type AttesterDutiesResponse = DependentRootResponse<Vec<AttesterDuty>>;
 
@@ -106,6 +116,15 @@ impl ProduceBlockResponse {
 
 /// Response type for attestation data endpoint.
 pub type AttestationDataResponse = DataResponse<AttestationData>;
+
+/// Response type for sync committee duties endpoint.
+pub type SyncCommitteeDutiesResponse = ExecutionOptimisticResponse<Vec<SyncCommitteeDuty>>;
+
+/// Response type for sync committee contribution endpoint.
+pub type SyncCommitteeContributionResponse = DataResponse<SyncCommitteeContribution>;
+
+pub use eth_types::SignedContributionAndProof;
+pub use eth_types::SyncCommitteeMessage;
 
 /// Validator information from the beacon state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
