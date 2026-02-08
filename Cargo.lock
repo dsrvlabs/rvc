@@ -2821,6 +2821,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvc-validator-store"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
