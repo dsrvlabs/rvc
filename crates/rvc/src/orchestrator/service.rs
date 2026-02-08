@@ -10,7 +10,7 @@ use tracing::{debug, error, info, warn};
 use beacon::{Attestation, AttesterDuty, BeaconClient};
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
-use eth_types::{Fork, Root, Slot};
+use eth_types::{ForkName, ForkSchedule, Root, Slot};
 use metrics::definitions::{
     attestation_status, orchestrator_result, RVC_ATTESTATIONS_TOTAL,
     RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
@@ -29,13 +29,17 @@ const BEACON_CALL_TIMEOUT_SECS: u64 = 4;
 #[derive(Clone)]
 pub struct OrchestratorConfig {
     pub genesis_validators_root: Root,
-    pub fork: Fork,
+    pub fork_schedule: Arc<ForkSchedule>,
     pub shutdown_timeout: Duration,
 }
 
 impl OrchestratorConfig {
-    pub fn new(genesis_validators_root: Root, fork: Fork) -> Self {
-        Self { genesis_validators_root, fork, shutdown_timeout: Duration::from_secs(30) }
+    pub fn new(genesis_validators_root: Root, fork_schedule: Arc<ForkSchedule>) -> Self {
+        Self {
+            genesis_validators_root,
+            fork_schedule,
+            shutdown_timeout: Duration::from_secs(30),
+        }
     }
 
     pub fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
@@ -425,10 +429,13 @@ where
             }
         };
 
+        let target_epoch = crypto_attestation_data.target.epoch;
+        let fork = self.derive_fork_for_epoch(target_epoch);
+
         let signature = match self.signer.sign_attestation(
             &crypto_attestation_data,
             &pubkey,
-            &self.config.fork,
+            &fork,
             self.config.genesis_validators_root,
         ) {
             Ok(sig) => sig,
@@ -470,6 +477,24 @@ where
                 success: false,
                 error: Some(format!("Failed to propagate attestation: {}", e)),
             },
+        }
+    }
+
+    fn derive_fork_for_epoch(&self, epoch: u64) -> eth_types::Fork {
+        let schedule = &self.config.fork_schedule;
+        let fork_name = ForkName::from_epoch(epoch, schedule);
+        let current_version = fork_name.fork_version(schedule);
+        let prior_fork_name = if epoch > 0 {
+            ForkName::from_epoch(epoch - 1, schedule)
+        } else {
+            ForkName::from_epoch(0, schedule)
+        };
+        let previous_version = prior_fork_name.fork_version(schedule);
+
+        eth_types::Fork {
+            previous_version,
+            current_version,
+            epoch: if current_version != previous_version { epoch } else { 0 },
         }
     }
 
@@ -578,16 +603,24 @@ mod tests {
 
     const TEST_GENESIS_TIME: u64 = 1606824023;
 
-    fn create_test_fork() -> Fork {
-        Fork {
-            previous_version: [0x00, 0x00, 0x00, 0x01],
-            current_version: [0x00, 0x00, 0x00, 0x02],
-            epoch: 0,
-        }
+    fn create_test_fork_schedule() -> Arc<ForkSchedule> {
+        Arc::new(ForkSchedule {
+            genesis_fork_version: [0, 0, 0, 1],
+            altair_fork_epoch: 10,
+            altair_fork_version: [0, 0, 0, 2],
+            bellatrix_fork_epoch: 20,
+            bellatrix_fork_version: [0, 0, 0, 3],
+            capella_fork_epoch: 30,
+            capella_fork_version: [0, 0, 0, 4],
+            deneb_fork_epoch: 40,
+            deneb_fork_version: [0, 0, 0, 5],
+            electra_fork_epoch: 50,
+            electra_fork_version: [0, 0, 0, 6],
+        })
     }
 
     fn create_test_config() -> OrchestratorConfig {
-        OrchestratorConfig::new([0xaa; 32], create_test_fork())
+        OrchestratorConfig::new([0xaa; 32], create_test_fork_schedule())
     }
 
     struct MockSubmitter {
@@ -639,14 +672,14 @@ mod tests {
 
     #[test]
     fn test_orchestrator_config_new() {
-        let config = OrchestratorConfig::new([0xbb; 32], create_test_fork());
+        let config = OrchestratorConfig::new([0xbb; 32], create_test_fork_schedule());
         assert_eq!(config.genesis_validators_root, [0xbb; 32]);
         assert_eq!(config.shutdown_timeout, Duration::from_secs(30));
     }
 
     #[test]
     fn test_orchestrator_config_with_shutdown_timeout() {
-        let config = OrchestratorConfig::new([0xcc; 32], create_test_fork())
+        let config = OrchestratorConfig::new([0xcc; 32], create_test_fork_schedule())
             .with_shutdown_timeout(Duration::from_secs(60));
         assert_eq!(config.shutdown_timeout, Duration::from_secs(60));
     }
