@@ -4,10 +4,12 @@ use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use eth_types::ForkSchedule;
+
 use crate::types::{
-    Attestation, AttestationDataResponse, AttesterDutiesResponse, ConfigSpecResponse,
-    GenesisResponse, IndexedAttestationError, StateForkResponse, SubmitAttestationResult,
-    ValidatorsResponse,
+    parse_fork_schedule, Attestation, AttestationDataResponse, AttesterDutiesResponse,
+    ConfigSpecResponse, GenesisResponse, IndexedAttestationError, StateForkResponse,
+    SubmitAttestationResult, ValidatorsResponse,
 };
 use crate::BeaconError;
 
@@ -165,6 +167,12 @@ impl BeaconClient {
     /// Includes fork versions, fork epochs, slot timing, and other consensus parameters.
     pub async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
         self.get("/eth/v1/config/spec").await
+    }
+
+    /// Fetches the config spec and parses fork epoch and version fields into a `ForkSchedule`.
+    pub async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
+        let spec = self.get_config_spec().await?;
+        parse_fork_schedule(&spec.data)
     }
 
     /// Fetches genesis information from the beacon node.
@@ -1776,5 +1784,75 @@ mod tests {
         assert!(!result.finalized);
         assert_eq!(result.data.current_version, "0x05000000");
         assert_eq!(result.data.epoch, "364544");
+    }
+
+    #[tokio::test]
+    async fn test_get_fork_schedule_success() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "data": {
+                "GENESIS_FORK_VERSION": "0x00000000",
+                "ALTAIR_FORK_EPOCH": "74240",
+                "ALTAIR_FORK_VERSION": "0x01000000",
+                "BELLATRIX_FORK_EPOCH": "144896",
+                "BELLATRIX_FORK_VERSION": "0x02000000",
+                "CAPELLA_FORK_EPOCH": "194048",
+                "CAPELLA_FORK_VERSION": "0x03000000",
+                "DENEB_FORK_EPOCH": "269568",
+                "DENEB_FORK_VERSION": "0x04000000",
+                "ELECTRA_FORK_EPOCH": "364544",
+                "ELECTRA_FORK_VERSION": "0x05000000",
+                "SECONDS_PER_SLOT": "12",
+                "SLOTS_PER_EPOCH": "32"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let schedule = client.get_fork_schedule().await.unwrap();
+        assert_eq!(schedule.genesis_fork_version, [0, 0, 0, 0]);
+        assert_eq!(schedule.altair_fork_epoch, 74240);
+        assert_eq!(schedule.altair_fork_version, [1, 0, 0, 0]);
+        assert_eq!(schedule.bellatrix_fork_epoch, 144896);
+        assert_eq!(schedule.capella_fork_epoch, 194048);
+        assert_eq!(schedule.deneb_fork_epoch, 269568);
+        assert_eq!(schedule.deneb_fork_version, [4, 0, 0, 0]);
+        assert_eq!(schedule.electra_fork_epoch, 364544);
+        assert_eq!(schedule.electra_fork_version, [5, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn test_get_fork_schedule_missing_field() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "data": {
+                "GENESIS_FORK_VERSION": "0x00000000",
+                "ALTAIR_FORK_EPOCH": "74240",
+                "ALTAIR_FORK_VERSION": "0x01000000"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_fork_schedule().await;
+        assert!(result.is_err());
     }
 }

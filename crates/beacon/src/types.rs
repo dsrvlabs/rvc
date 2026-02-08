@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
+use eth_types::{Epoch, ForkSchedule, Version};
 use serde::{Deserialize, Serialize};
+
+use crate::BeaconError;
 
 /// A checkpoint in the beacon chain consisting of an epoch and block root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +122,49 @@ pub struct StateResponse<T> {
 
 /// Response type for the beacon state fork endpoint.
 pub type StateForkResponse = StateResponse<StateFork>;
+
+/// Parses a config/spec response into a `ForkSchedule`.
+///
+/// Extracts fork epoch and version fields from the config spec map.
+/// Version fields are hex-encoded (e.g., "0x00000000") and epoch fields
+/// are decimal strings (e.g., "74240").
+pub fn parse_fork_schedule(spec: &HashMap<String, String>) -> Result<ForkSchedule, BeaconError> {
+    Ok(ForkSchedule {
+        genesis_fork_version: parse_version(spec, "GENESIS_FORK_VERSION")?,
+        altair_fork_epoch: parse_epoch(spec, "ALTAIR_FORK_EPOCH")?,
+        altair_fork_version: parse_version(spec, "ALTAIR_FORK_VERSION")?,
+        bellatrix_fork_epoch: parse_epoch(spec, "BELLATRIX_FORK_EPOCH")?,
+        bellatrix_fork_version: parse_version(spec, "BELLATRIX_FORK_VERSION")?,
+        capella_fork_epoch: parse_epoch(spec, "CAPELLA_FORK_EPOCH")?,
+        capella_fork_version: parse_version(spec, "CAPELLA_FORK_VERSION")?,
+        deneb_fork_epoch: parse_epoch(spec, "DENEB_FORK_EPOCH")?,
+        deneb_fork_version: parse_version(spec, "DENEB_FORK_VERSION")?,
+        electra_fork_epoch: parse_epoch(spec, "ELECTRA_FORK_EPOCH")?,
+        electra_fork_version: parse_version(spec, "ELECTRA_FORK_VERSION")?,
+    })
+}
+
+fn parse_epoch(spec: &HashMap<String, String>, key: &str) -> Result<Epoch, BeaconError> {
+    let value = spec
+        .get(key)
+        .ok_or_else(|| BeaconError::ParseError(format!("missing config key: {}", key)))?;
+    value
+        .parse::<u64>()
+        .map_err(|e| BeaconError::ParseError(format!("invalid epoch for {}: {}", key, e)))
+}
+
+fn parse_version(spec: &HashMap<String, String>, key: &str) -> Result<Version, BeaconError> {
+    let value = spec
+        .get(key)
+        .ok_or_else(|| BeaconError::ParseError(format!("missing config key: {}", key)))?;
+    let hex_str = value.strip_prefix("0x").unwrap_or(value);
+    let bytes = hex::decode(hex_str)
+        .map_err(|e| BeaconError::ParseError(format!("invalid hex for {}: {}", key, e)))?;
+    let arr: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| BeaconError::ParseError(format!("version must be 4 bytes for {}", key)))?;
+    Ok(arr)
+}
 
 /// Error details for a single attestation that failed validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -418,6 +464,96 @@ mod tests {
         assert_eq!(response.data.previous_version, "0x03000000");
         assert_eq!(response.data.current_version, "0x04000000");
         assert_eq!(response.data.epoch, "269568");
+    }
+
+    fn mainnet_config_spec() -> HashMap<String, String> {
+        let mut spec = HashMap::new();
+        spec.insert("GENESIS_FORK_VERSION".to_string(), "0x00000000".to_string());
+        spec.insert("ALTAIR_FORK_EPOCH".to_string(), "74240".to_string());
+        spec.insert("ALTAIR_FORK_VERSION".to_string(), "0x01000000".to_string());
+        spec.insert("BELLATRIX_FORK_EPOCH".to_string(), "144896".to_string());
+        spec.insert("BELLATRIX_FORK_VERSION".to_string(), "0x02000000".to_string());
+        spec.insert("CAPELLA_FORK_EPOCH".to_string(), "194048".to_string());
+        spec.insert("CAPELLA_FORK_VERSION".to_string(), "0x03000000".to_string());
+        spec.insert("DENEB_FORK_EPOCH".to_string(), "269568".to_string());
+        spec.insert("DENEB_FORK_VERSION".to_string(), "0x04000000".to_string());
+        spec.insert("ELECTRA_FORK_EPOCH".to_string(), "364544".to_string());
+        spec.insert("ELECTRA_FORK_VERSION".to_string(), "0x05000000".to_string());
+        spec
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_mainnet() {
+        let spec = mainnet_config_spec();
+        let schedule = parse_fork_schedule(&spec).unwrap();
+
+        assert_eq!(schedule.genesis_fork_version, [0, 0, 0, 0]);
+        assert_eq!(schedule.altair_fork_epoch, 74240);
+        assert_eq!(schedule.altair_fork_version, [1, 0, 0, 0]);
+        assert_eq!(schedule.bellatrix_fork_epoch, 144896);
+        assert_eq!(schedule.bellatrix_fork_version, [2, 0, 0, 0]);
+        assert_eq!(schedule.capella_fork_epoch, 194048);
+        assert_eq!(schedule.capella_fork_version, [3, 0, 0, 0]);
+        assert_eq!(schedule.deneb_fork_epoch, 269568);
+        assert_eq!(schedule.deneb_fork_version, [4, 0, 0, 0]);
+        assert_eq!(schedule.electra_fork_epoch, 364544);
+        assert_eq!(schedule.electra_fork_version, [5, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_unscheduled_forks() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("ELECTRA_FORK_EPOCH".to_string(), "18446744073709551615".to_string());
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(schedule.electra_fork_epoch, u64::MAX);
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_missing_key() {
+        let mut spec = mainnet_config_spec();
+        spec.remove("ALTAIR_FORK_EPOCH");
+        let result = parse_fork_schedule(&spec);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("ALTAIR_FORK_EPOCH"));
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_invalid_epoch() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("DENEB_FORK_EPOCH".to_string(), "not_a_number".to_string());
+        let result = parse_fork_schedule(&spec);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("DENEB_FORK_EPOCH"));
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_invalid_version_hex() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("CAPELLA_FORK_VERSION".to_string(), "0xZZZZZZZZ".to_string());
+        let result = parse_fork_schedule(&spec);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("CAPELLA_FORK_VERSION"));
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_wrong_version_length() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("GENESIS_FORK_VERSION".to_string(), "0x0000".to_string());
+        let result = parse_fork_schedule(&spec);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("GENESIS_FORK_VERSION"));
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_version_without_0x_prefix() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("GENESIS_FORK_VERSION".to_string(), "00000000".to_string());
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(schedule.genesis_fork_version, [0, 0, 0, 0]);
     }
 
     #[test]

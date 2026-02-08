@@ -9,8 +9,9 @@ mod types;
 pub use client::{BeaconClient, BeaconClientConfig};
 pub use error::BeaconError;
 pub use types::{
-    Attestation, AttestationData, AttestationDataResponse, AttesterDutiesResponse, AttesterDuty,
-    BeaconBlockHeader, Checkpoint, ConfigSpecResponse, DataResponse, DependentRootResponse,
-    GenesisData, GenesisResponse, IndexedAttestationError, StateFork, StateForkResponse,
-    StateResponse, SubmitAttestationResult, ValidatorData, ValidatorInfo, ValidatorsResponse,
+    parse_fork_schedule, Attestation, AttestationData, AttestationDataResponse,
+    AttesterDutiesResponse, AttesterDuty, BeaconBlockHeader, Checkpoint, ConfigSpecResponse,
+    DataResponse, DependentRootResponse, GenesisData, GenesisResponse, IndexedAttestationError,
+    StateFork, StateForkResponse, StateResponse, SubmitAttestationResult, ValidatorData,
+    ValidatorInfo, ValidatorsResponse,
 };
