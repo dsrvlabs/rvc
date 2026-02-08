@@ -2,7 +2,12 @@ use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
+mod block;
 mod fork;
+pub use block::{
+    BeaconBlock, BeaconBlockBody, BlindedBeaconBlock, BlindedBeaconBlockBody, BlobSidecar,
+    BlockContents, ProducedBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
+};
 pub use fork::{ForkName, ForkSchedule};
 
 pub type Slot = u64;
@@ -12,6 +17,7 @@ pub type Version = [u8; 4];
 pub type Root = [u8; 32];
 pub type Domain = [u8; 32];
 pub type DomainType = [u8; 4];
+pub type Signature = Vec<u8>;
 
 pub const SLOTS_PER_EPOCH: u64 = 32;
 pub const SECONDS_PER_SLOT: u64 = 12;
