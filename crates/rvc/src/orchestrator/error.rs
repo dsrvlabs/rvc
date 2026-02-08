@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::duty_tracker::DutyTrackerError;
+use duty_tracker::DutyTrackerError;
 use crate::propagator::PropagatorError;
 use crate::signer::SignerError;
 use crate::timing::TimingError;

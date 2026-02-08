@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tracing::info;
 
-use crate::duty_tracker::DutyTracker;
+use duty_tracker::DutyTracker;
 use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle};
 use crate::propagator::{AttestationSubmitter, Propagator};
 use crate::signer::SignerService;
