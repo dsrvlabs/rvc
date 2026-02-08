@@ -10,6 +10,7 @@ pub enum ForkName {
     Electra,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkSchedule {
     pub genesis_fork_version: Version,
     pub altair_fork_epoch: Epoch,
