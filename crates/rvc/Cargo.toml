@@ -17,7 +17,6 @@ metrics.workspace = true
 prometheus.workspace = true
 prost.workspace = true
 reqwest.workspace = true
-rusqlite.workspace = true
 secrecy.workspace = true
 slashing.workspace = true
 serde.workspace = true
