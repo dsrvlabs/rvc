@@ -2785,12 +2785,14 @@ dependencies = [
 name = "rvc-signer"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "hex",
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-metrics",
  "rvc-slashing",
  "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
