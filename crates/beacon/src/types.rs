@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use eth_types::{Epoch, ForkSchedule, Version};
+use eth_types::{BlindedBeaconBlock, BlockContents, Epoch, ForkSchedule, Version};
 use serde::{Deserialize, Serialize};
 
 use crate::BeaconError;
@@ -69,6 +69,40 @@ pub struct DependentRootResponse<T> {
 
 /// Response type for attester duties endpoint.
 pub type AttesterDutiesResponse = DependentRootResponse<Vec<AttesterDuty>>;
+
+/// Proposer duty information for a validator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposerDuty {
+    pub pubkey: String,
+    pub validator_index: String,
+    pub slot: String,
+}
+
+/// Response type for proposer duties endpoint.
+pub type ProposerDutiesResponse = DependentRootResponse<Vec<ProposerDuty>>;
+
+/// Response from the produce block v3 endpoint, including header metadata.
+#[derive(Debug, Clone)]
+pub struct ProduceBlockResponse {
+    pub data: serde_json::Value,
+    pub is_blinded: bool,
+    pub consensus_version: String,
+    pub execution_payload_value: Option<String>,
+}
+
+impl ProduceBlockResponse {
+    /// Parses the raw `data` field into a full block with blob sidecars.
+    pub fn parse_full_block(&self) -> Result<BlockContents, BeaconError> {
+        serde_json::from_value(self.data.clone())
+            .map_err(|e| BeaconError::ParseError(format!("invalid block contents: {}", e)))
+    }
+
+    /// Parses the raw `data` field into a blinded block.
+    pub fn parse_blinded_block(&self) -> Result<BlindedBeaconBlock, BeaconError> {
+        serde_json::from_value(self.data.clone())
+            .map_err(|e| BeaconError::ParseError(format!("invalid blinded block: {}", e)))
+    }
+}
 
 /// Response type for attestation data endpoint.
 pub type AttestationDataResponse = DataResponse<AttestationData>;
@@ -571,5 +605,96 @@ mod tests {
         assert_eq!(result.failures().len(), 2);
         assert_eq!(result.failures()[0].index, 0);
         assert_eq!(result.failures()[1].index, 2);
+    }
+
+    #[test]
+    fn test_proposer_duty_deserialize() {
+        let json = r#"{
+            "pubkey": "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a",
+            "validator_index": "1234",
+            "slot": "320000"
+        }"#;
+
+        let duty: ProposerDuty = serde_json::from_str(json).unwrap();
+        assert_eq!(duty.validator_index, "1234");
+        assert_eq!(duty.slot, "320000");
+    }
+
+    #[test]
+    fn test_proposer_duties_response_deserialize() {
+        let json = r#"{
+            "dependent_root": "0xdeproot",
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": "0xpubkey",
+                "validator_index": "1",
+                "slot": "100"
+            }]
+        }"#;
+
+        let response: ProposerDutiesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.dependent_root, "0xdeproot");
+        assert_eq!(response.data.len(), 1);
+        assert_eq!(response.data[0].slot, "100");
+    }
+
+    #[test]
+    fn test_produce_block_response_parse_full_block() {
+        let parent_root: Vec<u8> = vec![1u8; 32];
+        let state_root: Vec<u8> = vec![2u8; 32];
+        let block_json = serde_json::json!({
+            "slot": "100",
+            "proposer_index": "42",
+            "parent_root": parent_root,
+            "state_root": state_root,
+            "body": [0xde, 0xad]
+        });
+
+        let response = ProduceBlockResponse {
+            data: block_json,
+            is_blinded: false,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: Some("12345".to_string()),
+        };
+
+        let block = response.parse_full_block().unwrap();
+        assert_eq!(block.block().slot, 100);
+        assert_eq!(block.block().proposer_index, 42);
+    }
+
+    #[test]
+    fn test_produce_block_response_parse_blinded_block() {
+        let parent_root: Vec<u8> = vec![3u8; 32];
+        let state_root: Vec<u8> = vec![4u8; 32];
+        let block_json = serde_json::json!({
+            "slot": "200",
+            "proposer_index": "99",
+            "parent_root": parent_root,
+            "state_root": state_root,
+            "body": [0xbe, 0xef]
+        });
+
+        let response = ProduceBlockResponse {
+            data: block_json,
+            is_blinded: true,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: None,
+        };
+
+        let block = response.parse_blinded_block().unwrap();
+        assert_eq!(block.slot, 200);
+        assert_eq!(block.proposer_index, 99);
+    }
+
+    #[test]
+    fn test_produce_block_response_parse_invalid_data() {
+        let response = ProduceBlockResponse {
+            data: serde_json::json!({"invalid": "data"}),
+            is_blinded: false,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: None,
+        };
+
+        assert!(response.parse_full_block().is_err());
     }
 }

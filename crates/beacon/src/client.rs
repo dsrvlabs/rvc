@@ -8,8 +8,8 @@ use eth_types::ForkSchedule;
 
 use crate::types::{
     parse_fork_schedule, Attestation, AttestationDataResponse, AttesterDutiesResponse,
-    ConfigSpecResponse, GenesisResponse, IndexedAttestationError, StateForkResponse,
-    SubmitAttestationResult, ValidatorsResponse,
+    ConfigSpecResponse, GenesisResponse, IndexedAttestationError, ProduceBlockResponse,
+    ProposerDutiesResponse, StateForkResponse, SubmitAttestationResult, ValidatorsResponse,
 };
 use crate::BeaconError;
 
@@ -191,6 +191,77 @@ impl BeaconClient {
         self.get(&path).await
     }
 
+    /// Fetches proposer duties for the given epoch.
+    pub async fn get_proposer_duties(
+        &self,
+        epoch: u64,
+    ) -> Result<ProposerDutiesResponse, BeaconError> {
+        let path = format!("/eth/v1/validator/duties/proposer/{}", epoch);
+        self.get(&path).await
+    }
+
+    /// Produces a block for the given slot using the v3 endpoint.
+    ///
+    /// Returns the block data along with header metadata indicating whether the block
+    /// is blinded, the consensus version, and the execution payload value.
+    pub async fn produce_block_v3(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        let mut query = format!("randao_reveal={}", randao_reveal);
+        if let Some(g) = graffiti {
+            query.push_str(&format!("&graffiti={}", g));
+        }
+        if let Some(factor) = builder_boost_factor {
+            query.push_str(&format!("&builder_boost_factor={}", factor));
+        }
+        let url = format!("{}/eth/v3/validator/blocks/{}?{}", self.config.endpoint, slot, query);
+
+        let response =
+            self.execute_with_retry_raw(|| async { self.client.get(&url).send().await }).await?;
+
+        let is_blinded = response
+            .headers()
+            .get("Eth-Execution-Payload-Blinded")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        let consensus_version = response
+            .headers()
+            .get("Eth-Consensus-Version")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let execution_payload_value = response
+            .headers()
+            .get("Eth-Execution-Payload-Value")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string());
+
+        let data: serde_json::Value =
+            response.json().await.map_err(|e| BeaconError::ParseError(e.to_string()))?;
+
+        Ok(ProduceBlockResponse { data, is_blinded, consensus_version, execution_payload_value })
+    }
+
+    /// Publishes a signed beacon block to the network.
+    pub async fn publish_block<B: Serialize>(&self, signed_block: &B) -> Result<(), BeaconError> {
+        self.post_empty("/eth/v2/beacon/blocks", signed_block).await
+    }
+
+    /// Publishes a signed blinded beacon block to the network.
+    pub async fn publish_blinded_block<B: Serialize>(
+        &self,
+        signed_blinded_block: &B,
+    ) -> Result<(), BeaconError> {
+        self.post_empty("/eth/v1/beacon/blinded_blocks", signed_blinded_block).await
+    }
+
     /// Submits signed attestations to the beacon node.
     ///
     /// Accepts an array of attestations and submits them to the beacon pool.
@@ -300,6 +371,134 @@ impl BeaconClient {
                             .json::<T>()
                             .await
                             .map_err(|e| BeaconError::ParseError(e.to_string()));
+                    }
+
+                    if status.is_client_error() {
+                        let message = response.text().await.unwrap_or_default();
+                        return Err(BeaconError::ApiError { status: status.as_u16(), message });
+                    }
+
+                    if status.is_server_error() {
+                        let message = response.text().await.unwrap_or_default();
+                        last_error =
+                            Some(BeaconError::ApiError { status: status.as_u16(), message });
+                        warn!(
+                            attempt = attempt,
+                            status = status.as_u16(),
+                            "Server error, will retry"
+                        );
+                        continue;
+                    }
+
+                    let message = response.text().await.unwrap_or_default();
+                    return Err(BeaconError::ApiError { status: status.as_u16(), message });
+                }
+                Err(e) => {
+                    if e.is_timeout() {
+                        last_error = Some(BeaconError::Timeout);
+                        warn!(attempt = attempt, "Request timeout, will retry");
+                        continue;
+                    }
+
+                    if e.is_connect() || e.is_request() {
+                        last_error = Some(BeaconError::HttpError(e.to_string()));
+                        warn!(attempt = attempt, error = %e, "Connection error, will retry");
+                        continue;
+                    }
+
+                    return Err(BeaconError::HttpError(e.to_string()));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string())))
+    }
+
+    /// Performs a POST request with retry logic, expecting an empty success response.
+    async fn post_empty<B: Serialize>(&self, path: &str, body: &B) -> Result<(), BeaconError> {
+        let url = format!("{}{}", self.config.endpoint, path);
+        let mut last_error = None;
+
+        for attempt in 0..=self.config.max_retries {
+            if attempt > 0 {
+                let backoff = self.calculate_backoff(attempt - 1);
+                debug!(attempt = attempt, backoff_ms = ?backoff.as_millis(), "Retrying request");
+                tokio::time::sleep(backoff).await;
+            }
+
+            match self.client.post(&url).json(body).send().await {
+                Ok(response) => {
+                    let status = response.status();
+
+                    if status.is_success() {
+                        return Ok(());
+                    }
+
+                    if status.is_client_error() {
+                        let message = response.text().await.unwrap_or_default();
+                        return Err(BeaconError::ApiError { status: status.as_u16(), message });
+                    }
+
+                    if status.is_server_error() {
+                        let message = response.text().await.unwrap_or_default();
+                        last_error =
+                            Some(BeaconError::ApiError { status: status.as_u16(), message });
+                        warn!(
+                            attempt = attempt,
+                            status = status.as_u16(),
+                            "Server error, will retry"
+                        );
+                        continue;
+                    }
+
+                    let message = response.text().await.unwrap_or_default();
+                    return Err(BeaconError::ApiError { status: status.as_u16(), message });
+                }
+                Err(e) => {
+                    if e.is_timeout() {
+                        last_error = Some(BeaconError::Timeout);
+                        warn!(attempt = attempt, "Request timeout, will retry");
+                        continue;
+                    }
+
+                    if e.is_connect() || e.is_request() {
+                        last_error = Some(BeaconError::HttpError(e.to_string()));
+                        warn!(attempt = attempt, error = %e, "Connection error, will retry");
+                        continue;
+                    }
+
+                    return Err(BeaconError::HttpError(e.to_string()));
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string())))
+    }
+
+    /// Executes a request with retry logic and returns the raw response on success.
+    async fn execute_with_retry_raw<F, Fut>(
+        &self,
+        request_fn: F,
+    ) -> Result<reqwest::Response, BeaconError>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+    {
+        let mut last_error = None;
+
+        for attempt in 0..=self.config.max_retries {
+            if attempt > 0 {
+                let backoff = self.calculate_backoff(attempt - 1);
+                debug!(attempt = attempt, backoff_ms = ?backoff.as_millis(), "Retrying request");
+                tokio::time::sleep(backoff).await;
+            }
+
+            match request_fn().await {
+                Ok(response) => {
+                    let status = response.status();
+
+                    if status.is_success() {
+                        return Ok(response);
                     }
 
                     if status.is_client_error() {
@@ -1854,5 +2053,383 @@ mod tests {
 
         let result = client.get_fork_schedule().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_proposer_duties_success() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "dependent_root": "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+            "execution_optimistic": false,
+            "data": [
+                {
+                    "pubkey": "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a",
+                    "validator_index": "1234",
+                    "slot": "320000"
+                },
+                {
+                    "pubkey": "0xa1234f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74b",
+                    "validator_index": "5678",
+                    "slot": "320001"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/duties/proposer/10000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_proposer_duties(10000).await.unwrap();
+
+        assert_eq!(
+            result.dependent_root,
+            "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab"
+        );
+        assert!(!result.execution_optimistic);
+        assert_eq!(result.data.len(), 2);
+        assert_eq!(result.data[0].validator_index, "1234");
+        assert_eq!(result.data[0].slot, "320000");
+        assert_eq!(result.data[1].validator_index, "5678");
+        assert_eq!(result.data[1].slot, "320001");
+    }
+
+    #[tokio::test]
+    async fn test_get_proposer_duties_api_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/duties/proposer/999"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid epoch"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_proposer_duties(999).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert_eq!(message, "Invalid epoch");
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_produce_block_v3_full_block() {
+        let mock_server = MockServer::start().await;
+
+        let block_body = serde_json::json!({
+            "version": "deneb",
+            "data": {
+                "slot": "100",
+                "proposer_index": "42",
+                "parent_root": "0x0101010101010101010101010101010101010101010101010101010101010101",
+                "state_root": "0x0202020202020202020202020202020202020202020202020202020202020202",
+                "body": "0xdead"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/100"))
+            .and(wiremock::matchers::query_param("randao_reveal", "0xrandao"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&block_body)
+                    .insert_header("Eth-Execution-Payload-Blinded", "false")
+                    .insert_header("Eth-Consensus-Version", "deneb")
+                    .insert_header("Eth-Execution-Payload-Value", "12345"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.produce_block_v3(100, "0xrandao", None, None).await.unwrap();
+
+        assert!(!result.is_blinded);
+        assert_eq!(result.consensus_version, "deneb");
+        assert_eq!(result.execution_payload_value, Some("12345".to_string()));
+        assert!(result.data.is_object());
+    }
+
+    #[tokio::test]
+    async fn test_produce_block_v3_blinded_block() {
+        let mock_server = MockServer::start().await;
+
+        let block_body = serde_json::json!({
+            "version": "deneb",
+            "data": {
+                "slot": "200",
+                "proposer_index": "10",
+                "parent_root": "0x0101010101010101010101010101010101010101010101010101010101010101",
+                "state_root": "0x0202020202020202020202020202020202020202020202020202020202020202",
+                "body": "0xbeef"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/200"))
+            .and(wiremock::matchers::query_param("randao_reveal", "0xrandao"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&block_body)
+                    .insert_header("Eth-Execution-Payload-Blinded", "true")
+                    .insert_header("Eth-Consensus-Version", "deneb"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.produce_block_v3(200, "0xrandao", None, None).await.unwrap();
+
+        assert!(result.is_blinded);
+        assert_eq!(result.consensus_version, "deneb");
+        assert_eq!(result.execution_payload_value, None);
+    }
+
+    #[tokio::test]
+    async fn test_produce_block_v3_with_graffiti_and_boost() {
+        let mock_server = MockServer::start().await;
+
+        let block_body = serde_json::json!({
+            "data": {}
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/300"))
+            .and(wiremock::matchers::query_param("randao_reveal", "0xrandao"))
+            .and(wiremock::matchers::query_param("graffiti", "0xgraf"))
+            .and(wiremock::matchers::query_param("builder_boost_factor", "50"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&block_body)
+                    .insert_header("Eth-Execution-Payload-Blinded", "false")
+                    .insert_header("Eth-Consensus-Version", "deneb"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result =
+            client.produce_block_v3(300, "0xrandao", Some("0xgraf"), Some(50)).await.unwrap();
+
+        assert!(!result.is_blinded);
+        assert_eq!(result.consensus_version, "deneb");
+    }
+
+    #[tokio::test]
+    async fn test_produce_block_v3_api_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/999"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Slot in the past"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.produce_block_v3(999, "0xrandao", None, None).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert!(message.contains("past"));
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_publish_block() {
+        let mock_server = MockServer::start().await;
+
+        let signed_block = serde_json::json!({
+            "message": {
+                "slot": "100",
+                "proposer_index": "42",
+                "parent_root": "0x0101010101010101010101010101010101010101010101010101010101010101",
+                "state_root": "0x0202020202020202020202020202020202020202020202020202020202020202",
+                "body": "0xdead"
+            },
+            "signature": "0xaabbcc"
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .and(body_json(&signed_block))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        client.publish_block(&signed_block).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_publish_block_api_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid block"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let signed_block = serde_json::json!({"message": {}});
+        let result = client.publish_block(&signed_block).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert!(message.contains("Invalid block"));
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_publish_blinded_block() {
+        let mock_server = MockServer::start().await;
+
+        let signed_blinded_block = serde_json::json!({
+            "message": {
+                "slot": "200",
+                "proposer_index": "10",
+                "parent_root": "0x0101010101010101010101010101010101010101010101010101010101010101",
+                "state_root": "0x0202020202020202020202020202020202020202020202020202020202020202",
+                "body": "0xbeef"
+            },
+            "signature": "0xbbccdd"
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/blinded_blocks"))
+            .and(body_json(&signed_blinded_block))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        client.publish_blinded_block(&signed_blinded_block).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_publish_blinded_block_api_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/blinded_blocks"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid blinded block"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let signed_block = serde_json::json!({"message": {}});
+        let result = client.publish_blinded_block(&signed_block).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert!(message.contains("Invalid blinded block"));
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_proposer_duties_with_dependent_root() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "dependent_root": "0xabc123",
+            "execution_optimistic": true,
+            "data": [
+                {
+                    "pubkey": "0xpubkey1",
+                    "validator_index": "100",
+                    "slot": "64000"
+                }
+            ]
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/duties/proposer/2000"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_proposer_duties(2000).await.unwrap();
+
+        assert_eq!(result.dependent_root, "0xabc123");
+        assert!(result.execution_optimistic);
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0].pubkey, "0xpubkey1");
+    }
+
+    #[tokio::test]
+    async fn test_publish_block_server_error_with_retry() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(2)
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1));
+        let client = BeaconClient::new(config).unwrap();
+
+        let signed_block = serde_json::json!({"message": {}});
+        client.publish_block(&signed_block).await.unwrap();
     }
 }

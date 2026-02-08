@@ -12,6 +12,6 @@ pub use types::{
     parse_fork_schedule, Attestation, AttestationData, AttestationDataResponse,
     AttesterDutiesResponse, AttesterDuty, BeaconBlockHeader, Checkpoint, ConfigSpecResponse,
     DataResponse, DependentRootResponse, GenesisData, GenesisResponse, IndexedAttestationError,
-    StateFork, StateForkResponse, StateResponse, SubmitAttestationResult, ValidatorData,
-    ValidatorInfo, ValidatorsResponse,
+    ProduceBlockResponse, ProposerDutiesResponse, ProposerDuty, StateFork, StateForkResponse,
+    StateResponse, SubmitAttestationResult, ValidatorData, ValidatorInfo, ValidatorsResponse,
 };
