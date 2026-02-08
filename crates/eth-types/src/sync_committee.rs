@@ -17,6 +17,7 @@ pub struct SyncCommitteeDuty {
     pub pubkey: String,
     #[serde(with = "serde_utils::quoted_u64")]
     pub validator_index: u64,
+    #[serde(with = "serde_utils::quoted_u64_vec")]
     pub validator_sync_committee_indices: Vec<u64>,
 }
 
@@ -115,6 +116,17 @@ mod tests {
         let json = serde_json::to_string(&duty).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["validator_index"], serde_json::Value::String("42".to_string()));
+    }
+
+    #[test]
+    fn test_sync_committee_duty_quoted_indices() {
+        let duty = sample_sync_committee_duty();
+        let json = serde_json::to_string(&duty).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let indices = parsed["validator_sync_committee_indices"].as_array().unwrap();
+        assert_eq!(indices[0], serde_json::Value::String("0".to_string()));
+        assert_eq!(indices[1], serde_json::Value::String("128".to_string()));
+        assert_eq!(indices[2], serde_json::Value::String("256".to_string()));
     }
 
     #[test]
