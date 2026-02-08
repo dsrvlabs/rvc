@@ -2713,6 +2713,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvc-crypto"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "blst",
+ "ctr",
+ "ethereum_ssz 0.9.1",
+ "ethereum_ssz_derive",
+ "hex",
+ "pbkdf2",
+ "rand 0.8.5",
+ "rvc-eth-types",
+ "scrypt",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror 2.0.18",
+ "tracing",
+ "tree_hash",
+ "tree_hash_derive",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "rvc-eth-types"
 version = "0.1.0"
 dependencies = [

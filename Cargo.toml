@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/rvc", "crates/rvc", "crates/beacon", "crates/eth-types", "crates/metrics", "crates/timing"]
+members = ["bin/rvc", "crates/rvc", "crates/beacon", "crates/eth-types", "crates/metrics", "crates/timing", "crates/crypto"]
 default-members = ["bin/rvc"]
 resolver = "2"
 
@@ -17,6 +17,7 @@ beacon = { path = "crates/beacon" }
 eth-types = { path = "crates/eth-types", package = "rvc-eth-types" }
 metrics = { path = "crates/metrics", package = "rvc-metrics" }
 timing = { path = "crates/timing", package = "rvc-timing" }
+crypto = { path = "crates/crypto", package = "rvc-crypto" }
 
 # External
 axum = "0.7"
@@ -54,6 +55,7 @@ ctr = "0.9"
 uuid = { version = "1", features = ["v4", "serde"] }
 secrecy = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }
+subtle = "2.6"
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
