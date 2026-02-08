@@ -90,8 +90,20 @@ impl DutyTracker {
         let mut epoch_cache = EpochDutyCache::new(response.dependent_root.clone());
 
         for duty in &response.data {
-            let slot: u64 = duty.slot.parse().unwrap_or(0);
-            let committee_index: u64 = duty.committee_index.parse().unwrap_or(0);
+            let slot: u64 = match duty.slot.parse() {
+                Ok(s) => s,
+                Err(_) => {
+                    warn!(raw_slot = %duty.slot, "Skipping duty with unparseable slot");
+                    continue;
+                }
+            };
+            let committee_index: u64 = match duty.committee_index.parse() {
+                Ok(c) => c,
+                Err(_) => {
+                    warn!(raw_committee_index = %duty.committee_index, "Skipping duty with unparseable committee_index");
+                    continue;
+                }
+            };
 
             let key = DutyCacheKey { slot, committee_index };
             epoch_cache.insert(key, duty.clone());
@@ -160,8 +172,20 @@ impl DutyTracker {
             let mut epoch_cache = EpochDutyCache::new(response.dependent_root.clone());
 
             for duty in &response.data {
-                let slot: u64 = duty.slot.parse().unwrap_or(0);
-                let committee_index: u64 = duty.committee_index.parse().unwrap_or(0);
+                let slot: u64 = match duty.slot.parse() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        warn!(raw_slot = %duty.slot, "Skipping duty with unparseable slot");
+                        continue;
+                    }
+                };
+                let committee_index: u64 = match duty.committee_index.parse() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        warn!(raw_committee_index = %duty.committee_index, "Skipping duty with unparseable committee_index");
+                        continue;
+                    }
+                };
                 let key = DutyCacheKey { slot, committee_index };
                 epoch_cache.insert(key, duty.clone());
             }
@@ -171,6 +195,53 @@ impl DutyTracker {
         }
 
         Ok(false)
+    }
+
+    pub async fn evict_old_caches(&self, current_epoch: u64) {
+        let retain_epoch = current_epoch.saturating_sub(2);
+
+        let mut cache = self.cache.write().await;
+        let before = cache.len();
+        cache.retain(|&epoch, _| epoch >= retain_epoch);
+        let attester_removed = before - cache.len();
+        drop(cache);
+
+        let mut pcache = self.proposer_cache.write().await;
+        let before = pcache.len();
+        pcache.retain(|&epoch, _| epoch >= retain_epoch);
+        let proposer_removed = before - pcache.len();
+        drop(pcache);
+
+        let current_period = current_epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        let retain_period = current_period.saturating_sub(1);
+        let mut scache = self.sync_committee_cache.write().await;
+        let before = scache.len();
+        scache.retain(|&period, _| period >= retain_period);
+        let sync_removed = before - scache.len();
+        drop(scache);
+
+        if attester_removed > 0 || proposer_removed > 0 || sync_removed > 0 {
+            debug!(
+                current_epoch,
+                attester_removed, proposer_removed, sync_removed, "Evicted old duty caches"
+            );
+        }
+    }
+
+    pub async fn get_duties_for_slot(&self, slot: u64) -> Vec<AttesterDuty> {
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let cache = self.cache.read().await;
+
+        let Some(epoch_cache) = cache.get(&epoch) else {
+            return Vec::new();
+        };
+
+        epoch_cache
+            .duties
+            .iter()
+            .filter(|(key, _)| key.slot == slot)
+            .map(|(_, duty)| duty.clone())
+            .collect()
     }
 
     pub async fn clear_epoch_cache(&self, epoch: u64) {
@@ -200,7 +271,13 @@ impl DutyTracker {
 
         let mut slot_map = HashMap::new();
         for duty in &response.data {
-            let slot: u64 = duty.slot.parse().unwrap_or(0);
+            let slot: u64 = match duty.slot.parse() {
+                Ok(s) => s,
+                Err(_) => {
+                    warn!(raw_slot = %duty.slot, "Skipping proposer duty with unparseable slot");
+                    continue;
+                }
+            };
             slot_map.insert(slot, duty.clone());
         }
 
@@ -815,5 +892,173 @@ mod tests {
         assert_eq!(DutyTracker::sync_committee_period(255), 0);
         assert_eq!(DutyTracker::sync_committee_period(256), 1);
         assert_eq!(DutyTracker::sync_committee_period(512), 2);
+    }
+
+    #[tokio::test]
+    async fn test_get_duties_for_slot() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string(), "5678".to_string()];
+
+        let response = create_mock_duty_response(
+            10,
+            vec![(320, 1, "1234"), (320, 2, "5678"), (321, 0, "1234")],
+            "0xdeproot",
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        tracker.fetch_duties_for_epoch(10).await.unwrap();
+
+        let duties_320 = tracker.get_duties_for_slot(320).await;
+        assert_eq!(duties_320.len(), 2);
+
+        let duties_321 = tracker.get_duties_for_slot(321).await;
+        assert_eq!(duties_321.len(), 1);
+
+        let duties_322 = tracker.get_duties_for_slot(322).await;
+        assert!(duties_322.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_duties_for_slot_uncached_epoch() {
+        let (_, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+
+        let duties = tracker.get_duties_for_slot(320).await;
+        assert!(duties.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_evict_old_caches() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        // Set up responses for epochs 5, 6, 7, 8, 9
+        for epoch in 5..=9 {
+            let slot_base = epoch * 32;
+            let response = create_mock_duty_response(
+                epoch,
+                vec![(slot_base, 0, "1234")],
+                &format!("0xroot_{}", epoch),
+            );
+            Mock::given(method("POST"))
+                .and(path(format!("/eth/v1/validator/duties/attester/{}", epoch)))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+                .mount(&mock_server)
+                .await;
+        }
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+
+        for epoch in 5..=9 {
+            tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        }
+        for epoch in 5..=9 {
+            assert!(tracker.is_epoch_cached(epoch).await);
+        }
+
+        // Evict with current_epoch=9 should keep epochs >= 7
+        tracker.evict_old_caches(9).await;
+
+        assert!(!tracker.is_epoch_cached(5).await);
+        assert!(!tracker.is_epoch_cached(6).await);
+        assert!(tracker.is_epoch_cached(7).await);
+        assert!(tracker.is_epoch_cached(8).await);
+        assert!(tracker.is_epoch_cached(9).await);
+    }
+
+    #[tokio::test]
+    async fn test_evict_old_caches_proposer() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        for epoch in 5..=9 {
+            let slot_base = epoch * 32;
+            let response =
+                create_mock_proposer_response(vec![(slot_base, "1234", "0xpubkey_1234")]);
+            Mock::given(method("GET"))
+                .and(path(format!("/eth/v1/validator/duties/proposer/{}", epoch)))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+                .mount(&mock_server)
+                .await;
+        }
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+
+        for epoch in 5..=9 {
+            tracker.fetch_proposer_duties(epoch).await.unwrap();
+        }
+        for epoch in 5..=9 {
+            assert!(tracker.is_proposer_epoch_cached(epoch).await);
+        }
+
+        tracker.evict_old_caches(9).await;
+
+        assert!(!tracker.is_proposer_epoch_cached(5).await);
+        assert!(!tracker.is_proposer_epoch_cached(6).await);
+        assert!(tracker.is_proposer_epoch_cached(7).await);
+        assert!(tracker.is_proposer_epoch_cached(8).await);
+        assert!(tracker.is_proposer_epoch_cached(9).await);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_duties_skips_unparseable_slot() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        let data = vec![
+            serde_json::json!({
+                "pubkey": "0xpubkey_1234",
+                "validator_index": "1234",
+                "committee_index": "1",
+                "committee_length": "128",
+                "committees_at_slot": "64",
+                "validator_committee_index": "25",
+                "slot": "invalid"
+            }),
+            serde_json::json!({
+                "pubkey": "0xpubkey_1234",
+                "validator_index": "1234",
+                "committee_index": "1",
+                "committee_length": "128",
+                "committees_at_slot": "64",
+                "validator_committee_index": "25",
+                "slot": "320"
+            }),
+        ];
+
+        let response = serde_json::json!({
+            "dependent_root": "0xdeproot",
+            "execution_optimistic": false,
+            "data": data
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        let duties = tracker.fetch_duties_for_epoch(10).await.unwrap();
+        // Both returned from API
+        assert_eq!(duties.len(), 2);
+
+        // But only the valid one is cached
+        let duty = tracker.get_duty(320, 1).await;
+        assert!(duty.is_ok());
+
+        // The invalid slot should not be cached at slot 0 as before
+        let duties_at_zero = tracker.get_duties_for_slot(0).await;
+        assert!(duties_at_zero.is_empty());
     }
 }
