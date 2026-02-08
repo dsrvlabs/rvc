@@ -9,7 +9,6 @@ repository.workspace = true
 [dependencies]
 beacon.workspace = true
 metrics.workspace = true
-eth-types.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 
