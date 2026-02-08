@@ -7,11 +7,11 @@ use prometheus::{Gauge, Histogram, HistogramOpts, Opts};
 use tokio::sync::watch;
 use tokio::time::{sleep, Duration};
 
-use crate::crypto::Slot;
+use eth_types::Slot;
 use metrics::REGISTRY;
 
-use super::clock::SlotClock;
-use super::error::TimingError;
+use crate::clock::SlotClock;
+use crate::error::TimingError;
 
 lazy_static! {
     static ref RVC_SLOT_TIMING_CURRENT_SLOT: Gauge = {
@@ -177,7 +177,7 @@ impl AttestationTimerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::timing::clock::MockSlotClock;
+    use crate::clock::MockSlotClock;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
