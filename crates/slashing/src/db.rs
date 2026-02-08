@@ -2,14 +2,14 @@
 
 use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
-use crate::error::{AttestationSlashingViolation, SlashingError};
+use crate::error::{AttestationSlashingViolation, BlockSlashingViolation, SlashingError};
 use crate::types::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata,
     SignedAttestation, SignedBlock, ValidatorRecord,
 };
-use eth_types::Epoch;
+use eth_types::{Epoch, Slot};
 
 /// SQLite-backed database for storing slashing protection data.
 pub struct SlashingDb {
@@ -310,26 +310,74 @@ impl SlashingDb {
                     SlashingError::InvalidInterchangeFormat(format!("invalid slot: {}", block.slot))
                 })?;
 
-                let signed_block = SignedBlock {
-                    pubkey: validator.pubkey.clone(),
-                    slot,
-                    signing_root: block.signing_root.clone(),
-                };
-
-                self.record_block(&signed_block)?;
+                self.record_block(&validator.pubkey, slot, block.signing_root.clone())?;
             }
         }
 
         Ok(())
     }
 
-    fn record_block(&self, block: &SignedBlock) -> Result<(), SlashingError> {
+    /// Record a signed block with idempotent behavior.
+    ///
+    /// If a block with the same pubkey and slot already exists,
+    /// the operation silently succeeds without modifying the existing record.
+    pub fn record_block(
+        &self,
+        pubkey: &str,
+        slot: Slot,
+        signing_root: Option<String>,
+    ) -> Result<(), SlashingError> {
         self.conn.execute(
             "INSERT OR IGNORE INTO blocks (pubkey, slot, signing_root)
              VALUES (?1, ?2, ?3)",
-            (&block.pubkey, block.slot as i64, &block.signing_root),
+            (pubkey, slot as i64, &signing_root),
         )?;
         Ok(())
+    }
+
+    /// Check if it is safe to propose a block at the given slot.
+    ///
+    /// Returns `Ok(())` if safe, or `Err(SlashingError::SlashableBlock(_))`
+    /// with details about the violation type.
+    ///
+    /// Per EIP-3076:
+    /// - If no block exists for this (pubkey, slot): safe
+    /// - If a block exists with the same signing_root: safe (idempotent re-signing)
+    /// - If a block exists with a different signing_root: reject (double proposal)
+    pub fn is_safe_to_propose(
+        &self,
+        pubkey: &str,
+        slot: Slot,
+        signing_root: Option<String>,
+    ) -> Result<(), SlashingError> {
+        let existing: Option<Option<String>> = self
+            .conn
+            .query_row(
+                "SELECT signing_root FROM blocks WHERE pubkey = ?1 AND slot = ?2",
+                (pubkey, slot as i64),
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if let Some(existing_root) = existing {
+            if existing_root != signing_root {
+                return Err(BlockSlashingViolation::DoubleBlockProposal { slot }.into());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get the last signed block slot for a given public key.
+    ///
+    /// Returns `None` if no blocks have been signed for this validator.
+    pub fn last_signed_block_slot(&self, pubkey: &str) -> Result<Option<Slot>, SlashingError> {
+        let result: Option<i64> = self
+            .conn
+            .query_row("SELECT MAX(slot) FROM blocks WHERE pubkey = ?1", [pubkey], |row| row.get(0))
+            .map_err(SlashingError::from)?;
+
+        Ok(result.map(|s| s as Slot))
     }
 }
 
@@ -1280,5 +1328,157 @@ mod tests {
 
         assert_eq!(att1.len(), 1);
         assert_eq!(att2.len(), 1);
+    }
+
+    // --- Block slashing protection tests ---
+
+    #[test]
+    fn test_block_is_safe_to_propose_empty_db() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let result = db.is_safe_to_propose("0x1234", 1000, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_block_is_safe_to_propose_first_proposal_for_slot() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_block("0x1234", 999, None).expect("record should succeed");
+        let result = db.is_safe_to_propose("0x1234", 1000, Some("0xroot1".to_string()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_block_is_safe_to_propose_idempotent_resign_same_root() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_block("0x1234", 1000, Some("0xroot1".to_string()))
+            .expect("record should succeed");
+        let result = db.is_safe_to_propose("0x1234", 1000, Some("0xroot1".to_string()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_block_is_safe_to_propose_double_proposal_different_root() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_block("0x1234", 1000, Some("0xroot1".to_string()))
+            .expect("record should succeed");
+        let result = db.is_safe_to_propose("0x1234", 1000, Some("0xroot2".to_string()));
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            SlashingError::SlashableBlock(violation) => {
+                assert_eq!(violation, BlockSlashingViolation::DoubleBlockProposal { slot: 1000 });
+            }
+            other => panic!("expected SlashableBlock error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_block_is_safe_to_propose_double_proposal_existing_none_root() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_block("0x1234", 1000, None).expect("record should succeed");
+        // Existing has no root, new has a root — different, should reject
+        let result = db.is_safe_to_propose("0x1234", 1000, Some("0xroot1".to_string()));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal { slot }) => {
+                assert_eq!(slot, 1000)
+            }
+            other => panic!("expected DoubleBlockProposal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_block_is_safe_to_propose_both_none_roots_idempotent() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_block("0x1234", 1000, None).expect("record should succeed");
+        // Both have None root — same, should be safe (idempotent)
+        let result = db.is_safe_to_propose("0x1234", 1000, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_block_is_safe_to_propose_different_pubkey_no_conflict() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_block("0x1111", 1000, Some("0xroot1".to_string()))
+            .expect("record should succeed");
+        let result = db.is_safe_to_propose("0x2222", 1000, Some("0xroot2".to_string()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_block_record_block_new() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_block("0x1234", 1000, Some("0xabcd".to_string())).expect("record should succeed");
+        let blocks = db.get_blocks("0x1234").expect("failed to get");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].slot, 1000);
+        assert_eq!(blocks[0].signing_root, Some("0xabcd".to_string()));
+    }
+
+    #[test]
+    fn test_block_record_block_idempotent() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_block("0x1234", 1000, None).expect("first record");
+        db.record_block("0x1234", 1000, None).expect("duplicate record (idempotent)");
+        let blocks = db.get_blocks("0x1234").expect("failed to get");
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_block_record_block_multiple_slots() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_block("0x1234", 1000, None).expect("record");
+        db.record_block("0x1234", 1001, None).expect("record");
+        db.record_block("0x1234", 1002, None).expect("record");
+        let blocks = db.get_blocks("0x1234").expect("failed to get");
+        assert_eq!(blocks.len(), 3);
+    }
+
+    #[test]
+    fn test_block_last_signed_block_slot_empty_db() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let result = db.last_signed_block_slot("0x1234").expect("query should succeed");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_block_last_signed_block_slot_single() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_block("0x1234", 1000, None).expect("record");
+        let result = db.last_signed_block_slot("0x1234").expect("query should succeed");
+        assert_eq!(result, Some(1000));
+    }
+
+    #[test]
+    fn test_block_last_signed_block_slot_multiple() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_block("0x1234", 1000, None).expect("record");
+        db.record_block("0x1234", 1002, None).expect("record");
+        db.record_block("0x1234", 1001, None).expect("record");
+        let result = db.last_signed_block_slot("0x1234").expect("query should succeed");
+        assert_eq!(result, Some(1002));
+    }
+
+    #[test]
+    fn test_block_last_signed_block_slot_different_pubkeys() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_block("0x1111", 1000, None).expect("record");
+        db.record_block("0x2222", 2000, None).expect("record");
+        assert_eq!(db.last_signed_block_slot("0x1111").unwrap(), Some(1000));
+        assert_eq!(db.last_signed_block_slot("0x2222").unwrap(), Some(2000));
+    }
+
+    #[test]
+    fn test_block_is_safe_to_propose_multiple_existing_blocks() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_block("0x1234", 1000, None).expect("record");
+        db.record_block("0x1234", 1001, None).expect("record");
+        db.record_block("0x1234", 1002, None).expect("record");
+        // Proposing at unused slot should be safe
+        let result = db.is_safe_to_propose("0x1234", 1003, None);
+        assert!(result.is_ok());
+        // Proposing at existing slot with different root should fail
+        let result = db.is_safe_to_propose("0x1234", 1001, Some("0xnew".to_string()));
+        assert!(result.is_err());
     }
 }

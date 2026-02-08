@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use eth_types::Epoch;
+use eth_types::{Epoch, Slot};
 
 /// Errors that can occur during slashing protection operations.
 #[derive(Debug, Error)]
@@ -15,6 +15,9 @@ pub enum SlashingError {
 
     #[error("attestation slashable: {0}")]
     SlashableAttestation(#[from] AttestationSlashingViolation),
+
+    #[error("block slashable: {0}")]
+    SlashableBlock(#[from] BlockSlashingViolation),
 
     #[error("genesis validators root mismatch: expected {expected}, got {actual}")]
     GenesisValidatorsRootMismatch { expected: String, actual: String },
@@ -48,4 +51,11 @@ pub enum AttestationSlashingViolation {
         existing_source: Epoch,
         existing_target: Epoch,
     },
+}
+
+/// Specific types of block slashing violations per EIP-3076.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum BlockSlashingViolation {
+    #[error("double block proposal: already signed a different block for slot {slot}")]
+    DoubleBlockProposal { slot: Slot },
 }
