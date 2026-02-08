@@ -25,6 +25,7 @@ signer = { path = "crates/signer", package = "rvc-signer" }
 validator-store = { path = "crates/validator-store", package = "rvc-validator-store" }
 
 # External
+async-trait = "0.1"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
