@@ -7,11 +7,12 @@ use tracing::{debug, warn};
 use eth_types::ForkSchedule;
 
 use crate::types::{
-    parse_fork_schedule, Attestation, AttestationDataResponse, AttesterDutiesResponse,
-    BlockRootResponse, ConfigSpecResponse, GenesisResponse, IndexedAttestationError,
-    ProduceBlockResponse, ProposerDutiesResponse, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, ValidatorsResponse,
+    parse_fork_schedule, AggregateAttestationResponse, Attestation, AttestationDataResponse,
+    AttesterDutiesResponse, BlockRootResponse, ConfigSpecResponse, GenesisResponse,
+    IndexedAttestationError, ProduceBlockResponse, ProposerDutiesResponse, SignedAggregateAndProof,
+    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    ValidatorsResponse,
 };
 use crate::BeaconError;
 
@@ -334,6 +335,29 @@ impl BeaconClient {
         proofs: &[SignedContributionAndProof],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/validator/contribution_and_proofs", &proofs).await
+    }
+
+    // Aggregation
+
+    /// Fetches an aggregate attestation for the given slot and attestation data root.
+    pub async fn get_aggregate_attestation(
+        &self,
+        slot: u64,
+        attestation_data_root: &str,
+    ) -> Result<AggregateAttestationResponse, BeaconError> {
+        let path = format!(
+            "/eth/v1/validator/aggregate_attestation?slot={}&attestation_data_root={}",
+            slot, attestation_data_root
+        );
+        self.get(&path).await
+    }
+
+    /// Submits signed aggregate and proofs to the beacon node.
+    pub async fn submit_aggregate_and_proofs(
+        &self,
+        proofs: &[SignedAggregateAndProof],
+    ) -> Result<(), BeaconError> {
+        self.post_empty("/eth/v1/validator/aggregate_and_proofs", &proofs).await
     }
 
     /// Submits signed attestations to the beacon node.
@@ -2771,6 +2795,169 @@ mod tests {
         }];
 
         let result = client.submit_contribution_and_proofs(&proofs).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert_eq!(message, "Invalid proof");
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    // Aggregation endpoint tests
+
+    #[tokio::test]
+    async fn test_get_aggregate_attestation_success() {
+        let mock_server = MockServer::start().await;
+
+        let att_data_root = format!("0x{}", "ab".repeat(32));
+        let block_root_hex = format!("0x{}", "01".repeat(32));
+        let source_root_hex = format!("0x{}", "02".repeat(32));
+        let target_root_hex = format!("0x{}", "03".repeat(32));
+        let sig_hex = format!("0x{}", "aa".repeat(96));
+        let bits_hex = format!("0x{}", "ff".repeat(4));
+
+        let response_body = serde_json::json!({
+            "data": {
+                "aggregation_bits": bits_hex,
+                "data": {
+                    "slot": "100",
+                    "index": "1",
+                    "beacon_block_root": block_root_hex,
+                    "source": {
+                        "epoch": "3",
+                        "root": source_root_hex,
+                    },
+                    "target": {
+                        "epoch": "4",
+                        "root": target_root_hex,
+                    }
+                },
+                "signature": sig_hex
+            }
+        });
+
+        let expected_path = "/eth/v1/validator/aggregate_attestation";
+
+        Mock::given(method("GET"))
+            .and(path(expected_path))
+            .and(wiremock::matchers::query_param("slot", "100"))
+            .and(wiremock::matchers::query_param("attestation_data_root", &att_data_root))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_aggregate_attestation(100, &att_data_root).await.unwrap();
+
+        assert_eq!(result.data.data.slot, 100);
+        assert_eq!(result.data.data.index, 1);
+        assert_eq!(result.data.aggregation_bits, vec![0xff; 4]);
+        assert_eq!(result.data.signature, vec![0xaa; 96]);
+    }
+
+    #[tokio::test]
+    async fn test_get_aggregate_attestation_not_found() {
+        let mock_server = MockServer::start().await;
+
+        let att_data_root = format!("0x{}", "ab".repeat(32));
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("Attestation not found"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_aggregate_attestation(100, &att_data_root).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 404);
+                assert_eq!(message, "Attestation not found");
+            }
+            _ => panic!("Expected ApiError with status 404"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_aggregate_and_proofs_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let proofs = vec![eth_types::SignedAggregateAndProof {
+            message: eth_types::AggregateAndProof {
+                aggregator_index: 42,
+                aggregate: eth_types::Attestation {
+                    aggregation_bits: vec![0xff; 4],
+                    data: eth_types::AttestationData {
+                        slot: 100,
+                        index: 1,
+                        beacon_block_root: [1u8; 32],
+                        source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                        target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                    },
+                    signature: vec![0xaa; 96],
+                },
+                selection_proof: vec![0xbb; 96],
+            },
+            signature: vec![0xcc; 96],
+        }];
+
+        let result = client.submit_aggregate_and_proofs(&proofs).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_submit_aggregate_and_proofs_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid proof"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let proofs = vec![eth_types::SignedAggregateAndProof {
+            message: eth_types::AggregateAndProof {
+                aggregator_index: 42,
+                aggregate: eth_types::Attestation {
+                    aggregation_bits: vec![0xff; 4],
+                    data: eth_types::AttestationData {
+                        slot: 100,
+                        index: 1,
+                        beacon_block_root: [1u8; 32],
+                        source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                        target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                    },
+                    signature: vec![0xaa; 96],
+                },
+                selection_proof: vec![0xbb; 96],
+            },
+            signature: vec![0xcc; 96],
+        }];
+
+        let result = client.submit_aggregate_and_proofs(&proofs).await;
 
         match result {
             Err(BeaconError::ApiError { status, message }) => {
