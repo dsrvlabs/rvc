@@ -9,13 +9,13 @@ use std::time::Duration;
 
 use tracing::info;
 
-use duty_tracker::DutyTracker;
 use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle};
 use crate::propagator::{AttestationSubmitter, Propagator};
 use crate::signer::SignerService;
 use crate::timing::{SlotClock, SystemSlotClock};
 use beacon::{BeaconClient, BeaconClientConfig};
 use crypto::{KeyManager, PublicKey};
+use duty_tracker::DutyTracker;
 use eth_types::{Fork, Root};
 use slashing::SlashingDb;
 
