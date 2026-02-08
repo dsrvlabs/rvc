@@ -2663,10 +2663,10 @@ dependencies = [
  "prometheus",
  "prost",
  "reqwest",
- "rusqlite",
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-metrics",
+ "rvc-slashing",
  "rvc-timing",
  "secrecy",
  "serde",
@@ -2749,6 +2749,20 @@ dependencies = [
  "serde_json",
  "tokio",
  "tower 0.5.3",
+ "tracing",
+]
+
+[[package]]
+name = "rvc-slashing"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rusqlite",
+ "rvc-eth-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
