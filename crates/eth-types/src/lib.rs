@@ -22,8 +22,8 @@ pub use domains::{
 pub use duties::{ProposerDuty, SignedVoluntaryExit, VoluntaryExit};
 pub use fork::{ForkName, ForkSchedule};
 pub use sync_committee::{
-    ContributionAndProof, SignedContributionAndProof, SyncCommitteeContribution, SyncCommitteeDuty,
-    SyncCommitteeMessage,
+    ContributionAndProof, SignedContributionAndProof, SyncAggregatorSelectionData,
+    SyncCommitteeContribution, SyncCommitteeDuty, SyncCommitteeMessage,
 };
 
 pub type Slot = u64;
