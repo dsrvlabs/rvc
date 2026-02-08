@@ -2,10 +2,10 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::crypto::Slot;
+use eth_types::Slot;
 
-use super::error::TimingError;
-use super::{SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
+use crate::error::TimingError;
+use crate::{SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
 
 pub trait SlotClock: Send + Sync {
     fn genesis_time(&self) -> u64;

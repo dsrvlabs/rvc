@@ -32,6 +32,7 @@ ssz.workspace = true
 ssz_derive.workspace = true
 subtle = "2.6"
 thiserror.workspace = true
+timing.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tower.workspace = true

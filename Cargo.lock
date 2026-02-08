@@ -2673,6 +2673,7 @@ dependencies = [
  "rusqlite",
  "rvc-eth-types",
  "rvc-metrics",
+ "rvc-timing",
  "scrypt",
  "secrecy",
  "serde",
@@ -2739,8 +2740,11 @@ dependencies = [
 name = "rvc-timing"
 version = "0.1.0"
 dependencies = [
+ "lazy_static",
  "prometheus",
+ "rvc-eth-types",
  "rvc-metrics",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]

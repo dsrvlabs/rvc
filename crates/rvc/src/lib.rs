@@ -9,7 +9,7 @@ pub use metrics;
 pub mod propagator;
 pub mod signer;
 pub mod slashing;
-pub mod timing;
+pub use timing;
 
 pub mod proto {
     pub mod duty_tracker {
