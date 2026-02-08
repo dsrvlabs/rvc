@@ -9,6 +9,9 @@ pub type Root = [u8; 32];
 pub type Domain = [u8; 32];
 pub type DomainType = [u8; 4];
 
+pub const SLOTS_PER_EPOCH: u64 = 32;
+pub const SECONDS_PER_SLOT: u64 = 12;
+
 #[derive(Debug, Clone, PartialEq, Eq, Encode, Decode, TreeHash)]
 pub struct Checkpoint {
     pub epoch: Epoch,
@@ -89,5 +92,15 @@ mod tests {
         let signing_data = SigningData { object_root: [0u8; 32], domain: [1u8; 32] };
         let encoded = signing_data.as_ssz_bytes();
         assert_eq!(encoded.len(), 32 + 32);
+    }
+
+    #[test]
+    fn test_slots_per_epoch() {
+        assert_eq!(SLOTS_PER_EPOCH, 32);
+    }
+
+    #[test]
+    fn test_seconds_per_slot() {
+        assert_eq!(SECONDS_PER_SLOT, 12);
     }
 }
