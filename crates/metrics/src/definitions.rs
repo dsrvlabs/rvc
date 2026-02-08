@@ -7,7 +7,7 @@
 use lazy_static::lazy_static;
 use prometheus::{Gauge, HistogramOpts, HistogramVec, IntCounterVec, Opts};
 
-use super::REGISTRY;
+use crate::REGISTRY;
 
 lazy_static! {
     /// Counter for attestation operations.

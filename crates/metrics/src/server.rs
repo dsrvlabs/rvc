@@ -19,7 +19,7 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
-use super::REGISTRY;
+use crate::REGISTRY;
 
 /// Health status of the validator client.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -179,7 +179,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_registered_metrics_appear_in_output() {
-        use crate::metrics::register_counter;
+        use crate::register_counter;
 
         let counter = register_counter("test_server_counter", "A test counter for server tests")
             .expect("Failed to register counter");
