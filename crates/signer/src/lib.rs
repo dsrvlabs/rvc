@@ -5,6 +5,7 @@
 
 mod traits;
 
+pub use crypto::is_aggregator;
 pub use traits::ValidatorSigner;
 
 use std::sync::Arc;
@@ -15,7 +16,8 @@ use thiserror::Error;
 
 use crypto::{sign_attestation, KeyManager, PublicKey, Signature};
 use eth_types::{
-    AttestationData, Epoch, Fork, ForkSchedule, Root, Slot, DOMAIN_SYNC_COMMITTEE, SLOTS_PER_EPOCH,
+    AggregateAndProof, AttestationData, Epoch, Fork, ForkSchedule, Root, Slot,
+    DOMAIN_SYNC_COMMITTEE, SLOTS_PER_EPOCH,
 };
 use metrics::definitions::{
     slashing_result, RVC_ATTESTATIONS_TOTAL, RVC_SIGNING_DURATION_SECONDS,
@@ -216,6 +218,47 @@ impl SignerService {
         Ok(secret_key.sign(&signing_root))
     }
 
+    /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
+    pub fn sign_selection_proof(
+        &self,
+        slot: Slot,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+
+        let secret_key = self
+            .key_manager
+            .get_secret_key(pubkey)
+            .ok_or_else(|| SignerError::KeyNotFound(pubkey_hex))?;
+
+        Ok(crypto::sign_selection_proof(slot, secret_key, fork_schedule, *genesis_validators_root))
+    }
+
+    /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
+    pub fn sign_aggregate_and_proof(
+        &self,
+        aggregate_and_proof: &AggregateAndProof,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+
+        let secret_key = self
+            .key_manager
+            .get_secret_key(pubkey)
+            .ok_or_else(|| SignerError::KeyNotFound(pubkey_hex))?;
+
+        Ok(crypto::sign_aggregate_and_proof(
+            aggregate_and_proof,
+            secret_key,
+            fork_schedule,
+            *genesis_validators_root,
+        ))
+    }
+
     /// Returns a reference to the underlying key manager.
     pub fn key_manager(&self) -> &KeyManager {
         &self.key_manager
@@ -306,6 +349,40 @@ impl ValidatorSigner for SignerService {
             self,
             beacon_block_root,
             slot,
+            pubkey,
+            fork_schedule,
+            genesis_validators_root,
+        )?;
+        Ok(signature.to_bytes().to_vec())
+    }
+
+    async fn sign_selection_proof(
+        &self,
+        slot: Slot,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError> {
+        let signature = SignerService::sign_selection_proof(
+            self,
+            slot,
+            pubkey,
+            fork_schedule,
+            genesis_validators_root,
+        )?;
+        Ok(signature.to_bytes().to_vec())
+    }
+
+    async fn sign_aggregate_and_proof(
+        &self,
+        aggregate_and_proof: &AggregateAndProof,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError> {
+        let signature = SignerService::sign_aggregate_and_proof(
+            self,
+            aggregate_and_proof,
             pubkey,
             fork_schedule,
             genesis_validators_root,
@@ -1027,5 +1104,172 @@ mod tests {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let attestations = slashing_db.get_attestations(&pubkey_hex).expect("failed to get");
         assert_eq!(attestations.len(), 1);
+    }
+
+    // --- Aggregation signing tests ---
+
+    fn create_test_aggregate_and_proof(slot: Slot) -> eth_types::AggregateAndProof {
+        eth_types::AggregateAndProof {
+            aggregator_index: 42,
+            aggregate: eth_types::Attestation {
+                aggregation_bits: vec![0xff; 4],
+                data: AttestationData {
+                    slot,
+                    index: 1,
+                    beacon_block_root: [1u8; 32],
+                    source: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [2u8; 32] },
+                    target: Checkpoint { epoch: slot / SLOTS_PER_EPOCH + 1, root: [3u8; 32] },
+                },
+                signature: vec![0xaa; 96],
+            },
+            selection_proof: vec![0xbb; 96],
+        }
+    }
+
+    #[test]
+    fn test_sign_selection_proof_success() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(key_manager, slashing_db);
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let slot: Slot = 100;
+
+        let result = service.sign_selection_proof(slot, &pubkey, &schedule, &genesis_root);
+        assert!(result.is_ok());
+
+        let signature = result.unwrap();
+
+        let fork_name = eth_types::ForkName::from_epoch(slot / SLOTS_PER_EPOCH, &schedule);
+        let fork_version = fork_name.fork_version(&schedule);
+        let domain = compute_domain(eth_types::DOMAIN_SELECTION_PROOF, fork_version, genesis_root);
+        let signing_root = compute_signing_root(&slot, domain);
+        assert!(signature.verify(&pubkey, &signing_root).is_ok());
+    }
+
+    #[test]
+    fn test_sign_selection_proof_key_not_found() {
+        let key_manager = Arc::new(KeyManager::new());
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(key_manager, slashing_db);
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+
+        let result = service.sign_selection_proof(100, &pubkey, &schedule, &genesis_root);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SignerError::KeyNotFound(_) => {}
+            other => panic!("expected KeyNotFound, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_sign_aggregate_and_proof_success() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(key_manager, slashing_db);
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let agg_and_proof = create_test_aggregate_and_proof(100);
+
+        let result =
+            service.sign_aggregate_and_proof(&agg_and_proof, &pubkey, &schedule, &genesis_root);
+        assert!(result.is_ok());
+
+        let signature = result.unwrap();
+
+        let slot = agg_and_proof.aggregate.data.slot;
+        let fork_name = eth_types::ForkName::from_epoch(slot / SLOTS_PER_EPOCH, &schedule);
+        let fork_version = fork_name.fork_version(&schedule);
+        let domain =
+            compute_domain(eth_types::DOMAIN_AGGREGATE_AND_PROOF, fork_version, genesis_root);
+        let signing_root = compute_signing_root(&agg_and_proof, domain);
+        assert!(signature.verify(&pubkey, &signing_root).is_ok());
+    }
+
+    #[test]
+    fn test_sign_aggregate_and_proof_key_not_found() {
+        let key_manager = Arc::new(KeyManager::new());
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(key_manager, slashing_db);
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let agg_and_proof = create_test_aggregate_and_proof(100);
+
+        let result =
+            service.sign_aggregate_and_proof(&agg_and_proof, &pubkey, &schedule, &genesis_root);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SignerError::KeyNotFound(_) => {}
+            other => panic!("expected KeyNotFound, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_is_aggregator_reexported() {
+        // Verify that is_aggregator is accessible from signer crate
+        // committee_length=0 → modulo=max(1,0/16)=1 → always aggregator
+        assert!(is_aggregator(0, &[0xaa; 96]));
+        // committee_length=1 → modulo=max(1,1/16)=1 → always aggregator
+        assert!(is_aggregator(1, &[0xaa; 96]));
+    }
+
+    // --- Aggregation trait tests ---
+
+    #[tokio::test]
+    async fn test_trait_sign_selection_proof() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(key_manager, slashing_db);
+        let signer: &dyn ValidatorSigner = &service;
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+
+        let result = signer.sign_selection_proof(100, &pubkey, &schedule, &genesis_root).await;
+        assert!(result.is_ok());
+
+        let sig_bytes = result.unwrap();
+        assert_eq!(sig_bytes.len(), 96);
+    }
+
+    #[tokio::test]
+    async fn test_trait_sign_aggregate_and_proof() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(key_manager, slashing_db);
+        let signer: &dyn ValidatorSigner = &service;
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let agg_and_proof = create_test_aggregate_and_proof(100);
+
+        let result = signer
+            .sign_aggregate_and_proof(&agg_and_proof, &pubkey, &schedule, &genesis_root)
+            .await;
+        assert!(result.is_ok());
+
+        let sig_bytes = result.unwrap();
+        assert_eq!(sig_bytes.len(), 96);
     }
 }

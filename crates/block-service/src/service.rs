@@ -248,6 +248,26 @@ mod tests {
         ) -> Result<Vec<u8>, SignerError> {
             Ok(vec![])
         }
+
+        async fn sign_selection_proof(
+            &self,
+            _slot: Slot,
+            _pubkey: &PublicKey,
+            _fork_schedule: &ForkSchedule,
+            _genesis_validators_root: &Root,
+        ) -> Result<Vec<u8>, SignerError> {
+            Ok(vec![0xcc; 96])
+        }
+
+        async fn sign_aggregate_and_proof(
+            &self,
+            _aggregate_and_proof: &eth_types::AggregateAndProof,
+            _pubkey: &PublicKey,
+            _fork_schedule: &ForkSchedule,
+            _genesis_validators_root: &Root,
+        ) -> Result<Vec<u8>, SignerError> {
+            Ok(vec![0xdd; 96])
+        }
     }
 
     // --- Mock Beacon Client ---

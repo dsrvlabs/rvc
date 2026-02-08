@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tree_hash::{Hash256, MerkleHasher, TreeHash, TreeHashType};
 
 use crate::{AttestationData, Signature};
 
@@ -11,6 +12,28 @@ pub struct Attestation {
     pub signature: Signature,
 }
 
+impl TreeHash for Attestation {
+    fn tree_hash_type() -> TreeHashType {
+        TreeHashType::Container
+    }
+
+    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
+        unreachable!("containers cannot be packed")
+    }
+
+    fn tree_hash_packing_factor() -> usize {
+        1
+    }
+
+    fn tree_hash_root(&self) -> Hash256 {
+        let mut hasher = MerkleHasher::with_leaves(3);
+        hasher.write(vec_u8_tree_hash_root(&self.aggregation_bits).as_slice()).expect("valid leaf");
+        hasher.write(self.data.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
+        hasher.finish().expect("valid root")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateAndProof {
     #[serde(with = "serde_utils::quoted_u64")]
@@ -20,11 +43,40 @@ pub struct AggregateAndProof {
     pub selection_proof: Signature,
 }
 
+impl TreeHash for AggregateAndProof {
+    fn tree_hash_type() -> TreeHashType {
+        TreeHashType::Container
+    }
+
+    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
+        unreachable!("containers cannot be packed")
+    }
+
+    fn tree_hash_packing_factor() -> usize {
+        1
+    }
+
+    fn tree_hash_root(&self) -> Hash256 {
+        let mut hasher = MerkleHasher::with_leaves(3);
+        hasher.write(self.aggregator_index.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(self.aggregate.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(vec_u8_tree_hash_root(&self.selection_proof).as_slice()).expect("valid leaf");
+        hasher.finish().expect("valid root")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedAggregateAndProof {
     pub message: AggregateAndProof,
     #[serde(with = "serde_utils::hex_vec")]
     pub signature: Signature,
+}
+
+fn vec_u8_tree_hash_root(bytes: &[u8]) -> Hash256 {
+    let num_leaves = bytes.len().div_ceil(32);
+    let mut hasher = MerkleHasher::with_leaves(num_leaves.max(1));
+    hasher.write(bytes).expect("valid bytes");
+    hasher.finish().expect("valid root")
 }
 
 #[cfg(test)]
@@ -105,5 +157,37 @@ mod tests {
         let json = serde_json::to_string(&att).unwrap();
         let deserialized: Attestation = serde_json::from_str(&json).unwrap();
         assert_eq!(att, deserialized);
+    }
+
+    #[test]
+    fn test_attestation_tree_hash_deterministic() {
+        let att = sample_attestation();
+        let root1 = att.tree_hash_root();
+        let root2 = att.tree_hash_root();
+        assert_eq!(root1, root2);
+    }
+
+    #[test]
+    fn test_attestation_tree_hash_different_data_different_root() {
+        let att1 = sample_attestation();
+        let mut att2 = sample_attestation();
+        att2.data.slot = 999;
+        assert_ne!(att1.tree_hash_root(), att2.tree_hash_root());
+    }
+
+    #[test]
+    fn test_aggregate_and_proof_tree_hash_deterministic() {
+        let proof = sample_aggregate_and_proof();
+        let root1 = proof.tree_hash_root();
+        let root2 = proof.tree_hash_root();
+        assert_eq!(root1, root2);
+    }
+
+    #[test]
+    fn test_aggregate_and_proof_tree_hash_different_index_different_root() {
+        let proof1 = sample_aggregate_and_proof();
+        let mut proof2 = sample_aggregate_and_proof();
+        proof2.aggregator_index = 99;
+        assert_ne!(proof1.tree_hash_root(), proof2.tree_hash_root());
     }
 }

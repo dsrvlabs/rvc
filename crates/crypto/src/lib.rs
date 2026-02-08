@@ -1,5 +1,6 @@
 //! BLS key operations, EIP-2335 keystore decryption, key management, and Ethereum signing utilities.
 
+mod aggregation_signing;
 mod block_signing;
 mod bls;
 mod decryption_tracker;
@@ -9,6 +10,7 @@ mod keystore;
 mod signing;
 mod sync_signing;
 
+pub use aggregation_signing::{is_aggregator, sign_aggregate_and_proof, sign_selection_proof};
 pub use block_signing::{sign_block, sign_randao_reveal};
 pub use bls::{
     PublicKey, SecretKey, Signature, PUBLIC_KEY_BYTES_LEN, SECRET_KEY_BYTES_LEN,

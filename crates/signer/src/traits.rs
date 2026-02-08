@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crypto::PublicKey;
-use eth_types::{AttestationData, Epoch, ForkSchedule, Root, Slot};
+use eth_types::{AggregateAndProof, AttestationData, Epoch, ForkSchedule, Root, Slot};
 
 use crate::SignerError;
 
@@ -45,6 +45,24 @@ pub trait ValidatorSigner {
         &self,
         beacon_block_root: &Root,
         slot: Slot,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError>;
+
+    /// Sign a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
+    async fn sign_selection_proof(
+        &self,
+        slot: Slot,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError>;
+
+    /// Sign an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
+    async fn sign_aggregate_and_proof(
+        &self,
+        aggregate_and_proof: &AggregateAndProof,
         pubkey: &PublicKey,
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
