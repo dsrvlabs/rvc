@@ -7,6 +7,7 @@ mod block;
 mod domains;
 mod duties;
 mod fork;
+pub(crate) mod hex_fixed;
 mod sync_committee;
 pub use aggregation::{AggregateAndProof, Attestation, SignedAggregateAndProof};
 pub use block::{
@@ -42,6 +43,7 @@ pub const SECONDS_PER_SLOT: u64 = 12;
 pub struct Checkpoint {
     #[serde(with = "serde_utils::quoted_u64")]
     pub epoch: Epoch,
+    #[serde(with = "hex_fixed::bytes_32_hex")]
     pub root: Root,
 }
 
@@ -51,6 +53,7 @@ pub struct AttestationData {
     pub slot: Slot,
     #[serde(with = "serde_utils::quoted_u64")]
     pub index: CommitteeIndex,
+    #[serde(with = "hex_fixed::bytes_32_hex")]
     pub beacon_block_root: Root,
     pub source: Checkpoint,
     pub target: Checkpoint,
@@ -58,7 +61,9 @@ pub struct AttestationData {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct Fork {
+    #[serde(with = "serde_utils::bytes_4_hex")]
     pub previous_version: Version,
+    #[serde(with = "serde_utils::bytes_4_hex")]
     pub current_version: Version,
     #[serde(with = "serde_utils::quoted_u64")]
     pub epoch: Epoch,
@@ -66,13 +71,17 @@ pub struct Fork {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct ForkData {
+    #[serde(with = "serde_utils::bytes_4_hex")]
     pub current_version: Version,
+    #[serde(with = "hex_fixed::bytes_32_hex")]
     pub genesis_validators_root: Root,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct SigningData {
+    #[serde(with = "hex_fixed::bytes_32_hex")]
     pub object_root: Root,
+    #[serde(with = "hex_fixed::bytes_32_hex")]
     pub domain: Domain,
 }
 
@@ -143,13 +152,21 @@ mod tests {
     }
 
     #[test]
-    fn test_checkpoint_quoted_epoch_deserialization_from_string() {
-        let root = [0u8; 32];
-        let root_json: serde_json::Value = serde_json::to_value(root).unwrap();
-        let json = format!(r#"{{"epoch":"100","root":{}}}"#, root_json);
+    fn test_checkpoint_root_hex_serialization() {
+        let checkpoint = Checkpoint { epoch: 100, root: [0xab; 32] };
+        let json = serde_json::to_string(&checkpoint).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let expected_hex = format!("0x{}", "ab".repeat(32));
+        assert_eq!(parsed["root"], serde_json::Value::String(expected_hex));
+    }
+
+    #[test]
+    fn test_checkpoint_root_hex_deserialization() {
+        let hex_root = format!("0x{}", "ab".repeat(32));
+        let json = format!(r#"{{"epoch":"100","root":"{}"}}"#, hex_root);
         let checkpoint: Checkpoint = serde_json::from_str(&json).unwrap();
         assert_eq!(checkpoint.epoch, 100);
-        assert_eq!(checkpoint.root, [0u8; 32]);
+        assert_eq!(checkpoint.root, [0xab; 32]);
     }
 
     #[test]
@@ -207,6 +224,16 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let decoded: Fork = serde_json::from_str(&json).unwrap();
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_fork_version_hex_serialization() {
+        let fork =
+            Fork { previous_version: [0, 0, 0, 0], current_version: [1, 0, 0, 0], epoch: 100 };
+        let json = serde_json::to_string(&fork).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["previous_version"], serde_json::Value::String("0x00000000".to_string()));
+        assert_eq!(parsed["current_version"], serde_json::Value::String("0x01000000".to_string()));
     }
 
     #[test]

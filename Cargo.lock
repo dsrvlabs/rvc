@@ -2771,6 +2771,7 @@ dependencies = [
  "ethereum_serde_utils 0.8.0",
  "ethereum_ssz 0.9.1",
  "ethereum_ssz_derive",
+ "hex",
  "serde",
  "serde_json",
  "tree_hash",
