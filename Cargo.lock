@@ -2668,6 +2668,7 @@ dependencies = [
  "rvc-eth-types",
  "rvc-metrics",
  "rvc-propagator",
+ "rvc-signer",
  "rvc-slashing",
  "rvc-timing",
  "secrecy",
@@ -2737,7 +2738,6 @@ dependencies = [
  "beacon",
  "rvc-eth-types",
  "rvc-metrics",
- "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -2775,6 +2775,21 @@ version = "0.1.0"
 dependencies = [
  "beacon",
  "rvc-metrics",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "rvc-signer"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "rvc-crypto",
+ "rvc-eth-types",
+ "rvc-metrics",
+ "rvc-slashing",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
