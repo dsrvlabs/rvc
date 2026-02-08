@@ -1,5 +1,6 @@
 //! rvc - Rust Validator Client
 
+pub mod beacon_adapter;
 pub mod config;
 pub mod duty_tracker;
 pub mod orchestrator;

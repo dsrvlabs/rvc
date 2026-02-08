@@ -123,6 +123,15 @@ pub type SyncCommitteeDutiesResponse = ExecutionOptimisticResponse<Vec<SyncCommi
 /// Response type for sync committee contribution endpoint.
 pub type SyncCommitteeContributionResponse = DataResponse<SyncCommitteeContribution>;
 
+/// Block root data from the beacon API.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockRootData {
+    pub root: String,
+}
+
+/// Response type for the block root endpoint.
+pub type BlockRootResponse = DataResponse<BlockRootData>;
+
 pub use eth_types::SignedContributionAndProof;
 pub use eth_types::SyncCommitteeMessage;
 

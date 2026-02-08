@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use tracing::info;
 
+use crate::beacon_adapter::BeaconBlockAdapter;
 use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle};
 use beacon::{BeaconClient, BeaconClientConfig};
 use crypto::{KeyManager, PublicKey};
@@ -18,6 +19,7 @@ use propagator::{AttestationSubmitter, Propagator};
 use signer::SignerService;
 use slashing::SlashingDb;
 use timing::{SlotClock, SystemSlotClock};
+use validator_store::ValidatorStore;
 
 use super::error::ConfigError;
 use super::types::Config;
@@ -35,6 +37,7 @@ where
     pub propagator: Arc<Propagator<S>>,
     pub duty_tracker: Arc<DutyTracker>,
     pub slot_clock: Arc<C>,
+    pub validator_store: Arc<ValidatorStore>,
     pub pubkey_map: HashMap<String, PublicKey>,
     pub genesis_validators_root: Root,
     pub fork_schedule: Arc<ForkSchedule>,
@@ -180,6 +183,12 @@ impl ServiceBuilder {
         Ok(Arc::new(schedule))
     }
 
+    pub fn build_validator_store(&self) -> Arc<ValidatorStore> {
+        let store = ValidatorStore::new([0u8; 20], 100);
+        info!("Created validator store");
+        Arc::new(store)
+    }
+
     pub fn build_orchestrator_config(
         &self,
         genesis_validators_root: Root,
@@ -206,8 +215,10 @@ impl ServiceBuilder {
             BuiltServices<SystemSlotClock, BeaconClient>,
             impl FnOnce(
                 BuiltServices<SystemSlotClock, BeaconClient>,
-            )
-                -> (DutyOrchestrator<SystemSlotClock, BeaconClient>, OrchestratorHandle),
+            ) -> (
+                DutyOrchestrator<SystemSlotClock, BeaconClient, BeaconBlockAdapter>,
+                OrchestratorHandle,
+            ),
         ),
         ConfigError,
     > {
@@ -218,6 +229,7 @@ impl ServiceBuilder {
         let propagator = self.build_propagator(beacon.clone());
         let slot_clock = self.build_slot_clock()?;
         let pubkey_map = self.build_pubkey_map(&key_manager);
+        let validator_store = self.build_validator_store();
 
         let duty_tracker = self.build_duty_tracker(beacon.clone(), validator_indices);
 
@@ -231,6 +243,7 @@ impl ServiceBuilder {
             propagator,
             duty_tracker,
             slot_clock,
+            validator_store,
             pubkey_map,
             genesis_validators_root,
             fork_schedule,
@@ -243,12 +256,16 @@ impl ServiceBuilder {
             )
             .with_shutdown_timeout(Duration::from_secs(30));
 
+            let block_beacon = Arc::new(BeaconBlockAdapter(services.beacon.clone()));
+
             DutyOrchestrator::new(
                 services.slot_clock,
                 services.duty_tracker,
                 services.signer,
                 services.propagator,
                 services.beacon,
+                block_beacon,
+                services.validator_store,
                 config,
                 services.pubkey_map,
             )

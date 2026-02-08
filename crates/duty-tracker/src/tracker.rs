@@ -195,11 +195,8 @@ impl DutyTracker {
     ) -> Result<Vec<ProposerDuty>, DutyTrackerError> {
         debug!(epoch = epoch, "Fetching proposer duties for epoch");
 
-        let response = self
-            .beacon
-            .get_proposer_duties(epoch)
-            .await
-            .map_err(DutyTrackerError::BeaconError)?;
+        let response =
+            self.beacon.get_proposer_duties(epoch).await.map_err(DutyTrackerError::BeaconError)?;
 
         let mut slot_map = HashMap::new();
         for duty in &response.data {
@@ -270,7 +267,7 @@ impl DutyTracker {
     }
 
     pub fn is_sync_committee_period_boundary(epoch: u64) -> bool {
-        epoch % EPOCHS_PER_SYNC_COMMITTEE_PERIOD == 0
+        epoch.is_multiple_of(EPOCHS_PER_SYNC_COMMITTEE_PERIOD)
     }
 
     pub fn is_epoch_boundary_slot(slot: u64) -> bool {
@@ -652,8 +649,10 @@ mod tests {
         let (mock_server, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string()];
 
-        let response =
-            create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234"), (325, "5678", "0xpubkey_5678")]);
+        let response = create_mock_proposer_response(vec![
+            (320, "1234", "0xpubkey_1234"),
+            (325, "5678", "0xpubkey_5678"),
+        ]);
 
         Mock::given(method("GET"))
             .and(path("/eth/v1/validator/duties/proposer/10"))

@@ -2658,9 +2658,11 @@ dependencies = [
 name = "rvc"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "beacon",
  "hex",
  "prost",
+ "rvc-block-service",
  "rvc-crypto",
  "rvc-duty-tracker",
  "rvc-eth-types",
@@ -2668,7 +2670,9 @@ dependencies = [
  "rvc-propagator",
  "rvc-signer",
  "rvc-slashing",
+ "rvc-sync-service",
  "rvc-timing",
+ "rvc-validator-store",
  "secrecy",
  "serde",
  "serde_json",

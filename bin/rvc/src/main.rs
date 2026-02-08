@@ -210,6 +210,7 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
 
     let signer = builder.build_signer(key_manager.clone(), slashing_db.clone());
     let propagator = builder.build_propagator(beacon_client.clone());
+    let validator_store = builder.build_validator_store();
 
     let pubkey_map = builder.build_pubkey_map(&key_manager);
     let validator_indices = resolve_validator_indices(&beacon_client, &pubkey_map).await;
@@ -242,12 +243,17 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
     let orchestrator_config =
         builder.build_orchestrator_config(genesis_validators_root, fork_schedule);
 
+    let block_beacon =
+        std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(beacon_client.clone()));
+
     let (mut orchestrator, orchestrator_handle) = rvc::orchestrator::DutyOrchestrator::new(
         slot_clock,
         duty_tracker,
         signer,
         propagator,
         beacon_client,
+        block_beacon,
+        validator_store,
         orchestrator_config,
         pubkey_map,
     );

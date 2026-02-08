@@ -8,10 +8,10 @@ use eth_types::ForkSchedule;
 
 use crate::types::{
     parse_fork_schedule, Attestation, AttestationDataResponse, AttesterDutiesResponse,
-    ConfigSpecResponse, GenesisResponse, IndexedAttestationError, ProduceBlockResponse,
-    ProposerDutiesResponse, SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    ValidatorsResponse,
+    BlockRootResponse, ConfigSpecResponse, GenesisResponse, IndexedAttestationError,
+    ProduceBlockResponse, ProposerDutiesResponse, SignedContributionAndProof, StateForkResponse,
+    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, ValidatorsResponse,
 };
 use crate::BeaconError;
 
@@ -195,6 +195,14 @@ impl BeaconClient {
     /// Common state_id values: "head", "finalized", "justified", or a specific slot number.
     pub async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError> {
         let path = format!("/eth/v1/beacon/states/{}/fork", state_id);
+        self.get(&path).await
+    }
+
+    /// Fetches the block root for the given block identifier.
+    ///
+    /// Common block_id values: "head", "finalized", "justified", or a slot number.
+    pub async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
+        let path = format!("/eth/v1/beacon/blocks/{}/root", block_id);
         self.get(&path).await
     }
 

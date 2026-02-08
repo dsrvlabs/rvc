@@ -1,7 +1,7 @@
-//! Duty orchestrator for coordinating the attestation workflow.
+//! Duty orchestrator for coordinating the full validator workflow.
 //!
 //! This module provides the [`DutyOrchestrator`] service that coordinates
-//! the full attestation workflow: duty fetch, slot timing, signing, and propagation.
+//! attestation duties, block proposals, and sync committee participation.
 
 mod error;
 mod service;

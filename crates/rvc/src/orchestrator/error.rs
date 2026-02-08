@@ -3,9 +3,11 @@
 use thiserror::Error;
 
 use beacon::BeaconError;
+use block_service::BlockServiceError;
 use duty_tracker::DutyTrackerError;
 use propagator::PropagatorError;
 use signer::SignerError;
+use sync_service::SyncServiceError;
 use timing::TimingError;
 
 /// Errors that can occur during duty orchestration.
@@ -34,6 +36,12 @@ pub enum OrchestratorError {
 
     #[error("No duties found for slot {slot}")]
     NoDutiesForSlot { slot: u64 },
+
+    #[error("Block service error: {0}")]
+    BlockService(#[from] BlockServiceError),
+
+    #[error("Sync service error: {0}")]
+    SyncService(#[from] SyncServiceError),
 
     #[error("Failed to parse attestation data: {0}")]
     ParseError(String),
