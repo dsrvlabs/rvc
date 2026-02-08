@@ -6,7 +6,6 @@ pub mod orchestrator;
 
 pub use crypto;
 pub use metrics;
-pub mod propagator;
 pub mod signer;
 pub use slashing;
 pub use timing;

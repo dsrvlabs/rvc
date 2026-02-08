@@ -7,12 +7,12 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::propagator::{AttestationSubmitter, Propagator};
 use crate::signer::SignerService;
 use crate::timing::{SlotClock, SLOTS_PER_EPOCH};
 use beacon::{Attestation, AttesterDuty, BeaconClient};
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
+use propagator::{AttestationSubmitter, Propagator};
 use eth_types::{Fork, Root, Slot};
 use metrics::definitions::{
     attestation_status, orchestrator_result, RVC_ATTESTATIONS_TOTAL,

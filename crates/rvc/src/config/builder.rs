@@ -10,7 +10,7 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle};
-use crate::propagator::{AttestationSubmitter, Propagator};
+use propagator::{AttestationSubmitter, Propagator};
 use crate::signer::SignerService;
 use crate::timing::{SlotClock, SystemSlotClock};
 use beacon::{BeaconClient, BeaconClientConfig};
