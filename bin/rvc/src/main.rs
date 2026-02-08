@@ -13,6 +13,7 @@ use rvc::DutyTrackerServer;
 use tonic::transport::Server;
 use tracing::{error, info, warn};
 
+const DEFAULT_GRPC_ADDRESS: &str = "127.0.0.1";
 const DEFAULT_GRPC_PORT: u16 = 50051;
 const DEFAULT_METRICS_PORT: u16 = 8080;
 
@@ -57,6 +58,10 @@ enum Commands {
         #[arg(long, default_value_t = DEFAULT_GRPC_PORT)]
         grpc_port: u16,
 
+        /// Bind address for the gRPC server
+        #[arg(long, default_value = DEFAULT_GRPC_ADDRESS)]
+        grpc_address: String,
+
         /// Network preset (mainnet, goerli, sepolia, holesky, custom)
         #[arg(long)]
         network: Option<String>,
@@ -92,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
             slashing_db_path,
             metrics_port,
             grpc_port,
+            grpc_address,
             network,
             genesis_time,
             genesis_validators_root,
@@ -107,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
                 slashing_db_path,
                 metrics_port: Some(metrics_port),
                 grpc_port: Some(grpc_port),
+                grpc_address: Some(grpc_address),
                 network: network.and_then(|n| n.parse::<Network>().ok()),
                 genesis_time,
                 genesis_validators_root,
@@ -156,6 +163,7 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
         beacon_url = %config.beacon_url,
         network = %config.network,
         metrics_port = config.metrics_port,
+        grpc_address = %config.grpc_address,
         grpc_port = config.grpc_port,
         "Starting validator client"
     );
@@ -260,7 +268,7 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
 
     finalize_health_status(&health_status).await;
 
-    let grpc_addr = format!("0.0.0.0:{}", grpc_port).parse()?;
+    let grpc_addr = format!("{}:{}", config.grpc_address, grpc_port).parse()?;
     let duty_tracker_service = DutyTrackerService::new();
 
     info!(addr = %grpc_addr, "Starting gRPC server");

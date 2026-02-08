@@ -25,6 +25,8 @@ pub struct Config {
 
     pub grpc_port: u16,
 
+    pub grpc_address: String,
+
     pub network: Network,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -47,6 +49,7 @@ impl Default for Config {
             slashing_db_path: PathBuf::from("./slashing_protection.sqlite"),
             metrics_port: 8080,
             grpc_port: 50051,
+            grpc_address: "127.0.0.1".to_string(),
             network: Network::Mainnet,
             genesis_time: None,
             genesis_validators_root: None,
@@ -180,6 +183,10 @@ impl Config {
             self.grpc_port = grpc_port;
         }
 
+        if let Some(ref grpc_address) = cli.grpc_address {
+            self.grpc_address = grpc_address.clone();
+        }
+
         if let Some(network) = cli.network {
             self.network = network;
         }
@@ -210,6 +217,7 @@ pub struct CliOverrides {
     pub slashing_db_path: Option<PathBuf>,
     pub metrics_port: Option<u16>,
     pub grpc_port: Option<u16>,
+    pub grpc_address: Option<String>,
     pub network: Option<Network>,
     pub genesis_time: Option<u64>,
     pub genesis_validators_root: Option<String>,
@@ -230,6 +238,7 @@ mod tests {
         assert_eq!(config.keystore_path, PathBuf::from("./keystores"));
         assert_eq!(config.metrics_port, 8080);
         assert_eq!(config.grpc_port, 50051);
+        assert_eq!(config.grpc_address, "127.0.0.1");
         assert_eq!(config.network, Network::Mainnet);
         assert!(config.genesis_time.is_none());
         assert!(config.genesis_validators_root.is_none());
@@ -392,6 +401,37 @@ log_level = "debug"
         assert_eq!(config.metrics_port, 9999);
         assert_eq!(config.network, Network::Sepolia);
         assert_eq!(config.grpc_port, 50051);
+        assert_eq!(config.grpc_address, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_merge_with_cli_grpc_address() {
+        let mut config = Config::default();
+        let cli = CliOverrides { grpc_address: Some("0.0.0.0".to_string()), ..Default::default() };
+
+        config.merge_with_cli(&cli);
+
+        assert_eq!(config.grpc_address, "0.0.0.0");
+    }
+
+    #[test]
+    fn test_config_from_file_with_grpc_address() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+grpc_address = "192.168.1.1"
+network = "sepolia"
+log_level = "debug"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(config.grpc_address, "192.168.1.1");
     }
 
     #[test]
