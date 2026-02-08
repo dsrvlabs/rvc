@@ -6,10 +6,9 @@ use tracing::{debug, info, warn};
 
 use crate::metrics::definitions::RVC_DUTIES_FETCHED_TOTAL;
 use beacon::{AttesterDuty, BeaconClient};
+use eth_types::SLOTS_PER_EPOCH;
 
 use super::error::DutyTrackerError;
-
-pub const SLOTS_PER_EPOCH: u64 = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DutyCacheKey {
