@@ -46,7 +46,7 @@ pub enum ConfigError {
     KeyManagerError(#[from] crypto::KeyManagerError),
 
     #[error("slashing db error: {0}")]
-    SlashingDbError(#[from] crate::slashing::SlashingError),
+    SlashingDbError(#[from] slashing::SlashingError),
 
     #[error("beacon client error: {0}")]
     BeaconClientError(#[from] beacon::BeaconError),

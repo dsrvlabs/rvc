@@ -13,7 +13,7 @@ use crate::duty_tracker::DutyTracker;
 use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle};
 use crate::propagator::{AttestationSubmitter, Propagator};
 use crate::signer::SignerService;
-use crate::slashing::SlashingDb;
+use slashing::SlashingDb;
 use crate::timing::{SlotClock, SystemSlotClock};
 use beacon::{BeaconClient, BeaconClientConfig};
 use crypto::{KeyManager, PublicKey};

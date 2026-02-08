@@ -8,9 +8,9 @@ use std::time::Instant;
 
 use thiserror::Error;
 
-use crate::slashing::{SlashingDb, SlashingError};
 use crypto::{sign_attestation, KeyManager, PublicKey, Signature};
 use eth_types::{AttestationData, Fork, Root};
+use slashing::{SlashingDb, SlashingError};
 use metrics::definitions::{
     slashing_result, RVC_ATTESTATIONS_TOTAL, RVC_SIGNING_DURATION_SECONDS,
     RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
@@ -437,7 +437,7 @@ mod tests {
         let err = SignerError::KeyNotFound("abc123".to_string());
         assert_eq!(err.to_string(), "key not found for pubkey: abc123");
 
-        use crate::slashing::AttestationSlashingViolation;
+        use slashing::AttestationSlashingViolation;
         let slashing_err =
             SlashingError::SlashableAttestation(AttestationSlashingViolation::DoubleVote {
                 target_epoch: 100,

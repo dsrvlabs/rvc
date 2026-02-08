@@ -19,6 +19,7 @@ prost.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 secrecy.workspace = true
+slashing.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

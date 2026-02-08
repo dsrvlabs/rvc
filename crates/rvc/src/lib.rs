@@ -8,7 +8,7 @@ pub use crypto;
 pub use metrics;
 pub mod propagator;
 pub mod signer;
-pub mod slashing;
+pub use slashing;
 pub use timing;
 
 pub mod proto {

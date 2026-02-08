@@ -568,7 +568,7 @@ where
 #[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
-    use crate::slashing::SlashingDb;
+    use slashing::SlashingDb;
     use crate::timing::MockSlotClock;
     use beacon::BeaconClientConfig;
     use crypto::{KeyManager, SecretKey};
