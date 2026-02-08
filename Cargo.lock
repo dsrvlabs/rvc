@@ -2656,31 +2656,21 @@ dependencies = [
 name = "rvc"
 version = "0.1.0"
 dependencies = [
- "aes",
  "axum",
  "beacon",
- "blst",
- "ctr",
- "ethereum_ssz 0.9.1",
- "ethereum_ssz_derive",
  "hex",
  "lazy_static",
- "pbkdf2",
  "prometheus",
  "prost",
- "rand 0.8.5",
  "reqwest",
  "rusqlite",
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-metrics",
  "rvc-timing",
- "scrypt",
  "secrecy",
  "serde",
  "serde_json",
- "sha2",
- "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -2689,11 +2679,7 @@ dependencies = [
  "tonic-build",
  "tower 0.5.3",
  "tracing",
- "tree_hash",
- "tree_hash_derive",
- "uuid",
  "wiremock",
- "zeroize",
 ]
 
 [[package]]
