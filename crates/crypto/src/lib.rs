@@ -13,10 +13,6 @@ pub use bls::{
 };
 pub use decryption_tracker::DecryptionAttemptTracker;
 pub use error::{BlsError, KeyManagerError, KeystoreError};
-pub use eth_types::{
-    AttestationData, Checkpoint, CommitteeIndex, Domain, DomainType, Epoch, Fork, ForkData, Root,
-    SigningData, Slot, Version,
-};
 pub use key_manager::KeyManager;
 pub use keystore::{KdfParams, Keystore, Pbkdf2Params, ScryptParams};
 pub use signing::{
