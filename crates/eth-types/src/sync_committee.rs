@@ -1,15 +1,18 @@
 use serde::{Deserialize, Serialize};
 use tree_hash::{Hash256, MerkleHasher, TreeHash, TreeHashType};
 
+use crate::hex_fixed::bytes_32_hex;
 use crate::{Root, Signature, Slot};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncCommitteeMessage {
     #[serde(with = "serde_utils::quoted_u64")]
     pub slot: Slot,
+    #[serde(with = "bytes_32_hex")]
     pub beacon_block_root: Root,
     #[serde(with = "serde_utils::quoted_u64")]
     pub validator_index: u64,
+    #[serde(with = "serde_utils::hex_vec")]
     pub signature: Signature,
 }
 
@@ -26,10 +29,13 @@ pub struct SyncCommitteeDuty {
 pub struct SyncCommitteeContribution {
     #[serde(with = "serde_utils::quoted_u64")]
     pub slot: Slot,
+    #[serde(with = "bytes_32_hex")]
     pub beacon_block_root: Root,
     #[serde(with = "serde_utils::quoted_u64")]
     pub subcommittee_index: u64,
+    #[serde(with = "serde_utils::hex_vec")]
     pub aggregation_bits: Vec<u8>,
+    #[serde(with = "serde_utils::hex_vec")]
     pub signature: Signature,
 }
 
@@ -89,6 +95,7 @@ pub struct ContributionAndProof {
     #[serde(with = "serde_utils::quoted_u64")]
     pub aggregator_index: u64,
     pub contribution: SyncCommitteeContribution,
+    #[serde(with = "serde_utils::hex_vec")]
     pub selection_proof: Signature,
 }
 
@@ -117,6 +124,7 @@ impl TreeHash for ContributionAndProof {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedContributionAndProof {
     pub message: ContributionAndProof,
+    #[serde(with = "serde_utils::hex_vec")]
     pub signature: Signature,
 }
 

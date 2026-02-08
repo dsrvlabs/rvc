@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::hex_fixed::bytes_32_hex;
 use crate::{Root, Signature, Slot};
 
 pub type BeaconBlockBody = Vec<u8>;
@@ -11,8 +12,11 @@ pub struct BeaconBlock {
     pub slot: Slot,
     #[serde(with = "serde_utils::quoted_u64")]
     pub proposer_index: u64,
+    #[serde(with = "bytes_32_hex")]
     pub parent_root: Root,
+    #[serde(with = "bytes_32_hex")]
     pub state_root: Root,
+    #[serde(with = "serde_utils::hex_vec")]
     pub body: BeaconBlockBody,
 }
 
@@ -22,8 +26,11 @@ pub struct BlindedBeaconBlock {
     pub slot: Slot,
     #[serde(with = "serde_utils::quoted_u64")]
     pub proposer_index: u64,
+    #[serde(with = "bytes_32_hex")]
     pub parent_root: Root,
+    #[serde(with = "bytes_32_hex")]
     pub state_root: Root,
+    #[serde(with = "serde_utils::hex_vec")]
     pub body: BlindedBeaconBlockBody,
 }
 
@@ -31,6 +38,7 @@ pub struct BlindedBeaconBlock {
 pub struct BlobSidecar {
     #[serde(with = "serde_utils::quoted_u64")]
     pub index: u64,
+    #[serde(with = "serde_utils::hex_vec")]
     pub blob: Vec<u8>,
 }
 
@@ -51,12 +59,14 @@ pub enum ProducedBlock {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedBeaconBlock {
     pub message: BeaconBlock,
+    #[serde(with = "serde_utils::hex_vec")]
     pub signature: Signature,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedBlindedBeaconBlock {
     pub message: BlindedBeaconBlock,
+    #[serde(with = "serde_utils::hex_vec")]
     pub signature: Signature,
 }
 

@@ -22,6 +22,7 @@ pub struct VoluntaryExit {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedVoluntaryExit {
     pub message: VoluntaryExit,
+    #[serde(with = "serde_utils::hex_vec")]
     pub signature: Signature,
 }
 

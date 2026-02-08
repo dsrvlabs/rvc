@@ -4,8 +4,10 @@ use crate::{AttestationData, Signature};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attestation {
+    #[serde(with = "serde_utils::hex_vec")]
     pub aggregation_bits: Vec<u8>,
     pub data: AttestationData,
+    #[serde(with = "serde_utils::hex_vec")]
     pub signature: Signature,
 }
 
@@ -14,12 +16,14 @@ pub struct AggregateAndProof {
     #[serde(with = "serde_utils::quoted_u64")]
     pub aggregator_index: u64,
     pub aggregate: Attestation,
+    #[serde(with = "serde_utils::hex_vec")]
     pub selection_proof: Signature,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedAggregateAndProof {
     pub message: AggregateAndProof,
+    #[serde(with = "serde_utils::hex_vec")]
     pub signature: Signature,
 }
 
