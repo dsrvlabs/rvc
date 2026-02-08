@@ -1,8 +1,9 @@
 //! SQLite database layer for slashing protection.
 
 use std::path::Path;
+use std::sync::Mutex;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::error::{AttestationSlashingViolation, BlockSlashingViolation, SlashingError};
 use crate::types::{
@@ -13,7 +14,7 @@ use eth_types::{Epoch, Slot};
 
 /// SQLite-backed database for storing slashing protection data.
 pub struct SlashingDb {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl SlashingDb {
@@ -21,7 +22,7 @@ impl SlashingDb {
     /// Creates the file and runs migrations if it doesn't exist.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SlashingError> {
         let conn = Connection::open(path)?;
-        let db = Self { conn };
+        let db = Self { conn: Mutex::new(conn) };
         db.migrate()?;
         Ok(db)
     }
@@ -29,13 +30,14 @@ impl SlashingDb {
     /// Open an in-memory database for testing.
     pub fn open_in_memory() -> Result<Self, SlashingError> {
         let conn = Connection::open_in_memory()?;
-        let db = Self { conn };
+        let db = Self { conn: Mutex::new(conn) };
         db.migrate()?;
         Ok(db)
     }
 
     fn migrate(&self) -> Result<(), SlashingError> {
-        self.conn.execute_batch(
+        let conn = self.conn.lock().expect("mutex poisoned");
+        conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS attestations (
                 id INTEGER PRIMARY KEY,
@@ -60,7 +62,8 @@ impl SlashingDb {
 
     /// Insert a signed attestation record.
     pub fn insert_attestation(&self, attestation: &SignedAttestation) -> Result<(), SlashingError> {
-        self.conn.execute(
+        let conn = self.conn.lock().expect("mutex poisoned");
+        conn.execute(
             "INSERT INTO attestations (pubkey, source_epoch, target_epoch, signing_root)
              VALUES (?1, ?2, ?3, ?4)",
             (
@@ -85,7 +88,8 @@ impl SlashingDb {
         target_epoch: Epoch,
         signing_root: Option<String>,
     ) -> Result<(), SlashingError> {
-        self.conn.execute(
+        let conn = self.conn.lock().expect("mutex poisoned");
+        conn.execute(
             "INSERT OR IGNORE INTO attestations (pubkey, source_epoch, target_epoch, signing_root)
              VALUES (?1, ?2, ?3, ?4)",
             (pubkey, source_epoch as i64, target_epoch as i64, &signing_root),
@@ -95,7 +99,8 @@ impl SlashingDb {
 
     /// Get all attestations for a given public key.
     pub fn get_attestations(&self, pubkey: &str) -> Result<Vec<SignedAttestation>, SlashingError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let mut stmt = conn.prepare(
             "SELECT pubkey, source_epoch, target_epoch, signing_root
              FROM attestations
              WHERE pubkey = ?1
@@ -120,7 +125,8 @@ impl SlashingDb {
 
     /// Insert a signed block record.
     pub fn insert_block(&self, block: &SignedBlock) -> Result<(), SlashingError> {
-        self.conn.execute(
+        let conn = self.conn.lock().expect("mutex poisoned");
+        conn.execute(
             "INSERT INTO blocks (pubkey, slot, signing_root)
              VALUES (?1, ?2, ?3)",
             (&block.pubkey, block.slot as i64, &block.signing_root),
@@ -130,7 +136,8 @@ impl SlashingDb {
 
     /// Get all blocks for a given public key.
     pub fn get_blocks(&self, pubkey: &str) -> Result<Vec<SignedBlock>, SlashingError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let mut stmt = conn.prepare(
             "SELECT pubkey, slot, signing_root
              FROM blocks
              WHERE pubkey = ?1
@@ -167,7 +174,8 @@ impl SlashingDb {
         source_epoch: Epoch,
         target_epoch: Epoch,
     ) -> Result<(), SlashingError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let mut stmt = conn.prepare(
             "SELECT source_epoch, target_epoch
              FROM attestations
              WHERE pubkey = ?1",
@@ -214,7 +222,8 @@ impl SlashingDb {
     }
 
     fn get_all_pubkeys(&self) -> Result<Vec<String>, SlashingError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let mut stmt = conn.prepare(
             "SELECT DISTINCT pubkey FROM attestations
              UNION
              SELECT DISTINCT pubkey FROM blocks",
@@ -327,7 +336,8 @@ impl SlashingDb {
         slot: Slot,
         signing_root: Option<String>,
     ) -> Result<(), SlashingError> {
-        self.conn.execute(
+        let conn = self.conn.lock().expect("mutex poisoned");
+        conn.execute(
             "INSERT OR IGNORE INTO blocks (pubkey, slot, signing_root)
              VALUES (?1, ?2, ?3)",
             (pubkey, slot as i64, &signing_root),
@@ -350,8 +360,8 @@ impl SlashingDb {
         slot: Slot,
         signing_root: Option<String>,
     ) -> Result<(), SlashingError> {
-        let existing: Option<Option<String>> = self
-            .conn
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let existing: Option<Option<String>> = conn
             .query_row(
                 "SELECT signing_root FROM blocks WHERE pubkey = ?1 AND slot = ?2",
                 (pubkey, slot as i64),
@@ -368,12 +378,126 @@ impl SlashingDb {
         Ok(())
     }
 
+    /// Atomically check and record a block proposal.
+    ///
+    /// Combines `is_safe_to_propose` and `record_block` in a single SQLite
+    /// transaction with `IMMEDIATE` locking to prevent TOCTOU races.
+    pub fn check_and_record_block(
+        &self,
+        pubkey: &str,
+        slot: Slot,
+        signing_root: Option<String>,
+    ) -> Result<(), SlashingError> {
+        let mut conn = self.conn.lock().expect("mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let existing: Option<Option<String>> = tx
+            .query_row(
+                "SELECT signing_root FROM blocks WHERE pubkey = ?1 AND slot = ?2",
+                (pubkey, slot as i64),
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if let Some(existing_root) = existing {
+            if existing_root != signing_root {
+                return Err(BlockSlashingViolation::DoubleBlockProposal { slot }.into());
+            }
+            // Same signing root — idempotent re-sign, commit without inserting
+            tx.commit()?;
+            return Ok(());
+        }
+
+        tx.execute(
+            "INSERT INTO blocks (pubkey, slot, signing_root) VALUES (?1, ?2, ?3)",
+            (pubkey, slot as i64, &signing_root),
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically check and record an attestation.
+    ///
+    /// Combines `is_safe_to_sign` and `record_attestation` in a single SQLite
+    /// transaction with `IMMEDIATE` locking to prevent TOCTOU races.
+    pub fn check_and_record_attestation(
+        &self,
+        pubkey: &str,
+        source_epoch: Epoch,
+        target_epoch: Epoch,
+        signing_root: Option<String>,
+    ) -> Result<(), SlashingError> {
+        let mut conn = self.conn.lock().expect("mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let existing: Vec<(Epoch, Epoch, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT source_epoch, target_epoch, signing_root
+                 FROM attestations
+                 WHERE pubkey = ?1",
+            )?;
+            let result = stmt
+                .query_map([pubkey], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as Epoch,
+                        row.get::<_, i64>(1)? as Epoch,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            result
+        };
+
+        let mut is_duplicate = false;
+        for (existing_source, existing_target, existing_root) in &existing {
+            if target_epoch == *existing_target {
+                if *existing_root == signing_root {
+                    is_duplicate = true;
+                    continue;
+                }
+                return Err(AttestationSlashingViolation::DoubleVote { target_epoch }.into());
+            }
+
+            if source_epoch < *existing_source && target_epoch > *existing_target {
+                return Err(AttestationSlashingViolation::SurroundingVote {
+                    new_source: source_epoch,
+                    new_target: target_epoch,
+                    existing_source: *existing_source,
+                    existing_target: *existing_target,
+                }
+                .into());
+            }
+
+            if *existing_source < source_epoch && *existing_target > target_epoch {
+                return Err(AttestationSlashingViolation::SurroundedVote {
+                    new_source: source_epoch,
+                    new_target: target_epoch,
+                    existing_source: *existing_source,
+                    existing_target: *existing_target,
+                }
+                .into());
+            }
+        }
+
+        if !is_duplicate {
+            tx.execute(
+                "INSERT INTO attestations (pubkey, source_epoch, target_epoch, signing_root)
+                 VALUES (?1, ?2, ?3, ?4)",
+                (pubkey, source_epoch as i64, target_epoch as i64, &signing_root),
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Get the last signed block slot for a given public key.
     ///
     /// Returns `None` if no blocks have been signed for this validator.
     pub fn last_signed_block_slot(&self, pubkey: &str) -> Result<Option<Slot>, SlashingError> {
-        let result: Option<i64> = self
-            .conn
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let result: Option<i64> = conn
             .query_row("SELECT MAX(slot) FROM blocks WHERE pubkey = ?1", [pubkey], |row| row.get(0))
             .map_err(SlashingError::from)?;
 
@@ -406,8 +530,8 @@ mod tests {
     fn test_migration_creates_tables() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        let table_count: i64 = db
-            .conn
+        let conn = db.conn.lock().expect("mutex poisoned");
+        let table_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('attestations', 'blocks')",
                 [],
@@ -1480,5 +1604,202 @@ mod tests {
         // Proposing at existing slot with different root should fail
         let result = db.is_safe_to_propose("0x1234", 1001, Some("0xnew".to_string()));
         assert!(result.is_err());
+    }
+
+    // --- Atomic check-and-record tests ---
+
+    #[test]
+    fn test_check_and_record_block_safe() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        let result = db.check_and_record_block("0x1234", 1000, Some("0xroot1".to_string()));
+        assert!(result.is_ok());
+
+        let blocks = db.get_blocks("0x1234").expect("failed to get");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].slot, 1000);
+        assert_eq!(blocks[0].signing_root, Some("0xroot1".to_string()));
+    }
+
+    #[test]
+    fn test_check_and_record_block_double_proposal_rejected() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.check_and_record_block("0x1234", 1000, Some("0xroot1".to_string()))
+            .expect("first should succeed");
+
+        let result = db.check_and_record_block("0x1234", 1000, Some("0xroot2".to_string()));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal { slot }) => {
+                assert_eq!(slot, 1000);
+            }
+            other => panic!("expected DoubleBlockProposal, got: {other:?}"),
+        }
+
+        // Verify no second record was inserted
+        let blocks = db.get_blocks("0x1234").expect("failed to get");
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_check_and_record_block_idempotent_resign() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.check_and_record_block("0x1234", 1000, Some("0xroot1".to_string()))
+            .expect("first should succeed");
+
+        let result = db.check_and_record_block("0x1234", 1000, Some("0xroot1".to_string()));
+        assert!(result.is_ok());
+
+        let blocks = db.get_blocks("0x1234").expect("failed to get");
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_check_and_record_attestation_safe() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        let result =
+            db.check_and_record_attestation("0x1234", 100, 101, Some("0xroot1".to_string()));
+        assert!(result.is_ok());
+
+        let attestations = db.get_attestations("0x1234").expect("failed to get");
+        assert_eq!(attestations.len(), 1);
+        assert_eq!(attestations[0].source_epoch, 100);
+        assert_eq!(attestations[0].target_epoch, 101);
+    }
+
+    #[test]
+    fn test_check_and_record_attestation_double_vote_rejected() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.check_and_record_attestation("0x1234", 100, 101, Some("0xroot1".to_string()))
+            .expect("first should succeed");
+
+        let result =
+            db.check_and_record_attestation("0x1234", 99, 101, Some("0xroot2".to_string()));
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::SlashableAttestation(AttestationSlashingViolation::DoubleVote {
+                target_epoch,
+            }) => {
+                assert_eq!(target_epoch, 101);
+            }
+            other => panic!("expected DoubleVote, got: {other:?}"),
+        }
+
+        // Verify no second record was inserted
+        let attestations = db.get_attestations("0x1234").expect("failed to get");
+        assert_eq!(attestations.len(), 1);
+    }
+
+    #[test]
+    fn test_check_and_record_attestation_surrounding_vote_rejected() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.check_and_record_attestation("0x1234", 5, 10, None).expect("first should succeed");
+
+        let result = db.check_and_record_attestation("0x1234", 4, 11, None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::SlashableAttestation(
+                AttestationSlashingViolation::SurroundingVote { .. },
+            ) => {}
+            other => panic!("expected SurroundingVote, got: {other:?}"),
+        }
+
+        let attestations = db.get_attestations("0x1234").expect("failed to get");
+        assert_eq!(attestations.len(), 1);
+    }
+
+    #[test]
+    fn test_check_and_record_attestation_idempotent_resign() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.check_and_record_attestation("0x1234", 100, 101, Some("0xroot1".to_string()))
+            .expect("first should succeed");
+
+        // Same signing root for same epoch should pass (idempotent)
+        let result =
+            db.check_and_record_attestation("0x1234", 100, 101, Some("0xroot1".to_string()));
+        assert!(result.is_ok());
+
+        let attestations = db.get_attestations("0x1234").expect("failed to get");
+        assert_eq!(attestations.len(), 1);
+    }
+
+    #[test]
+    fn test_check_and_record_block_concurrent_double_proposal() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("concurrent_block.db");
+        let db = Arc::new(SlashingDb::open(&path).expect("failed to open db"));
+
+        let db1 = Arc::clone(&db);
+        let db2 = Arc::clone(&db);
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+
+        let handle1 = thread::spawn(move || {
+            b1.wait();
+            db1.check_and_record_block("0x1234", 1000, Some("0xroot1".to_string()))
+        });
+
+        let handle2 = thread::spawn(move || {
+            b2.wait();
+            db2.check_and_record_block("0x1234", 1000, Some("0xroot2".to_string()))
+        });
+
+        let r1 = handle1.join().expect("thread panicked");
+        let r2 = handle2.join().expect("thread panicked");
+
+        // Exactly one should succeed, one should fail
+        let successes = [r1.is_ok(), r2.is_ok()].iter().filter(|&&x| x).count();
+        assert_eq!(successes, 1, "exactly one concurrent block proposal should succeed");
+
+        let blocks = db.get_blocks("0x1234").expect("failed to get");
+        assert_eq!(blocks.len(), 1);
+    }
+
+    #[test]
+    fn test_check_and_record_attestation_concurrent_double_vote() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("concurrent_attestation.db");
+        let db = Arc::new(SlashingDb::open(&path).expect("failed to open db"));
+
+        let db1 = Arc::clone(&db);
+        let db2 = Arc::clone(&db);
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let b1 = Arc::clone(&barrier);
+        let b2 = Arc::clone(&barrier);
+
+        let handle1 = thread::spawn(move || {
+            b1.wait();
+            db1.check_and_record_attestation("0x1234", 100, 101, Some("0xroot1".to_string()))
+        });
+
+        let handle2 = thread::spawn(move || {
+            b2.wait();
+            db2.check_and_record_attestation("0x1234", 99, 101, Some("0xroot2".to_string()))
+        });
+
+        let r1 = handle1.join().expect("thread panicked");
+        let r2 = handle2.join().expect("thread panicked");
+
+        // Exactly one should succeed, one should fail
+        let successes = [r1.is_ok(), r2.is_ok()].iter().filter(|&&x| x).count();
+        assert_eq!(successes, 1, "exactly one concurrent attestation should succeed");
+
+        let attestations = db.get_attestations("0x1234").expect("failed to get");
+        assert_eq!(attestations.len(), 1);
     }
 }

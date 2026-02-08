@@ -31,12 +31,6 @@ pub enum SignerError {
 
     #[error("slashing protection blocked signing: {0}")]
     SlashingProtectionBlocked(#[from] SlashingError),
-
-    #[error("failed to record attestation: {0}")]
-    RecordingFailed(SlashingError),
-
-    #[error("failed to record block: {0}")]
-    BlockRecordingFailed(SlashingError),
 }
 
 /// Service that combines key management with slashing protection for signing.
@@ -54,13 +48,11 @@ impl SignerService {
     /// Signs an attestation after checking slashing protection.
     ///
     /// This method:
-    /// 1. Checks if the attestation is safe to sign according to EIP-3076 rules
-    /// 2. If blocked, increments metrics and returns an error
-    /// 3. If safe, retrieves the secret key and signs the attestation
-    /// 4. Records the attestation in the slashing database
+    /// 1. Computes the signing root
+    /// 2. Atomically checks and records the attestation (prevents TOCTOU)
+    /// 3. If blocked, increments metrics and returns an error
+    /// 4. If safe, retrieves the secret key and signs the attestation
     /// 5. Updates metrics for signing duration and success count
-    ///
-    /// Returns the signature on success, or an error if blocked or key not found.
     pub fn sign_attestation(
         &self,
         attestation_data: &AttestationData,
@@ -75,7 +67,25 @@ impl SignerService {
         let source_epoch = attestation_data.source.epoch;
         let target_epoch = attestation_data.target.epoch;
 
-        if let Err(e) = self.slashing_db.is_safe_to_sign(&pubkey_hex, source_epoch, target_epoch) {
+        let signing_root = hex::encode(crypto::compute_signing_root(
+            attestation_data,
+            crypto::compute_domain(
+                crypto::DOMAIN_BEACON_ATTESTER,
+                if target_epoch >= fork.epoch {
+                    fork.current_version
+                } else {
+                    fork.previous_version
+                },
+                genesis_validators_root,
+            ),
+        ));
+
+        if let Err(e) = self.slashing_db.check_and_record_attestation(
+            &pubkey_hex,
+            source_epoch,
+            target_epoch,
+            Some(signing_root),
+        ) {
             RVC_SLASHING_PROTECTION_CHECKS_TOTAL
                 .with_label_values(&[slashing_result::BLOCKED])
                 .inc();
@@ -93,29 +103,6 @@ impl SignerService {
         let signature =
             sign_attestation(attestation_data, secret_key, fork, genesis_validators_root);
 
-        let signing_root = hex::encode(crypto::compute_signing_root(
-            attestation_data,
-            crypto::compute_domain(
-                crypto::DOMAIN_BEACON_ATTESTER,
-                if target_epoch >= fork.epoch {
-                    fork.current_version
-                } else {
-                    fork.previous_version
-                },
-                genesis_validators_root,
-            ),
-        ));
-
-        if let Err(e) = self.slashing_db.record_attestation(
-            &pubkey_hex,
-            source_epoch,
-            target_epoch,
-            Some(signing_root),
-        ) {
-            RVC_ATTESTATIONS_TOTAL.with_label_values(&["failed"]).inc();
-            return Err(SignerError::RecordingFailed(e));
-        }
-
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[]).observe(duration);
         RVC_ATTESTATIONS_TOTAL.with_label_values(&["success"]).inc();
@@ -126,10 +113,10 @@ impl SignerService {
     /// Signs a block after checking slashing protection.
     ///
     /// This method:
-    /// 1. Computes the signing root for slashing check
-    /// 2. Checks if the block is safe to propose according to EIP-3076 rules
-    /// 3. Retrieves the secret key and signs the block
-    /// 4. Records the block in the slashing database
+    /// 1. Computes the signing root
+    /// 2. Atomically checks and records the block (prevents TOCTOU)
+    /// 3. If blocked, increments metrics and returns an error
+    /// 4. If safe, retrieves the secret key and signs the block
     pub fn sign_block(
         &self,
         block_root: &Root,
@@ -153,7 +140,7 @@ impl SignerService {
         let signing_root_hex = hex::encode(signing_root);
 
         if let Err(e) =
-            self.slashing_db.is_safe_to_propose(&pubkey_hex, slot, Some(signing_root_hex.clone()))
+            self.slashing_db.check_and_record_block(&pubkey_hex, slot, Some(signing_root_hex))
         {
             RVC_SLASHING_PROTECTION_CHECKS_TOTAL
                 .with_label_values(&[slashing_result::BLOCKED])
@@ -175,10 +162,6 @@ impl SignerService {
             fork_schedule,
             genesis_validators_root,
         );
-
-        if let Err(e) = self.slashing_db.record_block(&pubkey_hex, slot, Some(signing_root_hex)) {
-            return Err(SignerError::BlockRecordingFailed(e));
-        }
 
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[]).observe(duration);
@@ -332,7 +315,6 @@ impl ValidatorSigner for SignerService {
 }
 
 #[cfg(test)]
-#[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
     use crypto::{compute_domain, compute_signing_root, SecretKey, DOMAIN_BEACON_ATTESTER};
