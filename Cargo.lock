@@ -2702,6 +2702,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvc-block-service"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "rvc-crypto",
+ "rvc-eth-types",
+ "rvc-signer",
+ "rvc-validator-store",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rvc-crypto"
 version = "0.1.0"
 dependencies = [
