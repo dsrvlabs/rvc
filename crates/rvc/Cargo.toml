@@ -8,28 +8,22 @@ repository.workspace = true
 
 [dependencies]
 eth-types.workspace = true
-axum.workspace = true
 beacon.workspace = true
 crypto.workspace = true
 duty-tracker.workspace = true
 hex.workspace = true
-lazy_static.workspace = true
 metrics.workspace = true
 propagator.workspace = true
-prometheus.workspace = true
 prost.workspace = true
-reqwest.workspace = true
 secrecy.workspace = true
 signer.workspace = true
 slashing.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 toml.workspace = true
 thiserror.workspace = true
 timing.workspace = true
 tokio.workspace = true
 tonic.workspace = true
-tower.workspace = true
 tracing.workspace = true
 
 [build-dependencies]
@@ -37,5 +31,6 @@ tonic-build.workspace = true
 
 [dev-dependencies]
 crypto = { workspace = true, features = ["test-utils"] }
+serde_json.workspace = true
 tempfile.workspace = true
 wiremock.workspace = true
