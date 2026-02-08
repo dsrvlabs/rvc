@@ -13,7 +13,7 @@ use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHand
 use beacon::{BeaconClient, BeaconClientConfig};
 use crypto::{KeyManager, PublicKey};
 use duty_tracker::DutyTracker;
-use eth_types::{Fork, Root};
+use eth_types::{ForkSchedule, Root};
 use propagator::{AttestationSubmitter, Propagator};
 use signer::SignerService;
 use slashing::SlashingDb;
@@ -37,7 +37,7 @@ where
     pub slot_clock: Arc<C>,
     pub pubkey_map: HashMap<String, PublicKey>,
     pub genesis_validators_root: Root,
-    pub fork: Fork,
+    pub fork_schedule: Arc<ForkSchedule>,
 }
 
 /// Builder for constructing services from configuration.
@@ -167,23 +167,25 @@ impl ServiceBuilder {
         Ok(root)
     }
 
-    pub fn build_fork(&self) -> Fork {
-        // TODO: Implement proper fork version handling
-        // Fork versions should be fetched from beacon node or included in network presets
-        // (Bellatrix, Capella, Deneb have different fork versions)
-        Fork {
-            previous_version: [0x00, 0x00, 0x00, 0x00],
-            current_version: [0x00, 0x00, 0x00, 0x00],
-            epoch: 0,
-        }
+    pub async fn build_fork_schedule(
+        &self,
+        beacon: &BeaconClient,
+    ) -> Result<Arc<ForkSchedule>, ConfigError> {
+        info!("Fetching fork schedule from beacon node");
+        let schedule = beacon.get_fork_schedule().await?;
+        info!(
+            genesis_fork = ?schedule.genesis_fork_version,
+            "Loaded fork schedule from beacon node"
+        );
+        Ok(Arc::new(schedule))
     }
 
     pub fn build_orchestrator_config(
         &self,
         genesis_validators_root: Root,
-        fork: Fork,
+        fork_schedule: Arc<ForkSchedule>,
     ) -> OrchestratorConfig {
-        OrchestratorConfig::new(genesis_validators_root, fork)
+        OrchestratorConfig::new(genesis_validators_root, fork_schedule)
             .with_shutdown_timeout(Duration::from_secs(30))
     }
 
@@ -192,9 +194,13 @@ impl ServiceBuilder {
     /// The `validator_indices` parameter should contain numeric validator indices
     /// resolved from the beacon node. Callers should use `BeaconClient::get_validators`
     /// to resolve public keys to indices before calling this method.
+    ///
+    /// The `fork_schedule` must be fetched from the beacon node before calling
+    /// this method via `build_fork_schedule()`.
     pub fn build_all(
         self,
         validator_indices: Vec<String>,
+        fork_schedule: Arc<ForkSchedule>,
     ) -> Result<
         (
             BuiltServices<SystemSlotClock, BeaconClient>,
@@ -216,7 +222,6 @@ impl ServiceBuilder {
         let duty_tracker = self.build_duty_tracker(beacon.clone(), validator_indices);
 
         let genesis_validators_root = self.parse_genesis_validators_root()?;
-        let fork = self.build_fork();
 
         let services = BuiltServices {
             beacon,
@@ -228,12 +233,15 @@ impl ServiceBuilder {
             slot_clock,
             pubkey_map,
             genesis_validators_root,
-            fork,
+            fork_schedule,
         };
 
         let orchestrator_factory = move |services: BuiltServices<SystemSlotClock, BeaconClient>| {
-            let config = OrchestratorConfig::new(services.genesis_validators_root, services.fork)
-                .with_shutdown_timeout(Duration::from_secs(30));
+            let config = OrchestratorConfig::new(
+                services.genesis_validators_root,
+                services.fork_schedule.clone(),
+            )
+            .with_shutdown_timeout(Duration::from_secs(30));
 
             DutyOrchestrator::new(
                 services.slot_clock,
@@ -356,15 +364,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_fork() {
-        let config = create_minimal_config();
-        let builder = ServiceBuilder::new(config);
-        let fork = builder.build_fork();
-
-        assert_eq!(fork.epoch, 0);
-    }
-
-    #[test]
     fn test_build_pubkey_map_empty() {
         let config = create_minimal_config();
         let builder = ServiceBuilder::new(config);
@@ -403,8 +402,20 @@ mod tests {
         let builder = ServiceBuilder::new(config);
 
         let root = [0xaa; 32];
-        let fork = builder.build_fork();
-        let orch_config = builder.build_orchestrator_config(root, fork);
+        let fork_schedule = Arc::new(ForkSchedule {
+            genesis_fork_version: [0, 0, 0, 0],
+            altair_fork_epoch: 74240,
+            altair_fork_version: [1, 0, 0, 0],
+            bellatrix_fork_epoch: 144896,
+            bellatrix_fork_version: [2, 0, 0, 0],
+            capella_fork_epoch: 194048,
+            capella_fork_version: [3, 0, 0, 0],
+            deneb_fork_epoch: 269568,
+            deneb_fork_version: [4, 0, 0, 0],
+            electra_fork_epoch: 364544,
+            electra_fork_version: [5, 0, 0, 0],
+        });
+        let orch_config = builder.build_orchestrator_config(root, fork_schedule);
 
         assert_eq!(orch_config.genesis_validators_root, root);
         assert_eq!(orch_config.shutdown_timeout, Duration::from_secs(30));

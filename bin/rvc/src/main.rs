@@ -231,8 +231,16 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
         }
     };
 
-    let fork = builder.build_fork();
-    let orchestrator_config = builder.build_orchestrator_config(genesis_validators_root, fork);
+    let fork_schedule = match builder.build_fork_schedule(&beacon_client).await {
+        Ok(schedule) => schedule,
+        Err(e) => {
+            error!("Failed to fetch fork schedule from beacon node: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    let orchestrator_config =
+        builder.build_orchestrator_config(genesis_validators_root, fork_schedule);
 
     let (mut orchestrator, orchestrator_handle) = rvc::orchestrator::DutyOrchestrator::new(
         slot_clock,
