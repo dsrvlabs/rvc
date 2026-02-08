@@ -48,6 +48,9 @@ pub enum OrchestratorError {
 
     #[error("Invalid validator pubkey: {0}")]
     InvalidPubkey(String),
+
+    #[error("Beacon call timed out: {0}")]
+    BeaconTimeout(String),
 }
 
 #[cfg(test)]
@@ -89,6 +92,12 @@ mod tests {
     fn test_orchestrator_error_display_invalid_pubkey() {
         let err = OrchestratorError::InvalidPubkey("0xabc".to_string());
         assert_eq!(err.to_string(), "Invalid validator pubkey: 0xabc");
+    }
+
+    #[test]
+    fn test_orchestrator_error_display_beacon_timeout() {
+        let err = OrchestratorError::BeaconTimeout("produce_block_v3".to_string());
+        assert_eq!(err.to_string(), "Beacon call timed out: produce_block_v3");
     }
 
     #[test]
