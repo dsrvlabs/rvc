@@ -43,6 +43,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 prometheus = "0.13"
 lazy_static = "1.5"
 
+# Serde utils
+ethereum_serde_utils = "0.8"
+
 # Crypto
 blst = "0.3"
 hex = "0.4"
