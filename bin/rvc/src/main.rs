@@ -5,8 +5,8 @@
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use crypto::PublicKey;
 use rvc::config::{CliOverrides, Config, Network, ServiceBuilder};
-use rvc::crypto::PublicKey;
 use rvc::duty_tracker::DutyTrackerService;
 use rvc::metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
 use rvc::DutyTrackerServer;
@@ -192,7 +192,7 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
         Err(e) => {
             warn!("Failed to load keys, continuing without validators: {}", e);
             update_health_validators(&health_status, 0).await;
-            std::sync::Arc::new(rvc::crypto::KeyManager::new())
+            std::sync::Arc::new(crypto::KeyManager::new())
         }
     };
 

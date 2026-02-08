@@ -300,7 +300,7 @@ impl KeyManager {
 
     /// Inserts a secret key into the key manager.
     /// This is only available for testing purposes.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn insert(&mut self, secret_key: SecretKey) {
         let pubkey = secret_key.public_key();
         self.keys.insert(pubkey.to_bytes(), secret_key);

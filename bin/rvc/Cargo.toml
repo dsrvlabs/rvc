@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 beacon.workspace = true
+crypto.workspace = true
 rvc.workspace = true
 tokio.workspace = true
 clap.workspace = true
