@@ -4,6 +4,8 @@ use tree_hash_derive::TreeHash;
 
 mod aggregation;
 mod block;
+mod domains;
+mod duties;
 mod fork;
 mod sync_committee;
 pub use aggregation::{AggregateAndProof, Attestation, SignedAggregateAndProof};
@@ -11,6 +13,13 @@ pub use block::{
     BeaconBlock, BeaconBlockBody, BlindedBeaconBlock, BlindedBeaconBlockBody, BlobSidecar,
     BlockContents, ProducedBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
 };
+pub use domains::{
+    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_DEPOSIT, DOMAIN_RANDAO,
+    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_VOLUNTARY_EXIT,
+};
+pub use duties::{ProposerDuty, SignedVoluntaryExit, VoluntaryExit};
 pub use fork::{ForkName, ForkSchedule};
 pub use sync_committee::{
     ContributionAndProof, SignedContributionAndProof, SyncCommitteeContribution, SyncCommitteeDuty,
