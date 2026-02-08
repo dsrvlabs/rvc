@@ -5,8 +5,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, warn};
 
 use crate::types::{
-    Attestation, AttestationDataResponse, AttesterDutiesResponse, IndexedAttestationError,
-    SubmitAttestationResult, ValidatorsResponse,
+    Attestation, AttestationDataResponse, AttesterDutiesResponse, ConfigSpecResponse,
+    GenesisResponse, IndexedAttestationError, StateForkResponse, SubmitAttestationResult,
+    ValidatorsResponse,
 };
 use crate::BeaconError;
 
@@ -155,6 +156,30 @@ impl BeaconClient {
             "/eth/v1/validator/attestation_data?slot={}&committee_index={}",
             slot, committee_index
         );
+        self.get(&path).await
+    }
+
+    /// Fetches the chain configuration specification from the beacon node.
+    ///
+    /// Returns a map of all configuration parameters as string key-value pairs.
+    /// Includes fork versions, fork epochs, slot timing, and other consensus parameters.
+    pub async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
+        self.get("/eth/v1/config/spec").await
+    }
+
+    /// Fetches genesis information from the beacon node.
+    ///
+    /// Returns the genesis time, genesis validators root, and genesis fork version.
+    pub async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
+        self.get("/eth/v1/beacon/genesis").await
+    }
+
+    /// Fetches fork information for the given state.
+    ///
+    /// Returns the previous and current fork versions along with the fork epoch.
+    /// Common state_id values: "head", "finalized", "justified", or a specific slot number.
+    pub async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError> {
+        let path = format!("/eth/v1/beacon/states/{}/fork", state_id);
         self.get(&path).await
     }
 
@@ -1445,5 +1470,311 @@ mod tests {
         let attestations: Vec<crate::types::Attestation> = vec![];
         let result = client.submit_attestation(&attestations).await.unwrap();
         assert!(result.is_success());
+    }
+
+    #[tokio::test]
+    async fn test_get_config_spec_success() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "data": {
+                "GENESIS_FORK_VERSION": "0x00000000",
+                "ALTAIR_FORK_EPOCH": "74240",
+                "ALTAIR_FORK_VERSION": "0x01000000",
+                "BELLATRIX_FORK_EPOCH": "144896",
+                "BELLATRIX_FORK_VERSION": "0x02000000",
+                "CAPELLA_FORK_EPOCH": "194048",
+                "CAPELLA_FORK_VERSION": "0x03000000",
+                "DENEB_FORK_EPOCH": "269568",
+                "DENEB_FORK_VERSION": "0x04000000",
+                "SECONDS_PER_SLOT": "12",
+                "SLOTS_PER_EPOCH": "32"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_config_spec().await.unwrap();
+        assert_eq!(result.data.get("GENESIS_FORK_VERSION").unwrap(), "0x00000000");
+        assert_eq!(result.data.get("ALTAIR_FORK_EPOCH").unwrap(), "74240");
+        assert_eq!(result.data.get("BELLATRIX_FORK_EPOCH").unwrap(), "144896");
+        assert_eq!(result.data.get("CAPELLA_FORK_EPOCH").unwrap(), "194048");
+        assert_eq!(result.data.get("DENEB_FORK_EPOCH").unwrap(), "269568");
+        assert_eq!(result.data.get("SECONDS_PER_SLOT").unwrap(), "12");
+        assert_eq!(result.data.get("SLOTS_PER_EPOCH").unwrap(), "32");
+        assert_eq!(result.data.len(), 11);
+    }
+
+    #[tokio::test]
+    async fn test_get_config_spec_api_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .expect(4)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1));
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_config_spec().await;
+        match result {
+            Err(BeaconError::ApiError { status, .. }) => {
+                assert_eq!(status, 500);
+            }
+            _ => panic!("Expected ApiError with status 500"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_genesis_success() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "data": {
+                "genesis_time": "1606824023",
+                "genesis_validators_root": "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95",
+                "genesis_fork_version": "0x00000000"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_genesis().await.unwrap();
+        assert_eq!(result.data.genesis_time, "1606824023");
+        assert_eq!(
+            result.data.genesis_validators_root,
+            "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+        );
+        assert_eq!(result.data.genesis_fork_version, "0x00000000");
+    }
+
+    #[tokio::test]
+    async fn test_get_genesis_api_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(
+                ResponseTemplate::new(404).set_body_string("Chain genesis has not yet occurred"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_genesis().await;
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 404);
+                assert!(message.contains("genesis"));
+            }
+            _ => panic!("Expected ApiError with status 404"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_genesis_server_error_with_retry() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(2)
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+
+        let response_body = serde_json::json!({
+            "data": {
+                "genesis_time": "1606824023",
+                "genesis_validators_root": "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95",
+                "genesis_fork_version": "0x00000000"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1));
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_genesis().await.unwrap();
+        assert_eq!(result.data.genesis_time, "1606824023");
+    }
+
+    #[tokio::test]
+    async fn test_get_fork_head_success() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "execution_optimistic": false,
+            "finalized": false,
+            "data": {
+                "previous_version": "0x03000000",
+                "current_version": "0x04000000",
+                "epoch": "269568"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/states/head/fork"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_fork("head").await.unwrap();
+        assert!(!result.execution_optimistic);
+        assert!(!result.finalized);
+        assert_eq!(result.data.previous_version, "0x03000000");
+        assert_eq!(result.data.current_version, "0x04000000");
+        assert_eq!(result.data.epoch, "269568");
+    }
+
+    #[tokio::test]
+    async fn test_get_fork_finalized_success() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "execution_optimistic": false,
+            "finalized": true,
+            "data": {
+                "previous_version": "0x03000000",
+                "current_version": "0x04000000",
+                "epoch": "269568"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/states/finalized/fork"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_fork("finalized").await.unwrap();
+        assert!(!result.execution_optimistic);
+        assert!(result.finalized);
+        assert_eq!(result.data.current_version, "0x04000000");
+    }
+
+    #[tokio::test]
+    async fn test_get_fork_by_slot() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "execution_optimistic": false,
+            "finalized": true,
+            "data": {
+                "previous_version": "0x00000000",
+                "current_version": "0x01000000",
+                "epoch": "74240"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/states/2375680/fork"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_fork("2375680").await.unwrap();
+        assert_eq!(result.data.previous_version, "0x00000000");
+        assert_eq!(result.data.current_version, "0x01000000");
+        assert_eq!(result.data.epoch, "74240");
+    }
+
+    #[tokio::test]
+    async fn test_get_fork_not_found() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/states/99999999999/fork"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("State not found"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_fork("99999999999").await;
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 404);
+                assert!(message.contains("not found"));
+            }
+            _ => panic!("Expected ApiError with status 404"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_fork_execution_optimistic() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "execution_optimistic": true,
+            "finalized": false,
+            "data": {
+                "previous_version": "0x04000000",
+                "current_version": "0x05000000",
+                "epoch": "364544"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/states/head/fork"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_fork("head").await.unwrap();
+        assert!(result.execution_optimistic);
+        assert!(!result.finalized);
+        assert_eq!(result.data.current_version, "0x05000000");
+        assert_eq!(result.data.epoch, "364544");
     }
 }

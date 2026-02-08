@@ -10,6 +10,7 @@ pub use client::{BeaconClient, BeaconClientConfig};
 pub use error::BeaconError;
 pub use types::{
     Attestation, AttestationData, AttestationDataResponse, AttesterDutiesResponse, AttesterDuty,
-    BeaconBlockHeader, Checkpoint, DataResponse, DependentRootResponse, IndexedAttestationError,
-    SubmitAttestationResult, ValidatorData, ValidatorInfo, ValidatorsResponse,
+    BeaconBlockHeader, Checkpoint, ConfigSpecResponse, DataResponse, DependentRootResponse,
+    GenesisData, GenesisResponse, IndexedAttestationError, StateFork, StateForkResponse,
+    StateResponse, SubmitAttestationResult, ValidatorData, ValidatorInfo, ValidatorsResponse,
 };
