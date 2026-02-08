@@ -492,7 +492,9 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 name = "beacon"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "reqwest",
+ "rvc-eth-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
