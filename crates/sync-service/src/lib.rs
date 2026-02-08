@@ -2,6 +2,7 @@
 
 mod error;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -122,6 +123,10 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
             ));
         }
 
+        if duties.is_empty() {
+            return Ok(SyncMessagesResult { count: 0 });
+        }
+
         let mut messages = Vec::new();
         for (duty, pubkey) in duties.iter().zip(pubkeys.iter()) {
             let sig = self
@@ -166,7 +171,13 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
         let mut signed_proofs = Vec::new();
 
         for (duty, pubkey) in duties.iter().zip(pubkeys.iter()) {
-            for &subcommittee_index in &duty.validator_sync_committee_indices {
+            let subcommittee_indices: BTreeSet<u64> = duty
+                .validator_sync_committee_indices
+                .iter()
+                .map(|&pos| pos / (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT))
+                .collect();
+
+            for subcommittee_index in subcommittee_indices {
                 let selection_proof = self
                     .signer
                     .sign_selection_proof(
@@ -545,8 +556,8 @@ mod tests {
         assert!(result.is_ok());
         let result = result.unwrap();
         assert_eq!(result.count, 0);
-        // Still submits (empty array) — beacon should handle it
-        assert_eq!(service.beacon.submit_messages_call_count.load(Ordering::SeqCst), 1);
+        // Early return — no beacon call for empty duties
+        assert_eq!(service.beacon.submit_messages_call_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -689,10 +700,11 @@ mod tests {
         let beacon = MockBeacon::new();
         let service = create_service(signer, beacon);
 
+        // Positions 0, 128, 256 map to subcommittees 0, 1, 2 respectively
         let duties = vec![SyncCommitteeDuty {
             pubkey: "0x00".to_string(),
             validator_index: 42,
-            validator_sync_committee_indices: vec![0, 1, 2],
+            validator_sync_committee_indices: vec![0, 128, 256],
         }];
         let pubkeys = vec![vec![0u8; 48]];
         let head_root = [0x11; 32];
@@ -706,6 +718,35 @@ mod tests {
         assert_eq!(service.signer.sign_selection_call_count.load(Ordering::SeqCst), 3);
         assert_eq!(service.beacon.get_contribution_call_count.load(Ordering::SeqCst), 3);
         assert_eq!(service.signer.sign_contribution_call_count.load(Ordering::SeqCst), 3);
+        assert_eq!(service.beacon.submit_proofs_call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_produce_contributions_deduplicates_same_subcommittee() {
+        let aggregator_proof = find_aggregator_proof();
+        let signer = MockSigner::new().with_selection_proof(aggregator_proof);
+        let beacon = MockBeacon::new();
+        let service = create_service(signer, beacon);
+
+        // Positions 5 and 10 both map to subcommittee 0 (5/128=0, 10/128=0)
+        let duties = vec![SyncCommitteeDuty {
+            pubkey: "0x00".to_string(),
+            validator_index: 42,
+            validator_sync_committee_indices: vec![5, 10],
+        }];
+        let pubkeys = vec![vec![0u8; 48]];
+        let head_root = [0x11; 32];
+
+        let result = service.produce_contributions(100, &duties, &head_root, &pubkeys).await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        // Should produce only 1 contribution since both positions are in subcommittee 0
+        assert_eq!(result.count, 1);
+
+        assert_eq!(service.signer.sign_selection_call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(service.beacon.get_contribution_call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(service.signer.sign_contribution_call_count.load(Ordering::SeqCst), 1);
         assert_eq!(service.beacon.submit_proofs_call_count.load(Ordering::SeqCst), 1);
     }
 
