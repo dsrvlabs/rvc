@@ -8,9 +8,10 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use beacon::{Attestation, AttesterDuty, BeaconClient};
+use block_service::{BeaconBlockClient, BlockService};
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
-use eth_types::{ForkName, ForkSchedule, Root, Slot};
+use eth_types::{ForkName, ForkSchedule, Root, Slot, SyncCommitteeDuty};
 use metrics::definitions::{
     attestation_status, orchestrator_result, RVC_ATTESTATIONS_TOTAL,
     RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
@@ -35,11 +36,7 @@ pub struct OrchestratorConfig {
 
 impl OrchestratorConfig {
     pub fn new(genesis_validators_root: Root, fork_schedule: Arc<ForkSchedule>) -> Self {
-        Self {
-            genesis_validators_root,
-            fork_schedule,
-            shutdown_timeout: Duration::from_secs(30),
-        }
+        Self { genesis_validators_root, fork_schedule, shutdown_timeout: Duration::from_secs(30) }
     }
 
     pub fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
@@ -73,38 +70,52 @@ pub struct AttestationResult {
     pub error: Option<String>,
 }
 
-/// Main orchestrator for coordinating attestation duties.
-pub struct DutyOrchestrator<C, S>
+/// Main orchestrator for coordinating validator duties.
+pub struct DutyOrchestrator<C, S, B>
 where
     C: SlotClock + 'static,
     S: AttestationSubmitter + 'static,
+    B: BeaconBlockClient + 'static,
 {
     clock: Arc<C>,
     duty_tracker: Arc<DutyTracker>,
     signer: Arc<SignerService>,
     propagator: Arc<Propagator<S>>,
     beacon: Arc<BeaconClient>,
+    block_service: BlockService<SignerService, B>,
     config: OrchestratorConfig,
     pubkey_map: HashMap<String, PublicKey>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
-impl<C, S> DutyOrchestrator<C, S>
+impl<C, S, B> DutyOrchestrator<C, S, B>
 where
     C: SlotClock + 'static,
     S: AttestationSubmitter + 'static,
+    B: BeaconBlockClient + 'static,
 {
     /// Creates a new DutyOrchestrator with the given dependencies.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         clock: Arc<C>,
         duty_tracker: Arc<DutyTracker>,
         signer: Arc<SignerService>,
         propagator: Arc<Propagator<S>>,
         beacon: Arc<BeaconClient>,
+        block_beacon: Arc<B>,
+        validator_store: Arc<validator_store::ValidatorStore>,
         config: OrchestratorConfig,
         pubkey_map: HashMap<String, PublicKey>,
     ) -> (Self, OrchestratorHandle) {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let block_service = BlockService::new(
+            signer.clone(),
+            block_beacon,
+            validator_store,
+            config.fork_schedule.clone(),
+            config.genesis_validators_root,
+        );
 
         let orchestrator = Self {
             clock,
@@ -112,6 +123,7 @@ where
             signer,
             propagator,
             beacon,
+            block_service,
             config,
             pubkey_map,
             shutdown_rx,
@@ -122,7 +134,10 @@ where
         (orchestrator, handle)
     }
 
-    /// Runs the orchestrator main loop.
+    /// Runs the orchestrator main loop with three-phase slot processing:
+    /// - t=0: epoch boundary duty fetch + block proposal
+    /// - t=slot/3: attestations + sync committee messages
+    /// - t=2*slot/3: sync committee contributions
     pub async fn run(&mut self) -> Result<(), OrchestratorError> {
         info!("Starting duty orchestrator");
 
@@ -143,23 +158,19 @@ where
 
             let current_epoch = current_slot / SLOTS_PER_EPOCH;
 
-            if !self.duty_tracker.is_epoch_cached(current_epoch).await {
-                debug!(epoch = current_epoch, "Fetching duties for current epoch");
-                if let Err(e) = self.duty_tracker.fetch_duties_for_epoch(current_epoch).await {
-                    warn!(epoch = current_epoch, error = %e, "Failed to fetch duties for epoch");
-                }
+            // === Epoch boundary: fetch all duty types ===
+            self.fetch_epoch_duties(current_epoch).await;
+            self.fetch_epoch_duties(current_epoch + 1).await;
+
+            // === Phase 1: t=0 — Block proposal ===
+            self.maybe_propose_block(current_slot, current_epoch).await;
+
+            if self.check_shutdown() {
+                return Ok(());
             }
 
-            let next_epoch = current_epoch + 1;
-            if !self.duty_tracker.is_epoch_cached(next_epoch).await {
-                debug!(epoch = next_epoch, "Prefetching duties for next epoch");
-                if let Err(e) = self.duty_tracker.fetch_duties_for_epoch(next_epoch).await {
-                    warn!(epoch = next_epoch, error = %e, "Failed to prefetch duties for next epoch");
-                }
-            }
-
+            // === Phase 2: t=slot/3 — Attestations + sync committee messages ===
             let time_until_attestation = self.clock.time_until_attestation(current_slot)?;
-
             if !time_until_attestation.is_zero() {
                 debug!(
                     slot = current_slot,
@@ -170,16 +181,14 @@ where
                 tokio::select! {
                     _ = tokio::time::sleep(time_until_attestation) => {}
                     _ = self.shutdown_rx.changed() => {
-                        if *self.shutdown_rx.borrow() {
-                            info!("Shutdown signal received during wait");
+                        if self.check_shutdown() {
                             return Ok(());
                         }
                     }
                 }
             }
 
-            if *self.shutdown_rx.borrow() {
-                info!("Shutdown signal received, stopping orchestrator");
+            if self.check_shutdown() {
                 return Ok(());
             }
 
@@ -200,6 +209,46 @@ where
                 }
             }
 
+            self.maybe_produce_sync_messages(current_slot, current_epoch).await;
+
+            if self.check_shutdown() {
+                return Ok(());
+            }
+
+            // === Phase 3: t=2*slot/3 — Sync committee contributions ===
+            let slot_duration = self.clock.slot_duration();
+            let two_thirds_offset = slot_duration.as_secs() * 2 / 3;
+            let two_thirds_time = self.clock.slot_start_time(current_slot) + two_thirds_offset;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time went backwards")
+                .as_secs();
+
+            if now < two_thirds_time {
+                let wait_duration = Duration::from_secs(two_thirds_time - now);
+                debug!(
+                    slot = current_slot,
+                    wait_ms = wait_duration.as_millis(),
+                    "Waiting for 2/3 slot time"
+                );
+
+                tokio::select! {
+                    _ = tokio::time::sleep(wait_duration) => {}
+                    _ = self.shutdown_rx.changed() => {
+                        if self.check_shutdown() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            if self.check_shutdown() {
+                return Ok(());
+            }
+
+            self.maybe_produce_sync_contributions(current_slot, current_epoch).await;
+
+            // === Wait for next slot ===
             let next_slot = current_slot + 1;
             let time_until_next_slot = self.clock.time_until_slot(next_slot)?;
 
@@ -207,12 +256,227 @@ where
                 tokio::select! {
                     _ = tokio::time::sleep(time_until_next_slot) => {}
                     _ = self.shutdown_rx.changed() => {
-                        if *self.shutdown_rx.borrow() {
-                            info!("Shutdown signal received waiting for next slot");
+                        if self.check_shutdown() {
                             return Ok(());
                         }
                     }
                 }
+            }
+        }
+    }
+
+    fn check_shutdown(&self) -> bool {
+        if *self.shutdown_rx.borrow() {
+            info!("Shutdown signal received, stopping orchestrator");
+            true
+        } else {
+            false
+        }
+    }
+
+    async fn fetch_epoch_duties(&self, epoch: u64) {
+        // Attester duties
+        if !self.duty_tracker.is_epoch_cached(epoch).await {
+            debug!(epoch, "Fetching attester duties for epoch");
+            if let Err(e) = self.duty_tracker.fetch_duties_for_epoch(epoch).await {
+                warn!(epoch, error = %e, "Failed to fetch attester duties");
+            }
+        }
+
+        // Proposer duties
+        if !self.duty_tracker.is_proposer_epoch_cached(epoch).await {
+            debug!(epoch, "Fetching proposer duties for epoch");
+            if let Err(e) = self.duty_tracker.fetch_proposer_duties(epoch).await {
+                warn!(epoch, error = %e, "Failed to fetch proposer duties");
+            }
+        }
+
+        // Sync committee duties (at period boundaries)
+        if !self.duty_tracker.is_sync_period_cached(epoch).await {
+            debug!(epoch, "Fetching sync committee duties");
+            if let Err(e) = self.duty_tracker.fetch_sync_committee_duties(epoch).await {
+                warn!(epoch, error = %e, "Failed to fetch sync committee duties");
+            }
+        }
+    }
+
+    async fn maybe_propose_block(&self, slot: Slot, epoch: u64) {
+        let proposer_duty = match self.duty_tracker.get_proposer_duty(slot).await {
+            Some(duty) => duty,
+            None => return,
+        };
+
+        // Check if the proposer is one of our validators
+        let pubkey = match self.find_pubkey(&proposer_duty.pubkey) {
+            Some(pk) => pk,
+            None => return,
+        };
+
+        info!(slot, validator_index = proposer_duty.validator_index, "Proposing block");
+
+        match self.block_service.propose_block(slot, &pubkey).await {
+            Ok(result) => {
+                info!(
+                    slot,
+                    blinded = result.is_blinded,
+                    consensus_version = %result.consensus_version,
+                    "Block proposed successfully"
+                );
+            }
+            Err(e) => {
+                error!(
+                    slot,
+                    epoch,
+                    error = %e,
+                    "Failed to propose block"
+                );
+            }
+        }
+    }
+
+    async fn maybe_produce_sync_messages(&self, slot: Slot, _epoch: u64) {
+        let duties = self.duty_tracker.get_sync_committee_duties(slot).await;
+        if duties.is_empty() {
+            return;
+        }
+
+        let (matching_duties, matching_pubkeys) = self.filter_sync_duties(&duties);
+        if matching_duties.is_empty() {
+            return;
+        }
+
+        let head_root = match self.get_head_block_root().await {
+            Some(root) => root,
+            None => return,
+        };
+
+        let mut messages = Vec::new();
+
+        for (duty, pubkey) in matching_duties.iter().zip(matching_pubkeys.iter()) {
+            match SignerService::sign_sync_committee_message(
+                &self.signer,
+                &head_root,
+                slot,
+                pubkey,
+                &self.config.fork_schedule,
+                &self.config.genesis_validators_root,
+            ) {
+                Ok(sig) => {
+                    messages.push(beacon::SyncCommitteeMessage {
+                        slot,
+                        beacon_block_root: head_root,
+                        validator_index: duty.validator_index,
+                        signature: sig.to_bytes().to_vec(),
+                    });
+                }
+                Err(e) => {
+                    warn!(
+                        slot,
+                        validator_index = duty.validator_index,
+                        error = %e,
+                        "Failed to sign sync committee message"
+                    );
+                }
+            }
+        }
+
+        if !messages.is_empty() {
+            let count = messages.len();
+            if let Err(e) = self.beacon.submit_sync_committee_messages(&messages).await {
+                warn!(slot, error = %e, "Failed to submit sync committee messages");
+            } else {
+                info!(slot, count, "Submitted sync committee messages");
+            }
+        }
+    }
+
+    async fn maybe_produce_sync_contributions(&self, slot: Slot, _epoch: u64) {
+        let duties = self.duty_tracker.get_sync_committee_duties(slot).await;
+        if duties.is_empty() {
+            return;
+        }
+
+        let (matching_duties, matching_pubkeys) = self.filter_sync_duties(&duties);
+        if matching_duties.is_empty() {
+            return;
+        }
+
+        let head_root = match self.get_head_block_root().await {
+            Some(root) => root,
+            None => return,
+        };
+
+        let head_root_hex = format!("0x{}", hex::encode(head_root));
+        let mut contribution_count = 0u64;
+
+        for (duty, _pubkey) in matching_duties.iter().zip(matching_pubkeys.iter()) {
+            let subcommittee_indices: std::collections::BTreeSet<u64> =
+                duty.validator_sync_committee_indices.iter().map(|&pos| pos / 128).collect();
+
+            for subcommittee_index in subcommittee_indices {
+                match self
+                    .beacon
+                    .get_sync_committee_contribution(slot, subcommittee_index, &head_root_hex)
+                    .await
+                {
+                    Ok(_resp) => {
+                        debug!(
+                            slot,
+                            subcommittee_index,
+                            validator_index = duty.validator_index,
+                            "Fetched sync committee contribution"
+                        );
+                        contribution_count += 1;
+                    }
+                    Err(e) => {
+                        warn!(
+                            slot,
+                            subcommittee_index,
+                            error = %e,
+                            "Failed to get sync committee contribution"
+                        );
+                    }
+                }
+            }
+        }
+
+        if contribution_count > 0 {
+            info!(slot, count = contribution_count, "Processed sync committee contributions");
+        }
+    }
+
+    fn filter_sync_duties(
+        &self,
+        duties: &[SyncCommitteeDuty],
+    ) -> (Vec<SyncCommitteeDuty>, Vec<PublicKey>) {
+        let mut matching_duties = Vec::new();
+        let mut matching_pubkeys = Vec::new();
+
+        for duty in duties {
+            if let Some(pk) = self.find_pubkey(&duty.pubkey) {
+                matching_duties.push(duty.clone());
+                matching_pubkeys.push(pk);
+            }
+        }
+
+        (matching_duties, matching_pubkeys)
+    }
+
+    async fn get_head_block_root(&self) -> Option<Root> {
+        match self.beacon.get_block_root("head").await {
+            Ok(response) => {
+                let root_hex = response.data.root;
+                match Self::parse_hex_root(&root_hex) {
+                    Ok(root) => Some(root),
+                    Err(e) => {
+                        warn!(error = %e, "Failed to parse head block root");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch head block root");
+                None
             }
         }
     }
@@ -593,13 +857,16 @@ where
 #[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use beacon::BeaconClientConfig;
+    use block_service::ProduceBlockResponse;
     use crypto::{KeyManager, SecretKey};
     use slashing::SlashingDb;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use timing::MockSlotClock;
+    use validator_store::ValidatorStore;
 
     const TEST_GENESIS_TIME: u64 = 1606824023;
 
@@ -670,6 +937,45 @@ mod tests {
         }
     }
 
+    struct MockBlockBeacon;
+
+    #[async_trait(?Send)]
+    impl BeaconBlockClient for MockBlockBeacon {
+        async fn produce_block_v3(
+            &self,
+            _slot: Slot,
+            _randao_reveal: &str,
+            _graffiti: Option<&str>,
+            _builder_boost_factor: Option<u64>,
+        ) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
+            Err(block_service::BlockServiceError::Beacon("mock".to_string()))
+        }
+
+        async fn publish_block(
+            &self,
+            _signed_block: &eth_types::SignedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), block_service::BlockServiceError> {
+            Ok(())
+        }
+
+        async fn publish_blinded_block(
+            &self,
+            _signed_block: &eth_types::SignedBlindedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), block_service::BlockServiceError> {
+            Ok(())
+        }
+    }
+
+    fn create_mock_block_beacon() -> Arc<MockBlockBeacon> {
+        Arc::new(MockBlockBeacon)
+    }
+
+    fn create_mock_validator_store() -> Arc<ValidatorStore> {
+        Arc::new(ValidatorStore::new([0u8; 20], 100))
+    }
+
     #[test]
     fn test_orchestrator_config_new() {
         let config = OrchestratorConfig::new([0xbb; 32], create_test_fork_schedule());
@@ -686,32 +992,39 @@ mod tests {
 
     #[test]
     fn test_parse_hex_root_with_prefix() {
-        let root = DutyOrchestrator::<MockSlotClock, MockSubmitter>::parse_hex_root(
-            "0x1111111111111111111111111111111111111111111111111111111111111111",
-        )
-        .unwrap();
+        let root =
+            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::parse_hex_root(
+                "0x1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .unwrap();
         assert_eq!(root, [0x11; 32]);
     }
 
     #[test]
     fn test_parse_hex_root_without_prefix() {
-        let root = DutyOrchestrator::<MockSlotClock, MockSubmitter>::parse_hex_root(
-            "2222222222222222222222222222222222222222222222222222222222222222",
-        )
-        .unwrap();
+        let root =
+            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::parse_hex_root(
+                "2222222222222222222222222222222222222222222222222222222222222222",
+            )
+            .unwrap();
         assert_eq!(root, [0x22; 32]);
     }
 
     #[test]
     fn test_parse_hex_root_invalid_length() {
         let result =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter>::parse_hex_root("0x1111111111");
+            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::parse_hex_root(
+                "0x1111111111",
+            );
         assert!(result.is_err());
     }
 
     #[test]
     fn test_parse_hex_root_invalid_hex() {
-        let result = DutyOrchestrator::<MockSlotClock, MockSubmitter>::parse_hex_root("0xgggggggg");
+        let result =
+            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::parse_hex_root(
+                "0xgggggggg",
+            );
         assert!(result.is_err());
     }
 
@@ -735,7 +1048,7 @@ mod tests {
         };
 
         let crypto_data =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter>::convert_attestation_data(
+            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::convert_attestation_data(
                 &beacon_data,
             )
             .unwrap();
@@ -768,7 +1081,7 @@ mod tests {
             },
         };
 
-        let result = DutyOrchestrator::<MockSlotClock, MockSubmitter>::convert_attestation_data(
+        let result = DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::convert_attestation_data(
             &beacon_data,
         );
         assert!(result.is_err());
@@ -800,6 +1113,8 @@ mod tests {
             signer,
             propagator,
             beacon,
+            create_mock_block_beacon(),
+            create_mock_validator_store(),
             config,
             pubkey_map,
         );
@@ -837,6 +1152,8 @@ mod tests {
             signer,
             propagator,
             beacon,
+            create_mock_block_beacon(),
+            create_mock_validator_store(),
             config,
             pubkey_map,
         );
@@ -872,6 +1189,8 @@ mod tests {
             signer,
             propagator,
             beacon,
+            create_mock_block_beacon(),
+            create_mock_validator_store(),
             config,
             pubkey_map,
         );
@@ -939,6 +1258,8 @@ mod tests {
             signer,
             propagator,
             beacon,
+            create_mock_block_beacon(),
+            create_mock_validator_store(),
             config,
             pubkey_map,
         );
@@ -976,6 +1297,8 @@ mod tests {
             signer,
             propagator,
             beacon,
+            create_mock_block_beacon(),
+            create_mock_validator_store(),
             config,
             pubkey_map,
         );
@@ -1013,6 +1336,8 @@ mod tests {
             signer,
             propagator,
             beacon,
+            create_mock_block_beacon(),
+            create_mock_validator_store(),
             config,
             pubkey_map,
         );
@@ -1044,6 +1369,8 @@ mod tests {
             signer,
             propagator,
             beacon,
+            create_mock_block_beacon(),
+            create_mock_validator_store(),
             config,
             pubkey_map,
         );

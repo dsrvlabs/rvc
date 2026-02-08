@@ -7,8 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 eth-types.workspace = true
 beacon.workspace = true
+block-service.workspace = true
 crypto.workspace = true
 duty-tracker.workspace = true
 hex.workspace = true
@@ -18,6 +20,7 @@ prost.workspace = true
 secrecy.workspace = true
 signer.workspace = true
 slashing.workspace = true
+sync-service.workspace = true
 serde.workspace = true
 toml.workspace = true
 thiserror.workspace = true
@@ -25,6 +28,7 @@ timing.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 tracing.workspace = true
+validator-store.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true

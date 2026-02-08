@@ -9,4 +9,4 @@ mod traits;
 
 pub use error::BlockServiceError;
 pub use service::{BlockProposalResult, BlockService};
-pub use traits::BeaconBlockClient;
+pub use traits::{BeaconBlockClient, ProduceBlockResponse};
