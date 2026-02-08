@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::duty_tracker::DutyTracker;
+use duty_tracker::DutyTracker;
 use crate::propagator::{AttestationSubmitter, Propagator};
 use crate::signer::SignerService;
 use crate::timing::{SlotClock, SLOTS_PER_EPOCH};
