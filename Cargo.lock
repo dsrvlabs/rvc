@@ -2656,13 +2656,9 @@ dependencies = [
 name = "rvc"
 version = "0.1.0"
 dependencies = [
- "axum",
  "beacon",
  "hex",
- "lazy_static",
- "prometheus",
  "prost",
- "reqwest",
  "rvc-crypto",
  "rvc-duty-tracker",
  "rvc-eth-types",
@@ -2680,7 +2676,6 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-build",
- "tower 0.5.3",
  "tracing",
  "wiremock",
 ]
@@ -2696,6 +2691,7 @@ dependencies = [
  "reqwest",
  "rvc",
  "rvc-crypto",
+ "rvc-metrics",
  "tempfile",
  "tokio",
  "tonic",
@@ -2789,10 +2785,7 @@ dependencies = [
  "rvc-eth-types",
  "rvc-metrics",
  "rvc-slashing",
- "tempfile",
  "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]
