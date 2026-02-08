@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::crypto::{Fork, PublicKey, Root, Slot};
 use crate::duty_tracker::DutyTracker;
-use crate::metrics::definitions::{
+use metrics::definitions::{
     attestation_status, orchestrator_result, RVC_ATTESTATIONS_TOTAL,
     RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
     RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL, RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,

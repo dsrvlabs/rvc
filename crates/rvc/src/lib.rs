@@ -3,8 +3,9 @@
 pub mod config;
 pub mod crypto;
 pub mod duty_tracker;
-pub mod metrics;
 pub mod orchestrator;
+
+pub use metrics;
 pub mod propagator;
 pub mod signer;
 pub mod slashing;
