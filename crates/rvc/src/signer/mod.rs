@@ -11,11 +11,11 @@ use thiserror::Error;
 use crate::crypto::{
     sign_attestation, AttestationData, Fork, KeyManager, PublicKey, Root, Signature,
 };
+use crate::slashing::{SlashingDb, SlashingError};
 use metrics::definitions::{
     slashing_result, RVC_ATTESTATIONS_TOTAL, RVC_SIGNING_DURATION_SECONDS,
     RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
 };
-use crate::slashing::{SlashingDb, SlashingError};
 
 /// Errors that can occur during signing operations.
 #[derive(Debug, Error)]
