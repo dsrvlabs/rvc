@@ -243,23 +243,42 @@ impl BeaconClient {
             .and_then(|v| v.to_str().ok())
             .map(|v| v.to_string());
 
-        let data: serde_json::Value =
+        let body: serde_json::Value =
             response.json().await.map_err(|e| BeaconError::ParseError(e.to_string()))?;
+
+        let data = body.get("data").cloned().ok_or_else(|| {
+            BeaconError::ParseError("missing 'data' field in produce block response".into())
+        })?;
 
         Ok(ProduceBlockResponse { data, is_blinded, consensus_version, execution_payload_value })
     }
 
     /// Publishes a signed beacon block to the network.
-    pub async fn publish_block<B: Serialize>(&self, signed_block: &B) -> Result<(), BeaconError> {
-        self.post_empty("/eth/v2/beacon/blocks", signed_block).await
+    pub async fn publish_block<B: Serialize>(
+        &self,
+        signed_block: &B,
+        consensus_version: &str,
+    ) -> Result<(), BeaconError> {
+        self.post_empty_with_headers(
+            "/eth/v2/beacon/blocks",
+            signed_block,
+            &[("Eth-Consensus-Version", consensus_version)],
+        )
+        .await
     }
 
     /// Publishes a signed blinded beacon block to the network.
     pub async fn publish_blinded_block<B: Serialize>(
         &self,
         signed_blinded_block: &B,
+        consensus_version: &str,
     ) -> Result<(), BeaconError> {
-        self.post_empty("/eth/v1/beacon/blinded_blocks", signed_blinded_block).await
+        self.post_empty_with_headers(
+            "/eth/v1/beacon/blinded_blocks",
+            signed_blinded_block,
+            &[("Eth-Consensus-Version", consensus_version)],
+        )
+        .await
     }
 
     /// Submits signed attestations to the beacon node.
@@ -414,8 +433,13 @@ impl BeaconClient {
         Err(last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string())))
     }
 
-    /// Performs a POST request with retry logic, expecting an empty success response.
-    async fn post_empty<B: Serialize>(&self, path: &str, body: &B) -> Result<(), BeaconError> {
+    /// Performs a POST request with retry logic and optional headers, expecting an empty success response.
+    async fn post_empty_with_headers<B: Serialize>(
+        &self,
+        path: &str,
+        body: &B,
+        headers: &[(&str, &str)],
+    ) -> Result<(), BeaconError> {
         let url = format!("{}{}", self.config.endpoint, path);
         let mut last_error = None;
 
@@ -426,7 +450,12 @@ impl BeaconClient {
                 tokio::time::sleep(backoff).await;
             }
 
-            match self.client.post(&url).json(body).send().await {
+            let mut request = self.client.post(&url).json(body);
+            for &(name, value) in headers {
+                request = request.header(name, value);
+            }
+
+            match request.send().await {
                 Ok(response) => {
                     let status = response.status();
 
@@ -2129,15 +2158,19 @@ mod tests {
     async fn test_produce_block_v3_full_block() {
         let mock_server = MockServer::start().await;
 
-        let block_body = serde_json::json!({
+        let parent_root: Vec<u8> = vec![1u8; 32];
+        let state_root: Vec<u8> = vec![2u8; 32];
+        let block_data = serde_json::json!({
+            "slot": "100",
+            "proposer_index": "42",
+            "parent_root": parent_root,
+            "state_root": state_root,
+            "body": [0xde, 0xad]
+        });
+        let envelope = serde_json::json!({
             "version": "deneb",
-            "data": {
-                "slot": "100",
-                "proposer_index": "42",
-                "parent_root": "0x0101010101010101010101010101010101010101010101010101010101010101",
-                "state_root": "0x0202020202020202020202020202020202020202020202020202020202020202",
-                "body": "0xdead"
-            }
+            "execution_optimistic": false,
+            "data": block_data
         });
 
         Mock::given(method("GET"))
@@ -2145,7 +2178,7 @@ mod tests {
             .and(wiremock::matchers::query_param("randao_reveal", "0xrandao"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(&block_body)
+                    .set_body_json(&envelope)
                     .insert_header("Eth-Execution-Payload-Blinded", "false")
                     .insert_header("Eth-Consensus-Version", "deneb")
                     .insert_header("Eth-Execution-Payload-Value", "12345"),
@@ -2162,22 +2195,29 @@ mod tests {
         assert!(!result.is_blinded);
         assert_eq!(result.consensus_version, "deneb");
         assert_eq!(result.execution_payload_value, Some("12345".to_string()));
-        assert!(result.data.is_object());
+
+        let block = result.parse_full_block().unwrap();
+        assert_eq!(block.block().slot, 100);
+        assert_eq!(block.block().proposer_index, 42);
     }
 
     #[tokio::test]
     async fn test_produce_block_v3_blinded_block() {
         let mock_server = MockServer::start().await;
 
-        let block_body = serde_json::json!({
+        let parent_root: Vec<u8> = vec![3u8; 32];
+        let state_root: Vec<u8> = vec![4u8; 32];
+        let block_data = serde_json::json!({
+            "slot": "200",
+            "proposer_index": "10",
+            "parent_root": parent_root,
+            "state_root": state_root,
+            "body": [0xbe, 0xef]
+        });
+        let envelope = serde_json::json!({
             "version": "deneb",
-            "data": {
-                "slot": "200",
-                "proposer_index": "10",
-                "parent_root": "0x0101010101010101010101010101010101010101010101010101010101010101",
-                "state_root": "0x0202020202020202020202020202020202020202020202020202020202020202",
-                "body": "0xbeef"
-            }
+            "execution_optimistic": false,
+            "data": block_data
         });
 
         Mock::given(method("GET"))
@@ -2185,7 +2225,7 @@ mod tests {
             .and(wiremock::matchers::query_param("randao_reveal", "0xrandao"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(&block_body)
+                    .set_body_json(&envelope)
                     .insert_header("Eth-Execution-Payload-Blinded", "true")
                     .insert_header("Eth-Consensus-Version", "deneb"),
             )
@@ -2201,6 +2241,10 @@ mod tests {
         assert!(result.is_blinded);
         assert_eq!(result.consensus_version, "deneb");
         assert_eq!(result.execution_payload_value, None);
+
+        let block = result.parse_blinded_block().unwrap();
+        assert_eq!(block.slot, 200);
+        assert_eq!(block.proposer_index, 10);
     }
 
     #[tokio::test]
@@ -2208,6 +2252,7 @@ mod tests {
         let mock_server = MockServer::start().await;
 
         let block_body = serde_json::json!({
+            "version": "deneb",
             "data": {}
         });
 
@@ -2279,6 +2324,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/blocks"))
             .and(body_json(&signed_block))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "deneb"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock_server)
@@ -2287,7 +2333,7 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        client.publish_block(&signed_block).await.unwrap();
+        client.publish_block(&signed_block, "deneb").await.unwrap();
     }
 
     #[tokio::test]
@@ -2305,7 +2351,7 @@ mod tests {
         let client = BeaconClient::new(config).unwrap();
 
         let signed_block = serde_json::json!({"message": {}});
-        let result = client.publish_block(&signed_block).await;
+        let result = client.publish_block(&signed_block, "deneb").await;
 
         match result {
             Err(BeaconError::ApiError { status, message }) => {
@@ -2334,6 +2380,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/eth/v1/beacon/blinded_blocks"))
             .and(body_json(&signed_blinded_block))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "deneb"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock_server)
@@ -2342,7 +2389,7 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        client.publish_blinded_block(&signed_blinded_block).await.unwrap();
+        client.publish_blinded_block(&signed_blinded_block, "deneb").await.unwrap();
     }
 
     #[tokio::test]
@@ -2360,7 +2407,7 @@ mod tests {
         let client = BeaconClient::new(config).unwrap();
 
         let signed_block = serde_json::json!({"message": {}});
-        let result = client.publish_blinded_block(&signed_block).await;
+        let result = client.publish_blinded_block(&signed_block, "deneb").await;
 
         match result {
             Err(BeaconError::ApiError { status, message }) => {
@@ -2430,6 +2477,6 @@ mod tests {
         let client = BeaconClient::new(config).unwrap();
 
         let signed_block = serde_json::json!({"message": {}});
-        client.publish_block(&signed_block).await.unwrap();
+        client.publish_block(&signed_block, "deneb").await.unwrap();
     }
 }
