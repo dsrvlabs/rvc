@@ -7,7 +7,6 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::signer::SignerService;
 use crate::timing::{SlotClock, SLOTS_PER_EPOCH};
 use beacon::{Attestation, AttesterDuty, BeaconClient};
 use crypto::PublicKey;
@@ -19,6 +18,7 @@ use metrics::definitions::{
     RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL, RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
 };
 use propagator::{AttestationSubmitter, Propagator};
+use signer::SignerService;
 
 use super::error::OrchestratorError;
 
