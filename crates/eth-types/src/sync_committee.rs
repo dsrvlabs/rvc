@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tree_hash::{Hash256, MerkleHasher, TreeHash, TreeHashType};
 
 use crate::{Root, Signature, Slot};
 
@@ -32,6 +33,57 @@ pub struct SyncCommitteeContribution {
     pub signature: Signature,
 }
 
+impl TreeHash for SyncCommitteeContribution {
+    fn tree_hash_type() -> TreeHashType {
+        TreeHashType::Container
+    }
+
+    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
+        unreachable!("containers cannot be packed")
+    }
+
+    fn tree_hash_packing_factor() -> usize {
+        1
+    }
+
+    fn tree_hash_root(&self) -> Hash256 {
+        let mut hasher = MerkleHasher::with_leaves(5);
+        hasher.write(self.slot.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(self.beacon_block_root.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(self.subcommittee_index.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(vec_u8_tree_hash_root(&self.aggregation_bits).as_slice()).expect("valid leaf");
+        hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
+        hasher.finish().expect("valid root")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SyncAggregatorSelectionData {
+    pub slot: Slot,
+    pub subcommittee_index: u64,
+}
+
+impl TreeHash for SyncAggregatorSelectionData {
+    fn tree_hash_type() -> TreeHashType {
+        TreeHashType::Container
+    }
+
+    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
+        unreachable!("containers cannot be packed")
+    }
+
+    fn tree_hash_packing_factor() -> usize {
+        1
+    }
+
+    fn tree_hash_root(&self) -> Hash256 {
+        let mut hasher = MerkleHasher::with_leaves(2);
+        hasher.write(self.slot.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(self.subcommittee_index.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.finish().expect("valid root")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContributionAndProof {
     #[serde(with = "serde_utils::quoted_u64")]
@@ -40,10 +92,39 @@ pub struct ContributionAndProof {
     pub selection_proof: Signature,
 }
 
+impl TreeHash for ContributionAndProof {
+    fn tree_hash_type() -> TreeHashType {
+        TreeHashType::Container
+    }
+
+    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
+        unreachable!("containers cannot be packed")
+    }
+
+    fn tree_hash_packing_factor() -> usize {
+        1
+    }
+
+    fn tree_hash_root(&self) -> Hash256 {
+        let mut hasher = MerkleHasher::with_leaves(3);
+        hasher.write(self.aggregator_index.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(self.contribution.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(vec_u8_tree_hash_root(&self.selection_proof).as_slice()).expect("valid leaf");
+        hasher.finish().expect("valid root")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedContributionAndProof {
     pub message: ContributionAndProof,
     pub signature: Signature,
+}
+
+fn vec_u8_tree_hash_root(bytes: &[u8]) -> Hash256 {
+    let num_leaves = bytes.len().div_ceil(32);
+    let mut hasher = MerkleHasher::with_leaves(num_leaves.max(1));
+    hasher.write(bytes).expect("valid bytes");
+    hasher.finish().expect("valid root")
 }
 
 #[cfg(test)]
