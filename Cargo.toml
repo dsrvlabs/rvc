@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/rvc", "crates/rvc", "crates/beacon", "crates/eth-types", "crates/metrics", "crates/slashing", "crates/timing", "crates/crypto", "crates/duty-tracker", "crates/propagator"]
+members = ["bin/rvc", "crates/rvc", "crates/beacon", "crates/eth-types", "crates/metrics", "crates/slashing", "crates/timing", "crates/crypto", "crates/duty-tracker", "crates/propagator", "crates/signer"]
 default-members = ["bin/rvc"]
 resolver = "2"
 
@@ -21,6 +21,7 @@ timing = { path = "crates/timing", package = "rvc-timing" }
 crypto = { path = "crates/crypto", package = "rvc-crypto" }
 duty-tracker = { path = "crates/duty-tracker", package = "rvc-duty-tracker" }
 propagator = { path = "crates/propagator", package = "rvc-propagator" }
+signer = { path = "crates/signer", package = "rvc-signer" }
 
 # External
 axum = "0.7"

@@ -1,0 +1,20 @@
+[package]
+name = "rvc-signer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crypto.workspace = true
+eth-types.workspace = true
+hex.workspace = true
+metrics.workspace = true
+slashing.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
