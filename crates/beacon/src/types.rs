@@ -668,14 +668,12 @@ mod tests {
 
     #[test]
     fn test_produce_block_response_parse_full_block() {
-        let parent_root: Vec<u8> = vec![1u8; 32];
-        let state_root: Vec<u8> = vec![2u8; 32];
         let block_json = serde_json::json!({
             "slot": "100",
             "proposer_index": "42",
-            "parent_root": parent_root,
-            "state_root": state_root,
-            "body": [0xde, 0xad]
+            "parent_root": format!("0x{}", "01".repeat(32)),
+            "state_root": format!("0x{}", "02".repeat(32)),
+            "body": "0xdead"
         });
 
         let response = ProduceBlockResponse {
@@ -692,14 +690,12 @@ mod tests {
 
     #[test]
     fn test_produce_block_response_parse_blinded_block() {
-        let parent_root: Vec<u8> = vec![3u8; 32];
-        let state_root: Vec<u8> = vec![4u8; 32];
         let block_json = serde_json::json!({
             "slot": "200",
             "proposer_index": "99",
-            "parent_root": parent_root,
-            "state_root": state_root,
-            "body": [0xbe, 0xef]
+            "parent_root": format!("0x{}", "03".repeat(32)),
+            "state_root": format!("0x{}", "04".repeat(32)),
+            "body": "0xbeef"
         });
 
         let response = ProduceBlockResponse {
