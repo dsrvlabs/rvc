@@ -568,10 +568,10 @@ where
 #[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
-    use slashing::SlashingDb;
     use crate::timing::MockSlotClock;
     use beacon::BeaconClientConfig;
     use crypto::{KeyManager, SecretKey};
+    use slashing::SlashingDb;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};

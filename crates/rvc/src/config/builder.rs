@@ -13,11 +13,11 @@ use crate::duty_tracker::DutyTracker;
 use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle};
 use crate::propagator::{AttestationSubmitter, Propagator};
 use crate::signer::SignerService;
-use slashing::SlashingDb;
 use crate::timing::{SlotClock, SystemSlotClock};
 use beacon::{BeaconClient, BeaconClientConfig};
 use crypto::{KeyManager, PublicKey};
 use eth_types::{Fork, Root};
+use slashing::SlashingDb;
 
 use super::error::ConfigError;
 use super::types::Config;
