@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::{Epoch, Slot};
+use eth_types::{Epoch, Slot};
 
 /// Internal record of a signed attestation for slashing protection.
 #[derive(Debug, Clone, PartialEq, Eq)]

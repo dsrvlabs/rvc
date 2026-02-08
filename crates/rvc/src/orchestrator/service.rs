@@ -7,12 +7,13 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::crypto::{Fork, PublicKey, Root, Slot};
 use crate::duty_tracker::DutyTracker;
 use crate::propagator::{AttestationSubmitter, Propagator};
 use crate::signer::SignerService;
 use crate::timing::{SlotClock, SLOTS_PER_EPOCH};
 use beacon::{Attestation, AttesterDuty, BeaconClient};
+use crypto::PublicKey;
+use eth_types::{Fork, Root, Slot};
 use metrics::definitions::{
     attestation_status, orchestrator_result, RVC_ATTESTATIONS_TOTAL,
     RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
@@ -506,7 +507,7 @@ where
 
     fn convert_attestation_data(
         beacon_data: &beacon::AttestationData,
-    ) -> Result<crate::crypto::AttestationData, OrchestratorError> {
+    ) -> Result<eth_types::AttestationData, OrchestratorError> {
         let slot: u64 = beacon_data
             .slot
             .parse()
@@ -535,12 +536,12 @@ where
 
         let target_root = Self::parse_hex_root(&beacon_data.target.root)?;
 
-        Ok(crate::crypto::AttestationData {
+        Ok(eth_types::AttestationData {
             slot,
             index,
             beacon_block_root,
-            source: crate::crypto::Checkpoint { epoch: source_epoch, root: source_root },
-            target: crate::crypto::Checkpoint { epoch: target_epoch, root: target_root },
+            source: eth_types::Checkpoint { epoch: source_epoch, root: source_root },
+            target: eth_types::Checkpoint { epoch: target_epoch, root: target_root },
         })
     }
 
@@ -567,10 +568,10 @@ where
 #[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
-    use crate::crypto::{KeyManager, SecretKey};
     use crate::slashing::SlashingDb;
     use crate::timing::MockSlotClock;
     use beacon::BeaconClientConfig;
+    use crypto::{KeyManager, SecretKey};
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};

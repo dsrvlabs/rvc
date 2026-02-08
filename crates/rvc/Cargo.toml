@@ -12,6 +12,7 @@ eth-types.workspace = true
 axum.workspace = true
 beacon.workspace = true
 blst.workspace = true
+crypto.workspace = true
 ctr.workspace = true
 hex.workspace = true
 lazy_static.workspace = true
@@ -46,5 +47,6 @@ zeroize.workspace = true
 tonic-build.workspace = true
 
 [dev-dependencies]
+crypto = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 wiremock.workspace = true

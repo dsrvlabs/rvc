@@ -43,7 +43,7 @@ pub enum ConfigError {
     PasswordReadError(String),
 
     #[error("key manager error: {0}")]
-    KeyManagerError(#[from] crate::crypto::KeyManagerError),
+    KeyManagerError(#[from] crypto::KeyManagerError),
 
     #[error("slashing db error: {0}")]
     SlashingDbError(#[from] crate::slashing::SlashingError),

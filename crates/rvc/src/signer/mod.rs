@@ -8,10 +8,9 @@ use std::time::Instant;
 
 use thiserror::Error;
 
-use crate::crypto::{
-    sign_attestation, AttestationData, Fork, KeyManager, PublicKey, Root, Signature,
-};
 use crate::slashing::{SlashingDb, SlashingError};
+use crypto::{sign_attestation, KeyManager, PublicKey, Signature};
+use eth_types::{AttestationData, Fork, Root};
 use metrics::definitions::{
     slashing_result, RVC_ATTESTATIONS_TOTAL, RVC_SIGNING_DURATION_SECONDS,
     RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
@@ -84,10 +83,10 @@ impl SignerService {
         let signature =
             sign_attestation(attestation_data, secret_key, fork, genesis_validators_root);
 
-        let signing_root = hex::encode(crate::crypto::compute_signing_root(
+        let signing_root = hex::encode(crypto::compute_signing_root(
             attestation_data,
-            crate::crypto::compute_domain(
-                crate::crypto::DOMAIN_BEACON_ATTESTER,
+            crypto::compute_domain(
+                crypto::DOMAIN_BEACON_ATTESTER,
                 if target_epoch >= fork.epoch {
                     fork.current_version
                 } else {
@@ -129,9 +128,8 @@ impl SignerService {
 #[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
-    use crate::crypto::{
-        compute_domain, compute_signing_root, Checkpoint, SecretKey, DOMAIN_BEACON_ATTESTER,
-    };
+    use crypto::{compute_domain, compute_signing_root, SecretKey, DOMAIN_BEACON_ATTESTER};
+    use eth_types::Checkpoint;
 
     fn create_test_key_manager_with_key(secret_key: SecretKey) -> KeyManager {
         let mut manager = KeyManager::new();

@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::crypto::Epoch;
+use eth_types::Epoch;
 
 /// Errors that can occur during slashing protection operations.
 #[derive(Debug, Error)]

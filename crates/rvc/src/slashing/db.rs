@@ -9,7 +9,7 @@ use super::types::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata,
     SignedAttestation, SignedBlock, ValidatorRecord,
 };
-use crate::crypto::Epoch;
+use eth_types::Epoch;
 
 /// SQLite-backed database for storing slashing protection data.
 pub struct SlashingDb {

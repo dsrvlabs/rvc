@@ -1,7 +1,6 @@
 //! rvc - Rust Validator Client
 
 pub mod config;
-pub mod crypto;
 pub mod duty_tracker;
 pub mod orchestrator;
 
