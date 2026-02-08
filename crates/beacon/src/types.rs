@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 
 /// A checkpoint in the beacon chain consisting of an epoch and block root.
@@ -84,6 +86,39 @@ pub struct ValidatorInfo {
 
 /// Response type for the validators state endpoint.
 pub type ValidatorsResponse = DataResponse<Vec<ValidatorData>>;
+
+/// Genesis information from the beacon chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenesisData {
+    pub genesis_time: String,
+    pub genesis_validators_root: String,
+    pub genesis_fork_version: String,
+}
+
+/// Response type for the genesis endpoint.
+pub type GenesisResponse = DataResponse<GenesisData>;
+
+/// Response type for the config spec endpoint.
+pub type ConfigSpecResponse = DataResponse<HashMap<String, String>>;
+
+/// Fork information from the beacon state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateFork {
+    pub previous_version: String,
+    pub current_version: String,
+    pub epoch: String,
+}
+
+/// Wrapper for beacon API state responses with execution optimistic and finalized flags.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateResponse<T> {
+    pub execution_optimistic: bool,
+    pub finalized: bool,
+    pub data: T,
+}
+
+/// Response type for the beacon state fork endpoint.
+pub type StateForkResponse = StateResponse<StateFork>;
 
 /// Error details for a single attestation that failed validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +320,104 @@ mod tests {
         let result = SubmitAttestationResult::Success;
         assert!(result.is_success());
         assert!(result.failures().is_empty());
+    }
+
+    #[test]
+    fn test_genesis_data_deserialize() {
+        let json = r#"{
+            "genesis_time": "1606824023",
+            "genesis_validators_root": "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95",
+            "genesis_fork_version": "0x00000000"
+        }"#;
+
+        let genesis: GenesisData = serde_json::from_str(json).unwrap();
+        assert_eq!(genesis.genesis_time, "1606824023");
+        assert_eq!(
+            genesis.genesis_validators_root,
+            "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+        );
+        assert_eq!(genesis.genesis_fork_version, "0x00000000");
+    }
+
+    #[test]
+    fn test_genesis_data_serialize() {
+        let genesis = GenesisData {
+            genesis_time: "1606824023".to_string(),
+            genesis_validators_root:
+                "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95".to_string(),
+            genesis_fork_version: "0x00000000".to_string(),
+        };
+        let json = serde_json::to_string(&genesis).unwrap();
+        assert!(json.contains("\"genesis_time\":\"1606824023\""));
+        assert!(json.contains("\"genesis_fork_version\":\"0x00000000\""));
+    }
+
+    #[test]
+    fn test_genesis_response_deserialize() {
+        let json = r#"{
+            "data": {
+                "genesis_time": "1606824023",
+                "genesis_validators_root": "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95",
+                "genesis_fork_version": "0x00000000"
+            }
+        }"#;
+
+        let response: GenesisResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.data.genesis_time, "1606824023");
+    }
+
+    #[test]
+    fn test_config_spec_response_deserialize() {
+        let json = r#"{
+            "data": {
+                "GENESIS_FORK_VERSION": "0x00000000",
+                "ALTAIR_FORK_EPOCH": "74240",
+                "ALTAIR_FORK_VERSION": "0x01000000",
+                "SECONDS_PER_SLOT": "12",
+                "SLOTS_PER_EPOCH": "32"
+            }
+        }"#;
+
+        let response: ConfigSpecResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.data.get("GENESIS_FORK_VERSION").unwrap(), "0x00000000");
+        assert_eq!(response.data.get("ALTAIR_FORK_EPOCH").unwrap(), "74240");
+        assert_eq!(response.data.get("SECONDS_PER_SLOT").unwrap(), "12");
+        assert_eq!(response.data.get("SLOTS_PER_EPOCH").unwrap(), "32");
+        assert_eq!(response.data.len(), 5);
+    }
+
+    #[test]
+    fn test_state_fork_deserialize() {
+        let json = r#"{
+            "previous_version": "0x00000000",
+            "current_version": "0x04000000",
+            "epoch": "269568"
+        }"#;
+
+        let fork: StateFork = serde_json::from_str(json).unwrap();
+        assert_eq!(fork.previous_version, "0x00000000");
+        assert_eq!(fork.current_version, "0x04000000");
+        assert_eq!(fork.epoch, "269568");
+    }
+
+    #[test]
+    fn test_state_fork_response_deserialize() {
+        let json = r#"{
+            "execution_optimistic": false,
+            "finalized": true,
+            "data": {
+                "previous_version": "0x03000000",
+                "current_version": "0x04000000",
+                "epoch": "269568"
+            }
+        }"#;
+
+        let response: StateForkResponse = serde_json::from_str(json).unwrap();
+        assert!(!response.execution_optimistic);
+        assert!(response.finalized);
+        assert_eq!(response.data.previous_version, "0x03000000");
+        assert_eq!(response.data.current_version, "0x04000000");
+        assert_eq!(response.data.epoch, "269568");
     }
 
     #[test]
