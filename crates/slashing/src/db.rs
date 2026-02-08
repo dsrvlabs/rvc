@@ -4,8 +4,8 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use super::error::{AttestationSlashingViolation, SlashingError};
-use super::types::{
+use crate::error::{AttestationSlashingViolation, SlashingError};
+use crate::types::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata,
     SignedAttestation, SignedBlock, ValidatorRecord,
 };
@@ -629,8 +629,6 @@ mod tests {
 
     #[test]
     fn test_is_safe_to_sign_double_vote() {
-        use super::super::error::AttestationSlashingViolation;
-
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
         let attestation = SignedAttestation {
@@ -657,8 +655,6 @@ mod tests {
 
     #[test]
     fn test_is_safe_to_sign_surrounding_vote() {
-        use super::super::error::AttestationSlashingViolation;
-
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
         // Existing: source=5, target=10
@@ -692,8 +688,6 @@ mod tests {
 
     #[test]
     fn test_is_safe_to_sign_surrounded_vote() {
-        use super::super::error::AttestationSlashingViolation;
-
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
         // Existing: source=4, target=11
@@ -839,8 +833,6 @@ mod tests {
 
     #[test]
     fn test_is_safe_to_sign_surrounding_vote_minimal() {
-        use super::super::error::AttestationSlashingViolation;
-
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
         // Existing: source=5, target=6
@@ -866,8 +858,6 @@ mod tests {
 
     #[test]
     fn test_is_safe_to_sign_surrounded_vote_minimal() {
-        use super::super::error::AttestationSlashingViolation;
-
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
         // Existing: source=4, target=7
@@ -996,8 +986,6 @@ mod tests {
 
     #[test]
     fn test_import_empty_interchange() {
-        use super::super::types::{InterchangeFormat, InterchangeMetadata};
-
         let db = SlashingDb::open_in_memory().expect("failed to open db");
         let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
 
@@ -1015,8 +1003,6 @@ mod tests {
 
     #[test]
     fn test_import_genesis_root_mismatch() {
-        use super::super::types::{InterchangeFormat, InterchangeMetadata};
-
         let db = SlashingDb::open_in_memory().expect("failed to open db");
         let expected_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
         let actual_root = "0xdifferent00000000000000000000000000000000000000000000000000000000";
@@ -1043,10 +1029,6 @@ mod tests {
 
     #[test]
     fn test_import_with_attestations() {
-        use super::super::types::{
-            InterchangeAttestation, InterchangeFormat, InterchangeMetadata, ValidatorRecord,
-        };
-
         let db = SlashingDb::open_in_memory().expect("failed to open db");
         let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
@@ -1088,10 +1070,6 @@ mod tests {
 
     #[test]
     fn test_import_with_blocks() {
-        use super::super::types::{
-            InterchangeBlock, InterchangeFormat, InterchangeMetadata, ValidatorRecord,
-        };
-
         let db = SlashingDb::open_in_memory().expect("failed to open db");
         let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
@@ -1121,8 +1099,6 @@ mod tests {
 
     #[test]
     fn test_roundtrip_export_import() {
-        use super::super::types::InterchangeFormat;
-
         let db1 = SlashingDb::open_in_memory().expect("failed to open db");
         let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
@@ -1162,10 +1138,6 @@ mod tests {
 
     #[test]
     fn test_import_idempotent() {
-        use super::super::types::{
-            InterchangeAttestation, InterchangeFormat, InterchangeMetadata, ValidatorRecord,
-        };
-
         let db = SlashingDb::open_in_memory().expect("failed to open db");
         let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
@@ -1195,10 +1167,6 @@ mod tests {
 
     #[test]
     fn test_import_invalid_epoch_format() {
-        use super::super::types::{
-            InterchangeAttestation, InterchangeFormat, InterchangeMetadata, ValidatorRecord,
-        };
-
         let db = SlashingDb::open_in_memory().expect("failed to open db");
         let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
