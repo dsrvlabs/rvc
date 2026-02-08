@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tree_hash::{Hash256, MerkleHasher, TreeHash, TreeHashType};
 
 use crate::hex_fixed::bytes_32_hex;
 use crate::{Root, Signature, Slot};
@@ -79,9 +80,65 @@ impl BlockContents {
     }
 }
 
+fn vec_u8_tree_hash_root(bytes: &[u8]) -> Hash256 {
+    let num_leaves = bytes.len().div_ceil(32);
+    let mut hasher = MerkleHasher::with_leaves(num_leaves.max(1));
+    hasher.write(bytes).expect("valid bytes");
+    hasher.finish().expect("valid root")
+}
+
+impl TreeHash for BeaconBlock {
+    fn tree_hash_type() -> TreeHashType {
+        TreeHashType::Container
+    }
+
+    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
+        unreachable!("containers cannot be packed")
+    }
+
+    fn tree_hash_packing_factor() -> usize {
+        1
+    }
+
+    fn tree_hash_root(&self) -> Hash256 {
+        let mut hasher = MerkleHasher::with_leaves(5);
+        hasher.write(self.slot.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(self.proposer_index.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(self.parent_root.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(self.state_root.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(vec_u8_tree_hash_root(&self.body).as_slice()).expect("valid leaf");
+        hasher.finish().expect("valid root")
+    }
+}
+
+impl TreeHash for BlindedBeaconBlock {
+    fn tree_hash_type() -> TreeHashType {
+        TreeHashType::Container
+    }
+
+    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
+        unreachable!("containers cannot be packed")
+    }
+
+    fn tree_hash_packing_factor() -> usize {
+        1
+    }
+
+    fn tree_hash_root(&self) -> Hash256 {
+        let mut hasher = MerkleHasher::with_leaves(5);
+        hasher.write(self.slot.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(self.proposer_index.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(self.parent_root.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(self.state_root.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(vec_u8_tree_hash_root(&self.body).as_slice()).expect("valid leaf");
+        hasher.finish().expect("valid root")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tree_hash::TreeHash;
 
     fn sample_block() -> BeaconBlock {
         BeaconBlock {
@@ -234,5 +291,46 @@ mod tests {
         assert_eq!(block.proposer_index, 42);
         assert_eq!(block.parent_root, [1u8; 32]);
         assert_eq!(block.state_root, [2u8; 32]);
+    }
+
+    #[test]
+    fn test_beacon_block_tree_hash_root_deterministic() {
+        let block = sample_block();
+        let root1 = block.tree_hash_root();
+        let root2 = block.tree_hash_root();
+        assert_eq!(root1, root2);
+        assert_ne!(root1.as_slice(), &[0u8; 32]);
+    }
+
+    #[test]
+    fn test_beacon_block_tree_hash_root_differs_for_different_blocks() {
+        let block1 = sample_block();
+        let mut block2 = sample_block();
+        block2.slot = 200;
+        assert_ne!(block1.tree_hash_root(), block2.tree_hash_root());
+    }
+
+    #[test]
+    fn test_blinded_beacon_block_tree_hash_root_deterministic() {
+        let block = sample_blinded_block();
+        let root1 = block.tree_hash_root();
+        let root2 = block.tree_hash_root();
+        assert_eq!(root1, root2);
+        assert_ne!(root1.as_slice(), &[0u8; 32]);
+    }
+
+    #[test]
+    fn test_blinded_beacon_block_tree_hash_root_differs_for_different_blocks() {
+        let block1 = sample_blinded_block();
+        let mut block2 = sample_blinded_block();
+        block2.slot = 200;
+        assert_ne!(block1.tree_hash_root(), block2.tree_hash_root());
+    }
+
+    #[test]
+    fn test_beacon_block_and_blinded_differ() {
+        let block = sample_block();
+        let blinded = sample_blinded_block();
+        assert_ne!(block.tree_hash_root(), blinded.tree_hash_root());
     }
 }

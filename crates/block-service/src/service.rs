@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
 use tracing::info;
+use tree_hash::TreeHash;
 
 use crypto::PublicKey;
 use eth_types::{ForkSchedule, Root, Slot, SLOTS_PER_EPOCH};
@@ -148,23 +148,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
 }
 
 fn compute_block_root(block: &eth_types::BeaconBlock) -> Root {
-    let bytes = serde_json::to_vec(block).unwrap_or_default();
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let result = hasher.finalize();
-    let mut root = [0u8; 32];
-    root.copy_from_slice(&result);
-    root
+    block.tree_hash_root().0
 }
 
 fn compute_blinded_block_root(block: &eth_types::BlindedBeaconBlock) -> Root {
-    let bytes = serde_json::to_vec(block).unwrap_or_default();
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    let result = hasher.finalize();
-    let mut root = [0u8; 32];
-    root.copy_from_slice(&result);
-    root
+    block.tree_hash_root().0
 }
 
 #[cfg(test)]
@@ -427,6 +415,24 @@ mod tests {
     }
 
     // --- Tests ---
+
+    #[test]
+    fn test_compute_block_root_matches_tree_hash() {
+        use tree_hash::TreeHash;
+        let block = test_block(100);
+        let root = compute_block_root(&block);
+        let expected = block.tree_hash_root();
+        assert_eq!(root, expected.0);
+    }
+
+    #[test]
+    fn test_compute_blinded_block_root_matches_tree_hash() {
+        use tree_hash::TreeHash;
+        let block = test_blinded_block(200);
+        let root = compute_blinded_block_root(&block);
+        let expected = block.tree_hash_root();
+        assert_eq!(root, expected.0);
+    }
 
     #[tokio::test]
     async fn test_propose_block_unblinded() {
