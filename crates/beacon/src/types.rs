@@ -232,6 +232,23 @@ fn parse_version(spec: &HashMap<String, String>, key: &str) -> Result<Version, B
     Ok(arr)
 }
 
+/// Proposer preparation data sent to the beacon node to register fee recipients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposerPreparation {
+    pub validator_index: String,
+    pub fee_recipient: String,
+}
+
+/// Beacon committee subscription data for attestation subnet management.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeaconCommitteeSubscription {
+    pub validator_index: String,
+    pub committee_index: String,
+    pub committees_at_slot: String,
+    pub slot: String,
+    pub is_aggregator: bool,
+}
+
 /// Error details for a single attestation that failed validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedAttestationError {
@@ -724,5 +741,65 @@ mod tests {
         };
 
         assert!(response.parse_full_block().is_err());
+    }
+
+    #[test]
+    fn test_proposer_preparation_serialize() {
+        let prep = ProposerPreparation {
+            validator_index: "1234".to_string(),
+            fee_recipient: "0xabcf8e0d4e9587369b2301d0790347320302cc09".to_string(),
+        };
+
+        let json = serde_json::to_string(&prep).unwrap();
+        assert!(json.contains("\"validator_index\":\"1234\""));
+        assert!(json.contains("\"fee_recipient\":\"0xabcf8e0d4e9587369b2301d0790347320302cc09\""));
+    }
+
+    #[test]
+    fn test_proposer_preparation_deserialize() {
+        let json = r#"{
+            "validator_index": "1234",
+            "fee_recipient": "0xabcf8e0d4e9587369b2301d0790347320302cc09"
+        }"#;
+
+        let prep: ProposerPreparation = serde_json::from_str(json).unwrap();
+        assert_eq!(prep.validator_index, "1234");
+        assert_eq!(prep.fee_recipient, "0xabcf8e0d4e9587369b2301d0790347320302cc09");
+    }
+
+    #[test]
+    fn test_beacon_committee_subscription_serialize() {
+        let sub = BeaconCommitteeSubscription {
+            validator_index: "1234".to_string(),
+            committee_index: "1".to_string(),
+            committees_at_slot: "64".to_string(),
+            slot: "10000".to_string(),
+            is_aggregator: true,
+        };
+
+        let json = serde_json::to_string(&sub).unwrap();
+        assert!(json.contains("\"validator_index\":\"1234\""));
+        assert!(json.contains("\"committee_index\":\"1\""));
+        assert!(json.contains("\"committees_at_slot\":\"64\""));
+        assert!(json.contains("\"slot\":\"10000\""));
+        assert!(json.contains("\"is_aggregator\":true"));
+    }
+
+    #[test]
+    fn test_beacon_committee_subscription_deserialize() {
+        let json = r#"{
+            "validator_index": "1234",
+            "committee_index": "1",
+            "committees_at_slot": "64",
+            "slot": "10000",
+            "is_aggregator": false
+        }"#;
+
+        let sub: BeaconCommitteeSubscription = serde_json::from_str(json).unwrap();
+        assert_eq!(sub.validator_index, "1234");
+        assert_eq!(sub.committee_index, "1");
+        assert_eq!(sub.committees_at_slot, "64");
+        assert_eq!(sub.slot, "10000");
+        assert!(!sub.is_aggregator);
     }
 }

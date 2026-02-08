@@ -8,11 +8,11 @@ use eth_types::ForkSchedule;
 
 use crate::types::{
     parse_fork_schedule, AggregateAttestationResponse, Attestation, AttestationDataResponse,
-    AttesterDutiesResponse, BlockRootResponse, ConfigSpecResponse, GenesisResponse,
-    IndexedAttestationError, ProduceBlockResponse, ProposerDutiesResponse, SignedAggregateAndProof,
-    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    ValidatorsResponse,
+    AttesterDutiesResponse, BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse,
+    GenesisResponse, IndexedAttestationError, ProduceBlockResponse, ProposerDutiesResponse,
+    ProposerPreparation, SignedAggregateAndProof, SignedContributionAndProof, StateForkResponse,
+    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, ValidatorsResponse,
 };
 use crate::BeaconError;
 
@@ -358,6 +358,28 @@ impl BeaconClient {
         proofs: &[SignedAggregateAndProof],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/validator/aggregate_and_proofs", &proofs).await
+    }
+
+    /// Sends proposer preparation data to the beacon node.
+    ///
+    /// Informs the beacon node of each validator's fee recipient address
+    /// so that the execution layer can direct transaction fees appropriately.
+    pub async fn prepare_beacon_proposer(
+        &self,
+        preparations: &[ProposerPreparation],
+    ) -> Result<(), BeaconError> {
+        self.post_empty("/eth/v1/validator/prepare_beacon_proposer", &preparations).await
+    }
+
+    /// Subscribes validators to beacon committees for attestation subnet management.
+    ///
+    /// The beacon node uses these subscriptions to join the appropriate
+    /// attestation subnets and prepare for aggregation duties.
+    pub async fn submit_beacon_committee_subscriptions(
+        &self,
+        subscriptions: &[BeaconCommitteeSubscription],
+    ) -> Result<(), BeaconError> {
+        self.post_empty("/eth/v1/validator/beacon_committee_subscriptions", &subscriptions).await
     }
 
     /// Submits signed attestations to the beacon node.
@@ -2963,6 +2985,135 @@ mod tests {
             Err(BeaconError::ApiError { status, message }) => {
                 assert_eq!(status, 400);
                 assert_eq!(message, "Invalid proof");
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prepare_beacon_proposer_success() {
+        let mock_server = MockServer::start().await;
+
+        let preparations = vec![
+            ProposerPreparation {
+                validator_index: "1234".to_string(),
+                fee_recipient: "0xabcf8e0d4e9587369b2301d0790347320302cc09".to_string(),
+            },
+            ProposerPreparation {
+                validator_index: "5678".to_string(),
+                fee_recipient: "0x1234567890abcdef1234567890abcdef12345678".to_string(),
+            },
+        ];
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .and(body_json(&preparations))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.prepare_beacon_proposer(&preparations).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_prepare_beacon_proposer_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid preparation data"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let preparations = vec![ProposerPreparation {
+            validator_index: "1234".to_string(),
+            fee_recipient: "0xabcf8e0d4e9587369b2301d0790347320302cc09".to_string(),
+        }];
+
+        let result = client.prepare_beacon_proposer(&preparations).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert_eq!(message, "Invalid preparation data");
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_beacon_committee_subscriptions_success() {
+        let mock_server = MockServer::start().await;
+
+        let subscriptions = vec![
+            BeaconCommitteeSubscription {
+                validator_index: "1234".to_string(),
+                committee_index: "1".to_string(),
+                committees_at_slot: "64".to_string(),
+                slot: "10000".to_string(),
+                is_aggregator: true,
+            },
+            BeaconCommitteeSubscription {
+                validator_index: "5678".to_string(),
+                committee_index: "2".to_string(),
+                committees_at_slot: "64".to_string(),
+                slot: "10000".to_string(),
+                is_aggregator: false,
+            },
+        ];
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/beacon_committee_subscriptions"))
+            .and(body_json(&subscriptions))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.submit_beacon_committee_subscriptions(&subscriptions).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_submit_beacon_committee_subscriptions_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/beacon_committee_subscriptions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid subscription data"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let subscriptions = vec![BeaconCommitteeSubscription {
+            validator_index: "1234".to_string(),
+            committee_index: "1".to_string(),
+            committees_at_slot: "64".to_string(),
+            slot: "10000".to_string(),
+            is_aggregator: true,
+        }];
+
+        let result = client.submit_beacon_committee_subscriptions(&subscriptions).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert_eq!(message, "Invalid subscription data");
             }
             _ => panic!("Expected ApiError with status 400"),
         }
