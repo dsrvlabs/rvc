@@ -12,9 +12,9 @@ crypto.workspace = true
 eth-types.workspace = true
 hex.workspace = true
 signer.workspace = true
-sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tree_hash.workspace = true
 serde_json.workspace = true
 validator-store.workspace = true
 
