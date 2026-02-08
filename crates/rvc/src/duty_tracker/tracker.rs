@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use crate::metrics::definitions::RVC_DUTIES_FETCHED_TOTAL;
+use metrics::definitions::RVC_DUTIES_FETCHED_TOTAL;
 use beacon::{AttesterDuty, BeaconClient};
 use eth_types::SLOTS_PER_EPOCH;
 

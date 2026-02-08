@@ -8,7 +8,7 @@ use tokio::sync::watch;
 use tokio::time::{sleep, Duration};
 
 use crate::crypto::Slot;
-use crate::metrics::REGISTRY;
+use metrics::REGISTRY;
 
 use super::clock::SlotClock;
 use super::error::TimingError;

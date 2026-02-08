@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
-use crate::metrics::definitions::{attestation_status, RVC_ATTESTATIONS_TOTAL};
+use metrics::definitions::{attestation_status, RVC_ATTESTATIONS_TOTAL};
 use beacon::{Attestation, BeaconClient, BeaconError, SubmitAttestationResult};
 
 pub use error::PropagatorError;

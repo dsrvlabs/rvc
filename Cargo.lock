@@ -2672,6 +2672,7 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "rvc-eth-types",
+ "rvc-metrics",
  "scrypt",
  "secrecy",
  "serde",
