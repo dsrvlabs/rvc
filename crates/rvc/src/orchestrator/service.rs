@@ -11,7 +11,10 @@ use beacon::{Attestation, AttesterDuty, BeaconClient};
 use block_service::{BeaconBlockClient, BlockService};
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
-use eth_types::{ForkName, ForkSchedule, Root, Slot, SyncCommitteeDuty};
+use eth_types::{
+    ContributionAndProof, ForkName, ForkSchedule, Root, SignedContributionAndProof, Slot,
+    SyncCommitteeDuty,
+};
 use metrics::definitions::{
     attestation_status, orchestrator_result, RVC_ATTESTATIONS_TOTAL,
     RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
@@ -19,12 +22,19 @@ use metrics::definitions::{
 };
 use propagator::{AttestationSubmitter, Propagator};
 use signer::SignerService;
+use sync_service::is_sync_committee_aggregator;
 use timing::{SlotClock, SLOTS_PER_EPOCH};
 
 use super::error::OrchestratorError;
 
 /// Default timeout for beacon client API calls in seconds.
 const BEACON_CALL_TIMEOUT_SECS: u64 = 4;
+
+/// Total validators in a sync committee.
+const SYNC_COMMITTEE_SIZE: u64 = 512;
+
+/// Number of subnets the sync committee is split across.
+const SYNC_COMMITTEE_SUBNET_COUNT: u64 = 4;
 
 /// Configuration for the duty orchestrator.
 #[derive(Clone)]
@@ -275,6 +285,9 @@ where
     }
 
     async fn fetch_epoch_duties(&self, epoch: u64) {
+        // Evict old caches to prevent unbounded growth
+        self.duty_tracker.evict_old_caches(epoch).await;
+
         // Attester duties
         if !self.duty_tracker.is_epoch_cached(epoch).await {
             debug!(epoch, "Fetching attester duties for epoch");
@@ -407,27 +420,58 @@ where
         };
 
         let head_root_hex = format!("0x{}", hex::encode(head_root));
-        let mut contribution_count = 0u64;
+        let mut signed_proofs = Vec::new();
 
-        for (duty, _pubkey) in matching_duties.iter().zip(matching_pubkeys.iter()) {
-            let subcommittee_indices: std::collections::BTreeSet<u64> =
-                duty.validator_sync_committee_indices.iter().map(|&pos| pos / 128).collect();
+        for (duty, pubkey) in matching_duties.iter().zip(matching_pubkeys.iter()) {
+            let subcommittee_indices: std::collections::BTreeSet<u64> = duty
+                .validator_sync_committee_indices
+                .iter()
+                .map(|&pos| pos / (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT))
+                .collect();
 
-            for subcommittee_index in subcommittee_indices {
-                match self
+            let secret_key = match self.signer.key_manager().get_secret_key(pubkey) {
+                Some(sk) => sk,
+                None => {
+                    warn!(
+                        validator_index = duty.validator_index,
+                        "Secret key not found for sync contribution signing"
+                    );
+                    continue;
+                }
+            };
+
+            for subcommittee_index in &subcommittee_indices {
+                let selection_proof = crypto::sign_sync_committee_selection_proof(
+                    slot,
+                    *subcommittee_index,
+                    secret_key,
+                    &self.config.fork_schedule,
+                    self.config.genesis_validators_root,
+                );
+
+                if !is_sync_committee_aggregator(&selection_proof.to_bytes()) {
+                    debug!(
+                        slot,
+                        subcommittee_index,
+                        validator_index = duty.validator_index,
+                        "Not selected as sync committee aggregator"
+                    );
+                    continue;
+                }
+
+                debug!(
+                    slot,
+                    subcommittee_index,
+                    validator_index = duty.validator_index,
+                    "Selected as sync committee aggregator"
+                );
+
+                let contribution = match self
                     .beacon
-                    .get_sync_committee_contribution(slot, subcommittee_index, &head_root_hex)
+                    .get_sync_committee_contribution(slot, *subcommittee_index, &head_root_hex)
                     .await
                 {
-                    Ok(_resp) => {
-                        debug!(
-                            slot,
-                            subcommittee_index,
-                            validator_index = duty.validator_index,
-                            "Fetched sync committee contribution"
-                        );
-                        contribution_count += 1;
-                    }
+                    Ok(resp) => resp.data,
                     Err(e) => {
                         warn!(
                             slot,
@@ -435,13 +479,37 @@ where
                             error = %e,
                             "Failed to get sync committee contribution"
                         );
+                        continue;
                     }
-                }
+                };
+
+                let proof = ContributionAndProof {
+                    aggregator_index: duty.validator_index,
+                    contribution,
+                    selection_proof: selection_proof.to_bytes().to_vec(),
+                };
+
+                let sig = crypto::sign_contribution_and_proof(
+                    &proof,
+                    secret_key,
+                    &self.config.fork_schedule,
+                    self.config.genesis_validators_root,
+                );
+
+                signed_proofs.push(SignedContributionAndProof {
+                    message: proof,
+                    signature: sig.to_bytes().to_vec(),
+                });
             }
         }
 
-        if contribution_count > 0 {
-            info!(slot, count = contribution_count, "Processed sync committee contributions");
+        if !signed_proofs.is_empty() {
+            let count = signed_proofs.len();
+            if let Err(e) = self.beacon.submit_contribution_and_proofs(&signed_proofs).await {
+                warn!(slot, error = %e, "Failed to submit contribution and proofs");
+            } else {
+                info!(slot, count, "Submitted sync committee contribution and proofs");
+            }
         }
     }
 
@@ -577,20 +645,17 @@ where
             self.duty_tracker.fetch_duties_for_epoch(epoch).await?;
         }
 
-        // Normalize all pubkeys to lowercase without 0x prefix for efficient lookup
         let normalized_pubkeys: std::collections::HashSet<String> =
             self.pubkey_map.keys().map(|k| Self::normalize_pubkey(k)).collect();
 
-        let mut duties = Vec::new();
-        // Check a reasonable range of committee indices (typical max is 64 per slot)
-        for committee_index in 0..64 {
-            if let Ok(duty) = self.duty_tracker.get_duty(slot, committee_index).await {
+        let all_duties = self.duty_tracker.get_duties_for_slot(slot).await;
+        let duties: Vec<AttesterDuty> = all_duties
+            .into_iter()
+            .filter(|duty| {
                 let normalized_duty_pubkey = Self::normalize_pubkey(&duty.pubkey);
-                if normalized_pubkeys.contains(&normalized_duty_pubkey) {
-                    duties.push(duty);
-                }
-            }
-        }
+                normalized_pubkeys.contains(&normalized_duty_pubkey)
+            })
+            .collect();
 
         Ok(duties)
     }
