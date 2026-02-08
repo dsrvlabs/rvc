@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/rvc", "crates/rvc", "crates/beacon", "crates/eth-types"]
+members = ["bin/rvc", "crates/rvc", "crates/beacon", "crates/eth-types", "crates/metrics", "crates/timing"]
 default-members = ["bin/rvc"]
 resolver = "2"
 
@@ -15,6 +15,8 @@ repository = "https://github.com/rootwarp/rvc"
 rvc = { path = "crates/rvc" }
 beacon = { path = "crates/beacon" }
 eth-types = { path = "crates/eth-types", package = "rvc-eth-types" }
+metrics = { path = "crates/metrics", package = "rvc-metrics" }
+timing = { path = "crates/timing", package = "rvc-timing" }
 
 # External
 axum = "0.7"
