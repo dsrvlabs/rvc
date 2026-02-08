@@ -6,9 +6,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use crypto::PublicKey;
+use metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
 use rvc::config::{CliOverrides, Config, Network, ServiceBuilder};
 use rvc::duty_tracker::DutyTrackerService;
-use rvc::metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
 use rvc::DutyTrackerServer;
 use tonic::transport::Server;
 use tracing::{error, info, warn};

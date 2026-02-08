@@ -7,7 +7,6 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use crate::timing::{SlotClock, SLOTS_PER_EPOCH};
 use beacon::{Attestation, AttesterDuty, BeaconClient};
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
@@ -19,6 +18,7 @@ use metrics::definitions::{
 };
 use propagator::{AttestationSubmitter, Propagator};
 use signer::SignerService;
+use timing::{SlotClock, SLOTS_PER_EPOCH};
 
 use super::error::OrchestratorError;
 
@@ -568,13 +568,13 @@ where
 #[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
-    use crate::timing::MockSlotClock;
     use beacon::BeaconClientConfig;
     use crypto::{KeyManager, SecretKey};
     use slashing::SlashingDb;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use timing::MockSlotClock;
 
     const TEST_GENESIS_TIME: u64 = 1606824023;
 
