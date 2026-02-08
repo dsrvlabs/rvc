@@ -10,11 +10,11 @@ use thiserror::Error;
 
 use crypto::{sign_attestation, KeyManager, PublicKey, Signature};
 use eth_types::{AttestationData, Fork, Root};
-use slashing::{SlashingDb, SlashingError};
 use metrics::definitions::{
     slashing_result, RVC_ATTESTATIONS_TOTAL, RVC_SIGNING_DURATION_SECONDS,
     RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
 };
+use slashing::{SlashingDb, SlashingError};
 
 /// Errors that can occur during signing operations.
 #[derive(Debug, Error)]
