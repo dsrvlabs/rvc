@@ -12,13 +12,13 @@ use crate::timing::{SlotClock, SLOTS_PER_EPOCH};
 use beacon::{Attestation, AttesterDuty, BeaconClient};
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
-use propagator::{AttestationSubmitter, Propagator};
 use eth_types::{Fork, Root, Slot};
 use metrics::definitions::{
     attestation_status, orchestrator_result, RVC_ATTESTATIONS_TOTAL,
     RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
     RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL, RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
 };
+use propagator::{AttestationSubmitter, Propagator};
 
 use super::error::OrchestratorError;
 
