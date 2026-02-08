@@ -45,9 +45,6 @@ const DUTY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for attestation data fetch.
 const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(4);
 
-/// Timeout for attestation propagation (submit to beacon pool).
-const ATTESTATION_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// Total validators in a sync committee.
 const SYNC_COMMITTEE_SIZE: u64 = 512;
 
