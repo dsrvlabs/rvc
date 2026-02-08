@@ -2667,6 +2667,7 @@ dependencies = [
  "rvc-duty-tracker",
  "rvc-eth-types",
  "rvc-metrics",
+ "rvc-propagator",
  "rvc-slashing",
  "rvc-timing",
  "secrecy",
