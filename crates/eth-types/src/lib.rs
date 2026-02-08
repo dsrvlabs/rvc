@@ -2,13 +2,20 @@ use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
+mod aggregation;
 mod block;
 mod fork;
+mod sync_committee;
+pub use aggregation::{AggregateAndProof, Attestation, SignedAggregateAndProof};
 pub use block::{
     BeaconBlock, BeaconBlockBody, BlindedBeaconBlock, BlindedBeaconBlockBody, BlobSidecar,
     BlockContents, ProducedBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
 };
 pub use fork::{ForkName, ForkSchedule};
+pub use sync_committee::{
+    ContributionAndProof, SignedContributionAndProof, SyncCommitteeContribution, SyncCommitteeDuty,
+    SyncCommitteeMessage,
+};
 
 pub type Slot = u64;
 pub type Epoch = u64;
