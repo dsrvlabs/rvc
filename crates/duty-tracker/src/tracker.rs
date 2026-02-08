@@ -8,7 +8,7 @@ use beacon::{AttesterDuty, BeaconClient};
 use eth_types::SLOTS_PER_EPOCH;
 use metrics::definitions::RVC_DUTIES_FETCHED_TOTAL;
 
-use super::error::DutyTrackerError;
+use crate::error::DutyTrackerError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DutyCacheKey {

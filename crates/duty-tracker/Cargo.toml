@@ -11,6 +11,7 @@ beacon.workspace = true
 eth-types.workspace = true
 metrics.workspace = true
 serde.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

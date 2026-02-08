@@ -1,7 +1,4 @@
-mod error;
-mod service;
-mod tracker;
+pub mod service;
 
-pub use error::DutyTrackerError;
+pub use duty_tracker::*;
 pub use service::DutyTrackerService;
-pub use tracker::{DutyCacheKey, DutyTracker};
