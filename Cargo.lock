@@ -2769,6 +2769,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvc-propagator"
+version = "0.1.0"
+dependencies = [
+ "beacon",
+ "rvc-eth-types",
+ "rvc-metrics",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rvc-slashing"
 version = "0.1.0"
 dependencies = [
