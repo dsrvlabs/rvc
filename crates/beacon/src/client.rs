@@ -3136,16 +3136,15 @@ mod tests {
     async fn test_post_validator_liveness_success() {
         let mock_server = MockServer::start().await;
 
+        // Standard spec response: only index + is_live, no epoch.
         let response_body = serde_json::json!({
             "data": [
                 {
                     "index": "1234",
-                    "epoch": "100",
                     "is_live": true
                 },
                 {
                     "index": "5678",
-                    "epoch": "100",
                     "is_live": false
                 }
             ]
@@ -3167,10 +3166,43 @@ mod tests {
 
         assert_eq!(result.data.len(), 2);
         assert_eq!(result.data[0].index, "1234");
-        assert_eq!(result.data[0].epoch, "100");
         assert!(result.data[0].is_live);
         assert_eq!(result.data[1].index, "5678");
         assert!(!result.data[1].is_live);
+    }
+
+    #[tokio::test]
+    async fn test_post_validator_liveness_lighthouse_compat() {
+        let mock_server = MockServer::start().await;
+
+        // Lighthouse returns an extra `epoch` field; serde ignores it.
+        let response_body = serde_json::json!({
+            "data": [
+                {
+                    "index": "1234",
+                    "epoch": "100",
+                    "is_live": true
+                }
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/liveness/100"))
+            .and(body_json(["1234"]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let indices = vec!["1234".to_string()];
+        let result = client.post_validator_liveness(100, &indices).await.unwrap();
+
+        assert_eq!(result.data.len(), 1);
+        assert_eq!(result.data[0].index, "1234");
+        assert!(result.data[0].is_live);
     }
 
     #[tokio::test]

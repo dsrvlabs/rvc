@@ -250,10 +250,13 @@ pub struct BeaconCommitteeSubscription {
 }
 
 /// Validator liveness data from the beacon node.
+///
+/// Per the standard Eth2 Beacon API (`POST /eth/v1/validator/liveness/{epoch}`),
+/// only `index` and `is_live` are returned. The epoch is already a parameter
+/// to the request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorLiveness {
     pub index: String,
-    pub epoch: String,
     pub is_live: bool,
 }
 
@@ -651,7 +654,32 @@ mod tests {
     }
 
     #[test]
-    fn test_validator_liveness_deserialize() {
+    fn test_validator_liveness_deserialize_standard_spec() {
+        let json = r#"{
+            "index": "1234",
+            "is_live": true
+        }"#;
+
+        let liveness: ValidatorLiveness = serde_json::from_str(json).unwrap();
+        assert_eq!(liveness.index, "1234");
+        assert!(liveness.is_live);
+    }
+
+    #[test]
+    fn test_validator_liveness_deserialize_not_live() {
+        let json = r#"{
+            "index": "5678",
+            "is_live": false
+        }"#;
+
+        let liveness: ValidatorLiveness = serde_json::from_str(json).unwrap();
+        assert_eq!(liveness.index, "5678");
+        assert!(!liveness.is_live);
+    }
+
+    #[test]
+    fn test_validator_liveness_deserialize_with_extra_fields() {
+        // Lighthouse returns an extra `epoch` field; serde should ignore it.
         let json = r#"{
             "index": "1234",
             "epoch": "100",
@@ -660,22 +688,7 @@ mod tests {
 
         let liveness: ValidatorLiveness = serde_json::from_str(json).unwrap();
         assert_eq!(liveness.index, "1234");
-        assert_eq!(liveness.epoch, "100");
         assert!(liveness.is_live);
-    }
-
-    #[test]
-    fn test_validator_liveness_deserialize_not_live() {
-        let json = r#"{
-            "index": "5678",
-            "epoch": "200",
-            "is_live": false
-        }"#;
-
-        let liveness: ValidatorLiveness = serde_json::from_str(json).unwrap();
-        assert_eq!(liveness.index, "5678");
-        assert_eq!(liveness.epoch, "200");
-        assert!(!liveness.is_live);
     }
 
     #[test]
@@ -684,12 +697,10 @@ mod tests {
             "data": [
                 {
                     "index": "1234",
-                    "epoch": "100",
                     "is_live": true
                 },
                 {
                     "index": "5678",
-                    "epoch": "100",
                     "is_live": false
                 }
             ]
