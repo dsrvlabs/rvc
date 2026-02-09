@@ -2,6 +2,8 @@
 //!
 //! Main entry point for the validator client binary.
 
+mod commands;
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -82,6 +84,49 @@ enum Commands {
         #[arg(long, default_value = "info")]
         log_level: String,
     },
+
+    /// Submit a voluntary exit for a validator
+    VoluntaryExit {
+        /// Validator public key (hex, with or without 0x prefix)
+        #[arg(long)]
+        pubkey: String,
+
+        /// Exit epoch (defaults to current epoch if not specified)
+        #[arg(long)]
+        epoch: Option<u64>,
+
+        /// Skip interactive confirmation prompt
+        #[arg(long)]
+        confirm: bool,
+
+        /// Beacon node URL (e.g., http://localhost:5052)
+        #[arg(long, default_value = "http://localhost:5052")]
+        beacon_url: String,
+
+        /// Path to the keystore directory
+        #[arg(long)]
+        keystore_path: PathBuf,
+
+        /// Path to the password file for keystore decryption
+        #[arg(long)]
+        password_file: PathBuf,
+
+        /// Path to the slashing protection database
+        #[arg(long)]
+        slashing_db_path: Option<PathBuf>,
+
+        /// Network preset (mainnet, goerli, sepolia, holesky, custom)
+        #[arg(long)]
+        network: Option<String>,
+
+        /// Genesis validators root override (hex string with 0x prefix)
+        #[arg(long)]
+        genesis_validators_root: Option<String>,
+
+        /// Log level (trace, debug, info, warn, error)
+        #[arg(long, default_value = "info")]
+        log_level: String,
+    },
 }
 
 #[tokio::main]
@@ -130,6 +175,34 @@ async fn main() -> anyhow::Result<()> {
             }
 
             run_validator(cfg).await?;
+        }
+        Commands::VoluntaryExit {
+            pubkey,
+            epoch,
+            confirm,
+            beacon_url,
+            keystore_path,
+            password_file,
+            slashing_db_path,
+            network,
+            genesis_validators_root,
+            log_level,
+        } => {
+            init_logging(&log_level);
+
+            let args = commands::voluntary_exit::VoluntaryExitArgs {
+                pubkey,
+                epoch,
+                confirm,
+                beacon_url,
+                keystore_path,
+                password_file,
+                slashing_db_path,
+                network,
+                genesis_validators_root,
+            };
+
+            commands::voluntary_exit::execute(args).await?;
         }
     }
 

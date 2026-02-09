@@ -268,6 +268,16 @@ mod tests {
         ) -> Result<Vec<u8>, SignerError> {
             Ok(vec![0xdd; 96])
         }
+
+        async fn sign_voluntary_exit(
+            &self,
+            _voluntary_exit: &eth_types::VoluntaryExit,
+            _pubkey: &PublicKey,
+            _fork_schedule: &ForkSchedule,
+            _genesis_validators_root: &Root,
+        ) -> Result<Vec<u8>, SignerError> {
+            Ok(vec![0xee; 96])
+        }
     }
 
     // --- Mock Beacon Client ---

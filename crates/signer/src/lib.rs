@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crypto::{sign_attestation, KeyManager, PublicKey, Signature};
 use eth_types::{
-    AggregateAndProof, AttestationData, Epoch, Fork, ForkSchedule, Root, Slot,
+    AggregateAndProof, AttestationData, Epoch, Fork, ForkSchedule, Root, Slot, VoluntaryExit,
     DOMAIN_SYNC_COMMITTEE, SLOTS_PER_EPOCH,
 };
 use metrics::definitions::{
@@ -259,6 +259,29 @@ impl SignerService {
         ))
     }
 
+    /// Signs a voluntary exit with DOMAIN_VOLUNTARY_EXIT.
+    pub fn sign_voluntary_exit(
+        &self,
+        voluntary_exit: &VoluntaryExit,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+
+        let secret_key = self
+            .key_manager
+            .get_secret_key(pubkey)
+            .ok_or_else(|| SignerError::KeyNotFound(pubkey_hex))?;
+
+        Ok(crypto::sign_voluntary_exit(
+            voluntary_exit,
+            secret_key,
+            fork_schedule,
+            *genesis_validators_root,
+        ))
+    }
+
     /// Returns a reference to the underlying key manager.
     pub fn key_manager(&self) -> &KeyManager {
         &self.key_manager
@@ -383,6 +406,23 @@ impl ValidatorSigner for SignerService {
         let signature = SignerService::sign_aggregate_and_proof(
             self,
             aggregate_and_proof,
+            pubkey,
+            fork_schedule,
+            genesis_validators_root,
+        )?;
+        Ok(signature.to_bytes().to_vec())
+    }
+
+    async fn sign_voluntary_exit(
+        &self,
+        voluntary_exit: &VoluntaryExit,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError> {
+        let signature = SignerService::sign_voluntary_exit(
+            self,
+            voluntary_exit,
             pubkey,
             fork_schedule,
             genesis_validators_root,
@@ -1267,6 +1307,74 @@ mod tests {
         let result = signer
             .sign_aggregate_and_proof(&agg_and_proof, &pubkey, &schedule, &genesis_root)
             .await;
+        assert!(result.is_ok());
+
+        let sig_bytes = result.unwrap();
+        assert_eq!(sig_bytes.len(), 96);
+    }
+
+    // --- Voluntary exit signing tests ---
+
+    #[test]
+    fn test_sign_voluntary_exit_success() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(key_manager, slashing_db);
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let exit = eth_types::VoluntaryExit { epoch: 5, validator_index: 42 };
+
+        let result = service.sign_voluntary_exit(&exit, &pubkey, &schedule, &genesis_root);
+        assert!(result.is_ok());
+
+        let signature = result.unwrap();
+
+        let fork_name = eth_types::ForkName::from_epoch(exit.epoch, &schedule);
+        let fork_version = fork_name.fork_version(&schedule);
+        let domain = compute_domain(eth_types::DOMAIN_VOLUNTARY_EXIT, fork_version, genesis_root);
+        let signing_root = compute_signing_root(&exit, domain);
+        assert!(signature.verify(&pubkey, &signing_root).is_ok());
+    }
+
+    #[test]
+    fn test_sign_voluntary_exit_key_not_found() {
+        let key_manager = Arc::new(KeyManager::new());
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(key_manager, slashing_db);
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let exit = eth_types::VoluntaryExit { epoch: 5, validator_index: 42 };
+
+        let result = service.sign_voluntary_exit(&exit, &pubkey, &schedule, &genesis_root);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SignerError::KeyNotFound(_) => {}
+            other => panic!("expected KeyNotFound, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trait_sign_voluntary_exit() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(key_manager, slashing_db);
+        let signer: &dyn ValidatorSigner = &service;
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let exit = eth_types::VoluntaryExit { epoch: 5, validator_index: 42 };
+
+        let result = signer.sign_voluntary_exit(&exit, &pubkey, &schedule, &genesis_root).await;
         assert!(result.is_ok());
 
         let sig_bytes = result.unwrap();

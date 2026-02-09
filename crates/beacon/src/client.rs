@@ -4,7 +4,7 @@ use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use eth_types::ForkSchedule;
+use eth_types::{ForkSchedule, SignedVoluntaryExit};
 
 use crate::types::{
     parse_fork_schedule, AggregateAttestationResponse, Attestation, AttestationDataResponse,
@@ -382,6 +382,18 @@ impl BeaconClient {
     ) -> Result<ValidatorLivenessResponse, BeaconError> {
         let path = format!("/eth/v1/validator/liveness/{}", epoch);
         self.post(&path, &validator_indices).await
+    }
+
+    /// Submits a signed voluntary exit to the beacon node pool.
+    ///
+    /// Once submitted, the exit is irreversible. The beacon node will propagate
+    /// the exit through the network and the validator will be exited from the
+    /// active validator set after the exit epoch.
+    pub async fn submit_voluntary_exit(
+        &self,
+        signed_exit: &SignedVoluntaryExit,
+    ) -> Result<(), BeaconError> {
+        self.post_empty("/eth/v1/beacon/pool/voluntary_exits", signed_exit).await
     }
 
     /// Subscribes validators to beacon committees for attestation subnet management.
@@ -3251,6 +3263,61 @@ mod tests {
             Err(BeaconError::ApiError { status, message }) => {
                 assert_eq!(status, 400);
                 assert_eq!(message, "Invalid epoch");
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    // --- Voluntary exit tests ---
+
+    #[tokio::test]
+    async fn test_submit_voluntary_exit_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/pool/voluntary_exits"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let signed_exit = eth_types::SignedVoluntaryExit {
+            message: eth_types::VoluntaryExit { epoch: 100, validator_index: 42 },
+            signature: vec![0xaa; 96],
+        };
+
+        let result = client.submit_voluntary_exit(&signed_exit).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_submit_voluntary_exit_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/pool/voluntary_exits"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid exit"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let signed_exit = eth_types::SignedVoluntaryExit {
+            message: eth_types::VoluntaryExit { epoch: 100, validator_index: 42 },
+            signature: vec![0xaa; 96],
+        };
+
+        let result = client.submit_voluntary_exit(&signed_exit).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert_eq!(message, "Invalid exit");
             }
             _ => panic!("Expected ApiError with status 400"),
         }

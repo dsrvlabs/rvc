@@ -1879,9 +1879,7 @@ mod tests {
     #[test]
     fn test_liveness_last_signed_attestation_epoch_empty_db() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let result = db
-            .last_signed_attestation_epoch("0x1234")
-            .expect("query should succeed");
+        let result = db.last_signed_attestation_epoch("0x1234").expect("query should succeed");
         assert!(result.is_none());
     }
 
@@ -1889,9 +1887,7 @@ mod tests {
     fn test_liveness_last_signed_attestation_epoch_single() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
         db.record_attestation("0x1234", 100, 101, None).expect("record");
-        let result = db
-            .last_signed_attestation_epoch("0x1234")
-            .expect("query should succeed");
+        let result = db.last_signed_attestation_epoch("0x1234").expect("query should succeed");
         assert_eq!(result, Some(101));
     }
 
@@ -1901,9 +1897,7 @@ mod tests {
         db.record_attestation("0x1234", 100, 101, None).expect("record");
         db.record_attestation("0x1234", 103, 105, None).expect("record");
         db.record_attestation("0x1234", 101, 103, None).expect("record");
-        let result = db
-            .last_signed_attestation_epoch("0x1234")
-            .expect("query should succeed");
+        let result = db.last_signed_attestation_epoch("0x1234").expect("query should succeed");
         assert_eq!(result, Some(105));
     }
 

@@ -9,6 +9,7 @@ mod key_manager;
 mod keystore;
 mod signing;
 mod sync_signing;
+mod voluntary_exit_signing;
 
 pub use aggregation_signing::{is_aggregator, sign_aggregate_and_proof, sign_selection_proof};
 pub use block_signing::{sign_block, sign_randao_reveal};
@@ -28,3 +29,4 @@ pub use signing::{
 pub use sync_signing::{
     sign_contribution_and_proof, sign_sync_committee_message, sign_sync_committee_selection_proof,
 };
+pub use voluntary_exit_signing::sign_voluntary_exit;
