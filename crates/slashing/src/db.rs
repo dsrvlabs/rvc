@@ -492,6 +492,25 @@ impl SlashingDb {
         Ok(())
     }
 
+    /// Get the last signed attestation epoch for a given public key.
+    ///
+    /// Returns `None` if no attestations have been signed for this validator.
+    pub fn last_signed_attestation_epoch(
+        &self,
+        pubkey: &str,
+    ) -> Result<Option<Epoch>, SlashingError> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let result: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(target_epoch) FROM attestations WHERE pubkey = ?1",
+                [pubkey],
+                |row| row.get(0),
+            )
+            .map_err(SlashingError::from)?;
+
+        Ok(result.map(|e| e as Epoch))
+    }
+
     /// Get the last signed block slot for a given public key.
     ///
     /// Returns `None` if no blocks have been signed for this validator.
@@ -1764,6 +1783,48 @@ mod tests {
 
         let blocks = db.get_blocks("0x1234").expect("failed to get");
         assert_eq!(blocks.len(), 1);
+    }
+
+    // --- Liveness query tests ---
+
+    #[test]
+    fn test_liveness_last_signed_attestation_epoch_empty_db() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let result = db
+            .last_signed_attestation_epoch("0x1234")
+            .expect("query should succeed");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_liveness_last_signed_attestation_epoch_single() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_attestation("0x1234", 100, 101, None).expect("record");
+        let result = db
+            .last_signed_attestation_epoch("0x1234")
+            .expect("query should succeed");
+        assert_eq!(result, Some(101));
+    }
+
+    #[test]
+    fn test_liveness_last_signed_attestation_epoch_multiple() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_attestation("0x1234", 100, 101, None).expect("record");
+        db.record_attestation("0x1234", 103, 105, None).expect("record");
+        db.record_attestation("0x1234", 101, 103, None).expect("record");
+        let result = db
+            .last_signed_attestation_epoch("0x1234")
+            .expect("query should succeed");
+        assert_eq!(result, Some(105));
+    }
+
+    #[test]
+    fn test_liveness_last_signed_attestation_epoch_different_pubkeys() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_attestation("0x1111", 100, 101, None).expect("record");
+        db.record_attestation("0x2222", 200, 201, None).expect("record");
+        assert_eq!(db.last_signed_attestation_epoch("0x1111").unwrap(), Some(101));
+        assert_eq!(db.last_signed_attestation_epoch("0x2222").unwrap(), Some(201));
     }
 
     #[test]
