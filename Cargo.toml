@@ -60,6 +60,7 @@ ssz_derive = { package = "ethereum_ssz_derive", version = "0.9" }
 tree_hash = "0.9"
 tree_hash_derive = "0.9"
 sha2 = "0.10"
+url = "2"
 scrypt = "0.11"
 pbkdf2 = "0.12"
 aes = "0.8"

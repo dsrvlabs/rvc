@@ -9,6 +9,8 @@ use beacon::{
 };
 use eth_types::{ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock};
 
+use url::Url;
+
 use crate::traits::{BeaconNodeClient, BnManagerConfig};
 use crate::BnManagerError;
 
@@ -31,13 +33,26 @@ impl BnManager {
         }
 
         let endpoint = &config.endpoints[0];
-        let trimmed = endpoint.trim_end_matches('/');
 
-        if !trimmed.starts_with("http://") && !trimmed.starts_with("https://") {
+        let parsed = Url::parse(endpoint)
+            .map_err(|e| BnManagerError::InvalidEndpoint(format!("failed to parse URL: {e}")))?;
+
+        if parsed.scheme() != "http" && parsed.scheme() != "https" {
             return Err(BnManagerError::InvalidEndpoint(format!(
-                "endpoint must start with http:// or https://: {}",
-                endpoint
+                "endpoint must use http or https scheme: {endpoint}"
             )));
+        }
+
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(BnManagerError::InvalidEndpoint(
+                "endpoint must not contain credentials".to_string(),
+            ));
+        }
+
+        if parsed.host_str().is_none() || parsed.host_str() == Some("") {
+            return Err(BnManagerError::InvalidEndpoint(
+                "endpoint must contain a host".to_string(),
+            ));
         }
 
         let client_config =
@@ -378,6 +393,29 @@ mod tests {
         let config = BnManagerConfig::new(vec!["localhost:5052".to_string()]);
         let result = BnManager::new(config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_rejects_scheme_only_url() {
+        let config = BnManagerConfig::new(vec!["http://".to_string()]);
+        let err = BnManager::new(config).err().expect("should fail");
+        assert!(matches!(err, BnManagerError::InvalidEndpoint(_)));
+    }
+
+    #[test]
+    fn test_new_rejects_url_with_credentials() {
+        let config = BnManagerConfig::new(vec!["http://user:pass@localhost:5052".to_string()]);
+        let err = BnManager::new(config).err().expect("should fail");
+        assert!(matches!(err, BnManagerError::InvalidEndpoint(_)));
+    }
+
+    #[test]
+    fn test_new_accepts_valid_urls() {
+        let config = BnManagerConfig::new(vec!["http://localhost:5052".to_string()]);
+        assert!(BnManager::new(config).is_ok());
+
+        let config = BnManagerConfig::new(vec!["https://beacon.example.com".to_string()]);
+        assert!(BnManager::new(config).is_ok());
     }
 
     #[test]
