@@ -12,7 +12,7 @@ use crate::types::{
     GenesisResponse, IndexedAttestationError, ProduceBlockResponse, ProposerDutiesResponse,
     ProposerPreparation, SignedAggregateAndProof, SignedContributionAndProof, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, ValidatorsResponse,
+    SyncCommitteeMessage, ValidatorLivenessResponse, ValidatorsResponse,
 };
 use crate::BeaconError;
 
@@ -369,6 +369,19 @@ impl BeaconClient {
         preparations: &[ProposerPreparation],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/validator/prepare_beacon_proposer", &preparations).await
+    }
+
+    /// Posts validator indices to check liveness for the given epoch.
+    ///
+    /// Returns liveness data indicating whether each validator was active
+    /// during the specified epoch. Used for doppelganger detection.
+    pub async fn post_validator_liveness(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<ValidatorLivenessResponse, BeaconError> {
+        let path = format!("/eth/v1/validator/liveness/{}", epoch);
+        self.post(&path, &validator_indices).await
     }
 
     /// Subscribes validators to beacon committees for attestation subnet management.
@@ -3114,6 +3127,98 @@ mod tests {
             Err(BeaconError::ApiError { status, message }) => {
                 assert_eq!(status, 400);
                 assert_eq!(message, "Invalid subscription data");
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_post_validator_liveness_success() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "data": [
+                {
+                    "index": "1234",
+                    "epoch": "100",
+                    "is_live": true
+                },
+                {
+                    "index": "5678",
+                    "epoch": "100",
+                    "is_live": false
+                }
+            ]
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/liveness/100"))
+            .and(body_json(["1234", "5678"]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let indices = vec!["1234".to_string(), "5678".to_string()];
+        let result = client.post_validator_liveness(100, &indices).await.unwrap();
+
+        assert_eq!(result.data.len(), 2);
+        assert_eq!(result.data[0].index, "1234");
+        assert_eq!(result.data[0].epoch, "100");
+        assert!(result.data[0].is_live);
+        assert_eq!(result.data[1].index, "5678");
+        assert!(!result.data[1].is_live);
+    }
+
+    #[tokio::test]
+    async fn test_post_validator_liveness_empty_indices() {
+        let mock_server = MockServer::start().await;
+
+        let response_body = serde_json::json!({
+            "data": []
+        });
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/liveness/100"))
+            .and(body_json::<Vec<String>>(vec![]))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let indices: Vec<String> = vec![];
+        let result = client.post_validator_liveness(100, &indices).await.unwrap();
+
+        assert!(result.data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_post_validator_liveness_api_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/liveness/999"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid epoch"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let indices = vec!["1234".to_string()];
+        let result = client.post_validator_liveness(999, &indices).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert_eq!(message, "Invalid epoch");
             }
             _ => panic!("Expected ApiError with status 400"),
         }

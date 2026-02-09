@@ -249,6 +249,17 @@ pub struct BeaconCommitteeSubscription {
     pub is_aggregator: bool,
 }
 
+/// Validator liveness data from the beacon node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatorLiveness {
+    pub index: String,
+    pub epoch: String,
+    pub is_live: bool,
+}
+
+/// Response type for the validator liveness endpoint.
+pub type ValidatorLivenessResponse = DataResponse<Vec<ValidatorLiveness>>;
+
 /// Error details for a single attestation that failed validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedAttestationError {
@@ -637,6 +648,57 @@ mod tests {
         spec.insert("GENESIS_FORK_VERSION".to_string(), "00000000".to_string());
         let schedule = parse_fork_schedule(&spec).unwrap();
         assert_eq!(schedule.genesis_fork_version, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_validator_liveness_deserialize() {
+        let json = r#"{
+            "index": "1234",
+            "epoch": "100",
+            "is_live": true
+        }"#;
+
+        let liveness: ValidatorLiveness = serde_json::from_str(json).unwrap();
+        assert_eq!(liveness.index, "1234");
+        assert_eq!(liveness.epoch, "100");
+        assert!(liveness.is_live);
+    }
+
+    #[test]
+    fn test_validator_liveness_deserialize_not_live() {
+        let json = r#"{
+            "index": "5678",
+            "epoch": "200",
+            "is_live": false
+        }"#;
+
+        let liveness: ValidatorLiveness = serde_json::from_str(json).unwrap();
+        assert_eq!(liveness.index, "5678");
+        assert_eq!(liveness.epoch, "200");
+        assert!(!liveness.is_live);
+    }
+
+    #[test]
+    fn test_validator_liveness_response_deserialize() {
+        let json = r#"{
+            "data": [
+                {
+                    "index": "1234",
+                    "epoch": "100",
+                    "is_live": true
+                },
+                {
+                    "index": "5678",
+                    "epoch": "100",
+                    "is_live": false
+                }
+            ]
+        }"#;
+
+        let response: ValidatorLivenessResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.data.len(), 2);
+        assert!(response.data[0].is_live);
+        assert!(!response.data[1].is_live);
     }
 
     #[test]

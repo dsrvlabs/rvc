@@ -17,5 +17,5 @@ pub use types::{
     ProposerPreparation, SignedAggregateAndProof, SignedContributionAndProof, StateFork,
     StateForkResponse, StateResponse, SubmitAttestationResult, SyncCommitteeContributionResponse,
     SyncCommitteeDutiesResponse, SyncCommitteeMessage, ValidatorData, ValidatorInfo,
-    ValidatorsResponse,
+    ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
 };
