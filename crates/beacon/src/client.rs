@@ -12,7 +12,7 @@ use crate::types::{
     GenesisResponse, IndexedAttestationError, ProduceBlockResponse, ProposerDutiesResponse,
     ProposerPreparation, SignedAggregateAndProof, SignedContributionAndProof, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, ValidatorLivenessResponse, ValidatorsResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
 };
 use crate::BeaconError;
 
@@ -62,6 +62,7 @@ impl BeaconClientConfig {
 }
 
 /// Async HTTP client wrapper for beacon node communication.
+#[derive(Clone)]
 pub struct BeaconClient {
     client: Client,
     config: BeaconClientConfig,
@@ -405,6 +406,14 @@ impl BeaconClient {
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/validator/beacon_committee_subscriptions", &subscriptions).await
+    }
+
+    /// Fetches the sync status of the beacon node.
+    ///
+    /// Returns whether the node is syncing, its head slot, sync distance,
+    /// and whether the execution layer is offline.
+    pub async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+        self.get("/eth/v1/node/syncing").await
     }
 
     /// Submits signed attestations to the beacon node.
@@ -3321,5 +3330,71 @@ mod tests {
             }
             _ => panic!("Expected ApiError with status 400"),
         }
+    }
+
+    // -- get_node_syncing tests --
+
+    #[tokio::test]
+    async fn test_get_node_syncing_synced() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"head_slot":"1000","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}"#,
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_node_syncing().await.unwrap();
+        assert_eq!(result.data.head_slot, "1000");
+        assert_eq!(result.data.sync_distance, "0");
+        assert!(!result.data.is_syncing);
+        assert!(!result.data.is_optimistic);
+        assert!(!result.data.el_offline);
+    }
+
+    #[tokio::test]
+    async fn test_get_node_syncing_still_syncing() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"head_slot":"500","sync_distance":"500","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#,
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_node_syncing().await.unwrap();
+        assert_eq!(result.data.head_slot, "500");
+        assert_eq!(result.data.sync_distance, "500");
+        assert!(result.data.is_syncing);
+    }
+
+    #[tokio::test]
+    async fn test_get_node_syncing_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_node_syncing().await;
+        assert!(result.is_err());
     }
 }

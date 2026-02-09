@@ -3,6 +3,7 @@
 mod error;
 mod manager;
 pub mod sse;
+mod sync_status;
 mod traits;
 
 pub use error::BnManagerError;
@@ -11,6 +12,7 @@ pub use sse::{
     parse_sse_event, BlockEvent, ChainReorgEvent, FinalizedCheckpointEvent, HeadEvent, SseConfig,
     SseConnectionState, SseError, SseEvent, DEFAULT_SSE_TOPICS,
 };
+pub use sync_status::{BnSyncStatus, SharedSyncStatuses};
 pub use traits::{BeaconNodeClient, BnHealthScore, BnManagerConfig, BnSelectionStrategy};
 
 // Re-export types used in trait signatures so downstream crates
@@ -22,6 +24,6 @@ pub use beacon::{
     ProduceBlockResponse, ProposerDutiesResponse, ProposerDuty, ProposerPreparation,
     SignedAggregateAndProof, SignedContributionAndProof, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, ValidatorsResponse,
+    SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorsResponse,
 };
 pub use eth_types::{ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock};

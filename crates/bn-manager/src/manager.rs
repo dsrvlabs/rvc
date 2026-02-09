@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use beacon::{
@@ -8,7 +9,7 @@ use beacon::{
     GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
     SignedAggregateAndProof, SignedContributionAndProof, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, ValidatorsResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorsResponse,
 };
 use eth_types::{ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock};
 use futures::future::join_all;
@@ -16,6 +17,11 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::sse::{self, SseConfig, SseEvent};
+#[cfg(test)]
+use crate::sync_status::BnSyncStatus;
+use crate::sync_status::{
+    check_all_sync_statuses, new_shared_sync_statuses, start_sync_monitor, SharedSyncStatuses,
+};
 use crate::traits::{BeaconNodeClient, BnManagerConfig};
 use crate::BnManagerError;
 
@@ -23,14 +29,21 @@ type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, BeaconError>> + Send 
 type IndexedResultFut<'a, T> =
     Pin<Box<dyn Future<Output = (usize, String, Result<T, BeaconError>)> + Send + 'a>>;
 
+/// Default sync check interval: once per epoch (~384 seconds).
+const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
+
 /// Beacon node manager with multi-BN support, strategy-based selection, and broadcast.
 ///
 /// Supports three operation modes:
-/// - **First**: Try BNs in order, fail over on error (used for duty fetching, attestation data)
-/// - **Best**: Query all BNs in parallel, pick best result (used for block production)
-/// - **Broadcast**: Send to all BNs, return first success (used for all submissions)
+/// - **First**: Try synced BNs in order, fail over on error (used for duty fetching, attestation data)
+/// - **Best**: Query synced BNs in parallel, pick best result (used for block production)
+/// - **Broadcast**: Send to all BNs regardless of sync status, return first success (used for all submissions)
+///
+/// Tracks per-BN sync status and skips unsynced BNs for query operations.
+/// In single-BN mode, logs warnings but continues with the only available BN.
 pub struct BnManager {
     clients: Vec<BeaconClient>,
+    sync_statuses: SharedSyncStatuses,
 }
 
 impl BnManager {
@@ -76,7 +89,30 @@ impl BnManager {
             clients.push(client);
         }
 
-        Ok(Self { clients })
+        let sync_statuses = new_shared_sync_statuses(clients.len());
+        Ok(Self { clients, sync_statuses })
+    }
+
+    /// Returns the shared sync status tracker.
+    pub fn sync_statuses(&self) -> &SharedSyncStatuses {
+        &self.sync_statuses
+    }
+
+    /// Checks sync status of all configured BNs immediately.
+    pub async fn check_sync_status(&self) {
+        check_all_sync_statuses(&self.clients, &self.sync_statuses).await;
+    }
+
+    /// Starts a background task that periodically polls sync status.
+    ///
+    /// Uses the default interval of one epoch (~384 seconds) if `interval` is None.
+    pub fn start_sync_monitor(
+        &self,
+        interval: Option<Duration>,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
+        let interval = interval.unwrap_or(DEFAULT_SYNC_CHECK_INTERVAL);
+        start_sync_monitor(self.clients.clone(), self.sync_statuses.clone(), interval, shutdown)
     }
 
     /// Returns the endpoint URL of the first (primary) client.
@@ -103,15 +139,39 @@ impl BnManager {
         })
     }
 
-    /// Query using the `First` strategy: try BNs in order, fail over on error.
+    /// Returns indices of synced BNs, falling back to all BNs if none are synced
+    /// (single-BN mode logs a warning).
+    async fn synced_indices(&self) -> Vec<usize> {
+        let guard = self.sync_statuses.read().await;
+        let synced: Vec<usize> =
+            guard.iter().enumerate().filter(|(_, s)| s.is_usable()).map(|(i, _)| i).collect();
+
+        if synced.is_empty() {
+            if self.clients.len() == 1 {
+                warn!(
+                    endpoint = self.clients[0].endpoint(),
+                    "single BN is not synced, continuing with degraded service"
+                );
+            } else {
+                warn!("no synced BNs available, falling back to all BNs");
+            }
+            (0..self.clients.len()).collect()
+        } else {
+            synced
+        }
+    }
+
+    /// Query using the `First` strategy: try synced BNs in order, fail over on error.
     async fn query_first<'s, T, F>(&'s self, op_name: &str, op: F) -> Result<T, BeaconError>
     where
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
+        let indices = self.synced_indices().await;
         let mut last_err = None;
 
-        for (i, client) in self.clients.iter().enumerate() {
+        for i in indices {
+            let client = &self.clients[i];
             match op(client).await {
                 Ok(result) => {
                     debug!(
@@ -138,10 +198,10 @@ impl BnManager {
         Err(last_err.expect("at least one client exists"))
     }
 
-    /// Query using the `Best` strategy: query all BNs in parallel, pick best result.
+    /// Query using the `Best` strategy: query synced BNs in parallel, pick best result.
     ///
     /// The `pick_best` function returns `true` if the first argument is better than the second.
-    /// Falls back to `First` strategy if only one BN is configured.
+    /// Falls back to `First` strategy if only one synced BN is available.
     async fn query_best<'s, T, F>(
         &'s self,
         op_name: &str,
@@ -152,18 +212,44 @@ impl BnManager {
         T: Send + 'static,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        if self.clients.len() == 1 {
-            return self.query_first(op_name, op).await;
+        let indices = self.synced_indices().await;
+
+        if indices.len() == 1 {
+            let client = &self.clients[indices[0]];
+            let i = indices[0];
+            return match op(client).await {
+                Ok(result) => {
+                    debug!(
+                        op = op_name,
+                        bn_index = i,
+                        endpoint = client.endpoint(),
+                        "query succeeded (single synced BN)"
+                    );
+                    Ok(result)
+                }
+                Err(e) => {
+                    warn!(
+                        op = op_name,
+                        bn_index = i,
+                        endpoint = client.endpoint(),
+                        error = %e,
+                        "BN query failed"
+                    );
+                    Err(e)
+                }
+            };
         }
 
-        let mut futs: Vec<IndexedResultFut<'_, T>> = Vec::with_capacity(self.clients.len());
+        let mut futs: Vec<IndexedResultFut<'_, T>> = Vec::with_capacity(indices.len());
 
-        for (i, client) in self.clients.iter().enumerate() {
+        for i in &indices {
+            let client = &self.clients[*i];
             let endpoint = client.endpoint().to_string();
+            let idx = *i;
             let fut = op(client);
             futs.push(Box::pin(async move {
                 let result = fut.await;
-                (i, endpoint, result)
+                (idx, endpoint, result)
             }));
         }
 
@@ -213,7 +299,7 @@ impl BnManager {
         }
     }
 
-    /// Broadcast an operation to all BNs. Returns first success.
+    /// Broadcast an operation to all BNs (regardless of sync status). Returns first success.
     /// If all fail, returns the last error.
     async fn broadcast<'s, F>(&'s self, op_name: &str, op: F) -> Result<(), BeaconError>
     where
@@ -527,6 +613,12 @@ impl BeaconNodeClient for BnManager {
         })
         .await
     }
+
+    // -- Node status: query(First) --
+
+    async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+        self.query_first("get_node_syncing", |c| Box::pin(c.get_node_syncing())).await
+    }
 }
 
 /// Implements `BeaconNodeClient` for `BeaconClient` directly, useful for tests
@@ -668,6 +760,10 @@ impl BeaconNodeClient for BeaconClient {
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
         self.submit_beacon_committee_subscriptions(subscriptions).await
+    }
+
+    async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+        self.get_node_syncing().await
     }
 }
 
@@ -1650,5 +1746,307 @@ mod tests {
             execution_payload_value: Some("1000".to_string()),
         };
         assert!(!is_better_block(&a, &b));
+    }
+
+    // ===================================================================
+    // Sync status integration tests
+    // ===================================================================
+
+    const SYNCED_RESPONSE: &str = r#"{"data":{"head_slot":"1000","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}"#;
+    const SYNCING_SYNCING_RESPONSE: &str = r#"{"data":{"head_slot":"500","sync_distance":"500","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#;
+
+    #[tokio::test]
+    async fn test_sync_check_sync_status_marks_synced() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let manager = make_manager(&server.uri());
+        manager.check_sync_status().await;
+
+        let guard = manager.sync_statuses().read().await;
+        assert_eq!(guard[0], BnSyncStatus::Synced);
+    }
+
+    #[tokio::test]
+    async fn test_sync_check_sync_status_marks_syncing() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let manager = make_manager(&server.uri());
+        manager.check_sync_status().await;
+
+        let guard = manager.sync_statuses().read().await;
+        assert_eq!(guard[0], BnSyncStatus::Syncing);
+    }
+
+    #[tokio::test]
+    async fn test_sync_check_sync_status_marks_unreachable() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Error"))
+            .mount(&server)
+            .await;
+
+        let manager = make_manager(&server.uri());
+        manager.check_sync_status().await;
+
+        let guard = manager.sync_statuses().read().await;
+        assert_eq!(guard[0], BnSyncStatus::Unreachable);
+    }
+
+    #[tokio::test]
+    async fn test_sync_query_first_skips_unsynced_bn() {
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+
+        // Primary: syncing, has genesis endpoint
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
+            .mount(&primary)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(0) // Should NOT be called because primary is syncing
+            .mount(&primary)
+            .await;
+
+        // Secondary: synced
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&secondary)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(1)
+            .mount(&secondary)
+            .await;
+
+        let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+        manager.check_sync_status().await;
+
+        let result = manager.get_genesis().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().data.genesis_time, "1606824023");
+    }
+
+    #[tokio::test]
+    async fn test_sync_query_first_falls_back_when_all_unsynced() {
+        let primary = MockServer::start().await;
+
+        // Syncing but still the only BN — should be used with warning
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
+            .mount(&primary)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(1)
+            .mount(&primary)
+            .await;
+
+        let manager = make_manager(&primary.uri());
+        manager.check_sync_status().await;
+
+        // Should still work despite syncing status (single-BN fallback)
+        let result = manager.get_genesis().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sync_query_best_skips_unsynced_bn() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // BN1: syncing
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
+            .mount(&bn1)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Execution-Payload-Value", "9999")
+                .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+            .expect(0) // Should NOT be called
+            .mount(&bn1)
+            .await;
+
+        // BN2: synced
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&bn2)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Execution-Payload-Value", "5000")
+                .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+            .expect(1)
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+        manager.check_sync_status().await;
+
+        let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().execution_payload_value, Some("5000".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_sync_broadcast_sends_to_all_regardless_of_sync_status() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // BN1: syncing
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
+            .mount(&bn1)
+            .await;
+
+        // BN2: synced
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&bn2)
+            .await;
+
+        // Both should receive the broadcast
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&bn1)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+        manager.check_sync_status().await;
+
+        let result = manager.prepare_beacon_proposer(&[]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sync_start_sync_monitor() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let manager = make_manager(&server.uri());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        let handle = manager.start_sync_monitor(Some(Duration::from_millis(50)), shutdown_rx);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let guard = manager.sync_statuses().read().await;
+        assert_eq!(guard[0], BnSyncStatus::Synced);
+        drop(guard);
+
+        shutdown_tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_sync_multi_bn_all_unsynced_falls_back_to_all() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // Both syncing
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
+            .mount(&bn1)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
+            .mount(&bn2)
+            .await;
+
+        // BN1 fails genesis, BN2 succeeds — tests that fallback tries all
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Error"))
+            .expect(1)
+            .mount(&bn1)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(1)
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+        manager.check_sync_status().await;
+
+        let result = manager.get_genesis().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sync_initial_status_is_synced() {
+        // Before any sync check, all BNs default to Synced
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let manager = make_manager(&server.uri());
+
+        // Without calling check_sync_status, BN should be usable
+        let result = manager.get_genesis().await;
+        assert!(result.is_ok());
+
+        let guard = manager.sync_statuses().read().await;
+        assert_eq!(guard[0], BnSyncStatus::Synced);
     }
 }

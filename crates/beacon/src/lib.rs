@@ -16,6 +16,6 @@ pub use types::{
     IndexedAttestationError, ProduceBlockResponse, ProposerDutiesResponse, ProposerDuty,
     ProposerPreparation, SignedAggregateAndProof, SignedContributionAndProof, StateFork,
     StateForkResponse, StateResponse, SubmitAttestationResult, SyncCommitteeContributionResponse,
-    SyncCommitteeDutiesResponse, SyncCommitteeMessage, ValidatorData, ValidatorInfo,
-    ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
+    SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorData,
+    ValidatorInfo, ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
 };

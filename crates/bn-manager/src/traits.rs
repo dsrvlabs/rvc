@@ -8,7 +8,7 @@ use beacon::{
     GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
     SignedAggregateAndProof, SignedContributionAndProof, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, ValidatorsResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorsResponse,
 };
 use eth_types::{ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock};
 
@@ -130,6 +130,10 @@ pub trait BeaconNodeClient: Send + Sync {
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError>;
+
+    // -- Node status --
+
+    async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError>;
 }
 
 /// Strategy for selecting a beacon node when multiple are configured.
@@ -473,6 +477,9 @@ mod tests {
             &self,
             _subscriptions: &[BeaconCommitteeSubscription],
         ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
     }

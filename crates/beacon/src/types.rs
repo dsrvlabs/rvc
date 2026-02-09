@@ -263,6 +263,19 @@ pub struct ValidatorLiveness {
 /// Response type for the validator liveness endpoint.
 pub type ValidatorLivenessResponse = DataResponse<Vec<ValidatorLiveness>>;
 
+/// Sync status data from the beacon node's `/eth/v1/node/syncing` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncingData {
+    pub head_slot: String,
+    pub sync_distance: String,
+    pub is_syncing: bool,
+    pub is_optimistic: bool,
+    pub el_offline: bool,
+}
+
+/// Response type for the node syncing endpoint.
+pub type SyncingResponse = DataResponse<SyncingData>;
+
 /// Error details for a single attestation that failed validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedAttestationError {
@@ -874,5 +887,56 @@ mod tests {
         assert_eq!(sub.committees_at_slot, "64");
         assert_eq!(sub.slot, "10000");
         assert!(!sub.is_aggregator);
+    }
+
+    #[test]
+    fn test_syncing_data_deserialize_synced() {
+        let json = r#"{
+            "head_slot": "1000",
+            "sync_distance": "0",
+            "is_syncing": false,
+            "is_optimistic": false,
+            "el_offline": false
+        }"#;
+
+        let data: SyncingData = serde_json::from_str(json).unwrap();
+        assert_eq!(data.head_slot, "1000");
+        assert_eq!(data.sync_distance, "0");
+        assert!(!data.is_syncing);
+        assert!(!data.is_optimistic);
+        assert!(!data.el_offline);
+    }
+
+    #[test]
+    fn test_syncing_data_deserialize_syncing() {
+        let json = r#"{
+            "head_slot": "500",
+            "sync_distance": "500",
+            "is_syncing": true,
+            "is_optimistic": true,
+            "el_offline": false
+        }"#;
+
+        let data: SyncingData = serde_json::from_str(json).unwrap();
+        assert!(data.is_syncing);
+        assert!(data.is_optimistic);
+        assert_eq!(data.sync_distance, "500");
+    }
+
+    #[test]
+    fn test_syncing_response_deserialize() {
+        let json = r#"{
+            "data": {
+                "head_slot": "1000",
+                "sync_distance": "0",
+                "is_syncing": false,
+                "is_optimistic": false,
+                "el_offline": false
+            }
+        }"#;
+
+        let response: SyncingResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.data.head_slot, "1000");
+        assert!(!response.data.is_syncing);
     }
 }
