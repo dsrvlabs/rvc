@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/rvc", "crates/rvc", "crates/beacon", "crates/eth-types", "crates/metrics", "crates/slashing", "crates/timing", "crates/crypto", "crates/duty-tracker", "crates/propagator", "crates/signer", "crates/validator-store", "crates/block-service", "crates/sync-service"]
+members = ["bin/rvc", "crates/rvc", "crates/beacon", "crates/bn-manager", "crates/eth-types", "crates/metrics", "crates/slashing", "crates/timing", "crates/crypto", "crates/duty-tracker", "crates/propagator", "crates/signer", "crates/validator-store", "crates/block-service", "crates/sync-service"]
 default-members = ["bin/rvc"]
 resolver = "2"
 
@@ -25,6 +25,7 @@ signer = { path = "crates/signer", package = "rvc-signer" }
 validator-store = { path = "crates/validator-store", package = "rvc-validator-store" }
 block-service = { path = "crates/block-service", package = "rvc-block-service" }
 sync-service = { path = "crates/sync-service", package = "rvc-sync-service" }
+bn-manager = { path = "crates/bn-manager", package = "rvc-bn-manager" }
 
 # External
 async-trait = "0.1"

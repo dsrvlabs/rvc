@@ -2724,6 +2724,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvc-bn-manager"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "beacon",
+ "rvc-eth-types",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "rvc-crypto"
 version = "0.1.0"
 dependencies = [
