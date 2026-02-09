@@ -4,7 +4,7 @@
 //! 1. Open slashing DB
 //! 2. Run integrity check
 //! 3. Validate genesis root against beacon node
-//! 4. Check sync status of beacon nodes
+//! 4. Check beacon node reachability
 //! 5. Run doppelganger detection (if enabled)
 
 use bn_manager::BeaconNodeClient;
@@ -41,6 +41,9 @@ pub enum StartupError {
 
     #[error("doppelganger error: {0}")]
     Doppelganger(#[from] doppelganger::DoppelgangerError),
+
+    #[error("startup exit with code {0}")]
+    StartupExit(i32),
 }
 
 impl StartupError {
@@ -91,15 +94,18 @@ pub async fn validate_genesis_root(
         });
     }
 
-    // Store/validate in slashing DB
-    slashing_db.set_genesis_validators_root(local_root_hex)?;
+    // Store normalized value (lowercase, no 0x prefix) for consistent comparisons
+    slashing_db.set_genesis_validators_root(&local_normalized)?;
 
     info!("Genesis validators root validated successfully");
     Ok(())
 }
 
-/// Check the sync status of the beacon node and warn if not synced.
-pub async fn check_sync_status(beacon: &dyn BeaconNodeClient) {
+/// Check whether the beacon node is reachable by querying its genesis endpoint.
+///
+/// This only verifies network reachability, not sync status.
+// TODO: integrate actual sync status check via node/syncing endpoint
+pub async fn check_beacon_reachability(beacon: &dyn BeaconNodeClient) {
     match beacon.get_genesis().await {
         Ok(_) => {
             info!("Beacon node is reachable");
@@ -185,7 +191,8 @@ mod tests {
         DataResponse, GenesisData, GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse,
         ProposerPreparation, SignedAggregateAndProof, SignedContributionAndProof,
         StateForkResponse, SubmitAttestationResult, SyncCommitteeContributionResponse,
-        SyncCommitteeDutiesResponse, SyncCommitteeMessage, ValidatorsResponse,
+        SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingData, SyncingResponse,
+        ValidatorsResponse,
     };
     use eth_types::{ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock};
 
@@ -339,6 +346,17 @@ mod tests {
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
+        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+            Ok(DataResponse {
+                data: SyncingData {
+                    head_slot: "0".to_string(),
+                    sync_distance: "0".to_string(),
+                    is_syncing: false,
+                    is_optimistic: false,
+                    el_offline: false,
+                },
+            })
+        }
     }
 
     // -- Exit code tests --
@@ -446,7 +464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_validate_genesis_root_stores_in_slashing_db() {
+    async fn test_validate_genesis_root_stores_normalized_in_slashing_db() {
         let root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
         let db = SlashingDb::open_in_memory().unwrap();
         let beacon = MockBeacon::with_root(root);
@@ -455,23 +473,27 @@ mod tests {
 
         let stored = db.genesis_validators_root().unwrap();
         assert!(stored.is_some());
-        assert_eq!(stored.unwrap(), root);
+        // Stored value should be normalized: lowercase without 0x prefix
+        assert_eq!(
+            stored.unwrap(),
+            "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+        );
     }
 
     // -- Sync status tests --
 
     #[tokio::test]
-    async fn test_check_sync_status_reachable() {
+    async fn test_check_beacon_reachability_reachable() {
         let beacon = MockBeacon::with_root("0xabc");
         // Should not panic, just log
-        check_sync_status(&beacon).await;
+        check_beacon_reachability(&beacon).await;
     }
 
     #[tokio::test]
-    async fn test_check_sync_status_unreachable() {
+    async fn test_check_beacon_reachability_unreachable() {
         let beacon = MockBeacon::failing();
         // Should not panic, just warn
-        check_sync_status(&beacon).await;
+        check_beacon_reachability(&beacon).await;
     }
 
     // -- StartupError display --

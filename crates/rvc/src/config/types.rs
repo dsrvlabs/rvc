@@ -111,6 +111,20 @@ impl Config {
             )));
         }
 
+        for node_url in &self.beacon_nodes {
+            if node_url.is_empty() {
+                return Err(ConfigError::InvalidBeaconUrl(
+                    "beacon_nodes entry cannot be empty".to_string(),
+                ));
+            }
+            if !node_url.starts_with("http://") && !node_url.starts_with("https://") {
+                return Err(ConfigError::InvalidBeaconUrl(format!(
+                    "beacon_nodes entry must start with http:// or https://: {}",
+                    node_url
+                )));
+            }
+        }
+
         if self.metrics_port == 0 {
             return Err(ConfigError::InvalidPort(self.metrics_port));
         }
@@ -521,6 +535,30 @@ log_level = "debug"
         let cli = CliOverrides { doppelganger_detection: Some(false), ..Default::default() };
         config.merge_with_cli(&cli);
         assert!(!config.doppelganger_detection);
+    }
+
+    #[test]
+    fn test_validate_beacon_nodes_invalid_scheme() {
+        let config = Config {
+            beacon_nodes: vec!["http://bn1:5052".to_string(), "ftp://bn2:5052".to_string()],
+            ..Default::default()
+        };
+        assert!(matches!(config.validate(), Err(ConfigError::InvalidBeaconUrl(_))));
+    }
+
+    #[test]
+    fn test_validate_beacon_nodes_empty_entry() {
+        let config = Config { beacon_nodes: vec!["".to_string()], ..Default::default() };
+        assert!(matches!(config.validate(), Err(ConfigError::InvalidBeaconUrl(_))));
+    }
+
+    #[test]
+    fn test_validate_beacon_nodes_valid() {
+        let config = Config {
+            beacon_nodes: vec!["http://bn1:5052".to_string(), "https://bn2:5052".to_string()],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     #[test]

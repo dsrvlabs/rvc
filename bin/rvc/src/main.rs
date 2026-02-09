@@ -87,9 +87,9 @@ enum Commands {
         #[arg(long)]
         graffiti: Option<String>,
 
-        /// Enable doppelganger detection (default: enabled)
-        #[arg(long, default_value_t = true)]
-        doppelganger_detection: bool,
+        /// Disable doppelganger detection (enabled by default)
+        #[arg(long)]
+        no_doppelganger_detection: bool,
 
         /// Log level (trace, debug, info, warn, error)
         #[arg(long, default_value = "info")]
@@ -159,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
             genesis_time,
             genesis_validators_root,
             graffiti,
-            doppelganger_detection,
+            no_doppelganger_detection,
             log_level,
         } => {
             init_logging(&log_level);
@@ -178,7 +178,7 @@ async fn main() -> anyhow::Result<()> {
                 genesis_validators_root,
                 graffiti,
                 log_level: Some(log_level),
-                doppelganger_detection: Some(doppelganger_detection),
+                doppelganger_detection: if no_doppelganger_detection { Some(false) } else { None },
             };
 
             let mut cfg = load_config(config)?;
@@ -282,7 +282,7 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
     // Step 2: Run integrity check
     if let Err(e) = startup::check_integrity(&slashing_db) {
         error!("Slashing DB integrity check failed: {}", e);
-        std::process::exit(e.exit_code());
+        return Err(e.into());
     }
 
     // Step 3: Create beacon client and BnManager
@@ -323,7 +323,7 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
     .await
     {
         error!("Genesis root validation failed: {}", e);
-        std::process::exit(e.exit_code());
+        return Err(e.into());
     }
 
     let genesis_validators_root = match builder.parse_genesis_validators_root() {
@@ -334,8 +334,8 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
         }
     };
 
-    // Step 5: Check sync status
-    startup::check_sync_status(bn_manager.as_ref()).await;
+    // Step 5: Check beacon reachability
+    startup::check_beacon_reachability(bn_manager.as_ref()).await;
 
     // Load validator keys
     let key_manager = match builder.build_key_manager() {
@@ -356,19 +356,30 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
 
     // Resolve validator indices using BnManager (via trait)
     let beacon_for_resolve: &dyn BeaconNodeClient = bn_manager.as_ref();
-    let validator_indices = resolve_validator_indices(beacon_for_resolve, &pubkey_map).await;
+    let validator_index_map = resolve_validator_indices(beacon_for_resolve, &pubkey_map).await;
 
     // Step 6: Doppelganger detection (if enabled)
     if doppelganger_enabled && !pubkey_map.is_empty() {
+        let validator_index_map = match validator_index_map {
+            Ok(ref map) if !map.is_empty() => map.clone(),
+            Ok(_) => {
+                error!("No validator indices resolved; cannot run doppelganger detection");
+                return Err(anyhow::anyhow!(
+                    "validator index resolution returned empty; doppelganger detection requires indices"
+                ));
+            }
+            Err(ref e) => {
+                error!("Failed to resolve validator indices: {}", e);
+                return Err(anyhow::anyhow!(
+                    "validator index resolution failed; doppelganger detection requires indices: {}", e
+                ));
+            }
+        };
+
         let doppelganger_service =
             builder.build_doppelganger_service(beacon_client.clone(), slashing_db.clone());
 
         let pubkeys: Vec<String> = pubkey_map.keys().cloned().collect();
-        let validator_index_map: std::collections::HashMap<String, String> = pubkey_map
-            .keys()
-            .zip(validator_indices.iter())
-            .map(|(pk, idx)| (pk.clone(), idx.clone()))
-            .collect();
 
         let slot_clock = match builder.build_slot_clock() {
             Ok(clock) => clock,
@@ -381,8 +392,8 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
         let current_epoch = match slot_clock.current_slot() {
             Ok(slot) => slot / timing::SLOTS_PER_EPOCH,
             Err(e) => {
-                warn!(error = %e, "Could not determine current epoch for doppelganger detection, skipping");
-                0
+                error!(error = %e, "Cannot determine current epoch; refusing to skip doppelganger detection");
+                return Err(anyhow::anyhow!("slot clock failure during doppelganger check"));
             }
         };
 
@@ -400,7 +411,7 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     error!("Doppelganger detection failed: {}", e);
-                    std::process::exit(e.exit_code());
+                    return Err(e.into());
                 }
             }
         }
@@ -414,6 +425,10 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
     let validator_store = builder.build_validator_store();
 
     let beacon: std::sync::Arc<dyn BeaconNodeClient> = bn_manager;
+    let validator_indices: Vec<String> = match validator_index_map {
+        Ok(ref map) => map.values().cloned().collect(),
+        Err(_) => Vec::new(),
+    };
     let duty_tracker = builder.build_duty_tracker(beacon.clone(), validator_indices);
 
     let slot_clock = match builder.build_slot_clock() {
@@ -506,30 +521,26 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
 async fn resolve_validator_indices(
     beacon_client: &dyn BeaconNodeClient,
     pubkey_map: &std::collections::HashMap<String, PublicKey>,
-) -> Vec<String> {
+) -> Result<std::collections::HashMap<String, String>, anyhow::Error> {
     if pubkey_map.is_empty() {
-        return Vec::new();
+        return Ok(std::collections::HashMap::new());
     }
 
     let pubkeys: Vec<String> = pubkey_map.keys().cloned().collect();
-    match beacon_client.get_validators(&pubkeys).await {
-        Ok(response) => {
-            let indices: Vec<String> = response.data.iter().map(|v| v.index.clone()).collect();
-            if indices.len() < pubkeys.len() {
-                warn!(
-                    resolved = indices.len(),
-                    total = pubkeys.len(),
-                    "Some validator public keys could not be resolved to indices"
-                );
-            }
-            info!(count = indices.len(), "Resolved validator indices");
-            indices
-        }
-        Err(e) => {
-            error!("Failed to resolve validator indices from beacon node: {}", e);
-            Vec::new()
-        }
+    let response = beacon_client.get_validators(&pubkeys).await?;
+
+    let index_map: std::collections::HashMap<String, String> =
+        response.data.iter().map(|v| (v.validator.pubkey.clone(), v.index.clone())).collect();
+
+    if index_map.len() < pubkeys.len() {
+        warn!(
+            resolved = index_map.len(),
+            total = pubkeys.len(),
+            "Some validator public keys could not be resolved to indices"
+        );
     }
+    info!(count = index_map.len(), "Resolved validator indices");
+    Ok(index_map)
 }
 
 async fn shutdown_signal() {
