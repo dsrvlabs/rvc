@@ -15,6 +15,7 @@ use futures::future::join_all;
 use tracing::{debug, warn};
 use url::Url;
 
+use crate::sse::{self, SseConfig, SseEvent};
 use crate::traits::{BeaconNodeClient, BnManagerConfig};
 use crate::BnManagerError;
 
@@ -82,6 +83,24 @@ impl BnManager {
     #[cfg(test)]
     fn primary_endpoint(&self) -> &str {
         self.clients[0].endpoint()
+    }
+
+    /// Starts SSE event subscription on the primary beacon node.
+    ///
+    /// The returned `JoinHandle` runs the SSE loop in a background task.
+    /// Send `true` on `shutdown` to stop the subscription.
+    pub fn start_sse<F>(
+        &self,
+        callback: F,
+        shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()>
+    where
+        F: Fn(SseEvent) + Send + Sync + 'static,
+    {
+        let config = SseConfig::new(self.clients[0].endpoint().to_string());
+        tokio::spawn(async move {
+            sse::subscribe_events(config, callback, shutdown).await;
+        })
     }
 
     /// Query using the `First` strategy: try BNs in order, fail over on error.

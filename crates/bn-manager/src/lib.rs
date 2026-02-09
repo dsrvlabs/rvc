@@ -2,10 +2,15 @@
 
 mod error;
 mod manager;
+pub mod sse;
 mod traits;
 
 pub use error::BnManagerError;
 pub use manager::BnManager;
+pub use sse::{
+    parse_sse_event, BlockEvent, ChainReorgEvent, FinalizedCheckpointEvent, HeadEvent, SseConfig,
+    SseConnectionState, SseError, SseEvent, DEFAULT_SSE_TOPICS,
+};
 pub use traits::{BeaconNodeClient, BnHealthScore, BnManagerConfig, BnSelectionStrategy};
 
 // Re-export types used in trait signatures so downstream crates
