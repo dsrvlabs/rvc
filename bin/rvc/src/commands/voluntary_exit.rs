@@ -101,9 +101,7 @@ pub async fn execute(args: VoluntaryExitArgs) -> anyhow::Result<()> {
         config.slashing_db_path = db_path;
     }
     if let Some(network) = args.network {
-        if let Ok(n) = network.parse() {
-            config.network = n;
-        }
+        config.network = network.parse().map_err(|e: String| anyhow::anyhow!("{}", e))?;
     }
 
     let builder = ServiceBuilder::new(config);
@@ -213,5 +211,24 @@ mod tests {
 
         assert_eq!(normalized1, "0xabcdef1234567890");
         assert_eq!(normalized2, "0xabcdef1234567890");
+    }
+
+    #[test]
+    fn test_invalid_network_returns_error() {
+        use rvc::config::Network;
+
+        let result = "invalid_network".parse::<Network>();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown network"));
+    }
+
+    #[test]
+    fn test_valid_networks_parse_ok() {
+        use rvc::config::Network;
+
+        assert_eq!("mainnet".parse::<Network>().unwrap(), Network::Mainnet);
+        assert_eq!("goerli".parse::<Network>().unwrap(), Network::Goerli);
+        assert_eq!("sepolia".parse::<Network>().unwrap(), Network::Sepolia);
+        assert_eq!("holesky".parse::<Network>().unwrap(), Network::Holesky);
     }
 }

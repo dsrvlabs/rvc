@@ -4,8 +4,8 @@ use eth_types::{ForkName, ForkSchedule, Root, VoluntaryExit, DOMAIN_VOLUNTARY_EX
 
 /// Signs a voluntary exit with the correct fork-aware domain.
 ///
-/// Per the Ethereum consensus spec, voluntary exits use `DOMAIN_VOLUNTARY_EXIT`
-/// and the fork version corresponding to the exit epoch.
+/// Per EIP-7044, voluntary exit signatures are perpetually valid by capping the
+/// fork version at Capella for exits at Capella epoch or later.
 pub fn sign_voluntary_exit(
     voluntary_exit: &VoluntaryExit,
     secret_key: &SecretKey,
@@ -13,7 +13,9 @@ pub fn sign_voluntary_exit(
     genesis_validators_root: Root,
 ) -> Signature {
     let fork_name = ForkName::from_epoch(voluntary_exit.epoch, fork_schedule);
-    let fork_version = fork_name.fork_version(fork_schedule);
+    // EIP-7044: voluntary exit signatures are perpetually valid by capping at Capella
+    let capped = if fork_name >= ForkName::Capella { ForkName::Capella } else { fork_name };
+    let fork_version = capped.fork_version(fork_schedule);
     let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, fork_version, genesis_validators_root);
     let signing_root = compute_signing_root(voluntary_exit, domain);
     secret_key.sign(&signing_root)
@@ -135,6 +137,78 @@ mod tests {
         let sig2 = sign_voluntary_exit(&exit2, &secret_key, &schedule, genesis_root);
 
         assert_ne!(sig1.to_bytes(), sig2.to_bytes());
+    }
+
+    #[test]
+    fn test_sign_voluntary_exit_eip7044_caps_at_capella() {
+        let secret_key = SecretKey::generate();
+        let public_key = secret_key.public_key();
+        let schedule = test_fork_schedule();
+        let genesis_root = test_genesis_validators_root();
+
+        // Exit at Deneb epoch (epoch 45, which is >= deneb_fork_epoch=40)
+        let exit = VoluntaryExit { epoch: 45, validator_index: 42 };
+        let signature = sign_voluntary_exit(&exit, &secret_key, &schedule, genesis_root);
+
+        // EIP-7044: signature must verify with Capella fork version
+        let capella_domain =
+            compute_domain(DOMAIN_VOLUNTARY_EXIT, schedule.capella_fork_version, genesis_root);
+        let capella_signing_root = compute_signing_root(&exit, capella_domain);
+        assert!(signature.verify(&public_key, &capella_signing_root).is_ok());
+
+        // Signature must NOT verify with Deneb fork version (proves the cap works)
+        let deneb_domain =
+            compute_domain(DOMAIN_VOLUNTARY_EXIT, schedule.deneb_fork_version, genesis_root);
+        let deneb_signing_root = compute_signing_root(&exit, deneb_domain);
+        assert!(signature.verify(&public_key, &deneb_signing_root).is_err());
+    }
+
+    #[test]
+    fn test_sign_voluntary_exit_eip7044_electra_also_capped() {
+        let secret_key = SecretKey::generate();
+        let public_key = secret_key.public_key();
+        let schedule = test_fork_schedule();
+        let genesis_root = test_genesis_validators_root();
+
+        // Exit at Electra epoch (epoch 55, which is >= electra_fork_epoch=50)
+        let exit = VoluntaryExit { epoch: 55, validator_index: 42 };
+        let signature = sign_voluntary_exit(&exit, &secret_key, &schedule, genesis_root);
+
+        // EIP-7044: signature must verify with Capella fork version
+        let capella_domain =
+            compute_domain(DOMAIN_VOLUNTARY_EXIT, schedule.capella_fork_version, genesis_root);
+        let capella_signing_root = compute_signing_root(&exit, capella_domain);
+        assert!(signature.verify(&public_key, &capella_signing_root).is_ok());
+
+        // Signature must NOT verify with Electra fork version
+        let electra_domain =
+            compute_domain(DOMAIN_VOLUNTARY_EXIT, schedule.electra_fork_version, genesis_root);
+        let electra_signing_root = compute_signing_root(&exit, electra_domain);
+        assert!(signature.verify(&public_key, &electra_signing_root).is_err());
+    }
+
+    #[test]
+    fn test_sign_voluntary_exit_pre_capella_not_capped() {
+        let secret_key = SecretKey::generate();
+        let public_key = secret_key.public_key();
+        let schedule = test_fork_schedule();
+        let genesis_root = test_genesis_validators_root();
+
+        // Exit at Bellatrix epoch (epoch 25, which is < capella_fork_epoch=30)
+        let exit = VoluntaryExit { epoch: 25, validator_index: 42 };
+        let signature = sign_voluntary_exit(&exit, &secret_key, &schedule, genesis_root);
+
+        // Pre-Capella: should use Bellatrix fork version, not Capella
+        let bellatrix_domain =
+            compute_domain(DOMAIN_VOLUNTARY_EXIT, schedule.bellatrix_fork_version, genesis_root);
+        let bellatrix_signing_root = compute_signing_root(&exit, bellatrix_domain);
+        assert!(signature.verify(&public_key, &bellatrix_signing_root).is_ok());
+
+        // Capella fork version should fail for pre-Capella exits
+        let capella_domain =
+            compute_domain(DOMAIN_VOLUNTARY_EXIT, schedule.capella_fork_version, genesis_root);
+        let capella_signing_root = compute_signing_root(&exit, capella_domain);
+        assert!(signature.verify(&public_key, &capella_signing_root).is_err());
     }
 
     #[test]
