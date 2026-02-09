@@ -28,6 +28,7 @@ impl DoppelgangerService {
     }
 
     pub fn with_monitoring_epochs(mut self, epochs: u64) -> Self {
+        assert!(epochs > 0, "monitoring_epochs must be >= 1");
         self.monitoring_epochs = epochs;
         self
     }
@@ -92,14 +93,32 @@ impl DoppelgangerService {
             return Ok(DoppelgangerResult { safe_validators: vec![], detected: vec![] });
         }
 
-        let indices: Vec<String> =
-            pubkeys_to_monitor.iter().filter_map(|pk| validator_indices.get(pk).cloned()).collect();
+        let checked_pubkeys: Vec<&String> = pubkeys_to_monitor
+            .iter()
+            .filter(|pk| {
+                if validator_indices.contains_key(pk.as_str()) {
+                    true
+                } else {
+                    warn!(pubkey = %pk, "pubkey has no validator index, skipping liveness check");
+                    false
+                }
+            })
+            .collect();
+
+        let indices: Vec<String> = checked_pubkeys
+            .iter()
+            .filter_map(|pk| validator_indices.get(pk.as_str()).cloned())
+            .collect();
 
         let mut detected: Vec<String> = Vec::new();
 
         // Check liveness for each epoch in the monitoring window
+        let base_epoch = current_epoch.saturating_sub(1);
         for epoch_offset in 0..self.monitoring_epochs {
-            let check_epoch = current_epoch.saturating_sub(1).saturating_sub(epoch_offset);
+            if epoch_offset > base_epoch {
+                break;
+            }
+            let check_epoch = base_epoch - epoch_offset;
 
             let liveness_data = self.liveness_checker.check_liveness(check_epoch, &indices).await?;
 
@@ -116,7 +135,7 @@ impl DoppelgangerService {
                     if let Some(&pubkey) = index_to_pubkey.get(entry.index.as_str()) {
                         // Check if we signed anything for this epoch
                         let our_last = self.slashing_db.last_signed_attestation_epoch(pubkey)?;
-                        let we_signed = our_last.is_some_and(|e| e >= check_epoch);
+                        let we_signed = our_last.is_some_and(|e| e == check_epoch);
 
                         if !we_signed {
                             warn!(
@@ -134,7 +153,7 @@ impl DoppelgangerService {
         }
 
         let safe_validators: Vec<String> =
-            pubkeys_to_monitor.iter().filter(|pk| !detected.contains(pk)).cloned().collect();
+            checked_pubkeys.iter().filter(|pk| !detected.contains(pk)).cloned().cloned().collect();
 
         Ok(DoppelgangerResult { safe_validators, detected })
     }
@@ -547,6 +566,164 @@ mod tests {
 
         let result = service.check_validators(&[pk("0xpk1")], 0).expect("should succeed");
         assert_eq!(result[0].1, DoppelgangerStatus::DetectionInProgress);
+    }
+
+    // -- Fix 1: pubkeys without validator indices must not appear in safe_validators --
+
+    #[tokio::test]
+    async fn test_run_monitoring_pubkey_without_index_not_in_safe() {
+        // pk1 has a validator index, pk2 does NOT (e.g., pending activation).
+        // pk2 must NOT appear in safe_validators because it was never checked.
+        let slashing_db =
+            Arc::new(MockSlashingDb::new().with_epoch("0xpk1", None).with_epoch("0xpk2", None));
+        let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![
+            // epoch 99: pk1 not live
+            vec![ValidatorLivenessData { index: "1".to_string(), is_live: false }],
+            // epoch 98: pk1 not live
+            vec![ValidatorLivenessData { index: "1".to_string(), is_live: false }],
+        ]));
+        let service = DoppelgangerService::new(liveness, slashing_db);
+
+        let mut indices = HashMap::new();
+        indices.insert(pk("0xpk1"), "1".to_string());
+        // Note: 0xpk2 is NOT in indices (no validator index)
+
+        let result = service
+            .run_monitoring(&[pk("0xpk1"), pk("0xpk2")], &indices, 100)
+            .await
+            .expect("should succeed");
+
+        // pk1 was checked and is safe
+        assert!(result.safe_validators.contains(&pk("0xpk1")));
+        // pk2 was NOT checked (no index) and must NOT be in safe_validators
+        assert!(!result.safe_validators.contains(&pk("0xpk2")));
+        assert!(!result.detected.contains(&pk("0xpk2")));
+    }
+
+    // -- Fix 2: we_signed must use == not >= --
+
+    #[tokio::test]
+    async fn test_run_monitoring_future_sign_does_not_mask_earlier_doppelganger() {
+        // Validator signed at epoch 105 (future relative to check_epoch 99).
+        // Validator is live at epoch 99. Because we only signed at 105, NOT at 99,
+        // this should be detected as a doppelganger at epoch 99.
+        let slashing_db = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", Some(105)));
+        let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![
+            // epoch 99: validator is live
+            vec![ValidatorLivenessData { index: "1".to_string(), is_live: true }],
+            // epoch 98: not live
+            vec![ValidatorLivenessData { index: "1".to_string(), is_live: false }],
+        ]));
+        let service = DoppelgangerService::new(liveness, slashing_db);
+
+        let mut indices = HashMap::new();
+        indices.insert(pk("0xpk1"), "1".to_string());
+
+        let result =
+            service.run_monitoring(&[pk("0xpk1")], &indices, 100).await.expect("should succeed");
+
+        // Should detect doppelganger because we did NOT sign at epoch 99
+        assert!(result.detected.contains(&pk("0xpk1")));
+        assert!(!result.safe_validators.contains(&pk("0xpk1")));
+    }
+
+    // -- Fix 3: monitoring_epochs = 0 must panic --
+
+    #[test]
+    #[should_panic(expected = "monitoring_epochs must be >= 1")]
+    fn test_with_monitoring_epochs_zero_panics() {
+        let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
+        let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
+        DoppelgangerService::new(liveness, slashing_db).with_monitoring_epochs(0);
+    }
+
+    // -- Fix 4: low epoch numbers must not produce duplicate epoch checks --
+
+    #[tokio::test]
+    async fn test_run_monitoring_epoch_zero_no_duplicate_checks() {
+        // At current_epoch=0, base_epoch = 0.saturating_sub(1) = 0.
+        // With monitoring_epochs=2, only epoch 0 should be checked (offset 0).
+        // Offset 1 would require base_epoch >= 1, so it should break early.
+        let slashing_db = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", None));
+        let checked_epochs: Arc<Mutex<Vec<Epoch>>> = Arc::new(Mutex::new(vec![]));
+        let checked_epochs_clone = checked_epochs.clone();
+
+        // We'll use a custom liveness checker that records which epochs are queried
+        struct EpochRecordingLiveness {
+            checked: Arc<Mutex<Vec<Epoch>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LivenessChecker for EpochRecordingLiveness {
+            async fn check_liveness(
+                &self,
+                epoch: Epoch,
+                _validator_indices: &[String],
+            ) -> Result<Vec<ValidatorLivenessData>, DoppelgangerError> {
+                self.checked.lock().expect("poisoned").push(epoch);
+                Ok(vec![ValidatorLivenessData { index: "1".to_string(), is_live: false }])
+            }
+        }
+
+        let liveness: Arc<dyn LivenessChecker> =
+            Arc::new(EpochRecordingLiveness { checked: checked_epochs_clone });
+        let service = DoppelgangerService::new(liveness, slashing_db);
+
+        let mut indices = HashMap::new();
+        indices.insert(pk("0xpk1"), "1".to_string());
+
+        let _result =
+            service.run_monitoring(&[pk("0xpk1")], &indices, 0).await.expect("should succeed");
+
+        let epochs = checked_epochs.lock().expect("poisoned");
+        // No duplicate epochs
+        let mut unique = epochs.clone();
+        unique.dedup();
+        assert_eq!(epochs.len(), unique.len(), "duplicate epoch checks detected: {:?}", *epochs);
+    }
+
+    #[tokio::test]
+    async fn test_run_monitoring_epoch_one_no_duplicate_checks() {
+        // At current_epoch=1, base_epoch = 1.saturating_sub(1) = 0.
+        // With monitoring_epochs=2, only epoch 0 should be checked (offset 0).
+        // Offset 1 would require base_epoch >= 1, but base_epoch is 0, so break.
+        let slashing_db = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", None));
+        let checked_epochs: Arc<Mutex<Vec<Epoch>>> = Arc::new(Mutex::new(vec![]));
+        let checked_epochs_clone = checked_epochs.clone();
+
+        struct EpochRecordingLiveness2 {
+            checked: Arc<Mutex<Vec<Epoch>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl LivenessChecker for EpochRecordingLiveness2 {
+            async fn check_liveness(
+                &self,
+                epoch: Epoch,
+                _validator_indices: &[String],
+            ) -> Result<Vec<ValidatorLivenessData>, DoppelgangerError> {
+                self.checked.lock().expect("poisoned").push(epoch);
+                Ok(vec![ValidatorLivenessData { index: "1".to_string(), is_live: false }])
+            }
+        }
+
+        let liveness: Arc<dyn LivenessChecker> =
+            Arc::new(EpochRecordingLiveness2 { checked: checked_epochs_clone });
+        let service = DoppelgangerService::new(liveness, slashing_db);
+
+        let mut indices = HashMap::new();
+        indices.insert(pk("0xpk1"), "1".to_string());
+
+        let _result =
+            service.run_monitoring(&[pk("0xpk1")], &indices, 1).await.expect("should succeed");
+
+        let epochs = checked_epochs.lock().expect("poisoned");
+        // Should only check epoch 0 once
+        let mut unique = epochs.clone();
+        unique.dedup();
+        assert_eq!(epochs.len(), unique.len(), "duplicate epoch checks detected: {:?}", *epochs);
+        // Should check exactly 1 epoch
+        assert_eq!(epochs.len(), 1, "expected 1 epoch check at epoch 1, got {:?}", *epochs);
     }
 
     #[test]
