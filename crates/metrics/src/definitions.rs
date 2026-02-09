@@ -157,6 +157,20 @@ lazy_static! {
         gauge
     };
 
+    /// Counter for aggregation operations.
+    /// Labels: status (success, failed, skipped)
+    pub static ref RVC_AGGREGATIONS_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_aggregations_total",
+            "Total number of attestation aggregation operations"
+        );
+        let counter = IntCounterVec::new(opts, &["status"])
+            .expect("Failed to create rvc_aggregations_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_aggregations_total metric");
+        counter
+    };
+
     /// Histogram for slot processing duration in seconds.
     pub static ref RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS: HistogramVec = {
         let opts = HistogramOpts::new(
@@ -182,6 +196,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_SIGNING_DURATION_SECONDS);
     lazy_static::initialize(&RVC_BEACON_REQUESTS_TOTAL);
     lazy_static::initialize(&RVC_SLASHING_PROTECTION_CHECKS_TOTAL);
+    lazy_static::initialize(&RVC_AGGREGATIONS_TOTAL);
     lazy_static::initialize(&RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL);
     lazy_static::initialize(&RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL);
     lazy_static::initialize(&RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS);

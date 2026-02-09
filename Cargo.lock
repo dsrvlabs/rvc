@@ -2683,6 +2683,7 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tracing",
+ "tree_hash",
  "wiremock",
 ]
 

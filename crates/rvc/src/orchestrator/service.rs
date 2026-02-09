@@ -12,18 +12,19 @@ use block_service::{BeaconBlockClient, BlockService};
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{
-    ContributionAndProof, ForkName, ForkSchedule, Root, SignedContributionAndProof, Slot,
-    SyncCommitteeDuty,
+    AggregateAndProof, ContributionAndProof, ForkName, ForkSchedule, Root, SignedAggregateAndProof,
+    SignedContributionAndProof, Slot, SyncCommitteeDuty,
 };
 use metrics::definitions::{
-    attestation_status, orchestrator_result, RVC_ATTESTATIONS_TOTAL,
+    attestation_status, orchestrator_result, RVC_AGGREGATIONS_TOTAL, RVC_ATTESTATIONS_TOTAL,
     RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
     RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL, RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
 };
 use propagator::{AttestationSubmitter, Propagator};
-use signer::SignerService;
+use signer::{is_aggregator, SignerService};
 use sync_service::is_sync_committee_aggregator;
 use timing::{SlotClock, SLOTS_PER_EPOCH};
+use tree_hash::TreeHash;
 
 use super::error::OrchestratorError;
 
@@ -44,6 +45,9 @@ const DUTY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Timeout for attestation data fetch.
 const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Timeout for aggregate attestation fetch and submission.
+const AGGREGATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Total validators in a sync committee.
 const SYNC_COMMITTEE_SIZE: u64 = 512;
@@ -272,6 +276,7 @@ where
             }
 
             self.maybe_produce_sync_contributions(current_slot, current_epoch).await;
+            self.maybe_produce_aggregations(current_slot, current_epoch).await;
 
             // === Wait for next slot ===
             let next_slot = current_slot + 1;
@@ -603,6 +608,217 @@ where
                     "Contribution and proofs submit timed out after {}s",
                     SYNC_CONTRIBUTION_TIMEOUT.as_secs()
                 ),
+            }
+        }
+    }
+
+    async fn maybe_produce_aggregations(&self, slot: Slot, _epoch: u64) {
+        let duties = match self.get_duties_for_slot(slot).await {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        if duties.is_empty() {
+            return;
+        }
+
+        let mut signed_aggregates: Vec<SignedAggregateAndProof> = Vec::new();
+
+        for duty in &duties {
+            let committee_length: u64 = match duty.committee_length.parse() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let pubkey = match self.find_pubkey(&duty.pubkey) {
+                Some(pk) => pk,
+                None => continue,
+            };
+
+            let selection_proof = match SignerService::sign_selection_proof(
+                &self.signer,
+                slot,
+                &pubkey,
+                &self.config.fork_schedule,
+                &self.config.genesis_validators_root,
+            ) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        error = %e,
+                        "Failed to sign selection proof for aggregation"
+                    );
+                    continue;
+                }
+            };
+
+            if !is_aggregator(committee_length, &selection_proof.to_bytes()) {
+                debug!(
+                    slot,
+                    validator_index = %duty.validator_index,
+                    "Not selected as attestation aggregator"
+                );
+                continue;
+            }
+
+            info!(
+                slot,
+                validator_index = %duty.validator_index,
+                "Selected as attestation aggregator"
+            );
+
+            // Compute attestation data root for fetching the aggregate
+            let committee_index: u64 = match duty.committee_index.parse() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let attestation_data_response = match tokio::time::timeout(
+                AGGREGATION_TIMEOUT,
+                self.beacon.get_attestation_data(slot, committee_index),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        error = %e,
+                        "Failed to get attestation data for aggregation"
+                    );
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    continue;
+                }
+                Err(_) => {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        "Attestation data fetch timed out for aggregation"
+                    );
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    continue;
+                }
+            };
+
+            let crypto_attestation_data =
+                match Self::convert_attestation_data(&attestation_data_response.data) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!(
+                            slot,
+                            validator_index = %duty.validator_index,
+                            error = %e,
+                            "Failed to convert attestation data for aggregation"
+                        );
+                        RVC_AGGREGATIONS_TOTAL
+                            .with_label_values(&[attestation_status::FAILED])
+                            .inc();
+                        continue;
+                    }
+                };
+
+            let att_data_root = crypto_attestation_data.tree_hash_root();
+            let att_data_root_hex = format!("0x{}", hex::encode(att_data_root.0));
+
+            // Fetch the aggregate attestation
+            let aggregate = match tokio::time::timeout(
+                AGGREGATION_TIMEOUT,
+                self.beacon.get_aggregate_attestation(slot, &att_data_root_hex),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => resp.data,
+                Ok(Err(e)) => {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        error = %e,
+                        "Failed to get aggregate attestation"
+                    );
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    continue;
+                }
+                Err(_) => {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        "Aggregate attestation fetch timed out"
+                    );
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    continue;
+                }
+            };
+
+            let aggregator_index: u64 = match duty.validator_index.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let aggregate_and_proof = AggregateAndProof {
+                aggregator_index,
+                aggregate,
+                selection_proof: selection_proof.to_bytes().to_vec(),
+            };
+
+            let signature = match SignerService::sign_aggregate_and_proof(
+                &self.signer,
+                &aggregate_and_proof,
+                &pubkey,
+                &self.config.fork_schedule,
+                &self.config.genesis_validators_root,
+            ) {
+                Ok(sig) => sig,
+                Err(e) => {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        error = %e,
+                        "Failed to sign aggregate and proof"
+                    );
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    continue;
+                }
+            };
+
+            signed_aggregates.push(SignedAggregateAndProof {
+                message: aggregate_and_proof,
+                signature: signature.to_bytes().to_vec(),
+            });
+        }
+
+        if !signed_aggregates.is_empty() {
+            let count = signed_aggregates.len();
+            match tokio::time::timeout(
+                AGGREGATION_TIMEOUT,
+                self.beacon.submit_aggregate_and_proofs(&signed_aggregates),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    info!(slot, count, "Submitted aggregate and proofs");
+                    RVC_AGGREGATIONS_TOTAL
+                        .with_label_values(&[attestation_status::SUCCESS])
+                        .inc_by(count as u64);
+                }
+                Ok(Err(e)) => {
+                    warn!(slot, error = %e, "Failed to submit aggregate and proofs");
+                    RVC_AGGREGATIONS_TOTAL
+                        .with_label_values(&[attestation_status::FAILED])
+                        .inc_by(count as u64);
+                }
+                Err(_) => {
+                    warn!(
+                        slot,
+                        "Aggregate and proofs submit timed out after {}s",
+                        AGGREGATION_TIMEOUT.as_secs()
+                    );
+                    RVC_AGGREGATIONS_TOTAL
+                        .with_label_values(&[attestation_status::FAILED])
+                        .inc_by(count as u64);
+                }
             }
         }
     }
@@ -1665,5 +1881,308 @@ mod tests {
             tokio::time::timeout(SYNC_MESSAGE_TIMEOUT, beacon.get_block_root("head")).await;
 
         assert!(result.is_err(), "Head block root fetch should have timed out");
+    }
+
+    #[test]
+    fn test_aggregation_timeout_is_reasonable() {
+        // Must fit within the 2/3-slot to end-of-slot window (~4s for 12s slots)
+        assert!(AGGREGATION_TIMEOUT.as_secs() <= 4);
+        assert!(AGGREGATION_TIMEOUT.as_secs() >= 1);
+    }
+
+    /// Helper to build an orchestrator wired to a wiremock mock_server for aggregation tests.
+    async fn build_aggregation_orchestrator(
+        mock_server_uri: &str,
+    ) -> (
+        DutyOrchestrator<MockSlotClock, MockSubmitter, MockBlockBeacon>,
+        OrchestratorHandle,
+        PublicKey,
+        String,
+    ) {
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(100);
+
+        let beacon_config = BeaconClientConfig::new(mock_server_uri);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let secret_key = SecretKey::generate();
+        let pubkey_hex = format!("0x{}", hex::encode(secret_key.public_key().to_bytes()));
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+
+        let pubkey = secret_key.public_key();
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let key_manager = Arc::new(key_manager);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+        let mut pubkey_map = HashMap::new();
+        pubkey_map.insert(pubkey_hex.clone(), pubkey.clone());
+
+        let (orchestrator, handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        (orchestrator, handle, pubkey, pubkey_hex)
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_no_duties_does_nothing() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, _, _) =
+            build_aggregation_orchestrator(&mock_server.uri()).await;
+
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        // Mock attester duties to return empty list
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Fetch duties (empty) so the epoch is cached
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        // Should NOT call any aggregation endpoints
+        Mock::given(method("GET"))
+            .and(path_regex(r"/eth/v1/validator/aggregate_attestation.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_full_flow_with_mock_beacon() {
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, _, pubkey_hex) =
+            build_aggregation_orchestrator(&mock_server.uri()).await;
+
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        // 1. Mock attester duties endpoint — return a duty with a small committee
+        //    (committee_length ≤ 16 → modulo=1 → always aggregator)
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "1",
+                    "committee_length": "8",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "0",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // 2. Mock attestation data endpoint
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "1",
+                    "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source": {
+                        "epoch": (epoch - 1).to_string(),
+                        "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    },
+                    "target": {
+                        "epoch": epoch.to_string(),
+                        "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // 3. Mock aggregate attestation endpoint
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "aggregation_bits": "0xffffffff",
+                    "data": {
+                        "slot": slot.to_string(),
+                        "index": "1",
+                        "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "source": {
+                            "epoch": (epoch - 1).to_string(),
+                            "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                        },
+                        "target": {
+                            "epoch": epoch.to_string(),
+                            "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                        }
+                    },
+                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // 4. Mock submit aggregate and proofs endpoint
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Fetch duties first so they're cached
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        // Run the aggregation dispatch
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+
+        // The mock server's expect(1) on submit verifies the request was made
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_non_aggregator_skips() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, _, pubkey_hex) =
+            build_aggregation_orchestrator(&mock_server.uri()).await;
+
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        // Use a very large committee_length so is_aggregator is very unlikely
+        // committee_length=100000 → modulo=6250 → ~0.016% chance
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "1",
+                    "committee_length": "100000",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "0",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Should NOT call get_aggregate_attestation or submit
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_beacon_failure_handled_gracefully() {
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, _, pubkey_hex) =
+            build_aggregation_orchestrator(&mock_server.uri()).await;
+
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        // Small committee → always aggregator
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "1",
+                    "committee_length": "8",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "0",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Attestation data endpoint returns an error
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "message": "Internal server error"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Should NOT call submit since attestation data fetch failed
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        // Should not panic; gracefully handle error
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
     }
 }
