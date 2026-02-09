@@ -1,6 +1,6 @@
 //! SQLite database layer for slashing protection.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
@@ -15,14 +15,16 @@ use eth_types::{Epoch, Slot};
 /// SQLite-backed database for storing slashing protection data.
 pub struct SlashingDb {
     conn: Mutex<Connection>,
+    path: Option<PathBuf>,
 }
 
 impl SlashingDb {
     /// Open a database at the specified path.
     /// Creates the file and runs migrations if it doesn't exist.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SlashingError> {
+        let path = path.as_ref();
         let conn = Connection::open(path)?;
-        let db = Self { conn: Mutex::new(conn) };
+        let db = Self { conn: Mutex::new(conn), path: Some(path.to_path_buf()) };
         db.migrate()?;
         Ok(db)
     }
@@ -30,7 +32,7 @@ impl SlashingDb {
     /// Open an in-memory database for testing.
     pub fn open_in_memory() -> Result<Self, SlashingError> {
         let conn = Connection::open_in_memory()?;
-        let db = Self { conn: Mutex::new(conn) };
+        let db = Self { conn: Mutex::new(conn), path: None };
         db.migrate()?;
         Ok(db)
     }
@@ -54,6 +56,11 @@ impl SlashingDb {
                 slot INTEGER NOT NULL,
                 signing_root TEXT,
                 UNIQUE(pubkey, slot)
+            );
+
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
             ",
         )?;
@@ -522,6 +529,74 @@ impl SlashingDb {
 
         Ok(result.map(|s| s as Slot))
     }
+
+    /// Run SQLite `PRAGMA integrity_check` and return an error if the database is corrupt.
+    pub fn check_integrity(&self) -> Result<(), SlashingError> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if result != "ok" {
+            return Err(SlashingError::IntegrityCheckFailed(result));
+        }
+        Ok(())
+    }
+
+    /// Read the stored genesis validators root from the metadata table.
+    pub fn genesis_validators_root(&self) -> Result<Option<String>, SlashingError> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'genesis_validators_root'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Store the genesis validators root in the metadata table.
+    ///
+    /// On first run, the root is stored. On subsequent runs, the stored root
+    /// is compared against the provided root. If they differ, an error is returned.
+    pub fn set_genesis_validators_root(&self, root: &str) -> Result<(), SlashingError> {
+        let existing = self.genesis_validators_root()?;
+        match existing {
+            Some(stored) if stored != root => Err(SlashingError::GenesisValidatorsRootMismatch {
+                expected: stored,
+                actual: root.to_string(),
+            }),
+            Some(_) => Ok(()),
+            None => {
+                let conn = self.conn.lock().expect("mutex poisoned");
+                conn.execute(
+                    "INSERT INTO metadata (key, value) VALUES ('genesis_validators_root', ?1)",
+                    [root],
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Check file permissions and warn if the slashing DB is world-readable (Unix only).
+    #[cfg(unix)]
+    pub fn check_file_permissions(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(path) = &self.path {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                let mode = metadata.permissions().mode();
+                if mode & 0o004 != 0 {
+                    tracing::warn!(
+                        path = %path.display(),
+                        mode = format!("{:o}", mode),
+                        "slashing protection database is world-readable; consider restricting permissions"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Check file permissions (no-op on non-Unix platforms).
+    #[cfg(not(unix))]
+    pub fn check_file_permissions(&self) {}
 }
 
 #[cfg(test)]
@@ -1862,5 +1937,145 @@ mod tests {
 
         let attestations = db.get_attestations("0x1234").expect("failed to get");
         assert_eq!(attestations.len(), 1);
+    }
+
+    // --- Startup integrity check tests ---
+
+    #[test]
+    fn test_integrity_check_clean_db() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let result = db.check_integrity();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_integrity_check_clean_file_db() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("integrity.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+        db.record_attestation("0x1234", 100, 101, None).expect("record");
+        let result = db.check_integrity();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_integrity_check_returns_error_variant() {
+        let err = SlashingError::IntegrityCheckFailed("test failure".to_string());
+        match err {
+            SlashingError::IntegrityCheckFailed(msg) => assert_eq!(msg, "test failure"),
+            _ => panic!("expected IntegrityCheckFailed"),
+        }
+    }
+
+    #[test]
+    fn test_integrity_genesis_validators_root_empty() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let root = db.genesis_validators_root().expect("query should succeed");
+        assert!(root.is_none());
+    }
+
+    #[test]
+    fn test_integrity_set_genesis_validators_root() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        db.set_genesis_validators_root(root).expect("set should succeed");
+
+        let stored = db.genesis_validators_root().expect("query should succeed");
+        assert_eq!(stored, Some(root.to_string()));
+    }
+
+    #[test]
+    fn test_integrity_genesis_validators_root_roundtrip() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        db.set_genesis_validators_root(root).expect("first set should succeed");
+        db.set_genesis_validators_root(root).expect("same root should succeed");
+
+        let stored = db.genesis_validators_root().expect("query should succeed");
+        assert_eq!(stored, Some(root.to_string()));
+    }
+
+    #[test]
+    fn test_integrity_genesis_validators_root_mismatch() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let root1 = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let root2 = "0xdifferent00000000000000000000000000000000000000000000000000000000";
+
+        db.set_genesis_validators_root(root1).expect("first set should succeed");
+        let result = db.set_genesis_validators_root(root2);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            SlashingError::GenesisValidatorsRootMismatch { expected, actual } => {
+                assert_eq!(expected, root1);
+                assert_eq!(actual, root2);
+            }
+            other => panic!("expected GenesisValidatorsRootMismatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_integrity_genesis_root_persists_across_connections() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("genesis.db");
+        let root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        {
+            let db = SlashingDb::open(&path).expect("failed to open db");
+            db.set_genesis_validators_root(root).expect("set should succeed");
+        }
+
+        {
+            let db = SlashingDb::open(&path).expect("failed to reopen db");
+            let stored = db.genesis_validators_root().expect("query should succeed");
+            assert_eq!(stored, Some(root.to_string()));
+        }
+    }
+
+    #[test]
+    fn test_integrity_metadata_table_created() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let conn = db.conn.lock().expect("mutex poisoned");
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'metadata'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("failed to query tables");
+        assert_eq!(table_count, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_integrity_file_permission_check_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("perms.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("failed to set permissions");
+
+        // Should not panic, just log a warning
+        db.check_file_permissions();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_integrity_file_permission_check_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("perms_restricted.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("failed to set permissions");
+
+        // Should not warn
+        db.check_file_permissions();
     }
 }
