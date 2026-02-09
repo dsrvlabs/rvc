@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
-use beacon::{Attestation, BeaconClient, BeaconError, SubmitAttestationResult};
+use bn_manager::{Attestation, BeaconError, BeaconNodeClient, SubmitAttestationResult};
 use metrics::definitions::{attestation_status, RVC_ATTESTATIONS_TOTAL};
 
 pub use error::PropagatorError;
@@ -24,13 +24,13 @@ pub trait AttestationSubmitter: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<SubmitAttestationResult, BeaconError>> + Send + 'a>>;
 }
 
-impl AttestationSubmitter for BeaconClient {
+impl<T: BeaconNodeClient + ?Sized> AttestationSubmitter for T {
     fn submit_attestation<'a>(
         &'a self,
         attestations: &'a [Attestation],
     ) -> Pin<Box<dyn Future<Output = Result<SubmitAttestationResult, BeaconError>> + Send + 'a>>
     {
-        Box::pin(async move { BeaconClient::submit_attestation(self, attestations).await })
+        Box::pin(async move { BeaconNodeClient::submit_attestation(self, attestations).await })
     }
 }
 
@@ -138,7 +138,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use beacon::{AttestationData, Checkpoint, IndexedAttestationError};
+    use bn_manager::{AttestationData, Checkpoint, IndexedAttestationError};
 
     struct MockSubmitter {
         result: tokio::sync::Mutex<SubmitAttestationResult>,

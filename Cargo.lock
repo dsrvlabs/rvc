@@ -2663,6 +2663,7 @@ dependencies = [
  "hex",
  "prost",
  "rvc-block-service",
+ "rvc-bn-manager",
  "rvc-crypto",
  "rvc-duty-tracker",
  "rvc-eth-types",
@@ -2788,6 +2789,7 @@ name = "rvc-duty-tracker"
 version = "0.1.0"
 dependencies = [
  "beacon",
+ "rvc-bn-manager",
  "rvc-eth-types",
  "rvc-metrics",
  "serde_json",
@@ -2829,7 +2831,7 @@ dependencies = [
 name = "rvc-propagator"
 version = "0.1.0"
 dependencies = [
- "beacon",
+ "rvc-bn-manager",
  "rvc-metrics",
  "thiserror 2.0.18",
  "tokio",

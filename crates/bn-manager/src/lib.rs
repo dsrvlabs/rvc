@@ -11,9 +11,10 @@ pub use traits::{BeaconNodeClient, BnHealthScore, BnManagerConfig, BnSelectionSt
 // Re-export types used in trait signatures so downstream crates
 // don't need to depend on `beacon` directly.
 pub use beacon::{
-    AggregateAttestationResponse, Attestation, AttestationDataResponse, AttesterDutiesResponse,
-    BeaconCommitteeSubscription, BeaconError, BlockRootResponse, ConfigSpecResponse,
-    GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
+    AggregateAttestationResponse, Attestation, AttestationData, AttestationDataResponse,
+    AttesterDutiesResponse, AttesterDuty, BeaconCommitteeSubscription, BeaconError,
+    BlockRootResponse, Checkpoint, ConfigSpecResponse, GenesisResponse, IndexedAttestationError,
+    ProduceBlockResponse, ProposerDutiesResponse, ProposerDuty, ProposerPreparation,
     SignedAggregateAndProof, SignedContributionAndProof, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
     SyncCommitteeMessage, ValidatorsResponse,

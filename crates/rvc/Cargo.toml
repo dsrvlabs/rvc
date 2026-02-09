@@ -10,6 +10,7 @@ repository.workspace = true
 async-trait.workspace = true
 eth-types.workspace = true
 beacon.workspace = true
+bn-manager.workspace = true
 block-service.workspace = true
 crypto.workspace = true
 duty-tracker.workspace = true

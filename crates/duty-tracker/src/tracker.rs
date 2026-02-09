@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-use beacon::{AttesterDuty, BeaconClient, ProposerDuty};
+use bn_manager::{AttesterDuty, BeaconNodeClient, ProposerDuty};
 use eth_types::{SyncCommitteeDuty, SLOTS_PER_EPOCH};
 use metrics::definitions::RVC_DUTIES_FETCHED_TOTAL;
 
@@ -40,7 +40,7 @@ impl EpochDutyCache {
 }
 
 pub struct DutyTracker {
-    beacon: Arc<BeaconClient>,
+    beacon: Arc<dyn BeaconNodeClient>,
     validator_indices: Vec<String>,
     cache: RwLock<HashMap<u64, EpochDutyCache>>,
     /// Proposer duties keyed by epoch -> slot -> ProposerDuty.
@@ -50,7 +50,7 @@ pub struct DutyTracker {
 }
 
 impl DutyTracker {
-    pub fn new(beacon: Arc<BeaconClient>, validator_indices: Vec<String>) -> Self {
+    pub fn new(beacon: Arc<dyn BeaconNodeClient>, validator_indices: Vec<String>) -> Self {
         Self {
             beacon,
             validator_indices,
@@ -363,17 +363,18 @@ mod tests {
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use beacon::BeaconClientConfig;
+    use beacon::{BeaconClient, BeaconClientConfig};
+    use bn_manager::BeaconNodeClient;
 
     use super::*;
 
-    async fn setup_mock_beacon() -> (MockServer, Arc<BeaconClient>) {
+    async fn setup_mock_beacon() -> (MockServer, Arc<dyn BeaconNodeClient>) {
         let mock_server = MockServer::start().await;
         let config = BeaconClientConfig::new(mock_server.uri())
             .with_timeout(Duration::from_secs(5))
             .with_max_retries(1);
         let client = BeaconClient::new(config).unwrap();
-        (mock_server, Arc::new(client))
+        (mock_server, Arc::new(client) as Arc<dyn BeaconNodeClient>)
     }
 
     fn create_mock_duty_response(
