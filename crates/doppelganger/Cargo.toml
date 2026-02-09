@@ -1,0 +1,19 @@
+[package]
+name = "rvc-doppelganger"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Doppelganger detection for Ethereum validator client"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rootwarp/rvc"
+keywords = ["ethereum", "validator", "doppelganger", "safety"]
+categories = ["cryptography::cryptocurrencies"]
+
+[dependencies]
+eth-types = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
