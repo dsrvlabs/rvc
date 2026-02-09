@@ -2,9 +2,9 @@
 
 ## Overview
 
-RVC is a Rust-based Ethereum Validator Client being built in 6 phases (A-F) plus testnet validation. The project follows a 2-stream parallel development model with 59 total issues across all phases.
+RVC is a Rust-based Ethereum Validator Client being built in 6 phases (A-F) plus testnet validation. The project follows a 2-stream parallel development model with 64 total issues across all phases.
 
-**Total: 59 issues / 152 story points**
+**Total: 64 issues / 163 story points**
 
 ## Current Status
 
@@ -12,14 +12,14 @@ RVC is a Rust-based Ethereum Validator Client being built in 6 phases (A-F) plus
 |-------|------------|--------|--------|--------|
 | **A** | Minimum Viable Block Proposer | 16/16 | 41 | **Complete** |
 | **A-FU** | Phase A Follow-ups | 5/5 | 11 | **Complete** |
-| B | Full Duties (aggregation, proposer prep, subscriptions) | 0/6 | 14 | Not started |
+| **B** | Full Duties (aggregation, proposer prep, subscriptions) | 6/6 | 14 | **Complete** |
 | C | Reliability & Safety (multi-BN, doppelganger, SSE) | 0/12 | 33 | Not started |
 | D | MEV & Builder Integration | 0/7 | 16 | Not started |
 | E | Key Management API (keymanager, Web3Signer) | 0/7 | 22 | Not started |
 | F | Quality & Optimization (conformance, pruning, SSZ) | 0/5 | 15 | Not started |
 | Testnet | Testnet Validation | 0/6 | 11 | Not started |
 
-**Overall Progress: 21/64 issues (33%), 52/163 points (32%)**
+**Overall Progress: 27/64 issues (42%), 66/163 points (40%)**
 
 ---
 
@@ -124,12 +124,57 @@ Block proposals, sync committee messages, and fork-aware signing working alongsi
 
 ---
 
+## Phase B: Full Duties (Complete)
+
+Aggregation duties, proposer preparation, and beacon committee subscriptions integrated into the orchestrator.
+
+### Issues
+
+| Issue | Description | Points | Stream | Status | Commit |
+|-------|------------|--------|--------|--------|--------|
+| B-01 | Aggregation endpoints in beacon | 2 | A | Merged | `bea9827` |
+| B-02 | Aggregation signing in signer | 3 | A | Merged | `6790966` |
+| B-03 | Proposer preparation endpoint in beacon | 2 | B | Merged | `d0f6347` |
+| B-04 | Beacon committee subscription endpoint | 1 | B | Merged | `d0f6347` |
+| B-05 | Proposer prep + subscription in orchestrator | 3 | B | Merged | `92f17c5` |
+| B-06 | Aggregation duty dispatch in orchestrator | 3 | A | Merged | `09fea6a` |
+
+### Crates Extended in Phase B
+
+| Crate | Changes |
+|-------|---------|
+| `beacon` | Aggregation endpoints, proposer preparation, committee subscriptions |
+| `rvc-crypto` | Selection proof signing, aggregate_and_proof signing, is_aggregator |
+| `rvc-signer` | ValidatorSigner trait extended with sign_selection_proof, sign_aggregate_and_proof |
+| `rvc-eth-types` | TreeHash impls for Attestation/AggregateAndProof, TARGET_AGGREGATORS_PER_COMMITTEE |
+| `rvc-metrics` | RVC_AGGREGATIONS_TOTAL counter |
+| `rvc` (orchestrator) | Aggregation dispatch at t=2*slot/3, proposer preparation at epoch boundary, committee subscriptions |
+
+### Bugs Caught in Review
+
+| Issue | Bug | Severity | Resolution |
+|-------|-----|----------|------------|
+| B-02 | `is_aggregator` uses raw committee_length instead of `max(1, len/TARGET_AGGREGATORS_PER_COMMITTEE)` | Critical | Fixed: added modulo calculation with TARGET=16 |
+| B-04 | Wrong API version `/eth/v2/` instead of `/eth/v1/` for committee subscriptions | Critical | Fixed: changed to v1 |
+| B-01 | Out-of-scope orchestrator timeout removal bundled in commit | Warning | Accepted (safe, simplifies code) |
+| B-03+B-04 | Branch not rebased on develop, would revert B-01 aggregation endpoints | Warning | Fixed: rebased onto develop |
+
+### Test Coverage
+
+**762 tests passing, 0 failures, 6 ignored** (up from 695 in Phase A follow-ups)
+
+---
+
 ## Known Follow-ups
 
 | ID | Description | Priority |
 |----|------------|----------|
 | FU-06 | Tighten None signing root comparison in atomic slashing methods | Low |
 | FU-07 | Reduce visibility of is_safe_to_sign/is_safe_to_propose to pub(crate) | Low |
+| FU-08 | Add warn! logging to silent parse continue paths in aggregation dispatch | Low |
+| FU-09 | Add overall phase-3 deadline for sync contributions + aggregations | Medium |
+| FU-10 | Concurrent/deferred epoch boundary operations to avoid blocking slot-0 proposal | Medium |
+| FU-11 | Validator index cache to replace O(V*64*D) nested loop | Medium |
 
 ---
 
@@ -167,7 +212,7 @@ Foundation      beacon, eth-types, crypto, slashing, validator-store, metrics, t
 ## Phase Dependency Map
 
 ```
-Phase A (41pts) COMPLETE ──┬──> Phase B (14pts)
+Phase A (41pts) COMPLETE ──┬──> Phase B (14pts) COMPLETE
                            ├──> Phase C (33pts) ──> Phase E (22pts)
                            ├──> Phase D (16pts)
                            ├──> Phase F (15pts)
@@ -179,6 +224,7 @@ Phase A (41pts) COMPLETE ──┬──> Phase B (14pts)
 ## Git History
 
 - **Branch:** develop
-- **Develop HEAD:** `31d42fb`
+- **Develop HEAD:** `92f17c5`
 - **Total Phase A commits:** 24 (16 feature + 8 fixes)
 - **Total Follow-up commits:** 8 (5 feature + 2 fixes + 1 chore)
+- **Total Phase B commits:** 6 (6 feature)
