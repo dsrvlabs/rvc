@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+doppelganger.workspace = true
 eth-types.workspace = true
 beacon.workspace = true
 bn-manager.workspace = true

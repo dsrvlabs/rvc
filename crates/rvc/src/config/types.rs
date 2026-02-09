@@ -15,6 +15,9 @@ use super::network::Network;
 pub struct Config {
     pub beacon_url: String,
 
+    #[serde(default)]
+    pub beacon_nodes: Vec<String>,
+
     pub keystore_path: PathBuf,
 
     pub password_file: Option<PathBuf>,
@@ -38,12 +41,15 @@ pub struct Config {
     pub graffiti: Option<String>,
 
     pub log_level: String,
+
+    pub doppelganger_detection: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             beacon_url: "http://localhost:5052".to_string(),
+            beacon_nodes: Vec::new(),
             keystore_path: PathBuf::from("./keystores"),
             password_file: None,
             slashing_db_path: PathBuf::from("./slashing_protection.sqlite"),
@@ -55,6 +61,7 @@ impl Default for Config {
             genesis_validators_root: None,
             graffiti: None,
             log_level: "info".to_string(),
+            doppelganger_detection: true,
         }
     }
 }
@@ -158,9 +165,24 @@ impl Config {
         Ok(passwords)
     }
 
+    /// Returns the effective list of beacon node endpoints.
+    ///
+    /// Prefers `beacon_nodes` if non-empty, otherwise falls back to `beacon_url`.
+    pub fn effective_beacon_nodes(&self) -> Vec<String> {
+        if !self.beacon_nodes.is_empty() {
+            self.beacon_nodes.clone()
+        } else {
+            vec![self.beacon_url.clone()]
+        }
+    }
+
     pub fn merge_with_cli(&mut self, cli: &CliOverrides) {
         if let Some(ref beacon_url) = cli.beacon_url {
             self.beacon_url = beacon_url.clone();
+        }
+
+        if let Some(ref beacon_nodes) = cli.beacon_nodes {
+            self.beacon_nodes = beacon_nodes.clone();
         }
 
         if let Some(ref keystore_path) = cli.keystore_path {
@@ -206,12 +228,17 @@ impl Config {
         if let Some(ref log_level) = cli.log_level {
             self.log_level = log_level.clone();
         }
+
+        if let Some(doppelganger_detection) = cli.doppelganger_detection {
+            self.doppelganger_detection = doppelganger_detection;
+        }
     }
 }
 
 #[derive(Debug, Default)]
 pub struct CliOverrides {
     pub beacon_url: Option<String>,
+    pub beacon_nodes: Option<Vec<String>>,
     pub keystore_path: Option<PathBuf>,
     pub password_file: Option<PathBuf>,
     pub slashing_db_path: Option<PathBuf>,
@@ -223,6 +250,7 @@ pub struct CliOverrides {
     pub genesis_validators_root: Option<String>,
     pub graffiti: Option<String>,
     pub log_level: Option<String>,
+    pub doppelganger_detection: Option<bool>,
 }
 
 #[cfg(test)]
@@ -440,5 +468,80 @@ log_level = "debug"
         let toml_str = toml::to_string(&config).unwrap();
         assert!(toml_str.contains("beacon_url"));
         assert!(toml_str.contains("network"));
+    }
+
+    // -- beacon_nodes tests --
+
+    #[test]
+    fn test_default_config_beacon_nodes_empty() {
+        let config = Config::default();
+        assert!(config.beacon_nodes.is_empty());
+    }
+
+    #[test]
+    fn test_default_config_doppelganger_detection_enabled() {
+        let config = Config::default();
+        assert!(config.doppelganger_detection);
+    }
+
+    #[test]
+    fn test_effective_beacon_nodes_falls_back_to_beacon_url() {
+        let config = Config { beacon_url: "http://primary:5052".to_string(), ..Default::default() };
+        assert_eq!(config.effective_beacon_nodes(), vec!["http://primary:5052"]);
+    }
+
+    #[test]
+    fn test_effective_beacon_nodes_uses_beacon_nodes_when_set() {
+        let config = Config {
+            beacon_url: "http://primary:5052".to_string(),
+            beacon_nodes: vec!["http://bn1:5052".to_string(), "http://bn2:5052".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(config.effective_beacon_nodes(), vec!["http://bn1:5052", "http://bn2:5052"]);
+    }
+
+    #[test]
+    fn test_merge_with_cli_beacon_nodes() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            beacon_nodes: Some(vec!["http://bn1:5052".to_string(), "http://bn2:5052".to_string()]),
+            ..Default::default()
+        };
+
+        config.merge_with_cli(&cli);
+        assert_eq!(config.beacon_nodes.len(), 2);
+        assert_eq!(config.beacon_nodes[0], "http://bn1:5052");
+    }
+
+    #[test]
+    fn test_merge_with_cli_doppelganger_detection() {
+        let mut config = Config::default();
+        assert!(config.doppelganger_detection);
+
+        let cli = CliOverrides { doppelganger_detection: Some(false), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert!(!config.doppelganger_detection);
+    }
+
+    #[test]
+    fn test_config_from_file_with_beacon_nodes() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://primary:5052"
+beacon_nodes = ["http://bn1:5052", "http://bn2:5052"]
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+doppelganger_detection = false
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(config.beacon_nodes.len(), 2);
+        assert!(!config.doppelganger_detection);
     }
 }

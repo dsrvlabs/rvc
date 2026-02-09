@@ -6,12 +6,15 @@ mod commands;
 
 use std::path::PathBuf;
 
+use bn_manager::BeaconNodeClient;
 use clap::{Parser, Subcommand};
 use crypto::PublicKey;
 use metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
 use rvc::config::{CliOverrides, Config, Network, ServiceBuilder};
 use rvc::duty_tracker::DutyTrackerService;
+use rvc::startup;
 use rvc::DutyTrackerServer;
+use timing::SlotClock;
 use tonic::transport::Server;
 use tracing::{error, info, warn};
 
@@ -39,6 +42,10 @@ enum Commands {
         /// Beacon node URL (e.g., http://localhost:5052)
         #[arg(long)]
         beacon_url: Option<String>,
+
+        /// Comma-separated list of beacon node URLs for multi-BN support
+        #[arg(long, value_delimiter = ',')]
+        beacon_nodes: Option<Vec<String>>,
 
         /// Path to the keystore directory
         #[arg(long)]
@@ -79,6 +86,10 @@ enum Commands {
         /// Graffiti string for blocks
         #[arg(long)]
         graffiti: Option<String>,
+
+        /// Enable doppelganger detection (default: enabled)
+        #[arg(long, default_value_t = true)]
+        doppelganger_detection: bool,
 
         /// Log level (trace, debug, info, warn, error)
         #[arg(long, default_value = "info")]
@@ -137,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Start {
             config,
             beacon_url,
+            beacon_nodes,
             keystore_path,
             password_file,
             slashing_db_path,
@@ -147,12 +159,14 @@ async fn main() -> anyhow::Result<()> {
             genesis_time,
             genesis_validators_root,
             graffiti,
+            doppelganger_detection,
             log_level,
         } => {
             init_logging(&log_level);
 
             let cli_overrides = CliOverrides {
                 beacon_url,
+                beacon_nodes,
                 keystore_path,
                 password_file,
                 slashing_db_path,
@@ -164,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
                 genesis_validators_root,
                 graffiti,
                 log_level: Some(log_level),
+                doppelganger_detection: Some(doppelganger_detection),
             };
 
             let mut cfg = load_config(config)?;
@@ -234,10 +249,12 @@ fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
 async fn run_validator(config: Config) -> anyhow::Result<()> {
     info!(
         beacon_url = %config.beacon_url,
+        beacon_nodes = ?config.effective_beacon_nodes(),
         network = %config.network,
         metrics_port = config.metrics_port,
         grpc_address = %config.grpc_address,
         grpc_port = config.grpc_port,
+        doppelganger_detection = config.doppelganger_detection,
         "Starting validator client"
     );
 
@@ -245,9 +262,30 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
 
     let grpc_port = config.grpc_port;
     let metrics_port = config.metrics_port;
+    let doppelganger_enabled = config.doppelganger_detection;
 
     let builder = ServiceBuilder::new(config.clone());
 
+    // Step 1: Open slashing DB
+    let slashing_db = match builder.build_slashing_db() {
+        Ok(db) => {
+            update_health_slashing_db(&health_status, true).await;
+            db
+        }
+        Err(e) => {
+            error!("Failed to open slashing database: {}", e);
+            update_health_error(&health_status, format!("Slashing DB error: {}", e)).await;
+            return Err(e.into());
+        }
+    };
+
+    // Step 2: Run integrity check
+    if let Err(e) = startup::check_integrity(&slashing_db) {
+        error!("Slashing DB integrity check failed: {}", e);
+        std::process::exit(e.exit_code());
+    }
+
+    // Step 3: Create beacon client and BnManager
     let beacon_client = match builder.build_beacon() {
         Ok(client) => {
             update_health_beacon_connected(&health_status, true).await;
@@ -260,9 +298,46 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
         }
     };
 
-    // Allow starting without validators for testing/monitoring purposes.
-    // Unlike beacon client and slashing DB, missing keys is not a fatal error
-    // since operators may want to run the client to verify connectivity first.
+    let bn_manager = match builder.build_bn_manager() {
+        Ok(manager) => manager,
+        Err(e) => {
+            error!("Failed to create BnManager: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    // Step 4: Validate genesis root against beacon node
+    let genesis_validators_root_hex = match builder.parse_genesis_validators_root() {
+        Ok(root) => format!("0x{}", hex::encode(root)),
+        Err(e) => {
+            error!("Failed to parse genesis validators root: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    if let Err(e) = startup::validate_genesis_root(
+        &slashing_db,
+        bn_manager.as_ref(),
+        &genesis_validators_root_hex,
+    )
+    .await
+    {
+        error!("Genesis root validation failed: {}", e);
+        std::process::exit(e.exit_code());
+    }
+
+    let genesis_validators_root = match builder.parse_genesis_validators_root() {
+        Ok(root) => root,
+        Err(e) => {
+            error!("Failed to parse genesis validators root: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    // Step 5: Check sync status
+    startup::check_sync_status(bn_manager.as_ref()).await;
+
+    // Load validator keys
     let key_manager = match builder.build_key_manager() {
         Ok(km) => {
             let validator_count = km.len();
@@ -277,25 +352,69 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
         }
     };
 
-    let slashing_db = match builder.build_slashing_db() {
-        Ok(db) => {
-            update_health_slashing_db(&health_status, true).await;
-            db
-        }
-        Err(e) => {
-            error!("Failed to open slashing database: {}", e);
-            update_health_error(&health_status, format!("Slashing DB error: {}", e)).await;
-            return Err(e.into());
-        }
-    };
+    let pubkey_map = builder.build_pubkey_map(&key_manager);
 
+    // Resolve validator indices using BnManager (via trait)
+    let beacon_for_resolve: &dyn BeaconNodeClient = bn_manager.as_ref();
+    let validator_indices = resolve_validator_indices(beacon_for_resolve, &pubkey_map).await;
+
+    // Step 6: Doppelganger detection (if enabled)
+    if doppelganger_enabled && !pubkey_map.is_empty() {
+        let doppelganger_service =
+            builder.build_doppelganger_service(beacon_client.clone(), slashing_db.clone());
+
+        let pubkeys: Vec<String> = pubkey_map.keys().cloned().collect();
+        let validator_index_map: std::collections::HashMap<String, String> = pubkey_map
+            .keys()
+            .zip(validator_indices.iter())
+            .map(|(pk, idx)| (pk.clone(), idx.clone()))
+            .collect();
+
+        let slot_clock = match builder.build_slot_clock() {
+            Ok(clock) => clock,
+            Err(e) => {
+                error!("Failed to create slot clock: {}", e);
+                return Err(e.into());
+            }
+        };
+
+        let current_epoch = match slot_clock.current_slot() {
+            Ok(slot) => slot / timing::SLOTS_PER_EPOCH,
+            Err(e) => {
+                warn!(error = %e, "Could not determine current epoch for doppelganger detection, skipping");
+                0
+            }
+        };
+
+        if current_epoch > 0 {
+            match startup::run_doppelganger_detection(
+                &doppelganger_service,
+                &pubkeys,
+                &validator_index_map,
+                current_epoch,
+            )
+            .await
+            {
+                Ok(safe_validators) => {
+                    info!(safe_count = safe_validators.len(), "Doppelganger detection complete");
+                }
+                Err(e) => {
+                    error!("Doppelganger detection failed: {}", e);
+                    std::process::exit(e.exit_code());
+                }
+            }
+        }
+    } else if !doppelganger_enabled {
+        warn!("Doppelganger detection is disabled");
+    }
+
+    // Step 7: Build remaining services
     let signer = builder.build_signer(key_manager.clone(), slashing_db.clone());
     let propagator = builder.build_propagator(beacon_client.clone());
     let validator_store = builder.build_validator_store();
 
-    let pubkey_map = builder.build_pubkey_map(&key_manager);
-    let validator_indices = resolve_validator_indices(&beacon_client, &pubkey_map).await;
-    let duty_tracker = builder.build_duty_tracker(beacon_client.clone(), validator_indices);
+    let beacon: std::sync::Arc<dyn BeaconNodeClient> = bn_manager;
+    let duty_tracker = builder.build_duty_tracker(beacon.clone(), validator_indices);
 
     let slot_clock = match builder.build_slot_clock() {
         Ok(clock) => clock,
@@ -305,15 +424,7 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
         }
     };
 
-    let genesis_validators_root = match builder.parse_genesis_validators_root() {
-        Ok(root) => root,
-        Err(e) => {
-            error!("Failed to parse genesis validators root: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    let fork_schedule = match builder.build_fork_schedule(&beacon_client).await {
+    let fork_schedule = match builder.build_fork_schedule(beacon.as_ref()).await {
         Ok(schedule) => schedule,
         Err(e) => {
             error!("Failed to fetch fork schedule from beacon node: {}", e);
@@ -327,12 +438,13 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
     let block_beacon =
         std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(beacon_client.clone()));
 
+    // Step 8: Start main duty loop
     let (mut orchestrator, orchestrator_handle) = rvc::orchestrator::DutyOrchestrator::new(
         slot_clock,
         duty_tracker,
         signer,
         propagator,
-        beacon_client,
+        beacon,
         block_beacon,
         validator_store,
         orchestrator_config,
@@ -392,7 +504,7 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
 }
 
 async fn resolve_validator_indices(
-    beacon_client: &beacon::BeaconClient,
+    beacon_client: &dyn BeaconNodeClient,
     pubkey_map: &std::collections::HashMap<String, PublicKey>,
 ) -> Vec<String> {
     if pubkey_map.is_empty() {

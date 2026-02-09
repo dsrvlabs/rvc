@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 beacon.workspace = true
+bn-manager.workspace = true
 crypto.workspace = true
 eth-types.workspace = true
 hex.workspace = true
@@ -19,6 +20,7 @@ metrics.workspace = true
 rvc.workspace = true
 signer.workspace = true
 slashing.workspace = true
+timing.workspace = true
 tokio.workspace = true
 clap.workspace = true
 tracing.workspace = true

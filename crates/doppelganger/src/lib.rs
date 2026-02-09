@@ -10,7 +10,7 @@ mod traits;
 
 pub use error::DoppelgangerError;
 pub use service::DoppelgangerService;
-pub use traits::{LivenessChecker, SlashingDbReader};
+pub use traits::{LivenessChecker, SlashingDbReader, ValidatorLivenessData};
 
 /// Status of doppelganger detection for a validator.
 #[derive(Debug, Clone, PartialEq, Eq)]

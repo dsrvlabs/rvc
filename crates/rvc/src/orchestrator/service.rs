@@ -7,10 +7,9 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use beacon::{
-    Attestation, AttesterDuty, BeaconClient, BeaconCommitteeSubscription, ProposerPreparation,
-};
+use beacon::{Attestation, AttesterDuty, BeaconCommitteeSubscription, ProposerPreparation};
 use block_service::{BeaconBlockClient, BlockService};
+use bn_manager::BeaconNodeClient;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{
@@ -115,7 +114,7 @@ where
     duty_tracker: Arc<DutyTracker>,
     signer: Arc<SignerService>,
     propagator: Arc<Propagator<S>>,
-    beacon: Arc<BeaconClient>,
+    beacon: Arc<dyn BeaconNodeClient>,
     block_service: BlockService<SignerService, B>,
     validator_store: Arc<validator_store::ValidatorStore>,
     config: OrchestratorConfig,
@@ -136,7 +135,7 @@ where
         duty_tracker: Arc<DutyTracker>,
         signer: Arc<SignerService>,
         propagator: Arc<Propagator<S>>,
-        beacon: Arc<BeaconClient>,
+        beacon: Arc<dyn BeaconNodeClient>,
         block_beacon: Arc<B>,
         validator_store: Arc<validator_store::ValidatorStore>,
         config: OrchestratorConfig,
@@ -1396,7 +1395,7 @@ where
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use beacon::BeaconClientConfig;
+    use beacon::{BeaconClient, BeaconClientConfig};
     use block_service::ProduceBlockResponse;
     use crypto::{KeyManager, SecretKey};
     use slashing::SlashingDb;
