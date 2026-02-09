@@ -202,6 +202,7 @@ impl BnManager {
     ///
     /// The `pick_best` function returns `true` if the first argument is better than the second.
     /// Falls back to `First` strategy if only one synced BN is available.
+    /// When all synced BNs fail, falls back to trying unsynced BNs sequentially.
     async fn query_best<'s, T, F>(
         &'s self,
         op_name: &str,
@@ -217,7 +218,7 @@ impl BnManager {
         if indices.len() == 1 {
             let client = &self.clients[indices[0]];
             let i = indices[0];
-            return match op(client).await {
+            match op(client).await {
                 Ok(result) => {
                     debug!(
                         op = op_name,
@@ -225,7 +226,7 @@ impl BnManager {
                         endpoint = client.endpoint(),
                         "query succeeded (single synced BN)"
                     );
-                    Ok(result)
+                    return Ok(result);
                 }
                 Err(e) => {
                     warn!(
@@ -233,11 +234,11 @@ impl BnManager {
                         bn_index = i,
                         endpoint = client.endpoint(),
                         error = %e,
-                        "BN query failed"
+                        "BN query failed, trying unsynced BNs"
                     );
-                    Err(e)
+                    return self.fallback_unsynced(op_name, &op, &indices).await.ok_or(e);
                 }
-            };
+            }
         }
 
         let mut futs: Vec<IndexedResultFut<'_, T>> = Vec::with_capacity(indices.len());
@@ -294,9 +295,59 @@ impl BnManager {
                 Ok(value)
             }
             None => {
+                if let Some(result) = self.fallback_unsynced(op_name, &op, &indices).await {
+                    return Ok(result);
+                }
                 Err(BeaconError::HttpError(format!("{op_name}: all BNs failed in best-selection")))
             }
         }
+    }
+
+    /// Tries unsynced BNs sequentially as a fallback when all synced BNs have failed.
+    async fn fallback_unsynced<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        op: &F,
+        tried_indices: &[usize],
+    ) -> Option<T>
+    where
+        T: Send,
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+    {
+        let unsynced: Vec<usize> =
+            (0..self.clients.len()).filter(|i| !tried_indices.contains(i)).collect();
+
+        if unsynced.is_empty() {
+            return None;
+        }
+
+        warn!(op = op_name, "all synced BNs failed, falling back to unsynced BNs");
+
+        for i in unsynced {
+            let client = &self.clients[i];
+            match op(client).await {
+                Ok(result) => {
+                    warn!(
+                        op = op_name,
+                        bn_index = i,
+                        endpoint = client.endpoint(),
+                        "query succeeded on unsynced BN (degraded)"
+                    );
+                    return Some(result);
+                }
+                Err(e) => {
+                    warn!(
+                        op = op_name,
+                        bn_index = i,
+                        endpoint = client.endpoint(),
+                        error = %e,
+                        "unsynced BN fallback also failed"
+                    );
+                }
+            }
+        }
+
+        None
     }
 
     /// Broadcast an operation to all BNs (regardless of sync status). Returns first success.
@@ -2029,8 +2080,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sync_initial_status_is_synced() {
-        // Before any sync check, all BNs default to Synced
+    async fn test_sync_query_best_falls_back_to_unsynced_when_synced_fail() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // BN1: synced but block production fails
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&bn1)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Error"))
+            .expect(1)
+            .mount(&bn1)
+            .await;
+
+        // BN2: syncing but block production works
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
+            .mount(&bn2)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Execution-Payload-Value", "7000")
+                .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+            .expect(1)
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+        manager.check_sync_status().await;
+
+        // BN1 (synced) fails, should fall back to BN2 (unsynced)
+        let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().execution_payload_value, Some("7000".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_sync_initial_status_is_unknown() {
+        // Before any sync check, all BNs default to Unknown
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -2042,11 +2139,12 @@ mod tests {
 
         let manager = make_manager(&server.uri());
 
-        // Without calling check_sync_status, BN should be usable
+        let guard = manager.sync_statuses().read().await;
+        assert_eq!(guard[0], BnSyncStatus::Unknown);
+        drop(guard);
+
+        // Without calling check_sync_status, BN should still be tried via fallback
         let result = manager.get_genesis().await;
         assert!(result.is_ok());
-
-        let guard = manager.sync_statuses().read().await;
-        assert_eq!(guard[0], BnSyncStatus::Synced);
     }
 }

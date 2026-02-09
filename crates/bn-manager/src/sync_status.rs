@@ -2,12 +2,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beacon::BeaconClient;
+use futures::future::join_all;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 /// Sync status of a single beacon node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BnSyncStatus {
+    /// Status not yet determined (before first poll).
+    Unknown,
     /// Node is fully synced and ready for queries.
     Synced,
     /// Node is still syncing (head behind chain tip).
@@ -26,33 +29,43 @@ impl BnSyncStatus {
 /// Shared sync status tracker for all configured beacon nodes.
 pub type SharedSyncStatuses = Arc<RwLock<Vec<BnSyncStatus>>>;
 
-/// Creates a new shared sync status vector, initially marking all BNs as synced.
+/// Creates a new shared sync status vector, initially marking all BNs as unknown.
 pub fn new_shared_sync_statuses(count: usize) -> SharedSyncStatuses {
-    Arc::new(RwLock::new(vec![BnSyncStatus::Synced; count]))
+    Arc::new(RwLock::new(vec![BnSyncStatus::Unknown; count]))
 }
 
-/// Polls the sync status of all beacon nodes and updates the shared state.
+/// Polls the sync status of all beacon nodes in parallel and updates the shared state.
 pub async fn check_all_sync_statuses(clients: &[BeaconClient], statuses: &SharedSyncStatuses) {
-    let mut new_statuses = Vec::with_capacity(clients.len());
+    let futs: Vec<_> = clients
+        .iter()
+        .enumerate()
+        .map(|(i, client)| async move {
+            let status = check_single_sync_status(client).await;
+            (i, client.endpoint().to_string(), status)
+        })
+        .collect();
 
-    for (i, client) in clients.iter().enumerate() {
-        let status = check_single_sync_status(client).await;
+    let results = join_all(futs).await;
+
+    let mut new_statuses = vec![BnSyncStatus::Unknown; clients.len()];
+    for (i, endpoint, status) in results {
         match status {
             BnSyncStatus::Synced => {
-                info!(bn_index = i, endpoint = client.endpoint(), "BN is synced");
+                info!(bn_index = i, endpoint = endpoint, "BN is synced");
             }
             BnSyncStatus::Syncing => {
                 warn!(
                     bn_index = i,
-                    endpoint = client.endpoint(),
+                    endpoint = endpoint,
                     "BN is still syncing, will be skipped for duties"
                 );
             }
             BnSyncStatus::Unreachable => {
-                warn!(bn_index = i, endpoint = client.endpoint(), "BN is unreachable");
+                warn!(bn_index = i, endpoint = endpoint, "BN is unreachable");
             }
+            BnSyncStatus::Unknown => {}
         }
-        new_statuses.push(status);
+        new_statuses[i] = status;
     }
 
     let mut guard = statuses.write().await;
@@ -60,10 +73,13 @@ pub async fn check_all_sync_statuses(clients: &[BeaconClient], statuses: &Shared
 }
 
 /// Checks the sync status of a single beacon node.
+///
+/// Marks as `Syncing` if `is_syncing`, `is_optimistic`, or `el_offline` is true.
 async fn check_single_sync_status(client: &BeaconClient) -> BnSyncStatus {
     match client.get_node_syncing().await {
         Ok(response) => {
-            if response.data.is_syncing {
+            let data = &response.data;
+            if data.is_syncing || data.is_optimistic || data.el_offline {
                 BnSyncStatus::Syncing
             } else {
                 BnSyncStatus::Synced
@@ -119,6 +135,11 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_status_unknown_not_usable() {
+        assert!(!BnSyncStatus::Unknown.is_usable());
+    }
+
+    #[test]
     fn test_sync_status_eq() {
         assert_eq!(BnSyncStatus::Synced, BnSyncStatus::Synced);
         assert_ne!(BnSyncStatus::Synced, BnSyncStatus::Syncing);
@@ -145,13 +166,17 @@ mod tests {
             let statuses = new_shared_sync_statuses(3);
             let guard = statuses.read().await;
             assert_eq!(guard.len(), 3);
-            assert!(guard.iter().all(|s| *s == BnSyncStatus::Synced));
+            assert!(guard.iter().all(|s| *s == BnSyncStatus::Unknown));
         });
     }
 
     #[tokio::test]
     async fn test_is_usable_filter_all_synced() {
-        let statuses = new_shared_sync_statuses(3);
+        let statuses = Arc::new(RwLock::new(vec![
+            BnSyncStatus::Synced,
+            BnSyncStatus::Synced,
+            BnSyncStatus::Synced,
+        ]));
         let guard = statuses.read().await;
         let usable: Vec<usize> =
             guard.iter().enumerate().filter(|(_, s)| s.is_usable()).map(|(i, _)| i).collect();
@@ -203,6 +228,8 @@ mod tests {
 
     const SYNCED_RESPONSE: &str = r#"{"data":{"head_slot":"1000","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}"#;
     const SYNCING_RESPONSE: &str = r#"{"data":{"head_slot":"500","sync_distance":"500","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#;
+    const EL_OFFLINE_RESPONSE: &str = r#"{"data":{"head_slot":"1000","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":true}}"#;
+    const OPTIMISTIC_RESPONSE: &str = r#"{"data":{"head_slot":"1000","sync_distance":"0","is_syncing":false,"is_optimistic":true,"el_offline":false}}"#;
 
     fn make_client(endpoint: &str) -> BeaconClient {
         let config = BeaconClientConfig::new(endpoint).with_max_retries(0);
@@ -341,5 +368,103 @@ mod tests {
 
         shutdown_tx.send(true).unwrap();
         handle.await.unwrap();
+    }
+
+    // -- el_offline and is_optimistic tests --
+
+    #[tokio::test]
+    async fn test_check_single_el_offline_marks_syncing() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(EL_OFFLINE_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let clients = vec![make_client(&server.uri())];
+        let statuses = new_shared_sync_statuses(1);
+
+        check_all_sync_statuses(&clients, &statuses).await;
+
+        let guard = statuses.read().await;
+        assert_eq!(guard[0], BnSyncStatus::Syncing);
+    }
+
+    #[tokio::test]
+    async fn test_check_single_is_optimistic_marks_syncing() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(OPTIMISTIC_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let clients = vec![make_client(&server.uri())];
+        let statuses = new_shared_sync_statuses(1);
+
+        check_all_sync_statuses(&clients, &statuses).await;
+
+        let guard = statuses.read().await;
+        assert_eq!(guard[0], BnSyncStatus::Syncing);
+    }
+
+    #[tokio::test]
+    async fn test_check_all_sync_statuses_polls_in_parallel() {
+        // Use a slow server to verify parallel polling completes faster than sequential.
+        let server1 = MockServer::start().await;
+        let server2 = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(SYNCED_RESPONSE)
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&server1)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(SYNCED_RESPONSE)
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&server2)
+            .await;
+
+        let clients = vec![make_client(&server1.uri()), make_client(&server2.uri())];
+        let statuses = new_shared_sync_statuses(2);
+
+        let start = tokio::time::Instant::now();
+        check_all_sync_statuses(&clients, &statuses).await;
+        let elapsed = start.elapsed();
+
+        // If sequential, would take >= 400ms. Parallel should complete in ~200ms.
+        assert!(
+            elapsed < Duration::from_millis(350),
+            "polling took {:?}, expected < 350ms (parallel)",
+            elapsed
+        );
+
+        let guard = statuses.read().await;
+        assert_eq!(guard[0], BnSyncStatus::Synced);
+        assert_eq!(guard[1], BnSyncStatus::Synced);
+    }
+
+    #[tokio::test]
+    async fn test_unknown_status_not_usable_in_filter() {
+        let statuses = Arc::new(RwLock::new(vec![
+            BnSyncStatus::Unknown,
+            BnSyncStatus::Synced,
+            BnSyncStatus::Unknown,
+        ]));
+        let guard = statuses.read().await;
+        let usable: Vec<usize> =
+            guard.iter().enumerate().filter(|(_, s)| s.is_usable()).map(|(i, _)| i).collect();
+        assert_eq!(usable, vec![1]);
     }
 }
