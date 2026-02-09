@@ -558,7 +558,14 @@ impl SlashingDb {
     /// On first run, the root is stored. On subsequent runs, the stored root
     /// is compared against the provided root. If they differ, an error is returned.
     pub fn set_genesis_validators_root(&self, root: &str) -> Result<(), SlashingError> {
-        let existing = self.genesis_validators_root()?;
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'genesis_validators_root'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
         match existing {
             Some(stored) if stored != root => Err(SlashingError::GenesisValidatorsRootMismatch {
                 expected: stored,
@@ -566,7 +573,6 @@ impl SlashingDb {
             }),
             Some(_) => Ok(()),
             None => {
-                let conn = self.conn.lock().expect("mutex poisoned");
                 conn.execute(
                     "INSERT INTO metadata (key, value) VALUES ('genesis_validators_root', ?1)",
                     [root],
@@ -576,18 +582,26 @@ impl SlashingDb {
         }
     }
 
-    /// Check file permissions and warn if the slashing DB is world-readable (Unix only).
+    /// Check file permissions and warn if the slashing DB is world-readable or world-writable (Unix only).
     #[cfg(unix)]
     pub fn check_file_permissions(&self) {
         use std::os::unix::fs::PermissionsExt;
         if let Some(path) = &self.path {
             if let Ok(metadata) = std::fs::metadata(path) {
                 let mode = metadata.permissions().mode();
-                if mode & 0o004 != 0 {
+                let dangerous_bits = 0o006; // world-readable (4) + world-writable (2)
+                if mode & dangerous_bits != 0 {
+                    let issues = match (mode & 0o004 != 0, mode & 0o002 != 0) {
+                        (true, true) => "world-readable and world-writable",
+                        (true, false) => "world-readable",
+                        (false, true) => "world-writable",
+                        _ => unreachable!(),
+                    };
                     tracing::warn!(
                         path = %path.display(),
                         mode = format!("{:o}", mode),
-                        "slashing protection database is world-readable; consider restricting permissions"
+                        "slashing protection database is {}; consider restricting permissions to 0600",
+                        issues,
                     );
                 }
             }
@@ -2060,6 +2074,38 @@ mod tests {
             .expect("failed to set permissions");
 
         // Should not panic, just log a warning
+        db.check_file_permissions();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_integrity_file_permission_check_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("perms_writable.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o602))
+            .expect("failed to set permissions");
+
+        // Should not panic, just log a warning about world-writable
+        db.check_file_permissions();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_integrity_file_permission_check_world_readable_and_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("perms_both.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o606))
+            .expect("failed to set permissions");
+
+        // Should not panic, just log a warning about both world-readable and world-writable
         db.check_file_permissions();
     }
 

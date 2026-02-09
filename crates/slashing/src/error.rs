@@ -27,9 +27,6 @@ pub enum SlashingError {
 
     #[error("database integrity check failed: {0}")]
     IntegrityCheckFailed(String),
-
-    #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
 }
 
 /// Specific types of attestation slashing violations per EIP-3076.
