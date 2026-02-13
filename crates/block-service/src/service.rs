@@ -278,6 +278,15 @@ mod tests {
         ) -> Result<Vec<u8>, SignerError> {
             Ok(vec![0xee; 96])
         }
+
+        async fn sign_builder_registration(
+            &self,
+            _registration: &eth_types::ValidatorRegistrationV1,
+            _pubkey: &PublicKey,
+            _fork_version: [u8; 4],
+        ) -> Result<Vec<u8>, SignerError> {
+            Ok(vec![0xff; 96])
+        }
     }
 
     // --- Mock Beacon Client ---
