@@ -247,7 +247,13 @@ impl SignerService {
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
         let fork_name = eth_types::ForkName::from_epoch(voluntary_exit.epoch, fork_schedule);
-        let fork_version = fork_name.fork_version(fork_schedule);
+        // EIP-7044: cap fork version at Capella for voluntary exits
+        let capped = if fork_name >= eth_types::ForkName::Capella {
+            eth_types::ForkName::Capella
+        } else {
+            fork_name
+        };
+        let fork_version = capped.fork_version(fork_schedule);
         let domain = crypto::compute_domain(
             eth_types::DOMAIN_VOLUNTARY_EXIT,
             fork_version,
@@ -1134,6 +1140,95 @@ mod tests {
         let domain = compute_domain(eth_types::DOMAIN_VOLUNTARY_EXIT, fork_version, genesis_root);
         let signing_root = compute_signing_root(&exit, domain);
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sign_voluntary_exit_electra_epoch_uses_capella_fork_version() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(signer, slashing_db);
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        // Epoch 55 is in the Electra era (electra_fork_epoch=50)
+        let exit = eth_types::VoluntaryExit { epoch: 55, validator_index: 99 };
+
+        let result = service.sign_voluntary_exit(&exit, &pubkey, &schedule, &genesis_root).await;
+        assert!(result.is_ok());
+
+        let signature = result.unwrap();
+
+        // EIP-7044: still capped at Capella even in Electra
+        let capella_fork_version = schedule.capella_fork_version;
+        let domain =
+            compute_domain(eth_types::DOMAIN_VOLUNTARY_EXIT, capella_fork_version, genesis_root);
+        let signing_root = compute_signing_root(&exit, domain);
+        assert!(
+            signature.verify(&pubkey, &signing_root).is_ok(),
+            "EIP-7044: voluntary exit at Electra epoch must use Capella fork version"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sign_voluntary_exit_pre_capella_uses_actual_fork_version() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(signer, slashing_db);
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        // Epoch 15 is in the Altair era (altair=10, bellatrix=20) — pre-Capella, no cap
+        let exit = eth_types::VoluntaryExit { epoch: 15, validator_index: 7 };
+
+        let result = service.sign_voluntary_exit(&exit, &pubkey, &schedule, &genesis_root).await;
+        assert!(result.is_ok());
+
+        let signature = result.unwrap();
+
+        let altair_fork_version = schedule.altair_fork_version;
+        let domain =
+            compute_domain(eth_types::DOMAIN_VOLUNTARY_EXIT, altair_fork_version, genesis_root);
+        let signing_root = compute_signing_root(&exit, domain);
+        assert!(
+            signature.verify(&pubkey, &signing_root).is_ok(),
+            "Pre-Capella voluntary exit should use the actual fork version (Altair)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sign_voluntary_exit_deneb_epoch_uses_capella_fork_version() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(signer, slashing_db);
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        // Epoch 45 is in the Deneb era (deneb_fork_epoch=40, electra_fork_epoch=50)
+        let exit = eth_types::VoluntaryExit { epoch: 45, validator_index: 42 };
+
+        let result = service.sign_voluntary_exit(&exit, &pubkey, &schedule, &genesis_root).await;
+        assert!(result.is_ok());
+
+        let signature = result.unwrap();
+
+        // EIP-7044: voluntary exit fork version MUST be capped at Capella
+        let capella_fork_version = schedule.capella_fork_version;
+        let domain =
+            compute_domain(eth_types::DOMAIN_VOLUNTARY_EXIT, capella_fork_version, genesis_root);
+        let signing_root = compute_signing_root(&exit, domain);
+        assert!(
+            signature.verify(&pubkey, &signing_root).is_ok(),
+            "EIP-7044: voluntary exit at Deneb epoch must use Capella fork version"
+        );
     }
 
     // --- Builder registration signing tests ---
