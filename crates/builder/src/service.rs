@@ -73,7 +73,7 @@ impl BuilderService {
         // the cache under a read lock, then release the lock before
         // performing any async signing.
         let candidates: Vec<([u8; 48], [u8; 20], u64)> = {
-            let cache = self.cache.read().unwrap();
+            let cache = self.cache.read().expect("builder cache lock poisoned");
             builder_pubkeys
                 .iter()
                 .filter_map(|pubkey| {
@@ -136,7 +136,7 @@ impl BuilderService {
 
         // Update cache after successful submission
         {
-            let mut cache = self.cache.write().unwrap();
+            let mut cache = self.cache.write().expect("builder cache lock poisoned");
             for reg in &registrations {
                 cache.insert(
                     reg.message.pubkey,

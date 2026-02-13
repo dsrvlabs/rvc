@@ -209,7 +209,6 @@ where
                 self.prepare_proposers().await;
                 self.submit_committee_subscriptions(current_epoch).await;
                 self.submit_committee_subscriptions(current_epoch + 1).await;
-                self.register_builders().await;
             }
 
             // === Phase 1: t=0 — Block proposal ===
@@ -298,6 +297,13 @@ where
 
             self.maybe_produce_sync_contributions(current_slot, current_epoch).await;
             self.maybe_produce_aggregations(current_slot, current_epoch).await;
+
+            // === Post-duty: builder registration (epoch boundary only) ===
+            // Runs after all time-sensitive phases to avoid blocking block proposal.
+            // Builder registration includes jitter + API call that can take up to 40s.
+            if current_slot % SLOTS_PER_EPOCH == 0 {
+                self.register_builders().await;
+            }
 
             // === Wait for next slot ===
             let next_slot = current_slot + 1;
