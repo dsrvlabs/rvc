@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 aes.workspace = true
+async-trait.workspace = true
 blst.workspace = true
 ctr.workspace = true
 eth-types.workspace = true
@@ -34,3 +35,4 @@ test-utils = []
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }

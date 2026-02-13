@@ -2824,6 +2824,7 @@ name = "rvc-crypto"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "async-trait",
  "blst",
  "ctr",
  "ethereum_ssz 0.9.1",
@@ -2840,6 +2841,7 @@ dependencies = [
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "tree_hash",
  "tree_hash_derive",
