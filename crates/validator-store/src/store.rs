@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
 use serde::Deserialize;
@@ -41,18 +41,20 @@ fn parse_hex_bytes<const N: usize>(s: &str) -> Result<[u8; N], ValidatorStoreErr
 
 pub struct ValidatorStore {
     validators: RwLock<HashMap<[u8; 48], ValidatorConfig>>,
-    default_fee_recipient: [u8; 20],
-    default_gas_limit: u64,
-    default_graffiti: Option<[u8; 32]>,
+    default_fee_recipient: RwLock<[u8; 20]>,
+    default_gas_limit: RwLock<u64>,
+    default_graffiti: RwLock<Option<[u8; 32]>>,
+    config_path: Option<PathBuf>,
 }
 
 impl ValidatorStore {
     pub fn new(default_fee_recipient: [u8; 20], default_gas_limit: u64) -> Self {
         Self {
             validators: RwLock::new(HashMap::new()),
-            default_fee_recipient,
-            default_gas_limit,
-            default_graffiti: None,
+            default_fee_recipient: RwLock::new(default_fee_recipient),
+            default_gas_limit: RwLock::new(default_gas_limit),
+            default_graffiti: RwLock::new(None),
+            config_path: None,
         }
     }
 
@@ -78,27 +80,16 @@ impl ValidatorStore {
 
         let mut validators = HashMap::new();
         for v in &toml_config.validators {
-            let pubkey: [u8; 48] = parse_hex_bytes(&v.pubkey)?;
-            let fee_recipient = v.fee_recipient.as_ref().map(|s| parse_hex_bytes(s)).transpose()?;
-            let graffiti = v.graffiti.as_ref().map(|s| parse_graffiti(s));
-
-            let config = ValidatorConfig {
-                pubkey,
-                fee_recipient,
-                gas_limit: v.gas_limit,
-                builder_proposals: v.builder_proposals.unwrap_or(false),
-                builder_boost_factor: v.builder_boost_factor.unwrap_or(100),
-                graffiti,
-                enabled: v.enabled.unwrap_or(true),
-            };
-            validators.insert(pubkey, config);
+            let config = parse_validator(v)?;
+            validators.insert(config.pubkey, config);
         }
 
         Ok(Self {
             validators: RwLock::new(validators),
-            default_fee_recipient,
-            default_gas_limit,
-            default_graffiti,
+            default_fee_recipient: RwLock::new(default_fee_recipient),
+            default_gas_limit: RwLock::new(default_gas_limit),
+            default_graffiti: RwLock::new(default_graffiti),
+            config_path: Some(path.to_path_buf()),
         })
     }
 
@@ -112,7 +103,7 @@ impl ValidatorStore {
             .unwrap()
             .get(pubkey)
             .and_then(|c| c.fee_recipient)
-            .unwrap_or(self.default_fee_recipient)
+            .unwrap_or(*self.default_fee_recipient.read().unwrap())
     }
 
     pub fn effective_gas_limit(&self, pubkey: &[u8; 48]) -> u64 {
@@ -121,7 +112,7 @@ impl ValidatorStore {
             .unwrap()
             .get(pubkey)
             .and_then(|c| c.gas_limit)
-            .unwrap_or(self.default_gas_limit)
+            .unwrap_or(*self.default_gas_limit.read().unwrap())
     }
 
     pub fn effective_graffiti(&self, pubkey: &[u8; 48]) -> Option<[u8; 32]> {
@@ -130,7 +121,7 @@ impl ValidatorStore {
             .unwrap()
             .get(pubkey)
             .and_then(|c| c.graffiti)
-            .or(self.default_graffiti)
+            .or(*self.default_graffiti.read().unwrap())
     }
 
     pub fn is_builder_enabled(&self, pubkey: &[u8; 48]) -> bool {
@@ -178,6 +169,51 @@ impl ValidatorStore {
             }
         }
     }
+
+    pub fn reload_config(&self) -> Result<(), ValidatorStoreError> {
+        let path = self.config_path.as_ref().ok_or_else(|| {
+            ValidatorStoreError::Config("no config path set for reload".to_string())
+        })?;
+
+        let content = std::fs::read_to_string(path)?;
+        let toml_config: TomlConfig = toml::from_str(&content)?;
+
+        if let Some(defaults) = &toml_config.defaults {
+            if let Some(ref fr) = defaults.fee_recipient {
+                *self.default_fee_recipient.write().unwrap() = parse_hex_bytes(fr)?;
+            }
+            if let Some(gl) = defaults.gas_limit {
+                *self.default_gas_limit.write().unwrap() = gl;
+            }
+            if let Some(ref g) = defaults.graffiti {
+                *self.default_graffiti.write().unwrap() = Some(parse_graffiti(g));
+            }
+        }
+
+        let mut validators = self.validators.write().unwrap();
+        for v in &toml_config.validators {
+            let config = parse_validator(v)?;
+            validators.insert(config.pubkey, config);
+        }
+
+        Ok(())
+    }
+}
+
+fn parse_validator(v: &TomlValidator) -> Result<ValidatorConfig, ValidatorStoreError> {
+    let pubkey: [u8; 48] = parse_hex_bytes(&v.pubkey)?;
+    let fee_recipient = v.fee_recipient.as_ref().map(|s| parse_hex_bytes(s)).transpose()?;
+    let graffiti = v.graffiti.as_ref().map(|s| parse_graffiti(s));
+
+    Ok(ValidatorConfig {
+        pubkey,
+        fee_recipient,
+        gas_limit: v.gas_limit,
+        builder_proposals: v.builder_proposals.unwrap_or(false),
+        builder_boost_factor: v.builder_boost_factor.unwrap_or(100),
+        graffiti,
+        enabled: v.enabled.unwrap_or(true),
+    })
 }
 
 fn parse_graffiti(s: &str) -> [u8; 32] {
@@ -211,9 +247,9 @@ mod tests {
         let store = ValidatorStore::new(fr, 30_000_000);
 
         assert!(store.list_enabled_pubkeys().is_empty());
-        assert_eq!(store.default_fee_recipient, fr);
-        assert_eq!(store.default_gas_limit, 30_000_000);
-        assert!(store.default_graffiti.is_none());
+        assert_eq!(*store.default_fee_recipient.read().unwrap(), fr);
+        assert_eq!(*store.default_gas_limit.read().unwrap(), 30_000_000);
+        assert!(store.default_graffiti.read().unwrap().is_none());
     }
 
     #[test]
@@ -327,8 +363,8 @@ mod tests {
         let mut default_graffiti = [0u8; 32];
         default_graffiti[..4].copy_from_slice(b"test");
 
-        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
-        store.default_graffiti = Some(default_graffiti);
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        *store.default_graffiti.write().unwrap() = Some(default_graffiti);
 
         let pk = test_pubkey(1);
         store.add_validator(ValidatorConfig::new(pk));
@@ -536,8 +572,8 @@ graffiti = "my graffiti"
         assert!(config.graffiti.is_some());
         assert!(config.enabled);
 
-        assert_eq!(store.default_fee_recipient, [0xaau8; 20]);
-        assert_eq!(store.default_gas_limit, 30_000_000);
+        assert_eq!(*store.default_fee_recipient.read().unwrap(), [0xaau8; 20]);
+        assert_eq!(*store.default_gas_limit.read().unwrap(), 30_000_000);
     }
 
     #[test]
@@ -592,9 +628,9 @@ pubkey = "{}"
         file.write_all(toml_content.as_bytes()).unwrap();
 
         let store = ValidatorStore::load_from_config(&config_path).unwrap();
-        assert_eq!(store.default_fee_recipient, [0u8; 20]);
-        assert_eq!(store.default_gas_limit, 30_000_000);
-        assert!(store.default_graffiti.is_none());
+        assert_eq!(*store.default_fee_recipient.read().unwrap(), [0u8; 20]);
+        assert_eq!(*store.default_gas_limit.read().unwrap(), 30_000_000);
+        assert!(store.default_graffiti.read().unwrap().is_none());
     }
 
     #[test]
@@ -710,5 +746,184 @@ pubkey = "not-valid-hex"
         assert_eq!(config.builder_boost_factor, 100);
         assert!(config.graffiti.is_none());
         assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_reload_config_updates_builder_proposals() {
+        let pubkey_hex = "0x".to_string() + &hex::encode([1u8; 48]);
+
+        let toml_v1 = format!(
+            r#"
+[[validators]]
+pubkey = "{}"
+builder_proposals = false
+"#,
+            pubkey_hex,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &toml_v1).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+        let pk = [1u8; 48];
+        assert!(!store.is_builder_enabled(&pk));
+
+        let toml_v2 = format!(
+            r#"
+[[validators]]
+pubkey = "{}"
+builder_proposals = true
+builder_boost_factor = 250
+"#,
+            pubkey_hex,
+        );
+        std::fs::write(&config_path, &toml_v2).unwrap();
+
+        store.reload_config().unwrap();
+
+        assert!(store.is_builder_enabled(&pk));
+        assert_eq!(store.builder_boost_factor(&pk), 250);
+    }
+
+    #[test]
+    fn test_reload_config_updates_defaults() {
+        let pubkey_hex = "0x".to_string() + &hex::encode([1u8; 48]);
+        let fr1_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+        let fr2_hex = "0x".to_string() + &hex::encode([0xbbu8; 20]);
+
+        let toml_v1 = format!(
+            r#"
+[defaults]
+fee_recipient = "{}"
+gas_limit = 30000000
+
+[[validators]]
+pubkey = "{}"
+"#,
+            fr1_hex, pubkey_hex,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &toml_v1).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+        let pk = [1u8; 48];
+        assert_eq!(store.effective_fee_recipient(&pk), [0xaau8; 20]);
+
+        let toml_v2 = format!(
+            r#"
+[defaults]
+fee_recipient = "{}"
+gas_limit = 40000000
+
+[[validators]]
+pubkey = "{}"
+"#,
+            fr2_hex, pubkey_hex,
+        );
+        std::fs::write(&config_path, &toml_v2).unwrap();
+
+        store.reload_config().unwrap();
+
+        assert_eq!(store.effective_fee_recipient(&pk), [0xbbu8; 20]);
+        assert_eq!(store.effective_gas_limit(&pk), 40_000_000);
+    }
+
+    #[test]
+    fn test_reload_config_adds_new_validators() {
+        let pk1_hex = "0x".to_string() + &hex::encode([1u8; 48]);
+        let pk2_hex = "0x".to_string() + &hex::encode([2u8; 48]);
+
+        let toml_v1 = format!(
+            r#"
+[[validators]]
+pubkey = "{}"
+"#,
+            pk1_hex,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &toml_v1).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert_eq!(store.list_enabled_pubkeys().len(), 1);
+
+        let toml_v2 = format!(
+            r#"
+[[validators]]
+pubkey = "{}"
+
+[[validators]]
+pubkey = "{}"
+builder_proposals = true
+"#,
+            pk1_hex, pk2_hex,
+        );
+        std::fs::write(&config_path, &toml_v2).unwrap();
+
+        store.reload_config().unwrap();
+
+        assert_eq!(store.list_enabled_pubkeys().len(), 2);
+        let pk2 = [2u8; 48];
+        assert!(store.is_builder_enabled(&pk2));
+    }
+
+    #[test]
+    fn test_reload_config_preserves_programmatic_validators() {
+        let pk1_hex = "0x".to_string() + &hex::encode([1u8; 48]);
+
+        let toml_v1 = format!(
+            r#"
+[[validators]]
+pubkey = "{}"
+"#,
+            pk1_hex,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &toml_v1).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+
+        let pk_extra = [99u8; 48];
+        store.add_validator(ValidatorConfig::new(pk_extra));
+        assert_eq!(store.list_enabled_pubkeys().len(), 2);
+
+        store.reload_config().unwrap();
+
+        assert!(store.get_config(&pk_extra).is_some());
+    }
+
+    #[test]
+    fn test_reload_config_no_path_returns_error() {
+        let store = ValidatorStore::new([0u8; 20], 30_000_000);
+        let result = store.reload_config();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reload_config_invalid_file_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, "[[validators]]\npubkey = \"0x01\"\n").unwrap();
+
+        // Initial load will fail due to wrong length, so create a valid one first
+        let pk_hex = "0x".to_string() + &hex::encode([1u8; 48]);
+        let valid_toml = format!("[[validators]]\npubkey = \"{}\"\n", pk_hex);
+        std::fs::write(&config_path, &valid_toml).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+
+        std::fs::write(&config_path, "not valid toml [[[").unwrap();
+
+        let result = store.reload_config();
+        assert!(result.is_err());
+
+        // Store should be unchanged after failed reload
+        assert!(store.get_config(&[1u8; 48]).is_some());
     }
 }
