@@ -10,9 +10,11 @@ repository.workspace = true
 axum.workspace = true
 hex.workspace = true
 rand.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 axum = { workspace = true, features = ["macros"] }

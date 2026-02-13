@@ -7,47 +7,87 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use rand::RngCore;
+use subtle::ConstantTimeEq;
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("Invalid token: {0}")]
+    InvalidToken(String),
 }
 
-pub fn generate_token() -> String {
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
+pub fn generate_token() -> Zeroizing<String> {
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    rand::rngs::OsRng.fill_bytes(bytes.as_mut());
+    Zeroizing::new(hex::encode(*bytes))
 }
 
 pub fn write_token_file(path: &std::path::Path, token: &str) -> Result<(), AuthError> {
-    std::fs::write(path, token)?;
+    use std::io::Write;
 
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o400);
-        std::fs::set_permissions(path, perms)?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o400)
+            .open(path)?;
+        file.write_all(token.as_bytes())?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, token)?;
     }
 
     Ok(())
 }
 
-pub fn read_token_file(path: &std::path::Path) -> Result<String, AuthError> {
-    let contents = std::fs::read_to_string(path)?;
-    Ok(contents.trim().to_string())
+pub fn read_token_file(path: &std::path::Path) -> Result<Zeroizing<String>, AuthError> {
+    let contents = Zeroizing::new(std::fs::read_to_string(path)?);
+    let token = Zeroizing::new(contents.trim().to_string());
+    validate_token(&token)?;
+    Ok(token)
 }
 
-pub fn ensure_token(path: &std::path::Path) -> Result<String, AuthError> {
-    if path.exists() {
-        return read_token_file(path);
+fn validate_token(token: &str) -> Result<(), AuthError> {
+    if token.len() != 64 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(AuthError::InvalidToken(format!(
+            "expected 64 hex characters, got {} characters",
+            token.len()
+        )));
     }
+    Ok(())
+}
 
-    let token = generate_token();
-    write_token_file(path, &token)?;
-    tracing::info!(path = %path.display(), "Generated new API token");
-    Ok(token)
+pub fn ensure_token(path: &std::path::Path) -> Result<Zeroizing<String>, AuthError> {
+    use std::io::Write;
+
+    // Attempt atomic exclusive creation (O_CREAT | O_EXCL) to avoid TOCTOU race.
+    #[cfg(unix)]
+    let create_result = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new().write(true).create_new(true).mode(0o400).open(path)
+    };
+
+    #[cfg(not(unix))]
+    let create_result = std::fs::OpenOptions::new().write(true).create_new(true).open(path);
+
+    match create_result {
+        Ok(mut file) => {
+            let token = generate_token();
+            file.write_all(token.as_bytes())?;
+            tracing::info!(path = %path.display(), "Generated new API token");
+            Ok(token)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_token_file(path),
+        Err(e) => Err(AuthError::Io(e)),
+    }
 }
 
 pub fn warn_if_world_readable(path: &std::path::Path) -> bool {
@@ -85,7 +125,7 @@ async fn bearer_auth(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .map(|token| token == expected_token.as_str())
+        .map(|token| token.as_bytes().ct_eq(expected_token.as_bytes()).unwrap_u8() == 1)
         .unwrap_or(false);
 
     if authorized {
@@ -125,7 +165,7 @@ mod tests {
 
         write_token_file(&path, token).unwrap();
         let read_back = read_token_file(&path).unwrap();
-        assert_eq!(read_back, token);
+        assert_eq!(&*read_back, token);
     }
 
     #[cfg(unix)]
@@ -182,10 +222,53 @@ mod tests {
     fn test_read_token_file_trims_whitespace() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("api-token.txt");
-        std::fs::write(&path, "  abc123  \n").unwrap();
+        let valid_hex = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        std::fs::write(&path, format!("  {valid_hex}  \n")).unwrap();
 
         let token = read_token_file(&path).unwrap();
-        assert_eq!(token, "abc123");
+        assert_eq!(&*token, valid_hex);
+    }
+
+    #[test]
+    fn test_read_token_file_rejects_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token.txt");
+        std::fs::write(&path, "").unwrap();
+
+        let result = read_token_file(&path);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), AuthError::InvalidToken(_)),
+            "Expected AuthError::InvalidToken for empty file"
+        );
+    }
+
+    #[test]
+    fn test_read_token_file_rejects_non_hex_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token.txt");
+        std::fs::write(&path, "zzzz_not_hex_at_all!").unwrap();
+
+        let result = read_token_file(&path);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), AuthError::InvalidToken(_)),
+            "Expected AuthError::InvalidToken for non-hex content"
+        );
+    }
+
+    #[test]
+    fn test_read_token_file_rejects_wrong_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token.txt");
+        std::fs::write(&path, "abcdef").unwrap();
+
+        let result = read_token_file(&path);
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), AuthError::InvalidToken(_)),
+            "Expected AuthError::InvalidToken for wrong-length token"
+        );
     }
 
     #[test]
@@ -198,7 +281,7 @@ mod tests {
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
 
         let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(on_disk, token);
+        assert_eq!(on_disk, *token);
     }
 
     #[test]
@@ -209,7 +292,36 @@ mod tests {
         std::fs::write(&path, &existing).unwrap();
 
         let token = ensure_token(&path).unwrap();
-        assert_eq!(token, existing);
+        assert_eq!(*token, existing);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_token_creates_file_with_0o400_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token.txt");
+
+        let _token = ensure_token(&path).unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o400);
+    }
+
+    #[test]
+    fn test_ensure_token_concurrent_creation_reads_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token.txt");
+        let existing = "deadbeef".repeat(8);
+
+        // Pre-create the file to simulate a concurrent create_new failure
+        std::fs::write(&path, &existing).unwrap();
+
+        // ensure_token should fall back to reading the existing file
+        let token = ensure_token(&path).unwrap();
+        assert_eq!(*token, existing);
     }
 
     #[tokio::test]
