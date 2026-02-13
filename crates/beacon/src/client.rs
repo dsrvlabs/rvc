@@ -4,7 +4,7 @@ use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use eth_types::{ForkSchedule, SignedVoluntaryExit};
+use eth_types::{ForkSchedule, SignedValidatorRegistration, SignedVoluntaryExit};
 
 use crate::types::{
     parse_fork_schedule, AggregateAttestationResponse, Attestation, AttestationDataResponse,
@@ -406,6 +406,15 @@ impl BeaconClient {
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/validator/beacon_committee_subscriptions", &subscriptions).await
+    }
+
+    // Builder
+
+    pub async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistration],
+    ) -> Result<(), BeaconError> {
+        self.post_empty("/eth/v1/validator/register_validator", &registrations).await
     }
 
     /// Fetches the sync status of the beacon node.
@@ -3396,5 +3405,91 @@ mod tests {
 
         let result = client.get_node_syncing().await;
         assert!(result.is_err());
+    }
+
+    // -- Builder registration tests --
+
+    fn sample_signed_registration() -> eth_types::SignedValidatorRegistration {
+        eth_types::SignedValidatorRegistration {
+            message: eth_types::ValidatorRegistrationV1 {
+                fee_recipient: [0xab; 20],
+                gas_limit: 30_000_000,
+                timestamp: 1_700_000_000,
+                pubkey: [0xcd; 48],
+            },
+            signature: vec![0xee; 96],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_builder_register_validators_success() {
+        let mock_server = MockServer::start().await;
+
+        let registrations = vec![sample_signed_registration()];
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/register_validator"))
+            .and(body_json(&registrations))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.register_validators(&registrations).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_builder_register_validators_multiple() {
+        let mock_server = MockServer::start().await;
+
+        let mut reg2 = sample_signed_registration();
+        reg2.message.pubkey = [0xdd; 48];
+        reg2.message.fee_recipient = [0xbc; 20];
+
+        let registrations = vec![sample_signed_registration(), reg2];
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/register_validator"))
+            .and(body_json(&registrations))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.register_validators(&registrations).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_builder_register_validators_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/register_validator"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid registration data"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let registrations = vec![sample_signed_registration()];
+        let result = client.register_validators(&registrations).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, message }) => {
+                assert_eq!(status, 400);
+                assert_eq!(message, "Invalid registration data");
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
     }
 }
