@@ -4,6 +4,7 @@ use tree_hash_derive::TreeHash;
 
 mod aggregation;
 mod block;
+mod builder;
 mod domains;
 mod duties;
 mod fork;
@@ -14,6 +15,7 @@ pub use block::{
     BeaconBlock, BeaconBlockBody, BlindedBeaconBlock, BlindedBeaconBlockBody, BlobSidecar,
     BlockContents, ProducedBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
 };
+pub use builder::{SignedValidatorRegistration, ValidatorRegistrationV1};
 pub use domains::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
     DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_DEPOSIT, DOMAIN_RANDAO,
