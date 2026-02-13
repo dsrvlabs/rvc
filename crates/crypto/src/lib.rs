@@ -8,6 +8,7 @@ mod decryption_tracker;
 mod error;
 mod key_manager;
 mod keystore;
+mod remote_signer;
 mod signer_trait;
 mod signing;
 mod sync_signing;
@@ -25,6 +26,7 @@ pub use error::{BlsError, KeyManagerError, KeystoreError};
 pub use eth_types::{DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
 pub use key_manager::KeyManager;
 pub use keystore::{KdfParams, Keystore, Pbkdf2Params, ScryptParams};
+pub use remote_signer::{RemoteSigner, RemoteSignerConfig};
 pub use signer_trait::{LocalSigner, Signer, SigningError};
 pub use signing::{
     compute_domain, compute_fork_data_root, compute_signing_root, sign_attestation,

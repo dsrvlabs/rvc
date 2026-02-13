@@ -9,6 +9,9 @@ use eth_types::Root;
 pub enum SigningError {
     #[error("key not found: {0}")]
     KeyNotFound(String),
+
+    #[error("remote signer error: {0}")]
+    RemoteSignerError(String),
 }
 
 #[async_trait]
@@ -107,6 +110,7 @@ mod tests {
             SigningError::KeyNotFound(pk_hex) => {
                 assert_eq!(pk_hex, hex::encode(unknown_pk_bytes));
             }
+            other => panic!("expected KeyNotFound, got: {other:?}"),
         }
     }
 
