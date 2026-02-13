@@ -17,10 +17,12 @@ block-service.workspace = true
 crypto.workspace = true
 duty-tracker.workspace = true
 hex.workspace = true
+keymanager-api.workspace = true
 metrics.workspace = true
 propagator.workspace = true
 prost.workspace = true
 secrecy.workspace = true
+serde_json.workspace = true
 signer.workspace = true
 slashing.workspace = true
 sync-service.workspace = true
@@ -38,7 +40,10 @@ validator-store.workspace = true
 tonic-build.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
 crypto = { workspace = true, features = ["test-utils"] }
+http-body-util = "0.1"
 serde_json.workspace = true
 tempfile.workspace = true
+tower = { workspace = true, features = ["util"] }
 wiremock.workspace = true

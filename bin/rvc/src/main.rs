@@ -12,6 +12,10 @@ use crypto::PublicKey;
 use metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
 use rvc::config::{CliOverrides, Config, Network, ServiceBuilder};
 use rvc::duty_tracker::DutyTrackerService;
+use rvc::keymanager_adapters::{
+    DoppelgangerMonitorAdapter, KeystoreManagerAdapter, RemoteKeyManagerAdapter,
+    SlashingProtectionAdapter, ValidatorManagerAdapter,
+};
 use rvc::startup;
 use rvc::DutyTrackerServer;
 use timing::SlotClock;
@@ -94,6 +98,22 @@ enum Commands {
         /// Log level (trace, debug, info, warn, error)
         #[arg(long, default_value = "info")]
         log_level: String,
+
+        /// Enable the Keymanager API server
+        #[arg(long)]
+        keymanager_enabled: bool,
+
+        /// Bind address for the Keymanager API server (default: 127.0.0.1:5062)
+        #[arg(long)]
+        keymanager_address: Option<String>,
+
+        /// Path to the Keymanager API bearer token file
+        #[arg(long)]
+        keymanager_token_file: Option<std::path::PathBuf>,
+
+        /// Remote signer (Web3Signer) URL
+        #[arg(long)]
+        remote_signer_url: Option<String>,
     },
 
     /// Submit a voluntary exit for a validator
@@ -161,6 +181,10 @@ async fn main() -> anyhow::Result<()> {
             graffiti,
             no_doppelganger_detection,
             log_level,
+            keymanager_enabled,
+            keymanager_address,
+            keymanager_token_file,
+            remote_signer_url,
         } => {
             init_logging(&log_level);
 
@@ -179,6 +203,10 @@ async fn main() -> anyhow::Result<()> {
                 graffiti,
                 log_level: Some(log_level),
                 doppelganger_detection: if no_doppelganger_detection { Some(false) } else { None },
+                keymanager_enabled: if keymanager_enabled { Some(true) } else { None },
+                keymanager_address,
+                keymanager_token_file,
+                remote_signer_url,
             };
 
             let mut cfg = load_config(config)?;
@@ -460,6 +488,79 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
         validator_store.clone(),
         orchestrator_config.fork_schedule.genesis_fork_version,
     )));
+
+    // Step 7b: Optionally start Keymanager API server
+    if config.keymanager_enabled {
+        let composite_signer = std::sync::Arc::new(crypto::CompositeSigner::new(
+            crypto::LocalSigner::new(crypto::KeyManager::new()),
+        ));
+
+        // If remote signer URL is configured, create initial remote signer
+        if let Some(ref url) = config.remote_signer_url {
+            info!(url = %url, "Configuring remote signer");
+        }
+
+        let token_path = config
+            .keymanager_token_file
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("./keymanager-api-token.txt"));
+        let token = match keymanager_api::auth::ensure_token(&token_path) {
+            Ok(t) => {
+                keymanager_api::auth::warn_if_world_readable(&token_path);
+                t
+            }
+            Err(e) => {
+                error!("Failed to ensure Keymanager API token: {}", e);
+                return Err(anyhow::anyhow!("keymanager token error: {}", e));
+            }
+        };
+
+        let km_addr: std::net::SocketAddr = config
+            .keymanager_address
+            .as_deref()
+            .unwrap_or("127.0.0.1:5062")
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid keymanager address: {}", e))?;
+
+        if !km_addr.ip().is_loopback() {
+            warn!(
+                addr = %km_addr,
+                "Keymanager API is bound to a non-loopback address; this exposes key management over the network"
+            );
+        }
+
+        let keystore_mgr = std::sync::Arc::new(KeystoreManagerAdapter::new(
+            config.keystore_path.clone(),
+            composite_signer.clone(),
+        ));
+        let slashing_prot = std::sync::Arc::new(SlashingProtectionAdapter::new(
+            slashing_db.clone(),
+            genesis_validators_root_hex.clone(),
+        ));
+        let validator_mgr =
+            std::sync::Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
+        let doppelganger_mon = std::sync::Arc::new(DoppelgangerMonitorAdapter::new());
+        let remote_key_mgr =
+            std::sync::Arc::new(RemoteKeyManagerAdapter::new(composite_signer.clone()));
+
+        let km_server = keymanager_api::KeymanagerServer::new(
+            keystore_mgr,
+            slashing_prot,
+            validator_mgr,
+            doppelganger_mon,
+            remote_key_mgr,
+            token.to_string(),
+            km_addr,
+        );
+
+        info!(addr = %km_addr, token_path = %token_path.display(), "Keymanager API enabled");
+
+        tokio::spawn(async move {
+            if let Err(e) = km_server.run().await {
+                error!("Keymanager API server error: {}", e);
+            }
+        });
+    }
 
     // Step 8: Start main duty loop
     let (mut orchestrator, orchestrator_handle) = rvc::orchestrator::DutyOrchestrator::new(

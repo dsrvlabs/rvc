@@ -43,6 +43,18 @@ pub struct Config {
     pub log_level: String,
 
     pub doppelganger_detection: bool,
+
+    #[serde(default)]
+    pub keymanager_enabled: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keymanager_address: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keymanager_token_file: Option<PathBuf>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_signer_url: Option<String>,
 }
 
 impl Default for Config {
@@ -62,6 +74,10 @@ impl Default for Config {
             graffiti: None,
             log_level: "info".to_string(),
             doppelganger_detection: true,
+            keymanager_enabled: false,
+            keymanager_address: None,
+            keymanager_token_file: None,
+            remote_signer_url: None,
         }
     }
 }
@@ -246,6 +262,22 @@ impl Config {
         if let Some(doppelganger_detection) = cli.doppelganger_detection {
             self.doppelganger_detection = doppelganger_detection;
         }
+
+        if let Some(keymanager_enabled) = cli.keymanager_enabled {
+            self.keymanager_enabled = keymanager_enabled;
+        }
+
+        if let Some(ref keymanager_address) = cli.keymanager_address {
+            self.keymanager_address = Some(keymanager_address.clone());
+        }
+
+        if let Some(ref keymanager_token_file) = cli.keymanager_token_file {
+            self.keymanager_token_file = Some(keymanager_token_file.clone());
+        }
+
+        if let Some(ref remote_signer_url) = cli.remote_signer_url {
+            self.remote_signer_url = Some(remote_signer_url.clone());
+        }
     }
 }
 
@@ -265,6 +297,10 @@ pub struct CliOverrides {
     pub graffiti: Option<String>,
     pub log_level: Option<String>,
     pub doppelganger_detection: Option<bool>,
+    pub keymanager_enabled: Option<bool>,
+    pub keymanager_address: Option<String>,
+    pub keymanager_token_file: Option<PathBuf>,
+    pub remote_signer_url: Option<String>,
 }
 
 #[cfg(test)]
@@ -581,5 +617,74 @@ doppelganger_detection = false
         let config = Config::from_file(file.path()).unwrap();
         assert_eq!(config.beacon_nodes.len(), 2);
         assert!(!config.doppelganger_detection);
+    }
+
+    // -- keymanager config tests --
+
+    #[test]
+    fn test_default_config_keymanager_disabled() {
+        let config = Config::default();
+        assert!(!config.keymanager_enabled);
+        assert!(config.keymanager_address.is_none());
+        assert!(config.keymanager_token_file.is_none());
+        assert!(config.remote_signer_url.is_none());
+    }
+
+    #[test]
+    fn test_merge_with_cli_keymanager_fields() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            keymanager_enabled: Some(true),
+            keymanager_address: Some("0.0.0.0:5062".to_string()),
+            keymanager_token_file: Some(PathBuf::from("/data/token.txt")),
+            remote_signer_url: Some("https://signer.example.com".to_string()),
+            ..Default::default()
+        };
+
+        config.merge_with_cli(&cli);
+
+        assert!(config.keymanager_enabled);
+        assert_eq!(config.keymanager_address.as_deref(), Some("0.0.0.0:5062"));
+        assert_eq!(config.keymanager_token_file, Some(PathBuf::from("/data/token.txt")));
+        assert_eq!(config.remote_signer_url.as_deref(), Some("https://signer.example.com"));
+    }
+
+    #[test]
+    fn test_config_from_file_with_keymanager() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+keymanager_enabled = true
+keymanager_address = "0.0.0.0:5062"
+keymanager_token_file = "/data/token.txt"
+remote_signer_url = "https://signer.example.com"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert!(config.keymanager_enabled);
+        assert_eq!(config.keymanager_address.as_deref(), Some("0.0.0.0:5062"));
+        assert_eq!(config.keymanager_token_file, Some(PathBuf::from("/data/token.txt")));
+        assert_eq!(config.remote_signer_url.as_deref(), Some("https://signer.example.com"));
+    }
+
+    #[test]
+    fn test_merge_with_cli_keymanager_none_preserves_defaults() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+
+        config.merge_with_cli(&cli);
+
+        assert!(!config.keymanager_enabled);
+        assert!(config.keymanager_address.is_none());
+        assert!(config.keymanager_token_file.is_none());
+        assert!(config.remote_signer_url.is_none());
     }
 }
