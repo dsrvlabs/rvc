@@ -2,7 +2,8 @@ use async_trait::async_trait;
 
 use crypto::PublicKey;
 use eth_types::{
-    AggregateAndProof, AttestationData, Epoch, ForkSchedule, Root, Slot, VoluntaryExit,
+    AggregateAndProof, AttestationData, Epoch, ForkSchedule, Root, Slot, ValidatorRegistrationV1,
+    VoluntaryExit,
 };
 
 use crate::SignerError;
@@ -77,5 +78,15 @@ pub trait ValidatorSigner {
         pubkey: &PublicKey,
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError>;
+
+    /// Sign a builder registration with DOMAIN_APPLICATION_BUILDER.
+    ///
+    /// No slashing check is needed — builder registrations are not slashable.
+    async fn sign_builder_registration(
+        &self,
+        registration: &ValidatorRegistrationV1,
+        pubkey: &PublicKey,
+        fork_version: [u8; 4],
     ) -> Result<Vec<u8>, SignerError>;
 }

@@ -16,8 +16,8 @@ use thiserror::Error;
 
 use crypto::{sign_attestation, KeyManager, PublicKey, Signature};
 use eth_types::{
-    AggregateAndProof, AttestationData, Epoch, Fork, ForkSchedule, Root, Slot, VoluntaryExit,
-    DOMAIN_SYNC_COMMITTEE, SLOTS_PER_EPOCH,
+    AggregateAndProof, AttestationData, Epoch, Fork, ForkSchedule, Root, Slot,
+    ValidatorRegistrationV1, VoluntaryExit, DOMAIN_SYNC_COMMITTEE, SLOTS_PER_EPOCH,
 };
 use metrics::definitions::{
     slashing_result, RVC_ATTESTATIONS_TOTAL, RVC_SIGNING_DURATION_SECONDS,
@@ -282,6 +282,25 @@ impl SignerService {
         ))
     }
 
+    /// Signs a builder registration with DOMAIN_APPLICATION_BUILDER.
+    ///
+    /// No slashing check is needed — builder registrations are not slashable.
+    pub fn sign_builder_registration(
+        &self,
+        registration: &ValidatorRegistrationV1,
+        pubkey: &PublicKey,
+        fork_version: [u8; 4],
+    ) -> Result<Signature, SignerError> {
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+
+        let secret_key = self
+            .key_manager
+            .get_secret_key(pubkey)
+            .ok_or_else(|| SignerError::KeyNotFound(pubkey_hex))?;
+
+        Ok(crypto::sign_builder_registration(registration, secret_key, fork_version))
+    }
+
     /// Returns a reference to the underlying key manager.
     pub fn key_manager(&self) -> &KeyManager {
         &self.key_manager
@@ -427,6 +446,17 @@ impl ValidatorSigner for SignerService {
             fork_schedule,
             genesis_validators_root,
         )?;
+        Ok(signature.to_bytes().to_vec())
+    }
+
+    async fn sign_builder_registration(
+        &self,
+        registration: &ValidatorRegistrationV1,
+        pubkey: &PublicKey,
+        fork_version: [u8; 4],
+    ) -> Result<Vec<u8>, SignerError> {
+        let signature =
+            SignerService::sign_builder_registration(self, registration, pubkey, fork_version)?;
         Ok(signature.to_bytes().to_vec())
     }
 }
@@ -1375,6 +1405,105 @@ mod tests {
         let exit = eth_types::VoluntaryExit { epoch: 5, validator_index: 42 };
 
         let result = signer.sign_voluntary_exit(&exit, &pubkey, &schedule, &genesis_root).await;
+        assert!(result.is_ok());
+
+        let sig_bytes = result.unwrap();
+        assert_eq!(sig_bytes.len(), 96);
+    }
+
+    // --- Builder registration signing tests ---
+
+    fn create_test_registration() -> ValidatorRegistrationV1 {
+        ValidatorRegistrationV1 {
+            fee_recipient: [0xab; 20],
+            gas_limit: 30_000_000,
+            timestamp: 1_700_000_000,
+            pubkey: [0xcd; 48],
+        }
+    }
+
+    #[test]
+    fn test_sign_builder_registration_success() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(key_manager, slashing_db);
+
+        let registration = create_test_registration();
+        let fork_version = [0x01, 0x00, 0x00, 0x00];
+
+        let result = service.sign_builder_registration(&registration, &pubkey, fork_version);
+        assert!(result.is_ok());
+
+        let signature = result.unwrap();
+
+        let zeroed_genesis_root = [0u8; 32];
+        let domain = compute_domain(
+            eth_types::DOMAIN_APPLICATION_BUILDER,
+            fork_version,
+            zeroed_genesis_root,
+        );
+        let signing_root = compute_signing_root(&registration, domain);
+        assert!(signature.verify(&pubkey, &signing_root).is_ok());
+    }
+
+    #[test]
+    fn test_sign_builder_registration_no_slashing_check() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(key_manager, slashing_db);
+
+        let registration = create_test_registration();
+        let fork_version = [0x01, 0x00, 0x00, 0x00];
+
+        // Sign the same registration multiple times — no slashing protection should block
+        let result1 = service.sign_builder_registration(&registration, &pubkey, fork_version);
+        assert!(result1.is_ok());
+
+        let result2 = service.sign_builder_registration(&registration, &pubkey, fork_version);
+        assert!(result2.is_ok());
+
+        assert_eq!(result1.unwrap().to_bytes(), result2.unwrap().to_bytes());
+    }
+
+    #[test]
+    fn test_sign_builder_registration_key_not_found() {
+        let key_manager = Arc::new(KeyManager::new());
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(key_manager, slashing_db);
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let registration = create_test_registration();
+        let fork_version = [0x01, 0x00, 0x00, 0x00];
+
+        let result = service.sign_builder_registration(&registration, &pubkey, fork_version);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SignerError::KeyNotFound(_) => {}
+            other => panic!("expected KeyNotFound, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trait_sign_builder_registration() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(key_manager, slashing_db);
+        let signer: &dyn ValidatorSigner = &service;
+
+        let registration = create_test_registration();
+        let fork_version = [0x01, 0x00, 0x00, 0x00];
+
+        let result = signer.sign_builder_registration(&registration, &pubkey, fork_version).await;
         assert!(result.is_ok());
 
         let sig_bytes = result.unwrap();

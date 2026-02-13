@@ -3,6 +3,7 @@
 mod aggregation_signing;
 mod block_signing;
 mod bls;
+mod builder_signing;
 mod decryption_tracker;
 mod error;
 mod key_manager;
@@ -17,6 +18,7 @@ pub use bls::{
     PublicKey, SecretKey, Signature, PUBLIC_KEY_BYTES_LEN, SECRET_KEY_BYTES_LEN,
     SIGNATURE_BYTES_LEN,
 };
+pub use builder_signing::sign_builder_registration;
 pub use decryption_tracker::DecryptionAttemptTracker;
 pub use error::{BlsError, KeyManagerError, KeystoreError};
 pub use eth_types::{DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
