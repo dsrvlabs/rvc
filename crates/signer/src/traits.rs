@@ -2,8 +2,8 @@ use async_trait::async_trait;
 
 use crypto::PublicKey;
 use eth_types::{
-    AggregateAndProof, AttestationData, Epoch, ForkSchedule, Root, Slot, ValidatorRegistrationV1,
-    VoluntaryExit,
+    AggregateAndProof, AttestationData, ContributionAndProof, Epoch, ForkSchedule, Root, Slot,
+    ValidatorRegistrationV1, VoluntaryExit,
 };
 
 use crate::SignerError;
@@ -88,5 +88,24 @@ pub trait ValidatorSigner {
         registration: &ValidatorRegistrationV1,
         pubkey: &PublicKey,
         fork_version: [u8; 4],
+    ) -> Result<Vec<u8>, SignerError>;
+
+    /// Sign a sync committee selection proof for aggregator selection.
+    async fn sign_sync_committee_selection_proof(
+        &self,
+        slot: Slot,
+        subcommittee_index: u64,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError>;
+
+    /// Sign a ContributionAndProof with DOMAIN_CONTRIBUTION_AND_PROOF.
+    async fn sign_contribution_and_proof(
+        &self,
+        contribution_and_proof: &ContributionAndProof,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
     ) -> Result<Vec<u8>, SignerError>;
 }

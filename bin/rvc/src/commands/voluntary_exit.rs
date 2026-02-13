@@ -110,7 +110,12 @@ pub async fn execute(args: VoluntaryExitArgs) -> anyhow::Result<()> {
 
     let slashing_db = builder.build_slashing_db().context("Failed to open slashing database")?;
 
-    let signer = SignerService::new(key_manager.clone(), slashing_db);
+    let key_manager_owned = std::sync::Arc::try_unwrap(key_manager)
+        .unwrap_or_else(|_| panic!("single reference to key_manager"));
+    let composite_signer = std::sync::Arc::new(crypto::CompositeSigner::new(
+        crypto::LocalSigner::new(key_manager_owned),
+    ));
+    let signer = SignerService::new(composite_signer, slashing_db);
 
     // Find the pubkey in the key manager
     let pubkey_hex = pubkey_with_prefix.strip_prefix("0x").unwrap_or(&pubkey_with_prefix);
@@ -133,6 +138,7 @@ pub async fn execute(args: VoluntaryExitArgs) -> anyhow::Result<()> {
 
     let signature = signer
         .sign_voluntary_exit(&voluntary_exit, &pubkey, &fork_schedule, &genesis_validators_root)
+        .await
         .map_err(|e| anyhow::anyhow!("Failed to sign voluntary exit: {}", e))?;
 
     let signed_exit =

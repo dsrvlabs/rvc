@@ -465,6 +465,25 @@ mod tests {
             self.sign_calls.lock().unwrap().push(pubkey.to_bytes());
             Ok(vec![0xaa; 96])
         }
+        async fn sign_sync_committee_selection_proof(
+            &self,
+            _: Slot,
+            _: u64,
+            _: &PublicKey,
+            _: &eth_types::ForkSchedule,
+            _: &Root,
+        ) -> Result<Vec<u8>, SignerError> {
+            Err(SignerError::KeyNotFound("mock".into()))
+        }
+        async fn sign_contribution_and_proof(
+            &self,
+            _: &eth_types::ContributionAndProof,
+            _: &PublicKey,
+            _: &eth_types::ForkSchedule,
+            _: &Root,
+        ) -> Result<Vec<u8>, SignerError> {
+            Err(SignerError::KeyNotFound("mock".into()))
+        }
     }
 
     // --- Helpers ---

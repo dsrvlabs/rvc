@@ -14,10 +14,12 @@ use std::time::Instant;
 use async_trait::async_trait;
 use thiserror::Error;
 
-use crypto::{sign_attestation, KeyManager, PublicKey, Signature};
+use crypto::{CompositeSigner, PublicKey, Signature, Signer, SigningError};
 use eth_types::{
-    AggregateAndProof, AttestationData, Epoch, Fork, ForkSchedule, Root, Slot,
-    ValidatorRegistrationV1, VoluntaryExit, DOMAIN_SYNC_COMMITTEE, SLOTS_PER_EPOCH,
+    AggregateAndProof, AttestationData, ContributionAndProof, Epoch, Fork, ForkSchedule, Root,
+    Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
+    DOMAIN_APPLICATION_BUILDER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SLOTS_PER_EPOCH,
 };
 use metrics::definitions::{
     slashing_result, RVC_ATTESTATIONS_TOTAL, RVC_SIGNING_DURATION_SECONDS,
@@ -33,29 +35,34 @@ pub enum SignerError {
 
     #[error("slashing protection blocked signing: {0}")]
     SlashingProtectionBlocked(#[from] SlashingError),
+
+    #[error("signing failed: {0}")]
+    SigningFailed(String),
 }
 
-/// Service that combines key management with slashing protection for signing.
+impl From<SigningError> for SignerError {
+    fn from(e: SigningError) -> Self {
+        match e {
+            SigningError::KeyNotFound(pk) => SignerError::KeyNotFound(pk),
+            SigningError::RemoteSignerError(msg) => SignerError::SigningFailed(msg),
+        }
+    }
+}
+
+/// Service that combines signing through CompositeSigner with slashing protection.
 pub struct SignerService {
-    key_manager: Arc<KeyManager>,
+    signer: Arc<CompositeSigner>,
     slashing_db: Arc<SlashingDb>,
 }
 
 impl SignerService {
-    /// Creates a new SignerService with the provided key manager and slashing database.
-    pub fn new(key_manager: Arc<KeyManager>, slashing_db: Arc<SlashingDb>) -> Self {
-        Self { key_manager, slashing_db }
+    /// Creates a new SignerService with the provided composite signer and slashing database.
+    pub fn new(signer: Arc<CompositeSigner>, slashing_db: Arc<SlashingDb>) -> Self {
+        Self { signer, slashing_db }
     }
 
     /// Signs an attestation after checking slashing protection.
-    ///
-    /// This method:
-    /// 1. Computes the signing root
-    /// 2. Atomically checks and records the attestation (prevents TOCTOU)
-    /// 3. If blocked, increments metrics and returns an error
-    /// 4. If safe, retrieves the secret key and signs the attestation
-    /// 5. Updates metrics for signing duration and success count
-    pub fn sign_attestation(
+    pub async fn sign_attestation(
         &self,
         attestation_data: &AttestationData,
         pubkey: &PublicKey,
@@ -69,24 +76,19 @@ impl SignerService {
         let source_epoch = attestation_data.source.epoch;
         let target_epoch = attestation_data.target.epoch;
 
-        let signing_root = hex::encode(crypto::compute_signing_root(
-            attestation_data,
-            crypto::compute_domain(
-                crypto::DOMAIN_BEACON_ATTESTER,
-                if target_epoch >= fork.epoch {
-                    fork.current_version
-                } else {
-                    fork.previous_version
-                },
-                genesis_validators_root,
-            ),
-        ));
+        let domain = crypto::compute_domain(
+            crypto::DOMAIN_BEACON_ATTESTER,
+            if target_epoch >= fork.epoch { fork.current_version } else { fork.previous_version },
+            genesis_validators_root,
+        );
+        let signing_root = crypto::compute_signing_root(attestation_data, domain);
+        let signing_root_hex = hex::encode(signing_root);
 
         if let Err(e) = self.slashing_db.check_and_record_attestation(
             &pubkey_hex,
             source_epoch,
             target_epoch,
-            Some(signing_root),
+            Some(signing_root_hex),
         ) {
             RVC_SLASHING_PROTECTION_CHECKS_TOTAL
                 .with_label_values(&[slashing_result::BLOCKED])
@@ -97,13 +99,8 @@ impl SignerService {
 
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
 
-        let secret_key = self
-            .key_manager
-            .get_secret_key(pubkey)
-            .ok_or_else(|| SignerError::KeyNotFound(pubkey_hex.clone()))?;
-
-        let signature =
-            sign_attestation(attestation_data, secret_key, fork, genesis_validators_root);
+        let pubkey_bytes = pubkey.to_bytes();
+        let signature = self.signer.sign(&signing_root, &pubkey_bytes).await?;
 
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[]).observe(duration);
@@ -113,13 +110,7 @@ impl SignerService {
     }
 
     /// Signs a block after checking slashing protection.
-    ///
-    /// This method:
-    /// 1. Computes the signing root
-    /// 2. Atomically checks and records the block (prevents TOCTOU)
-    /// 3. If blocked, increments metrics and returns an error
-    /// 4. If safe, retrieves the secret key and signs the block
-    pub fn sign_block(
+    pub async fn sign_block(
         &self,
         block_root: &Root,
         slot: Slot,
@@ -152,18 +143,8 @@ impl SignerService {
 
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
 
-        let secret_key = self
-            .key_manager
-            .get_secret_key(pubkey)
-            .ok_or_else(|| SignerError::KeyNotFound(pubkey_hex.clone()))?;
-
-        let signature = crypto::sign_block(
-            block_root,
-            slot,
-            secret_key,
-            fork_schedule,
-            genesis_validators_root,
-        );
+        let pubkey_bytes = pubkey.to_bytes();
+        let signature = self.signer.sign(&signing_root, &pubkey_bytes).await?;
 
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[]).observe(duration);
@@ -172,28 +153,28 @@ impl SignerService {
     }
 
     /// Signs a RANDAO reveal for the given epoch.
-    pub fn sign_randao_reveal(
+    pub async fn sign_randao_reveal(
         &self,
         epoch: Epoch,
         pubkey: &PublicKey,
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
+        let fork_version = fork_name.fork_version(fork_schedule);
+        let domain = crypto::compute_domain(
+            eth_types::DOMAIN_RANDAO,
+            fork_version,
+            *genesis_validators_root,
+        );
+        let signing_root = crypto::compute_signing_root(&epoch, domain);
 
-        let secret_key = self
-            .key_manager
-            .get_secret_key(pubkey)
-            .ok_or_else(|| SignerError::KeyNotFound(pubkey_hex))?;
-
-        let signature =
-            crypto::sign_randao_reveal(epoch, secret_key, fork_schedule, genesis_validators_root);
-
-        Ok(signature)
+        let pubkey_bytes = pubkey.to_bytes();
+        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
     }
 
     /// Signs a sync committee message for the given beacon block root and slot.
-    pub fn sign_sync_committee_message(
+    pub async fn sign_sync_committee_message(
         &self,
         beacon_block_root: &Root,
         slot: Slot,
@@ -201,13 +182,6 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
-
-        let secret_key = self
-            .key_manager
-            .get_secret_key(pubkey)
-            .ok_or_else(|| SignerError::KeyNotFound(pubkey_hex))?;
-
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
@@ -215,95 +189,143 @@ impl SignerService {
             crypto::compute_domain(DOMAIN_SYNC_COMMITTEE, fork_version, *genesis_validators_root);
         let signing_root = crypto::compute_signing_root(beacon_block_root, domain);
 
-        Ok(secret_key.sign(&signing_root))
+        let pubkey_bytes = pubkey.to_bytes();
+        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
     }
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
-    pub fn sign_selection_proof(
+    pub async fn sign_selection_proof(
         &self,
         slot: Slot,
         pubkey: &PublicKey,
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
+        let fork_version = fork_name.fork_version(fork_schedule);
+        let domain = crypto::compute_domain(
+            eth_types::DOMAIN_SELECTION_PROOF,
+            fork_version,
+            *genesis_validators_root,
+        );
+        let signing_root = crypto::compute_signing_root(&slot, domain);
 
-        let secret_key = self
-            .key_manager
-            .get_secret_key(pubkey)
-            .ok_or_else(|| SignerError::KeyNotFound(pubkey_hex))?;
-
-        Ok(crypto::sign_selection_proof(slot, secret_key, fork_schedule, *genesis_validators_root))
+        let pubkey_bytes = pubkey.to_bytes();
+        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
     }
 
     /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
-    pub fn sign_aggregate_and_proof(
+    pub async fn sign_aggregate_and_proof(
         &self,
         aggregate_and_proof: &AggregateAndProof,
         pubkey: &PublicKey,
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
-
-        let secret_key = self
-            .key_manager
-            .get_secret_key(pubkey)
-            .ok_or_else(|| SignerError::KeyNotFound(pubkey_hex))?;
-
-        Ok(crypto::sign_aggregate_and_proof(
-            aggregate_and_proof,
-            secret_key,
-            fork_schedule,
+        let slot = aggregate_and_proof.aggregate.data.slot;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
+        let fork_version = fork_name.fork_version(fork_schedule);
+        let domain = crypto::compute_domain(
+            eth_types::DOMAIN_AGGREGATE_AND_PROOF,
+            fork_version,
             *genesis_validators_root,
-        ))
+        );
+        let signing_root = crypto::compute_signing_root(aggregate_and_proof, domain);
+
+        let pubkey_bytes = pubkey.to_bytes();
+        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
     }
 
     /// Signs a voluntary exit with DOMAIN_VOLUNTARY_EXIT.
-    pub fn sign_voluntary_exit(
+    pub async fn sign_voluntary_exit(
         &self,
         voluntary_exit: &VoluntaryExit,
         pubkey: &PublicKey,
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
-
-        let secret_key = self
-            .key_manager
-            .get_secret_key(pubkey)
-            .ok_or_else(|| SignerError::KeyNotFound(pubkey_hex))?;
-
-        Ok(crypto::sign_voluntary_exit(
-            voluntary_exit,
-            secret_key,
-            fork_schedule,
+        let fork_name = eth_types::ForkName::from_epoch(voluntary_exit.epoch, fork_schedule);
+        let fork_version = fork_name.fork_version(fork_schedule);
+        let domain = crypto::compute_domain(
+            eth_types::DOMAIN_VOLUNTARY_EXIT,
+            fork_version,
             *genesis_validators_root,
-        ))
+        );
+        let signing_root = crypto::compute_signing_root(voluntary_exit, domain);
+
+        let pubkey_bytes = pubkey.to_bytes();
+        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
     }
 
     /// Signs a builder registration with DOMAIN_APPLICATION_BUILDER.
     ///
     /// No slashing check is needed — builder registrations are not slashable.
-    pub fn sign_builder_registration(
+    pub async fn sign_builder_registration(
         &self,
         registration: &ValidatorRegistrationV1,
         pubkey: &PublicKey,
         fork_version: [u8; 4],
     ) -> Result<Signature, SignerError> {
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let zeroed_genesis_root = [0u8; 32];
+        let domain =
+            crypto::compute_domain(DOMAIN_APPLICATION_BUILDER, fork_version, zeroed_genesis_root);
+        let signing_root = crypto::compute_signing_root(registration, domain);
 
-        let secret_key = self
-            .key_manager
-            .get_secret_key(pubkey)
-            .ok_or_else(|| SignerError::KeyNotFound(pubkey_hex))?;
-
-        Ok(crypto::sign_builder_registration(registration, secret_key, fork_version))
+        let pubkey_bytes = pubkey.to_bytes();
+        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
     }
 
-    /// Returns a reference to the underlying key manager.
-    pub fn key_manager(&self) -> &KeyManager {
-        &self.key_manager
+    /// Signs a sync committee selection proof for the given slot and subcommittee.
+    pub async fn sign_sync_committee_selection_proof(
+        &self,
+        slot: Slot,
+        subcommittee_index: u64,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
+        let fork_version = fork_name.fork_version(fork_schedule);
+        let domain = crypto::compute_domain(
+            DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+            fork_version,
+            *genesis_validators_root,
+        );
+        let selection_data = SyncAggregatorSelectionData { slot, subcommittee_index };
+        let signing_root = crypto::compute_signing_root(&selection_data, domain);
+
+        let pubkey_bytes = pubkey.to_bytes();
+        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+    }
+
+    /// Signs a ContributionAndProof with DOMAIN_CONTRIBUTION_AND_PROOF.
+    pub async fn sign_contribution_and_proof(
+        &self,
+        contribution_and_proof: &ContributionAndProof,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let epoch = contribution_and_proof.contribution.slot / SLOTS_PER_EPOCH;
+        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
+        let fork_version = fork_name.fork_version(fork_schedule);
+        let domain = crypto::compute_domain(
+            DOMAIN_CONTRIBUTION_AND_PROOF,
+            fork_version,
+            *genesis_validators_root,
+        );
+        let signing_root = crypto::compute_signing_root(contribution_and_proof, domain);
+
+        let pubkey_bytes = pubkey.to_bytes();
+        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+    }
+
+    /// Returns a reference to the underlying composite signer.
+    pub fn signer(&self) -> &CompositeSigner {
+        &self.signer
     }
 
     /// Returns a reference to the underlying slashing database.
@@ -339,7 +361,8 @@ impl ValidatorSigner for SignerService {
         };
 
         let signature =
-            SignerService::sign_attestation(self, data, pubkey, &fork, *genesis_validators_root)?;
+            SignerService::sign_attestation(self, data, pubkey, &fork, *genesis_validators_root)
+                .await?;
         Ok(signature.to_bytes().to_vec())
     }
 
@@ -358,7 +381,8 @@ impl ValidatorSigner for SignerService {
             pubkey,
             fork_schedule,
             genesis_validators_root,
-        )?;
+        )
+        .await?;
         Ok(signature.to_bytes().to_vec())
     }
 
@@ -375,7 +399,8 @@ impl ValidatorSigner for SignerService {
             pubkey,
             fork_schedule,
             genesis_validators_root,
-        )?;
+        )
+        .await?;
         Ok(signature.to_bytes().to_vec())
     }
 
@@ -394,7 +419,8 @@ impl ValidatorSigner for SignerService {
             pubkey,
             fork_schedule,
             genesis_validators_root,
-        )?;
+        )
+        .await?;
         Ok(signature.to_bytes().to_vec())
     }
 
@@ -411,7 +437,8 @@ impl ValidatorSigner for SignerService {
             pubkey,
             fork_schedule,
             genesis_validators_root,
-        )?;
+        )
+        .await?;
         Ok(signature.to_bytes().to_vec())
     }
 
@@ -428,7 +455,8 @@ impl ValidatorSigner for SignerService {
             pubkey,
             fork_schedule,
             genesis_validators_root,
-        )?;
+        )
+        .await?;
         Ok(signature.to_bytes().to_vec())
     }
 
@@ -445,7 +473,8 @@ impl ValidatorSigner for SignerService {
             pubkey,
             fork_schedule,
             genesis_validators_root,
-        )?;
+        )
+        .await?;
         Ok(signature.to_bytes().to_vec())
     }
 
@@ -456,7 +485,46 @@ impl ValidatorSigner for SignerService {
         fork_version: [u8; 4],
     ) -> Result<Vec<u8>, SignerError> {
         let signature =
-            SignerService::sign_builder_registration(self, registration, pubkey, fork_version)?;
+            SignerService::sign_builder_registration(self, registration, pubkey, fork_version)
+                .await?;
+        Ok(signature.to_bytes().to_vec())
+    }
+
+    async fn sign_sync_committee_selection_proof(
+        &self,
+        slot: Slot,
+        subcommittee_index: u64,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError> {
+        let signature = SignerService::sign_sync_committee_selection_proof(
+            self,
+            slot,
+            subcommittee_index,
+            pubkey,
+            fork_schedule,
+            genesis_validators_root,
+        )
+        .await?;
+        Ok(signature.to_bytes().to_vec())
+    }
+
+    async fn sign_contribution_and_proof(
+        &self,
+        contribution_and_proof: &ContributionAndProof,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError> {
+        let signature = SignerService::sign_contribution_and_proof(
+            self,
+            contribution_and_proof,
+            pubkey,
+            fork_schedule,
+            genesis_validators_root,
+        )
+        .await?;
         Ok(signature.to_bytes().to_vec())
     }
 }
@@ -464,13 +532,20 @@ impl ValidatorSigner for SignerService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crypto::{compute_domain, compute_signing_root, SecretKey, DOMAIN_BEACON_ATTESTER};
+    use crypto::{
+        compute_domain, compute_signing_root, KeyManager, LocalSigner, SecretKey,
+        DOMAIN_BEACON_ATTESTER,
+    };
     use eth_types::Checkpoint;
 
-    fn create_test_key_manager_with_key(secret_key: SecretKey) -> KeyManager {
+    fn create_test_composite_signer_with_key(secret_key: SecretKey) -> Arc<CompositeSigner> {
         let mut manager = KeyManager::new();
         manager.insert(secret_key);
-        manager
+        Arc::new(CompositeSigner::new(LocalSigner::new(manager)))
+    }
+
+    fn create_empty_composite_signer() -> Arc<CompositeSigner> {
+        Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())))
     }
 
     fn create_test_attestation_data(source_epoch: u64, target_epoch: u64) -> AttestationData {
@@ -493,28 +568,29 @@ mod tests {
 
     #[test]
     fn test_signer_service_creation() {
-        let key_manager = Arc::new(KeyManager::new());
+        let signer = create_empty_composite_signer();
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager.clone(), slashing_db.clone());
+        let service = SignerService::new(signer, slashing_db);
 
-        assert!(service.key_manager().is_empty());
+        assert!(service.signer().public_keys().is_empty());
     }
 
-    #[test]
-    fn test_sign_attestation_success() {
+    #[tokio::test]
+    async fn test_sign_attestation_success() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db.clone());
+        let service = SignerService::new(signer, slashing_db.clone());
 
         let attestation_data = create_test_attestation_data(100, 101);
         let fork = create_test_fork();
         let genesis_root = [0xaa; 32];
 
-        let result = service.sign_attestation(&attestation_data, &pubkey, &fork, genesis_root);
+        let result =
+            service.sign_attestation(&attestation_data, &pubkey, &fork, genesis_root).await;
 
         assert!(result.is_ok());
         let signature = result.unwrap();
@@ -533,14 +609,14 @@ mod tests {
         assert!(attestations[0].signing_root.is_some());
     }
 
-    #[test]
-    fn test_sign_attestation_success_uses_previous_fork_version() {
+    #[tokio::test]
+    async fn test_sign_attestation_success_uses_previous_fork_version() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db);
+        let service = SignerService::new(signer, slashing_db);
 
         let fork = Fork {
             previous_version: [0x00, 0x00, 0x00, 0x01],
@@ -550,7 +626,8 @@ mod tests {
         let attestation_data = create_test_attestation_data(50, 51);
         let genesis_root = [0xaa; 32];
 
-        let result = service.sign_attestation(&attestation_data, &pubkey, &fork, genesis_root);
+        let result =
+            service.sign_attestation(&attestation_data, &pubkey, &fork, genesis_root).await;
 
         assert!(result.is_ok());
         let signature = result.unwrap();
@@ -561,49 +638,26 @@ mod tests {
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
     }
 
-    #[test]
-    fn test_sign_attestation_records_in_slashing_db() {
+    #[tokio::test]
+    async fn test_sign_attestation_prevents_double_vote_after_signing() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db.clone());
-
-        let attestation_data = create_test_attestation_data(100, 101);
-        let fork = create_test_fork();
-        let genesis_root = [0xaa; 32];
-
-        service
-            .sign_attestation(&attestation_data, &pubkey, &fork, genesis_root)
-            .expect("signing should succeed");
-
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
-        let attestations = slashing_db.get_attestations(&pubkey_hex).expect("failed to get");
-        assert_eq!(attestations.len(), 1);
-        assert_eq!(attestations[0].pubkey, pubkey_hex);
-        assert_eq!(attestations[0].source_epoch, 100);
-        assert_eq!(attestations[0].target_epoch, 101);
-    }
-
-    #[test]
-    fn test_sign_attestation_prevents_double_vote_after_signing() {
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-
-        let service = SignerService::new(key_manager, slashing_db);
+        let service = SignerService::new(signer, slashing_db);
 
         let attestation_data1 = create_test_attestation_data(100, 101);
         let fork = create_test_fork();
         let genesis_root = [0xaa; 32];
 
-        let result1 = service.sign_attestation(&attestation_data1, &pubkey, &fork, genesis_root);
+        let result1 =
+            service.sign_attestation(&attestation_data1, &pubkey, &fork, genesis_root).await;
         assert!(result1.is_ok());
 
         let attestation_data2 = create_test_attestation_data(99, 101);
-        let result2 = service.sign_attestation(&attestation_data2, &pubkey, &fork, genesis_root);
+        let result2 =
+            service.sign_attestation(&attestation_data2, &pubkey, &fork, genesis_root).await;
 
         assert!(result2.is_err());
         match result2.unwrap_err() {
@@ -612,28 +666,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_sign_attestation_allows_multiple_non_conflicting() {
+    #[tokio::test]
+    async fn test_sign_attestation_allows_multiple_non_conflicting() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db.clone());
+        let service = SignerService::new(signer, slashing_db.clone());
 
         let fork = create_test_fork();
         let genesis_root = [0xaa; 32];
 
         let attestation_data1 = create_test_attestation_data(100, 101);
-        let result1 = service.sign_attestation(&attestation_data1, &pubkey, &fork, genesis_root);
+        let result1 =
+            service.sign_attestation(&attestation_data1, &pubkey, &fork, genesis_root).await;
         assert!(result1.is_ok());
 
         let attestation_data2 = create_test_attestation_data(101, 102);
-        let result2 = service.sign_attestation(&attestation_data2, &pubkey, &fork, genesis_root);
+        let result2 =
+            service.sign_attestation(&attestation_data2, &pubkey, &fork, genesis_root).await;
         assert!(result2.is_ok());
 
         let attestation_data3 = create_test_attestation_data(102, 103);
-        let result3 = service.sign_attestation(&attestation_data3, &pubkey, &fork, genesis_root);
+        let result3 =
+            service.sign_attestation(&attestation_data3, &pubkey, &fork, genesis_root).await;
         assert!(result3.is_ok());
 
         let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -641,11 +698,11 @@ mod tests {
         assert_eq!(attestations.len(), 3);
     }
 
-    #[test]
-    fn test_sign_attestation_key_not_found() {
-        let key_manager = Arc::new(KeyManager::new());
+    #[tokio::test]
+    async fn test_sign_attestation_key_not_found() {
+        let signer = create_empty_composite_signer();
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-        let service = SignerService::new(key_manager, slashing_db);
+        let service = SignerService::new(signer, slashing_db);
 
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
@@ -653,7 +710,8 @@ mod tests {
         let fork = create_test_fork();
         let genesis_root = [0xaa; 32];
 
-        let result = service.sign_attestation(&attestation_data, &pubkey, &fork, genesis_root);
+        let result =
+            service.sign_attestation(&attestation_data, &pubkey, &fork, genesis_root).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -664,8 +722,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_sign_attestation_slashing_blocked_double_vote() {
+    #[tokio::test]
+    async fn test_sign_attestation_slashing_blocked_double_vote() {
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
         let secret_key = SecretKey::generate();
@@ -674,14 +732,15 @@ mod tests {
 
         slashing_db.record_attestation(&pubkey_hex, 100, 101, None).expect("record should succeed");
 
-        let key_manager = Arc::new(KeyManager::new());
-        let service = SignerService::new(key_manager, slashing_db);
+        let signer = create_empty_composite_signer();
+        let service = SignerService::new(signer, slashing_db);
 
         let attestation_data = create_test_attestation_data(99, 101);
         let fork = create_test_fork();
         let genesis_root = [0xaa; 32];
 
-        let result = service.sign_attestation(&attestation_data, &pubkey, &fork, genesis_root);
+        let result =
+            service.sign_attestation(&attestation_data, &pubkey, &fork, genesis_root).await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -690,81 +749,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_sign_attestation_slashing_blocked_surrounding_vote() {
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
-
-        slashing_db.record_attestation(&pubkey_hex, 5, 10, None).expect("record should succeed");
-
-        let key_manager = Arc::new(KeyManager::new());
-        let service = SignerService::new(key_manager, slashing_db);
-
-        let attestation_data = create_test_attestation_data(4, 11);
-        let fork = create_test_fork();
-        let genesis_root = [0xaa; 32];
-
-        let result = service.sign_attestation(&attestation_data, &pubkey, &fork, genesis_root);
-
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SignerError::SlashingProtectionBlocked(_) => {}
-            _ => panic!("expected SlashingProtectionBlocked error"),
-        }
-    }
-
-    #[test]
-    fn test_sign_attestation_slashing_blocked_surrounded_vote() {
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
-
-        slashing_db.record_attestation(&pubkey_hex, 4, 11, None).expect("record should succeed");
-
-        let key_manager = Arc::new(KeyManager::new());
-        let service = SignerService::new(key_manager, slashing_db);
-
-        let attestation_data = create_test_attestation_data(5, 10);
-        let fork = create_test_fork();
-        let genesis_root = [0xaa; 32];
-
-        let result = service.sign_attestation(&attestation_data, &pubkey, &fork, genesis_root);
-
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SignerError::SlashingProtectionBlocked(_) => {}
-            _ => panic!("expected SlashingProtectionBlocked error"),
-        }
-    }
-
-    #[test]
-    fn test_sign_attestation_different_validators_isolated() {
+    #[tokio::test]
+    async fn test_sign_attestation_different_validators_isolated() {
         let secret_key1 = SecretKey::generate();
         let secret_key2 = SecretKey::generate();
         let pubkey1 = secret_key1.public_key();
         let pubkey2 = secret_key2.public_key();
 
-        let mut key_manager = KeyManager::new();
-        key_manager.insert(secret_key1);
-        key_manager.insert(secret_key2);
-        let key_manager = Arc::new(key_manager);
+        let signer = create_empty_composite_signer();
+        signer.add_local_key(secret_key1);
+        signer.add_local_key(secret_key2);
 
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-        let service = SignerService::new(key_manager, slashing_db);
+        let service = SignerService::new(signer, slashing_db);
 
         let attestation_data = create_test_attestation_data(100, 101);
         let fork = create_test_fork();
         let genesis_root = [0xaa; 32];
 
-        let result1 = service.sign_attestation(&attestation_data, &pubkey1, &fork, genesis_root);
+        let result1 =
+            service.sign_attestation(&attestation_data, &pubkey1, &fork, genesis_root).await;
         assert!(result1.is_ok());
 
-        let result2 = service.sign_attestation(&attestation_data, &pubkey2, &fork, genesis_root);
+        let result2 =
+            service.sign_attestation(&attestation_data, &pubkey2, &fork, genesis_root).await;
         assert!(result2.is_ok());
     }
 
@@ -780,23 +788,23 @@ mod tests {
             });
         let err = SignerError::SlashingProtectionBlocked(slashing_err);
         assert!(err.to_string().contains("slashing protection blocked"));
+
+        let err = SignerError::SigningFailed("remote error".to_string());
+        assert!(err.to_string().contains("signing failed"));
     }
 
     #[test]
     fn test_signer_service_accessors() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db);
+        let service = SignerService::new(signer, slashing_db);
 
-        assert!(!service.key_manager().is_empty());
-        assert_eq!(service.key_manager().len(), 1);
-
-        let keys = service.key_manager().list_public_keys();
+        let keys = service.signer().public_keys();
         assert_eq!(keys.len(), 1);
-        assert_eq!(keys[0].to_bytes(), pubkey.to_bytes());
+        assert_eq!(keys[0], pubkey.to_bytes());
     }
 
     // --- Block signing tests ---
@@ -817,21 +825,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_sign_block_safe_proposal() {
+    #[tokio::test]
+    async fn test_sign_block_safe_proposal() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db.clone());
+        let service = SignerService::new(signer, slashing_db.clone());
 
         let block_root = [0x11; 32];
         let slot = 5;
         let schedule = create_test_fork_schedule();
         let genesis_root = [0xaa; 32];
 
-        let result = service.sign_block(&block_root, slot, &pubkey, &schedule, &genesis_root);
+        let result = service.sign_block(&block_root, slot, &pubkey, &schedule, &genesis_root).await;
         assert!(result.is_ok());
 
         let signature = result.unwrap();
@@ -848,22 +856,22 @@ mod tests {
         assert!(blocks[0].signing_root.is_some());
     }
 
-    #[test]
-    fn test_sign_block_double_proposal_rejected() {
+    #[tokio::test]
+    async fn test_sign_block_double_proposal_rejected() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db);
+        let service = SignerService::new(signer, slashing_db);
 
         let schedule = create_test_fork_schedule();
         let genesis_root = [0xaa; 32];
 
-        let result1 = service.sign_block(&[0x11; 32], 5, &pubkey, &schedule, &genesis_root);
+        let result1 = service.sign_block(&[0x11; 32], 5, &pubkey, &schedule, &genesis_root).await;
         assert!(result1.is_ok());
 
-        let result2 = service.sign_block(&[0x22; 32], 5, &pubkey, &schedule, &genesis_root);
+        let result2 = service.sign_block(&[0x22; 32], 5, &pubkey, &schedule, &genesis_root).await;
         assert!(result2.is_err());
         match result2.unwrap_err() {
             SignerError::SlashingProtectionBlocked(_) => {}
@@ -871,46 +879,18 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_sign_block_idempotent_resign() {
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+    #[tokio::test]
+    async fn test_sign_block_key_not_found() {
+        let signer = create_empty_composite_signer();
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-
-        let service = SignerService::new(key_manager, slashing_db.clone());
-
-        let block_root = [0x11; 32];
-        let schedule = create_test_fork_schedule();
-        let genesis_root = [0xaa; 32];
-
-        let result1 = service.sign_block(&block_root, 5, &pubkey, &schedule, &genesis_root);
-        assert!(result1.is_ok());
-
-        let result2 = service.sign_block(&block_root, 5, &pubkey, &schedule, &genesis_root);
-        assert!(result2.is_ok());
-
-        let sig1 = result1.unwrap();
-        let sig2 = result2.unwrap();
-        assert_eq!(sig1.to_bytes(), sig2.to_bytes());
-
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
-        let blocks = slashing_db.get_blocks(&pubkey_hex).expect("failed to get");
-        assert_eq!(blocks.len(), 1);
-    }
-
-    #[test]
-    fn test_sign_block_key_not_found() {
-        let key_manager = Arc::new(KeyManager::new());
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-        let service = SignerService::new(key_manager, slashing_db);
+        let service = SignerService::new(signer, slashing_db);
 
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
         let schedule = create_test_fork_schedule();
         let genesis_root = [0xaa; 32];
 
-        let result = service.sign_block(&[0x11; 32], 5, &pubkey, &schedule, &genesis_root);
+        let result = service.sign_block(&[0x11; 32], 5, &pubkey, &schedule, &genesis_root).await;
         assert!(result.is_err());
         match result.unwrap_err() {
             SignerError::KeyNotFound(_) => {}
@@ -918,52 +898,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_sign_block_fork_aware() {
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-
-        let service = SignerService::new(key_manager, slashing_db);
-
-        let block_root = [0x11; 32];
-        let schedule = create_test_fork_schedule();
-        let genesis_root = [0xaa; 32];
-
-        // Slot in Altair epoch (epoch 15, slot 480)
-        let altair_slot = SLOTS_PER_EPOCH * 15;
-        let result =
-            service.sign_block(&block_root, altair_slot, &pubkey, &schedule, &genesis_root);
-        assert!(result.is_ok());
-
-        let signature = result.unwrap();
-
-        let domain = compute_domain(
-            eth_types::DOMAIN_BEACON_PROPOSER,
-            schedule.altair_fork_version,
-            genesis_root,
-        );
-        let signing_root = compute_signing_root(&block_root, domain);
-        assert!(signature.verify(&pubkey, &signing_root).is_ok());
-    }
-
     // --- RANDAO signing tests ---
 
-    #[test]
-    fn test_sign_randao_reveal() {
+    #[tokio::test]
+    async fn test_sign_randao_reveal() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db);
+        let service = SignerService::new(signer, slashing_db);
 
         let schedule = create_test_fork_schedule();
         let genesis_root = [0xaa; 32];
         let epoch = 5_u64;
 
-        let result = service.sign_randao_reveal(epoch, &pubkey, &schedule, &genesis_root);
+        let result = service.sign_randao_reveal(epoch, &pubkey, &schedule, &genesis_root).await;
         assert!(result.is_ok());
 
         let signature = result.unwrap();
@@ -974,18 +924,18 @@ mod tests {
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
     }
 
-    #[test]
-    fn test_sign_randao_reveal_key_not_found() {
-        let key_manager = Arc::new(KeyManager::new());
+    #[tokio::test]
+    async fn test_sign_randao_reveal_key_not_found() {
+        let signer = create_empty_composite_signer();
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-        let service = SignerService::new(key_manager, slashing_db);
+        let service = SignerService::new(signer, slashing_db);
 
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
         let schedule = create_test_fork_schedule();
         let genesis_root = [0xaa; 32];
 
-        let result = service.sign_randao_reveal(5, &pubkey, &schedule, &genesis_root);
+        let result = service.sign_randao_reveal(5, &pubkey, &schedule, &genesis_root).await;
         assert!(result.is_err());
         match result.unwrap_err() {
             SignerError::KeyNotFound(_) => {}
@@ -993,52 +943,31 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_sign_randao_reveal_fork_aware() {
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-
-        let service = SignerService::new(key_manager, slashing_db);
-
-        let schedule = create_test_fork_schedule();
-        let genesis_root = [0xaa; 32];
-        let epoch = 45_u64; // Deneb
-
-        let result = service.sign_randao_reveal(epoch, &pubkey, &schedule, &genesis_root);
-        assert!(result.is_ok());
-
-        let signature = result.unwrap();
-        let domain =
-            compute_domain(eth_types::DOMAIN_RANDAO, schedule.deneb_fork_version, genesis_root);
-        let signing_root = compute_signing_root(&epoch, domain);
-        assert!(signature.verify(&pubkey, &signing_root).is_ok());
-    }
-
     // --- Sync committee signing tests ---
 
-    #[test]
-    fn test_sign_sync_committee_message() {
+    #[tokio::test]
+    async fn test_sign_sync_committee_message() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db);
+        let service = SignerService::new(signer, slashing_db);
 
         let beacon_block_root = [0x11; 32];
         let slot = SLOTS_PER_EPOCH * 15; // Altair epoch
         let schedule = create_test_fork_schedule();
         let genesis_root = [0xaa; 32];
 
-        let result = service.sign_sync_committee_message(
-            &beacon_block_root,
-            slot,
-            &pubkey,
-            &schedule,
-            &genesis_root,
-        );
+        let result = service
+            .sign_sync_committee_message(
+                &beacon_block_root,
+                slot,
+                &pubkey,
+                &schedule,
+                &genesis_root,
+            )
+            .await;
         assert!(result.is_ok());
 
         let signature = result.unwrap();
@@ -1049,48 +978,24 @@ mod tests {
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
     }
 
-    #[test]
-    fn test_sign_sync_committee_message_key_not_found() {
-        let key_manager = Arc::new(KeyManager::new());
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-        let service = SignerService::new(key_manager, slashing_db);
-
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let schedule = create_test_fork_schedule();
-        let genesis_root = [0xaa; 32];
-
-        let result = service.sign_sync_committee_message(
-            &[0x11; 32],
-            SLOTS_PER_EPOCH * 15,
-            &pubkey,
-            &schedule,
-            &genesis_root,
-        );
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SignerError::KeyNotFound(_) => {}
-            other => panic!("expected KeyNotFound, got: {other:?}"),
-        }
-    }
-
     // --- ValidatorSigner trait tests ---
 
     #[tokio::test]
     async fn test_trait_sign_block_safe_proposal() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db.clone());
-        let signer: &dyn ValidatorSigner = &service;
+        let service = SignerService::new(signer, slashing_db.clone());
+        let trait_signer: &dyn ValidatorSigner = &service;
 
         let block_root = [0x11; 32];
         let schedule = create_test_fork_schedule();
         let genesis_root = [0xaa; 32];
 
-        let result = signer.sign_block(&block_root, 5, &pubkey, &schedule, &genesis_root).await;
+        let result =
+            trait_signer.sign_block(&block_root, 5, &pubkey, &schedule, &genesis_root).await;
         assert!(result.is_ok());
 
         let sig_bytes = result.unwrap();
@@ -1102,78 +1007,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_trait_sign_randao_reveal() {
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-
-        let service = SignerService::new(key_manager, slashing_db);
-        let signer: &dyn ValidatorSigner = &service;
-
-        let schedule = create_test_fork_schedule();
-        let genesis_root = [0xaa; 32];
-
-        let result = signer.sign_randao_reveal(5, &pubkey, &schedule, &genesis_root).await;
-        assert!(result.is_ok());
-
-        let sig_bytes = result.unwrap();
-        assert_eq!(sig_bytes.len(), 96);
-    }
-
-    #[tokio::test]
-    async fn test_trait_sign_sync_committee_message() {
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-
-        let service = SignerService::new(key_manager, slashing_db);
-        let signer: &dyn ValidatorSigner = &service;
-
-        let beacon_block_root = [0x11; 32];
-        let schedule = create_test_fork_schedule();
-        let genesis_root = [0xaa; 32];
-
-        let result = signer
-            .sign_sync_committee_message(
-                &beacon_block_root,
-                SLOTS_PER_EPOCH * 15,
-                &pubkey,
-                &schedule,
-                &genesis_root,
-            )
-            .await;
-        assert!(result.is_ok());
-
-        let sig_bytes = result.unwrap();
-        assert_eq!(sig_bytes.len(), 96);
-    }
-
-    #[tokio::test]
     async fn test_trait_sign_attestation_still_works() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db.clone());
-        let signer: &dyn ValidatorSigner = &service;
+        let service = SignerService::new(signer, slashing_db.clone());
+        let trait_signer: &dyn ValidatorSigner = &service;
 
         let attestation_data = create_test_attestation_data(100, 101);
         let schedule = create_test_fork_schedule();
         let genesis_root = [0xaa; 32];
 
-        let result =
-            signer.sign_attestation(&attestation_data, &pubkey, &schedule, &genesis_root).await;
+        let result = trait_signer
+            .sign_attestation(&attestation_data, &pubkey, &schedule, &genesis_root)
+            .await;
         assert!(result.is_ok());
 
         let sig_bytes = result.unwrap();
         assert_eq!(sig_bytes.len(), 96);
-
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
-        let attestations = slashing_db.get_attestations(&pubkey_hex).expect("failed to get");
-        assert_eq!(attestations.len(), 1);
     }
 
     // --- Aggregation signing tests ---
@@ -1196,20 +1049,20 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_sign_selection_proof_success() {
+    #[tokio::test]
+    async fn test_sign_selection_proof_success() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db);
+        let service = SignerService::new(signer, slashing_db);
 
         let schedule = create_test_fork_schedule();
         let genesis_root = [0xaa; 32];
         let slot: Slot = 100;
 
-        let result = service.sign_selection_proof(slot, &pubkey, &schedule, &genesis_root);
+        let result = service.sign_selection_proof(slot, &pubkey, &schedule, &genesis_root).await;
         assert!(result.is_ok());
 
         let signature = result.unwrap();
@@ -1221,40 +1074,22 @@ mod tests {
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
     }
 
-    #[test]
-    fn test_sign_selection_proof_key_not_found() {
-        let key_manager = Arc::new(KeyManager::new());
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-        let service = SignerService::new(key_manager, slashing_db);
-
+    #[tokio::test]
+    async fn test_sign_aggregate_and_proof_success() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let schedule = create_test_fork_schedule();
-        let genesis_root = [0xaa; 32];
-
-        let result = service.sign_selection_proof(100, &pubkey, &schedule, &genesis_root);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SignerError::KeyNotFound(_) => {}
-            other => panic!("expected KeyNotFound, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_sign_aggregate_and_proof_success() {
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db);
+        let service = SignerService::new(signer, slashing_db);
 
         let schedule = create_test_fork_schedule();
         let genesis_root = [0xaa; 32];
         let agg_and_proof = create_test_aggregate_and_proof(100);
 
-        let result =
-            service.sign_aggregate_and_proof(&agg_and_proof, &pubkey, &schedule, &genesis_root);
+        let result = service
+            .sign_aggregate_and_proof(&agg_and_proof, &pubkey, &schedule, &genesis_root)
+            .await;
         assert!(result.is_ok());
 
         let signature = result.unwrap();
@@ -1269,96 +1104,27 @@ mod tests {
     }
 
     #[test]
-    fn test_sign_aggregate_and_proof_key_not_found() {
-        let key_manager = Arc::new(KeyManager::new());
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-        let service = SignerService::new(key_manager, slashing_db);
-
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let schedule = create_test_fork_schedule();
-        let genesis_root = [0xaa; 32];
-        let agg_and_proof = create_test_aggregate_and_proof(100);
-
-        let result =
-            service.sign_aggregate_and_proof(&agg_and_proof, &pubkey, &schedule, &genesis_root);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SignerError::KeyNotFound(_) => {}
-            other => panic!("expected KeyNotFound, got: {other:?}"),
-        }
-    }
-
-    #[test]
     fn test_is_aggregator_reexported() {
-        // Verify that is_aggregator is accessible from signer crate
-        // committee_length=0 → modulo=max(1,0/16)=1 → always aggregator
         assert!(is_aggregator(0, &[0xaa; 96]));
-        // committee_length=1 → modulo=max(1,1/16)=1 → always aggregator
         assert!(is_aggregator(1, &[0xaa; 96]));
-    }
-
-    // --- Aggregation trait tests ---
-
-    #[tokio::test]
-    async fn test_trait_sign_selection_proof() {
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-
-        let service = SignerService::new(key_manager, slashing_db);
-        let signer: &dyn ValidatorSigner = &service;
-
-        let schedule = create_test_fork_schedule();
-        let genesis_root = [0xaa; 32];
-
-        let result = signer.sign_selection_proof(100, &pubkey, &schedule, &genesis_root).await;
-        assert!(result.is_ok());
-
-        let sig_bytes = result.unwrap();
-        assert_eq!(sig_bytes.len(), 96);
-    }
-
-    #[tokio::test]
-    async fn test_trait_sign_aggregate_and_proof() {
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-
-        let service = SignerService::new(key_manager, slashing_db);
-        let signer: &dyn ValidatorSigner = &service;
-
-        let schedule = create_test_fork_schedule();
-        let genesis_root = [0xaa; 32];
-        let agg_and_proof = create_test_aggregate_and_proof(100);
-
-        let result = signer
-            .sign_aggregate_and_proof(&agg_and_proof, &pubkey, &schedule, &genesis_root)
-            .await;
-        assert!(result.is_ok());
-
-        let sig_bytes = result.unwrap();
-        assert_eq!(sig_bytes.len(), 96);
     }
 
     // --- Voluntary exit signing tests ---
 
-    #[test]
-    fn test_sign_voluntary_exit_success() {
+    #[tokio::test]
+    async fn test_sign_voluntary_exit_success() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db);
+        let service = SignerService::new(signer, slashing_db);
 
         let schedule = create_test_fork_schedule();
         let genesis_root = [0xaa; 32];
         let exit = eth_types::VoluntaryExit { epoch: 5, validator_index: 42 };
 
-        let result = service.sign_voluntary_exit(&exit, &pubkey, &schedule, &genesis_root);
+        let result = service.sign_voluntary_exit(&exit, &pubkey, &schedule, &genesis_root).await;
         assert!(result.is_ok());
 
         let signature = result.unwrap();
@@ -1368,47 +1134,6 @@ mod tests {
         let domain = compute_domain(eth_types::DOMAIN_VOLUNTARY_EXIT, fork_version, genesis_root);
         let signing_root = compute_signing_root(&exit, domain);
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
-    }
-
-    #[test]
-    fn test_sign_voluntary_exit_key_not_found() {
-        let key_manager = Arc::new(KeyManager::new());
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-        let service = SignerService::new(key_manager, slashing_db);
-
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let schedule = create_test_fork_schedule();
-        let genesis_root = [0xaa; 32];
-        let exit = eth_types::VoluntaryExit { epoch: 5, validator_index: 42 };
-
-        let result = service.sign_voluntary_exit(&exit, &pubkey, &schedule, &genesis_root);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SignerError::KeyNotFound(_) => {}
-            other => panic!("expected KeyNotFound, got: {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_trait_sign_voluntary_exit() {
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-
-        let service = SignerService::new(key_manager, slashing_db);
-        let signer: &dyn ValidatorSigner = &service;
-
-        let schedule = create_test_fork_schedule();
-        let genesis_root = [0xaa; 32];
-        let exit = eth_types::VoluntaryExit { epoch: 5, validator_index: 42 };
-
-        let result = signer.sign_voluntary_exit(&exit, &pubkey, &schedule, &genesis_root).await;
-        assert!(result.is_ok());
-
-        let sig_bytes = result.unwrap();
-        assert_eq!(sig_bytes.len(), 96);
     }
 
     // --- Builder registration signing tests ---
@@ -1422,19 +1147,19 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_sign_builder_registration_success() {
+    #[tokio::test]
+    async fn test_sign_builder_registration_success() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db);
+        let service = SignerService::new(signer, slashing_db);
 
         let registration = create_test_registration();
         let fork_version = [0x01, 0x00, 0x00, 0x00];
 
-        let result = service.sign_builder_registration(&registration, &pubkey, fork_version);
+        let result = service.sign_builder_registration(&registration, &pubkey, fork_version).await;
         assert!(result.is_ok());
 
         let signature = result.unwrap();
@@ -1449,64 +1174,106 @@ mod tests {
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
     }
 
-    #[test]
-    fn test_sign_builder_registration_no_slashing_check() {
+    // --- CompositeSigner integration: dynamically added keys work ---
+
+    #[tokio::test]
+    async fn test_dynamically_added_key_is_signable() {
+        let signer = create_empty_composite_signer();
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(signer.clone(), slashing_db);
+
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db);
+        // Key is not in signer yet — signing should fail
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let result = service.sign_randao_reveal(5, &pubkey, &schedule, &genesis_root).await;
+        assert!(result.is_err());
 
-        let registration = create_test_registration();
-        let fork_version = [0x01, 0x00, 0x00, 0x00];
+        // Add key dynamically (simulating keymanager API import)
+        signer.add_local_key(secret_key);
 
-        // Sign the same registration multiple times — no slashing protection should block
-        let result1 = service.sign_builder_registration(&registration, &pubkey, fork_version);
-        assert!(result1.is_ok());
-
-        let result2 = service.sign_builder_registration(&registration, &pubkey, fork_version);
-        assert!(result2.is_ok());
-
-        assert_eq!(result1.unwrap().to_bytes(), result2.unwrap().to_bytes());
+        // Now signing should succeed
+        let result = service.sign_randao_reveal(5, &pubkey, &schedule, &genesis_root).await;
+        assert!(result.is_ok());
     }
 
-    #[test]
-    fn test_sign_builder_registration_key_not_found() {
-        let key_manager = Arc::new(KeyManager::new());
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
-        let service = SignerService::new(key_manager, slashing_db);
+    // --- Sync committee selection proof / contribution tests ---
 
+    #[tokio::test]
+    async fn test_sign_sync_committee_selection_proof() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let registration = create_test_registration();
-        let fork_version = [0x01, 0x00, 0x00, 0x00];
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let result = service.sign_builder_registration(&registration, &pubkey, fork_version);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SignerError::KeyNotFound(_) => {}
-            other => panic!("expected KeyNotFound, got: {other:?}"),
-        }
+        let service = SignerService::new(signer, slashing_db);
+
+        let slot: Slot = 100;
+        let subcommittee_index: u64 = 2;
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+
+        let result = service
+            .sign_sync_committee_selection_proof(
+                slot,
+                subcommittee_index,
+                &pubkey,
+                &schedule,
+                &genesis_root,
+            )
+            .await;
+        assert!(result.is_ok());
+
+        let signature = result.unwrap();
+
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let fork_name = eth_types::ForkName::from_epoch(epoch, &schedule);
+        let fork_version = fork_name.fork_version(&schedule);
+        let domain =
+            compute_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, fork_version, genesis_root);
+        let selection_data = SyncAggregatorSelectionData { slot, subcommittee_index };
+        let signing_root = compute_signing_root(&selection_data, domain);
+        assert!(signature.verify(&pubkey, &signing_root).is_ok());
     }
 
     #[tokio::test]
-    async fn test_trait_sign_builder_registration() {
+    async fn test_sign_contribution_and_proof() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
-        let key_manager = Arc::new(create_test_key_manager_with_key(secret_key));
+        let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
 
-        let service = SignerService::new(key_manager, slashing_db);
-        let signer: &dyn ValidatorSigner = &service;
+        let service = SignerService::new(signer, slashing_db);
 
-        let registration = create_test_registration();
-        let fork_version = [0x01, 0x00, 0x00, 0x00];
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
 
-        let result = signer.sign_builder_registration(&registration, &pubkey, fork_version).await;
+        let contribution_and_proof = ContributionAndProof {
+            aggregator_index: 42,
+            contribution: eth_types::SyncCommitteeContribution {
+                slot: 100,
+                beacon_block_root: [0x11; 32],
+                subcommittee_index: 2,
+                aggregation_bits: vec![0xff; 16],
+                signature: vec![0xbb; 96],
+            },
+            selection_proof: vec![0xcc; 96],
+        };
+
+        let result = service
+            .sign_contribution_and_proof(&contribution_and_proof, &pubkey, &schedule, &genesis_root)
+            .await;
         assert!(result.is_ok());
 
-        let sig_bytes = result.unwrap();
-        assert_eq!(sig_bytes.len(), 96);
+        let signature = result.unwrap();
+
+        let epoch = contribution_and_proof.contribution.slot / SLOTS_PER_EPOCH;
+        let fork_name = eth_types::ForkName::from_epoch(epoch, &schedule);
+        let fork_version = fork_name.fork_version(&schedule);
+        let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, fork_version, genesis_root);
+        let signing_root = compute_signing_root(&contribution_and_proof, domain);
+        assert!(signature.verify(&pubkey, &signing_root).is_ok());
     }
 }

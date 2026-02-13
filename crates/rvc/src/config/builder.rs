@@ -15,7 +15,7 @@ use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHand
 use beacon::{BeaconClient, BeaconClientConfig};
 use bn_manager::{BeaconNodeClient, BnManager, BnManagerConfig};
 use builder::BuilderService;
-use crypto::{KeyManager, PublicKey};
+use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey};
 use doppelganger::DoppelgangerService;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkSchedule, Root};
@@ -36,7 +36,7 @@ where
 {
     pub beacon: Arc<dyn BeaconNodeClient>,
     pub beacon_client: Arc<BeaconClient>,
-    pub key_manager: Arc<KeyManager>,
+    pub composite_signer: Arc<CompositeSigner>,
     pub slashing_db: Arc<SlashingDb>,
     pub signer: Arc<SignerService>,
     pub propagator: Arc<Propagator<S>>,
@@ -124,10 +124,10 @@ impl ServiceBuilder {
 
     pub fn build_signer(
         &self,
-        key_manager: Arc<KeyManager>,
+        composite_signer: Arc<CompositeSigner>,
         slashing_db: Arc<SlashingDb>,
     ) -> Arc<SignerService> {
-        let signer = SignerService::new(key_manager, slashing_db);
+        let signer = SignerService::new(composite_signer, slashing_db);
         info!("Created signer service");
         Arc::new(signer)
     }
@@ -266,10 +266,13 @@ impl ServiceBuilder {
         let beacon_client = self.build_beacon()?;
         let key_manager = self.build_key_manager()?;
         let slashing_db = self.build_slashing_db()?;
-        let signer = self.build_signer(key_manager.clone(), slashing_db.clone());
+        let pubkey_map = self.build_pubkey_map(&key_manager);
+        let key_manager_owned = Arc::try_unwrap(key_manager)
+            .unwrap_or_else(|_| panic!("single reference to key_manager after pubkey_map build"));
+        let composite_signer = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager_owned)));
+        let signer = self.build_signer(composite_signer.clone(), slashing_db.clone());
         let propagator = self.build_propagator(beacon_client.clone());
         let slot_clock = self.build_slot_clock()?;
-        let pubkey_map = self.build_pubkey_map(&key_manager);
         let validator_store = self.build_validator_store();
 
         let beacon: Arc<dyn BeaconNodeClient> = beacon_client.clone();
@@ -294,7 +297,7 @@ impl ServiceBuilder {
         let services = BuiltServices {
             beacon,
             beacon_client,
-            key_manager,
+            composite_signer,
             slashing_db,
             signer,
             propagator,
@@ -338,6 +341,7 @@ impl ServiceBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crypto::Signer as _;
     use tempfile::TempDir;
 
     fn create_minimal_config() -> Config {
@@ -455,11 +459,11 @@ mod tests {
         let config = create_minimal_config();
         let builder = ServiceBuilder::new(config);
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = builder.build_signer(key_manager, slashing_db);
+        let signer = builder.build_signer(composite, slashing_db);
 
-        assert!(signer.key_manager().is_empty());
+        assert!(signer.signer().public_keys().is_empty());
     }
 
     #[test]
@@ -532,9 +536,9 @@ mod tests {
         let builder = ServiceBuilder::new(config);
 
         let beacon = builder.build_beacon().unwrap();
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = builder.build_signer(key_manager, slashing_db);
+        let signer = builder.build_signer(composite, slashing_db);
         let validator_store = builder.build_validator_store();
 
         let _builder_service =

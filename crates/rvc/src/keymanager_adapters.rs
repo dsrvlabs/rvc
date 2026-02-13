@@ -8,7 +8,7 @@ use keymanager_api::traits::{
     ValidatorManager,
 };
 use slashing::SlashingDb;
-use tracing::info;
+use tracing::{info, warn};
 use validator_store::ValidatorStore;
 
 pub struct KeystoreManagerAdapter {
@@ -46,24 +46,44 @@ impl KeystoreManager for KeystoreManagerAdapter {
 
         let pubkey_bytes = secret_key.public_key().to_bytes();
 
-        {
-            let keys = self.tracked_keys.lock().expect("tracked_keys lock poisoned");
-            if keys.contains(&pubkey_bytes) {
-                return Err(ImportKeystoreError::Duplicate);
-            }
+        // Hold lock for the entire check-and-insert to prevent TOCTOU race
+        let mut keys = self.tracked_keys.lock().expect("tracked_keys lock poisoned");
+        if keys.contains(&pubkey_bytes) {
+            return Err(ImportKeystoreError::Duplicate);
         }
 
-        // Save keystore file to disk
+        // Save keystore file to disk with restricted permissions (0o600)
         let filename = format!("0x{}.json", hex::encode(pubkey_bytes));
         let file_path = self.keystore_dir.join(&filename);
-        std::fs::write(&file_path, keystore_json)
-            .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
+
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&file_path)
+                .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
+            file.write_all(keystore_json.as_bytes())
+                .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&file_path, keystore_json)
+                .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
+        }
 
         // Add to composite signer for signing
         self.composite_signer.add_local_key(secret_key);
 
-        // Track the key
-        self.tracked_keys.lock().expect("tracked_keys lock poisoned").push(pubkey_bytes);
+        // Track the key (lock still held)
+        keys.push(pubkey_bytes);
 
         info!(pubkey = %hex::encode(pubkey_bytes), "Imported keystore");
         Ok(pubkey_bytes)
@@ -72,17 +92,19 @@ impl KeystoreManager for KeystoreManagerAdapter {
     fn delete_keystore(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError> {
         let mut keys = self.tracked_keys.lock().expect("tracked_keys lock poisoned");
         if let Some(pos) = keys.iter().position(|k| k == pubkey) {
-            keys.remove(pos);
-            drop(keys);
-
-            self.composite_signer.remove_local_key(pubkey);
-
+            // Delete file FIRST — if IO fails, memory state remains consistent
             let filename = format!("0x{}.json", hex::encode(pubkey));
             let file_path = self.keystore_dir.join(&filename);
             if file_path.exists() {
                 std::fs::remove_file(&file_path)
                     .map_err(|e| DeleteKeystoreError::Io(e.to_string()))?;
             }
+
+            // Only remove from memory after file delete succeeds
+            keys.remove(pos);
+            drop(keys);
+
+            self.composite_signer.remove_local_key(pubkey);
 
             info!(pubkey = %hex::encode(pubkey), "Deleted keystore");
             Ok(true)
@@ -146,15 +168,21 @@ impl ValidatorManagerAdapter {
 impl ValidatorManager for ValidatorManagerAdapter {
     fn add_validator(&self, pubkey: Pubkey, enabled: bool) {
         let pubkey_hex = format!("0x{}", hex::encode(pubkey));
-        info!(pubkey = %pubkey_hex, enabled, "Adding validator");
-        let _ = &self.validator_store;
+        let mut config = validator_store::ValidatorConfig::new(pubkey);
+        config.enabled = enabled;
+        self.validator_store.add_validator(config);
+        info!(pubkey = %pubkey_hex, enabled, "Added validator to store");
     }
 
     fn remove_validator(&self, pubkey: &Pubkey) -> bool {
         let pubkey_hex = format!("0x{}", hex::encode(pubkey));
-        info!(pubkey = %pubkey_hex, "Removing validator");
-        let _ = &self.validator_store;
-        true
+        let removed = self.validator_store.remove_validator(pubkey).is_some();
+        if removed {
+            info!(pubkey = %pubkey_hex, "Removed validator from store");
+        } else {
+            warn!(pubkey = %pubkey_hex, "Validator not found in store for removal");
+        }
+        removed
     }
 }
 
@@ -202,6 +230,14 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
     }
 
     fn import_remote_key(&self, pubkey: Pubkey, url: String) -> Result<(), ImportRemoteKeyError> {
+        // Validate URL scheme to prevent SSRF
+        if !url.starts_with("https://") && !url.starts_with("http://") {
+            return Err(ImportRemoteKeyError::Other(format!(
+                "invalid URL scheme: must be http:// or https://, got: {}",
+                url
+            )));
+        }
+
         let mut keys = self.tracked_keys.lock().expect("tracked_keys lock poisoned");
         if keys.iter().any(|(pk, _)| *pk == pubkey) {
             return Err(ImportRemoteKeyError::Duplicate);
@@ -334,9 +370,18 @@ mod tests {
     #[test]
     fn test_validator_manager_adapter_add_remove() {
         let store = Arc::new(ValidatorStore::new([0u8; 20], 100));
-        let adapter = ValidatorManagerAdapter::new(store);
-        adapter.add_validator(test_pubkey(1), false);
+        let adapter = ValidatorManagerAdapter::new(store.clone());
+        adapter.add_validator(test_pubkey(1), true);
+
+        // Verify the validator was actually added to the store
+        assert!(store.get_config(&test_pubkey(1)).is_some());
+
+        // Remove and verify
         assert!(adapter.remove_validator(&test_pubkey(1)));
+        assert!(store.get_config(&test_pubkey(1)).is_none());
+
+        // Removing non-existent returns false
+        assert!(!adapter.remove_validator(&test_pubkey(99)));
     }
 
     // --- DoppelgangerMonitorAdapter tests ---
@@ -408,6 +453,29 @@ mod tests {
     fn test_remote_key_adapter_delete_nonexistent() {
         let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer());
         assert_eq!(adapter.delete_remote_key(&test_pubkey(99)).unwrap(), false);
+    }
+
+    #[test]
+    fn test_remote_key_adapter_import_rejects_invalid_url_scheme() {
+        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer());
+        let pk = test_pubkey(1);
+
+        // file:// scheme — SSRF risk
+        let result = adapter.import_remote_key(pk, "file:///etc/passwd".to_string());
+        assert!(matches!(result, Err(ImportRemoteKeyError::Other(_))));
+
+        // ftp:// scheme
+        let result = adapter.import_remote_key(pk, "ftp://evil.com".to_string());
+        assert!(matches!(result, Err(ImportRemoteKeyError::Other(_))));
+
+        // No scheme
+        let result = adapter.import_remote_key(pk, "signer.example.com".to_string());
+        assert!(matches!(result, Err(ImportRemoteKeyError::Other(_))));
+
+        // Valid schemes should be accepted
+        let pk2 = test_pubkey(2);
+        let result = adapter.import_remote_key(pk2, "https://signer.example.com".to_string());
+        assert!(result.is_ok());
     }
 
     // --- Keystore import with real secret key ---

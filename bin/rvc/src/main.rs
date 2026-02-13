@@ -103,6 +103,10 @@ enum Commands {
         #[arg(long)]
         keymanager_enabled: bool,
 
+        /// Disable the Keymanager API server (overrides config file)
+        #[arg(long, conflicts_with = "keymanager_enabled")]
+        no_keymanager: bool,
+
         /// Bind address for the Keymanager API server (default: 127.0.0.1:5062)
         #[arg(long)]
         keymanager_address: Option<String>,
@@ -182,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
             no_doppelganger_detection,
             log_level,
             keymanager_enabled,
+            no_keymanager,
             keymanager_address,
             keymanager_token_file,
             remote_signer_url,
@@ -203,7 +208,13 @@ async fn main() -> anyhow::Result<()> {
                 graffiti,
                 log_level: Some(log_level),
                 doppelganger_detection: if no_doppelganger_detection { Some(false) } else { None },
-                keymanager_enabled: if keymanager_enabled { Some(true) } else { None },
+                keymanager_enabled: if no_keymanager {
+                    Some(false)
+                } else if keymanager_enabled {
+                    Some(true)
+                } else {
+                    None
+                },
                 keymanager_address,
                 keymanager_token_file,
                 remote_signer_url,
@@ -382,6 +393,12 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
 
     let pubkey_map = builder.build_pubkey_map(&key_manager);
 
+    // Create shared CompositeSigner from loaded keys
+    let key_manager_owned = std::sync::Arc::try_unwrap(key_manager)
+        .unwrap_or_else(|_| panic!("single reference to key_manager after pubkey_map build"));
+    let local_signer = crypto::LocalSigner::new(key_manager_owned);
+    let composite_signer = std::sync::Arc::new(crypto::CompositeSigner::new(local_signer));
+
     // Resolve validator indices using BnManager (via trait)
     let beacon_for_resolve: &dyn BeaconNodeClient = bn_manager.as_ref();
     let validator_index_map = resolve_validator_indices(beacon_for_resolve, &pubkey_map).await;
@@ -448,7 +465,7 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
     }
 
     // Step 7: Build remaining services
-    let signer = builder.build_signer(key_manager.clone(), slashing_db.clone());
+    let signer = builder.build_signer(composite_signer.clone(), slashing_db.clone());
     let propagator = builder.build_propagator(beacon_client.clone());
     let validator_store = builder.build_validator_store();
 
@@ -489,17 +506,20 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
         orchestrator_config.fork_schedule.genesis_fork_version,
     )));
 
-    // Step 7b: Optionally start Keymanager API server
-    if config.keymanager_enabled {
-        let composite_signer = std::sync::Arc::new(crypto::CompositeSigner::new(
-            crypto::LocalSigner::new(crypto::KeyManager::new()),
-        ));
-
-        // If remote signer URL is configured, create initial remote signer
-        if let Some(ref url) = config.remote_signer_url {
-            info!(url = %url, "Configuring remote signer");
+    // Step 7b: Configure remote signer if URL provided
+    if let Some(ref url) = config.remote_signer_url {
+        if !config.keymanager_enabled {
+            warn!(
+                url = %url,
+                "Remote signer URL configured but Keymanager API is disabled; \
+                 enable --keymanager-enabled to manage remote keys at runtime"
+            );
         }
+        info!(url = %url, "Remote signer URL configured");
+    }
 
+    // Step 7c: Optionally start Keymanager API server
+    if config.keymanager_enabled {
         let token_path = config
             .keymanager_token_file
             .clone()
@@ -529,9 +549,10 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
             );
         }
 
+        let km_composite = composite_signer.clone();
         let keystore_mgr = std::sync::Arc::new(KeystoreManagerAdapter::new(
             config.keystore_path.clone(),
-            composite_signer.clone(),
+            km_composite.clone(),
         ));
         let slashing_prot = std::sync::Arc::new(SlashingProtectionAdapter::new(
             slashing_db.clone(),
@@ -540,8 +561,7 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
         let validator_mgr =
             std::sync::Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
         let doppelganger_mon = std::sync::Arc::new(DoppelgangerMonitorAdapter::new());
-        let remote_key_mgr =
-            std::sync::Arc::new(RemoteKeyManagerAdapter::new(composite_signer.clone()));
+        let remote_key_mgr = std::sync::Arc::new(RemoteKeyManagerAdapter::new(km_composite));
 
         let km_server = keymanager_api::KeymanagerServer::new(
             keystore_mgr,

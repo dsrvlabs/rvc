@@ -487,12 +487,16 @@ where
                 };
 
                 // Compute selection proof and determine if aggregator
-                let selection_proof = match self.signer.sign_selection_proof(
-                    slot,
-                    &pubkey,
-                    &self.config.fork_schedule,
-                    &self.config.genesis_validators_root,
-                ) {
+                let selection_proof = match self
+                    .signer
+                    .sign_selection_proof(
+                        slot,
+                        &pubkey,
+                        &self.config.fork_schedule,
+                        &self.config.genesis_validators_root,
+                    )
+                    .await
+                {
                     Ok(sig) => sig,
                     Err(e) => {
                         warn!(
@@ -630,14 +634,17 @@ where
         let mut messages = Vec::new();
 
         for (duty, pubkey) in matching_duties.iter().zip(matching_pubkeys.iter()) {
-            match SignerService::sign_sync_committee_message(
-                &self.signer,
-                &head_root,
-                slot,
-                pubkey,
-                &self.config.fork_schedule,
-                &self.config.genesis_validators_root,
-            ) {
+            match self
+                .signer
+                .sign_sync_committee_message(
+                    &head_root,
+                    slot,
+                    pubkey,
+                    &self.config.fork_schedule,
+                    &self.config.genesis_validators_root,
+                )
+                .await
+            {
                 Ok(sig) => {
                     messages.push(beacon::SyncCommitteeMessage {
                         slot,
@@ -702,25 +709,30 @@ where
                 .map(|&pos| pos / (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT))
                 .collect();
 
-            let secret_key = match self.signer.key_manager().get_secret_key(pubkey) {
-                Some(sk) => sk,
-                None => {
-                    warn!(
-                        validator_index = duty.validator_index,
-                        "Secret key not found for sync contribution signing"
-                    );
-                    continue;
-                }
-            };
-
             for subcommittee_index in &subcommittee_indices {
-                let selection_proof = crypto::sign_sync_committee_selection_proof(
-                    slot,
-                    *subcommittee_index,
-                    secret_key,
-                    &self.config.fork_schedule,
-                    self.config.genesis_validators_root,
-                );
+                let selection_proof = match self
+                    .signer
+                    .sign_sync_committee_selection_proof(
+                        slot,
+                        *subcommittee_index,
+                        pubkey,
+                        &self.config.fork_schedule,
+                        &self.config.genesis_validators_root,
+                    )
+                    .await
+                {
+                    Ok(sig) => sig,
+                    Err(e) => {
+                        warn!(
+                            slot,
+                            subcommittee_index,
+                            validator_index = duty.validator_index,
+                            error = %e,
+                            "Failed to sign sync committee selection proof"
+                        );
+                        continue;
+                    }
+                };
 
                 if !is_sync_committee_aggregator(&selection_proof.to_bytes()) {
                     debug!(
@@ -776,12 +788,28 @@ where
                     selection_proof: selection_proof.to_bytes().to_vec(),
                 };
 
-                let sig = crypto::sign_contribution_and_proof(
-                    &proof,
-                    secret_key,
-                    &self.config.fork_schedule,
-                    self.config.genesis_validators_root,
-                );
+                let sig = match self
+                    .signer
+                    .sign_contribution_and_proof(
+                        &proof,
+                        pubkey,
+                        &self.config.fork_schedule,
+                        &self.config.genesis_validators_root,
+                    )
+                    .await
+                {
+                    Ok(sig) => sig,
+                    Err(e) => {
+                        warn!(
+                            slot,
+                            subcommittee_index,
+                            validator_index = duty.validator_index,
+                            error = %e,
+                            "Failed to sign contribution and proof"
+                        );
+                        continue;
+                    }
+                };
 
                 signed_proofs.push(SignedContributionAndProof {
                     message: proof,
@@ -832,13 +860,16 @@ where
                 None => continue,
             };
 
-            let selection_proof = match SignerService::sign_selection_proof(
-                &self.signer,
-                slot,
-                &pubkey,
-                &self.config.fork_schedule,
-                &self.config.genesis_validators_root,
-            ) {
+            let selection_proof = match self
+                .signer
+                .sign_selection_proof(
+                    slot,
+                    &pubkey,
+                    &self.config.fork_schedule,
+                    &self.config.genesis_validators_root,
+                )
+                .await
+            {
                 Ok(sig) => sig,
                 Err(e) => {
                     warn!(
@@ -960,13 +991,16 @@ where
                 selection_proof: selection_proof.to_bytes().to_vec(),
             };
 
-            let signature = match SignerService::sign_aggregate_and_proof(
-                &self.signer,
-                &aggregate_and_proof,
-                &pubkey,
-                &self.config.fork_schedule,
-                &self.config.genesis_validators_root,
-            ) {
+            let signature = match self
+                .signer
+                .sign_aggregate_and_proof(
+                    &aggregate_and_proof,
+                    &pubkey,
+                    &self.config.fork_schedule,
+                    &self.config.genesis_validators_root,
+                )
+                .await
+            {
                 Ok(sig) => sig,
                 Err(e) => {
                     warn!(
@@ -1272,12 +1306,16 @@ where
         let target_epoch = crypto_attestation_data.target.epoch;
         let fork = self.derive_fork_for_epoch(target_epoch);
 
-        let signature = match self.signer.sign_attestation(
-            &crypto_attestation_data,
-            &pubkey,
-            &fork,
-            self.config.genesis_validators_root,
-        ) {
+        let signature = match self
+            .signer
+            .sign_attestation(
+                &crypto_attestation_data,
+                &pubkey,
+                &fork,
+                self.config.genesis_validators_root,
+            )
+            .await
+        {
             Ok(sig) => sig,
             Err(e) => {
                 return AttestationResult {
@@ -1436,7 +1474,7 @@ mod tests {
     use async_trait::async_trait;
     use beacon::{BeaconClient, BeaconClientConfig};
     use block_service::ProduceBlockResponse;
-    use crypto::{KeyManager, SecretKey};
+    use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
     use slashing::SlashingDb;
     use std::future::Future;
     use std::pin::Pin;
@@ -1673,9 +1711,9 @@ mod tests {
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1713,9 +1751,9 @@ mod tests {
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1751,9 +1789,9 @@ mod tests {
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1819,10 +1857,10 @@ mod tests {
 
         let mut key_manager = KeyManager::new();
         key_manager.insert(secret_key);
-        let key_manager = Arc::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
 
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1856,9 +1894,9 @@ mod tests {
         let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1896,9 +1934,9 @@ mod tests {
         let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1935,9 +1973,9 @@ mod tests {
         let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2117,9 +2155,9 @@ mod tests {
         let pubkey = secret_key.public_key();
         let mut key_manager = KeyManager::new();
         key_manager.insert(secret_key);
-        let key_manager = Arc::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2444,10 +2482,10 @@ mod tests {
 
         let mut key_manager = KeyManager::new();
         key_manager.insert(secret_key);
-        let key_manager = Arc::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
 
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2502,9 +2540,9 @@ mod tests {
         let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2575,9 +2613,9 @@ mod tests {
 
         let mut key_manager = KeyManager::new();
         key_manager.insert(secret_key);
-        let key_manager = Arc::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2658,10 +2696,10 @@ mod tests {
 
         let mut key_manager = KeyManager::new();
         key_manager.insert(secret_key);
-        let key_manager = Arc::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
 
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2712,9 +2750,9 @@ mod tests {
         let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2783,9 +2821,9 @@ mod tests {
 
         let mut key_manager = KeyManager::new();
         key_manager.insert(secret_key);
-        let key_manager = Arc::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2850,10 +2888,10 @@ mod tests {
 
         let mut key_manager = KeyManager::new();
         key_manager.insert(secret_key);
-        let key_manager = Arc::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
 
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         // Set up validator store with a builder-enabled validator
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
@@ -2921,10 +2959,10 @@ mod tests {
 
         let mut key_manager = KeyManager::new();
         key_manager.insert(secret_key);
-        let key_manager = Arc::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
 
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
         let mut config = validator_store::ValidatorConfig::new(pubkey_bytes);
@@ -2976,9 +3014,9 @@ mod tests {
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -3026,10 +3064,10 @@ mod tests {
 
         let mut key_manager = KeyManager::new();
         key_manager.insert(secret_key);
-        let key_manager = Arc::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
 
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         // Validator with builder_proposals = false (default)
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
