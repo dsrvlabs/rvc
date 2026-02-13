@@ -44,6 +44,14 @@ pub async fn import_keystores(
         ));
     }
 
+    // Import slashing protection FIRST — before any keystores are activated.
+    // This prevents a window where signing keys exist without slashing records.
+    if let Some(ref slashing_json) = request.slashing_protection {
+        if let Err(e) = state.slashing_protection.import_interchange(slashing_json) {
+            return Err(ApiError::Internal(format!("failed to import slashing protection: {e}")));
+        }
+    }
+
     let mut results = Vec::with_capacity(request.keystores.len());
 
     for (keystore_json, password) in request.keystores.iter().zip(request.passwords.iter()) {
@@ -71,12 +79,6 @@ pub async fn import_keystores(
         }
     }
 
-    if let Some(ref slashing_json) = request.slashing_protection {
-        if let Err(e) = state.slashing_protection.import_interchange(slashing_json) {
-            tracing::warn!(error = %e, "Failed to import slashing protection data");
-        }
-    }
-
     Ok(Json(ImportKeystoresResponse { data: results }))
 }
 
@@ -84,50 +86,59 @@ pub async fn delete_keystores(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DeleteKeystoresRequest>,
 ) -> Result<Json<DeleteKeystoresResponse>, ApiError> {
-    let mut results = Vec::with_capacity(request.pubkeys.len());
-    let mut deleted_pubkeys = Vec::new();
+    // Parse all pubkeys and identify which ones exist for slashing export
+    let parsed: Vec<Result<Pubkey, String>> =
+        request.pubkeys.iter().map(|s| parse_pubkey(s)).collect();
 
-    for pubkey_str in &request.pubkeys {
-        let pubkey = match parse_pubkey(pubkey_str) {
-            Ok(pk) => pk,
-            Err(e) => {
-                results.push(DeleteKeystoreResult { status: DeleteStatus::Error, message: e });
-                continue;
-            }
-        };
+    let existing_keys: Vec<Pubkey> = parsed
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .filter(|pk| state.keystore_manager.has_key(pk))
+        .copied()
+        .collect();
 
-        match state.keystore_manager.delete_keystore(&pubkey) {
-            Ok(true) => {
-                state.validator_manager.remove_validator(&pubkey);
-                deleted_pubkeys.push(pubkey);
-                results.push(DeleteKeystoreResult {
-                    status: DeleteStatus::Deleted,
-                    message: String::new(),
-                });
-            }
-            Ok(false) => {
-                results.push(DeleteKeystoreResult {
-                    status: DeleteStatus::NotFound,
-                    message: String::new(),
-                });
-            }
-            Err(e) => {
-                results.push(DeleteKeystoreResult {
-                    status: DeleteStatus::Error,
-                    message: e.to_string(),
-                });
-            }
-        }
-    }
-
-    let slashing_protection = if deleted_pubkeys.is_empty() {
+    // Export slashing protection BEFORE any deletions
+    let slashing_protection = if existing_keys.is_empty() {
         empty_interchange()
     } else {
-        state.slashing_protection.export_interchange(&deleted_pubkeys).unwrap_or_else(|e| {
+        state.slashing_protection.export_interchange(&existing_keys).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "Failed to export slashing protection");
             empty_interchange()
         })
     };
+
+    // Now process deletions
+    let mut results = Vec::with_capacity(request.pubkeys.len());
+    for parse_result in &parsed {
+        match parse_result {
+            Ok(pubkey) => match state.keystore_manager.delete_keystore(pubkey) {
+                Ok(true) => {
+                    state.validator_manager.remove_validator(pubkey);
+                    state.doppelganger_monitor.stop_monitoring(pubkey);
+                    results.push(DeleteKeystoreResult {
+                        status: DeleteStatus::Deleted,
+                        message: String::new(),
+                    });
+                }
+                Ok(false) => {
+                    results.push(DeleteKeystoreResult {
+                        status: DeleteStatus::NotFound,
+                        message: String::new(),
+                    });
+                }
+                Err(e) => {
+                    results.push(DeleteKeystoreResult {
+                        status: DeleteStatus::Error,
+                        message: e.to_string(),
+                    });
+                }
+            },
+            Err(e) => {
+                results
+                    .push(DeleteKeystoreResult { status: DeleteStatus::Error, message: e.clone() });
+            }
+        }
+    }
 
     Ok(Json(DeleteKeystoresResponse { data: results, slashing_protection }))
 }
@@ -305,6 +316,13 @@ mod tests {
         fn start_monitoring(&self, pubkey: Pubkey) {
             self.monitored.lock().unwrap().push(pubkey);
         }
+
+        fn stop_monitoring(&self, pubkey: &Pubkey) {
+            let mut monitored = self.monitored.lock().unwrap();
+            if let Some(pos) = monitored.iter().position(|pk| pk == pubkey) {
+                monitored.remove(pos);
+            }
+        }
     }
 
     // --- Test helpers ---
@@ -325,7 +343,7 @@ mod tests {
 
     struct TestApp {
         keystore_manager: Arc<MockKeystoreManager>,
-        slashing_protection: Arc<MockSlashingProtection>,
+        slashing_protection: Arc<dyn SlashingProtection>,
         validator_manager: Arc<MockValidatorManager>,
         doppelganger_monitor: Arc<MockDoppelgangerMonitor>,
     }
@@ -349,6 +367,27 @@ mod tests {
             }
         }
 
+        fn with_failing_slashing() -> Self {
+            Self {
+                keystore_manager: Arc::new(MockKeystoreManager::new()),
+                slashing_protection: Arc::new(FailingSlashingProtection),
+                validator_manager: Arc::new(MockValidatorManager::new()),
+                doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+            }
+        }
+
+        fn with_key_aware_slashing(keys: Vec<Pubkey>) -> Self {
+            let keystore_manager = Arc::new(MockKeystoreManager::with_keys(keys));
+            Self {
+                slashing_protection: Arc::new(KeyAwareSlashingProtection {
+                    keystore_manager: keystore_manager.clone(),
+                }),
+                keystore_manager,
+                validator_manager: Arc::new(MockValidatorManager::new()),
+                doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+            }
+        }
+
         fn router(&self) -> Router {
             let state = Arc::new(AppState {
                 keystore_manager: self.keystore_manager.clone(),
@@ -366,6 +405,53 @@ mod tests {
 
         fn authed_router(&self, token: &str) -> Router {
             auth::with_auth(self.router(), Arc::new(token.to_string()))
+        }
+    }
+
+    struct FailingSlashingProtection;
+
+    impl SlashingProtection for FailingSlashingProtection {
+        fn import_interchange(&self, _interchange_json: &str) -> Result<(), String> {
+            Err("slashing DB corrupted".into())
+        }
+
+        fn export_interchange(&self, _pubkeys: &[Pubkey]) -> Result<String, String> {
+            Err("export failed".into())
+        }
+    }
+
+    /// Mock that checks key existence in a shared KeystoreManager at export time.
+    struct KeyAwareSlashingProtection {
+        keystore_manager: Arc<MockKeystoreManager>,
+    }
+
+    impl SlashingProtection for KeyAwareSlashingProtection {
+        fn import_interchange(&self, _interchange_json: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, String> {
+            // Only export data for keys that still exist in the keystore manager
+            let existing: Vec<&Pubkey> =
+                pubkeys.iter().filter(|pk| self.keystore_manager.has_key(pk)).collect();
+            let data: Vec<serde_json::Value> = existing
+                .iter()
+                .map(|pk| {
+                    serde_json::json!({
+                        "pubkey": format!("0x{}", hex::encode(pk)),
+                        "signed_blocks": [],
+                        "signed_attestations": []
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({
+                "metadata": {
+                    "interchange_format_version": "5",
+                    "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
+                },
+                "data": data
+            })
+            .to_string())
         }
     }
 
@@ -514,7 +600,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_import_with_slashing_protection() {
-        let app = TestApp::new();
+        let mock_slashing = Arc::new(MockSlashingProtection::new());
+        let app = TestApp {
+            keystore_manager: Arc::new(MockKeystoreManager::new()),
+            slashing_protection: mock_slashing.clone(),
+            validator_manager: Arc::new(MockValidatorManager::new()),
+            doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+        };
         let slashing_data = serde_json::json!({
             "metadata": {
                 "interchange_format_version": "5",
@@ -544,7 +636,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let imported = app.slashing_protection.imported.lock().unwrap();
+        let imported = mock_slashing.imported.lock().unwrap();
         assert_eq!(imported.len(), 1);
     }
 
@@ -821,5 +913,188 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    // --- Finding #1 & #2: Slashing import must happen FIRST and failure is a hard error ---
+
+    #[tokio::test]
+    async fn test_import_slashing_failure_returns_error_no_keys_imported() {
+        let app = TestApp::with_failing_slashing();
+        let slashing_data = serde_json::json!({
+            "metadata": {
+                "interchange_format_version": "5",
+                "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "data": []
+        })
+        .to_string();
+
+        let request_body = serde_json::json!({
+            "keystores": [mock_keystore_json(1)],
+            "passwords": ["password1"],
+            "slashing_protection": slashing_data
+        });
+
+        let response = app
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/eth/v1/keystores")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Must return an error status, NOT 200
+        assert_eq!(response.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+        // No keys should have been imported
+        assert!(!app.keystore_manager.has_key(&test_pubkey(1)));
+
+        // No validators should have been added
+        let validators = app.validator_manager.validators.lock().unwrap();
+        assert!(validators.is_empty());
+
+        // No doppelganger monitoring started
+        let monitored = app.doppelganger_monitor.monitored.lock().unwrap();
+        assert!(monitored.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_import_without_slashing_data_succeeds() {
+        // When no slashing_protection is provided, import should still work
+        let app = TestApp::with_failing_slashing();
+        let request_body = serde_json::json!({
+            "keystores": [mock_keystore_json(1)],
+            "passwords": ["password1"]
+        });
+
+        let response = app
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/eth/v1/keystores")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(app.keystore_manager.has_key(&test_pubkey(1)));
+    }
+
+    // --- Finding #3: message field should be omitted when empty ---
+
+    #[test]
+    fn test_import_success_result_omits_empty_message() {
+        let result =
+            ImportKeystoreResult { status: ImportStatus::Imported, message: String::new() };
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(
+            json.get("message").is_none(),
+            "success result should not have 'message' key, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_delete_success_result_omits_empty_message() {
+        let result = DeleteKeystoreResult { status: DeleteStatus::Deleted, message: String::new() };
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(
+            json.get("message").is_none(),
+            "success result should not have 'message' key, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_error_result_includes_message() {
+        let result = ImportKeystoreResult {
+            status: ImportStatus::Error,
+            message: "something went wrong".into(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["message"], "something went wrong");
+    }
+
+    // --- Finding #4: Delete must export slashing BEFORE deleting keystores ---
+
+    #[tokio::test]
+    async fn test_delete_exports_slashing_before_deletion() {
+        // Uses key-aware slashing mock that only returns data for keys
+        // that still exist in the keystore manager
+        let app = TestApp::with_key_aware_slashing(vec![test_pubkey(1)]);
+        let request_body = serde_json::json!({
+            "pubkeys": [format!("0x{}", test_pubkey_hex(1))]
+        });
+
+        let response = app
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/eth/v1/keystores")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: DeleteKeystoresResponse = serde_json::from_slice(&body).unwrap();
+
+        // Key should be deleted
+        assert_eq!(resp.data[0].status, DeleteStatus::Deleted);
+        assert!(!app.keystore_manager.has_key(&test_pubkey(1)));
+
+        // Slashing export should contain the deleted key's data
+        // (only possible if export happened BEFORE deletion)
+        let export: serde_json::Value = serde_json::from_str(&resp.slashing_protection).unwrap();
+        assert_eq!(
+            export["data"].as_array().unwrap().len(),
+            1,
+            "export should contain data for the deleted key (export must happen before delete)"
+        );
+    }
+
+    // --- Finding #5: Delete must call stop_monitoring ---
+
+    #[tokio::test]
+    async fn test_delete_calls_stop_monitoring() {
+        let app = TestApp::with_keys(vec![test_pubkey(1), test_pubkey(2)]);
+        // Pre-populate monitoring
+        app.doppelganger_monitor.start_monitoring(test_pubkey(1));
+        app.doppelganger_monitor.start_monitoring(test_pubkey(2));
+
+        let request_body = serde_json::json!({
+            "pubkeys": [format!("0x{}", test_pubkey_hex(1))]
+        });
+
+        let response = app
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/eth/v1/keystores")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+        // Key 1 should no longer be monitored, key 2 should remain
+        let monitored = app.doppelganger_monitor.monitored.lock().unwrap();
+        assert_eq!(monitored.len(), 1);
+        assert_eq!(monitored[0], test_pubkey(2));
     }
 }

@@ -32,7 +32,7 @@ pub enum ImportStatus {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ImportKeystoreResult {
     pub status: ImportStatus,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub message: String,
 }
 
@@ -58,7 +58,7 @@ pub enum DeleteStatus {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteKeystoreResult {
     pub status: DeleteStatus,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub message: String,
 }
 

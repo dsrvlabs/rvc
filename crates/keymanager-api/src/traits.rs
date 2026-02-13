@@ -47,4 +47,5 @@ pub trait ValidatorManager: Send + Sync {
 /// Triggers doppelganger detection for newly imported keys.
 pub trait DoppelgangerMonitor: Send + Sync {
     fn start_monitoring(&self, pubkey: Pubkey);
+    fn stop_monitoring(&self, pubkey: &Pubkey);
 }
