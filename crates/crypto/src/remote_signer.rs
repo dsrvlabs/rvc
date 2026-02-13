@@ -70,7 +70,11 @@ impl Signer for RemoteSigner {
         signing_root: &Root,
         pubkey: &[u8; PUBLIC_KEY_BYTES_LEN],
     ) -> Result<Signature, SigningError> {
-        let identifier = hex::encode(pubkey);
+        if !self.pubkeys.contains(pubkey) {
+            return Err(SigningError::KeyNotFound(hex::encode(pubkey)));
+        }
+
+        let identifier = format!("0x{}", hex::encode(pubkey));
         let url = format!("{}/api/v1/eth2/sign/{}", self.url, identifier);
 
         let request_body = SignRequest { signing_root: format!("0x{}", hex::encode(signing_root)) };
@@ -263,6 +267,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_remote_signer_sign_unknown_pubkey_returns_key_not_found() {
+        let pk_bytes = [0xaa; PUBLIC_KEY_BYTES_LEN];
+        let unknown_pk = [0xbb; PUBLIC_KEY_BYTES_LEN];
+        let config = RemoteSignerConfig::new("http://localhost:9000");
+        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+
+        let result = signer.sign(&[0xab; 32], &unknown_pk).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SigningError::KeyNotFound(pk_hex) => {
+                assert_eq!(pk_hex, hex::encode(unknown_pk));
+            }
+            other => panic!("expected KeyNotFound, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_remote_signer_object_safety() {
         let sk = SecretKey::generate();
         let pk_bytes = sk.public_key().to_bytes();
@@ -313,7 +334,7 @@ mod tests {
         let sig_hex = format!("0x{}", hex::encode(expected_sig.to_bytes()));
 
         let mock_server = MockServer::start().await;
-        let expected_path = format!("/api/v1/eth2/sign/{}", hex::encode(pk_bytes));
+        let expected_path = format!("/api/v1/eth2/sign/0x{}", hex::encode(pk_bytes));
         Mock::given(method("POST"))
             .and(wiremock::matchers::path(expected_path))
             .respond_with(
