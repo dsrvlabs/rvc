@@ -75,10 +75,12 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             self.sign_and_publish_full(&response, slot, pubkey).await?
         };
 
+        let block_type = if is_blinded { "blinded" } else { "unblinded" };
         info!(
             slot,
-            blinded = is_blinded,
+            block_type,
             consensus_version = %response.consensus_version,
+            value_wei = response.execution_payload_value.as_deref().unwrap_or("unknown"),
             "block proposed"
         );
 
@@ -701,6 +703,97 @@ mod tests {
 
         assert_eq!(beacon_arc.publish_calls.borrow().len(), 1);
         assert!(beacon_arc.publish_blinded_calls.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_blinded_block_signing_failure_prevents_publish() {
+        let pubkey = test_pubkey();
+        let slot = 200;
+        let block = test_blinded_block(slot);
+        let beacon = MockBeaconClient::blinded(block);
+        let signer = MockSigner::new().with_block_error();
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(signer),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), BlockServiceError::Signer(_)));
+
+        // Verify no publish calls were made
+        assert!(beacon_arc.publish_blinded_calls.borrow().is_empty());
+        assert!(beacon_arc.publish_calls.borrow().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_blinded_block_publish_failure() {
+        let pubkey = test_pubkey();
+        let slot = 200;
+        let block = test_blinded_block(slot);
+        let beacon = MockBeaconClient::blinded(block).with_publish_error();
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), BlockServiceError::Beacon(_)));
+    }
+
+    #[tokio::test]
+    async fn test_blinded_and_unblinded_same_slot_have_different_block_roots() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+
+        // Propose unblinded block
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block.clone());
+        let signer = MockSigner::new();
+        let signer_arc = Arc::new(signer);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            Arc::new(beacon),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+        let unblinded_result = service.propose_block(slot, &pubkey).await.unwrap();
+
+        // Propose blinded block at same slot
+        let blinded_block = test_blinded_block(slot);
+        let beacon2 = MockBeaconClient::blinded(blinded_block.clone());
+        let signer2 = MockSigner::new();
+        let signer2_arc = Arc::new(signer2);
+        let store2 = test_validator_store(&pubkey);
+        let service2 = BlockService::new(
+            signer2_arc.clone(),
+            Arc::new(beacon2),
+            Arc::new(store2),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+        let blinded_result = service2.propose_block(slot, &pubkey).await.unwrap();
+
+        // Block roots must differ (slashing protection uses these to detect double proposals)
+        assert_ne!(
+            unblinded_result.block_root, blinded_result.block_root,
+            "blinded and unblinded blocks at same slot must have different roots for slashing protection"
+        );
+
+        // Both signers were called with the respective root
+        let unblinded_calls = signer_arc.block_calls.borrow();
+        let blinded_calls = signer2_arc.block_calls.borrow();
+        assert_eq!(unblinded_calls.len(), 1);
+        assert_eq!(blinded_calls.len(), 1);
+        assert_eq!(unblinded_calls[0].0, unblinded_result.block_root);
+        assert_eq!(blinded_calls[0].0, blinded_result.block_root);
     }
 
     #[tokio::test]
