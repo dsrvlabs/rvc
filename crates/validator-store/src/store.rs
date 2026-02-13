@@ -178,21 +178,35 @@ impl ValidatorStore {
         let content = std::fs::read_to_string(path)?;
         let toml_config: TomlConfig = toml::from_str(&content)?;
 
+        // Parse-first: compute all new values before any mutation.
+        let mut new_fee_recipient = [0u8; 20];
+        let mut new_gas_limit = 30_000_000u64;
+        let mut new_graffiti = None;
+
         if let Some(defaults) = &toml_config.defaults {
             if let Some(ref fr) = defaults.fee_recipient {
-                *self.default_fee_recipient.write().unwrap() = parse_hex_bytes(fr)?;
+                new_fee_recipient = parse_hex_bytes(fr)?;
             }
             if let Some(gl) = defaults.gas_limit {
-                *self.default_gas_limit.write().unwrap() = gl;
+                new_gas_limit = gl;
             }
             if let Some(ref g) = defaults.graffiti {
-                *self.default_graffiti.write().unwrap() = Some(parse_graffiti(g));
+                new_graffiti = Some(parse_graffiti(g));
             }
         }
 
-        let mut validators = self.validators.write().unwrap();
+        let mut parsed_validators = Vec::with_capacity(toml_config.validators.len());
         for v in &toml_config.validators {
-            let config = parse_validator(v)?;
+            parsed_validators.push(parse_validator(v)?);
+        }
+
+        // Apply-second: all parsing succeeded, now mutate atomically.
+        *self.default_fee_recipient.write().unwrap() = new_fee_recipient;
+        *self.default_gas_limit.write().unwrap() = new_gas_limit;
+        *self.default_graffiti.write().unwrap() = new_graffiti;
+
+        let mut validators = self.validators.write().unwrap();
+        for config in parsed_validators {
             validators.insert(config.pubkey, config);
         }
 
@@ -925,5 +939,158 @@ pubkey = "{}"
 
         // Store should be unchanged after failed reload
         assert!(store.get_config(&[1u8; 48]).is_some());
+    }
+
+    #[test]
+    fn test_reload_config_partial_validator_failure_no_mutation() {
+        let pk1_hex = "0x".to_string() + &hex::encode([1u8; 48]);
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+
+        let toml_v1 = format!(
+            r#"
+[defaults]
+fee_recipient = "{}"
+gas_limit = 30000000
+
+[[validators]]
+pubkey = "{}"
+builder_proposals = false
+"#,
+            fr_hex, pk1_hex,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &toml_v1).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+        let pk1 = [1u8; 48];
+        assert!(!store.is_builder_enabled(&pk1));
+        assert_eq!(store.effective_fee_recipient(&pk1), [0xaau8; 20]);
+        assert_eq!(store.effective_gas_limit(&pk1), 30_000_000);
+
+        // Write config with one valid validator (changed) + one invalid validator
+        let pk2_hex = "0x".to_string() + &hex::encode([2u8; 48]);
+        let fr2_hex = "0x".to_string() + &hex::encode([0xbbu8; 20]);
+        let toml_v2 = format!(
+            r#"
+[defaults]
+fee_recipient = "{}"
+gas_limit = 50000000
+
+[[validators]]
+pubkey = "{}"
+builder_proposals = true
+
+[[validators]]
+pubkey = "invalid-hex-not-48-bytes"
+"#,
+            fr2_hex, pk2_hex,
+        );
+        std::fs::write(&config_path, &toml_v2).unwrap();
+
+        let result = store.reload_config();
+        assert!(result.is_err());
+
+        // CRITICAL: Store must be completely unchanged after failed reload
+        // Defaults must not have changed
+        assert_eq!(*store.default_fee_recipient.read().unwrap(), [0xaau8; 20]);
+        assert_eq!(*store.default_gas_limit.read().unwrap(), 30_000_000);
+
+        // No new validators added
+        assert!(store.get_config(&[2u8; 48]).is_none());
+
+        // Existing validator unchanged
+        assert!(!store.is_builder_enabled(&pk1));
+    }
+
+    #[test]
+    fn test_reload_config_resets_defaults_when_section_removed() {
+        let pk1_hex = "0x".to_string() + &hex::encode([1u8; 48]);
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+
+        let toml_v1 = format!(
+            r#"
+[defaults]
+fee_recipient = "{}"
+gas_limit = 50000000
+graffiti = "my graffiti"
+
+[[validators]]
+pubkey = "{}"
+"#,
+            fr_hex, pk1_hex,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &toml_v1).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert_eq!(*store.default_fee_recipient.read().unwrap(), [0xaau8; 20]);
+        assert_eq!(*store.default_gas_limit.read().unwrap(), 50_000_000);
+        assert!(store.default_graffiti.read().unwrap().is_some());
+
+        // Remove [defaults] section entirely
+        let toml_v2 = format!(
+            r#"
+[[validators]]
+pubkey = "{}"
+"#,
+            pk1_hex,
+        );
+        std::fs::write(&config_path, &toml_v2).unwrap();
+
+        store.reload_config().unwrap();
+
+        // Defaults should reset to hardcoded fallbacks
+        assert_eq!(*store.default_fee_recipient.read().unwrap(), [0u8; 20]);
+        assert_eq!(*store.default_gas_limit.read().unwrap(), 30_000_000);
+        assert!(store.default_graffiti.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_reload_config_resets_individual_default_fields() {
+        let pk1_hex = "0x".to_string() + &hex::encode([1u8; 48]);
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+
+        let toml_v1 = format!(
+            r#"
+[defaults]
+fee_recipient = "{}"
+gas_limit = 50000000
+graffiti = "my graffiti"
+
+[[validators]]
+pubkey = "{}"
+"#,
+            fr_hex, pk1_hex,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &toml_v1).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+
+        // Keep [defaults] but remove some fields
+        let toml_v2 = format!(
+            r#"
+[defaults]
+gas_limit = 40000000
+
+[[validators]]
+pubkey = "{}"
+"#,
+            pk1_hex,
+        );
+        std::fs::write(&config_path, &toml_v2).unwrap();
+
+        store.reload_config().unwrap();
+
+        // fee_recipient and graffiti should reset to hardcoded fallbacks
+        assert_eq!(*store.default_fee_recipient.read().unwrap(), [0u8; 20]);
+        assert_eq!(*store.default_gas_limit.read().unwrap(), 40_000_000);
+        assert!(store.default_graffiti.read().unwrap().is_none());
     }
 }
