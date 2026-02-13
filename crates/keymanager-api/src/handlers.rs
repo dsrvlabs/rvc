@@ -5,13 +5,15 @@ use axum::Json;
 
 use crate::error::ApiError;
 use crate::traits::{
-    DoppelgangerMonitor, ImportKeystoreError, KeystoreManager, Pubkey, SlashingProtection,
-    ValidatorManager,
+    DoppelgangerMonitor, ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey,
+    RemoteKeyManager, SlashingProtection, ValidatorManager,
 };
 use crate::types::{
-    DeleteKeystoreResult, DeleteKeystoresRequest, DeleteKeystoresResponse, DeleteStatus,
-    ImportKeystoreResult, ImportKeystoresRequest, ImportKeystoresResponse, ImportStatus,
-    KeystoreInfo, ListKeystoresResponse,
+    DeleteKeystoreResult, DeleteKeystoresRequest, DeleteKeystoresResponse, DeleteRemoteKeyResult,
+    DeleteRemoteKeyStatus, DeleteRemoteKeysRequest, DeleteRemoteKeysResponse, DeleteStatus,
+    ImportKeystoreResult, ImportKeystoresRequest, ImportKeystoresResponse, ImportRemoteKeyResult,
+    ImportRemoteKeyStatus, ImportRemoteKeysRequest, ImportRemoteKeysResponse, ImportStatus,
+    KeystoreInfo, ListKeystoresResponse, ListRemoteKeysResponse, RemoteKeyEntry,
 };
 
 pub struct AppState {
@@ -19,11 +21,14 @@ pub struct AppState {
     pub slashing_protection: Arc<dyn SlashingProtection>,
     pub validator_manager: Arc<dyn ValidatorManager>,
     pub doppelganger_monitor: Arc<dyn DoppelgangerMonitor>,
+    pub remote_key_manager: Arc<dyn RemoteKeyManager>,
 }
 
 pub async fn list_keystores(State(state): State<Arc<AppState>>) -> Json<ListKeystoresResponse> {
-    let pubkeys = state.keystore_manager.list_keys();
-    let data = pubkeys
+    let local_keys = state.keystore_manager.list_keys();
+    let remote_keys = state.remote_key_manager.list_remote_keys();
+
+    let mut data: Vec<KeystoreInfo> = local_keys
         .into_iter()
         .map(|pk| KeystoreInfo {
             validating_pubkey: format!("0x{}", hex::encode(pk)),
@@ -31,6 +36,15 @@ pub async fn list_keystores(State(state): State<Arc<AppState>>) -> Json<ListKeys
             readonly: false,
         })
         .collect();
+
+    for (pk, _url) in &remote_keys {
+        data.push(KeystoreInfo {
+            validating_pubkey: format!("0x{}", hex::encode(pk)),
+            derivation_path: None,
+            readonly: true,
+        });
+    }
+
     Json(ListKeystoresResponse { data })
 }
 
@@ -143,6 +157,103 @@ pub async fn delete_keystores(
     Ok(Json(DeleteKeystoresResponse { data: results, slashing_protection }))
 }
 
+// --- Remote key handlers ---
+
+pub async fn list_remote_keys(State(state): State<Arc<AppState>>) -> Json<ListRemoteKeysResponse> {
+    let keys = state.remote_key_manager.list_remote_keys();
+    let data = keys
+        .into_iter()
+        .map(|(pk, url)| RemoteKeyEntry {
+            pubkey: format!("0x{}", hex::encode(pk)),
+            url,
+            readonly: false,
+        })
+        .collect();
+    Json(ListRemoteKeysResponse { data })
+}
+
+pub async fn import_remote_keys(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ImportRemoteKeysRequest>,
+) -> Json<ImportRemoteKeysResponse> {
+    let mut results = Vec::with_capacity(request.remote_keys.len());
+
+    for key_import in &request.remote_keys {
+        match parse_pubkey(&key_import.pubkey) {
+            Ok(pubkey) => {
+                match state.remote_key_manager.import_remote_key(pubkey, key_import.url.clone()) {
+                    Ok(()) => {
+                        results.push(ImportRemoteKeyResult {
+                            status: ImportRemoteKeyStatus::Imported,
+                            message: String::new(),
+                        });
+                    }
+                    Err(ImportRemoteKeyError::Duplicate) => {
+                        results.push(ImportRemoteKeyResult {
+                            status: ImportRemoteKeyStatus::Duplicate,
+                            message: "key already exists".into(),
+                        });
+                    }
+                    Err(e) => {
+                        results.push(ImportRemoteKeyResult {
+                            status: ImportRemoteKeyStatus::Error,
+                            message: e.to_string(),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                results.push(ImportRemoteKeyResult {
+                    status: ImportRemoteKeyStatus::Error,
+                    message: e,
+                });
+            }
+        }
+    }
+
+    Json(ImportRemoteKeysResponse { data: results })
+}
+
+pub async fn delete_remote_keys(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<DeleteRemoteKeysRequest>,
+) -> Json<DeleteRemoteKeysResponse> {
+    let mut results = Vec::with_capacity(request.pubkeys.len());
+
+    for pubkey_str in &request.pubkeys {
+        match parse_pubkey(pubkey_str) {
+            Ok(pubkey) => match state.remote_key_manager.delete_remote_key(&pubkey) {
+                Ok(true) => {
+                    results.push(DeleteRemoteKeyResult {
+                        status: DeleteRemoteKeyStatus::Deleted,
+                        message: String::new(),
+                    });
+                }
+                Ok(false) => {
+                    results.push(DeleteRemoteKeyResult {
+                        status: DeleteRemoteKeyStatus::NotFound,
+                        message: String::new(),
+                    });
+                }
+                Err(e) => {
+                    results.push(DeleteRemoteKeyResult {
+                        status: DeleteRemoteKeyStatus::Error,
+                        message: e.to_string(),
+                    });
+                }
+            },
+            Err(e) => {
+                results.push(DeleteRemoteKeyResult {
+                    status: DeleteRemoteKeyStatus::Error,
+                    message: e,
+                });
+            }
+        }
+    }
+
+    Json(DeleteRemoteKeysResponse { data: results })
+}
+
 fn parse_pubkey(s: &str) -> Result<Pubkey, String> {
     let hex_str = s.strip_prefix("0x").unwrap_or(s);
     let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
@@ -169,7 +280,13 @@ fn empty_interchange() -> String {
 mod tests {
     use super::*;
     use crate::auth;
-    use crate::traits::DeleteKeystoreError;
+    use crate::traits::{
+        DeleteKeystoreError, DeleteRemoteKeyError, ImportRemoteKeyError, RemoteKeyManager,
+    };
+    use crate::types::{
+        DeleteRemoteKeyStatus, DeleteRemoteKeysResponse, ImportRemoteKeyStatus,
+        ImportRemoteKeysResponse, ListRemoteKeysResponse,
+    };
     use axum::routing::get;
     use axum::Router;
     use http_body_util::BodyExt;
@@ -325,6 +442,53 @@ mod tests {
         }
     }
 
+    struct MockRemoteKeyManager {
+        keys: Mutex<Vec<(Pubkey, String)>>,
+    }
+
+    impl MockRemoteKeyManager {
+        fn new() -> Self {
+            Self { keys: Mutex::new(Vec::new()) }
+        }
+
+        fn with_keys(keys: Vec<(Pubkey, String)>) -> Self {
+            Self { keys: Mutex::new(keys) }
+        }
+    }
+
+    impl RemoteKeyManager for MockRemoteKeyManager {
+        fn list_remote_keys(&self) -> Vec<(Pubkey, String)> {
+            self.keys.lock().unwrap().clone()
+        }
+
+        fn has_remote_key(&self, pubkey: &Pubkey) -> bool {
+            self.keys.lock().unwrap().iter().any(|(pk, _)| pk == pubkey)
+        }
+
+        fn import_remote_key(
+            &self,
+            pubkey: Pubkey,
+            url: String,
+        ) -> Result<(), ImportRemoteKeyError> {
+            let mut keys = self.keys.lock().unwrap();
+            if keys.iter().any(|(pk, _)| *pk == pubkey) {
+                return Err(ImportRemoteKeyError::Duplicate);
+            }
+            keys.push((pubkey, url));
+            Ok(())
+        }
+
+        fn delete_remote_key(&self, pubkey: &Pubkey) -> Result<bool, DeleteRemoteKeyError> {
+            let mut keys = self.keys.lock().unwrap();
+            if let Some(pos) = keys.iter().position(|(pk, _)| pk == pubkey) {
+                keys.remove(pos);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }
+    }
+
     // --- Test helpers ---
 
     fn test_pubkey(id: u8) -> Pubkey {
@@ -346,6 +510,7 @@ mod tests {
         slashing_protection: Arc<dyn SlashingProtection>,
         validator_manager: Arc<MockValidatorManager>,
         doppelganger_monitor: Arc<MockDoppelgangerMonitor>,
+        remote_key_manager: Arc<MockRemoteKeyManager>,
     }
 
     impl TestApp {
@@ -355,6 +520,7 @@ mod tests {
                 slashing_protection: Arc::new(MockSlashingProtection::new()),
                 validator_manager: Arc::new(MockValidatorManager::new()),
                 doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+                remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
             }
         }
 
@@ -364,6 +530,17 @@ mod tests {
                 slashing_protection: Arc::new(MockSlashingProtection::new()),
                 validator_manager: Arc::new(MockValidatorManager::new()),
                 doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+                remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+            }
+        }
+
+        fn with_remote_keys(keys: Vec<(Pubkey, String)>) -> Self {
+            Self {
+                keystore_manager: Arc::new(MockKeystoreManager::new()),
+                slashing_protection: Arc::new(MockSlashingProtection::new()),
+                validator_manager: Arc::new(MockValidatorManager::new()),
+                doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+                remote_key_manager: Arc::new(MockRemoteKeyManager::with_keys(keys)),
             }
         }
 
@@ -373,6 +550,7 @@ mod tests {
                 slashing_protection: Arc::new(FailingSlashingProtection),
                 validator_manager: Arc::new(MockValidatorManager::new()),
                 doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+                remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
             }
         }
 
@@ -385,6 +563,7 @@ mod tests {
                 keystore_manager,
                 validator_manager: Arc::new(MockValidatorManager::new()),
                 doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+                remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
             }
         }
 
@@ -394,11 +573,16 @@ mod tests {
                 slashing_protection: self.slashing_protection.clone(),
                 validator_manager: self.validator_manager.clone(),
                 doppelganger_monitor: self.doppelganger_monitor.clone(),
+                remote_key_manager: self.remote_key_manager.clone(),
             });
             Router::new()
                 .route(
                     "/eth/v1/keystores",
                     get(list_keystores).post(import_keystores).delete(delete_keystores),
+                )
+                .route(
+                    "/eth/v1/remotekeys",
+                    get(list_remote_keys).post(import_remote_keys).delete(delete_remote_keys),
                 )
                 .with_state(state)
         }
@@ -606,6 +790,7 @@ mod tests {
             slashing_protection: mock_slashing.clone(),
             validator_manager: Arc::new(MockValidatorManager::new()),
             doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+            remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
         };
         let slashing_data = serde_json::json!({
             "metadata": {
@@ -1096,5 +1281,414 @@ mod tests {
         let monitored = app.doppelganger_monitor.monitored.lock().unwrap();
         assert_eq!(monitored.len(), 1);
         assert_eq!(monitored[0], test_pubkey(2));
+    }
+
+    // --- GET /eth/v1/remotekeys tests ---
+
+    #[tokio::test]
+    async fn test_list_remote_keys_empty() {
+        let app = TestApp::new();
+        let response = app
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/eth/v1/remotekeys")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: ListRemoteKeysResponse = serde_json::from_slice(&body).unwrap();
+        assert!(resp.data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_remote_keys_with_entries() {
+        let app = TestApp::with_remote_keys(vec![
+            (test_pubkey(1), "https://signer1.example.com".into()),
+            (test_pubkey(2), "https://signer2.example.com".into()),
+        ]);
+
+        let response = app
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/eth/v1/remotekeys")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: ListRemoteKeysResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.data.len(), 2);
+        assert_eq!(resp.data[0].pubkey, format!("0x{}", test_pubkey_hex(1)));
+        assert_eq!(resp.data[0].url, "https://signer1.example.com");
+        assert!(!resp.data[0].readonly);
+        assert_eq!(resp.data[1].pubkey, format!("0x{}", test_pubkey_hex(2)));
+        assert_eq!(resp.data[1].url, "https://signer2.example.com");
+    }
+
+    // --- POST /eth/v1/remotekeys tests ---
+
+    #[tokio::test]
+    async fn test_import_single_remote_key() {
+        let app = TestApp::new();
+        let request_body = serde_json::json!({
+            "remote_keys": [{
+                "pubkey": format!("0x{}", test_pubkey_hex(1)),
+                "url": "https://signer.example.com"
+            }]
+        });
+
+        let response = app
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/eth/v1/remotekeys")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: ImportRemoteKeysResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.data[0].status, ImportRemoteKeyStatus::Imported);
+
+        assert!(app.remote_key_manager.has_remote_key(&test_pubkey(1)));
+    }
+
+    #[tokio::test]
+    async fn test_import_multiple_remote_keys() {
+        let app = TestApp::new();
+        let request_body = serde_json::json!({
+            "remote_keys": [
+                {"pubkey": format!("0x{}", test_pubkey_hex(1)), "url": "https://signer1.example.com"},
+                {"pubkey": format!("0x{}", test_pubkey_hex(2)), "url": "https://signer2.example.com"}
+            ]
+        });
+
+        let response = app
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/eth/v1/remotekeys")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: ImportRemoteKeysResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.data.len(), 2);
+        assert_eq!(resp.data[0].status, ImportRemoteKeyStatus::Imported);
+        assert_eq!(resp.data[1].status, ImportRemoteKeyStatus::Imported);
+    }
+
+    #[tokio::test]
+    async fn test_import_duplicate_remote_key() {
+        let app =
+            TestApp::with_remote_keys(vec![(test_pubkey(1), "https://signer.example.com".into())]);
+        let request_body = serde_json::json!({
+            "remote_keys": [{
+                "pubkey": format!("0x{}", test_pubkey_hex(1)),
+                "url": "https://signer.example.com"
+            }]
+        });
+
+        let response = app
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/eth/v1/remotekeys")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: ImportRemoteKeysResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.data[0].status, ImportRemoteKeyStatus::Duplicate);
+    }
+
+    #[tokio::test]
+    async fn test_import_remote_key_invalid_pubkey() {
+        let app = TestApp::new();
+        let request_body = serde_json::json!({
+            "remote_keys": [{
+                "pubkey": "not_valid_hex!",
+                "url": "https://signer.example.com"
+            }]
+        });
+
+        let response = app
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/eth/v1/remotekeys")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: ImportRemoteKeysResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.data[0].status, ImportRemoteKeyStatus::Error);
+    }
+
+    // --- DELETE /eth/v1/remotekeys tests ---
+
+    #[tokio::test]
+    async fn test_delete_existing_remote_key() {
+        let app =
+            TestApp::with_remote_keys(vec![(test_pubkey(1), "https://signer.example.com".into())]);
+        let request_body = serde_json::json!({
+            "pubkeys": [format!("0x{}", test_pubkey_hex(1))]
+        });
+
+        let response = app
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/eth/v1/remotekeys")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: DeleteRemoteKeysResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.data[0].status, DeleteRemoteKeyStatus::Deleted);
+        assert!(!app.remote_key_manager.has_remote_key(&test_pubkey(1)));
+    }
+
+    #[tokio::test]
+    async fn test_delete_nonexistent_remote_key() {
+        let app = TestApp::new();
+        let request_body = serde_json::json!({
+            "pubkeys": [format!("0x{}", test_pubkey_hex(99))]
+        });
+
+        let response = app
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/eth/v1/remotekeys")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: DeleteRemoteKeysResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.data[0].status, DeleteRemoteKeyStatus::NotFound);
+    }
+
+    #[tokio::test]
+    async fn test_delete_remote_key_invalid_pubkey() {
+        let app = TestApp::new();
+        let request_body = serde_json::json!({
+            "pubkeys": ["not_valid_hex!"]
+        });
+
+        let response = app
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/eth/v1/remotekeys")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: DeleteRemoteKeysResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.data[0].status, DeleteRemoteKeyStatus::Error);
+    }
+
+    // --- Remote key readonly in list_keystores ---
+
+    #[tokio::test]
+    async fn test_list_keystores_remote_keys_readonly() {
+        let app = TestApp {
+            keystore_manager: Arc::new(MockKeystoreManager::with_keys(vec![test_pubkey(1)])),
+            slashing_protection: Arc::new(MockSlashingProtection::new()),
+            validator_manager: Arc::new(MockValidatorManager::new()),
+            doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+            remote_key_manager: Arc::new(MockRemoteKeyManager::with_keys(vec![(
+                test_pubkey(2),
+                "https://signer.example.com".into(),
+            )])),
+        };
+
+        let response = app
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/eth/v1/keystores")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: ListKeystoresResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resp.data.len(), 2);
+        // Local key: not readonly
+        assert_eq!(resp.data[0].validating_pubkey, format!("0x{}", test_pubkey_hex(1)));
+        assert!(!resp.data[0].readonly);
+        // Remote key: readonly
+        assert_eq!(resp.data[1].validating_pubkey, format!("0x{}", test_pubkey_hex(2)));
+        assert!(resp.data[1].readonly);
+    }
+
+    // --- Auth tests for remote key endpoints ---
+
+    #[tokio::test]
+    async fn test_auth_rejects_unauthenticated_get_remotekeys() {
+        let app = TestApp::new();
+        let response = app
+            .authed_router("test_token")
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/eth/v1/remotekeys")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_rejects_unauthenticated_post_remotekeys() {
+        let app = TestApp::new();
+        let request_body = serde_json::json!({"remote_keys": []});
+
+        let response = app
+            .authed_router("test_token")
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/eth/v1/remotekeys")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_rejects_unauthenticated_delete_remotekeys() {
+        let app = TestApp::new();
+        let request_body = serde_json::json!({"pubkeys": []});
+
+        let response = app
+            .authed_router("test_token")
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri("/eth/v1/remotekeys")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(request_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_auth_allows_valid_token_remotekeys() {
+        let app = TestApp::new();
+        let token = "test_token";
+
+        let response = app
+            .authed_router(token)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/eth/v1/remotekeys")
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    // --- Import remote key result message omission ---
+
+    #[test]
+    fn test_import_remote_key_success_omits_empty_message() {
+        let result = ImportRemoteKeyResult {
+            status: ImportRemoteKeyStatus::Imported,
+            message: String::new(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(
+            json.get("message").is_none(),
+            "success result should not have 'message' key, got: {json}"
+        );
+    }
+
+    #[test]
+    fn test_delete_remote_key_success_omits_empty_message() {
+        let result = DeleteRemoteKeyResult {
+            status: DeleteRemoteKeyStatus::Deleted,
+            message: String::new(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(
+            json.get("message").is_none(),
+            "success result should not have 'message' key, got: {json}"
+        );
     }
 }

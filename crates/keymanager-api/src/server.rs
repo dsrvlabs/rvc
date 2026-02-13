@@ -6,7 +6,9 @@ use axum::Router;
 
 use crate::auth;
 use crate::handlers::{self, AppState};
-use crate::traits::{DoppelgangerMonitor, KeystoreManager, SlashingProtection, ValidatorManager};
+use crate::traits::{
+    DoppelgangerMonitor, KeystoreManager, RemoteKeyManager, SlashingProtection, ValidatorManager,
+};
 
 pub const DEFAULT_ADDR: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 5062);
@@ -23,6 +25,7 @@ impl KeymanagerServer {
         slashing_protection: Arc<dyn SlashingProtection>,
         validator_manager: Arc<dyn ValidatorManager>,
         doppelganger_monitor: Arc<dyn DoppelgangerMonitor>,
+        remote_key_manager: Arc<dyn RemoteKeyManager>,
         token: String,
         addr: SocketAddr,
     ) -> Self {
@@ -32,6 +35,7 @@ impl KeymanagerServer {
                 slashing_protection,
                 validator_manager,
                 doppelganger_monitor,
+                remote_key_manager,
             }),
             token: Arc::new(token),
             addr,
@@ -45,6 +49,12 @@ impl KeymanagerServer {
                 get(handlers::list_keystores)
                     .post(handlers::import_keystores)
                     .delete(handlers::delete_keystores),
+            )
+            .route(
+                "/eth/v1/remotekeys",
+                get(handlers::list_remote_keys)
+                    .post(handlers::import_remote_keys)
+                    .delete(handlers::delete_remote_keys),
             )
             .with_state(self.state.clone());
 

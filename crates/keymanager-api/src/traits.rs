@@ -49,3 +49,25 @@ pub trait DoppelgangerMonitor: Send + Sync {
     fn start_monitoring(&self, pubkey: Pubkey);
     fn stop_monitoring(&self, pubkey: &Pubkey);
 }
+
+#[derive(Debug, Error)]
+pub enum ImportRemoteKeyError {
+    #[error("duplicate key")]
+    Duplicate,
+    #[error("{0}")]
+    Other(String),
+}
+
+#[derive(Debug, Error)]
+pub enum DeleteRemoteKeyError {
+    #[error("{0}")]
+    Other(String),
+}
+
+/// Manages remote signing keys (Web3Signer).
+pub trait RemoteKeyManager: Send + Sync {
+    fn list_remote_keys(&self) -> Vec<(Pubkey, String)>;
+    fn has_remote_key(&self, pubkey: &Pubkey) -> bool;
+    fn import_remote_key(&self, pubkey: Pubkey, url: String) -> Result<(), ImportRemoteKeyError>;
+    fn delete_remote_key(&self, pubkey: &Pubkey) -> Result<bool, DeleteRemoteKeyError>;
+}
