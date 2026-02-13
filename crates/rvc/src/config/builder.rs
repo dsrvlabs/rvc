@@ -14,6 +14,7 @@ use crate::doppelganger_adapter::{BeaconLivenessAdapter, SlashingDbReaderAdapter
 use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle};
 use beacon::{BeaconClient, BeaconClientConfig};
 use bn_manager::{BeaconNodeClient, BnManager, BnManagerConfig};
+use builder::BuilderService;
 use crypto::{KeyManager, PublicKey};
 use doppelganger::DoppelgangerService;
 use duty_tracker::DutyTracker;
@@ -46,6 +47,7 @@ where
     pub genesis_validators_root: Root,
     pub fork_schedule: Arc<ForkSchedule>,
     pub doppelganger_service: Option<DoppelgangerService>,
+    pub builder_service: Option<Arc<BuilderService>>,
 }
 
 /// Builder for constructing services from configuration.
@@ -216,6 +218,18 @@ impl ServiceBuilder {
         Arc::new(store)
     }
 
+    pub fn build_builder_service(
+        &self,
+        signer: Arc<SignerService>,
+        beacon: Arc<dyn BeaconNodeClient>,
+        validator_store: Arc<ValidatorStore>,
+        genesis_fork_version: [u8; 4],
+    ) -> Arc<BuilderService> {
+        let service = BuilderService::new(signer, beacon, validator_store, genesis_fork_version);
+        info!("Created builder service");
+        Arc::new(service)
+    }
+
     pub fn build_orchestrator_config(
         &self,
         genesis_validators_root: Root,
@@ -269,6 +283,14 @@ impl ServiceBuilder {
 
         let genesis_validators_root = self.parse_genesis_validators_root()?;
 
+        let genesis_fork_version = fork_schedule.genesis_fork_version;
+        let builder_service = Some(self.build_builder_service(
+            signer.clone(),
+            beacon.clone(),
+            validator_store.clone(),
+            genesis_fork_version,
+        ));
+
         let services = BuiltServices {
             beacon,
             beacon_client,
@@ -283,6 +305,7 @@ impl ServiceBuilder {
             genesis_validators_root,
             fork_schedule,
             doppelganger_service,
+            builder_service,
         };
 
         let orchestrator_factory = move |services: BuiltServices<SystemSlotClock, BeaconClient>| {
@@ -301,6 +324,7 @@ impl ServiceBuilder {
                 services.propagator,
                 services.beacon,
                 block_beacon,
+                services.builder_service,
                 services.validator_store,
                 config,
                 services.pubkey_map,
@@ -500,5 +524,20 @@ mod tests {
         let beacon = builder.build_beacon().unwrap();
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let _service = builder.build_doppelganger_service(beacon, slashing_db);
+    }
+
+    #[test]
+    fn test_build_builder_service() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+
+        let beacon = builder.build_beacon().unwrap();
+        let key_manager = Arc::new(KeyManager::new());
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = builder.build_signer(key_manager, slashing_db);
+        let validator_store = builder.build_validator_store();
+
+        let _builder_service =
+            builder.build_builder_service(signer, beacon, validator_store, [0, 0, 0, 0]);
     }
 }

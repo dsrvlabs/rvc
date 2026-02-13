@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 beacon.workspace = true
 bn-manager.workspace = true
+builder.workspace = true
 crypto.workspace = true
 eth-types.workspace = true
 hex.workspace = true

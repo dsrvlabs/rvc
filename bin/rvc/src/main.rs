@@ -453,6 +453,14 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
     let block_beacon =
         std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(beacon_client.clone()));
 
+    #[allow(clippy::arc_with_non_send_sync)]
+    let builder_service = Some(std::sync::Arc::new(builder::BuilderService::new(
+        signer.clone(),
+        beacon.clone(),
+        validator_store.clone(),
+        orchestrator_config.fork_schedule.genesis_fork_version,
+    )));
+
     // Step 8: Start main duty loop
     let (mut orchestrator, orchestrator_handle) = rvc::orchestrator::DutyOrchestrator::new(
         slot_clock,
@@ -461,6 +469,7 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
         propagator,
         beacon,
         block_beacon,
+        builder_service,
         validator_store,
         orchestrator_config,
         pubkey_map,

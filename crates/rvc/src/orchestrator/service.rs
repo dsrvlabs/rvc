@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 use beacon::{Attestation, AttesterDuty, BeaconCommitteeSubscription, ProposerPreparation};
 use block_service::{BeaconBlockClient, BlockService};
 use bn_manager::BeaconNodeClient;
+use builder::BuilderService;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{
@@ -103,6 +104,9 @@ pub struct AttestationResult {
     pub error: Option<String>,
 }
 
+/// Timeout for builder registration API calls.
+const BUILDER_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Main orchestrator for coordinating validator duties.
 pub struct DutyOrchestrator<C, S, B>
 where
@@ -116,6 +120,7 @@ where
     propagator: Arc<Propagator<S>>,
     beacon: Arc<dyn BeaconNodeClient>,
     block_service: BlockService<SignerService, B>,
+    builder_service: Option<Arc<BuilderService>>,
     validator_store: Arc<validator_store::ValidatorStore>,
     config: OrchestratorConfig,
     pubkey_map: HashMap<String, PublicKey>,
@@ -137,6 +142,7 @@ where
         propagator: Arc<Propagator<S>>,
         beacon: Arc<dyn BeaconNodeClient>,
         block_beacon: Arc<B>,
+        builder_service: Option<Arc<BuilderService>>,
         validator_store: Arc<validator_store::ValidatorStore>,
         config: OrchestratorConfig,
         pubkey_map: HashMap<String, PublicKey>,
@@ -158,6 +164,7 @@ where
             propagator,
             beacon,
             block_service,
+            builder_service,
             validator_store,
             config,
             pubkey_map,
@@ -202,6 +209,7 @@ where
                 self.prepare_proposers().await;
                 self.submit_committee_subscriptions(current_epoch).await;
                 self.submit_committee_subscriptions(current_epoch + 1).await;
+                self.register_builders().await;
             }
 
             // === Phase 1: t=0 — Block proposal ===
@@ -520,6 +528,31 @@ where
                 epoch,
                 "Committee subscription timed out after {}s",
                 PREPARATION_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
+    async fn register_builders(&self) {
+        let builder_service = match &self.builder_service {
+            Some(bs) => bs.clone(),
+            None => return,
+        };
+
+        let jitter = Duration::from_secs(BuilderService::jitter_seconds());
+        debug!(jitter_secs = jitter.as_secs(), "Delaying builder registration with jitter");
+        tokio::time::sleep(jitter).await;
+
+        match tokio::time::timeout(
+            BUILDER_REGISTRATION_TIMEOUT,
+            builder_service.register_validators(),
+        )
+        .await
+        {
+            Ok(Ok(_)) => info!("Builder registration completed"),
+            Ok(Err(e)) => warn!(error = %e, "Builder registration failed (non-fatal)"),
+            Err(_) => warn!(
+                "Builder registration timed out after {}s (non-fatal)",
+                BUILDER_REGISTRATION_TIMEOUT.as_secs()
             ),
         }
     }
@@ -1651,6 +1684,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -1690,6 +1724,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -1727,6 +1762,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -1796,6 +1832,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -1835,6 +1872,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -1874,6 +1912,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -1907,6 +1946,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -2089,6 +2129,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -2423,6 +2464,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             validator_store,
             config,
             pubkey_map,
@@ -2471,6 +2513,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -2549,6 +2592,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             validator_store,
             config,
             pubkey_map,
@@ -2630,6 +2674,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -2678,6 +2723,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -2752,6 +2798,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -2765,5 +2812,256 @@ mod tests {
     fn test_preparation_timeout_is_reasonable() {
         assert!(PREPARATION_TIMEOUT.as_secs() >= 1);
         assert!(PREPARATION_TIMEOUT.as_secs() <= 5);
+    }
+
+    #[test]
+    fn test_builder_registration_timeout_is_reasonable() {
+        assert!(BUILDER_REGISTRATION_TIMEOUT.as_secs() >= 5);
+        assert!(BUILDER_REGISTRATION_TIMEOUT.as_secs() <= 15);
+    }
+
+    #[tokio::test]
+    async fn test_builder_registration_called_at_epoch_boundary() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock register_validators endpoint
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/register_validator"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_bytes = pubkey.to_bytes();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let key_manager = Arc::new(key_manager);
+
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+
+        // Set up validator store with a builder-enabled validator
+        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+        let mut config = validator_store::ValidatorConfig::new(pubkey_bytes);
+        config.builder_proposals = true;
+        validator_store.add_validator(config);
+
+        let builder_service = builder::BuilderService::new(
+            signer.clone(),
+            beacon.clone() as Arc<dyn BeaconNodeClient>,
+            validator_store.clone(),
+            [0x00, 0x00, 0x00, 0x00],
+        );
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(100);
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let orch_config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            Some(Arc::new(builder_service)),
+            validator_store,
+            orch_config,
+            pubkey_map,
+        );
+
+        orchestrator.register_builders().await;
+        // wiremock will verify expect(1) on drop
+    }
+
+    #[tokio::test]
+    async fn test_builder_registration_nonfatal_on_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock register_validators endpoint with a 500 error
+        // Beacon client may retry, so expect at least 1 call
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/register_validator"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("server error"))
+            .expect(1..)
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_bytes = pubkey.to_bytes();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let key_manager = Arc::new(key_manager);
+
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+
+        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+        let mut config = validator_store::ValidatorConfig::new(pubkey_bytes);
+        config.builder_proposals = true;
+        validator_store.add_validator(config);
+
+        let builder_service = builder::BuilderService::new(
+            signer.clone(),
+            beacon.clone() as Arc<dyn BeaconNodeClient>,
+            validator_store.clone(),
+            [0x00, 0x00, 0x00, 0x00],
+        );
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(100);
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let orch_config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            Some(Arc::new(builder_service)),
+            validator_store,
+            orch_config,
+            pubkey_map,
+        );
+
+        // Should NOT panic or return error - registration failure is non-fatal
+        orchestrator.register_builders().await;
+    }
+
+    #[tokio::test]
+    async fn test_builder_registration_skipped_when_no_builder_service() {
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(100);
+
+        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
+
+        let key_manager = Arc::new(KeyManager::new());
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        // Should return immediately with no errors when builder_service is None
+        orchestrator.register_builders().await;
+    }
+
+    #[tokio::test]
+    async fn test_builder_registration_skips_non_builder_validators() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // No registration calls expected since builder is not enabled
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/register_validator"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let secret_key = SecretKey::generate();
+        let pubkey_bytes = secret_key.public_key().to_bytes();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let key_manager = Arc::new(key_manager);
+
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+
+        // Validator with builder_proposals = false (default)
+        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+        let config = validator_store::ValidatorConfig::new(pubkey_bytes);
+        validator_store.add_validator(config);
+
+        let builder_service = builder::BuilderService::new(
+            signer.clone(),
+            beacon.clone() as Arc<dyn BeaconNodeClient>,
+            validator_store.clone(),
+            [0x00, 0x00, 0x00, 0x00],
+        );
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(100);
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let orch_config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            Some(Arc::new(builder_service)),
+            validator_store,
+            orch_config,
+            pubkey_map,
+        );
+
+        orchestrator.register_builders().await;
+        // wiremock expect(0) verifies no registration call was made
     }
 }
