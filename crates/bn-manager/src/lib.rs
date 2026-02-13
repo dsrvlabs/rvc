@@ -26,4 +26,7 @@ pub use beacon::{
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
     SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorsResponse,
 };
-pub use eth_types::{ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock};
+pub use eth_types::{
+    ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
+    ValidatorRegistrationV1,
+};

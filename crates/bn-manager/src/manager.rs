@@ -11,7 +11,9 @@ use beacon::{
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
     SyncCommitteeMessage, SyncingResponse, ValidatorsResponse,
 };
-use eth_types::{ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock};
+use eth_types::{
+    ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
+};
 use futures::future::join_all;
 use tracing::{debug, warn};
 use url::Url;
@@ -665,6 +667,16 @@ impl BeaconNodeClient for BnManager {
         .await
     }
 
+    // -- Builder: broadcast --
+
+    async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistration],
+    ) -> Result<(), BeaconError> {
+        self.broadcast("register_validators", |c| Box::pin(c.register_validators(registrations)))
+            .await
+    }
+
     // -- Node status: query(First) --
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
@@ -811,6 +823,13 @@ impl BeaconNodeClient for BeaconClient {
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
         self.submit_beacon_committee_subscriptions(subscriptions).await
+    }
+
+    async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistration],
+    ) -> Result<(), BeaconError> {
+        self.register_validators(registrations).await
     }
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {

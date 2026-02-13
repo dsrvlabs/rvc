@@ -2801,6 +2801,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvc-builder"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "rand 0.8.5",
+ "rvc-bn-manager",
+ "rvc-crypto",
+ "rvc-eth-types",
+ "rvc-signer",
+ "rvc-validator-store",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rvc-crypto"
 version = "0.1.0"
 dependencies = [

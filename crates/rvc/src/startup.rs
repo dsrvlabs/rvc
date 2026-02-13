@@ -346,6 +346,12 @@ mod tests {
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
+        async fn register_validators(
+            &self,
+            _registrations: &[bn_manager::SignedValidatorRegistration],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
         async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
             Ok(DataResponse {
                 data: SyncingData {

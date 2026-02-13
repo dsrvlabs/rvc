@@ -10,7 +10,9 @@ use beacon::{
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
     SyncCommitteeMessage, SyncingResponse, ValidatorsResponse,
 };
-use eth_types::{ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock};
+use eth_types::{
+    ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
+};
 
 /// Comprehensive trait abstracting all beacon node operations.
 ///
@@ -129,6 +131,13 @@ pub trait BeaconNodeClient: Send + Sync {
     async fn submit_beacon_committee_subscriptions(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
+    ) -> Result<(), BeaconError>;
+
+    // -- Builder --
+
+    async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistration],
     ) -> Result<(), BeaconError>;
 
     // -- Node status --
@@ -476,6 +485,12 @@ mod tests {
         async fn submit_beacon_committee_subscriptions(
             &self,
             _subscriptions: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn register_validators(
+            &self,
+            _registrations: &[SignedValidatorRegistration],
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
