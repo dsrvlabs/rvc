@@ -183,6 +183,20 @@ lazy_static! {
             .expect("Failed to register rvc_orchestrator_slot_processing_duration_seconds metric");
         histogram
     };
+
+    /// Counter for slashing DB prune operations.
+    /// Labels: type (attestation, block)
+    pub static ref RVC_SLASHING_DB_PRUNE_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_slashing_db_prune_total",
+            "Total number of slashing DB records pruned"
+        );
+        let counter = IntCounterVec::new(opts, &["type"])
+            .expect("Failed to create rvc_slashing_db_prune_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_slashing_db_prune_total metric");
+        counter
+    };
 }
 
 /// Initializes all core metrics by accessing the lazy_static variables.
@@ -201,6 +215,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL);
     lazy_static::initialize(&RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS);
     lazy_static::initialize(&RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS);
+    lazy_static::initialize(&RVC_SLASHING_DB_PRUNE_TOTAL);
 }
 
 /// Attestation status label values.
@@ -234,6 +249,12 @@ pub mod orchestrator_result {
     pub const SUCCESS: &str = "success";
     pub const FAILED: &str = "failed";
     pub const NO_DUTIES: &str = "no_duties";
+}
+
+/// Slashing DB prune type label values.
+pub mod prune_type {
+    pub const ATTESTATION: &str = "attestation";
+    pub const BLOCK: &str = "block";
 }
 
 #[cfg(test)]

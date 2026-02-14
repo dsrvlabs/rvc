@@ -27,6 +27,18 @@ pub enum SlashingError {
 
     #[error("database integrity check failed: {0}")]
     IntegrityCheckFailed(String),
+
+    #[error("watermark can only be raised: attempted to lower {watermark_type} for {pubkey}")]
+    WatermarkLowered { pubkey: String, watermark_type: String },
+
+    #[error("no watermarks set: pruning without watermarks would delete all records")]
+    NoWatermarksSet,
+
+    #[error("block at slot {slot} is below watermark slot {watermark_slot}")]
+    BelowBlockWatermark { slot: Slot, watermark_slot: Slot },
+
+    #[error("attestation with target epoch {target_epoch} is below watermark target epoch {watermark_target}")]
+    BelowAttestationWatermark { target_epoch: Epoch, watermark_target: Epoch },
 }
 
 /// Specific types of attestation slashing violations per EIP-3076.
