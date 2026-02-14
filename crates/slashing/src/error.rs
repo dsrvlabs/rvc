@@ -39,6 +39,9 @@ pub enum SlashingError {
 
     #[error("attestation with target epoch {target_epoch} is below watermark target epoch {watermark_target}")]
     BelowAttestationWatermark { target_epoch: Epoch, watermark_target: Epoch },
+
+    #[error("attestation with source epoch {source_epoch} is below watermark source epoch {watermark_source}")]
+    BelowAttestationSourceWatermark { source_epoch: Epoch, watermark_source: Epoch },
 }
 
 /// Specific types of attestation slashing violations per EIP-3076.
