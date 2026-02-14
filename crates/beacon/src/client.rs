@@ -218,7 +218,12 @@ impl BeaconClient {
     }
 
     /// SSZ content negotiation Accept header for block production.
-    const SSZ_ACCEPT_HEADER: &'static str = "application/octet-stream;q=1.0,application/json;q=0.9";
+    /// Accept header for block production. SSZ preference is disabled until
+    /// the downstream deserialization pipeline is implemented. The SSZ
+    /// Content-Type branching and field plumbing are in place and ready
+    /// to activate by changing this to:
+    /// "application/octet-stream;q=1.0,application/json;q=0.9"
+    const SSZ_ACCEPT_HEADER: &'static str = "application/json";
 
     /// Produces a block for the given slot using the v3 endpoint.
     ///
@@ -279,11 +284,29 @@ impl BeaconClient {
             .to_string();
 
         if content_type.starts_with("application/octet-stream") {
+            // 16 MB guard: no valid beacon block exceeds this, even with Deneb blobs
+            const MAX_SSZ_BLOCK_BYTES: usize = 16 * 1024 * 1024;
+
             let ssz_bytes = response
                 .bytes()
                 .await
-                .map_err(|e| BeaconError::ParseError(format!("failed to read SSZ bytes: {e}")))?
-                .to_vec();
+                .map_err(|e| BeaconError::ParseError(format!("failed to read SSZ bytes: {e}")))?;
+
+            if ssz_bytes.is_empty() {
+                return Err(BeaconError::ParseError(
+                    "received empty SSZ body from beacon node".into(),
+                ));
+            }
+
+            if ssz_bytes.len() > MAX_SSZ_BLOCK_BYTES {
+                return Err(BeaconError::ParseError(format!(
+                    "SSZ response too large: {} bytes (max {})",
+                    ssz_bytes.len(),
+                    MAX_SSZ_BLOCK_BYTES
+                )));
+            }
+
+            let ssz_bytes = ssz_bytes.to_vec();
 
             debug!(
                 slot = slot,
@@ -2589,14 +2612,11 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let accept = requests[0].headers.get("accept").expect("Accept header must be present");
         let accept_str = accept.to_str().unwrap();
-        assert!(
-            accept_str.contains("application/octet-stream"),
-            "Accept header must prefer SSZ: {}",
-            accept_str
-        );
+        // SSZ preference is disabled until downstream deserialization is implemented.
+        // Accept header currently requests JSON only.
         assert!(
             accept_str.contains("application/json"),
-            "Accept header must include JSON fallback: {}",
+            "Accept header must include JSON: {}",
             accept_str
         );
     }
@@ -2642,7 +2662,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_produce_block_v3_ssz_empty_body() {
+    async fn test_produce_block_v3_ssz_empty_body_rejected() {
         let mock_server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -2660,10 +2680,8 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let result = client.produce_block_v3(900, "0xrandao", None, None).await.unwrap();
-
-        assert!(result.is_ssz);
-        assert_eq!(result.ssz_bytes, Some(vec![]));
+        let result = client.produce_block_v3(900, "0xrandao", None, None).await;
+        assert!(result.is_err(), "empty SSZ body should be rejected");
     }
 
     #[tokio::test]
