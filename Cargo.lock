@@ -2972,6 +2972,7 @@ name = "rvc-slashing"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "proptest",
  "rusqlite",
  "rvc-eth-types",
  "serde",
