@@ -1845,12 +1845,16 @@ mod tests {
             is_blinded: false,
             consensus_version: "deneb".to_string(),
             execution_payload_value: Some("5000".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
         };
         let b = ProduceBlockResponse {
             data: serde_json::Value::Null,
             is_blinded: false,
             consensus_version: "deneb".to_string(),
             execution_payload_value: Some("1000".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
         };
         assert!(is_better_block(&a, &b));
         assert!(!is_better_block(&b, &a));
@@ -1863,12 +1867,16 @@ mod tests {
             is_blinded: false,
             consensus_version: "deneb".to_string(),
             execution_payload_value: None,
+            is_ssz: false,
+            ssz_bytes: None,
         };
         let b = ProduceBlockResponse {
             data: serde_json::Value::Null,
             is_blinded: false,
             consensus_version: "deneb".to_string(),
             execution_payload_value: Some("1000".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
         };
         assert!(!is_better_block(&a, &b));
         assert!(is_better_block(&b, &a));
@@ -1881,12 +1889,16 @@ mod tests {
             is_blinded: false,
             consensus_version: "deneb".to_string(),
             execution_payload_value: None,
+            is_ssz: false,
+            ssz_bytes: None,
         };
         let b = ProduceBlockResponse {
             data: serde_json::Value::Null,
             is_blinded: false,
             consensus_version: "deneb".to_string(),
             execution_payload_value: None,
+            is_ssz: false,
+            ssz_bytes: None,
         };
         assert!(!is_better_block(&a, &b));
     }
@@ -1898,12 +1910,16 @@ mod tests {
             is_blinded: false,
             consensus_version: "deneb".to_string(),
             execution_payload_value: Some("1000".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
         };
         let b = ProduceBlockResponse {
             data: serde_json::Value::Null,
             is_blinded: false,
             consensus_version: "deneb".to_string(),
             execution_payload_value: Some("1000".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
         };
         assert!(!is_better_block(&a, &b));
     }

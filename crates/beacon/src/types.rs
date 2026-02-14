@@ -92,12 +92,20 @@ pub struct ProposerDuty {
 pub type ProposerDutiesResponse = DependentRootResponse<Vec<ProposerDuty>>;
 
 /// Response from the produce block v3 endpoint, including header metadata.
+///
+/// Supports both JSON and SSZ content types. When the BN responds with SSZ,
+/// `is_ssz` is `true` and `ssz_bytes` contains the raw SSZ-encoded block.
+/// When JSON, `data` contains the parsed JSON value.
 #[derive(Debug, Clone)]
 pub struct ProduceBlockResponse {
     pub data: serde_json::Value,
     pub is_blinded: bool,
     pub consensus_version: String,
     pub execution_payload_value: Option<String>,
+    /// Whether the response was received as SSZ (`application/octet-stream`).
+    pub is_ssz: bool,
+    /// Raw SSZ bytes when the BN responded with SSZ content type.
+    pub ssz_bytes: Option<Vec<u8>>,
 }
 
 impl ProduceBlockResponse {
@@ -788,6 +796,8 @@ mod tests {
             is_blinded: false,
             consensus_version: "deneb".to_string(),
             execution_payload_value: Some("12345".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
         };
 
         let block = response.parse_full_block().unwrap();
@@ -810,6 +820,8 @@ mod tests {
             is_blinded: true,
             consensus_version: "deneb".to_string(),
             execution_payload_value: None,
+            is_ssz: false,
+            ssz_bytes: None,
         };
 
         let block = response.parse_blinded_block().unwrap();
@@ -824,6 +836,8 @@ mod tests {
             is_blinded: false,
             consensus_version: "deneb".to_string(),
             execution_payload_value: None,
+            is_ssz: false,
+            ssz_bytes: None,
         };
 
         assert!(response.parse_full_block().is_err());
