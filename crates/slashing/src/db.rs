@@ -192,8 +192,12 @@ impl SlashingDb {
             Ok((row.get::<_, i64>(0)? as Epoch, row.get::<_, i64>(1)? as Epoch))
         })?;
 
+        let mut min_target: Option<Epoch> = None;
+
         for row in rows {
             let (existing_source, existing_target) = row?;
+
+            min_target = Some(min_target.map_or(existing_target, |m| m.min(existing_target)));
 
             // Check for double voting (same target epoch)
             if target_epoch == existing_target {
@@ -220,6 +224,17 @@ impl SlashingDb {
                     new_target: target_epoch,
                     existing_source,
                     existing_target,
+                }
+                .into());
+            }
+        }
+
+        // Check target epoch is not below minimum existing target
+        if let Some(min) = min_target {
+            if target_epoch < min {
+                return Err(AttestationSlashingViolation::TargetEpochBelowMinimum {
+                    target_epoch,
+                    min_target: min,
                 }
                 .into());
             }
@@ -380,6 +395,24 @@ impl SlashingDb {
             if existing_root != signing_root {
                 return Err(BlockSlashingViolation::DoubleBlockProposal { slot }.into());
             }
+        } else {
+            // No block at this slot — check that slot is not below the minimum
+            let min_slot: Option<i64> = conn
+                .query_row("SELECT MIN(slot) FROM blocks WHERE pubkey = ?1", [pubkey], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .flatten();
+
+            if let Some(min) = min_slot {
+                if (slot as i64) < min {
+                    return Err(BlockSlashingViolation::SlotBelowMinimum {
+                        slot,
+                        min_slot: min as Slot,
+                    }
+                    .into());
+                }
+            }
         }
 
         Ok(())
@@ -413,6 +446,22 @@ impl SlashingDb {
             // Same signing root — idempotent re-sign, commit without inserting
             tx.commit()?;
             return Ok(());
+        }
+
+        // No block at this slot — check that slot is not below the minimum
+        let min_slot: Option<i64> = tx
+            .query_row("SELECT MIN(slot) FROM blocks WHERE pubkey = ?1", [pubkey], |row| row.get(0))
+            .optional()?
+            .flatten();
+
+        if let Some(min) = min_slot {
+            if (slot as i64) < min {
+                return Err(BlockSlashingViolation::SlotBelowMinimum {
+                    slot,
+                    min_slot: min as Slot,
+                }
+                .into());
+            }
         }
 
         tx.execute(
@@ -488,6 +537,18 @@ impl SlashingDb {
         }
 
         if !is_duplicate {
+            // Check target epoch is not below minimum existing target
+            let min_target = existing.iter().map(|(_, t, _)| *t).min();
+            if let Some(min) = min_target {
+                if target_epoch < min {
+                    return Err(AttestationSlashingViolation::TargetEpochBelowMinimum {
+                        target_epoch,
+                        min_target: min,
+                    }
+                    .into());
+                }
+            }
+
             tx.execute(
                 "INSERT INTO attestations (pubkey, source_epoch, target_epoch, signing_root)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -1102,13 +1163,17 @@ mod tests {
         };
         db.insert_attestation(&attestation).expect("failed to insert");
 
-        // New: source=4, target=10 - same source, not surrounded (need existing_source < new_source)
+        // New: source=4, target=10 - below min target (11), rejected per EIP-3076
         let result = db.is_safe_to_sign("0x1234", 4, 10);
-        assert!(result.is_ok());
+        assert!(result.is_err());
 
         // New: source=5, target=11 - same target (double vote)
         let result = db.is_safe_to_sign("0x1234", 5, 11);
         assert!(result.is_err());
+
+        // New: source=4, target=12 - above min target (11), safe
+        let result = db.is_safe_to_sign("0x1234", 4, 12);
+        assert!(result.is_ok());
     }
 
     #[test]

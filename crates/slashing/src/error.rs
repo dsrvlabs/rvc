@@ -54,6 +54,9 @@ pub enum AttestationSlashingViolation {
         existing_source: Epoch,
         existing_target: Epoch,
     },
+
+    #[error("target epoch {target_epoch} is below minimum existing target epoch {min_target}")]
+    TargetEpochBelowMinimum { target_epoch: Epoch, min_target: Epoch },
 }
 
 /// Specific types of block slashing violations per EIP-3076.
@@ -61,4 +64,7 @@ pub enum AttestationSlashingViolation {
 pub enum BlockSlashingViolation {
     #[error("double block proposal: already signed a different block for slot {slot}")]
     DoubleBlockProposal { slot: Slot },
+
+    #[error("slot {slot} is below minimum existing slot {min_slot}")]
+    SlotBelowMinimum { slot: Slot, min_slot: Slot },
 }
