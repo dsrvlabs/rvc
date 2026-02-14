@@ -5,7 +5,7 @@
 //! and slashing protection.
 
 use lazy_static::lazy_static;
-use prometheus::{Gauge, HistogramOpts, HistogramVec, IntCounterVec, Opts};
+use prometheus::{Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, Opts};
 
 use crate::REGISTRY;
 
@@ -197,6 +197,48 @@ lazy_static! {
             .expect("Failed to register rvc_slashing_db_prune_total metric");
         counter
     };
+
+    /// Gauge for BN health score per endpoint.
+    /// Labels: endpoint
+    pub static ref RVC_BN_HEALTH_SCORE: GaugeVec = {
+        let opts = Opts::new(
+            "rvc_bn_health_score",
+            "Composite health score of each beacon node"
+        );
+        let gauge = GaugeVec::new(opts, &["endpoint"])
+            .expect("Failed to create rvc_bn_health_score metric");
+        REGISTRY.register(Box::new(gauge.clone()))
+            .expect("Failed to register rvc_bn_health_score metric");
+        gauge
+    };
+
+    /// Histogram for BN response latency in seconds per endpoint.
+    /// Labels: endpoint
+    pub static ref RVC_BN_LATENCY_SECONDS: HistogramVec = {
+        let opts = HistogramOpts::new(
+            "rvc_bn_latency_seconds",
+            "Response latency of each beacon node in seconds"
+        ).buckets(vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]);
+        let histogram = HistogramVec::new(opts, &["endpoint"])
+            .expect("Failed to create rvc_bn_latency_seconds metric");
+        REGISTRY.register(Box::new(histogram.clone()))
+            .expect("Failed to register rvc_bn_latency_seconds metric");
+        histogram
+    };
+
+    /// Counter for BN errors per endpoint.
+    /// Labels: endpoint
+    pub static ref RVC_BN_ERRORS_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_bn_errors_total",
+            "Total number of errors from each beacon node"
+        );
+        let counter = IntCounterVec::new(opts, &["endpoint"])
+            .expect("Failed to create rvc_bn_errors_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_bn_errors_total metric");
+        counter
+    };
 }
 
 /// Initializes all core metrics by accessing the lazy_static variables.
@@ -216,6 +258,9 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS);
     lazy_static::initialize(&RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS);
     lazy_static::initialize(&RVC_SLASHING_DB_PRUNE_TOTAL);
+    lazy_static::initialize(&RVC_BN_HEALTH_SCORE);
+    lazy_static::initialize(&RVC_BN_LATENCY_SECONDS);
+    lazy_static::initialize(&RVC_BN_ERRORS_TOTAL);
 }
 
 /// Attestation status label values.

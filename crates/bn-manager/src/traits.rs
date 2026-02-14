@@ -188,6 +188,12 @@ pub struct BnHealthScore {
     pub head_slot: Option<u64>,
     /// Response latency for the most recent health check.
     pub latency: Option<Duration>,
+    /// Exponential moving average latency in milliseconds.
+    pub latency_ms: f64,
+    /// Error rate as a fraction (0.0 = no errors, 1.0 = all errors).
+    pub error_rate: f64,
+    /// Composite health score (0.0 = worst, 1.0 = best).
+    pub score: f64,
 }
 
 #[cfg(test)]
@@ -298,10 +304,14 @@ mod tests {
             is_synced: true,
             head_slot: Some(1000),
             latency: Some(Duration::from_millis(50)),
+            latency_ms: 50.0,
+            error_rate: 0.0,
+            score: 0.99,
         };
         assert!(score.is_reachable);
         assert!(score.is_synced);
         assert_eq!(score.head_slot, Some(1000));
+        assert!(score.score > 0.9);
     }
 
     #[test]
@@ -312,11 +322,15 @@ mod tests {
             is_synced: false,
             head_slot: None,
             latency: None,
+            latency_ms: 0.0,
+            error_rate: 1.0,
+            score: 0.0,
         };
         assert!(!score.is_reachable);
         assert!(!score.is_synced);
         assert!(score.head_slot.is_none());
         assert!(score.latency.is_none());
+        assert_eq!(score.error_rate, 1.0);
     }
 
     #[test]
@@ -327,6 +341,9 @@ mod tests {
             is_synced: false,
             head_slot: Some(500),
             latency: Some(Duration::from_millis(200)),
+            latency_ms: 200.0,
+            error_rate: 0.1,
+            score: 0.8,
         };
         assert!(score.is_reachable);
         assert!(!score.is_synced);
@@ -341,6 +358,9 @@ mod tests {
             is_synced: true,
             head_slot: Some(1000),
             latency: Some(Duration::from_millis(50)),
+            latency_ms: 50.0,
+            error_rate: 0.0,
+            score: 0.99,
         };
         let cloned = score.clone();
         assert_eq!(score, cloned);
@@ -354,6 +374,9 @@ mod tests {
             is_synced: true,
             head_slot: Some(1000),
             latency: Some(Duration::from_millis(50)),
+            latency_ms: 50.0,
+            error_rate: 0.0,
+            score: 0.99,
         };
         let debug = format!("{:?}", score);
         assert!(debug.contains("BnHealthScore"));

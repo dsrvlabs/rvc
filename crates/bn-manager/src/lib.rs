@@ -1,6 +1,7 @@
 //! Beacon node manager with multi-BN support, failover, and health tracking.
 
 mod error;
+mod health;
 mod manager;
 pub mod sse;
 mod sync_status;

@@ -18,18 +18,19 @@ use futures::future::join_all;
 use tracing::{debug, warn};
 use url::Url;
 
+use crate::health::{new_shared_health_trackers, SharedHealthTrackers};
 use crate::sse::{self, SseConfig, SseEvent};
 #[cfg(test)]
 use crate::sync_status::BnSyncStatus;
 use crate::sync_status::{
     check_all_sync_statuses, new_shared_sync_statuses, start_sync_monitor, SharedSyncStatuses,
 };
-use crate::traits::{BeaconNodeClient, BnManagerConfig};
+use crate::traits::{BeaconNodeClient, BnHealthScore, BnManagerConfig};
 use crate::BnManagerError;
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, BeaconError>> + Send + 'a>>;
-type IndexedResultFut<'a, T> =
-    Pin<Box<dyn Future<Output = (usize, String, Result<T, BeaconError>)> + Send + 'a>>;
+type IndexedTimedResultFut<'a, T> =
+    Pin<Box<dyn Future<Output = (usize, String, Result<T, BeaconError>, Duration)> + Send + 'a>>;
 
 /// Default sync check interval: once per epoch (~384 seconds).
 const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
@@ -46,6 +47,7 @@ const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 pub struct BnManager {
     clients: Vec<BeaconClient>,
     sync_statuses: SharedSyncStatuses,
+    health_trackers: SharedHealthTrackers,
 }
 
 impl BnManager {
@@ -92,12 +94,37 @@ impl BnManager {
         }
 
         let sync_statuses = new_shared_sync_statuses(clients.len());
-        Ok(Self { clients, sync_statuses })
+        let endpoints: Vec<String> = clients.iter().map(|c| c.endpoint().to_string()).collect();
+        let health_trackers = new_shared_health_trackers(&endpoints);
+        Ok(Self { clients, sync_statuses, health_trackers })
     }
 
     /// Returns the shared sync status tracker.
     pub fn sync_statuses(&self) -> &SharedSyncStatuses {
         &self.sync_statuses
+    }
+
+    /// Returns the shared health trackers.
+    pub fn health_trackers(&self) -> &SharedHealthTrackers {
+        &self.health_trackers
+    }
+
+    /// Returns current health scores for all BNs.
+    pub async fn health_scores(&self) -> Vec<BnHealthScore> {
+        let guard = self.health_trackers.read().await;
+        guard
+            .iter()
+            .map(|t| BnHealthScore {
+                endpoint: t.endpoint().to_string(),
+                is_reachable: true,
+                is_synced: true,
+                head_slot: None,
+                latency: t.latency_ema_ms().map(|ms| Duration::from_secs_f64(ms / 1000.0)),
+                latency_ms: t.latency_ema_ms().unwrap_or(0.0),
+                error_rate: t.error_rate(),
+                score: t.score(),
+            })
+            .collect()
     }
 
     /// Checks sync status of all configured BNs immediately.
@@ -141,12 +168,14 @@ impl BnManager {
         })
     }
 
-    /// Returns indices of synced BNs, falling back to all BNs if none are synced
-    /// (single-BN mode logs a warning).
+    /// Returns indices of synced+healthy BNs, ordered by health score (highest first).
+    /// Falls back to all BNs if none are synced (single-BN mode logs a warning).
     async fn synced_indices(&self) -> Vec<usize> {
-        let guard = self.sync_statuses.read().await;
-        let synced: Vec<usize> =
-            guard.iter().enumerate().filter(|(_, s)| s.is_usable()).map(|(i, _)| i).collect();
+        let sync_guard = self.sync_statuses.read().await;
+        let health_guard = self.health_trackers.read().await;
+
+        let mut synced: Vec<usize> =
+            sync_guard.iter().enumerate().filter(|(_, s)| s.is_usable()).map(|(i, _)| i).collect();
 
         if synced.is_empty() {
             if self.clients.len() == 1 {
@@ -157,10 +186,29 @@ impl BnManager {
             } else {
                 warn!("no synced BNs available, falling back to all BNs");
             }
-            (0..self.clients.len()).collect()
-        } else {
-            synced
+            synced = (0..self.clients.len()).collect();
         }
+
+        // Filter out unhealthy BNs (unless it would leave none)
+        let healthy: Vec<usize> =
+            synced.iter().copied().filter(|&i| health_guard[i].is_healthy()).collect();
+
+        let mut result = if healthy.is_empty() {
+            warn!("all synced BNs are unhealthy, using all synced BNs");
+            synced
+        } else {
+            healthy
+        };
+
+        // Sort by health score descending (highest score first)
+        result.sort_by(|&a, &b| {
+            health_guard[b]
+                .score()
+                .partial_cmp(&health_guard[a].score())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        result
     }
 
     /// Query using the `First` strategy: try synced BNs in order, fail over on error.
@@ -174,17 +222,22 @@ impl BnManager {
 
         for i in indices {
             let client = &self.clients[i];
+            let start = tokio::time::Instant::now();
             match op(client).await {
                 Ok(result) => {
+                    let elapsed = start.elapsed();
+                    self.health_trackers.write().await[i].record_success(elapsed);
                     debug!(
                         op = op_name,
                         bn_index = i,
                         endpoint = client.endpoint(),
+                        latency_ms = elapsed.as_millis() as u64,
                         "query succeeded"
                     );
                     return Ok(result);
                 }
                 Err(e) => {
+                    self.health_trackers.write().await[i].record_error();
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -220,8 +273,10 @@ impl BnManager {
         if indices.len() == 1 {
             let client = &self.clients[indices[0]];
             let i = indices[0];
+            let start = tokio::time::Instant::now();
             match op(client).await {
                 Ok(result) => {
+                    self.health_trackers.write().await[i].record_success(start.elapsed());
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -231,6 +286,7 @@ impl BnManager {
                     return Ok(result);
                 }
                 Err(e) => {
+                    self.health_trackers.write().await[i].record_error();
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -243,7 +299,7 @@ impl BnManager {
             }
         }
 
-        let mut futs: Vec<IndexedResultFut<'_, T>> = Vec::with_capacity(indices.len());
+        let mut futs: Vec<IndexedTimedResultFut<'_, T>> = Vec::with_capacity(indices.len());
 
         for i in &indices {
             let client = &self.clients[*i];
@@ -251,8 +307,10 @@ impl BnManager {
             let idx = *i;
             let fut = op(client);
             futs.push(Box::pin(async move {
+                let start = tokio::time::Instant::now();
                 let result = fut.await;
-                (idx, endpoint, result)
+                let elapsed = start.elapsed();
+                (idx, endpoint, result, elapsed)
             }));
         }
 
@@ -260,9 +318,10 @@ impl BnManager {
 
         let mut best: Option<(usize, T)> = None;
 
-        for (i, endpoint, result) in results {
+        for (i, endpoint, result, elapsed) in results {
             match result {
                 Ok(value) => {
+                    self.health_trackers.write().await[i].record_success(elapsed);
                     best = Some(match best {
                         None => (i, value),
                         Some((prev_i, prev_value)) => {
@@ -275,6 +334,7 @@ impl BnManager {
                     });
                 }
                 Err(e) => {
+                    self.health_trackers.write().await[i].record_error();
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -358,44 +418,61 @@ impl BnManager {
     where
         F: Fn(&'s BeaconClient) -> BoxFut<'s, ()>,
     {
-        let mut futs: Vec<IndexedResultFut<'_, ()>> = Vec::with_capacity(self.clients.len());
+        let mut futs: Vec<IndexedTimedResultFut<'_, ()>> = Vec::with_capacity(self.clients.len());
 
         for (i, client) in self.clients.iter().enumerate() {
             let endpoint = client.endpoint().to_string();
             let fut = op(client);
             futs.push(Box::pin(async move {
+                let start = tokio::time::Instant::now();
                 let result = fut.await;
-                (i, endpoint, result)
+                let elapsed = start.elapsed();
+                (i, endpoint, result, elapsed)
             }));
         }
 
         let results = join_all(futs).await;
 
+        // Record health for ALL BNs first, then determine the result.
+        let mut first_ok = false;
         let mut last_err = None;
-        for (i, endpoint, result) in results {
-            match result {
-                Ok(()) => {
-                    debug!(
-                        op = op_name,
-                        bn_index = i,
-                        endpoint = endpoint,
-                        "broadcast succeeded on BN"
-                    );
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!(
-                        op = op_name,
-                        bn_index = i,
-                        endpoint = endpoint,
-                        error = %e,
-                        "broadcast failed on BN"
-                    );
-                    last_err = Some(e);
+        {
+            let mut guard = self.health_trackers.write().await;
+            for (i, endpoint, result, elapsed) in &results {
+                match result {
+                    Ok(()) => {
+                        guard[*i].record_success(*elapsed);
+                        debug!(
+                            op = op_name,
+                            bn_index = i,
+                            endpoint = endpoint,
+                            "broadcast succeeded on BN"
+                        );
+                        first_ok = true;
+                    }
+                    Err(e) => {
+                        guard[*i].record_error();
+                        warn!(
+                            op = op_name,
+                            bn_index = i,
+                            endpoint = endpoint,
+                            error = %e,
+                            "broadcast failed on BN"
+                        );
+                    }
                 }
             }
         }
 
+        if first_ok {
+            return Ok(());
+        }
+
+        for (_, _, result, _) in results {
+            if let Err(e) = result {
+                last_err = Some(e);
+            }
+        }
         Err(last_err.expect("at least one client exists"))
     }
 
@@ -410,44 +487,57 @@ impl BnManager {
         T: Send + 'static,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        let mut futs: Vec<IndexedResultFut<'_, T>> = Vec::with_capacity(self.clients.len());
+        let mut futs: Vec<IndexedTimedResultFut<'_, T>> = Vec::with_capacity(self.clients.len());
 
         for (i, client) in self.clients.iter().enumerate() {
             let endpoint = client.endpoint().to_string();
             let fut = op(client);
             futs.push(Box::pin(async move {
+                let start = tokio::time::Instant::now();
                 let result = fut.await;
-                (i, endpoint, result)
+                let elapsed = start.elapsed();
+                (i, endpoint, result, elapsed)
             }));
         }
 
         let results = join_all(futs).await;
 
-        let mut last_err = None;
-        for (i, endpoint, result) in results {
-            match result {
-                Ok(v) => {
-                    debug!(
-                        op = op_name,
-                        bn_index = i,
-                        endpoint = endpoint,
-                        "broadcast succeeded on BN"
-                    );
-                    return Ok(v);
-                }
-                Err(e) => {
-                    warn!(
-                        op = op_name,
-                        bn_index = i,
-                        endpoint = endpoint,
-                        error = %e,
-                        "broadcast failed on BN"
-                    );
-                    last_err = Some(e);
+        // Record health for ALL BNs first.
+        {
+            let mut guard = self.health_trackers.write().await;
+            for (i, endpoint, result, elapsed) in &results {
+                match result {
+                    Ok(_) => {
+                        guard[*i].record_success(*elapsed);
+                        debug!(
+                            op = op_name,
+                            bn_index = i,
+                            endpoint = endpoint,
+                            "broadcast succeeded on BN"
+                        );
+                    }
+                    Err(e) => {
+                        guard[*i].record_error();
+                        warn!(
+                            op = op_name,
+                            bn_index = i,
+                            endpoint = endpoint,
+                            error = %e,
+                            "broadcast failed on BN"
+                        );
+                    }
                 }
             }
         }
 
+        // Return first success or last error.
+        let mut last_err = None;
+        for (_, _, result, _) in results {
+            match result {
+                Ok(v) => return Ok(v),
+                Err(e) => last_err = Some(e),
+            }
+        }
         Err(last_err.expect("at least one client exists"))
     }
 }
@@ -2165,5 +2255,350 @@ mod tests {
         // Without calling check_sync_status, BN should still be tried via fallback
         let result = manager.get_genesis().await;
         assert!(result.is_ok());
+    }
+
+    // ===================================================================
+    // Health scoring tests
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_health_scores_tracked_after_success() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let manager = make_manager(&server.uri());
+        let _ = manager.get_genesis().await.unwrap();
+
+        let scores = manager.health_scores().await;
+        assert_eq!(scores.len(), 1);
+        assert!(scores[0].latency_ms > 0.0, "latency should be recorded");
+        assert_eq!(scores[0].error_rate, 0.0);
+        assert!(scores[0].score > 0.5, "score should be high after success");
+    }
+
+    #[tokio::test]
+    async fn test_health_scores_tracked_after_error() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Error"))
+            .mount(&server)
+            .await;
+
+        let manager = make_manager(&server.uri());
+        let _ = manager.get_genesis().await;
+
+        let scores = manager.health_scores().await;
+        assert_eq!(scores[0].error_rate, 1.0);
+        assert!(scores[0].score < 0.5, "score should be low after error");
+    }
+
+    #[tokio::test]
+    async fn test_health_scores_tracked_in_broadcast() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&bn1)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Error"))
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+        let _ = manager.prepare_beacon_proposer(&[]).await;
+
+        let scores = manager.health_scores().await;
+        // BN1 succeeded
+        assert_eq!(scores[0].error_rate, 0.0);
+        // BN2 failed
+        assert_eq!(scores[1].error_rate, 1.0);
+    }
+
+    #[tokio::test]
+    async fn test_health_healthy_bn_preferred_in_failover() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // Both synced
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&bn1)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+        manager.check_sync_status().await;
+
+        // Degrade BN1 health by recording errors
+        {
+            let mut guard = manager.health_trackers().write().await;
+            for _ in 0..50 {
+                guard[0].record_error();
+            }
+            // BN2 is healthy — record successes
+            for _ in 0..50 {
+                guard[1].record_success(Duration::from_millis(10));
+            }
+        }
+
+        // BN2 should be tried first (higher score) due to health ordering
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(1)
+            .mount(&bn2)
+            .await;
+
+        // BN1 should NOT be called (BN2 succeeds first)
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(0)
+            .mount(&bn1)
+            .await;
+
+        let result = manager.get_genesis().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_health_unhealthy_bn_excluded() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // Both synced
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&bn1)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+        manager.check_sync_status().await;
+
+        // Make BN1 unhealthy (100% error rate → score=0.2, below 0.2 threshold)
+        {
+            let mut guard = manager.health_trackers().write().await;
+            for _ in 0..100 {
+                guard[0].record_error();
+            }
+            // BN2 is healthy
+            for _ in 0..10 {
+                guard[1].record_success(Duration::from_millis(50));
+            }
+        }
+
+        // Only BN2 should be called
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(1)
+            .mount(&bn2)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(0)
+            .mount(&bn1)
+            .await;
+
+        let result = manager.get_genesis().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_health_recovery_readds_bn() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // Both synced
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&bn1)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+        manager.check_sync_status().await;
+
+        // Make BN1 unhealthy
+        {
+            let mut guard = manager.health_trackers().write().await;
+            for _ in 0..100 {
+                guard[0].record_error();
+            }
+            for _ in 0..10 {
+                guard[1].record_success(Duration::from_millis(50));
+            }
+        }
+
+        // Verify BN1 is excluded
+        let guard = manager.health_trackers().read().await;
+        assert!(!guard[0].is_healthy());
+        drop(guard);
+
+        // Now recover BN1 by adding many successes
+        {
+            let mut guard = manager.health_trackers().write().await;
+            for _ in 0..100 {
+                guard[0].record_success(Duration::from_millis(20));
+            }
+        }
+
+        // BN1 should be healthy again
+        let guard = manager.health_trackers().read().await;
+        assert!(guard[0].is_healthy());
+        drop(guard);
+
+        // BN1 (now recovered & low latency) should have higher score than BN2
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(1)
+            .mount(&bn1)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(0)
+            .mount(&bn2)
+            .await;
+
+        let result = manager.get_genesis().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_health_all_unhealthy_falls_back_to_all() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // Both synced
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&bn1)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+        manager.check_sync_status().await;
+
+        // Make both unhealthy
+        {
+            let mut guard = manager.health_trackers().write().await;
+            for _ in 0..100 {
+                guard[0].record_error();
+                guard[1].record_error();
+            }
+        }
+
+        // Should still work despite both being unhealthy (fallback to all)
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .mount(&bn1)
+            .await;
+
+        let result = manager.get_genesis().await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_health_scores_accumulate_over_operations() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let manager = make_manager(&server.uri());
+
+        // Multiple operations should update EMA
+        for _ in 0..5 {
+            let _ = manager.get_genesis().await.unwrap();
+        }
+
+        let scores = manager.health_scores().await;
+        assert!(scores[0].latency_ms > 0.0);
+        assert_eq!(scores[0].error_rate, 0.0);
+        assert!(scores[0].score > 0.9, "should be very healthy after 5 successes");
+    }
+
+    #[tokio::test]
+    async fn test_health_best_strategy_records_health() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // BN1 returns lower value block
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Execution-Payload-Value", "1000")
+                .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+            .mount(&bn1)
+            .await;
+
+        // BN2 returns higher value block
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Execution-Payload-Value", "5000")
+                .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+        let _ = manager.produce_block_v3(1, "0xrandao", None, None).await.unwrap();
+
+        // Both BNs should have health recorded
+        let scores = manager.health_scores().await;
+        assert!(scores[0].latency_ms > 0.0, "BN1 latency should be tracked");
+        assert!(scores[1].latency_ms > 0.0, "BN2 latency should be tracked");
+        assert_eq!(scores[0].error_rate, 0.0);
+        assert_eq!(scores[1].error_rate, 0.0);
     }
 }
