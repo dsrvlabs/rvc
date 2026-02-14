@@ -21,6 +21,12 @@ fn pubkey(n: u8) -> String {
     format!("0x{}", hex::encode([n; 48]))
 }
 
+/// Strategy that produces either None or Some(hex_root) to cover the EIP-3076
+/// "unknown signing root" code path.
+fn signing_root_strategy() -> impl Strategy<Value = Option<String>> {
+    prop_oneof![Just(None), (1u8..255).prop_map(|b| Some(hex_root(b))),]
+}
+
 // =========================================================================
 // Property 1: No double proposals
 // Same (validator, slot) with different signing roots → exactly one success
@@ -32,13 +38,11 @@ proptest! {
     #[test]
     fn proptest_no_double_proposals(
         slot in 0u64..100_000,
-        root_a_byte in 1u8..255,
-        root_b_byte in 1u8..255,
+        root_a in signing_root_strategy(),
+        root_b in signing_root_strategy(),
     ) {
         let db = SlashingDb::open_in_memory().unwrap();
         let pk = pubkey(1);
-        let root_a = Some(hex_root(root_a_byte));
-        let root_b = Some(hex_root(root_b_byte));
 
         if root_a == root_b {
             // Same signing root — both should succeed (idempotent re-signing)
@@ -67,13 +71,11 @@ proptest! {
         source_a in 0u64..50_000,
         source_b in 0u64..50_000,
         target in 1u64..100_000,
-        root_a_byte in 1u8..255,
-        root_b_byte in 1u8..255,
+        root_a in signing_root_strategy(),
+        root_b in signing_root_strategy(),
     ) {
         let db = SlashingDb::open_in_memory().unwrap();
         let pk = pubkey(1);
-        let root_a = Some(hex_root(root_a_byte));
-        let root_b = Some(hex_root(root_b_byte));
 
         // First attestation should always succeed
         let r1 = db.check_and_record_attestation(&pk, source_a, target, root_a.clone());
@@ -83,6 +85,11 @@ proptest! {
             // Same signing root — idempotent, should succeed
             let r2 = db.check_and_record_attestation(&pk, source_b, target, root_b);
             prop_assert!(r2.is_ok());
+
+            // Verify only 1 record exists and original source is preserved
+            let atts = db.get_attestations(&pk).unwrap();
+            prop_assert_eq!(atts.len(), 1, "re-sign should not create duplicate record");
+            prop_assert_eq!(atts[0].source_epoch, source_a, "re-sign must not overwrite source epoch");
         } else {
             // Different signing roots — must be rejected (double vote)
             let r2 = db.check_and_record_attestation(&pk, source_b, target, root_b);
@@ -109,17 +116,15 @@ proptest! {
         let db = SlashingDb::open_in_memory().unwrap();
         let pk = pubkey(1);
 
-        // Track successfully recorded attestations
-        let mut accepted: Vec<(u64, u64)> = Vec::new();
-
-        for (source, target_offset) in &attestations {
+        // Submit attestations with unique roots per index to avoid collisions
+        for (i, (source, target_offset)) in attestations.iter().enumerate() {
             let target = source + target_offset; // Ensure target > source
-            let root = Some(hex_root((target % 255) as u8 + 1));
-
-            if db.check_and_record_attestation(&pk, *source, target, root).is_ok() {
-                accepted.push((*source, target));
-            }
+            let root = Some(hex_root((i as u8).wrapping_add(1)));
+            let _ = db.check_and_record_attestation(&pk, *source, target, root);
         }
+
+        // Query the ACTUAL DB records for the surround invariant check
+        let accepted = db.get_attestations(&pk).unwrap();
 
         // Verify no surround pairs exist among accepted attestations
         for i in 0..accepted.len() {
@@ -127,8 +132,8 @@ proptest! {
                 if i == j {
                     continue;
                 }
-                let (s_i, t_i) = accepted[i];
-                let (s_j, t_j) = accepted[j];
+                let (s_i, t_i) = (accepted[i].source_epoch, accepted[i].target_epoch);
+                let (s_j, t_j) = (accepted[j].source_epoch, accepted[j].target_epoch);
                 // i surrounds j: s_i < s_j AND t_i > t_j
                 prop_assert!(
                     !(s_i < s_j && t_i > t_j),
@@ -220,12 +225,11 @@ proptest! {
     #[test]
     fn proptest_validator_independence_blocks(
         slot in 0u64..100_000,
-        root_byte in 1u8..255,
+        root in signing_root_strategy(),
     ) {
         let db = SlashingDb::open_in_memory().unwrap();
         let pk_a = pubkey(1);
         let pk_b = pubkey(2);
-        let root = Some(hex_root(root_byte));
 
         // Validator A records a block
         db.check_and_record_block(&pk_a, slot, root.clone()).unwrap();
@@ -239,12 +243,11 @@ proptest! {
     fn proptest_validator_independence_attestations(
         source in 0u64..50_000,
         target in 50_001u64..100_000,
-        root_byte in 1u8..255,
+        root in signing_root_strategy(),
     ) {
         let db = SlashingDb::open_in_memory().unwrap();
         let pk_a = pubkey(1);
         let pk_b = pubkey(2);
-        let root = Some(hex_root(root_byte));
 
         // Validator A records an attestation
         db.check_and_record_attestation(&pk_a, source, target, root.clone()).unwrap();
@@ -270,12 +273,11 @@ proptest! {
     #[test]
     fn proptest_resign_block_always_succeeds(
         slot in 0u64..100_000,
-        root_byte in 1u8..255,
+        root in signing_root_strategy(),
         repeat_count in 2u8..10,
     ) {
         let db = SlashingDb::open_in_memory().unwrap();
         let pk = pubkey(1);
-        let root = Some(hex_root(root_byte));
 
         for _ in 0..repeat_count {
             let result = db.check_and_record_block(&pk, slot, root.clone());
@@ -291,12 +293,11 @@ proptest! {
     fn proptest_resign_attestation_always_succeeds(
         source in 0u64..50_000,
         target in 50_001u64..100_000,
-        root_byte in 1u8..255,
+        root in signing_root_strategy(),
         repeat_count in 2u8..10,
     ) {
         let db = SlashingDb::open_in_memory().unwrap();
         let pk = pubkey(1);
-        let root = Some(hex_root(root_byte));
 
         for _ in 0..repeat_count {
             let result = db.check_and_record_attestation(&pk, source, target, root.clone());
