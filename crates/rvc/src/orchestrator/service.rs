@@ -3558,4 +3558,457 @@ mod tests {
         let fork_name = ForkName::from_epoch(100, &schedule);
         assert!(fork_name >= ForkName::Electra);
     }
+
+    // --- G-1-06: Electra fork transition integration tests ---
+
+    /// A submitter that captures the submitted VersionedAttestation for assertion.
+    struct CapturingSubmitter {
+        captured: std::sync::Mutex<Vec<VersionedAttestation>>,
+    }
+
+    impl CapturingSubmitter {
+        fn new() -> Self {
+            Self { captured: std::sync::Mutex::new(Vec::new()) }
+        }
+
+        fn captured(&self) -> Vec<VersionedAttestation> {
+            self.captured.lock().unwrap().clone()
+        }
+    }
+
+    impl AttestationSubmitter for CapturingSubmitter {
+        fn submit_attestation<'a>(
+            &'a self,
+            attestations: &'a VersionedAttestation,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<beacon::SubmitAttestationResult, beacon::BeaconError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.captured.lock().unwrap().push(attestations.clone());
+            Box::pin(async move { Ok(beacon::SubmitAttestationResult::Success) })
+        }
+    }
+
+    /// Builds an orchestrator with a CapturingSubmitter for fork transition tests.
+    /// Returns the orchestrator, handle, pubkey hex, and a reference to the capturing submitter.
+    async fn build_fork_transition_orchestrator(
+        mock_server_uri: &str,
+        slot: u64,
+    ) -> (
+        DutyOrchestrator<MockSlotClock, CapturingSubmitter, MockBlockBeacon>,
+        OrchestratorHandle,
+        String,
+        Arc<CapturingSubmitter>,
+    ) {
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(slot);
+
+        let beacon_config = BeaconClientConfig::new(mock_server_uri);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let secret_key = SecretKey::generate();
+        let pubkey_hex = format!("0x{}", hex::encode(secret_key.public_key().to_bytes()));
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+
+        let pubkey = secret_key.public_key();
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let capturing_submitter = Arc::new(CapturingSubmitter::new());
+        let propagator = Arc::new(Propagator::new(capturing_submitter.clone()));
+
+        let config = create_test_config();
+        let mut pubkey_map = HashMap::new();
+        pubkey_map.insert(pubkey_hex.clone(), pubkey);
+
+        let (orchestrator, handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        (orchestrator, handle, pubkey_hex, capturing_submitter)
+    }
+
+    /// Mounts attestation data and attester duties on the mock server for a given slot.
+    async fn mount_attestation_mocks(
+        mock_server: &wiremock::MockServer,
+        slot: u64,
+        pubkey_hex: &str,
+    ) {
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        // Mock attester duties — small committee (always aggregator)
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "3",
+                    "committee_length": "8",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "2",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(mock_server)
+            .await;
+
+        // Mock attestation data
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "3",
+                    "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source": {
+                        "epoch": (epoch.saturating_sub(1)).to_string(),
+                        "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    },
+                    "target": {
+                        "epoch": epoch.to_string(),
+                        "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    }
+                }
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_pre_electra_attestation_produces_legacy_format() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        // Slot 96 = epoch 3, well before electra_fork_epoch=50
+        let slot = 96u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        // Fetch duties so they're cached
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        // Process the slot
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+
+        // Verify the captured attestation is PreElectra
+        let captured = capturing.captured();
+        assert_eq!(captured.len(), 1, "Expected exactly one submission");
+
+        match &captured[0] {
+            VersionedAttestation::PreElectra(attestations) => {
+                assert_eq!(attestations.len(), 1);
+                let att = &attestations[0];
+                // aggregation_bits should be set (not empty)
+                assert!(!att.aggregation_bits.is_empty());
+                // data.index should be the committee index from the duty ("3")
+                assert_eq!(att.data.index, "3");
+            }
+            VersionedAttestation::Electra(_) => {
+                panic!(
+                    "Expected PreElectra attestation for slot in epoch 3 (< electra_fork_epoch=50)"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_electra_attestation_produces_single_attestation_format() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        // Slot 1600 = epoch 50 = electra_fork_epoch, first Electra slot
+        let slot = 1600u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        assert_eq!(epoch, 50, "Slot 1600 should be epoch 50");
+
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+
+        let captured = capturing.captured();
+        assert_eq!(captured.len(), 1);
+
+        match &captured[0] {
+            VersionedAttestation::Electra(attestations) => {
+                assert_eq!(attestations.len(), 1);
+                let att = &attestations[0];
+                // EIP-7549: data.index must be "0" in Electra
+                assert_eq!(
+                    att.data.index, "0",
+                    "Electra attestation data.index must be 0 (EIP-7549)"
+                );
+                // committee_index carries the original committee index
+                assert_eq!(
+                    att.committee_index, 3,
+                    "committee_index should be the duty committee index"
+                );
+                // attester_index should be the validator index
+                assert_eq!(att.attester_index, 42);
+            }
+            VersionedAttestation::PreElectra(_) => {
+                panic!("Expected Electra attestation for slot in epoch 50 (= electra_fork_epoch)");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fork_boundary_last_pre_electra_slot() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        // Slot 1599 = last slot of epoch 49 (pre-Electra)
+        let slot = 1599u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        assert_eq!(epoch, 49, "Slot 1599 should be epoch 49");
+
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+
+        let captured = capturing.captured();
+        assert_eq!(captured.len(), 1);
+
+        match &captured[0] {
+            VersionedAttestation::PreElectra(attestations) => {
+                assert_eq!(attestations.len(), 1);
+                // Last pre-Electra slot should still use legacy format
+                assert!(!attestations[0].aggregation_bits.is_empty());
+                assert_eq!(attestations[0].data.index, "3");
+            }
+            VersionedAttestation::Electra(_) => {
+                panic!(
+                    "Expected PreElectra attestation for slot 1599 (epoch 49, last pre-Electra)"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_electra_aggregation_passes_committee_index() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Slot 1600 = epoch 50 = electra_fork_epoch, small committee → always aggregator
+        let slot = 1600u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        let (orchestrator, _handle, pubkey_hex, _capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        // Mock aggregate attestation endpoint — expect committee_index query param for Electra
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(query_param("slot", slot.to_string()))
+            .and(query_param("committee_index", "3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "aggregation_bits": "0xff01",
+                    "data": {
+                        "slot": slot.to_string(),
+                        "index": "3",
+                        "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "source": {
+                            "epoch": (epoch - 1).to_string(),
+                            "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                        },
+                        "target": {
+                            "epoch": epoch.to_string(),
+                            "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                        }
+                    },
+                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Mock aggregate submission
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+
+        // wiremock expect(1) on aggregate_attestation with committee_index=3
+        // confirms Electra path passes the committee_index query parameter
+    }
+
+    #[tokio::test]
+    async fn test_pre_electra_aggregation_no_committee_index() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Slot 96 = epoch 3, pre-Electra
+        let slot = 96u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        let (orchestrator, _handle, pubkey_hex, _capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        // Pre-Electra: aggregate_attestation WITHOUT committee_index param
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "aggregation_bits": "0xff01",
+                    "data": {
+                        "slot": slot.to_string(),
+                        "index": "3",
+                        "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "source": {
+                            "epoch": (epoch.saturating_sub(1)).to_string(),
+                            "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                        },
+                        "target": {
+                            "epoch": epoch.to_string(),
+                            "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                        }
+                    },
+                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+    }
+
+    #[tokio::test]
+    async fn test_electra_attestation_data_index_zero_before_signing() {
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Post-Electra: epoch 51
+        let slot = 1632u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        assert_eq!(epoch, 51);
+
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+        // BN returns attestation data with index "7" — different from 0
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "99",
+                    "committee_index": "7",
+                    "committee_length": "16",
+                    "committees_at_slot": "8",
+                    "validator_committee_index": "5",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "7",
+                    "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source": {
+                        "epoch": (epoch - 1).to_string(),
+                        "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    },
+                    "target": {
+                        "epoch": epoch.to_string(),
+                        "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+
+        let captured = capturing.captured();
+        assert_eq!(captured.len(), 1);
+
+        match &captured[0] {
+            VersionedAttestation::Electra(atts) => {
+                // EIP-7549: data.index must be "0" even though BN returned "7"
+                assert_eq!(atts[0].data.index, "0",
+                    "EIP-7549: data.index must be zeroed before signing");
+                // committee_index preserves the original value
+                assert_eq!(atts[0].committee_index, 7);
+                assert_eq!(atts[0].attester_index, 99);
+            }
+            VersionedAttestation::PreElectra(_) => {
+                panic!("Expected Electra attestation for epoch 51");
+            }
+        }
+    }
 }
