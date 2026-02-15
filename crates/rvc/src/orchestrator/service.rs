@@ -8,8 +8,8 @@ use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
 use beacon::{
-    Attestation, AttesterDuty, BeaconCommitteeSubscription, ProposerPreparation,
-    VersionedAttestation, VersionedSignedAggregateAndProof,
+    AttesterDuty, BeaconCommitteeSubscription, LegacyAttestation, ProposerPreparation,
+    SingleAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use block_service::{BeaconBlockClient, BlockService};
 use bn_manager::BeaconNodeClient;
@@ -63,6 +63,28 @@ const SYNC_COMMITTEE_SIZE: u64 = 512;
 
 /// Number of subnets the sync committee is split across.
 const SYNC_COMMITTEE_SUBNET_COUNT: u64 = 4;
+
+/// Constructs a hex-encoded SSZ bitlist where only the validator's position
+/// in the committee is set (pre-Electra aggregation_bits format).
+fn make_aggregation_bits(duty: &AttesterDuty) -> String {
+    let committee_length: usize = duty.committee_length.parse().unwrap_or(0);
+    let validator_committee_index: usize = duty.validator_committee_index.parse().unwrap_or(0);
+
+    // SSZ bitlist: ceil((committee_length + 1) / 8) bytes
+    // The "+1" is for the length bit at position committee_length
+    let byte_count = (committee_length + 8) / 8;
+    let mut bits = vec![0u8; byte_count];
+
+    // Set the validator's bit
+    if validator_committee_index < committee_length {
+        bits[validator_committee_index / 8] |= 1 << (validator_committee_index % 8);
+    }
+
+    // Set the length bit (sentinel) at position committee_length
+    bits[committee_length / 8] |= 1 << (committee_length % 8);
+
+    format!("0x{}", hex::encode(bits))
+}
 
 /// Configuration for the duty orchestrator.
 #[derive(Clone)]
@@ -900,7 +922,7 @@ where
         }
     }
 
-    async fn maybe_produce_aggregations(&self, slot: Slot, _epoch: u64) {
+    async fn maybe_produce_aggregations(&self, slot: Slot, epoch: u64) {
         let duties = match self.get_duties_for_slot(slot).await {
             Ok(d) => d,
             Err(_) => return,
@@ -909,6 +931,9 @@ where
         if duties.is_empty() {
             return;
         }
+
+        let fork_name = ForkName::from_epoch(epoch, &self.config.fork_schedule);
+        let is_electra = fork_name >= ForkName::Electra;
 
         let mut signed_aggregates: Vec<SignedAggregateAndProof> = Vec::new();
 
@@ -1015,10 +1040,15 @@ where
             let att_data_root_hex = format!("0x{}", hex::encode(att_data_root.0));
 
             // Fetch the aggregate attestation
+            // Electra: pass committee_index for per-committee aggregation
+            let electra_committee_index = if is_electra { Some(committee_index) } else { None };
             let aggregate = match tokio::time::timeout(
                 AGGREGATION_TIMEOUT,
-                // TODO(G-1-05): fork-aware committee_index
-                self.beacon.get_aggregate_attestation(slot, &att_data_root_hex, None),
+                self.beacon.get_aggregate_attestation(
+                    slot,
+                    &att_data_root_hex,
+                    electra_committee_index,
+                ),
             )
             .await
             {
@@ -1086,12 +1116,10 @@ where
 
         if !signed_aggregates.is_empty() {
             let count = signed_aggregates.len();
+            let versioned = VersionedSignedAggregateAndProof::PreElectra(signed_aggregates);
             match tokio::time::timeout(
                 AGGREGATION_TIMEOUT,
-                // TODO(G-1-05): fork-aware aggregate variant
-                self.beacon.submit_aggregate_and_proofs(
-                    &VersionedSignedAggregateAndProof::PreElectra(signed_aggregates),
-                ),
+                self.beacon.submit_aggregate_and_proofs(&versioned),
             )
             .await
             {
@@ -1357,21 +1385,29 @@ where
 
         let beacon_attestation_data = attestation_data_response.data;
 
-        let crypto_attestation_data = match Self::convert_attestation_data(&beacon_attestation_data)
-        {
-            Ok(data) => data,
-            Err(e) => {
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!("Failed to convert attestation data: {}", e)),
-                };
-            }
-        };
+        let mut crypto_attestation_data =
+            match Self::convert_attestation_data(&beacon_attestation_data) {
+                Ok(data) => data,
+                Err(e) => {
+                    return AttestationResult {
+                        validator_index,
+                        slot,
+                        success: false,
+                        error: Some(format!("Failed to convert attestation data: {}", e)),
+                    };
+                }
+            };
 
         let target_epoch = crypto_attestation_data.target.epoch;
         let fork = self.derive_fork_for_epoch(target_epoch);
+        let fork_name = ForkName::from_epoch(target_epoch, &self.config.fork_schedule);
+        let is_electra = fork_name >= ForkName::Electra;
+
+        // EIP-7549: For Electra, set data.index = 0 BEFORE signing because
+        // the index field is part of the signed AttestationData.
+        if is_electra {
+            crypto_attestation_data.index = 0;
+        }
 
         let signature = match self
             .signer
@@ -1407,15 +1443,25 @@ where
             }
         };
 
-        let attestation = Attestation {
-            committee_index,
-            attester_index,
-            data: beacon_attestation_data,
-            signature: format!("0x{}", hex::encode(signature.to_bytes())),
+        let sig_hex = format!("0x{}", hex::encode(signature.to_bytes()));
+
+        let versioned = if is_electra {
+            let mut electra_data = beacon_attestation_data.clone();
+            electra_data.index = "0".to_string();
+            VersionedAttestation::Electra(vec![SingleAttestation {
+                committee_index,
+                attester_index,
+                data: electra_data,
+                signature: sig_hex,
+            }])
+        } else {
+            VersionedAttestation::PreElectra(vec![LegacyAttestation {
+                aggregation_bits: make_aggregation_bits(&duty),
+                data: beacon_attestation_data,
+                signature: sig_hex,
+            }])
         };
 
-        // TODO(G-1-05): fork-aware attestation construction
-        let versioned = VersionedAttestation::Electra(vec![attestation]);
         match self.propagator.propagate(&versioned).await {
             Ok(_) => AttestationResult { validator_index, slot, success: true, error: None },
             Err(e) => AttestationResult {
@@ -3435,5 +3481,81 @@ mod tests {
 
         // Should not panic even with broken beacon
         orchestrator.check_reorg_at_epoch_boundary(10).await;
+    }
+
+    // -- Fork-aware attestation construction tests (G-1-05) --
+
+    #[test]
+    fn test_make_aggregation_bits_first_position() {
+        let duty = AttesterDuty {
+            pubkey: "0xaabb".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: "4".to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: "0".to_string(),
+            slot: "100".to_string(),
+        };
+        let bits = make_aggregation_bits(&duty);
+        // committee_length=4, validator_committee_index=0
+        // Byte 0: bit 0 set (validator) = 0x01
+        // Length bit at position 4 → byte 0, bit 4 = 0x10
+        // Combined: 0x11
+        assert_eq!(bits, "0x11");
+    }
+
+    #[test]
+    fn test_make_aggregation_bits_middle_position() {
+        let duty = AttesterDuty {
+            pubkey: "0xaabb".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: "8".to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: "3".to_string(),
+            slot: "100".to_string(),
+        };
+        let bits = make_aggregation_bits(&duty);
+        // committee_length=8, validator_committee_index=3
+        // Byte 0: bit 3 set = 0x08
+        // Length bit at position 8 → byte 1, bit 0 = 0x01
+        // Result: [0x08, 0x01]
+        assert_eq!(bits, "0x0801");
+    }
+
+    #[test]
+    fn test_make_aggregation_bits_last_position() {
+        let duty = AttesterDuty {
+            pubkey: "0xaabb".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: "4".to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: "3".to_string(),
+            slot: "100".to_string(),
+        };
+        let bits = make_aggregation_bits(&duty);
+        // committee_length=4, validator_committee_index=3
+        // Byte 0: bit 3 set = 0x08, length bit at position 4 = 0x10
+        // Combined: 0x18
+        assert_eq!(bits, "0x18");
+    }
+
+    #[test]
+    fn test_fork_name_electra_detection() {
+        let schedule = create_test_fork_schedule();
+        // electra_fork_epoch = 50
+
+        // Pre-Electra (Deneb)
+        let fork_name = ForkName::from_epoch(49, &schedule);
+        assert!(fork_name < ForkName::Electra);
+
+        // Electra boundary
+        let fork_name = ForkName::from_epoch(50, &schedule);
+        assert!(fork_name >= ForkName::Electra);
+
+        // Post-Electra
+        let fork_name = ForkName::from_epoch(100, &schedule);
+        assert!(fork_name >= ForkName::Electra);
     }
 }
