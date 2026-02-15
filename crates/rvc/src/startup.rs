@@ -186,13 +186,13 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use beacon::{
-        AggregateAttestationResponse, Attestation, AttestationDataResponse, AttesterDutiesResponse,
+        AggregateAttestationResponse, AttestationDataResponse, AttesterDutiesResponse,
         BeaconCommitteeSubscription, BeaconError, BlockRootResponse, ConfigSpecResponse,
         DataResponse, GenesisData, GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse,
-        ProposerPreparation, SignedAggregateAndProof, SignedContributionAndProof,
-        StateForkResponse, SubmitAttestationResult, SyncCommitteeContributionResponse,
-        SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingData, SyncingResponse,
-        ValidatorsResponse,
+        ProposerPreparation, SignedContributionAndProof, StateForkResponse,
+        SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+        SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorsResponse,
+        VersionedAttestation, VersionedSignedAggregateAndProof,
     };
     use eth_types::{ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock};
 
@@ -294,7 +294,7 @@ mod tests {
         }
         async fn submit_attestation(
             &self,
-            _attestations: &[Attestation],
+            _attestations: &VersionedAttestation,
         ) -> Result<SubmitAttestationResult, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
@@ -302,12 +302,13 @@ mod tests {
             &self,
             _slot: u64,
             _attestation_data_root: &str,
+            _committee_index: Option<u64>,
         ) -> Result<AggregateAttestationResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
         async fn submit_aggregate_and_proofs(
             &self,
-            _proofs: &[SignedAggregateAndProof],
+            _proofs: &VersionedSignedAggregateAndProof,
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }

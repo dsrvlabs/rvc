@@ -22,10 +22,11 @@ pub use beacon::{
     AggregateAttestationResponse, Attestation, AttestationData, AttestationDataResponse,
     AttesterDutiesResponse, AttesterDuty, BeaconCommitteeSubscription, BeaconError,
     BlockRootResponse, Checkpoint, ConfigSpecResponse, GenesisResponse, IndexedAttestationError,
-    ProduceBlockResponse, ProposerDutiesResponse, ProposerDuty, ProposerPreparation,
-    SignedAggregateAndProof, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorsResponse,
+    LegacyAttestation, ProduceBlockResponse, ProposerDutiesResponse, ProposerDuty,
+    ProposerPreparation, SignedAggregateAndProof, SignedContributionAndProof, SingleAttestation,
+    StateForkResponse, SubmitAttestationResult, SyncCommitteeContributionResponse,
+    SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingData, SyncingResponse,
+    ValidatorsResponse, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 pub use eth_types::{
     ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,

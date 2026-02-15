@@ -194,12 +194,13 @@ mod tests {
 
     use async_trait::async_trait;
     use bn_manager::{
-        AggregateAttestationResponse, Attestation, AttestationDataResponse, AttesterDutiesResponse,
+        AggregateAttestationResponse, AttestationDataResponse, AttesterDutiesResponse,
         BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, ForkSchedule,
-        GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse, SignedAggregateAndProof,
-        SignedBeaconBlock, SignedBlindedBeaconBlock, SignedContributionAndProof, StateForkResponse,
+        GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse, SignedBeaconBlock,
+        SignedBlindedBeaconBlock, SignedContributionAndProof, StateForkResponse,
         SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-        SyncCommitteeMessage, SyncingResponse, ValidatorsResponse,
+        SyncCommitteeMessage, SyncingResponse, ValidatorsResponse, VersionedAttestation,
+        VersionedSignedAggregateAndProof,
     };
     use crypto::PublicKey;
     use eth_types::{AggregateAndProof, AttestationData, Epoch, Root, Slot, VoluntaryExit};
@@ -297,7 +298,7 @@ mod tests {
         }
         async fn submit_attestation(
             &self,
-            _: &[Attestation],
+            _: &VersionedAttestation,
         ) -> Result<SubmitAttestationResult, BeaconError> {
             Err(BeaconError::HttpError("mock".into()))
         }
@@ -305,12 +306,13 @@ mod tests {
             &self,
             _: u64,
             _: &str,
+            _: Option<u64>,
         ) -> Result<AggregateAttestationResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".into()))
         }
         async fn submit_aggregate_and_proofs(
             &self,
-            _: &[SignedAggregateAndProof],
+            _: &VersionedSignedAggregateAndProof,
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".into()))
         }

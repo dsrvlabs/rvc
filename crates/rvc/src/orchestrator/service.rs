@@ -7,7 +7,10 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use beacon::{Attestation, AttesterDuty, BeaconCommitteeSubscription, ProposerPreparation};
+use beacon::{
+    Attestation, AttesterDuty, BeaconCommitteeSubscription, ProposerPreparation,
+    VersionedAttestation, VersionedSignedAggregateAndProof,
+};
 use block_service::{BeaconBlockClient, BlockService};
 use bn_manager::BeaconNodeClient;
 use builder::BuilderService;
@@ -1014,7 +1017,8 @@ where
             // Fetch the aggregate attestation
             let aggregate = match tokio::time::timeout(
                 AGGREGATION_TIMEOUT,
-                self.beacon.get_aggregate_attestation(slot, &att_data_root_hex),
+                // TODO(G-1-05): fork-aware committee_index
+                self.beacon.get_aggregate_attestation(slot, &att_data_root_hex, None),
             )
             .await
             {
@@ -1084,7 +1088,10 @@ where
             let count = signed_aggregates.len();
             match tokio::time::timeout(
                 AGGREGATION_TIMEOUT,
-                self.beacon.submit_aggregate_and_proofs(&signed_aggregates),
+                // TODO(G-1-05): fork-aware aggregate variant
+                self.beacon.submit_aggregate_and_proofs(
+                    &VersionedSignedAggregateAndProof::PreElectra(signed_aggregates),
+                ),
             )
             .await
             {
@@ -1407,8 +1414,10 @@ where
             signature: format!("0x{}", hex::encode(signature.to_bytes())),
         };
 
-        match self.propagator.propagate(attestation).await {
-            Ok(()) => AttestationResult { validator_index, slot, success: true, error: None },
+        // TODO(G-1-05): fork-aware attestation construction
+        let versioned = VersionedAttestation::Electra(vec![attestation]);
+        match self.propagator.propagate(&versioned).await {
+            Ok(_) => AttestationResult { validator_index, slot, success: true, error: None },
             Err(e) => AttestationResult {
                 validator_index,
                 slot,
@@ -1591,7 +1600,7 @@ mod tests {
     impl AttestationSubmitter for MockSubmitter {
         fn submit_attestation<'a>(
             &'a self,
-            _attestations: &'a [Attestation],
+            _attestations: &'a VersionedAttestation,
         ) -> Pin<
             Box<
                 dyn Future<Output = Result<beacon::SubmitAttestationResult, beacon::BeaconError>>
