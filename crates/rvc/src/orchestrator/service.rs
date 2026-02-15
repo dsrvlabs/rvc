@@ -206,6 +206,7 @@ where
 
             // Proposer preparation and committee subscriptions (non-fatal)
             if current_slot % SLOTS_PER_EPOCH == 0 {
+                self.check_reorg_at_epoch_boundary(current_epoch).await;
                 self.prepare_proposers().await;
                 self.submit_committee_subscriptions(current_epoch).await;
                 self.submit_committee_subscriptions(current_epoch + 1).await;
@@ -389,6 +390,30 @@ where
                     "Sync committee duty fetch timed out after {}s",
                     DUTY_FETCH_TIMEOUT.as_secs()
                 ),
+            }
+        }
+    }
+
+    async fn check_reorg_at_epoch_boundary(&self, current_epoch: u64) {
+        for epoch in [current_epoch, current_epoch + 1] {
+            match self.duty_tracker.check_and_refetch_if_root_changed(epoch).await {
+                Ok(true) => {
+                    warn!(epoch, "Reorg detected: attester duties refetched");
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(epoch, error = %e, "Failed to check attester dependent root");
+                }
+            }
+
+            match self.duty_tracker.check_and_refetch_proposer_if_root_changed(epoch).await {
+                Ok(true) => {
+                    warn!(epoch, "Reorg detected: proposer duties refetched");
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(epoch, error = %e, "Failed to check proposer dependent root");
+                }
             }
         }
     }
@@ -3107,5 +3132,184 @@ mod tests {
 
         orchestrator.register_builders().await;
         // wiremock expect(0) verifies no registration call was made
+    }
+
+    #[tokio::test]
+    async fn test_check_reorg_at_epoch_boundary_no_change() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let attester_response = serde_json::json!({
+            "data": [],
+            "dependent_root": "0xstable_root",
+            "execution_optimistic": false
+        });
+
+        let proposer_response = serde_json::json!({
+            "data": [],
+            "dependent_root": "0xstable_root",
+            "execution_optimistic": false
+        });
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&attester_response))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/eth/v1/validator/duties/proposer/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&proposer_response))
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri())
+            .with_timeout(Duration::from_secs(5))
+            .with_max_retries(1);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+        // Pre-populate caches
+        duty_tracker.fetch_duties_for_epoch(10).await.unwrap();
+        duty_tracker.fetch_duties_for_epoch(11).await.unwrap();
+        duty_tracker.fetch_proposer_duties(10).await.unwrap();
+        duty_tracker.fetch_proposer_duties(11).await.unwrap();
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(320);
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+        let config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        // Should not panic, should complete successfully
+        orchestrator.check_reorg_at_epoch_boundary(10).await;
+    }
+
+    #[tokio::test]
+    async fn test_check_reorg_at_epoch_boundary_uncached_fetches() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let attester_response = serde_json::json!({
+            "data": [],
+            "dependent_root": "0xnew_root",
+            "execution_optimistic": false
+        });
+
+        let proposer_response = serde_json::json!({
+            "data": [],
+            "dependent_root": "0xnew_root",
+            "execution_optimistic": false
+        });
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&attester_response))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/eth/v1/validator/duties/proposer/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&proposer_response))
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri())
+            .with_timeout(Duration::from_secs(5))
+            .with_max_retries(1);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(320);
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+        let config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker.clone(),
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        // No caches populated — should fetch and not panic
+        orchestrator.check_reorg_at_epoch_boundary(10).await;
+
+        // Caches should now be populated
+        assert!(duty_tracker.is_epoch_cached(10).await);
+        assert!(duty_tracker.is_epoch_cached(11).await);
+        assert!(duty_tracker.is_proposer_epoch_cached(10).await);
+        assert!(duty_tracker.is_proposer_epoch_cached(11).await);
+    }
+
+    #[tokio::test]
+    async fn test_check_reorg_at_epoch_boundary_survives_error() {
+        // Use a broken beacon endpoint to verify errors are logged not propagated
+        let beacon_config = beacon::BeaconClientConfig::new("http://127.0.0.1:1")
+            .with_timeout(Duration::from_millis(100))
+            .with_max_retries(0);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(320);
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+        let config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        // Should not panic even with broken beacon
+        orchestrator.check_reorg_at_epoch_boundary(10).await;
     }
 }
