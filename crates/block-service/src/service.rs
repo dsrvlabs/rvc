@@ -106,7 +106,8 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             BlockServiceError::Parse("SSZ response missing ssz_bytes".to_string())
         })?;
 
-        let header = beacon::ssz_deser::extract_block_header_from_ssz(ssz_bytes)
+        let format = ssz_block_format(response.is_blinded, &response.consensus_version);
+        let header = beacon::ssz_deser::extract_block_header_from_ssz(ssz_bytes, format)
             .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
 
         if header.slot != slot {
@@ -199,6 +200,25 @@ fn compute_block_root(block: &eth_types::BeaconBlock) -> Root {
 
 fn compute_blinded_block_root(block: &eth_types::BlindedBeaconBlock) -> Root {
     block.tree_hash_root().0
+}
+
+/// Determines the SSZ wire format based on block type and consensus version.
+///
+/// - Blinded blocks are always raw `BeaconBlock` SSZ (all forks).
+/// - Unblinded blocks use `BlockContents` SSZ for Deneb and later forks
+///   (which wraps the `BeaconBlock` with kzg_proofs and blobs).
+fn ssz_block_format(
+    is_blinded: bool,
+    consensus_version: &str,
+) -> beacon::ssz_deser::SszBlockFormat {
+    use beacon::ssz_deser::SszBlockFormat;
+    if is_blinded {
+        return SszBlockFormat::BeaconBlock;
+    }
+    match consensus_version {
+        "deneb" | "electra" => SszBlockFormat::BlockContents,
+        _ => SszBlockFormat::BeaconBlock,
+    }
 }
 
 #[cfg(test)]
@@ -405,16 +425,26 @@ mod tests {
             }
         }
 
+        /// Create an SSZ mock response.
+        ///
+        /// - Blinded → raw `BeaconBlock` layout (slot at offset 0).
+        /// - Unblinded (deneb) → `BlockContents` layout (3 × 4-byte offsets, then block).
         fn ssz(slot: Slot, proposer_index: u64, is_blinded: bool) -> Self {
-            let mut ssz_bytes = Vec::new();
-            ssz_bytes.extend_from_slice(&slot.to_le_bytes());
-            ssz_bytes.extend_from_slice(&proposer_index.to_le_bytes());
-            ssz_bytes.extend_from_slice(&[0xab; 128]); // simulated block body
+            Self::ssz_with_version(slot, proposer_index, is_blinded, "deneb")
+        }
+
+        fn ssz_with_version(
+            slot: Slot,
+            proposer_index: u64,
+            is_blinded: bool,
+            consensus_version: &str,
+        ) -> Self {
+            let ssz_bytes = build_ssz_bytes(slot, proposer_index, is_blinded, consensus_version);
             Self {
                 produce_response: Some(ProduceBlockResponse {
                     data: serde_json::Value::Null,
                     is_blinded,
-                    consensus_version: "deneb".to_string(),
+                    consensus_version: consensus_version.to_string(),
                     execution_payload_value: Some("99999".to_string()),
                     is_ssz: true,
                     ssz_bytes: Some(ssz_bytes),
@@ -563,6 +593,31 @@ mod tests {
             Arc::new(test_fork_schedule()),
             [0xaa; 32],
         )
+    }
+
+    /// Build synthetic SSZ bytes matching the expected wire format.
+    fn build_ssz_bytes(
+        slot: Slot,
+        proposer_index: u64,
+        is_blinded: bool,
+        consensus_version: &str,
+    ) -> Vec<u8> {
+        let use_block_contents = !is_blinded && matches!(consensus_version, "deneb" | "electra");
+        let mut bytes = Vec::new();
+        if use_block_contents {
+            // BlockContents: 3 × 4-byte offsets, then BeaconBlock at offset 12
+            let block_offset: u32 = 12;
+            let kzg_offset: u32 = 12 + 16 + 64;
+            let blobs_offset: u32 = kzg_offset + 48;
+            bytes.extend_from_slice(&block_offset.to_le_bytes());
+            bytes.extend_from_slice(&kzg_offset.to_le_bytes());
+            bytes.extend_from_slice(&blobs_offset.to_le_bytes());
+        }
+        // BeaconBlock header fields
+        bytes.extend_from_slice(&slot.to_le_bytes());
+        bytes.extend_from_slice(&proposer_index.to_le_bytes());
+        bytes.extend_from_slice(&[0xab; 128]); // simulated body
+        bytes
     }
 
     // --- Tests ---
@@ -1097,6 +1152,79 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BlockServiceError::Beacon(_)));
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_ssz_pre_deneb_uses_beacon_block_format() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        // Pre-Deneb unblinded: raw BeaconBlock SSZ (no BlockContents wrapper)
+        let beacon = MockBeaconClient::ssz_with_version(slot, 42, false, "capella");
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(slot, &pubkey).await;
+
+        assert!(result.is_ok());
+        let proposal = result.unwrap();
+        assert_eq!(proposal.slot, slot);
+        assert!(!proposal.is_blinded);
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_ssz_electra_unblinded_uses_block_contents() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = MockBeaconClient::ssz_with_version(slot, 42, false, "electra");
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(slot, &pubkey).await;
+
+        assert!(result.is_ok());
+        let proposal = result.unwrap();
+        assert_eq!(proposal.slot, slot);
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_ssz_deneb_blinded_uses_beacon_block_format() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        // Deneb blinded: raw BeaconBlock SSZ (NOT BlockContents)
+        let beacon = MockBeaconClient::ssz_with_version(slot, 42, true, "deneb");
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(slot, &pubkey).await;
+
+        assert!(result.is_ok());
+        let proposal = result.unwrap();
+        assert!(proposal.is_blinded);
+    }
+
+    #[test]
+    fn test_ssz_block_format_blinded_always_beacon_block() {
+        use beacon::ssz_deser::SszBlockFormat;
+        assert_eq!(ssz_block_format(true, "phase0"), SszBlockFormat::BeaconBlock);
+        assert_eq!(ssz_block_format(true, "capella"), SszBlockFormat::BeaconBlock);
+        assert_eq!(ssz_block_format(true, "deneb"), SszBlockFormat::BeaconBlock);
+        assert_eq!(ssz_block_format(true, "electra"), SszBlockFormat::BeaconBlock);
+    }
+
+    #[test]
+    fn test_ssz_block_format_unblinded_pre_deneb_beacon_block() {
+        use beacon::ssz_deser::SszBlockFormat;
+        assert_eq!(ssz_block_format(false, "phase0"), SszBlockFormat::BeaconBlock);
+        assert_eq!(ssz_block_format(false, "altair"), SszBlockFormat::BeaconBlock);
+        assert_eq!(ssz_block_format(false, "bellatrix"), SszBlockFormat::BeaconBlock);
+        assert_eq!(ssz_block_format(false, "capella"), SszBlockFormat::BeaconBlock);
+    }
+
+    #[test]
+    fn test_ssz_block_format_unblinded_deneb_plus_block_contents() {
+        use beacon::ssz_deser::SszBlockFormat;
+        assert_eq!(ssz_block_format(false, "deneb"), SszBlockFormat::BlockContents);
+        assert_eq!(ssz_block_format(false, "electra"), SszBlockFormat::BlockContents);
     }
 
     #[tokio::test]
