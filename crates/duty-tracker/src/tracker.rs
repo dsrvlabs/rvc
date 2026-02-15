@@ -320,6 +320,51 @@ impl DutyTracker {
         cache.get(&epoch).map(|c| c.dependent_root.clone())
     }
 
+    pub async fn check_and_refetch_proposer_if_root_changed(
+        &self,
+        epoch: u64,
+    ) -> Result<bool, DutyTrackerError> {
+        let cached_root = {
+            let cache = self.proposer_cache.read().await;
+            cache.get(&epoch).map(|c| c.dependent_root.clone())
+        };
+
+        if cached_root.is_none() {
+            self.fetch_proposer_duties(epoch).await?;
+            return Ok(true);
+        }
+
+        let response =
+            self.beacon.get_proposer_duties(epoch).await.map_err(DutyTrackerError::BeaconError)?;
+
+        if cached_root.as_ref() != Some(&response.dependent_root) {
+            info!(
+                epoch = epoch,
+                old_root = ?cached_root,
+                new_root = %response.dependent_root,
+                "Proposer dependent root changed, refetching duties"
+            );
+
+            let mut epoch_cache = ProposerEpochDutyCache::new(response.dependent_root.clone());
+            for duty in &response.data {
+                let slot: u64 = match duty.slot.parse() {
+                    Ok(s) => s,
+                    Err(_) => {
+                        warn!(raw_slot = %duty.slot, "Skipping proposer duty with unparseable slot");
+                        continue;
+                    }
+                };
+                epoch_cache.insert(slot, duty.clone());
+            }
+
+            let mut cache = self.proposer_cache.write().await;
+            cache.insert(epoch, epoch_cache);
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
     pub async fn is_proposer_epoch_cached(&self, epoch: u64) -> bool {
         let cache = self.proposer_cache.read().await;
         cache.contains_key(&epoch)
@@ -892,6 +937,88 @@ mod tests {
         tracker.fetch_proposer_duties(10).await.unwrap();
         let root2 = tracker.get_cached_proposer_dependent_root(10).await;
         assert_eq!(root2, Some("0xsecond_root".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_check_and_refetch_proposer_if_root_changed_uncached() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        let response = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/duties/proposer/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+
+        let changed = tracker.check_and_refetch_proposer_if_root_changed(10).await.unwrap();
+        assert!(changed);
+        assert!(tracker.is_proposer_epoch_cached(10).await);
+    }
+
+    #[tokio::test]
+    async fn test_check_and_refetch_proposer_if_root_changed_detects_change() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        let mut response1 = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
+        response1["dependent_root"] = serde_json::json!("0xfirst_root");
+
+        let mut response2 = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
+        response2["dependent_root"] = serde_json::json!("0xsecond_root");
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/duties/proposer/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response1))
+            .expect(1)
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/duties/proposer/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response2))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+
+        tracker.fetch_proposer_duties(10).await.unwrap();
+        let root1 = tracker.get_cached_proposer_dependent_root(10).await;
+        assert_eq!(root1, Some("0xfirst_root".to_string()));
+
+        let changed = tracker.check_and_refetch_proposer_if_root_changed(10).await.unwrap();
+        assert!(changed);
+
+        let root2 = tracker.get_cached_proposer_dependent_root(10).await;
+        assert_eq!(root2, Some("0xsecond_root".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_check_and_refetch_proposer_if_root_unchanged() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        let response = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/duties/proposer/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+
+        tracker.fetch_proposer_duties(10).await.unwrap();
+
+        let changed = tracker.check_and_refetch_proposer_if_root_changed(10).await.unwrap();
+        assert!(!changed);
     }
 
     // --- Sync committee duty tests ---
