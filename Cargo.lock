@@ -2975,6 +2975,7 @@ dependencies = [
  "proptest",
  "rusqlite",
  "rvc-eth-types",
+ "rvc-metrics",
  "serde",
  "serde_json",
  "tempfile",

@@ -309,7 +309,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let adapter =
             KeystoreManagerAdapter::new(dir.path().to_path_buf(), create_empty_composite_signer());
-        assert_eq!(adapter.delete_keystore(&test_pubkey(1)).unwrap(), false);
+        assert!(!adapter.delete_keystore(&test_pubkey(1)).unwrap());
     }
 
     #[test]
@@ -452,7 +452,7 @@ mod tests {
     #[test]
     fn test_remote_key_adapter_delete_nonexistent() {
         let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer());
-        assert_eq!(adapter.delete_remote_key(&test_pubkey(99)).unwrap(), false);
+        assert!(!adapter.delete_remote_key(&test_pubkey(99)).unwrap());
     }
 
     #[test]

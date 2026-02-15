@@ -163,8 +163,7 @@ mod tests {
     use async_trait::async_trait;
     use eth_types::{BeaconBlock, BlindedBeaconBlock, SignedBeaconBlock, SignedBlindedBeaconBlock};
     use signer::SignerError;
-    use std::cell::RefCell;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use validator_store::ValidatorStore;
 
     // --- Mock Signer ---
@@ -172,8 +171,8 @@ mod tests {
     struct MockSigner {
         fail_randao: bool,
         fail_block: bool,
-        randao_calls: RefCell<Vec<u64>>,
-        block_calls: RefCell<Vec<(Root, Slot)>>,
+        randao_calls: Mutex<Vec<u64>>,
+        block_calls: Mutex<Vec<(Root, Slot)>>,
     }
 
     impl MockSigner {
@@ -181,8 +180,8 @@ mod tests {
             Self {
                 fail_randao: false,
                 fail_block: false,
-                randao_calls: RefCell::new(Vec::new()),
-                block_calls: RefCell::new(Vec::new()),
+                randao_calls: Mutex::new(Vec::new()),
+                block_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -217,7 +216,7 @@ mod tests {
             _fork_schedule: &ForkSchedule,
             _genesis_validators_root: &Root,
         ) -> Result<Vec<u8>, SignerError> {
-            self.block_calls.borrow_mut().push((*block_root, slot));
+            self.block_calls.lock().unwrap().push((*block_root, slot));
             if self.fail_block {
                 Err(SignerError::KeyNotFound("test".to_string()))
             } else {
@@ -232,7 +231,7 @@ mod tests {
             _fork_schedule: &ForkSchedule,
             _genesis_validators_root: &Root,
         ) -> Result<Vec<u8>, SignerError> {
-            self.randao_calls.borrow_mut().push(epoch);
+            self.randao_calls.lock().unwrap().push(epoch);
             if self.fail_randao {
                 Err(SignerError::KeyNotFound("test".to_string()))
             } else {
@@ -318,8 +317,8 @@ mod tests {
         produce_response: Option<ProduceBlockResponse>,
         fail_produce: bool,
         fail_publish: bool,
-        publish_calls: RefCell<Vec<String>>,
-        publish_blinded_calls: RefCell<Vec<String>>,
+        publish_calls: Mutex<Vec<String>>,
+        publish_blinded_calls: Mutex<Vec<String>>,
     }
 
     impl MockBeaconClient {
@@ -336,8 +335,8 @@ mod tests {
                 }),
                 fail_produce: false,
                 fail_publish: false,
-                publish_calls: RefCell::new(Vec::new()),
-                publish_blinded_calls: RefCell::new(Vec::new()),
+                publish_calls: Mutex::new(Vec::new()),
+                publish_blinded_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -354,8 +353,8 @@ mod tests {
                 }),
                 fail_produce: false,
                 fail_publish: false,
-                publish_calls: RefCell::new(Vec::new()),
-                publish_blinded_calls: RefCell::new(Vec::new()),
+                publish_calls: Mutex::new(Vec::new()),
+                publish_blinded_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -390,7 +389,7 @@ mod tests {
             _signed_block: &SignedBeaconBlock,
             consensus_version: &str,
         ) -> Result<(), BlockServiceError> {
-            self.publish_calls.borrow_mut().push(consensus_version.to_string());
+            self.publish_calls.lock().unwrap().push(consensus_version.to_string());
             if self.fail_publish {
                 return Err(BlockServiceError::Beacon("publish failed".to_string()));
             }
@@ -402,7 +401,7 @@ mod tests {
             _signed_block: &SignedBlindedBeaconBlock,
             consensus_version: &str,
         ) -> Result<(), BlockServiceError> {
-            self.publish_blinded_calls.borrow_mut().push(consensus_version.to_string());
+            self.publish_blinded_calls.lock().unwrap().push(consensus_version.to_string());
             if self.fail_publish {
                 return Err(BlockServiceError::Beacon("publish failed".to_string()));
             }
@@ -612,8 +611,8 @@ mod tests {
 
         struct CapturingBeacon {
             inner: MockBeaconClient,
-            graffiti_arg: RefCell<Option<String>>,
-            boost_arg: RefCell<Option<u64>>,
+            graffiti_arg: Mutex<Option<String>>,
+            boost_arg: Mutex<Option<u64>>,
         }
 
         #[async_trait(?Send)]
@@ -625,8 +624,8 @@ mod tests {
                 graffiti: Option<&str>,
                 builder_boost_factor: Option<u64>,
             ) -> Result<ProduceBlockResponse, BlockServiceError> {
-                *self.graffiti_arg.borrow_mut() = graffiti.map(|s| s.to_string());
-                *self.boost_arg.borrow_mut() = builder_boost_factor;
+                *self.graffiti_arg.lock().unwrap() = graffiti.map(|s| s.to_string());
+                *self.boost_arg.lock().unwrap() = builder_boost_factor;
                 self.inner
                     .produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor)
                     .await
@@ -651,8 +650,8 @@ mod tests {
 
         let capturing_beacon = CapturingBeacon {
             inner: MockBeaconClient::unblinded(block),
-            graffiti_arg: RefCell::new(None),
-            boost_arg: RefCell::new(None),
+            graffiti_arg: Mutex::new(None),
+            boost_arg: Mutex::new(None),
         };
 
         let store = test_validator_store(&pubkey);
@@ -668,7 +667,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify graffiti was passed (hex-encoded "hello" + padding)
-        let graffiti = service.beacon.graffiti_arg.borrow().clone();
+        let graffiti = service.beacon.graffiti_arg.lock().unwrap().clone();
         assert!(graffiti.is_some());
         let graffiti_str = graffiti.unwrap();
         assert!(graffiti_str.starts_with("0x"));
@@ -676,7 +675,7 @@ mod tests {
         assert!(graffiti_str.contains("68656c6c6f"));
 
         // Verify boost factor was passed
-        let boost = *service.beacon.boost_arg.borrow();
+        let boost = *service.beacon.boost_arg.lock().unwrap();
         assert_eq!(boost, Some(150));
     }
 
@@ -701,8 +700,8 @@ mod tests {
         let result = service.propose_block(slot, &pubkey).await;
         assert!(result.is_ok());
 
-        assert_eq!(beacon_arc.publish_blinded_calls.borrow().len(), 1);
-        assert!(beacon_arc.publish_calls.borrow().is_empty());
+        assert_eq!(beacon_arc.publish_blinded_calls.lock().unwrap().len(), 1);
+        assert!(beacon_arc.publish_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -726,8 +725,8 @@ mod tests {
         let result = service.propose_block(slot, &pubkey).await;
         assert!(result.is_ok());
 
-        assert_eq!(beacon_arc.publish_calls.borrow().len(), 1);
-        assert!(beacon_arc.publish_blinded_calls.borrow().is_empty());
+        assert_eq!(beacon_arc.publish_calls.lock().unwrap().len(), 1);
+        assert!(beacon_arc.publish_blinded_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -753,8 +752,8 @@ mod tests {
         assert!(matches!(result.unwrap_err(), BlockServiceError::Signer(_)));
 
         // Verify no publish calls were made
-        assert!(beacon_arc.publish_blinded_calls.borrow().is_empty());
-        assert!(beacon_arc.publish_calls.borrow().is_empty());
+        assert!(beacon_arc.publish_blinded_calls.lock().unwrap().is_empty());
+        assert!(beacon_arc.publish_calls.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -813,8 +812,8 @@ mod tests {
         );
 
         // Both signers were called with the respective root
-        let unblinded_calls = signer_arc.block_calls.borrow();
-        let blinded_calls = signer2_arc.block_calls.borrow();
+        let unblinded_calls = signer_arc.block_calls.lock().unwrap();
+        let blinded_calls = signer2_arc.block_calls.lock().unwrap();
         assert_eq!(unblinded_calls.len(), 1);
         assert_eq!(blinded_calls.len(), 1);
         assert_eq!(unblinded_calls[0].0, unblinded_result.block_root);
@@ -842,7 +841,7 @@ mod tests {
         let result = service.propose_block(slot, &pubkey).await;
         assert!(result.is_ok());
 
-        let calls = signer_arc.randao_calls.borrow();
+        let calls = signer_arc.randao_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], 10); // epoch = 320/32
     }

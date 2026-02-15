@@ -527,13 +527,12 @@ mod tests {
                     let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
 
                     // Send chunked HTTP response with SSE content-type
-                    let headers = format!(
-                        "HTTP/1.1 200 OK\r\n\
+                    let headers = "HTTP/1.1 200 OK\r\n\
                          Content-Type: text/event-stream\r\n\
                          Cache-Control: no-cache\r\n\
                          Transfer-Encoding: chunked\r\n\
                          \r\n"
-                    );
+                        .to_string();
                     let _ = stream.write_all(headers.as_bytes()).await;
 
                     // Send body as a single chunk

@@ -499,9 +499,9 @@ mod tests {
         fr
     }
 
-    fn test_store_with_builder_validators(
-        validators: &[([u8; 48], bool, Option<[u8; 20]>, Option<u64>)],
-    ) -> ValidatorStore {
+    type ValidatorEntry = ([u8; 48], bool, Option<[u8; 20]>, Option<u64>);
+
+    fn test_store_with_builder_validators(validators: &[ValidatorEntry]) -> ValidatorStore {
         let store = ValidatorStore::new(test_fee_recipient(0xff), 30_000_000);
         for (pk, builder_enabled, fee_recipient, gas_limit) in validators {
             let mut config = ValidatorConfig::new(*pk);
@@ -680,17 +680,12 @@ mod tests {
         // First call should register
         let result = service.register_validators().await;
         assert!(result.is_ok());
-
-        let calls = bn.register_calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        drop(calls);
+        assert_eq!(bn.register_calls.lock().unwrap().len(), 1);
 
         // Second call should skip (cached)
         let result = service.register_validators().await;
         assert!(result.is_ok());
-
-        let calls = bn.register_calls.lock().unwrap();
-        assert_eq!(calls.len(), 1); // Still 1, no new call
+        assert_eq!(bn.register_calls.lock().unwrap().len(), 1); // Still 1, no new call
     }
 
     #[tokio::test]
