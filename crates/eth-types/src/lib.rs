@@ -3,6 +3,7 @@ use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
 mod aggregation;
+mod attestation;
 mod block;
 mod builder;
 mod domains;
@@ -10,7 +11,11 @@ mod duties;
 mod fork;
 pub(crate) mod hex_fixed;
 mod sync_committee;
-pub use aggregation::{AggregateAndProof, Attestation, SignedAggregateAndProof};
+pub use aggregation::{
+    AggregateAndProof, Attestation, ElectraAggregateAndProof, ElectraAttestation,
+    SignedAggregateAndProof, SignedElectraAggregateAndProof,
+};
+pub use attestation::SingleAttestation;
 pub use block::{
     BeaconBlock, BeaconBlockBody, BlindedBeaconBlock, BlindedBeaconBlockBody, BlobSidecar,
     BlockContents, ProducedBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
