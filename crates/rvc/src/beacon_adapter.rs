@@ -60,4 +60,16 @@ impl BeaconBlockClient for BeaconBlockAdapter {
             .await
             .map_err(|e| BlockServiceError::Beacon(e.to_string()))
     }
+
+    async fn publish_block_ssz(
+        &self,
+        ssz_bytes: &[u8],
+        consensus_version: &str,
+        is_blinded: bool,
+    ) -> Result<(), BlockServiceError> {
+        self.0
+            .publish_block_ssz(ssz_bytes, consensus_version, is_blinded)
+            .await
+            .map_err(|e| BlockServiceError::Beacon(e.to_string()))
+    }
 }

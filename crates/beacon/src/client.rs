@@ -372,6 +372,44 @@ impl BeaconClient {
         .await
     }
 
+    /// Publishes a block as raw SSZ bytes using `Content-Type: application/octet-stream`.
+    ///
+    /// Routes to the blinded or unblinded endpoint based on `is_blinded`.
+    pub async fn publish_block_ssz(
+        &self,
+        ssz_bytes: &[u8],
+        consensus_version: &str,
+        is_blinded: bool,
+    ) -> Result<(), BeaconError> {
+        let path = if is_blinded {
+            "/eth/v1/beacon/blinded_blocks"
+        } else {
+            "/eth/v2/beacon/blocks"
+        };
+        let url = format!("{}{}", self.config.endpoint, path);
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/octet-stream")
+            .header("Eth-Consensus-Version", consensus_version)
+            .body(ssz_bytes.to_vec())
+            .send()
+            .await
+            .map_err(|e| BeaconError::HttpError(e.to_string()))?;
+
+        let status = response.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            Err(BeaconError::ApiError {
+                status: status.as_u16(),
+                message: body,
+            })
+        }
+    }
+
     /// Fetches sync committee duties for the given epoch and validator indices.
     pub async fn post_sync_committee_duties(
         &self,
