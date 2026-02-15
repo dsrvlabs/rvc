@@ -43,7 +43,7 @@ pub enum SlashingError {
     #[error("attestation with source epoch {source_epoch} is below watermark source epoch {watermark_source}")]
     BelowAttestationSourceWatermark { source_epoch: Epoch, watermark_source: Epoch },
 
-    #[error("unsafe file permissions on {path} (mode {mode}): world-readable or world-writable")]
+    #[error("unsafe file permissions on {path} (mode {mode}): group or world accessible")]
     UnsafePermissions { path: String, mode: String },
 }
 

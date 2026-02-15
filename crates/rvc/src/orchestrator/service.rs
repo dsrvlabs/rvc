@@ -4000,8 +4000,10 @@ mod tests {
         match &captured[0] {
             VersionedAttestation::Electra(atts) => {
                 // EIP-7549: data.index must be "0" even though BN returned "7"
-                assert_eq!(atts[0].data.index, "0",
-                    "EIP-7549: data.index must be zeroed before signing");
+                assert_eq!(
+                    atts[0].data.index, "0",
+                    "EIP-7549: data.index must be zeroed before signing"
+                );
                 // committee_index preserves the original value
                 assert_eq!(atts[0].committee_index, 7);
                 assert_eq!(atts[0].attester_index, 99);

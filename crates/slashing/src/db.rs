@@ -942,26 +942,39 @@ impl SlashingDb {
         })
     }
 
-    /// Check file permissions and warn if the slashing DB is world-readable or world-writable (Unix only).
+    /// Check file permissions and warn if the slashing DB is group- or world-accessible (Unix only).
     #[cfg(unix)]
     pub fn check_file_permissions(&self) {
         use std::os::unix::fs::PermissionsExt;
         if let Some(path) = &self.path {
             if let Ok(metadata) = std::fs::metadata(path) {
                 let mode = metadata.permissions().mode();
-                let dangerous_bits = 0o006; // world-readable (4) + world-writable (2)
+                let dangerous_bits = 0o077; // group + world bits
                 if mode & dangerous_bits != 0 {
-                    let issues = match (mode & 0o004 != 0, mode & 0o002 != 0) {
-                        (true, true) => "world-readable and world-writable",
-                        (true, false) => "world-readable",
-                        (false, true) => "world-writable",
-                        _ => unreachable!(),
-                    };
+                    let mut issues = Vec::new();
+                    if mode & 0o040 != 0 {
+                        issues.push("group-readable");
+                    }
+                    if mode & 0o020 != 0 {
+                        issues.push("group-writable");
+                    }
+                    if mode & 0o010 != 0 {
+                        issues.push("group-executable");
+                    }
+                    if mode & 0o004 != 0 {
+                        issues.push("world-readable");
+                    }
+                    if mode & 0o002 != 0 {
+                        issues.push("world-writable");
+                    }
+                    if mode & 0o001 != 0 {
+                        issues.push("world-executable");
+                    }
                     tracing::warn!(
                         path = %path.display(),
                         mode = format!("{:o}", mode),
                         "slashing protection database is {}; consider restricting permissions to 0600",
-                        issues,
+                        issues.join(" and "),
                     );
                 }
             }
@@ -972,22 +985,26 @@ impl SlashingDb {
     #[cfg(not(unix))]
     pub fn check_file_permissions(&self) {}
 
-    /// Check file permissions and return an error if the slashing DB is world-readable or world-writable (Unix only).
+    /// Check file permissions and return an error if the slashing DB is group- or world-accessible (Unix only).
     ///
     /// Use this with the `--strict-permissions` CLI flag to make unsafe permissions fatal at startup.
+    /// Unlike `check_file_permissions`, this also returns an error if file metadata cannot be read.
     #[cfg(unix)]
     pub fn check_file_permissions_strict(&self) -> Result<(), SlashingError> {
         use std::os::unix::fs::PermissionsExt;
         if let Some(path) = &self.path {
-            if let Ok(metadata) = std::fs::metadata(path) {
-                let mode = metadata.permissions().mode();
-                let dangerous_bits = 0o006;
-                if mode & dangerous_bits != 0 {
-                    return Err(SlashingError::UnsafePermissions {
-                        path: path.display().to_string(),
-                        mode: format!("{:o}", mode),
-                    });
-                }
+            let metadata =
+                std::fs::metadata(path).map_err(|e| SlashingError::UnsafePermissions {
+                    path: path.display().to_string(),
+                    mode: format!("unreadable: {}", e),
+                })?;
+            let mode = metadata.permissions().mode();
+            let dangerous_bits = 0o077; // group + world bits
+            if mode & dangerous_bits != 0 {
+                return Err(SlashingError::UnsafePermissions {
+                    path: path.display().to_string(),
+                    mode: format!("{:o}", mode),
+                });
             }
         }
         Ok(())
@@ -2567,6 +2584,73 @@ mod tests {
             }
             _ => panic!("expected UnsafePermissions, got {:?}", err),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_permissions_strict_returns_err_for_0660_group_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("strict_group.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
+            .expect("failed to set permissions");
+
+        let err = db.check_file_permissions_strict().unwrap_err();
+        match err {
+            SlashingError::UnsafePermissions { ref path, ref mode } => {
+                assert!(path.contains("strict_group.db"));
+                assert_eq!(mode, "100660");
+            }
+            _ => panic!("expected UnsafePermissions, got {:?}", err),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_permissions_strict_in_memory_returns_ok() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        assert!(db.check_file_permissions_strict().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_permissions_strict_deleted_file_returns_err() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("deleted.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::remove_file(&path).expect("failed to delete file");
+
+        let err = db.check_file_permissions_strict().unwrap_err();
+        match err {
+            SlashingError::UnsafePermissions { ref mode, .. } => {
+                assert!(
+                    mode.starts_with("unreadable:"),
+                    "expected 'unreadable:' prefix, got: {}",
+                    mode
+                );
+            }
+            _ => panic!("expected UnsafePermissions, got {:?}", err),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_permissions_warn_detects_group_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("perms_group.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
+            .expect("failed to set permissions");
+
+        // Should not panic, just log a warning about group-readable and group-writable
+        db.check_file_permissions();
     }
 
     #[cfg(not(unix))]

@@ -329,15 +329,14 @@ async fn run_validator(config: Config, strict_permissions: bool) -> anyhow::Resu
         return Err(e.into());
     }
 
-    // Step 2b: Check slashing DB file permissions (warn-only)
-    slashing_db.check_file_permissions();
-
-    // Step 2c: Strict permissions check (fatal if --strict-permissions is set)
+    // Step 2b: Check slashing DB file permissions
     if strict_permissions {
         if let Err(e) = slashing_db.check_file_permissions_strict() {
             error!("Strict permissions check failed: {}", e);
             return Err(e.into());
         }
+    } else {
+        slashing_db.check_file_permissions();
     }
 
     // Step 3: Create beacon client and BnManager
