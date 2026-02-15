@@ -971,6 +971,33 @@ impl SlashingDb {
     /// Check file permissions (no-op on non-Unix platforms).
     #[cfg(not(unix))]
     pub fn check_file_permissions(&self) {}
+
+    /// Check file permissions and return an error if the slashing DB is world-readable or world-writable (Unix only).
+    ///
+    /// Use this with the `--strict-permissions` CLI flag to make unsafe permissions fatal at startup.
+    #[cfg(unix)]
+    pub fn check_file_permissions_strict(&self) -> Result<(), SlashingError> {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(path) = &self.path {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                let mode = metadata.permissions().mode();
+                let dangerous_bits = 0o006;
+                if mode & dangerous_bits != 0 {
+                    return Err(SlashingError::UnsafePermissions {
+                        path: path.display().to_string(),
+                        mode: format!("{:o}", mode),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Check file permissions strictly (no-op on non-Unix platforms).
+    #[cfg(not(unix))]
+    pub fn check_file_permissions_strict(&self) -> Result<(), SlashingError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2481,6 +2508,72 @@ mod tests {
 
         // Should not warn
         db.check_file_permissions();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_permissions_strict_returns_ok_for_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("strict_safe.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("failed to set permissions");
+
+        assert!(db.check_file_permissions_strict().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_permissions_strict_returns_err_for_0644() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("strict_readable.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("failed to set permissions");
+
+        let err = db.check_file_permissions_strict().unwrap_err();
+        match err {
+            SlashingError::UnsafePermissions { ref path, ref mode } => {
+                assert!(path.contains("strict_readable.db"));
+                assert_eq!(mode, "100644");
+            }
+            _ => panic!("expected UnsafePermissions, got {:?}", err),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_permissions_strict_returns_err_for_0666() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("strict_both.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("failed to set permissions");
+
+        let err = db.check_file_permissions_strict().unwrap_err();
+        match err {
+            SlashingError::UnsafePermissions { ref path, ref mode } => {
+                assert!(path.contains("strict_both.db"));
+                assert_eq!(mode, "100666");
+            }
+            _ => panic!("expected UnsafePermissions, got {:?}", err),
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn test_check_file_permissions_strict_returns_ok_on_non_unix() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        assert!(db.check_file_permissions_strict().is_ok());
     }
 
     // --- Watermark and pruning tests ---

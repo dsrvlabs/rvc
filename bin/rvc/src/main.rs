@@ -118,6 +118,10 @@ enum Commands {
         /// Remote signer (Web3Signer) URL
         #[arg(long)]
         remote_signer_url: Option<String>,
+
+        /// Exit on unsafe slashing DB file permissions (world-readable/writable)
+        #[arg(long)]
+        strict_permissions: bool,
     },
 
     /// Submit a voluntary exit for a validator
@@ -190,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
             keymanager_address,
             keymanager_token_file,
             remote_signer_url,
+            strict_permissions,
         } => {
             init_logging(&log_level);
 
@@ -228,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
                 return Err(e.into());
             }
 
-            run_validator(cfg).await?;
+            run_validator(cfg, strict_permissions).await?;
         }
         Commands::VoluntaryExit {
             pubkey,
@@ -285,7 +290,7 @@ fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
     }
 }
 
-async fn run_validator(config: Config) -> anyhow::Result<()> {
+async fn run_validator(config: Config, strict_permissions: bool) -> anyhow::Result<()> {
     info!(
         beacon_url = %config.beacon_url,
         beacon_nodes = ?config.effective_beacon_nodes(),
@@ -326,6 +331,14 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
 
     // Step 2b: Check slashing DB file permissions (warn-only)
     slashing_db.check_file_permissions();
+
+    // Step 2c: Strict permissions check (fatal if --strict-permissions is set)
+    if strict_permissions {
+        if let Err(e) = slashing_db.check_file_permissions_strict() {
+            error!("Strict permissions check failed: {}", e);
+            return Err(e.into());
+        }
+    }
 
     // Step 3: Create beacon client and BnManager
     let beacon_client = match builder.build_beacon() {
