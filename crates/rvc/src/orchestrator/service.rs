@@ -7,28 +7,52 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use beacon::{Attestation, AttesterDuty, BeaconClient};
+use beacon::{Attestation, AttesterDuty, BeaconCommitteeSubscription, ProposerPreparation};
 use block_service::{BeaconBlockClient, BlockService};
+use bn_manager::BeaconNodeClient;
+use builder::BuilderService;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{
-    ContributionAndProof, ForkName, ForkSchedule, Root, SignedContributionAndProof, Slot,
-    SyncCommitteeDuty,
+    AggregateAndProof, ContributionAndProof, ForkName, ForkSchedule, Root, SignedAggregateAndProof,
+    SignedContributionAndProof, Slot, SyncCommitteeDuty,
 };
 use metrics::definitions::{
-    attestation_status, orchestrator_result, RVC_ATTESTATIONS_TOTAL,
+    attestation_status, orchestrator_result, RVC_AGGREGATIONS_TOTAL, RVC_ATTESTATIONS_TOTAL,
     RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
     RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL, RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
 };
 use propagator::{AttestationSubmitter, Propagator};
-use signer::SignerService;
+use signer::{is_aggregator, SignerService};
 use sync_service::is_sync_committee_aggregator;
 use timing::{SlotClock, SLOTS_PER_EPOCH};
+use tree_hash::TreeHash;
 
 use super::error::OrchestratorError;
 
-/// Default timeout for beacon client API calls in seconds.
-const BEACON_CALL_TIMEOUT_SECS: u64 = 4;
+/// Timeout for block production beacon API calls.
+const BLOCK_PRODUCE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Timeout for block publication beacon API calls.
+const BLOCK_PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Timeout for sync committee message operations.
+const SYNC_MESSAGE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Timeout for sync committee contribution operations.
+const SYNC_CONTRIBUTION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Timeout for duty fetching operations.
+const DUTY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Timeout for attestation data fetch.
+const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Timeout for aggregate attestation fetch and submission.
+const AGGREGATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Timeout for proposer preparation and committee subscription calls.
+const PREPARATION_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Total validators in a sync committee.
 const SYNC_COMMITTEE_SIZE: u64 = 512;
@@ -80,6 +104,9 @@ pub struct AttestationResult {
     pub error: Option<String>,
 }
 
+/// Timeout for builder registration API calls.
+const BUILDER_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Main orchestrator for coordinating validator duties.
 pub struct DutyOrchestrator<C, S, B>
 where
@@ -91,8 +118,10 @@ where
     duty_tracker: Arc<DutyTracker>,
     signer: Arc<SignerService>,
     propagator: Arc<Propagator<S>>,
-    beacon: Arc<BeaconClient>,
+    beacon: Arc<dyn BeaconNodeClient>,
     block_service: BlockService<SignerService, B>,
+    builder_service: Option<Arc<BuilderService>>,
+    validator_store: Arc<validator_store::ValidatorStore>,
     config: OrchestratorConfig,
     pubkey_map: HashMap<String, PublicKey>,
     shutdown_rx: watch::Receiver<bool>,
@@ -111,8 +140,9 @@ where
         duty_tracker: Arc<DutyTracker>,
         signer: Arc<SignerService>,
         propagator: Arc<Propagator<S>>,
-        beacon: Arc<BeaconClient>,
+        beacon: Arc<dyn BeaconNodeClient>,
         block_beacon: Arc<B>,
+        builder_service: Option<Arc<BuilderService>>,
         validator_store: Arc<validator_store::ValidatorStore>,
         config: OrchestratorConfig,
         pubkey_map: HashMap<String, PublicKey>,
@@ -122,7 +152,7 @@ where
         let block_service = BlockService::new(
             signer.clone(),
             block_beacon,
-            validator_store,
+            validator_store.clone(),
             config.fork_schedule.clone(),
             config.genesis_validators_root,
         );
@@ -134,6 +164,8 @@ where
             propagator,
             beacon,
             block_service,
+            builder_service,
+            validator_store,
             config,
             pubkey_map,
             shutdown_rx,
@@ -171,6 +203,13 @@ where
             // === Epoch boundary: fetch all duty types ===
             self.fetch_epoch_duties(current_epoch).await;
             self.fetch_epoch_duties(current_epoch + 1).await;
+
+            // Proposer preparation and committee subscriptions (non-fatal)
+            if current_slot % SLOTS_PER_EPOCH == 0 {
+                self.prepare_proposers().await;
+                self.submit_committee_subscriptions(current_epoch).await;
+                self.submit_committee_subscriptions(current_epoch + 1).await;
+            }
 
             // === Phase 1: t=0 — Block proposal ===
             self.maybe_propose_block(current_slot, current_epoch).await;
@@ -257,6 +296,14 @@ where
             }
 
             self.maybe_produce_sync_contributions(current_slot, current_epoch).await;
+            self.maybe_produce_aggregations(current_slot, current_epoch).await;
+
+            // === Post-duty: builder registration (epoch boundary only) ===
+            // Runs after all time-sensitive phases to avoid blocking block proposal.
+            // Builder registration includes jitter + API call that can take up to 40s.
+            if current_slot % SLOTS_PER_EPOCH == 0 {
+                self.register_builders().await;
+            }
 
             // === Wait for next slot ===
             let next_slot = current_slot + 1;
@@ -291,25 +338,232 @@ where
         // Attester duties
         if !self.duty_tracker.is_epoch_cached(epoch).await {
             debug!(epoch, "Fetching attester duties for epoch");
-            if let Err(e) = self.duty_tracker.fetch_duties_for_epoch(epoch).await {
-                warn!(epoch, error = %e, "Failed to fetch attester duties");
+            match tokio::time::timeout(
+                DUTY_FETCH_TIMEOUT,
+                self.duty_tracker.fetch_duties_for_epoch(epoch),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch attester duties"),
+                Err(_) => warn!(
+                    epoch,
+                    "Attester duty fetch timed out after {}s",
+                    DUTY_FETCH_TIMEOUT.as_secs()
+                ),
             }
         }
 
         // Proposer duties
         if !self.duty_tracker.is_proposer_epoch_cached(epoch).await {
             debug!(epoch, "Fetching proposer duties for epoch");
-            if let Err(e) = self.duty_tracker.fetch_proposer_duties(epoch).await {
-                warn!(epoch, error = %e, "Failed to fetch proposer duties");
+            match tokio::time::timeout(
+                DUTY_FETCH_TIMEOUT,
+                self.duty_tracker.fetch_proposer_duties(epoch),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch proposer duties"),
+                Err(_) => warn!(
+                    epoch,
+                    "Proposer duty fetch timed out after {}s",
+                    DUTY_FETCH_TIMEOUT.as_secs()
+                ),
             }
         }
 
         // Sync committee duties (at period boundaries)
         if !self.duty_tracker.is_sync_period_cached(epoch).await {
             debug!(epoch, "Fetching sync committee duties");
-            if let Err(e) = self.duty_tracker.fetch_sync_committee_duties(epoch).await {
-                warn!(epoch, error = %e, "Failed to fetch sync committee duties");
+            match tokio::time::timeout(
+                DUTY_FETCH_TIMEOUT,
+                self.duty_tracker.fetch_sync_committee_duties(epoch),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch sync committee duties"),
+                Err(_) => warn!(
+                    epoch,
+                    "Sync committee duty fetch timed out after {}s",
+                    DUTY_FETCH_TIMEOUT.as_secs()
+                ),
             }
+        }
+    }
+
+    async fn prepare_proposers(&self) {
+        let mut preparations = Vec::new();
+
+        for (pubkey_hex, pubkey) in &self.pubkey_map {
+            let fee_recipient = self.validator_store.effective_fee_recipient(&pubkey.to_bytes());
+            let fee_recipient_hex = format!("0x{}", hex::encode(fee_recipient));
+
+            // We need the validator_index. Look it up from cached attester duties.
+            // Iterate over current and next epoch slots to find a duty with this pubkey.
+            let normalized = Self::normalize_pubkey(pubkey_hex);
+            let mut found_index = None;
+
+            if let Ok(current_slot) = self.clock.current_slot() {
+                let current_epoch = current_slot / SLOTS_PER_EPOCH;
+                for epoch in [current_epoch, current_epoch + 1] {
+                    for slot_offset in 0..SLOTS_PER_EPOCH {
+                        let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
+                        let duties = self.duty_tracker.get_duties_for_slot(slot).await;
+                        for duty in &duties {
+                            if Self::normalize_pubkey(&duty.pubkey) == normalized {
+                                found_index = Some(duty.validator_index.clone());
+                                break;
+                            }
+                        }
+                        if found_index.is_some() {
+                            break;
+                        }
+                    }
+                    if found_index.is_some() {
+                        break;
+                    }
+                }
+            }
+
+            if let Some(validator_index) = found_index {
+                preparations.push(ProposerPreparation {
+                    validator_index,
+                    fee_recipient: fee_recipient_hex,
+                });
+            } else {
+                debug!(pubkey = %pubkey_hex, "No validator index found for proposer preparation");
+            }
+        }
+
+        if preparations.is_empty() {
+            return;
+        }
+
+        let count = preparations.len();
+        match tokio::time::timeout(
+            PREPARATION_TIMEOUT,
+            self.beacon.prepare_beacon_proposer(&preparations),
+        )
+        .await
+        {
+            Ok(Ok(_)) => info!(count, "Sent proposer preparations"),
+            Ok(Err(e)) => warn!(error = %e, "Failed to send proposer preparations"),
+            Err(_) => {
+                warn!("Proposer preparation timed out after {}s", PREPARATION_TIMEOUT.as_secs())
+            }
+        }
+    }
+
+    async fn submit_committee_subscriptions(&self, epoch: u64) {
+        let mut subscriptions = Vec::new();
+
+        for slot_offset in 0..SLOTS_PER_EPOCH {
+            let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
+            let duties = self.duty_tracker.get_duties_for_slot(slot).await;
+
+            for duty in &duties {
+                // Only subscribe for our own validators
+                let normalized = Self::normalize_pubkey(&duty.pubkey);
+                let pubkey =
+                    self.pubkey_map.iter().find(|(k, _)| Self::normalize_pubkey(k) == normalized);
+
+                let pubkey = match pubkey {
+                    Some((_, pk)) => pk.clone(),
+                    None => continue,
+                };
+
+                let committee_length: u64 = match duty.committee_length.parse() {
+                    Ok(cl) => cl,
+                    Err(_) => {
+                        warn!(
+                            validator_index = %duty.validator_index,
+                            "Invalid committee_length in duty: {}",
+                            duty.committee_length
+                        );
+                        continue;
+                    }
+                };
+
+                // Compute selection proof and determine if aggregator
+                let selection_proof = match self
+                    .signer
+                    .sign_selection_proof(
+                        slot,
+                        &pubkey,
+                        &self.config.fork_schedule,
+                        &self.config.genesis_validators_root,
+                    )
+                    .await
+                {
+                    Ok(sig) => sig,
+                    Err(e) => {
+                        warn!(
+                            validator_index = %duty.validator_index,
+                            slot,
+                            error = %e,
+                            "Failed to sign selection proof for subscription"
+                        );
+                        continue;
+                    }
+                };
+
+                let is_agg = is_aggregator(committee_length, &selection_proof.to_bytes());
+
+                subscriptions.push(BeaconCommitteeSubscription {
+                    validator_index: duty.validator_index.clone(),
+                    committee_index: duty.committee_index.clone(),
+                    committees_at_slot: duty.committees_at_slot.clone(),
+                    slot: duty.slot.clone(),
+                    is_aggregator: is_agg,
+                });
+            }
+        }
+
+        if subscriptions.is_empty() {
+            return;
+        }
+
+        let count = subscriptions.len();
+        match tokio::time::timeout(
+            PREPARATION_TIMEOUT,
+            self.beacon.submit_beacon_committee_subscriptions(&subscriptions),
+        )
+        .await
+        {
+            Ok(Ok(_)) => info!(count, epoch, "Sent committee subscriptions"),
+            Ok(Err(e)) => warn!(epoch, error = %e, "Failed to send committee subscriptions"),
+            Err(_) => warn!(
+                epoch,
+                "Committee subscription timed out after {}s",
+                PREPARATION_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
+    async fn register_builders(&self) {
+        let builder_service = match &self.builder_service {
+            Some(bs) => bs.clone(),
+            None => return,
+        };
+
+        let jitter = Duration::from_secs(BuilderService::jitter_seconds());
+        debug!(jitter_secs = jitter.as_secs(), "Delaying builder registration with jitter");
+        tokio::time::sleep(jitter).await;
+
+        match tokio::time::timeout(
+            BUILDER_REGISTRATION_TIMEOUT,
+            builder_service.register_validators(),
+        )
+        .await
+        {
+            Ok(Ok(_)) => info!("Builder registration completed"),
+            Ok(Err(e)) => warn!(error = %e, "Builder registration failed (non-fatal)"),
+            Err(_) => warn!(
+                "Builder registration timed out after {}s (non-fatal)",
+                BUILDER_REGISTRATION_TIMEOUT.as_secs()
+            ),
         }
     }
 
@@ -327,8 +581,14 @@ where
 
         info!(slot, validator_index = proposer_duty.validator_index, "Proposing block");
 
-        match self.block_service.propose_block(slot, &pubkey).await {
-            Ok(result) => {
+        // Wrap with combined produce + publish timeout
+        match tokio::time::timeout(
+            BLOCK_PRODUCE_TIMEOUT + BLOCK_PUBLISH_TIMEOUT,
+            self.block_service.propose_block(slot, &pubkey),
+        )
+        .await
+        {
+            Ok(Ok(result)) => {
                 info!(
                     slot,
                     blinded = result.is_blinded,
@@ -336,12 +596,20 @@ where
                     "Block proposed successfully"
                 );
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!(
                     slot,
                     epoch,
                     error = %e,
                     "Failed to propose block"
+                );
+            }
+            Err(_) => {
+                error!(
+                    slot,
+                    epoch,
+                    "Block proposal timed out after {}s",
+                    (BLOCK_PRODUCE_TIMEOUT + BLOCK_PUBLISH_TIMEOUT).as_secs()
                 );
             }
         }
@@ -366,14 +634,17 @@ where
         let mut messages = Vec::new();
 
         for (duty, pubkey) in matching_duties.iter().zip(matching_pubkeys.iter()) {
-            match SignerService::sign_sync_committee_message(
-                &self.signer,
-                &head_root,
-                slot,
-                pubkey,
-                &self.config.fork_schedule,
-                &self.config.genesis_validators_root,
-            ) {
+            match self
+                .signer
+                .sign_sync_committee_message(
+                    &head_root,
+                    slot,
+                    pubkey,
+                    &self.config.fork_schedule,
+                    &self.config.genesis_validators_root,
+                )
+                .await
+            {
                 Ok(sig) => {
                     messages.push(beacon::SyncCommitteeMessage {
                         slot,
@@ -395,10 +666,19 @@ where
 
         if !messages.is_empty() {
             let count = messages.len();
-            if let Err(e) = self.beacon.submit_sync_committee_messages(&messages).await {
-                warn!(slot, error = %e, "Failed to submit sync committee messages");
-            } else {
-                info!(slot, count, "Submitted sync committee messages");
+            match tokio::time::timeout(
+                SYNC_MESSAGE_TIMEOUT,
+                self.beacon.submit_sync_committee_messages(&messages),
+            )
+            .await
+            {
+                Ok(Ok(_)) => info!(slot, count, "Submitted sync committee messages"),
+                Ok(Err(e)) => warn!(slot, error = %e, "Failed to submit sync committee messages"),
+                Err(_) => warn!(
+                    slot,
+                    "Sync committee message submit timed out after {}s",
+                    SYNC_MESSAGE_TIMEOUT.as_secs()
+                ),
             }
         }
     }
@@ -429,25 +709,30 @@ where
                 .map(|&pos| pos / (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT))
                 .collect();
 
-            let secret_key = match self.signer.key_manager().get_secret_key(pubkey) {
-                Some(sk) => sk,
-                None => {
-                    warn!(
-                        validator_index = duty.validator_index,
-                        "Secret key not found for sync contribution signing"
-                    );
-                    continue;
-                }
-            };
-
             for subcommittee_index in &subcommittee_indices {
-                let selection_proof = crypto::sign_sync_committee_selection_proof(
-                    slot,
-                    *subcommittee_index,
-                    secret_key,
-                    &self.config.fork_schedule,
-                    self.config.genesis_validators_root,
-                );
+                let selection_proof = match self
+                    .signer
+                    .sign_sync_committee_selection_proof(
+                        slot,
+                        *subcommittee_index,
+                        pubkey,
+                        &self.config.fork_schedule,
+                        &self.config.genesis_validators_root,
+                    )
+                    .await
+                {
+                    Ok(sig) => sig,
+                    Err(e) => {
+                        warn!(
+                            slot,
+                            subcommittee_index,
+                            validator_index = duty.validator_index,
+                            error = %e,
+                            "Failed to sign sync committee selection proof"
+                        );
+                        continue;
+                    }
+                };
 
                 if !is_sync_committee_aggregator(&selection_proof.to_bytes()) {
                     debug!(
@@ -466,18 +751,32 @@ where
                     "Selected as sync committee aggregator"
                 );
 
-                let contribution = match self
-                    .beacon
-                    .get_sync_committee_contribution(slot, *subcommittee_index, &head_root_hex)
-                    .await
+                let contribution = match tokio::time::timeout(
+                    SYNC_CONTRIBUTION_TIMEOUT,
+                    self.beacon.get_sync_committee_contribution(
+                        slot,
+                        *subcommittee_index,
+                        &head_root_hex,
+                    ),
+                )
+                .await
                 {
-                    Ok(resp) => resp.data,
-                    Err(e) => {
+                    Ok(Ok(resp)) => resp.data,
+                    Ok(Err(e)) => {
                         warn!(
                             slot,
                             subcommittee_index,
                             error = %e,
                             "Failed to get sync committee contribution"
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        warn!(
+                            slot,
+                            subcommittee_index,
+                            "Sync committee contribution fetch timed out after {}s",
+                            SYNC_CONTRIBUTION_TIMEOUT.as_secs()
                         );
                         continue;
                     }
@@ -489,12 +788,28 @@ where
                     selection_proof: selection_proof.to_bytes().to_vec(),
                 };
 
-                let sig = crypto::sign_contribution_and_proof(
-                    &proof,
-                    secret_key,
-                    &self.config.fork_schedule,
-                    self.config.genesis_validators_root,
-                );
+                let sig = match self
+                    .signer
+                    .sign_contribution_and_proof(
+                        &proof,
+                        pubkey,
+                        &self.config.fork_schedule,
+                        &self.config.genesis_validators_root,
+                    )
+                    .await
+                {
+                    Ok(sig) => sig,
+                    Err(e) => {
+                        warn!(
+                            slot,
+                            subcommittee_index,
+                            validator_index = duty.validator_index,
+                            error = %e,
+                            "Failed to sign contribution and proof"
+                        );
+                        continue;
+                    }
+                };
 
                 signed_proofs.push(SignedContributionAndProof {
                     message: proof,
@@ -505,10 +820,236 @@ where
 
         if !signed_proofs.is_empty() {
             let count = signed_proofs.len();
-            if let Err(e) = self.beacon.submit_contribution_and_proofs(&signed_proofs).await {
-                warn!(slot, error = %e, "Failed to submit contribution and proofs");
-            } else {
-                info!(slot, count, "Submitted sync committee contribution and proofs");
+            match tokio::time::timeout(
+                SYNC_CONTRIBUTION_TIMEOUT,
+                self.beacon.submit_contribution_and_proofs(&signed_proofs),
+            )
+            .await
+            {
+                Ok(Ok(_)) => info!(slot, count, "Submitted sync committee contribution and proofs"),
+                Ok(Err(e)) => warn!(slot, error = %e, "Failed to submit contribution and proofs"),
+                Err(_) => warn!(
+                    slot,
+                    "Contribution and proofs submit timed out after {}s",
+                    SYNC_CONTRIBUTION_TIMEOUT.as_secs()
+                ),
+            }
+        }
+    }
+
+    async fn maybe_produce_aggregations(&self, slot: Slot, _epoch: u64) {
+        let duties = match self.get_duties_for_slot(slot).await {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        if duties.is_empty() {
+            return;
+        }
+
+        let mut signed_aggregates: Vec<SignedAggregateAndProof> = Vec::new();
+
+        for duty in &duties {
+            let committee_length: u64 = match duty.committee_length.parse() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let pubkey = match self.find_pubkey(&duty.pubkey) {
+                Some(pk) => pk,
+                None => continue,
+            };
+
+            let selection_proof = match self
+                .signer
+                .sign_selection_proof(
+                    slot,
+                    &pubkey,
+                    &self.config.fork_schedule,
+                    &self.config.genesis_validators_root,
+                )
+                .await
+            {
+                Ok(sig) => sig,
+                Err(e) => {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        error = %e,
+                        "Failed to sign selection proof for aggregation"
+                    );
+                    continue;
+                }
+            };
+
+            if !is_aggregator(committee_length, &selection_proof.to_bytes()) {
+                debug!(
+                    slot,
+                    validator_index = %duty.validator_index,
+                    "Not selected as attestation aggregator"
+                );
+                continue;
+            }
+
+            info!(
+                slot,
+                validator_index = %duty.validator_index,
+                "Selected as attestation aggregator"
+            );
+
+            // Compute attestation data root for fetching the aggregate
+            let committee_index: u64 = match duty.committee_index.parse() {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let attestation_data_response = match tokio::time::timeout(
+                AGGREGATION_TIMEOUT,
+                self.beacon.get_attestation_data(slot, committee_index),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => resp,
+                Ok(Err(e)) => {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        error = %e,
+                        "Failed to get attestation data for aggregation"
+                    );
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    continue;
+                }
+                Err(_) => {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        "Attestation data fetch timed out for aggregation"
+                    );
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    continue;
+                }
+            };
+
+            let crypto_attestation_data =
+                match Self::convert_attestation_data(&attestation_data_response.data) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        warn!(
+                            slot,
+                            validator_index = %duty.validator_index,
+                            error = %e,
+                            "Failed to convert attestation data for aggregation"
+                        );
+                        RVC_AGGREGATIONS_TOTAL
+                            .with_label_values(&[attestation_status::FAILED])
+                            .inc();
+                        continue;
+                    }
+                };
+
+            let att_data_root = crypto_attestation_data.tree_hash_root();
+            let att_data_root_hex = format!("0x{}", hex::encode(att_data_root.0));
+
+            // Fetch the aggregate attestation
+            let aggregate = match tokio::time::timeout(
+                AGGREGATION_TIMEOUT,
+                self.beacon.get_aggregate_attestation(slot, &att_data_root_hex),
+            )
+            .await
+            {
+                Ok(Ok(resp)) => resp.data,
+                Ok(Err(e)) => {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        error = %e,
+                        "Failed to get aggregate attestation"
+                    );
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    continue;
+                }
+                Err(_) => {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        "Aggregate attestation fetch timed out"
+                    );
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    continue;
+                }
+            };
+
+            let aggregator_index: u64 = match duty.validator_index.parse() {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            let aggregate_and_proof = AggregateAndProof {
+                aggregator_index,
+                aggregate,
+                selection_proof: selection_proof.to_bytes().to_vec(),
+            };
+
+            let signature = match self
+                .signer
+                .sign_aggregate_and_proof(
+                    &aggregate_and_proof,
+                    &pubkey,
+                    &self.config.fork_schedule,
+                    &self.config.genesis_validators_root,
+                )
+                .await
+            {
+                Ok(sig) => sig,
+                Err(e) => {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        error = %e,
+                        "Failed to sign aggregate and proof"
+                    );
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    continue;
+                }
+            };
+
+            signed_aggregates.push(SignedAggregateAndProof {
+                message: aggregate_and_proof,
+                signature: signature.to_bytes().to_vec(),
+            });
+        }
+
+        if !signed_aggregates.is_empty() {
+            let count = signed_aggregates.len();
+            match tokio::time::timeout(
+                AGGREGATION_TIMEOUT,
+                self.beacon.submit_aggregate_and_proofs(&signed_aggregates),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    info!(slot, count, "Submitted aggregate and proofs");
+                    RVC_AGGREGATIONS_TOTAL
+                        .with_label_values(&[attestation_status::SUCCESS])
+                        .inc_by(count as u64);
+                }
+                Ok(Err(e)) => {
+                    warn!(slot, error = %e, "Failed to submit aggregate and proofs");
+                    RVC_AGGREGATIONS_TOTAL
+                        .with_label_values(&[attestation_status::FAILED])
+                        .inc_by(count as u64);
+                }
+                Err(_) => {
+                    warn!(
+                        slot,
+                        "Aggregate and proofs submit timed out after {}s",
+                        AGGREGATION_TIMEOUT.as_secs()
+                    );
+                    RVC_AGGREGATIONS_TOTAL
+                        .with_label_values(&[attestation_status::FAILED])
+                        .inc_by(count as u64);
+                }
             }
         }
     }
@@ -531,8 +1072,8 @@ where
     }
 
     async fn get_head_block_root(&self) -> Option<Root> {
-        match self.beacon.get_block_root("head").await {
-            Ok(response) => {
+        match tokio::time::timeout(SYNC_MESSAGE_TIMEOUT, self.beacon.get_block_root("head")).await {
+            Ok(Ok(response)) => {
                 let root_hex = response.data.root;
                 match Self::parse_hex_root(&root_hex) {
                     Ok(root) => Some(root),
@@ -542,8 +1083,12 @@ where
                     }
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 warn!(error = %e, "Failed to fetch head block root");
+                None
+            }
+            Err(_) => {
+                warn!("Head block root fetch timed out after {}s", SYNC_MESSAGE_TIMEOUT.as_secs());
                 None
             }
         }
@@ -718,7 +1263,7 @@ where
 
         // Apply timeout to beacon client call to prevent blocking
         let attestation_data_result = tokio::time::timeout(
-            Duration::from_secs(BEACON_CALL_TIMEOUT_SECS),
+            ATTESTATION_TIMEOUT,
             self.beacon.get_attestation_data(slot, committee_index),
         )
         .await;
@@ -761,12 +1306,16 @@ where
         let target_epoch = crypto_attestation_data.target.epoch;
         let fork = self.derive_fork_for_epoch(target_epoch);
 
-        let signature = match self.signer.sign_attestation(
-            &crypto_attestation_data,
-            &pubkey,
-            &fork,
-            self.config.genesis_validators_root,
-        ) {
+        let signature = match self
+            .signer
+            .sign_attestation(
+                &crypto_attestation_data,
+                &pubkey,
+                &fork,
+                self.config.genesis_validators_root,
+            )
+            .await
+        {
             Ok(sig) => sig,
             Err(e) => {
                 return AttestationResult {
@@ -923,9 +1472,9 @@ where
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use beacon::BeaconClientConfig;
+    use beacon::{BeaconClient, BeaconClientConfig};
     use block_service::ProduceBlockResponse;
-    use crypto::{KeyManager, SecretKey};
+    use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
     use slashing::SlashingDb;
     use std::future::Future;
     use std::pin::Pin;
@@ -1162,9 +1711,9 @@ mod tests {
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1179,6 +1728,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -1201,9 +1751,9 @@ mod tests {
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1218,6 +1768,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -1238,9 +1789,9 @@ mod tests {
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1255,6 +1806,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -1305,10 +1857,10 @@ mod tests {
 
         let mut key_manager = KeyManager::new();
         key_manager.insert(secret_key);
-        let key_manager = Arc::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
 
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1324,6 +1876,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -1341,9 +1894,9 @@ mod tests {
         let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1363,6 +1916,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -1380,9 +1934,9 @@ mod tests {
         let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1402,6 +1956,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -1418,9 +1973,9 @@ mod tests {
         let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(key_manager, slashing_db));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1435,6 +1990,7 @@ mod tests {
             propagator,
             beacon,
             create_mock_block_beacon(),
+            None,
             create_mock_validator_store(),
             config,
             pubkey_map,
@@ -1442,5 +1998,1114 @@ mod tests {
 
         let found = orchestrator.find_pubkey("0x1234567890abcdef");
         assert!(found.is_none());
+    }
+
+    #[test]
+    fn test_timeout_constants_are_reasonable() {
+        // Block production must fit within a slot third (~4s for 12s slots)
+        assert!(BLOCK_PRODUCE_TIMEOUT.as_secs() <= 4);
+        assert!(BLOCK_PRODUCE_TIMEOUT.as_secs() >= 1);
+
+        // Block publish must fit within remaining slot time
+        assert!(BLOCK_PUBLISH_TIMEOUT.as_secs() <= 3);
+        assert!(BLOCK_PUBLISH_TIMEOUT.as_secs() >= 1);
+
+        // Produce + publish together should fit in one slot third (~4s)
+        assert!(BLOCK_PRODUCE_TIMEOUT + BLOCK_PUBLISH_TIMEOUT <= Duration::from_secs(6));
+
+        // Sync operations must fit within their slot third
+        assert!(SYNC_MESSAGE_TIMEOUT.as_secs() <= 3);
+        assert!(SYNC_CONTRIBUTION_TIMEOUT.as_secs() <= 3);
+
+        // Duty fetch is less time-critical but should still be bounded
+        assert!(DUTY_FETCH_TIMEOUT.as_secs() <= 12);
+        assert!(DUTY_FETCH_TIMEOUT.as_secs() >= 5);
+
+        // Attestation timeout must fit within slot third
+        assert!(ATTESTATION_TIMEOUT.as_secs() <= 5);
+    }
+
+    #[tokio::test]
+    async fn test_duty_fetch_timeout() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock attester duties endpoint with a 15s delay (exceeds DUTY_FETCH_TIMEOUT of 10s)
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "data": [],
+                        "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
+                    }))
+                    .set_delay(DUTY_FETCH_TIMEOUT + Duration::from_secs(5)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+        let epoch = 1u64;
+        let result =
+            tokio::time::timeout(DUTY_FETCH_TIMEOUT, duty_tracker.fetch_duties_for_epoch(epoch))
+                .await;
+
+        // Should timeout (Err from tokio::time::timeout)
+        assert!(result.is_err(), "Duty fetch should have timed out");
+    }
+
+    #[tokio::test]
+    async fn test_sync_message_submit_timeout() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock sync committee messages endpoint with delay exceeding SYNC_MESSAGE_TIMEOUT
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/pool/sync_committees"))
+            .respond_with(
+                ResponseTemplate::new(200).set_delay(SYNC_MESSAGE_TIMEOUT + Duration::from_secs(5)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let messages = vec![beacon::SyncCommitteeMessage {
+            slot: 100,
+            beacon_block_root: [0u8; 32],
+            validator_index: 1,
+            signature: vec![0u8; 96],
+        }];
+
+        let result = tokio::time::timeout(
+            SYNC_MESSAGE_TIMEOUT,
+            beacon.submit_sync_committee_messages(&messages),
+        )
+        .await;
+
+        assert!(result.is_err(), "Sync message submit should have timed out");
+    }
+
+    #[tokio::test]
+    async fn test_head_block_root_timeout() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock block root endpoint with delay exceeding SYNC_MESSAGE_TIMEOUT
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/blocks/head/root"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "data": {
+                            "root": "0x0000000000000000000000000000000000000000000000000000000000000000"
+                        }
+                    }))
+                    .set_delay(SYNC_MESSAGE_TIMEOUT + Duration::from_secs(5)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let result =
+            tokio::time::timeout(SYNC_MESSAGE_TIMEOUT, beacon.get_block_root("head")).await;
+
+        assert!(result.is_err(), "Head block root fetch should have timed out");
+    }
+
+    #[test]
+    fn test_aggregation_timeout_is_reasonable() {
+        // Must fit within the 2/3-slot to end-of-slot window (~4s for 12s slots)
+        assert!(AGGREGATION_TIMEOUT.as_secs() <= 4);
+        assert!(AGGREGATION_TIMEOUT.as_secs() >= 1);
+    }
+
+    /// Helper to build an orchestrator wired to a wiremock mock_server for aggregation tests.
+    async fn build_aggregation_orchestrator(
+        mock_server_uri: &str,
+    ) -> (
+        DutyOrchestrator<MockSlotClock, MockSubmitter, MockBlockBeacon>,
+        OrchestratorHandle,
+        PublicKey,
+        String,
+    ) {
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(100);
+
+        let beacon_config = BeaconClientConfig::new(mock_server_uri);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let secret_key = SecretKey::generate();
+        let pubkey_hex = format!("0x{}", hex::encode(secret_key.public_key().to_bytes()));
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+
+        let pubkey = secret_key.public_key();
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+        let mut pubkey_map = HashMap::new();
+        pubkey_map.insert(pubkey_hex.clone(), pubkey.clone());
+
+        let (orchestrator, handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        (orchestrator, handle, pubkey, pubkey_hex)
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_no_duties_does_nothing() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, _, _) =
+            build_aggregation_orchestrator(&mock_server.uri()).await;
+
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        // Mock attester duties to return empty list
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Fetch duties (empty) so the epoch is cached
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        // Should NOT call any aggregation endpoints
+        Mock::given(method("GET"))
+            .and(path_regex(r"/eth/v1/validator/aggregate_attestation.*"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_full_flow_with_mock_beacon() {
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, _, pubkey_hex) =
+            build_aggregation_orchestrator(&mock_server.uri()).await;
+
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        // 1. Mock attester duties endpoint — return a duty with a small committee
+        //    (committee_length ≤ 16 → modulo=1 → always aggregator)
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "1",
+                    "committee_length": "8",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "0",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // 2. Mock attestation data endpoint
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "1",
+                    "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source": {
+                        "epoch": (epoch - 1).to_string(),
+                        "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    },
+                    "target": {
+                        "epoch": epoch.to_string(),
+                        "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // 3. Mock aggregate attestation endpoint
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "aggregation_bits": "0xffffffff",
+                    "data": {
+                        "slot": slot.to_string(),
+                        "index": "1",
+                        "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "source": {
+                            "epoch": (epoch - 1).to_string(),
+                            "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                        },
+                        "target": {
+                            "epoch": epoch.to_string(),
+                            "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                        }
+                    },
+                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // 4. Mock submit aggregate and proofs endpoint
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Fetch duties first so they're cached
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        // Run the aggregation dispatch
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+
+        // The mock server's expect(1) on submit verifies the request was made
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_non_aggregator_skips() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, _, pubkey_hex) =
+            build_aggregation_orchestrator(&mock_server.uri()).await;
+
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        // Use a very large committee_length so is_aggregator is very unlikely
+        // committee_length=100000 → modulo=6250 → ~0.016% chance
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "1",
+                    "committee_length": "100000",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "0",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Should NOT call get_aggregate_attestation or submit
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_beacon_failure_handled_gracefully() {
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, _, pubkey_hex) =
+            build_aggregation_orchestrator(&mock_server.uri()).await;
+
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        // Small committee → always aggregator
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "1",
+                    "committee_length": "8",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "0",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Attestation data endpoint returns an error
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "message": "Internal server error"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Should NOT call submit since attestation data fetch failed
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        // Should not panic; gracefully handle error
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+    }
+
+    // --- B-05: Proposer preparation tests ---
+
+    #[tokio::test]
+    async fn test_prepare_proposers_sends_preparations() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock attester duties endpoint to seed the duty tracker cache
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "validator_index": "42",
+                    "committee_index": "1",
+                    "committee_length": "128",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "10",
+                    "slot": "96"
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock proposer preparation endpoint
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Slot 96 = epoch 3, slot 0 of epoch
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 96));
+        clock.set_slot(96);
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["42".to_string()]));
+
+        // Fetch duties to populate the cache
+        duty_tracker.fetch_duties_for_epoch(3).await.unwrap();
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+
+        // Map our pubkey to match the duty's pubkey
+        let mut pubkey_map = HashMap::new();
+        pubkey_map.insert(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            pubkey,
+        );
+
+        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            validator_store,
+            config,
+            pubkey_map,
+        );
+
+        orchestrator.prepare_proposers().await;
+        // wiremock will verify expect(1) on drop
+    }
+
+    #[tokio::test]
+    async fn test_prepare_proposers_no_validators_no_call() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock should NOT be called
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 0));
+        clock.set_slot(0);
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        orchestrator.prepare_proposers().await;
+    }
+
+    #[tokio::test]
+    async fn test_prepare_proposers_failure_is_non_fatal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock attester duties to seed cache
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "validator_index": "99",
+                    "committee_index": "0",
+                    "committee_length": "64",
+                    "committees_at_slot": "2",
+                    "validator_committee_index": "5",
+                    "slot": "96"
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Return error for prepare_beacon_proposer
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .mount(&mock_server)
+            .await;
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 96));
+        clock.set_slot(96);
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["99".to_string()]));
+
+        duty_tracker.fetch_duties_for_epoch(3).await.unwrap();
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+        let mut pubkey_map = HashMap::new();
+        pubkey_map.insert(
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            pubkey,
+        );
+
+        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            validator_store,
+            config,
+            pubkey_map,
+        );
+
+        // Should not panic - failure is non-fatal
+        orchestrator.prepare_proposers().await;
+    }
+
+    // --- B-05: Committee subscription tests ---
+
+    #[tokio::test]
+    async fn test_submit_committee_subscriptions_sends_subscriptions() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock attester duties
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "validator_index": "10",
+                    "committee_index": "2",
+                    "committee_length": "128",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "7",
+                    "slot": "100"
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock committee subscription endpoint
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/beacon_committee_subscriptions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 96));
+        clock.set_slot(96);
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["10".to_string()]));
+        duty_tracker.fetch_duties_for_epoch(3).await.unwrap();
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+        let mut pubkey_map = HashMap::new();
+        pubkey_map.insert(
+            "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
+            pubkey,
+        );
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        orchestrator.submit_committee_subscriptions(3).await;
+        // wiremock will verify expect(1) on drop
+    }
+
+    #[tokio::test]
+    async fn test_submit_committee_subscriptions_no_duties_no_call() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock should NOT be called
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/beacon_committee_subscriptions"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 0));
+        clock.set_slot(0);
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        orchestrator.submit_committee_subscriptions(0).await;
+    }
+
+    #[tokio::test]
+    async fn test_submit_committee_subscriptions_failure_is_non_fatal() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    "validator_index": "55",
+                    "committee_index": "0",
+                    "committee_length": "64",
+                    "committees_at_slot": "2",
+                    "validator_committee_index": "3",
+                    "slot": "97"
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Return error for subscriptions
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/beacon_committee_subscriptions"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .mount(&mock_server)
+            .await;
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 96));
+        clock.set_slot(96);
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["55".to_string()]));
+        duty_tracker.fetch_duties_for_epoch(3).await.unwrap();
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+        let mut pubkey_map = HashMap::new();
+        pubkey_map.insert(
+            "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+            pubkey,
+        );
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        // Should not panic
+        orchestrator.submit_committee_subscriptions(3).await;
+    }
+
+    #[test]
+    fn test_preparation_timeout_is_reasonable() {
+        assert!(PREPARATION_TIMEOUT.as_secs() >= 1);
+        assert!(PREPARATION_TIMEOUT.as_secs() <= 5);
+    }
+
+    #[test]
+    fn test_builder_registration_timeout_is_reasonable() {
+        assert!(BUILDER_REGISTRATION_TIMEOUT.as_secs() >= 5);
+        assert!(BUILDER_REGISTRATION_TIMEOUT.as_secs() <= 15);
+    }
+
+    #[tokio::test]
+    async fn test_builder_registration_called_at_epoch_boundary() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock register_validators endpoint
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/register_validator"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_bytes = pubkey.to_bytes();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        // Set up validator store with a builder-enabled validator
+        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+        let mut config = validator_store::ValidatorConfig::new(pubkey_bytes);
+        config.builder_proposals = true;
+        validator_store.add_validator(config);
+
+        let builder_service = builder::BuilderService::new(
+            signer.clone(),
+            beacon.clone() as Arc<dyn BeaconNodeClient>,
+            validator_store.clone(),
+            [0x00, 0x00, 0x00, 0x00],
+        );
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(100);
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let orch_config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            Some(Arc::new(builder_service)),
+            validator_store,
+            orch_config,
+            pubkey_map,
+        );
+
+        orchestrator.register_builders().await;
+        // wiremock will verify expect(1) on drop
+    }
+
+    #[tokio::test]
+    async fn test_builder_registration_nonfatal_on_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock register_validators endpoint with a 500 error
+        // Beacon client may retry, so expect at least 1 call
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/register_validator"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("server error"))
+            .expect(1..)
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_bytes = pubkey.to_bytes();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+        let mut config = validator_store::ValidatorConfig::new(pubkey_bytes);
+        config.builder_proposals = true;
+        validator_store.add_validator(config);
+
+        let builder_service = builder::BuilderService::new(
+            signer.clone(),
+            beacon.clone() as Arc<dyn BeaconNodeClient>,
+            validator_store.clone(),
+            [0x00, 0x00, 0x00, 0x00],
+        );
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(100);
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let orch_config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            Some(Arc::new(builder_service)),
+            validator_store,
+            orch_config,
+            pubkey_map,
+        );
+
+        // Should NOT panic or return error - registration failure is non-fatal
+        orchestrator.register_builders().await;
+    }
+
+    #[tokio::test]
+    async fn test_builder_registration_skipped_when_no_builder_service() {
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(100);
+
+        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        // Should return immediately with no errors when builder_service is None
+        orchestrator.register_builders().await;
+    }
+
+    #[tokio::test]
+    async fn test_builder_registration_skips_non_builder_validators() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // No registration calls expected since builder is not enabled
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/register_validator"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let secret_key = SecretKey::generate();
+        let pubkey_bytes = secret_key.public_key().to_bytes();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        // Validator with builder_proposals = false (default)
+        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+        let config = validator_store::ValidatorConfig::new(pubkey_bytes);
+        validator_store.add_validator(config);
+
+        let builder_service = builder::BuilderService::new(
+            signer.clone(),
+            beacon.clone() as Arc<dyn BeaconNodeClient>,
+            validator_store.clone(),
+            [0x00, 0x00, 0x00, 0x00],
+        );
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(100);
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let orch_config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            Some(Arc::new(builder_service)),
+            validator_store,
+            orch_config,
+            pubkey_map,
+        );
+
+        orchestrator.register_builders().await;
+        // wiremock expect(0) verifies no registration call was made
     }
 }

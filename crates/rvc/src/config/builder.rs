@@ -10,9 +10,13 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::beacon_adapter::BeaconBlockAdapter;
+use crate::doppelganger_adapter::{BeaconLivenessAdapter, SlashingDbReaderAdapter};
 use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle};
 use beacon::{BeaconClient, BeaconClientConfig};
-use crypto::{KeyManager, PublicKey};
+use bn_manager::{BeaconNodeClient, BnManager, BnManagerConfig};
+use builder::BuilderService;
+use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey};
+use doppelganger::DoppelgangerService;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkSchedule, Root};
 use propagator::{AttestationSubmitter, Propagator};
@@ -30,8 +34,9 @@ where
     C: SlotClock + 'static,
     S: AttestationSubmitter + 'static,
 {
-    pub beacon: Arc<BeaconClient>,
-    pub key_manager: Arc<KeyManager>,
+    pub beacon: Arc<dyn BeaconNodeClient>,
+    pub beacon_client: Arc<BeaconClient>,
+    pub composite_signer: Arc<CompositeSigner>,
     pub slashing_db: Arc<SlashingDb>,
     pub signer: Arc<SignerService>,
     pub propagator: Arc<Propagator<S>>,
@@ -41,6 +46,8 @@ where
     pub pubkey_map: HashMap<String, PublicKey>,
     pub genesis_validators_root: Root,
     pub fork_schedule: Arc<ForkSchedule>,
+    pub doppelganger_service: Option<DoppelgangerService>,
+    pub builder_service: Option<Arc<BuilderService>>,
 }
 
 /// Builder for constructing services from configuration.
@@ -61,6 +68,28 @@ impl ServiceBuilder {
         let client = BeaconClient::new(beacon_config)?;
         info!(url = %self.config.beacon_url, "Created beacon client");
         Ok(Arc::new(client))
+    }
+
+    pub fn build_bn_manager(&self) -> Result<Arc<BnManager>, ConfigError> {
+        let endpoints = self.config.effective_beacon_nodes();
+        let config = BnManagerConfig::new(endpoints.clone());
+        let manager = BnManager::new(config).map_err(|e| {
+            ConfigError::InvalidBeaconUrl(format!("failed to create BnManager: {}", e))
+        })?;
+        info!(endpoints = ?endpoints, "Created BnManager with {} beacon nodes", endpoints.len());
+        Ok(Arc::new(manager))
+    }
+
+    pub fn build_doppelganger_service(
+        &self,
+        beacon: Arc<BeaconClient>,
+        slashing_db: Arc<SlashingDb>,
+    ) -> DoppelgangerService {
+        let liveness_checker = Arc::new(BeaconLivenessAdapter::new(beacon));
+        let slashing_reader = Arc::new(SlashingDbReaderAdapter::new(slashing_db));
+        let service = DoppelgangerService::new(liveness_checker, slashing_reader);
+        info!("Created doppelganger detection service");
+        service
     }
 
     pub fn build_key_manager(&self) -> Result<Arc<KeyManager>, ConfigError> {
@@ -95,10 +124,10 @@ impl ServiceBuilder {
 
     pub fn build_signer(
         &self,
-        key_manager: Arc<KeyManager>,
+        composite_signer: Arc<CompositeSigner>,
         slashing_db: Arc<SlashingDb>,
     ) -> Arc<SignerService> {
-        let signer = SignerService::new(key_manager, slashing_db);
+        let signer = SignerService::new(composite_signer, slashing_db);
         info!("Created signer service");
         Arc::new(signer)
     }
@@ -114,7 +143,7 @@ impl ServiceBuilder {
 
     pub fn build_duty_tracker(
         &self,
-        beacon: Arc<BeaconClient>,
+        beacon: Arc<dyn BeaconNodeClient>,
         validator_indices: Vec<String>,
     ) -> Arc<DutyTracker> {
         let tracker = DutyTracker::new(beacon, validator_indices);
@@ -172,7 +201,7 @@ impl ServiceBuilder {
 
     pub async fn build_fork_schedule(
         &self,
-        beacon: &BeaconClient,
+        beacon: &dyn BeaconNodeClient,
     ) -> Result<Arc<ForkSchedule>, ConfigError> {
         info!("Fetching fork schedule from beacon node");
         let schedule = beacon.get_fork_schedule().await?;
@@ -187,6 +216,18 @@ impl ServiceBuilder {
         let store = ValidatorStore::new([0u8; 20], 100);
         info!("Created validator store");
         Arc::new(store)
+    }
+
+    pub fn build_builder_service(
+        &self,
+        signer: Arc<SignerService>,
+        beacon: Arc<dyn BeaconNodeClient>,
+        validator_store: Arc<ValidatorStore>,
+        genesis_fork_version: [u8; 4],
+    ) -> Arc<BuilderService> {
+        let service = BuilderService::new(signer, beacon, validator_store, genesis_fork_version);
+        info!("Created builder service");
+        Arc::new(service)
     }
 
     pub fn build_orchestrator_config(
@@ -222,22 +263,41 @@ impl ServiceBuilder {
         ),
         ConfigError,
     > {
-        let beacon = self.build_beacon()?;
+        let beacon_client = self.build_beacon()?;
         let key_manager = self.build_key_manager()?;
         let slashing_db = self.build_slashing_db()?;
-        let signer = self.build_signer(key_manager.clone(), slashing_db.clone());
-        let propagator = self.build_propagator(beacon.clone());
-        let slot_clock = self.build_slot_clock()?;
         let pubkey_map = self.build_pubkey_map(&key_manager);
+        let key_manager_owned = Arc::try_unwrap(key_manager)
+            .unwrap_or_else(|_| panic!("single reference to key_manager after pubkey_map build"));
+        let composite_signer = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager_owned)));
+        let signer = self.build_signer(composite_signer.clone(), slashing_db.clone());
+        let propagator = self.build_propagator(beacon_client.clone());
+        let slot_clock = self.build_slot_clock()?;
         let validator_store = self.build_validator_store();
 
+        let beacon: Arc<dyn BeaconNodeClient> = beacon_client.clone();
         let duty_tracker = self.build_duty_tracker(beacon.clone(), validator_indices);
+
+        let doppelganger_service = if self.config.doppelganger_detection {
+            Some(self.build_doppelganger_service(beacon_client.clone(), slashing_db.clone()))
+        } else {
+            None
+        };
 
         let genesis_validators_root = self.parse_genesis_validators_root()?;
 
+        let genesis_fork_version = fork_schedule.genesis_fork_version;
+        let builder_service = Some(self.build_builder_service(
+            signer.clone(),
+            beacon.clone(),
+            validator_store.clone(),
+            genesis_fork_version,
+        ));
+
         let services = BuiltServices {
             beacon,
-            key_manager,
+            beacon_client,
+            composite_signer,
             slashing_db,
             signer,
             propagator,
@@ -247,6 +307,8 @@ impl ServiceBuilder {
             pubkey_map,
             genesis_validators_root,
             fork_schedule,
+            doppelganger_service,
+            builder_service,
         };
 
         let orchestrator_factory = move |services: BuiltServices<SystemSlotClock, BeaconClient>| {
@@ -256,7 +318,7 @@ impl ServiceBuilder {
             )
             .with_shutdown_timeout(Duration::from_secs(30));
 
-            let block_beacon = Arc::new(BeaconBlockAdapter(services.beacon.clone()));
+            let block_beacon = Arc::new(BeaconBlockAdapter(services.beacon_client.clone()));
 
             DutyOrchestrator::new(
                 services.slot_clock,
@@ -265,6 +327,7 @@ impl ServiceBuilder {
                 services.propagator,
                 services.beacon,
                 block_beacon,
+                services.builder_service,
                 services.validator_store,
                 config,
                 services.pubkey_map,
@@ -278,6 +341,7 @@ impl ServiceBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crypto::Signer as _;
     use tempfile::TempDir;
 
     fn create_minimal_config() -> Config {
@@ -395,11 +459,11 @@ mod tests {
         let config = create_minimal_config();
         let builder = ServiceBuilder::new(config);
 
-        let key_manager = Arc::new(KeyManager::new());
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = builder.build_signer(key_manager, slashing_db);
+        let signer = builder.build_signer(composite, slashing_db);
 
-        assert!(signer.key_manager().is_empty());
+        assert!(signer.signer().public_keys().is_empty());
     }
 
     #[test]
@@ -436,5 +500,48 @@ mod tests {
 
         assert_eq!(orch_config.genesis_validators_root, root);
         assert_eq!(orch_config.shutdown_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_build_bn_manager_single_node() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let result = builder.build_bn_manager();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_bn_manager_multi_node() {
+        let config = Config {
+            beacon_nodes: vec!["http://bn1:5052".to_string(), "http://bn2:5052".to_string()],
+            ..create_minimal_config()
+        };
+        let builder = ServiceBuilder::new(config);
+        let result = builder.build_bn_manager();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_build_doppelganger_service() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let beacon = builder.build_beacon().unwrap();
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let _service = builder.build_doppelganger_service(beacon, slashing_db);
+    }
+
+    #[test]
+    fn test_build_builder_service() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+
+        let beacon = builder.build_beacon().unwrap();
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = builder.build_signer(composite, slashing_db);
+        let validator_store = builder.build_validator_store();
+
+        let _builder_service =
+            builder.build_builder_service(signer, beacon, validator_store, [0, 0, 0, 0]);
     }
 }

@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use beacon::BeaconError;
+use bn_manager::BeaconError;
 
 #[derive(Error, Debug)]
 pub enum DutyTrackerError {

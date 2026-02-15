@@ -92,12 +92,20 @@ pub struct ProposerDuty {
 pub type ProposerDutiesResponse = DependentRootResponse<Vec<ProposerDuty>>;
 
 /// Response from the produce block v3 endpoint, including header metadata.
+///
+/// Supports both JSON and SSZ content types. When the BN responds with SSZ,
+/// `is_ssz` is `true` and `ssz_bytes` contains the raw SSZ-encoded block.
+/// When JSON, `data` contains the parsed JSON value.
 #[derive(Debug, Clone)]
 pub struct ProduceBlockResponse {
     pub data: serde_json::Value,
     pub is_blinded: bool,
     pub consensus_version: String,
     pub execution_payload_value: Option<String>,
+    /// Whether the response was received as SSZ (`application/octet-stream`).
+    pub is_ssz: bool,
+    /// Raw SSZ bytes when the BN responded with SSZ content type.
+    pub ssz_bytes: Option<Vec<u8>>,
 }
 
 impl ProduceBlockResponse {
@@ -132,8 +140,12 @@ pub struct BlockRootData {
 /// Response type for the block root endpoint.
 pub type BlockRootResponse = DataResponse<BlockRootData>;
 
+pub use eth_types::SignedAggregateAndProof;
 pub use eth_types::SignedContributionAndProof;
 pub use eth_types::SyncCommitteeMessage;
+
+/// Response type for the aggregate attestation endpoint.
+pub type AggregateAttestationResponse = DataResponse<eth_types::Attestation>;
 
 /// Validator information from the beacon state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -227,6 +239,50 @@ fn parse_version(spec: &HashMap<String, String>, key: &str) -> Result<Version, B
         .map_err(|_| BeaconError::ParseError(format!("version must be 4 bytes for {}", key)))?;
     Ok(arr)
 }
+
+/// Proposer preparation data sent to the beacon node to register fee recipients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposerPreparation {
+    pub validator_index: String,
+    pub fee_recipient: String,
+}
+
+/// Beacon committee subscription data for attestation subnet management.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeaconCommitteeSubscription {
+    pub validator_index: String,
+    pub committee_index: String,
+    pub committees_at_slot: String,
+    pub slot: String,
+    pub is_aggregator: bool,
+}
+
+/// Validator liveness data from the beacon node.
+///
+/// Per the standard Eth2 Beacon API (`POST /eth/v1/validator/liveness/{epoch}`),
+/// only `index` and `is_live` are returned. The epoch is already a parameter
+/// to the request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ValidatorLiveness {
+    pub index: String,
+    pub is_live: bool,
+}
+
+/// Response type for the validator liveness endpoint.
+pub type ValidatorLivenessResponse = DataResponse<Vec<ValidatorLiveness>>;
+
+/// Sync status data from the beacon node's `/eth/v1/node/syncing` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncingData {
+    pub head_slot: String,
+    pub sync_distance: String,
+    pub is_syncing: bool,
+    pub is_optimistic: bool,
+    pub el_offline: bool,
+}
+
+/// Response type for the node syncing endpoint.
+pub type SyncingResponse = DataResponse<SyncingData>;
 
 /// Error details for a single attestation that failed validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -619,6 +675,65 @@ mod tests {
     }
 
     #[test]
+    fn test_validator_liveness_deserialize_standard_spec() {
+        let json = r#"{
+            "index": "1234",
+            "is_live": true
+        }"#;
+
+        let liveness: ValidatorLiveness = serde_json::from_str(json).unwrap();
+        assert_eq!(liveness.index, "1234");
+        assert!(liveness.is_live);
+    }
+
+    #[test]
+    fn test_validator_liveness_deserialize_not_live() {
+        let json = r#"{
+            "index": "5678",
+            "is_live": false
+        }"#;
+
+        let liveness: ValidatorLiveness = serde_json::from_str(json).unwrap();
+        assert_eq!(liveness.index, "5678");
+        assert!(!liveness.is_live);
+    }
+
+    #[test]
+    fn test_validator_liveness_deserialize_with_extra_fields() {
+        // Lighthouse returns an extra `epoch` field; serde should ignore it.
+        let json = r#"{
+            "index": "1234",
+            "epoch": "100",
+            "is_live": true
+        }"#;
+
+        let liveness: ValidatorLiveness = serde_json::from_str(json).unwrap();
+        assert_eq!(liveness.index, "1234");
+        assert!(liveness.is_live);
+    }
+
+    #[test]
+    fn test_validator_liveness_response_deserialize() {
+        let json = r#"{
+            "data": [
+                {
+                    "index": "1234",
+                    "is_live": true
+                },
+                {
+                    "index": "5678",
+                    "is_live": false
+                }
+            ]
+        }"#;
+
+        let response: ValidatorLivenessResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.data.len(), 2);
+        assert!(response.data[0].is_live);
+        assert!(!response.data[1].is_live);
+    }
+
+    #[test]
     fn test_submit_attestation_result_partial_failure() {
         let result = SubmitAttestationResult::PartialFailure {
             failures: vec![
@@ -681,6 +796,8 @@ mod tests {
             is_blinded: false,
             consensus_version: "deneb".to_string(),
             execution_payload_value: Some("12345".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
         };
 
         let block = response.parse_full_block().unwrap();
@@ -703,6 +820,8 @@ mod tests {
             is_blinded: true,
             consensus_version: "deneb".to_string(),
             execution_payload_value: None,
+            is_ssz: false,
+            ssz_bytes: None,
         };
 
         let block = response.parse_blinded_block().unwrap();
@@ -717,8 +836,121 @@ mod tests {
             is_blinded: false,
             consensus_version: "deneb".to_string(),
             execution_payload_value: None,
+            is_ssz: false,
+            ssz_bytes: None,
         };
 
         assert!(response.parse_full_block().is_err());
+    }
+
+    #[test]
+    fn test_proposer_preparation_serialize() {
+        let prep = ProposerPreparation {
+            validator_index: "1234".to_string(),
+            fee_recipient: "0xabcf8e0d4e9587369b2301d0790347320302cc09".to_string(),
+        };
+
+        let json = serde_json::to_string(&prep).unwrap();
+        assert!(json.contains("\"validator_index\":\"1234\""));
+        assert!(json.contains("\"fee_recipient\":\"0xabcf8e0d4e9587369b2301d0790347320302cc09\""));
+    }
+
+    #[test]
+    fn test_proposer_preparation_deserialize() {
+        let json = r#"{
+            "validator_index": "1234",
+            "fee_recipient": "0xabcf8e0d4e9587369b2301d0790347320302cc09"
+        }"#;
+
+        let prep: ProposerPreparation = serde_json::from_str(json).unwrap();
+        assert_eq!(prep.validator_index, "1234");
+        assert_eq!(prep.fee_recipient, "0xabcf8e0d4e9587369b2301d0790347320302cc09");
+    }
+
+    #[test]
+    fn test_beacon_committee_subscription_serialize() {
+        let sub = BeaconCommitteeSubscription {
+            validator_index: "1234".to_string(),
+            committee_index: "1".to_string(),
+            committees_at_slot: "64".to_string(),
+            slot: "10000".to_string(),
+            is_aggregator: true,
+        };
+
+        let json = serde_json::to_string(&sub).unwrap();
+        assert!(json.contains("\"validator_index\":\"1234\""));
+        assert!(json.contains("\"committee_index\":\"1\""));
+        assert!(json.contains("\"committees_at_slot\":\"64\""));
+        assert!(json.contains("\"slot\":\"10000\""));
+        assert!(json.contains("\"is_aggregator\":true"));
+    }
+
+    #[test]
+    fn test_beacon_committee_subscription_deserialize() {
+        let json = r#"{
+            "validator_index": "1234",
+            "committee_index": "1",
+            "committees_at_slot": "64",
+            "slot": "10000",
+            "is_aggregator": false
+        }"#;
+
+        let sub: BeaconCommitteeSubscription = serde_json::from_str(json).unwrap();
+        assert_eq!(sub.validator_index, "1234");
+        assert_eq!(sub.committee_index, "1");
+        assert_eq!(sub.committees_at_slot, "64");
+        assert_eq!(sub.slot, "10000");
+        assert!(!sub.is_aggregator);
+    }
+
+    #[test]
+    fn test_syncing_data_deserialize_synced() {
+        let json = r#"{
+            "head_slot": "1000",
+            "sync_distance": "0",
+            "is_syncing": false,
+            "is_optimistic": false,
+            "el_offline": false
+        }"#;
+
+        let data: SyncingData = serde_json::from_str(json).unwrap();
+        assert_eq!(data.head_slot, "1000");
+        assert_eq!(data.sync_distance, "0");
+        assert!(!data.is_syncing);
+        assert!(!data.is_optimistic);
+        assert!(!data.el_offline);
+    }
+
+    #[test]
+    fn test_syncing_data_deserialize_syncing() {
+        let json = r#"{
+            "head_slot": "500",
+            "sync_distance": "500",
+            "is_syncing": true,
+            "is_optimistic": true,
+            "el_offline": false
+        }"#;
+
+        let data: SyncingData = serde_json::from_str(json).unwrap();
+        assert!(data.is_syncing);
+        assert!(data.is_optimistic);
+        assert_eq!(data.sync_distance, "500");
+    }
+
+    #[test]
+    fn test_syncing_response_deserialize() {
+        let json = r#"{
+            "data": {
+                "head_slot": "1000",
+                "sync_distance": "0",
+                "is_syncing": false,
+                "is_optimistic": false,
+                "el_offline": false
+            }
+        }"#;
+
+        let response: SyncingResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.data.head_slot, "1000");
+        assert!(!response.data.is_syncing);
     }
 }

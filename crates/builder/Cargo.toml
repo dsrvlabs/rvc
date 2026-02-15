@@ -1,0 +1,22 @@
+[package]
+name = "rvc-builder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bn-manager.workspace = true
+crypto.workspace = true
+eth-types.workspace = true
+signer.workspace = true
+validator-store.workspace = true
+async-trait.workspace = true
+hex.workspace = true
+rand.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

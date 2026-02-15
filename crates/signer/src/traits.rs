@@ -1,7 +1,10 @@
 use async_trait::async_trait;
 
 use crypto::PublicKey;
-use eth_types::{AttestationData, Epoch, ForkSchedule, Root, Slot};
+use eth_types::{
+    AggregateAndProof, AttestationData, ContributionAndProof, Epoch, ForkSchedule, Root, Slot,
+    ValidatorRegistrationV1, VoluntaryExit,
+};
 
 use crate::SignerError;
 
@@ -45,6 +48,62 @@ pub trait ValidatorSigner {
         &self,
         beacon_block_root: &Root,
         slot: Slot,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError>;
+
+    /// Sign a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
+    async fn sign_selection_proof(
+        &self,
+        slot: Slot,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError>;
+
+    /// Sign an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
+    async fn sign_aggregate_and_proof(
+        &self,
+        aggregate_and_proof: &AggregateAndProof,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError>;
+
+    /// Sign a voluntary exit with DOMAIN_VOLUNTARY_EXIT.
+    async fn sign_voluntary_exit(
+        &self,
+        voluntary_exit: &VoluntaryExit,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError>;
+
+    /// Sign a builder registration with DOMAIN_APPLICATION_BUILDER.
+    ///
+    /// No slashing check is needed — builder registrations are not slashable.
+    async fn sign_builder_registration(
+        &self,
+        registration: &ValidatorRegistrationV1,
+        pubkey: &PublicKey,
+        fork_version: [u8; 4],
+    ) -> Result<Vec<u8>, SignerError>;
+
+    /// Sign a sync committee selection proof for aggregator selection.
+    async fn sign_sync_committee_selection_proof(
+        &self,
+        slot: Slot,
+        subcommittee_index: u64,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError>;
+
+    /// Sign a ContributionAndProof with DOMAIN_CONTRIBUTION_AND_PROOF.
+    async fn sign_contribution_and_proof(
+        &self,
+        contribution_and_proof: &ContributionAndProof,
         pubkey: &PublicKey,
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,

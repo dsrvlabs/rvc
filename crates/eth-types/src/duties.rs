@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use ssz_derive::{Decode, Encode};
+use tree_hash_derive::TreeHash;
 
 use crate::{Epoch, Signature, Slot};
 
@@ -11,7 +13,7 @@ pub struct ProposerDuty {
     pub slot: Slot,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct VoluntaryExit {
     #[serde(with = "serde_utils::quoted_u64")]
     pub epoch: Epoch,

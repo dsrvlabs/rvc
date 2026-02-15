@@ -129,6 +129,10 @@ fn test_start_help() {
     assert!(stdout.contains("--metrics-port"));
     assert!(stdout.contains("--grpc-port"));
     assert!(stdout.contains("--network"));
+    assert!(stdout.contains("--keymanager-enabled"));
+    assert!(stdout.contains("--keymanager-address"));
+    assert!(stdout.contains("--keymanager-token-file"));
+    assert!(stdout.contains("--remote-signer-url"));
 }
 
 #[test]

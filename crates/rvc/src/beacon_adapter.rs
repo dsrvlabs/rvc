@@ -34,6 +34,8 @@ impl BeaconBlockClient for BeaconBlockAdapter {
             is_blinded: response.is_blinded,
             consensus_version: response.consensus_version,
             execution_payload_value: response.execution_payload_value,
+            is_ssz: response.is_ssz,
+            ssz_bytes: response.ssz_bytes,
         })
     }
 

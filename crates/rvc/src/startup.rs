@@ -1,0 +1,541 @@
+//! Startup sequence for the validator client.
+//!
+//! Implements the ordered startup checks:
+//! 1. Open slashing DB
+//! 2. Run integrity check
+//! 3. Validate genesis root against beacon node
+//! 4. Check beacon node reachability
+//! 5. Run doppelganger detection (if enabled)
+
+use bn_manager::BeaconNodeClient;
+use slashing::SlashingDb;
+use tracing::{error, info, warn};
+
+use crate::config::ConfigError;
+
+/// Distinct exit codes for startup failures.
+pub const EXIT_INTEGRITY_CHECK_FAILED: i32 = 10;
+pub const EXIT_GENESIS_ROOT_MISMATCH: i32 = 11;
+pub const EXIT_DOPPELGANGER_DETECTED: i32 = 12;
+
+/// Errors specific to the startup sequence.
+#[derive(Debug, thiserror::Error)]
+pub enum StartupError {
+    #[error("slashing DB integrity check failed: {0}")]
+    IntegrityCheckFailed(String),
+
+    #[error("genesis validators root mismatch: local={local}, beacon={beacon}")]
+    GenesisRootMismatch { local: String, beacon: String },
+
+    #[error("doppelganger detected for validators: {0:?}")]
+    DoppelgangerDetected(Vec<String>),
+
+    #[error("config error: {0}")]
+    Config(#[from] ConfigError),
+
+    #[error("slashing DB error: {0}")]
+    SlashingDb(#[from] slashing::SlashingError),
+
+    #[error("beacon error: {0}")]
+    Beacon(#[from] beacon::BeaconError),
+
+    #[error("doppelganger error: {0}")]
+    Doppelganger(#[from] doppelganger::DoppelgangerError),
+
+    #[error("startup exit with code {0}")]
+    StartupExit(i32),
+}
+
+impl StartupError {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::IntegrityCheckFailed(_) => EXIT_INTEGRITY_CHECK_FAILED,
+            Self::GenesisRootMismatch { .. } => EXIT_GENESIS_ROOT_MISMATCH,
+            Self::DoppelgangerDetected(_) => EXIT_DOPPELGANGER_DETECTED,
+            _ => 1,
+        }
+    }
+}
+
+/// Run the slashing DB integrity check.
+pub fn check_integrity(slashing_db: &SlashingDb) -> Result<(), StartupError> {
+    info!("Running slashing DB integrity check");
+    slashing_db.check_integrity().map_err(|e| StartupError::IntegrityCheckFailed(e.to_string()))?;
+    info!("Slashing DB integrity check passed");
+    Ok(())
+}
+
+/// Validate that the local genesis validators root matches the beacon node's.
+///
+/// On first run, stores the root from the beacon node into the slashing DB.
+/// On subsequent runs, compares the stored root against the beacon node's root.
+pub async fn validate_genesis_root(
+    slashing_db: &SlashingDb,
+    beacon: &dyn BeaconNodeClient,
+    local_root_hex: &str,
+) -> Result<(), StartupError> {
+    info!("Validating genesis validators root against beacon node");
+
+    let genesis_response = beacon.get_genesis().await?;
+    let beacon_root = &genesis_response.data.genesis_validators_root;
+
+    let local_normalized = normalize_hex(local_root_hex);
+    let beacon_normalized = normalize_hex(beacon_root);
+
+    if local_normalized != beacon_normalized {
+        error!(
+            local = %local_root_hex,
+            beacon = %beacon_root,
+            "Genesis validators root mismatch"
+        );
+        return Err(StartupError::GenesisRootMismatch {
+            local: local_root_hex.to_string(),
+            beacon: beacon_root.clone(),
+        });
+    }
+
+    // Store normalized value (lowercase, no 0x prefix) for consistent comparisons
+    slashing_db.set_genesis_validators_root(&local_normalized)?;
+
+    info!("Genesis validators root validated successfully");
+    Ok(())
+}
+
+/// Check whether the beacon node is reachable by querying its genesis endpoint.
+///
+/// This only verifies network reachability, not sync status.
+// TODO: integrate actual sync status check via node/syncing endpoint
+pub async fn check_beacon_reachability(beacon: &dyn BeaconNodeClient) {
+    match beacon.get_genesis().await {
+        Ok(_) => {
+            info!("Beacon node is reachable");
+        }
+        Err(e) => {
+            warn!(error = %e, "Beacon node may not be synced or reachable");
+        }
+    }
+}
+
+/// Run doppelganger detection for the given validators.
+pub async fn run_doppelganger_detection(
+    doppelganger: &doppelganger::DoppelgangerService,
+    pubkeys: &[String],
+    validator_indices: &std::collections::HashMap<String, String>,
+    current_epoch: u64,
+) -> Result<Vec<String>, StartupError> {
+    info!(validator_count = pubkeys.len(), "Starting doppelganger detection");
+
+    let check_results = doppelganger.check_validators(pubkeys, current_epoch)?;
+
+    let mut needs_monitoring: Vec<String> = Vec::new();
+    let mut safe: Vec<String> = Vec::new();
+
+    for (pubkey, status) in &check_results {
+        match status {
+            doppelganger::DoppelgangerStatus::Safe => {
+                safe.push(pubkey.clone());
+            }
+            doppelganger::DoppelgangerStatus::DetectionInProgress => {
+                needs_monitoring.push(pubkey.clone());
+            }
+            doppelganger::DoppelgangerStatus::DoppelgangerDetected => {
+                return Err(StartupError::DoppelgangerDetected(vec![pubkey.clone()]));
+            }
+        }
+    }
+
+    if safe.len() == pubkeys.len() {
+        info!(count = safe.len(), "All validators safe (restart-aware skip)");
+        return Ok(safe);
+    }
+
+    info!(
+        needs_monitoring = needs_monitoring.len(),
+        already_safe = safe.len(),
+        "Running doppelganger monitoring"
+    );
+
+    let result =
+        doppelganger.run_monitoring(&needs_monitoring, validator_indices, current_epoch).await?;
+
+    if !result.detected.is_empty() {
+        error!(
+            detected = ?result.detected,
+            "Doppelganger detected! Shutting down to prevent slashing"
+        );
+        return Err(StartupError::DoppelgangerDetected(result.detected));
+    }
+
+    let mut all_safe = safe;
+    all_safe.extend(result.safe_validators);
+
+    info!(
+        count = all_safe.len(),
+        "Doppelganger detection complete, all monitored validators are safe"
+    );
+
+    Ok(all_safe)
+}
+
+fn normalize_hex(s: &str) -> String {
+    s.to_lowercase().trim_start_matches("0x").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use beacon::{
+        AggregateAttestationResponse, Attestation, AttestationDataResponse, AttesterDutiesResponse,
+        BeaconCommitteeSubscription, BeaconError, BlockRootResponse, ConfigSpecResponse,
+        DataResponse, GenesisData, GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse,
+        ProposerPreparation, SignedAggregateAndProof, SignedContributionAndProof,
+        StateForkResponse, SubmitAttestationResult, SyncCommitteeContributionResponse,
+        SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingData, SyncingResponse,
+        ValidatorsResponse,
+    };
+    use eth_types::{ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock};
+
+    // -- Mock BeaconNodeClient for testing --
+
+    struct MockBeacon {
+        genesis_root: String,
+        should_fail: bool,
+    }
+
+    impl MockBeacon {
+        fn with_root(root: &str) -> Self {
+            Self { genesis_root: root.to_string(), should_fail: false }
+        }
+
+        fn failing() -> Self {
+            Self { genesis_root: String::new(), should_fail: true }
+        }
+    }
+
+    #[async_trait]
+    impl BeaconNodeClient for MockBeacon {
+        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
+            if self.should_fail {
+                return Err(BeaconError::HttpError("mock failure".to_string()));
+            }
+            Ok(DataResponse {
+                data: GenesisData {
+                    genesis_time: "1606824023".to_string(),
+                    genesis_validators_root: self.genesis_root.clone(),
+                    genesis_fork_version: "0x00000000".to_string(),
+                },
+            })
+        }
+        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_fork(&self, _state_id: &str) -> Result<StateForkResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_validators(
+            &self,
+            _pubkeys: &[String],
+        ) -> Result<ValidatorsResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_attester_duties(
+            &self,
+            _epoch: u64,
+            _validator_indices: &[String],
+        ) -> Result<AttesterDutiesResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_proposer_duties(
+            &self,
+            _epoch: u64,
+        ) -> Result<ProposerDutiesResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn post_sync_committee_duties(
+            &self,
+            _epoch: u64,
+            _validator_indices: &[String],
+        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn produce_block_v3(
+            &self,
+            _slot: u64,
+            _randao_reveal: &str,
+            _graffiti: Option<&str>,
+            _builder_boost_factor: Option<u64>,
+        ) -> Result<ProduceBlockResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn publish_block(
+            &self,
+            _signed_block: &SignedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn publish_blinded_block(
+            &self,
+            _signed_blinded_block: &SignedBlindedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_attestation_data(
+            &self,
+            _slot: u64,
+            _committee_index: u64,
+        ) -> Result<AttestationDataResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_attestation(
+            &self,
+            _attestations: &[Attestation],
+        ) -> Result<SubmitAttestationResult, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_aggregate_attestation(
+            &self,
+            _slot: u64,
+            _attestation_data_root: &str,
+        ) -> Result<AggregateAttestationResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_aggregate_and_proofs(
+            &self,
+            _proofs: &[SignedAggregateAndProof],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_sync_committee_messages(
+            &self,
+            _messages: &[SyncCommitteeMessage],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_sync_committee_contribution(
+            &self,
+            _slot: u64,
+            _subcommittee_index: u64,
+            _beacon_block_root: &str,
+        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_contribution_and_proofs(
+            &self,
+            _proofs: &[SignedContributionAndProof],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_block_root(&self, _block_id: &str) -> Result<BlockRootResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn prepare_beacon_proposer(
+            &self,
+            _preparations: &[ProposerPreparation],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_beacon_committee_subscriptions(
+            &self,
+            _subscriptions: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn register_validators(
+            &self,
+            _registrations: &[bn_manager::SignedValidatorRegistration],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+            Ok(DataResponse {
+                data: SyncingData {
+                    head_slot: "0".to_string(),
+                    sync_distance: "0".to_string(),
+                    is_syncing: false,
+                    is_optimistic: false,
+                    el_offline: false,
+                },
+            })
+        }
+    }
+
+    // -- Exit code tests --
+
+    #[test]
+    fn test_exit_code_integrity_failed() {
+        let err = StartupError::IntegrityCheckFailed("corrupt".to_string());
+        assert_eq!(err.exit_code(), EXIT_INTEGRITY_CHECK_FAILED);
+    }
+
+    #[test]
+    fn test_exit_code_genesis_mismatch() {
+        let err = StartupError::GenesisRootMismatch {
+            local: "0xabc".to_string(),
+            beacon: "0xdef".to_string(),
+        };
+        assert_eq!(err.exit_code(), EXIT_GENESIS_ROOT_MISMATCH);
+    }
+
+    #[test]
+    fn test_exit_code_doppelganger() {
+        let err = StartupError::DoppelgangerDetected(vec!["0xpk1".to_string()]);
+        assert_eq!(err.exit_code(), EXIT_DOPPELGANGER_DETECTED);
+    }
+
+    #[test]
+    fn test_exit_code_generic() {
+        let err = StartupError::SlashingDb(slashing::SlashingError::IntegrityCheckFailed(
+            "test".to_string(),
+        ));
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    // -- Integrity check tests --
+
+    #[test]
+    fn test_check_integrity_passes_on_valid_db() {
+        let db = SlashingDb::open_in_memory().unwrap();
+        let result = check_integrity(&db);
+        assert!(result.is_ok());
+    }
+
+    // -- Genesis root validation tests --
+
+    #[test]
+    fn test_normalize_hex_strips_prefix() {
+        assert_eq!(normalize_hex("0xAbCdEf"), "abcdef");
+    }
+
+    #[test]
+    fn test_normalize_hex_lowercases() {
+        assert_eq!(normalize_hex("ABCDEF"), "abcdef");
+    }
+
+    #[test]
+    fn test_normalize_hex_no_prefix() {
+        assert_eq!(normalize_hex("abcdef"), "abcdef");
+    }
+
+    #[tokio::test]
+    async fn test_validate_genesis_root_matching() {
+        let root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
+        let db = SlashingDb::open_in_memory().unwrap();
+        let beacon = MockBeacon::with_root(root);
+
+        let result = validate_genesis_root(&db, &beacon, root).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_genesis_root_matching_case_insensitive() {
+        let root_lower = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
+        let root_upper = "0x4B363DB94E286120D76EB905340FDD4E54BFE9F06BF33FF6CF5AD27F511BFE95";
+        let db = SlashingDb::open_in_memory().unwrap();
+        let beacon = MockBeacon::with_root(root_upper);
+
+        let result = validate_genesis_root(&db, &beacon, root_lower).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_genesis_root_mismatch() {
+        let local = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
+        let remote = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let db = SlashingDb::open_in_memory().unwrap();
+        let beacon = MockBeacon::with_root(remote);
+
+        let result = validate_genesis_root(&db, &beacon, local).await;
+        assert!(result.is_err());
+
+        let err = result.unwrap_err();
+        assert_eq!(err.exit_code(), EXIT_GENESIS_ROOT_MISMATCH);
+        assert!(matches!(err, StartupError::GenesisRootMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_validate_genesis_root_beacon_unreachable() {
+        let local = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
+        let db = SlashingDb::open_in_memory().unwrap();
+        let beacon = MockBeacon::failing();
+
+        let result = validate_genesis_root(&db, &beacon, local).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), StartupError::Beacon(_)));
+    }
+
+    #[tokio::test]
+    async fn test_validate_genesis_root_stores_normalized_in_slashing_db() {
+        let root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
+        let db = SlashingDb::open_in_memory().unwrap();
+        let beacon = MockBeacon::with_root(root);
+
+        validate_genesis_root(&db, &beacon, root).await.unwrap();
+
+        let stored = db.genesis_validators_root().unwrap();
+        assert!(stored.is_some());
+        // Stored value should be normalized: lowercase without 0x prefix
+        assert_eq!(
+            stored.unwrap(),
+            "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+        );
+    }
+
+    // -- Sync status tests --
+
+    #[tokio::test]
+    async fn test_check_beacon_reachability_reachable() {
+        let beacon = MockBeacon::with_root("0xabc");
+        // Should not panic, just log
+        check_beacon_reachability(&beacon).await;
+    }
+
+    #[tokio::test]
+    async fn test_check_beacon_reachability_unreachable() {
+        let beacon = MockBeacon::failing();
+        // Should not panic, just warn
+        check_beacon_reachability(&beacon).await;
+    }
+
+    // -- StartupError display --
+
+    #[test]
+    fn test_startup_error_display_integrity() {
+        let err = StartupError::IntegrityCheckFailed("data corrupt".to_string());
+        assert!(err.to_string().contains("integrity check failed"));
+    }
+
+    #[test]
+    fn test_startup_error_display_genesis_mismatch() {
+        let err = StartupError::GenesisRootMismatch {
+            local: "0xabc".to_string(),
+            beacon: "0xdef".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("0xabc"));
+        assert!(msg.contains("0xdef"));
+    }
+
+    #[test]
+    fn test_startup_error_display_doppelganger() {
+        let err = StartupError::DoppelgangerDetected(vec!["0xpk1".to_string()]);
+        assert!(err.to_string().contains("doppelganger detected"));
+    }
+
+    #[test]
+    fn test_startup_error_from_config_error() {
+        let err: StartupError = ConfigError::MissingField("test".to_string()).into();
+        assert_eq!(err.exit_code(), 1);
+    }
+
+    #[test]
+    fn test_startup_error_from_beacon_error() {
+        let err: StartupError = BeaconError::HttpError("test".to_string()).into();
+        assert_eq!(err.exit_code(), 1);
+    }
+}

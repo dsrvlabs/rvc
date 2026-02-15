@@ -10,6 +10,6 @@ mod types;
 pub use db::SlashingDb;
 pub use error::{AttestationSlashingViolation, BlockSlashingViolation, SlashingError};
 pub use types::{
-    InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata,
+    InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata, PruneStats,
     SignedAttestation, SignedBlock, ValidatorRecord,
 };

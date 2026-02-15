@@ -15,6 +15,9 @@ use super::network::Network;
 pub struct Config {
     pub beacon_url: String,
 
+    #[serde(default)]
+    pub beacon_nodes: Vec<String>,
+
     pub keystore_path: PathBuf,
 
     pub password_file: Option<PathBuf>,
@@ -38,12 +41,27 @@ pub struct Config {
     pub graffiti: Option<String>,
 
     pub log_level: String,
+
+    pub doppelganger_detection: bool,
+
+    #[serde(default)]
+    pub keymanager_enabled: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keymanager_address: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keymanager_token_file: Option<PathBuf>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_signer_url: Option<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             beacon_url: "http://localhost:5052".to_string(),
+            beacon_nodes: Vec::new(),
             keystore_path: PathBuf::from("./keystores"),
             password_file: None,
             slashing_db_path: PathBuf::from("./slashing_protection.sqlite"),
@@ -55,6 +73,11 @@ impl Default for Config {
             genesis_validators_root: None,
             graffiti: None,
             log_level: "info".to_string(),
+            doppelganger_detection: true,
+            keymanager_enabled: false,
+            keymanager_address: None,
+            keymanager_token_file: None,
+            remote_signer_url: None,
         }
     }
 }
@@ -102,6 +125,20 @@ impl Config {
                 "beacon URL must start with http:// or https://: {}",
                 self.beacon_url
             )));
+        }
+
+        for node_url in &self.beacon_nodes {
+            if node_url.is_empty() {
+                return Err(ConfigError::InvalidBeaconUrl(
+                    "beacon_nodes entry cannot be empty".to_string(),
+                ));
+            }
+            if !node_url.starts_with("http://") && !node_url.starts_with("https://") {
+                return Err(ConfigError::InvalidBeaconUrl(format!(
+                    "beacon_nodes entry must start with http:// or https://: {}",
+                    node_url
+                )));
+            }
         }
 
         if self.metrics_port == 0 {
@@ -158,9 +195,24 @@ impl Config {
         Ok(passwords)
     }
 
+    /// Returns the effective list of beacon node endpoints.
+    ///
+    /// Prefers `beacon_nodes` if non-empty, otherwise falls back to `beacon_url`.
+    pub fn effective_beacon_nodes(&self) -> Vec<String> {
+        if !self.beacon_nodes.is_empty() {
+            self.beacon_nodes.clone()
+        } else {
+            vec![self.beacon_url.clone()]
+        }
+    }
+
     pub fn merge_with_cli(&mut self, cli: &CliOverrides) {
         if let Some(ref beacon_url) = cli.beacon_url {
             self.beacon_url = beacon_url.clone();
+        }
+
+        if let Some(ref beacon_nodes) = cli.beacon_nodes {
+            self.beacon_nodes = beacon_nodes.clone();
         }
 
         if let Some(ref keystore_path) = cli.keystore_path {
@@ -206,12 +258,33 @@ impl Config {
         if let Some(ref log_level) = cli.log_level {
             self.log_level = log_level.clone();
         }
+
+        if let Some(doppelganger_detection) = cli.doppelganger_detection {
+            self.doppelganger_detection = doppelganger_detection;
+        }
+
+        if let Some(keymanager_enabled) = cli.keymanager_enabled {
+            self.keymanager_enabled = keymanager_enabled;
+        }
+
+        if let Some(ref keymanager_address) = cli.keymanager_address {
+            self.keymanager_address = Some(keymanager_address.clone());
+        }
+
+        if let Some(ref keymanager_token_file) = cli.keymanager_token_file {
+            self.keymanager_token_file = Some(keymanager_token_file.clone());
+        }
+
+        if let Some(ref remote_signer_url) = cli.remote_signer_url {
+            self.remote_signer_url = Some(remote_signer_url.clone());
+        }
     }
 }
 
 #[derive(Debug, Default)]
 pub struct CliOverrides {
     pub beacon_url: Option<String>,
+    pub beacon_nodes: Option<Vec<String>>,
     pub keystore_path: Option<PathBuf>,
     pub password_file: Option<PathBuf>,
     pub slashing_db_path: Option<PathBuf>,
@@ -223,6 +296,11 @@ pub struct CliOverrides {
     pub genesis_validators_root: Option<String>,
     pub graffiti: Option<String>,
     pub log_level: Option<String>,
+    pub doppelganger_detection: Option<bool>,
+    pub keymanager_enabled: Option<bool>,
+    pub keymanager_address: Option<String>,
+    pub keymanager_token_file: Option<PathBuf>,
+    pub remote_signer_url: Option<String>,
 }
 
 #[cfg(test)]
@@ -440,5 +518,173 @@ log_level = "debug"
         let toml_str = toml::to_string(&config).unwrap();
         assert!(toml_str.contains("beacon_url"));
         assert!(toml_str.contains("network"));
+    }
+
+    // -- beacon_nodes tests --
+
+    #[test]
+    fn test_default_config_beacon_nodes_empty() {
+        let config = Config::default();
+        assert!(config.beacon_nodes.is_empty());
+    }
+
+    #[test]
+    fn test_default_config_doppelganger_detection_enabled() {
+        let config = Config::default();
+        assert!(config.doppelganger_detection);
+    }
+
+    #[test]
+    fn test_effective_beacon_nodes_falls_back_to_beacon_url() {
+        let config = Config { beacon_url: "http://primary:5052".to_string(), ..Default::default() };
+        assert_eq!(config.effective_beacon_nodes(), vec!["http://primary:5052"]);
+    }
+
+    #[test]
+    fn test_effective_beacon_nodes_uses_beacon_nodes_when_set() {
+        let config = Config {
+            beacon_url: "http://primary:5052".to_string(),
+            beacon_nodes: vec!["http://bn1:5052".to_string(), "http://bn2:5052".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(config.effective_beacon_nodes(), vec!["http://bn1:5052", "http://bn2:5052"]);
+    }
+
+    #[test]
+    fn test_merge_with_cli_beacon_nodes() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            beacon_nodes: Some(vec!["http://bn1:5052".to_string(), "http://bn2:5052".to_string()]),
+            ..Default::default()
+        };
+
+        config.merge_with_cli(&cli);
+        assert_eq!(config.beacon_nodes.len(), 2);
+        assert_eq!(config.beacon_nodes[0], "http://bn1:5052");
+    }
+
+    #[test]
+    fn test_merge_with_cli_doppelganger_detection() {
+        let mut config = Config::default();
+        assert!(config.doppelganger_detection);
+
+        let cli = CliOverrides { doppelganger_detection: Some(false), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert!(!config.doppelganger_detection);
+    }
+
+    #[test]
+    fn test_validate_beacon_nodes_invalid_scheme() {
+        let config = Config {
+            beacon_nodes: vec!["http://bn1:5052".to_string(), "ftp://bn2:5052".to_string()],
+            ..Default::default()
+        };
+        assert!(matches!(config.validate(), Err(ConfigError::InvalidBeaconUrl(_))));
+    }
+
+    #[test]
+    fn test_validate_beacon_nodes_empty_entry() {
+        let config = Config { beacon_nodes: vec!["".to_string()], ..Default::default() };
+        assert!(matches!(config.validate(), Err(ConfigError::InvalidBeaconUrl(_))));
+    }
+
+    #[test]
+    fn test_validate_beacon_nodes_valid() {
+        let config = Config {
+            beacon_nodes: vec!["http://bn1:5052".to_string(), "https://bn2:5052".to_string()],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_from_file_with_beacon_nodes() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://primary:5052"
+beacon_nodes = ["http://bn1:5052", "http://bn2:5052"]
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+doppelganger_detection = false
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(config.beacon_nodes.len(), 2);
+        assert!(!config.doppelganger_detection);
+    }
+
+    // -- keymanager config tests --
+
+    #[test]
+    fn test_default_config_keymanager_disabled() {
+        let config = Config::default();
+        assert!(!config.keymanager_enabled);
+        assert!(config.keymanager_address.is_none());
+        assert!(config.keymanager_token_file.is_none());
+        assert!(config.remote_signer_url.is_none());
+    }
+
+    #[test]
+    fn test_merge_with_cli_keymanager_fields() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            keymanager_enabled: Some(true),
+            keymanager_address: Some("0.0.0.0:5062".to_string()),
+            keymanager_token_file: Some(PathBuf::from("/data/token.txt")),
+            remote_signer_url: Some("https://signer.example.com".to_string()),
+            ..Default::default()
+        };
+
+        config.merge_with_cli(&cli);
+
+        assert!(config.keymanager_enabled);
+        assert_eq!(config.keymanager_address.as_deref(), Some("0.0.0.0:5062"));
+        assert_eq!(config.keymanager_token_file, Some(PathBuf::from("/data/token.txt")));
+        assert_eq!(config.remote_signer_url.as_deref(), Some("https://signer.example.com"));
+    }
+
+    #[test]
+    fn test_config_from_file_with_keymanager() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+keymanager_enabled = true
+keymanager_address = "0.0.0.0:5062"
+keymanager_token_file = "/data/token.txt"
+remote_signer_url = "https://signer.example.com"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert!(config.keymanager_enabled);
+        assert_eq!(config.keymanager_address.as_deref(), Some("0.0.0.0:5062"));
+        assert_eq!(config.keymanager_token_file, Some(PathBuf::from("/data/token.txt")));
+        assert_eq!(config.remote_signer_url.as_deref(), Some("https://signer.example.com"));
+    }
+
+    #[test]
+    fn test_merge_with_cli_keymanager_none_preserves_defaults() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+
+        config.merge_with_cli(&cli);
+
+        assert!(!config.keymanager_enabled);
+        assert!(config.keymanager_address.is_none());
+        assert!(config.keymanager_token_file.is_none());
+        assert!(config.remote_signer_url.is_none());
     }
 }

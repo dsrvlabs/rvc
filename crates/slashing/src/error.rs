@@ -24,6 +24,24 @@ pub enum SlashingError {
 
     #[error("invalid interchange format: {0}")]
     InvalidInterchangeFormat(String),
+
+    #[error("database integrity check failed: {0}")]
+    IntegrityCheckFailed(String),
+
+    #[error("watermark can only be raised: attempted to lower {watermark_type} for {pubkey}")]
+    WatermarkLowered { pubkey: String, watermark_type: String },
+
+    #[error("no watermarks set: pruning without watermarks would delete all records")]
+    NoWatermarksSet,
+
+    #[error("block at slot {slot} is below watermark slot {watermark_slot}")]
+    BelowBlockWatermark { slot: Slot, watermark_slot: Slot },
+
+    #[error("attestation with target epoch {target_epoch} is below watermark target epoch {watermark_target}")]
+    BelowAttestationWatermark { target_epoch: Epoch, watermark_target: Epoch },
+
+    #[error("attestation with source epoch {source_epoch} is below watermark source epoch {watermark_source}")]
+    BelowAttestationSourceWatermark { source_epoch: Epoch, watermark_source: Epoch },
 }
 
 /// Specific types of attestation slashing violations per EIP-3076.
@@ -51,6 +69,9 @@ pub enum AttestationSlashingViolation {
         existing_source: Epoch,
         existing_target: Epoch,
     },
+
+    #[error("target epoch {target_epoch} is below minimum existing target epoch {min_target}")]
+    TargetEpochBelowMinimum { target_epoch: Epoch, min_target: Epoch },
 }
 
 /// Specific types of block slashing violations per EIP-3076.
@@ -58,4 +79,7 @@ pub enum AttestationSlashingViolation {
 pub enum BlockSlashingViolation {
     #[error("double block proposal: already signed a different block for slot {slot}")]
     DoubleBlockProposal { slot: Slot },
+
+    #[error("slot {slot} is below minimum existing slot {min_slot}")]
+    SlotBelowMinimum { slot: Slot, min_slot: Slot },
 }

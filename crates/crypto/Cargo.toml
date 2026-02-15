@@ -8,12 +8,14 @@ repository.workspace = true
 
 [dependencies]
 aes.workspace = true
+async-trait.workspace = true
 blst.workspace = true
 ctr.workspace = true
 eth-types.workspace = true
 hex.workspace = true
 pbkdf2.workspace = true
 rand.workspace = true
+reqwest = { workspace = true }
 scrypt.workspace = true
 secrecy.workspace = true
 serde.workspace = true
@@ -34,3 +36,5 @@ test-utils = []
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock.workspace = true

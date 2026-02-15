@@ -1,28 +1,31 @@
 //! SQLite database layer for slashing protection.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::error::{AttestationSlashingViolation, BlockSlashingViolation, SlashingError};
 use crate::types::{
-    InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata,
+    InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata, PruneStats,
     SignedAttestation, SignedBlock, ValidatorRecord,
 };
 use eth_types::{Epoch, Slot};
+use metrics::definitions as metrics;
 
 /// SQLite-backed database for storing slashing protection data.
 pub struct SlashingDb {
     conn: Mutex<Connection>,
+    path: Option<PathBuf>,
 }
 
 impl SlashingDb {
     /// Open a database at the specified path.
     /// Creates the file and runs migrations if it doesn't exist.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SlashingError> {
+        let path = path.as_ref();
         let conn = Connection::open(path)?;
-        let db = Self { conn: Mutex::new(conn) };
+        let db = Self { conn: Mutex::new(conn), path: Some(path.to_path_buf()) };
         db.migrate()?;
         Ok(db)
     }
@@ -30,7 +33,7 @@ impl SlashingDb {
     /// Open an in-memory database for testing.
     pub fn open_in_memory() -> Result<Self, SlashingError> {
         let conn = Connection::open_in_memory()?;
-        let db = Self { conn: Mutex::new(conn) };
+        let db = Self { conn: Mutex::new(conn), path: None };
         db.migrate()?;
         Ok(db)
     }
@@ -54,6 +57,18 @@ impl SlashingDb {
                 slot INTEGER NOT NULL,
                 signing_root TEXT,
                 UNIQUE(pubkey, slot)
+            );
+
+            CREATE TABLE IF NOT EXISTS metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS watermarks (
+                pubkey TEXT NOT NULL,
+                watermark_type TEXT NOT NULL,
+                value INTEGER NOT NULL,
+                UNIQUE(pubkey, watermark_type)
             );
             ",
         )?;
@@ -175,6 +190,40 @@ impl SlashingDb {
         target_epoch: Epoch,
     ) -> Result<(), SlashingError> {
         let conn = self.conn.lock().expect("mutex poisoned");
+
+        // Check attestation watermarks (both source and target)
+        let wm_source: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
+                [pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(ws) = wm_source {
+            if (source_epoch as i64) < ws {
+                return Err(SlashingError::BelowAttestationSourceWatermark {
+                    source_epoch,
+                    watermark_source: ws as Epoch,
+                });
+            }
+        }
+
+        let wm_target: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
+                [pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(wt) = wm_target {
+            if (target_epoch as i64) < wt {
+                return Err(SlashingError::BelowAttestationWatermark {
+                    target_epoch,
+                    watermark_target: wt as Epoch,
+                });
+            }
+        }
+
         let mut stmt = conn.prepare(
             "SELECT source_epoch, target_epoch
              FROM attestations
@@ -185,8 +234,12 @@ impl SlashingDb {
             Ok((row.get::<_, i64>(0)? as Epoch, row.get::<_, i64>(1)? as Epoch))
         })?;
 
+        let mut min_target: Option<Epoch> = None;
+
         for row in rows {
             let (existing_source, existing_target) = row?;
+
+            min_target = Some(min_target.map_or(existing_target, |m| m.min(existing_target)));
 
             // Check for double voting (same target epoch)
             if target_epoch == existing_target {
@@ -213,6 +266,17 @@ impl SlashingDb {
                     new_target: target_epoch,
                     existing_source,
                     existing_target,
+                }
+                .into());
+            }
+        }
+
+        // Check target epoch is not below minimum existing target
+        if let Some(min) = min_target {
+            if target_epoch < min {
+                return Err(AttestationSlashingViolation::TargetEpochBelowMinimum {
+                    target_epoch,
+                    min_target: min,
                 }
                 .into());
             }
@@ -361,6 +425,24 @@ impl SlashingDb {
         signing_root: Option<String>,
     ) -> Result<(), SlashingError> {
         let conn = self.conn.lock().expect("mutex poisoned");
+
+        // Check block watermark
+        let watermark: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
+                [pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(wm) = watermark {
+            if (slot as i64) < wm {
+                return Err(SlashingError::BelowBlockWatermark {
+                    slot,
+                    watermark_slot: wm as Slot,
+                });
+            }
+        }
+
         let existing: Option<Option<String>> = conn
             .query_row(
                 "SELECT signing_root FROM blocks WHERE pubkey = ?1 AND slot = ?2",
@@ -372,6 +454,24 @@ impl SlashingDb {
         if let Some(existing_root) = existing {
             if existing_root != signing_root {
                 return Err(BlockSlashingViolation::DoubleBlockProposal { slot }.into());
+            }
+        } else {
+            // No block at this slot — check that slot is not below the minimum
+            let min_slot: Option<i64> = conn
+                .query_row("SELECT MIN(slot) FROM blocks WHERE pubkey = ?1", [pubkey], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .flatten();
+
+            if let Some(min) = min_slot {
+                if (slot as i64) < min {
+                    return Err(BlockSlashingViolation::SlotBelowMinimum {
+                        slot,
+                        min_slot: min as Slot,
+                    }
+                    .into());
+                }
             }
         }
 
@@ -391,6 +491,23 @@ impl SlashingDb {
         let mut conn = self.conn.lock().expect("mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
+        // Check block watermark
+        let watermark: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
+                [pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(wm) = watermark {
+            if (slot as i64) < wm {
+                return Err(SlashingError::BelowBlockWatermark {
+                    slot,
+                    watermark_slot: wm as Slot,
+                });
+            }
+        }
+
         let existing: Option<Option<String>> = tx
             .query_row(
                 "SELECT signing_root FROM blocks WHERE pubkey = ?1 AND slot = ?2",
@@ -406,6 +523,22 @@ impl SlashingDb {
             // Same signing root — idempotent re-sign, commit without inserting
             tx.commit()?;
             return Ok(());
+        }
+
+        // No block at this slot — check that slot is not below the minimum
+        let min_slot: Option<i64> = tx
+            .query_row("SELECT MIN(slot) FROM blocks WHERE pubkey = ?1", [pubkey], |row| row.get(0))
+            .optional()?
+            .flatten();
+
+        if let Some(min) = min_slot {
+            if (slot as i64) < min {
+                return Err(BlockSlashingViolation::SlotBelowMinimum {
+                    slot,
+                    min_slot: min as Slot,
+                }
+                .into());
+            }
         }
 
         tx.execute(
@@ -430,6 +563,39 @@ impl SlashingDb {
     ) -> Result<(), SlashingError> {
         let mut conn = self.conn.lock().expect("mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Check attestation watermarks (both source and target)
+        let wm_source: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
+                [pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(ws) = wm_source {
+            if (source_epoch as i64) < ws {
+                return Err(SlashingError::BelowAttestationSourceWatermark {
+                    source_epoch,
+                    watermark_source: ws as Epoch,
+                });
+            }
+        }
+
+        let wm_target: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
+                [pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(wt) = wm_target {
+            if (target_epoch as i64) < wt {
+                return Err(SlashingError::BelowAttestationWatermark {
+                    target_epoch,
+                    watermark_target: wt as Epoch,
+                });
+            }
+        }
 
         let existing: Vec<(Epoch, Epoch, Option<String>)> = {
             let mut stmt = tx.prepare(
@@ -481,6 +647,18 @@ impl SlashingDb {
         }
 
         if !is_duplicate {
+            // Check target epoch is not below minimum existing target
+            let min_target = existing.iter().map(|(_, t, _)| *t).min();
+            if let Some(min) = min_target {
+                if target_epoch < min {
+                    return Err(AttestationSlashingViolation::TargetEpochBelowMinimum {
+                        target_epoch,
+                        min_target: min,
+                    }
+                    .into());
+                }
+            }
+
             tx.execute(
                 "INSERT INTO attestations (pubkey, source_epoch, target_epoch, signing_root)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -490,6 +668,25 @@ impl SlashingDb {
 
         tx.commit()?;
         Ok(())
+    }
+
+    /// Get the last signed attestation epoch for a given public key.
+    ///
+    /// Returns `None` if no attestations have been signed for this validator.
+    pub fn last_signed_attestation_epoch(
+        &self,
+        pubkey: &str,
+    ) -> Result<Option<Epoch>, SlashingError> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let result: Option<i64> = conn
+            .query_row(
+                "SELECT MAX(target_epoch) FROM attestations WHERE pubkey = ?1",
+                [pubkey],
+                |row| row.get(0),
+            )
+            .map_err(SlashingError::from)?;
+
+        Ok(result.map(|e| e as Epoch))
     }
 
     /// Get the last signed block slot for a given public key.
@@ -503,6 +700,277 @@ impl SlashingDb {
 
         Ok(result.map(|s| s as Slot))
     }
+
+    /// Run SQLite `PRAGMA integrity_check` and return an error if the database is corrupt.
+    pub fn check_integrity(&self) -> Result<(), SlashingError> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if result != "ok" {
+            return Err(SlashingError::IntegrityCheckFailed(result));
+        }
+        Ok(())
+    }
+
+    /// Read the stored genesis validators root from the metadata table.
+    pub fn genesis_validators_root(&self) -> Result<Option<String>, SlashingError> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'genesis_validators_root'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result)
+    }
+
+    /// Store the genesis validators root in the metadata table.
+    ///
+    /// On first run, the root is stored. On subsequent runs, the stored root
+    /// is compared against the provided root. If they differ, an error is returned.
+    pub fn set_genesis_validators_root(&self, root: &str) -> Result<(), SlashingError> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'genesis_validators_root'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(stored) if stored != root => Err(SlashingError::GenesisValidatorsRootMismatch {
+                expected: stored,
+                actual: root.to_string(),
+            }),
+            Some(_) => Ok(()),
+            None => {
+                conn.execute(
+                    "INSERT INTO metadata (key, value) VALUES ('genesis_validators_root', ?1)",
+                    [root],
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Set a block watermark for a validator. Blocks below this slot will be rejected and can be pruned.
+    ///
+    /// Watermarks can only be raised, never lowered. Setting the same value is idempotent.
+    pub fn set_block_watermark(&self, pubkey: &str, slot: Slot) -> Result<(), SlashingError> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
+                [pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if let Some(current) = existing {
+            if (slot as i64) < current {
+                return Err(SlashingError::WatermarkLowered {
+                    pubkey: pubkey.to_string(),
+                    watermark_type: "block".to_string(),
+                });
+            }
+            conn.execute(
+                "UPDATE watermarks SET value = ?1 WHERE pubkey = ?2 AND watermark_type = 'block'",
+                (slot as i64, pubkey),
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, 'block', ?2)",
+                (pubkey, slot as i64),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Get the block watermark for a validator.
+    pub fn get_block_watermark(&self, pubkey: &str) -> Result<Option<Slot>, SlashingError> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+        let result: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
+                [pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(result.map(|v| v as Slot))
+    }
+
+    /// Set an attestation watermark for a validator.
+    ///
+    /// Both source and target epoch watermarks can only be raised, never lowered.
+    pub fn set_attestation_watermark(
+        &self,
+        pubkey: &str,
+        source_epoch: Epoch,
+        target_epoch: Epoch,
+    ) -> Result<(), SlashingError> {
+        let mut conn = self.conn.lock().expect("mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let existing_source: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
+                [pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let existing_target: Option<i64> = tx
+            .query_row(
+                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
+                [pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        if let Some(current_source) = existing_source {
+            if (source_epoch as i64) < current_source {
+                return Err(SlashingError::WatermarkLowered {
+                    pubkey: pubkey.to_string(),
+                    watermark_type: "att_source".to_string(),
+                });
+            }
+        }
+        if let Some(current_target) = existing_target {
+            if (target_epoch as i64) < current_target {
+                return Err(SlashingError::WatermarkLowered {
+                    pubkey: pubkey.to_string(),
+                    watermark_type: "att_target".to_string(),
+                });
+            }
+        }
+
+        tx.execute(
+            "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, 'att_source', ?2)
+             ON CONFLICT(pubkey, watermark_type) DO UPDATE SET value = ?2",
+            (pubkey, source_epoch as i64),
+        )?;
+        tx.execute(
+            "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, 'att_target', ?2)
+             ON CONFLICT(pubkey, watermark_type) DO UPDATE SET value = ?2",
+            (pubkey, target_epoch as i64),
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get the attestation watermark for a validator.
+    ///
+    /// Returns `Some((source_epoch, target_epoch))` if both watermarks are set, `None` otherwise.
+    pub fn get_attestation_watermark(
+        &self,
+        pubkey: &str,
+    ) -> Result<Option<(Epoch, Epoch)>, SlashingError> {
+        let conn = self.conn.lock().expect("mutex poisoned");
+
+        let source: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
+                [pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let target: Option<i64> = conn
+            .query_row(
+                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
+                [pubkey],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        match (source, target) {
+            (Some(s), Some(t)) => Ok(Some((s as Epoch, t as Epoch))),
+            _ => Ok(None),
+        }
+    }
+
+    /// Delete slashing protection records below all set watermarks.
+    ///
+    /// Returns an error if no watermarks are set (safety: prevents accidental deletion of all records).
+    pub fn prune_below_watermarks(&self) -> Result<PruneStats, SlashingError> {
+        let mut conn = self.conn.lock().expect("mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let watermark_count: i64 =
+            tx.query_row("SELECT COUNT(*) FROM watermarks", [], |row| row.get(0))?;
+
+        if watermark_count == 0 {
+            return Err(SlashingError::NoWatermarksSet);
+        }
+
+        // Delete blocks below each validator's block watermark
+        let blocks_deleted = tx.execute(
+            "DELETE FROM blocks WHERE EXISTS (
+                SELECT 1 FROM watermarks w
+                WHERE w.pubkey = blocks.pubkey
+                  AND w.watermark_type = 'block'
+                  AND blocks.slot < w.value
+            )",
+            [],
+        )?;
+
+        // Delete attestations below each validator's target epoch watermark
+        let attestations_deleted = tx.execute(
+            "DELETE FROM attestations WHERE EXISTS (
+                SELECT 1 FROM watermarks w
+                WHERE w.pubkey = attestations.pubkey
+                  AND w.watermark_type = 'att_target'
+                  AND attestations.target_epoch < w.value
+            )",
+            [],
+        )?;
+
+        tx.commit()?;
+
+        // Increment prune metrics
+        metrics::RVC_SLASHING_DB_PRUNE_TOTAL
+            .with_label_values(&[metrics::prune_type::BLOCK])
+            .inc_by(blocks_deleted as u64);
+        metrics::RVC_SLASHING_DB_PRUNE_TOTAL
+            .with_label_values(&[metrics::prune_type::ATTESTATION])
+            .inc_by(attestations_deleted as u64);
+
+        Ok(PruneStats {
+            attestations_deleted: attestations_deleted as u64,
+            blocks_deleted: blocks_deleted as u64,
+        })
+    }
+
+    /// Check file permissions and warn if the slashing DB is world-readable or world-writable (Unix only).
+    #[cfg(unix)]
+    pub fn check_file_permissions(&self) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(path) = &self.path {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                let mode = metadata.permissions().mode();
+                let dangerous_bits = 0o006; // world-readable (4) + world-writable (2)
+                if mode & dangerous_bits != 0 {
+                    let issues = match (mode & 0o004 != 0, mode & 0o002 != 0) {
+                        (true, true) => "world-readable and world-writable",
+                        (true, false) => "world-readable",
+                        (false, true) => "world-writable",
+                        _ => unreachable!(),
+                    };
+                    tracing::warn!(
+                        path = %path.display(),
+                        mode = format!("{:o}", mode),
+                        "slashing protection database is {}; consider restricting permissions to 0600",
+                        issues,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Check file permissions (no-op on non-Unix platforms).
+    #[cfg(not(unix))]
+    pub fn check_file_permissions(&self) {}
 }
 
 #[cfg(test)]
@@ -994,13 +1462,17 @@ mod tests {
         };
         db.insert_attestation(&attestation).expect("failed to insert");
 
-        // New: source=4, target=10 - same source, not surrounded (need existing_source < new_source)
+        // New: source=4, target=10 - below min target (11), rejected per EIP-3076
         let result = db.is_safe_to_sign("0x1234", 4, 10);
-        assert!(result.is_ok());
+        assert!(result.is_err());
 
         // New: source=5, target=11 - same target (double vote)
         let result = db.is_safe_to_sign("0x1234", 5, 11);
         assert!(result.is_err());
+
+        // New: source=4, target=12 - above min target (11), safe
+        let result = db.is_safe_to_sign("0x1234", 4, 12);
+        assert!(result.is_ok());
     }
 
     #[test]
@@ -1766,6 +2238,42 @@ mod tests {
         assert_eq!(blocks.len(), 1);
     }
 
+    // --- Liveness query tests ---
+
+    #[test]
+    fn test_liveness_last_signed_attestation_epoch_empty_db() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let result = db.last_signed_attestation_epoch("0x1234").expect("query should succeed");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_liveness_last_signed_attestation_epoch_single() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_attestation("0x1234", 100, 101, None).expect("record");
+        let result = db.last_signed_attestation_epoch("0x1234").expect("query should succeed");
+        assert_eq!(result, Some(101));
+    }
+
+    #[test]
+    fn test_liveness_last_signed_attestation_epoch_multiple() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_attestation("0x1234", 100, 101, None).expect("record");
+        db.record_attestation("0x1234", 103, 105, None).expect("record");
+        db.record_attestation("0x1234", 101, 103, None).expect("record");
+        let result = db.last_signed_attestation_epoch("0x1234").expect("query should succeed");
+        assert_eq!(result, Some(105));
+    }
+
+    #[test]
+    fn test_liveness_last_signed_attestation_epoch_different_pubkeys() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.record_attestation("0x1111", 100, 101, None).expect("record");
+        db.record_attestation("0x2222", 200, 201, None).expect("record");
+        assert_eq!(db.last_signed_attestation_epoch("0x1111").unwrap(), Some(101));
+        assert_eq!(db.last_signed_attestation_epoch("0x2222").unwrap(), Some(201));
+    }
+
     #[test]
     fn test_check_and_record_attestation_concurrent_double_vote() {
         use std::sync::Arc;
@@ -1801,5 +2309,510 @@ mod tests {
 
         let attestations = db.get_attestations("0x1234").expect("failed to get");
         assert_eq!(attestations.len(), 1);
+    }
+
+    // --- Startup integrity check tests ---
+
+    #[test]
+    fn test_integrity_check_clean_db() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let result = db.check_integrity();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_integrity_check_clean_file_db() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("integrity.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+        db.record_attestation("0x1234", 100, 101, None).expect("record");
+        let result = db.check_integrity();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_integrity_check_returns_error_variant() {
+        let err = SlashingError::IntegrityCheckFailed("test failure".to_string());
+        match err {
+            SlashingError::IntegrityCheckFailed(msg) => assert_eq!(msg, "test failure"),
+            _ => panic!("expected IntegrityCheckFailed"),
+        }
+    }
+
+    #[test]
+    fn test_integrity_genesis_validators_root_empty() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let root = db.genesis_validators_root().expect("query should succeed");
+        assert!(root.is_none());
+    }
+
+    #[test]
+    fn test_integrity_set_genesis_validators_root() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        db.set_genesis_validators_root(root).expect("set should succeed");
+
+        let stored = db.genesis_validators_root().expect("query should succeed");
+        assert_eq!(stored, Some(root.to_string()));
+    }
+
+    #[test]
+    fn test_integrity_genesis_validators_root_roundtrip() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        db.set_genesis_validators_root(root).expect("first set should succeed");
+        db.set_genesis_validators_root(root).expect("same root should succeed");
+
+        let stored = db.genesis_validators_root().expect("query should succeed");
+        assert_eq!(stored, Some(root.to_string()));
+    }
+
+    #[test]
+    fn test_integrity_genesis_validators_root_mismatch() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let root1 = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let root2 = "0xdifferent00000000000000000000000000000000000000000000000000000000";
+
+        db.set_genesis_validators_root(root1).expect("first set should succeed");
+        let result = db.set_genesis_validators_root(root2);
+        assert!(result.is_err());
+
+        match result.unwrap_err() {
+            SlashingError::GenesisValidatorsRootMismatch { expected, actual } => {
+                assert_eq!(expected, root1);
+                assert_eq!(actual, root2);
+            }
+            other => panic!("expected GenesisValidatorsRootMismatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_integrity_genesis_root_persists_across_connections() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("genesis.db");
+        let root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        {
+            let db = SlashingDb::open(&path).expect("failed to open db");
+            db.set_genesis_validators_root(root).expect("set should succeed");
+        }
+
+        {
+            let db = SlashingDb::open(&path).expect("failed to reopen db");
+            let stored = db.genesis_validators_root().expect("query should succeed");
+            assert_eq!(stored, Some(root.to_string()));
+        }
+    }
+
+    #[test]
+    fn test_integrity_metadata_table_created() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let conn = db.conn.lock().expect("mutex poisoned");
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'metadata'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("failed to query tables");
+        assert_eq!(table_count, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_integrity_file_permission_check_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("perms.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("failed to set permissions");
+
+        // Should not panic, just log a warning
+        db.check_file_permissions();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_integrity_file_permission_check_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("perms_writable.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o602))
+            .expect("failed to set permissions");
+
+        // Should not panic, just log a warning about world-writable
+        db.check_file_permissions();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_integrity_file_permission_check_world_readable_and_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("perms_both.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o606))
+            .expect("failed to set permissions");
+
+        // Should not panic, just log a warning about both world-readable and world-writable
+        db.check_file_permissions();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_integrity_file_permission_check_restricted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("perms_restricted.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("failed to set permissions");
+
+        // Should not warn
+        db.check_file_permissions();
+    }
+
+    // --- Watermark and pruning tests ---
+
+    #[test]
+    fn test_prune_set_and_get_block_watermark() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        assert!(db.get_block_watermark("0x1234").unwrap().is_none());
+
+        db.set_block_watermark("0x1234", 1000).expect("set should succeed");
+        assert_eq!(db.get_block_watermark("0x1234").unwrap(), Some(1000));
+    }
+
+    #[test]
+    fn test_prune_block_watermark_raise_succeeds() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_block_watermark("0x1234", 1000).expect("set should succeed");
+        db.set_block_watermark("0x1234", 2000).expect("raise should succeed");
+        assert_eq!(db.get_block_watermark("0x1234").unwrap(), Some(2000));
+    }
+
+    #[test]
+    fn test_prune_block_watermark_lower_fails() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_block_watermark("0x1234", 2000).expect("set should succeed");
+        let result = db.set_block_watermark("0x1234", 1000);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::WatermarkLowered { .. } => {}
+            other => panic!("expected WatermarkLowered, got: {other:?}"),
+        }
+        assert_eq!(db.get_block_watermark("0x1234").unwrap(), Some(2000));
+    }
+
+    #[test]
+    fn test_prune_block_watermark_same_value_succeeds() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_block_watermark("0x1234", 1000).expect("set should succeed");
+        db.set_block_watermark("0x1234", 1000).expect("same value should succeed");
+        assert_eq!(db.get_block_watermark("0x1234").unwrap(), Some(1000));
+    }
+
+    #[test]
+    fn test_prune_set_and_get_attestation_watermark() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        assert!(db.get_attestation_watermark("0x1234").unwrap().is_none());
+
+        db.set_attestation_watermark("0x1234", 100, 101).expect("set should succeed");
+        assert_eq!(db.get_attestation_watermark("0x1234").unwrap(), Some((100, 101)));
+    }
+
+    #[test]
+    fn test_prune_attestation_watermark_raise_succeeds() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_attestation_watermark("0x1234", 100, 101).expect("set should succeed");
+        db.set_attestation_watermark("0x1234", 200, 201).expect("raise should succeed");
+        assert_eq!(db.get_attestation_watermark("0x1234").unwrap(), Some((200, 201)));
+    }
+
+    #[test]
+    fn test_prune_attestation_watermark_lower_source_fails() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_attestation_watermark("0x1234", 200, 201).expect("set should succeed");
+        let result = db.set_attestation_watermark("0x1234", 100, 300);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::WatermarkLowered { .. } => {}
+            other => panic!("expected WatermarkLowered, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_prune_attestation_watermark_lower_target_fails() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_attestation_watermark("0x1234", 200, 201).expect("set should succeed");
+        let result = db.set_attestation_watermark("0x1234", 300, 100);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::WatermarkLowered { .. } => {}
+            other => panic!("expected WatermarkLowered, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_prune_attestation_watermark_same_value_succeeds() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_attestation_watermark("0x1234", 100, 101).expect("set should succeed");
+        db.set_attestation_watermark("0x1234", 100, 101).expect("same should succeed");
+        assert_eq!(db.get_attestation_watermark("0x1234").unwrap(), Some((100, 101)));
+    }
+
+    #[test]
+    fn test_prune_watermarks_persist_across_connections() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("watermarks.db");
+
+        {
+            let db = SlashingDb::open(&path).expect("failed to open db");
+            db.set_block_watermark("0x1234", 1000).expect("set should succeed");
+            db.set_attestation_watermark("0x1234", 100, 101).expect("set should succeed");
+        }
+
+        {
+            let db = SlashingDb::open(&path).expect("failed to reopen db");
+            assert_eq!(db.get_block_watermark("0x1234").unwrap(), Some(1000));
+            assert_eq!(db.get_attestation_watermark("0x1234").unwrap(), Some((100, 101)));
+        }
+    }
+
+    #[test]
+    fn test_prune_watermarks_per_validator_isolated() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_block_watermark("0x1111", 1000).expect("set should succeed");
+        db.set_block_watermark("0x2222", 2000).expect("set should succeed");
+
+        assert_eq!(db.get_block_watermark("0x1111").unwrap(), Some(1000));
+        assert_eq!(db.get_block_watermark("0x2222").unwrap(), Some(2000));
+        assert!(db.get_block_watermark("0x3333").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_prune_is_safe_to_propose_rejects_below_watermark() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_block_watermark("0x1234", 1000).expect("set should succeed");
+
+        let result = db.is_safe_to_propose("0x1234", 999, None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::BelowBlockWatermark { slot: 999, watermark_slot: 1000 } => {}
+            other => panic!("expected BelowBlockWatermark, got: {other:?}"),
+        }
+
+        // At watermark should be fine
+        assert!(db.is_safe_to_propose("0x1234", 1000, None).is_ok());
+        // Above watermark should be fine
+        assert!(db.is_safe_to_propose("0x1234", 1001, None).is_ok());
+    }
+
+    #[test]
+    fn test_prune_is_safe_to_sign_rejects_below_target_watermark() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_attestation_watermark("0x1234", 100, 101).expect("set should succeed");
+
+        // source=100 is at source watermark, but target=100 < target watermark=101
+        let result = db.is_safe_to_sign("0x1234", 100, 100);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::BelowAttestationWatermark {
+                target_epoch: 100,
+                watermark_target: 101,
+            } => {}
+            other => panic!("expected BelowAttestationWatermark, got: {other:?}"),
+        }
+
+        // At watermark should be fine
+        assert!(db.is_safe_to_sign("0x1234", 101, 102).is_ok());
+    }
+
+    #[test]
+    fn test_prune_check_and_record_block_rejects_below_watermark() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_block_watermark("0x1234", 1000).expect("set should succeed");
+
+        let result = db.check_and_record_block("0x1234", 999, None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::BelowBlockWatermark { .. } => {}
+            other => panic!("expected BelowBlockWatermark, got: {other:?}"),
+        }
+
+        // Should not have recorded anything
+        assert!(db.get_blocks("0x1234").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_prune_check_and_record_attestation_rejects_below_target_watermark() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_attestation_watermark("0x1234", 100, 101).expect("set should succeed");
+
+        // source=100 is at source watermark, but target=100 < target watermark=101
+        let result = db.check_and_record_attestation("0x1234", 100, 100, None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::BelowAttestationWatermark { .. } => {}
+            other => panic!("expected BelowAttestationWatermark, got: {other:?}"),
+        }
+
+        assert!(db.get_attestations("0x1234").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_prune_is_safe_to_sign_rejects_below_source_watermark() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_attestation_watermark("0x1234", 20, 20).expect("set should succeed");
+
+        // source=1 is below source watermark=20, even though target=31 is above target watermark
+        let result = db.is_safe_to_sign("0x1234", 1, 31);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::BelowAttestationSourceWatermark {
+                source_epoch: 1,
+                watermark_source: 20,
+            } => {}
+            other => panic!("expected BelowAttestationSourceWatermark, got: {other:?}"),
+        }
+
+        // At source watermark should be fine
+        assert!(db.is_safe_to_sign("0x1234", 20, 31).is_ok());
+    }
+
+    #[test]
+    fn test_prune_check_and_record_attestation_rejects_below_source_watermark() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_attestation_watermark("0x1234", 20, 20).expect("set should succeed");
+
+        // source=1 is below source watermark=20
+        let result = db.check_and_record_attestation("0x1234", 1, 31, None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::BelowAttestationSourceWatermark { .. } => {}
+            other => panic!("expected BelowAttestationSourceWatermark, got: {other:?}"),
+        }
+
+        // Should not have recorded anything
+        assert!(db.get_attestations("0x1234").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_prune_below_watermarks_deletes_correct_records() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        // Insert blocks: 100, 200, 300, 400, 500
+        for slot in [100, 200, 300, 400, 500] {
+            db.record_block("0x1234", slot, None).expect("record should succeed");
+        }
+
+        // Insert attestations: target epochs 10, 20, 30, 40, 50
+        for (src, tgt) in [(5, 10), (10, 20), (20, 30), (30, 40), (40, 50)] {
+            db.record_attestation("0x1234", src, tgt, None).expect("record should succeed");
+        }
+
+        // Set watermarks: block at 300, attestation at (20, 30)
+        db.set_block_watermark("0x1234", 300).expect("set should succeed");
+        db.set_attestation_watermark("0x1234", 20, 30).expect("set should succeed");
+
+        let stats = db.prune_below_watermarks().expect("prune should succeed");
+
+        // Blocks below 300: slots 100, 200 → 2 deleted
+        assert_eq!(stats.blocks_deleted, 2);
+        // Attestations below target 30: target epochs 10, 20 → 2 deleted
+        assert_eq!(stats.attestations_deleted, 2);
+
+        // Verify remaining records
+        let blocks = db.get_blocks("0x1234").unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].slot, 300);
+
+        let attestations = db.get_attestations("0x1234").unwrap();
+        assert_eq!(attestations.len(), 3);
+        assert_eq!(attestations[0].target_epoch, 30);
+    }
+
+    #[test]
+    fn test_prune_without_watermarks_fails() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        // Insert some records but no watermarks
+        db.record_block("0x1234", 100, None).expect("record should succeed");
+        db.record_attestation("0x1234", 5, 10, None).expect("record should succeed");
+
+        let result = db.prune_below_watermarks();
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::NoWatermarksSet => {}
+            other => panic!("expected NoWatermarksSet, got: {other:?}"),
+        }
+
+        // Records should still be intact
+        assert_eq!(db.get_blocks("0x1234").unwrap().len(), 1);
+        assert_eq!(db.get_attestations("0x1234").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_prune_multiple_validators() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        // Validator 1: blocks at 100, 200; watermark at 200
+        db.record_block("0x1111", 100, None).expect("record");
+        db.record_block("0x1111", 200, None).expect("record");
+        db.set_block_watermark("0x1111", 200).expect("set");
+
+        // Validator 2: blocks at 300, 400; watermark at 350
+        db.record_block("0x2222", 300, None).expect("record");
+        db.record_block("0x2222", 400, None).expect("record");
+        db.set_block_watermark("0x2222", 350).expect("set");
+
+        let stats = db.prune_below_watermarks().expect("prune should succeed");
+
+        // V1: slot 100 < 200 → deleted; V2: slot 300 < 350 → deleted
+        assert_eq!(stats.blocks_deleted, 2);
+
+        assert_eq!(db.get_blocks("0x1111").unwrap().len(), 1);
+        assert_eq!(db.get_blocks("0x2222").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_prune_nothing_to_prune() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        // All records are at or above watermark
+        db.record_block("0x1234", 200, None).expect("record");
+        db.record_block("0x1234", 300, None).expect("record");
+        db.set_block_watermark("0x1234", 100).expect("set");
+
+        let stats = db.prune_below_watermarks().expect("prune should succeed");
+        assert_eq!(stats.blocks_deleted, 0);
+        assert_eq!(stats.attestations_deleted, 0);
+
+        assert_eq!(db.get_blocks("0x1234").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_prune_watermarks_table_created_on_migration() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let conn = db.conn.lock().expect("mutex poisoned");
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'watermarks'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("failed to query tables");
+        assert_eq!(table_count, 1);
     }
 }

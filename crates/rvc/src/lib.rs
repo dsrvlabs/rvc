@@ -2,8 +2,11 @@
 
 pub mod beacon_adapter;
 pub mod config;
+pub mod doppelganger_adapter;
 pub mod duty_tracker;
+pub mod keymanager_adapters;
 pub mod orchestrator;
+pub mod startup;
 
 pub mod proto {
     pub mod duty_tracker {

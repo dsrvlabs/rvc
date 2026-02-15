@@ -4,6 +4,13 @@ use serde::{Deserialize, Serialize};
 
 use eth_types::{Epoch, Slot};
 
+/// Statistics returned by a prune operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PruneStats {
+    pub attestations_deleted: u64,
+    pub blocks_deleted: u64,
+}
+
 /// Internal record of a signed attestation for slashing protection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedAttestation {

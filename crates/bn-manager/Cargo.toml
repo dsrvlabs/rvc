@@ -1,0 +1,27 @@
+[package]
+name = "rvc-bn-manager"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Beacon node manager with multi-BN support and failover"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/rootwarp/rvc"
+keywords = ["ethereum", "beacon", "validator", "failover"]
+categories = ["cryptography::cryptocurrencies"]
+
+[dependencies]
+beacon = { workspace = true }
+eth-types = { workspace = true }
+async-trait = { workspace = true }
+futures = "0.3"
+reqwest-eventsource = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+wiremock = { workspace = true }

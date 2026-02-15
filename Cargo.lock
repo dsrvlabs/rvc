@@ -423,6 +423,7 @@ checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
 dependencies = [
  "async-trait",
  "axum-core",
+ "axum-macros",
  "bytes",
  "futures-util",
  "http",
@@ -468,6 +469,17 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+]
+
+[[package]]
+name = "axum-macros"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57d123550fa8d071b7255cb0cc04dc302baa6c8c4a79f55701552684d8399bce"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.114",
 ]
 
 [[package]]
@@ -1051,6 +1063,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "eventsource-stream"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74fef4569247a5f429d9156b9d0a2599914385dd189c539334c625d8099d90ab"
+dependencies = [
+ "futures-core",
+ "nom",
+ "pin-project-lite",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1227,6 +1250,12 @@ name = "futures-task"
 version = "0.3.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f90f7dce0722e95104fcb095585910c0977252f286e354b5e3bd38902cd99988"
+
+[[package]]
+name = "futures-timer"
+version = "3.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f288b0a4f20f9a56b5d1da57e2227c661b7b16168e2f72365f57b63326e29b24"
 
 [[package]]
 name = "futures-util"
@@ -1859,6 +1888,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "minimal-lexical"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
+
+[[package]]
 name = "mio"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1874,6 +1909,16 @@ name = "multimap"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
+
+[[package]]
+name = "nom"
+version = "7.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
+dependencies = [
+ "memchr",
+ "minimal-lexical",
+]
 
 [[package]]
 name = "nu-ansi-term"
@@ -2466,14 +2511,32 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower 0.5.3",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
+]
+
+[[package]]
+name = "reqwest-eventsource"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "632c55746dbb44275691640e7b40c907c16a2dc1a5842aa98aaec90da6ec6bde"
+dependencies = [
+ "eventsource-stream",
+ "futures-core",
+ "futures-timer",
+ "mime",
+ "nom",
+ "pin-project-lite",
+ "reqwest",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2659,13 +2722,19 @@ name = "rvc"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "beacon",
  "hex",
+ "http-body-util",
  "prost",
  "rvc-block-service",
+ "rvc-bn-manager",
+ "rvc-builder",
  "rvc-crypto",
+ "rvc-doppelganger",
  "rvc-duty-tracker",
  "rvc-eth-types",
+ "rvc-keymanager-api",
  "rvc-metrics",
  "rvc-propagator",
  "rvc-signer",
@@ -2682,7 +2751,9 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-build",
+ "tower 0.5.3",
  "tracing",
+ "tree_hash",
  "wiremock",
 ]
 
@@ -2693,11 +2764,19 @@ dependencies = [
  "anyhow",
  "beacon",
  "clap",
+ "hex",
  "libc",
  "reqwest",
  "rvc",
+ "rvc-bn-manager",
+ "rvc-builder",
  "rvc-crypto",
+ "rvc-eth-types",
+ "rvc-keymanager-api",
  "rvc-metrics",
+ "rvc-signer",
+ "rvc-slashing",
+ "rvc-timing",
  "tempfile",
  "tokio",
  "tonic",
@@ -2723,10 +2802,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvc-bn-manager"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "beacon",
+ "futures",
+ "reqwest-eventsource",
+ "rvc-eth-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "rvc-builder"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "rand 0.8.5",
+ "rvc-bn-manager",
+ "rvc-crypto",
+ "rvc-eth-types",
+ "rvc-signer",
+ "rvc-validator-store",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rvc-crypto"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "async-trait",
  "blst",
  "ctr",
  "ethereum_ssz 0.9.1",
@@ -2734,6 +2849,7 @@ dependencies = [
  "hex",
  "pbkdf2",
  "rand 0.8.5",
+ "reqwest",
  "rvc-eth-types",
  "scrypt",
  "secrecy",
@@ -2743,11 +2859,24 @@ dependencies = [
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "tree_hash",
  "tree_hash_derive",
  "uuid",
+ "wiremock",
  "zeroize",
+]
+
+[[package]]
+name = "rvc-doppelganger"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "rvc-eth-types",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2755,6 +2884,7 @@ name = "rvc-duty-tracker"
 version = "0.1.0"
 dependencies = [
  "beacon",
+ "rvc-bn-manager",
  "rvc-eth-types",
  "rvc-metrics",
  "serde_json",
@@ -2779,6 +2909,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvc-keymanager-api"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "hex",
+ "http-body-util",
+ "hyper",
+ "rand 0.8.5",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower 0.5.3",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "rvc-metrics"
 version = "0.1.0"
 dependencies = [
@@ -2796,7 +2946,7 @@ dependencies = [
 name = "rvc-propagator"
 version = "0.1.0"
 dependencies = [
- "beacon",
+ "rvc-bn-manager",
  "rvc-metrics",
  "thiserror 2.0.18",
  "tokio",
@@ -2822,8 +2972,10 @@ name = "rvc-slashing"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "proptest",
  "rusqlite",
  "rvc-eth-types",
+ "rvc-metrics",
  "serde",
  "serde_json",
  "tempfile",
@@ -3841,6 +3993,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f01b580c9ac74c8d8f0c0e4afb04eeef2acf145458e52c03845ee9cd23e3d12"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

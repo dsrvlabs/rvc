@@ -5,7 +5,7 @@
 //! and slashing protection.
 
 use lazy_static::lazy_static;
-use prometheus::{Gauge, HistogramOpts, HistogramVec, IntCounterVec, Opts};
+use prometheus::{Gauge, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, Opts};
 
 use crate::REGISTRY;
 
@@ -157,6 +157,20 @@ lazy_static! {
         gauge
     };
 
+    /// Counter for aggregation operations.
+    /// Labels: status (success, failed, skipped)
+    pub static ref RVC_AGGREGATIONS_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_aggregations_total",
+            "Total number of attestation aggregation operations"
+        );
+        let counter = IntCounterVec::new(opts, &["status"])
+            .expect("Failed to create rvc_aggregations_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_aggregations_total metric");
+        counter
+    };
+
     /// Histogram for slot processing duration in seconds.
     pub static ref RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS: HistogramVec = {
         let opts = HistogramOpts::new(
@@ -168,6 +182,62 @@ lazy_static! {
         REGISTRY.register(Box::new(histogram.clone()))
             .expect("Failed to register rvc_orchestrator_slot_processing_duration_seconds metric");
         histogram
+    };
+
+    /// Counter for slashing DB prune operations.
+    /// Labels: type (attestation, block)
+    pub static ref RVC_SLASHING_DB_PRUNE_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_slashing_db_prune_total",
+            "Total number of slashing DB records pruned"
+        );
+        let counter = IntCounterVec::new(opts, &["type"])
+            .expect("Failed to create rvc_slashing_db_prune_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_slashing_db_prune_total metric");
+        counter
+    };
+
+    /// Gauge for BN health score per endpoint.
+    /// Labels: endpoint
+    pub static ref RVC_BN_HEALTH_SCORE: GaugeVec = {
+        let opts = Opts::new(
+            "rvc_bn_health_score",
+            "Composite health score of each beacon node"
+        );
+        let gauge = GaugeVec::new(opts, &["endpoint"])
+            .expect("Failed to create rvc_bn_health_score metric");
+        REGISTRY.register(Box::new(gauge.clone()))
+            .expect("Failed to register rvc_bn_health_score metric");
+        gauge
+    };
+
+    /// Histogram for BN response latency in seconds per endpoint.
+    /// Labels: endpoint
+    pub static ref RVC_BN_LATENCY_SECONDS: HistogramVec = {
+        let opts = HistogramOpts::new(
+            "rvc_bn_latency_seconds",
+            "Response latency of each beacon node in seconds"
+        ).buckets(vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]);
+        let histogram = HistogramVec::new(opts, &["endpoint"])
+            .expect("Failed to create rvc_bn_latency_seconds metric");
+        REGISTRY.register(Box::new(histogram.clone()))
+            .expect("Failed to register rvc_bn_latency_seconds metric");
+        histogram
+    };
+
+    /// Counter for BN errors per endpoint.
+    /// Labels: endpoint
+    pub static ref RVC_BN_ERRORS_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_bn_errors_total",
+            "Total number of errors from each beacon node"
+        );
+        let counter = IntCounterVec::new(opts, &["endpoint"])
+            .expect("Failed to create rvc_bn_errors_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_bn_errors_total metric");
+        counter
     };
 }
 
@@ -182,10 +252,15 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_SIGNING_DURATION_SECONDS);
     lazy_static::initialize(&RVC_BEACON_REQUESTS_TOTAL);
     lazy_static::initialize(&RVC_SLASHING_PROTECTION_CHECKS_TOTAL);
+    lazy_static::initialize(&RVC_AGGREGATIONS_TOTAL);
     lazy_static::initialize(&RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL);
     lazy_static::initialize(&RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL);
     lazy_static::initialize(&RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS);
     lazy_static::initialize(&RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS);
+    lazy_static::initialize(&RVC_SLASHING_DB_PRUNE_TOTAL);
+    lazy_static::initialize(&RVC_BN_HEALTH_SCORE);
+    lazy_static::initialize(&RVC_BN_LATENCY_SECONDS);
+    lazy_static::initialize(&RVC_BN_ERRORS_TOTAL);
 }
 
 /// Attestation status label values.
@@ -219,6 +294,12 @@ pub mod orchestrator_result {
     pub const SUCCESS: &str = "success";
     pub const FAILED: &str = "failed";
     pub const NO_DUTIES: &str = "no_duties";
+}
+
+/// Slashing DB prune type label values.
+pub mod prune_type {
+    pub const ATTESTATION: &str = "attestation";
+    pub const BLOCK: &str = "block";
 }
 
 #[cfg(test)]
