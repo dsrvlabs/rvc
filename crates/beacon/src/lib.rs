@@ -4,15 +4,16 @@
 
 mod client;
 mod error;
+pub mod ssz_deser;
 mod types;
 
 pub use client::{BeaconClient, BeaconClientConfig};
 pub use error::BeaconError;
 pub use types::{
-    parse_fork_schedule, AggregateAttestationResponse, AttestationData,
-    AttestationDataResponse, AttesterDutiesResponse, AttesterDuty, BeaconBlockHeader,
-    BeaconCommitteeSubscription, BlockRootData, BlockRootResponse, Checkpoint, ConfigSpecResponse,
-    DataResponse, DependentRootResponse, ExecutionOptimisticResponse, GenesisData, GenesisResponse,
+    parse_fork_schedule, AggregateAttestationResponse, AttestationData, AttestationDataResponse,
+    AttesterDutiesResponse, AttesterDuty, BeaconBlockHeader, BeaconCommitteeSubscription,
+    BlockRootData, BlockRootResponse, Checkpoint, ConfigSpecResponse, DataResponse,
+    DependentRootResponse, ExecutionOptimisticResponse, GenesisData, GenesisResponse,
     IndexedAttestationError, LegacyAttestation, ProduceBlockResponse, ProposerDutiesResponse,
     ProposerDuty, ProposerPreparation, SignedAggregateAndProof, SignedContributionAndProof,
     SingleAttestation, StateFork, StateForkResponse, StateResponse, SubmitAttestationResult,
