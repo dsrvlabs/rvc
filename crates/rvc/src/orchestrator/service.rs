@@ -1695,6 +1695,15 @@ mod tests {
         ) -> Result<(), block_service::BlockServiceError> {
             Ok(())
         }
+
+        async fn publish_block_ssz(
+            &self,
+            _ssz_bytes: &[u8],
+            _consensus_version: &str,
+            _is_blinded: bool,
+        ) -> Result<(), block_service::BlockServiceError> {
+            Ok(())
+        }
     }
 
     fn create_mock_block_beacon() -> Arc<MockBlockBeacon> {

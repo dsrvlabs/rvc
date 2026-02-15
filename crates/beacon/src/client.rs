@@ -285,63 +285,125 @@ impl BeaconClient {
             .to_string();
 
         if content_type.starts_with("application/octet-stream") {
-            // 16 MB guard: no valid beacon block exceeds this, even with Deneb blobs
-            const MAX_SSZ_BLOCK_BYTES: usize = 16 * 1024 * 1024;
-
-            let ssz_bytes = response
-                .bytes()
-                .await
-                .map_err(|e| BeaconError::ParseError(format!("failed to read SSZ bytes: {e}")))?;
-
-            if ssz_bytes.is_empty() {
-                return Err(BeaconError::ParseError(
-                    "received empty SSZ body from beacon node".into(),
-                ));
-            }
-
-            if ssz_bytes.len() > MAX_SSZ_BLOCK_BYTES {
-                return Err(BeaconError::ParseError(format!(
-                    "SSZ response too large: {} bytes (max {})",
-                    ssz_bytes.len(),
-                    MAX_SSZ_BLOCK_BYTES
-                )));
-            }
-
-            let ssz_bytes = ssz_bytes.to_vec();
-
-            debug!(
-                slot = slot,
-                consensus_version = consensus_version,
-                ssz_bytes = ssz_bytes.len(),
-                "received SSZ block response"
-            );
-
-            Ok(ProduceBlockResponse {
-                data: serde_json::Value::Null,
+            match Self::try_process_ssz_body(
+                response,
+                slot,
                 is_blinded,
-                consensus_version,
-                execution_payload_value,
-                is_ssz: true,
-                ssz_bytes: Some(ssz_bytes),
-            })
-        } else {
-            // JSON response (existing path or fallback)
-            let body: serde_json::Value =
-                response.json().await.map_err(|e| BeaconError::ParseError(e.to_string()))?;
-
-            let data = body.get("data").cloned().ok_or_else(|| {
-                BeaconError::ParseError("missing 'data' field in produce block response".into())
-            })?;
-
-            Ok(ProduceBlockResponse {
-                data,
-                is_blinded,
-                consensus_version,
-                execution_payload_value,
-                is_ssz: false,
-                ssz_bytes: None,
-            })
+                &consensus_version,
+                &execution_payload_value,
+            )
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(ssz_err) => {
+                    warn!(
+                        slot = slot,
+                        error = %ssz_err,
+                        "SSZ block response processing failed, retrying with JSON"
+                    );
+                    // Single fallback retry with explicit JSON Accept
+                    let fallback_response = self
+                        .execute_with_retry_raw(|| async {
+                            self.client
+                                .get(&url)
+                                .header(reqwest::header::ACCEPT, "application/json")
+                                .send()
+                                .await
+                        })
+                        .await?;
+                    return Self::parse_produce_block_json(fallback_response).await;
+                }
+            }
         }
+
+        Self::parse_produce_block_json(response).await
+    }
+
+    /// Attempt to read and validate the SSZ body from an HTTP response.
+    async fn try_process_ssz_body(
+        response: reqwest::Response,
+        slot: u64,
+        is_blinded: bool,
+        consensus_version: &str,
+        execution_payload_value: &Option<String>,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        const MAX_SSZ_BLOCK_BYTES: usize = 16 * 1024 * 1024;
+
+        let ssz_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| BeaconError::ParseError(format!("failed to read SSZ bytes: {e}")))?;
+
+        if ssz_bytes.is_empty() {
+            return Err(BeaconError::ParseError("received empty SSZ body from beacon node".into()));
+        }
+
+        if ssz_bytes.len() > MAX_SSZ_BLOCK_BYTES {
+            return Err(BeaconError::ParseError(format!(
+                "SSZ response too large: {} bytes (max {})",
+                ssz_bytes.len(),
+                MAX_SSZ_BLOCK_BYTES
+            )));
+        }
+
+        let ssz_bytes = ssz_bytes.to_vec();
+
+        debug!(
+            slot = slot,
+            consensus_version = consensus_version,
+            ssz_bytes = ssz_bytes.len(),
+            "received SSZ block response"
+        );
+
+        Ok(ProduceBlockResponse {
+            data: serde_json::Value::Null,
+            is_blinded,
+            consensus_version: consensus_version.to_string(),
+            execution_payload_value: execution_payload_value.clone(),
+            is_ssz: true,
+            ssz_bytes: Some(ssz_bytes),
+        })
+    }
+
+    /// Parse a JSON produce-block response (headers + body).
+    async fn parse_produce_block_json(
+        response: reqwest::Response,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        let is_blinded = response
+            .headers()
+            .get("Eth-Execution-Payload-Blinded")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        let consensus_version = response
+            .headers()
+            .get("Eth-Consensus-Version")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let execution_payload_value = response
+            .headers()
+            .get("Eth-Execution-Payload-Value")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string());
+
+        let body: serde_json::Value =
+            response.json().await.map_err(|e| BeaconError::ParseError(e.to_string()))?;
+
+        let data = body.get("data").cloned().ok_or_else(|| {
+            BeaconError::ParseError("missing 'data' field in produce block response".into())
+        })?;
+
+        Ok(ProduceBlockResponse {
+            data,
+            is_blinded,
+            consensus_version,
+            execution_payload_value,
+            is_ssz: false,
+            ssz_bytes: None,
+        })
     }
 
     /// Publishes a signed beacon block to the network.
@@ -381,11 +443,8 @@ impl BeaconClient {
         consensus_version: &str,
         is_blinded: bool,
     ) -> Result<(), BeaconError> {
-        let path = if is_blinded {
-            "/eth/v1/beacon/blinded_blocks"
-        } else {
-            "/eth/v2/beacon/blocks"
-        };
+        let path =
+            if is_blinded { "/eth/v1/beacon/blinded_blocks" } else { "/eth/v2/beacon/blocks" };
         let url = format!("{}{}", self.config.endpoint, path);
 
         let response = self
@@ -403,10 +462,7 @@ impl BeaconClient {
             Ok(())
         } else {
             let body = response.text().await.unwrap_or_default();
-            Err(BeaconError::ApiError {
-                status: status.as_u16(),
-                message: body,
-            })
+            Err(BeaconError::ApiError { status: status.as_u16(), message: body })
         }
     }
 
@@ -863,6 +919,8 @@ mod tests {
     use std::time::Duration;
 
     use serde::{Deserialize, Serialize};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2730,18 +2788,129 @@ mod tests {
         assert_eq!(block.block().slot, 100);
     }
 
+    /// Stateful responder: returns `first` on call 0, `second` on all subsequent calls.
+    struct SszThenJsonResponder {
+        call_count: AtomicUsize,
+        first: ResponseTemplate,
+        second: ResponseTemplate,
+    }
+
+    impl wiremock::Respond for SszThenJsonResponder {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                self.first.clone()
+            } else {
+                self.second.clone()
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn test_produce_block_v3_ssz_empty_body_rejected() {
+    async fn test_produce_block_v3_ssz_empty_body_falls_back_to_json() {
         let mock_server = MockServer::start().await;
+
+        let block_data = serde_json::json!({
+            "slot": "900",
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "01".repeat(32)),
+            "state_root": format!("0x{}", "02".repeat(32)),
+            "body": "0xdead"
+        });
+        let json_envelope = serde_json::json!({ "version": "deneb", "data": block_data });
+
+        let responder = SszThenJsonResponder {
+            call_count: AtomicUsize::new(0),
+            first: ResponseTemplate::new(200)
+                .set_body_raw(vec![], "application/octet-stream")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "deneb"),
+            second: ResponseTemplate::new(200)
+                .set_body_json(&json_envelope)
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "deneb"),
+        };
 
         Mock::given(method("GET"))
             .and(path("/eth/v3/validator/blocks/900"))
+            .respond_with(responder)
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.produce_block_v3(900, "0xrandao", None, None).await.unwrap();
+
+        // Should have fallen back to JSON
+        assert!(!result.is_ssz);
+        assert!(result.ssz_bytes.is_none());
+        assert_eq!(result.consensus_version, "deneb");
+        let block = result.parse_full_block().unwrap();
+        assert_eq!(block.block().slot, 900);
+    }
+
+    #[tokio::test]
+    async fn test_produce_block_v3_ssz_fallback_json_gets_correct_headers() {
+        let mock_server = MockServer::start().await;
+
+        let block_data = serde_json::json!({
+            "slot": "950",
+            "proposer_index": "55",
+            "parent_root": format!("0x{}", "03".repeat(32)),
+            "state_root": format!("0x{}", "04".repeat(32)),
+            "body": "0xbeef"
+        });
+        let json_envelope = serde_json::json!({ "version": "electra", "data": block_data });
+
+        let responder = SszThenJsonResponder {
+            call_count: AtomicUsize::new(0),
+            first: ResponseTemplate::new(200)
+                .set_body_raw(vec![], "application/octet-stream")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "deneb"),
+            second: ResponseTemplate::new(200)
+                .set_body_json(&json_envelope)
+                .insert_header("Eth-Execution-Payload-Blinded", "true")
+                .insert_header("Eth-Consensus-Version", "electra")
+                .insert_header("Eth-Execution-Payload-Value", "77777"),
+        };
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/950"))
+            .respond_with(responder)
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.produce_block_v3(950, "0xrandao", None, None).await.unwrap();
+
+        // Headers come from the JSON fallback response, not the original SSZ response
+        assert!(!result.is_ssz);
+        assert!(result.is_blinded);
+        assert_eq!(result.consensus_version, "electra");
+        assert_eq!(result.execution_payload_value, Some("77777".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_produce_block_v3_valid_ssz_no_fallback() {
+        let mock_server = MockServer::start().await;
+
+        let ssz_payload = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/960"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_raw(vec![], "application/octet-stream")
+                    .set_body_raw(ssz_payload.clone(), "application/octet-stream")
                     .insert_header("Eth-Execution-Payload-Blinded", "false")
                     .insert_header("Eth-Consensus-Version", "deneb"),
             )
+            // Must be called exactly once — no fallback attempt
             .expect(1)
             .mount(&mock_server)
             .await;
@@ -2749,8 +2918,39 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let result = client.produce_block_v3(900, "0xrandao", None, None).await;
-        assert!(result.is_err(), "empty SSZ body should be rejected");
+        let result = client.produce_block_v3(960, "0xrandao", None, None).await.unwrap();
+
+        assert!(result.is_ssz);
+        assert_eq!(result.ssz_bytes, Some(ssz_payload));
+    }
+
+    #[tokio::test]
+    async fn test_produce_block_v3_ssz_fallback_network_error_propagated() {
+        let mock_server = MockServer::start().await;
+
+        // Both calls return SSZ empty body — fallback also gets SSZ, which fails JSON parse
+        let responder = SszThenJsonResponder {
+            call_count: AtomicUsize::new(0),
+            first: ResponseTemplate::new(200)
+                .set_body_raw(vec![], "application/octet-stream")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "deneb"),
+            second: ResponseTemplate::new(500),
+        };
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/970"))
+            .respond_with(responder)
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.produce_block_v3(970, "0xrandao", None, None).await;
+        // The JSON fallback request gets a 500 server error, which propagates
+        assert!(result.is_err());
     }
 
     #[tokio::test]
