@@ -9,7 +9,7 @@ mod types;
 pub use client::{BeaconClient, BeaconClientConfig};
 pub use error::BeaconError;
 pub use types::{
-    parse_fork_schedule, AggregateAttestationResponse, Attestation, AttestationData,
+    parse_fork_schedule, AggregateAttestationResponse, AttestationData,
     AttestationDataResponse, AttesterDutiesResponse, AttesterDuty, BeaconBlockHeader,
     BeaconCommitteeSubscription, BlockRootData, BlockRootResponse, Checkpoint, ConfigSpecResponse,
     DataResponse, DependentRootResponse, ExecutionOptimisticResponse, GenesisData, GenesisResponse,

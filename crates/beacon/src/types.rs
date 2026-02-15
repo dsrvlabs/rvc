@@ -34,9 +34,6 @@ pub struct SingleAttestation {
     pub signature: String,
 }
 
-/// Temporary type alias for backward compatibility during migration (removed in G-1-07).
-pub type Attestation = SingleAttestation;
-
 /// A pre-Electra (Phase 0 through Deneb) attestation with aggregation bits.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegacyAttestation {
@@ -415,7 +412,7 @@ mod tests {
             "signature": "0xsignature"
         }"#;
 
-        let attestation: Attestation = serde_json::from_str(json).unwrap();
+        let attestation: SingleAttestation = serde_json::from_str(json).unwrap();
         assert_eq!(attestation.committee_index, 1);
         assert_eq!(attestation.attester_index, 42);
         assert_eq!(attestation.data.slot, "1000");
@@ -984,24 +981,6 @@ mod tests {
         let response: SyncingResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.data.head_slot, "1000");
         assert!(!response.data.is_syncing);
-    }
-
-    #[test]
-    fn test_single_attestation_is_attestation_alias() {
-        let att = SingleAttestation {
-            committee_index: 1,
-            attester_index: 42,
-            data: AttestationData {
-                slot: "1000".to_string(),
-                index: "1".to_string(),
-                beacon_block_root: "0xroot".to_string(),
-                source: Checkpoint { epoch: "100".to_string(), root: "0xsource".to_string() },
-                target: Checkpoint { epoch: "101".to_string(), root: "0xtarget".to_string() },
-            },
-            signature: "0xsig".to_string(),
-        };
-        let att_alias: Attestation = att.clone();
-        assert_eq!(att, att_alias);
     }
 
     #[test]

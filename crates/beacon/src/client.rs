@@ -1634,7 +1634,7 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let attestation = crate::types::Attestation {
+        let attestation = crate::types::SingleAttestation {
             attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1686,7 +1686,7 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let attestation = crate::types::Attestation {
+        let attestation = crate::types::SingleAttestation {
             attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1729,7 +1729,7 @@ mod tests {
             .with_initial_backoff(Duration::from_millis(1));
         let client = BeaconClient::new(config).unwrap();
 
-        let attestation = crate::types::Attestation {
+        let attestation = crate::types::SingleAttestation {
             attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1773,7 +1773,7 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let attestation1 = crate::types::Attestation {
+        let attestation1 = crate::types::SingleAttestation {
             attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1792,7 +1792,7 @@ mod tests {
             signature: "0xsignature1".to_string(),
         };
 
-        let attestation2 = crate::types::Attestation {
+        let attestation2 = crate::types::SingleAttestation {
             attester_index: 1,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1842,7 +1842,7 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let attestation1 = crate::types::Attestation {
+        let attestation1 = crate::types::SingleAttestation {
             attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1861,7 +1861,7 @@ mod tests {
             signature: "0xvalid".to_string(),
         };
 
-        let attestation2 = crate::types::Attestation {
+        let attestation2 = crate::types::SingleAttestation {
             attester_index: 1,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1908,7 +1908,7 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let attestation = crate::types::Attestation {
+        let attestation = crate::types::SingleAttestation {
             attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
