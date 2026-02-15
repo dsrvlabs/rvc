@@ -4,12 +4,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use beacon::{
-    AggregateAttestationResponse, Attestation, AttestationDataResponse, AttesterDutiesResponse,
-    BeaconClient, BeaconCommitteeSubscription, BeaconError, BlockRootResponse, ConfigSpecResponse,
+    AggregateAttestationResponse, AttestationDataResponse, AttesterDutiesResponse, BeaconClient,
+    BeaconCommitteeSubscription, BeaconError, BlockRootResponse, ConfigSpecResponse,
     GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
-    SignedAggregateAndProof, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorsResponse,
+    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    SyncingResponse, ValidatorsResponse, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use eth_types::{
     ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
@@ -662,7 +662,7 @@ impl BeaconNodeClient for BnManager {
 
     async fn submit_attestation(
         &self,
-        attestations: &[Attestation],
+        attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError> {
         self.broadcast_with_result("submit_attestation", |c| {
             Box::pin(c.submit_attestation(attestations))
@@ -676,16 +676,17 @@ impl BeaconNodeClient for BnManager {
         &self,
         slot: u64,
         attestation_data_root: &str,
+        committee_index: Option<u64>,
     ) -> Result<AggregateAttestationResponse, BeaconError> {
         self.query_first("get_aggregate_attestation", |c| {
-            Box::pin(c.get_aggregate_attestation(slot, attestation_data_root))
+            Box::pin(c.get_aggregate_attestation(slot, attestation_data_root, committee_index))
         })
         .await
     }
 
     async fn submit_aggregate_and_proofs(
         &self,
-        proofs: &[SignedAggregateAndProof],
+        proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError> {
         self.broadcast("submit_aggregate_and_proofs", |c| {
             Box::pin(c.submit_aggregate_and_proofs(proofs))
@@ -854,7 +855,7 @@ impl BeaconNodeClient for BeaconClient {
 
     async fn submit_attestation(
         &self,
-        attestations: &[Attestation],
+        attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError> {
         self.submit_attestation(attestations).await
     }
@@ -863,13 +864,14 @@ impl BeaconNodeClient for BeaconClient {
         &self,
         slot: u64,
         attestation_data_root: &str,
+        committee_index: Option<u64>,
     ) -> Result<AggregateAttestationResponse, BeaconError> {
-        self.get_aggregate_attestation(slot, attestation_data_root).await
+        self.get_aggregate_attestation(slot, attestation_data_root, committee_index).await
     }
 
     async fn submit_aggregate_and_proofs(
         &self,
-        proofs: &[SignedAggregateAndProof],
+        proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError> {
         self.submit_aggregate_and_proofs(proofs).await
     }
@@ -1278,7 +1280,8 @@ mod tests {
             .await;
 
         let manager = make_manager(&mock_server.uri());
-        let result = manager.submit_aggregate_and_proofs(&[]).await;
+        let proofs = VersionedSignedAggregateAndProof::PreElectra(vec![]);
+        let result = manager.submit_aggregate_and_proofs(&proofs).await;
         assert!(result.is_ok());
     }
 
@@ -1784,7 +1787,8 @@ mod tests {
             .await;
 
         let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
-        let result = manager.submit_aggregate_and_proofs(&[]).await;
+        let proofs = VersionedSignedAggregateAndProof::PreElectra(vec![]);
+        let result = manager.submit_aggregate_and_proofs(&proofs).await;
         assert!(result.is_ok());
     }
 
