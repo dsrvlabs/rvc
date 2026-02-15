@@ -324,6 +324,9 @@ async fn run_validator(config: Config) -> anyhow::Result<()> {
         return Err(e.into());
     }
 
+    // Step 2b: Check slashing DB file permissions (warn-only)
+    slashing_db.check_file_permissions();
+
     // Step 3: Create beacon client and BnManager
     let beacon_client = match builder.build_beacon() {
         Ok(client) => {
