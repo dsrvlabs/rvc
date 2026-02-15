@@ -219,12 +219,10 @@ impl BeaconClient {
     }
 
     /// SSZ content negotiation Accept header for block production.
-    /// Accept header for block production. SSZ preference is disabled until
-    /// the downstream deserialization pipeline is implemented. The SSZ
-    /// Content-Type branching and field plumbing are in place and ready
-    /// to activate by changing this to:
-    /// "application/octet-stream;q=1.0,application/json;q=0.9"
-    const SSZ_ACCEPT_HEADER: &'static str = "application/json";
+    /// Prefers SSZ for ~67% bandwidth savings with JSON as fallback.
+    /// The full SSZ pipeline (header extraction, block-service SSZ path,
+    /// JSON fallback on failure) is in place.
+    const SSZ_ACCEPT_HEADER: &'static str = "application/octet-stream;q=1.0,application/json;q=0.9";
 
     /// Produces a block for the given slot using the v3 endpoint.
     ///
