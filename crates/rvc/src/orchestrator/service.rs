@@ -19,8 +19,9 @@ use eth_types::{
 };
 use metrics::definitions::{
     attestation_status, orchestrator_result, RVC_AGGREGATIONS_TOTAL, RVC_ATTESTATIONS_TOTAL,
-    RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
-    RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL, RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
+    RVC_DUTY_REORG_DETECTED_TOTAL, RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS,
+    RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL, RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL,
+    RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
 };
 use propagator::{AttestationSubmitter, Propagator};
 use signer::{is_aggregator, SignerService};
@@ -405,6 +406,7 @@ where
             {
                 Ok(Ok(true)) if attester_cached => {
                     warn!(epoch, "Reorg detected: attester duties refetched");
+                    RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["attester"]).inc();
                 }
                 Ok(Ok(true)) => {
                     debug!(epoch, "Attester duties fetched (was uncached)");
@@ -431,6 +433,7 @@ where
             {
                 Ok(Ok(true)) if proposer_cached => {
                     warn!(epoch, "Reorg detected: proposer duties refetched");
+                    RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["proposer"]).inc();
                 }
                 Ok(Ok(true)) => {
                     debug!(epoch, "Proposer duties fetched (was uncached)");
