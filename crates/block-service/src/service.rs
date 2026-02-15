@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use sha2::{Digest, Sha256};
 use tracing::info;
 use tree_hash::TreeHash;
 
@@ -69,7 +70,9 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .await?;
 
         // 4. Sign and publish based on block type
-        let (block_root, is_blinded) = if response.is_blinded {
+        let (block_root, is_blinded) = if response.is_ssz {
+            self.sign_and_publish_ssz(&response, slot, pubkey).await?
+        } else if response.is_blinded {
             self.sign_and_publish_blinded(&response, slot, pubkey).await?
         } else {
             self.sign_and_publish_full(&response, slot, pubkey).await?
@@ -91,6 +94,47 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             consensus_version: response.consensus_version,
             value_wei: response.execution_payload_value,
         })
+    }
+
+    async fn sign_and_publish_ssz(
+        &self,
+        response: &ProduceBlockResponse,
+        slot: Slot,
+        pubkey: &PublicKey,
+    ) -> Result<(Root, bool), BlockServiceError> {
+        let ssz_bytes = response.ssz_bytes.as_ref().ok_or_else(|| {
+            BlockServiceError::Parse("SSZ response missing ssz_bytes".to_string())
+        })?;
+
+        let header = beacon::ssz_deser::extract_block_header_from_ssz(ssz_bytes)
+            .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
+
+        if header.slot != slot {
+            return Err(BlockServiceError::Parse(format!(
+                "SSZ block slot mismatch: header has {}, expected {}",
+                header.slot, slot,
+            )));
+        }
+
+        let block_root: Root = Sha256::digest(ssz_bytes).into();
+
+        let _sig = self
+            .signer
+            .sign_block(
+                &block_root,
+                slot,
+                pubkey,
+                &self.fork_schedule,
+                &self.genesis_validators_root,
+            )
+            .await
+            .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+
+        self.beacon
+            .publish_block_ssz(ssz_bytes, &response.consensus_version, response.is_blinded)
+            .await?;
+
+        Ok((block_root, response.is_blinded))
     }
 
     async fn sign_and_publish_full(
@@ -319,6 +363,7 @@ mod tests {
         fail_publish: bool,
         publish_calls: Mutex<Vec<String>>,
         publish_blinded_calls: Mutex<Vec<String>>,
+        publish_ssz_calls: Mutex<Vec<(Vec<u8>, String, bool)>>,
     }
 
     impl MockBeaconClient {
@@ -337,6 +382,7 @@ mod tests {
                 fail_publish: false,
                 publish_calls: Mutex::new(Vec::new()),
                 publish_blinded_calls: Mutex::new(Vec::new()),
+                publish_ssz_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -355,6 +401,29 @@ mod tests {
                 fail_publish: false,
                 publish_calls: Mutex::new(Vec::new()),
                 publish_blinded_calls: Mutex::new(Vec::new()),
+                publish_ssz_calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn ssz(slot: Slot, proposer_index: u64, is_blinded: bool) -> Self {
+            let mut ssz_bytes = Vec::new();
+            ssz_bytes.extend_from_slice(&slot.to_le_bytes());
+            ssz_bytes.extend_from_slice(&proposer_index.to_le_bytes());
+            ssz_bytes.extend_from_slice(&[0xab; 128]); // simulated block body
+            Self {
+                produce_response: Some(ProduceBlockResponse {
+                    data: serde_json::Value::Null,
+                    is_blinded,
+                    consensus_version: "deneb".to_string(),
+                    execution_payload_value: Some("99999".to_string()),
+                    is_ssz: true,
+                    ssz_bytes: Some(ssz_bytes),
+                }),
+                fail_produce: false,
+                fail_publish: false,
+                publish_calls: Mutex::new(Vec::new()),
+                publish_blinded_calls: Mutex::new(Vec::new()),
+                publish_ssz_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -402,6 +471,23 @@ mod tests {
             consensus_version: &str,
         ) -> Result<(), BlockServiceError> {
             self.publish_blinded_calls.lock().unwrap().push(consensus_version.to_string());
+            if self.fail_publish {
+                return Err(BlockServiceError::Beacon("publish failed".to_string()));
+            }
+            Ok(())
+        }
+
+        async fn publish_block_ssz(
+            &self,
+            ssz_bytes: &[u8],
+            consensus_version: &str,
+            is_blinded: bool,
+        ) -> Result<(), BlockServiceError> {
+            self.publish_ssz_calls.lock().unwrap().push((
+                ssz_bytes.to_vec(),
+                consensus_version.to_string(),
+                is_blinded,
+            ));
             if self.fail_publish {
                 return Err(BlockServiceError::Beacon("publish failed".to_string()));
             }
@@ -646,6 +732,15 @@ mod tests {
             ) -> Result<(), BlockServiceError> {
                 self.inner.publish_blinded_block(signed_block, consensus_version).await
             }
+
+            async fn publish_block_ssz(
+                &self,
+                ssz_bytes: &[u8],
+                consensus_version: &str,
+                is_blinded: bool,
+            ) -> Result<(), BlockServiceError> {
+                self.inner.publish_block_ssz(ssz_bytes, consensus_version, is_blinded).await
+            }
         }
 
         let capturing_beacon = CapturingBeacon {
@@ -818,6 +913,204 @@ mod tests {
         assert_eq!(blinded_calls.len(), 1);
         assert_eq!(unblinded_calls[0].0, unblinded_result.block_root);
         assert_eq!(blinded_calls[0].0, blinded_result.block_root);
+    }
+
+    // --- SSZ path tests ---
+
+    #[tokio::test]
+    async fn test_propose_block_ssz_unblinded() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = MockBeaconClient::ssz(slot, 42, false);
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(slot, &pubkey).await;
+
+        assert!(result.is_ok());
+        let proposal = result.unwrap();
+        assert_eq!(proposal.slot, slot);
+        assert!(!proposal.is_blinded);
+        assert_eq!(proposal.consensus_version, "deneb");
+        assert_ne!(proposal.block_root, [0u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_ssz_blinded() {
+        let pubkey = test_pubkey();
+        let slot = 200;
+        let beacon = MockBeaconClient::ssz(slot, 42, true);
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(slot, &pubkey).await;
+
+        assert!(result.is_ok());
+        let proposal = result.unwrap();
+        assert_eq!(proposal.slot, slot);
+        assert!(proposal.is_blinded);
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_ssz_calls_publish_block_ssz() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = MockBeaconClient::ssz(slot, 42, false);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
+        assert_eq!(ssz_calls.len(), 1);
+        assert_eq!(ssz_calls[0].1, "deneb");
+        assert!(!ssz_calls[0].2); // is_blinded = false
+
+        // JSON publish endpoints should NOT be called
+        assert!(beacon_arc.publish_calls.lock().unwrap().is_empty());
+        assert!(beacon_arc.publish_blinded_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_ssz_blinded_passes_is_blinded_flag() {
+        let pubkey = test_pubkey();
+        let slot = 200;
+        let beacon = MockBeaconClient::ssz(slot, 42, true);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
+        assert_eq!(ssz_calls.len(), 1);
+        assert!(ssz_calls[0].2); // is_blinded = true
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_ssz_slot_mismatch_returns_error() {
+        let pubkey = test_pubkey();
+        let requested_slot = 100;
+        let ssz_slot = 200; // mismatch!
+        let beacon = MockBeaconClient::ssz(ssz_slot, 42, false);
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(requested_slot, &pubkey).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("slot mismatch"), "error should mention slot mismatch: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_ssz_missing_bytes_returns_error() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let mut beacon = MockBeaconClient::ssz(slot, 42, false);
+        // Set ssz_bytes to None while is_ssz is true
+        beacon.produce_response.as_mut().unwrap().ssz_bytes = None;
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(slot, &pubkey).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("SSZ"), "error should mention SSZ: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_ssz_short_bytes_returns_error() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let mut beacon = MockBeaconClient::ssz(slot, 42, false);
+        // Set ssz_bytes to too-short buffer
+        beacon.produce_response.as_mut().unwrap().ssz_bytes = Some(vec![0u8; 8]);
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(slot, &pubkey).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_ssz_block_root_is_sha256() {
+        use sha2::{Digest, Sha256};
+
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = MockBeaconClient::ssz(slot, 42, false);
+        let ssz_bytes = beacon.produce_response.as_ref().unwrap().ssz_bytes.clone().unwrap();
+        let signer = MockSigner::new();
+
+        let signer_arc = Arc::new(signer);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            Arc::new(beacon),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        let expected_root: [u8; 32] = Sha256::digest(&ssz_bytes).into();
+        let proposal = result.unwrap();
+        assert_eq!(proposal.block_root, expected_root);
+
+        // Verify signer was called with the sha256 root
+        let block_calls = signer_arc.block_calls.lock().unwrap();
+        assert_eq!(block_calls.len(), 1);
+        assert_eq!(block_calls[0].0, expected_root);
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_ssz_publish_failure() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = MockBeaconClient::ssz(slot, 42, false).with_publish_error();
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(slot, &pubkey).await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), BlockServiceError::Beacon(_)));
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_ssz_signing_failure() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = MockBeaconClient::ssz(slot, 42, false);
+        let signer = MockSigner::new().with_block_error();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(slot, &pubkey).await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), BlockServiceError::Signer(_)));
     }
 
     #[tokio::test]
