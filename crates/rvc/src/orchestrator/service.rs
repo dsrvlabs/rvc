@@ -396,23 +396,55 @@ where
 
     async fn check_reorg_at_epoch_boundary(&self, current_epoch: u64) {
         for epoch in [current_epoch, current_epoch + 1] {
-            match self.duty_tracker.check_and_refetch_if_root_changed(epoch).await {
-                Ok(true) => {
+            let attester_cached = self.duty_tracker.is_epoch_cached(epoch).await;
+            match tokio::time::timeout(
+                DUTY_FETCH_TIMEOUT,
+                self.duty_tracker.check_and_refetch_if_root_changed(epoch),
+            )
+            .await
+            {
+                Ok(Ok(true)) if attester_cached => {
                     warn!(epoch, "Reorg detected: attester duties refetched");
                 }
-                Ok(false) => {}
-                Err(e) => {
+                Ok(Ok(true)) => {
+                    debug!(epoch, "Attester duties fetched (was uncached)");
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => {
                     warn!(epoch, error = %e, "Failed to check attester dependent root");
+                }
+                Err(_) => {
+                    warn!(
+                        epoch,
+                        "Attester reorg check timed out after {}s",
+                        DUTY_FETCH_TIMEOUT.as_secs()
+                    );
                 }
             }
 
-            match self.duty_tracker.check_and_refetch_proposer_if_root_changed(epoch).await {
-                Ok(true) => {
+            let proposer_cached = self.duty_tracker.is_proposer_epoch_cached(epoch).await;
+            match tokio::time::timeout(
+                DUTY_FETCH_TIMEOUT,
+                self.duty_tracker.check_and_refetch_proposer_if_root_changed(epoch),
+            )
+            .await
+            {
+                Ok(Ok(true)) if proposer_cached => {
                     warn!(epoch, "Reorg detected: proposer duties refetched");
                 }
-                Ok(false) => {}
-                Err(e) => {
+                Ok(Ok(true)) => {
+                    debug!(epoch, "Proposer duties fetched (was uncached)");
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => {
                     warn!(epoch, error = %e, "Failed to check proposer dependent root");
+                }
+                Err(_) => {
+                    warn!(
+                        epoch,
+                        "Proposer reorg check timed out after {}s",
+                        DUTY_FETCH_TIMEOUT.as_secs()
+                    );
                 }
             }
         }
@@ -3274,6 +3306,86 @@ mod tests {
         assert!(duty_tracker.is_epoch_cached(11).await);
         assert!(duty_tracker.is_proposer_epoch_cached(10).await);
         assert!(duty_tracker.is_proposer_epoch_cached(11).await);
+    }
+
+    #[tokio::test]
+    async fn test_check_reorg_at_epoch_boundary_timeout_bounds_slow_beacon() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let slow_response = serde_json::json!({
+            "data": [],
+            "dependent_root": "0xslow_root",
+            "execution_optimistic": false
+        });
+
+        // Respond slower than DUTY_FETCH_TIMEOUT (10s)
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&slow_response)
+                    .set_delay(DUTY_FETCH_TIMEOUT + Duration::from_secs(5)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/eth/v1/validator/duties/proposer/.*"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&slow_response)
+                    .set_delay(DUTY_FETCH_TIMEOUT + Duration::from_secs(5)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // HTTP timeout must exceed DUTY_FETCH_TIMEOUT so the tokio timeout fires first
+        let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri())
+            .with_timeout(Duration::from_secs(30))
+            .with_max_retries(0);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(320);
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+        let config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        let start = std::time::Instant::now();
+        orchestrator.check_reorg_at_epoch_boundary(10).await;
+        let elapsed = start.elapsed();
+
+        // 4 calls each bounded by DUTY_FETCH_TIMEOUT (10s).
+        // Without timeout wrapping this would take 4 * 15s = 60s.
+        // With timeouts: 4 * 10s = 40s + margin.
+        assert!(
+            elapsed < DUTY_FETCH_TIMEOUT * 5,
+            "Reorg check took {:?}, expected < {:?} (4 timeouts + margin)",
+            elapsed,
+            DUTY_FETCH_TIMEOUT * 5
+        );
     }
 
     #[tokio::test]
