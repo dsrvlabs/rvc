@@ -47,6 +47,9 @@ pub const SLOTS_PER_EPOCH: u64 = 32;
 pub const SECONDS_PER_SLOT: u64 = 12;
 pub const TARGET_AGGREGATORS_PER_COMMITTEE: u64 = 16;
 
+/// Consensus specification version this client implements.
+pub const CONSENSUS_SPEC_VERSION: &str = "v1.5.0-alpha.12";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash)]
 pub struct Checkpoint {
     #[serde(with = "serde_utils::quoted_u64")]
@@ -274,5 +277,15 @@ mod tests {
         let encoded = fork.as_ssz_bytes();
         let decoded = Fork::from_ssz_bytes(&encoded).unwrap();
         assert_eq!(fork, decoded);
+    }
+
+    #[test]
+    fn test_consensus_spec_version_exists_and_starts_with_v() {
+        assert!(CONSENSUS_SPEC_VERSION.starts_with('v'));
+    }
+
+    #[test]
+    fn test_consensus_spec_version_value() {
+        assert_eq!(CONSENSUS_SPEC_VERSION, "v1.5.0-alpha.12");
     }
 }

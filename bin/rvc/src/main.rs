@@ -308,6 +308,7 @@ async fn run_validator(
         grpc_address = %config.grpc_address,
         grpc_port = config.grpc_port,
         doppelganger_detection = config.doppelganger_detection,
+        spec_version = eth_types::CONSENSUS_SPEC_VERSION,
         "Starting validator client"
     );
 
