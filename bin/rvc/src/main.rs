@@ -36,6 +36,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Start the validator client
     Start {
@@ -126,6 +127,22 @@ enum Commands {
         /// Reject null-root re-signs as potential double votes (strict EIP-3076 semantics)
         #[arg(long)]
         strict_slashing_semantics: bool,
+
+        /// Block production timeout in seconds (default: 3)
+        #[arg(long)]
+        block_production_timeout: Option<u64>,
+
+        /// Attestation fetch timeout in seconds (default: 4)
+        #[arg(long)]
+        attestation_timeout: Option<u64>,
+
+        /// Aggregate fetch timeout in seconds (default: 2)
+        #[arg(long)]
+        aggregate_timeout: Option<u64>,
+
+        /// Duty fetch timeout in seconds (default: 10)
+        #[arg(long)]
+        duty_fetch_timeout: Option<u64>,
     },
 
     /// Submit a voluntary exit for a validator
@@ -200,8 +217,26 @@ async fn main() -> anyhow::Result<()> {
             remote_signer_url,
             strict_permissions,
             strict_slashing_semantics,
+            block_production_timeout,
+            attestation_timeout,
+            aggregate_timeout,
+            duty_fetch_timeout,
         } => {
             init_logging(&log_level);
+
+            let mut timeouts = bn_manager::OperationTimeouts::default();
+            if let Some(secs) = block_production_timeout {
+                timeouts.block_production = std::time::Duration::from_secs(secs);
+            }
+            if let Some(secs) = attestation_timeout {
+                timeouts.attestation_fetch = std::time::Duration::from_secs(secs);
+            }
+            if let Some(secs) = aggregate_timeout {
+                timeouts.aggregate_fetch = std::time::Duration::from_secs(secs);
+            }
+            if let Some(secs) = duty_fetch_timeout {
+                timeouts.duty_fetch = std::time::Duration::from_secs(secs);
+            }
 
             let cli_overrides = CliOverrides {
                 beacon_url,
@@ -238,7 +273,7 @@ async fn main() -> anyhow::Result<()> {
                 return Err(e.into());
             }
 
-            run_validator(cfg, strict_permissions, strict_slashing_semantics).await?;
+            run_validator(cfg, strict_permissions, strict_slashing_semantics, timeouts).await?;
         }
         Commands::VoluntaryExit {
             pubkey,
@@ -299,6 +334,7 @@ async fn run_validator(
     config: Config,
     strict_permissions: bool,
     strict_slashing_semantics: bool,
+    timeouts: bn_manager::OperationTimeouts,
 ) -> anyhow::Result<()> {
     info!(
         beacon_url = %config.beacon_url,
@@ -529,8 +565,9 @@ async fn run_validator(
         }
     };
 
-    let orchestrator_config =
-        builder.build_orchestrator_config(genesis_validators_root, fork_schedule);
+    let orchestrator_config = builder
+        .build_orchestrator_config(genesis_validators_root, fork_schedule)
+        .with_timeouts(timeouts);
 
     let block_beacon =
         std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(beacon_client.clone()));

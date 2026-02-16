@@ -12,7 +12,7 @@ use beacon::{
     SingleAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use block_service::{BeaconBlockClient, BlockService};
-use bn_manager::BeaconNodeClient;
+use bn_manager::{BeaconNodeClient, OperationTimeouts};
 use builder::BuilderService;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
@@ -33,30 +33,6 @@ use timing::{SlotClock, SLOTS_PER_EPOCH};
 use tree_hash::TreeHash;
 
 use super::error::OrchestratorError;
-
-/// Timeout for block production beacon API calls.
-const BLOCK_PRODUCE_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Timeout for block publication beacon API calls.
-const BLOCK_PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Timeout for sync committee message operations.
-const SYNC_MESSAGE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Timeout for sync committee contribution operations.
-const SYNC_CONTRIBUTION_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Timeout for duty fetching operations.
-const DUTY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Timeout for attestation data fetch.
-const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(4);
-
-/// Timeout for aggregate attestation fetch and submission.
-const AGGREGATION_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Timeout for proposer preparation and committee subscription calls.
-const PREPARATION_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Total validators in a sync committee.
 const SYNC_COMMITTEE_SIZE: u64 = 512;
@@ -92,15 +68,26 @@ pub struct OrchestratorConfig {
     pub genesis_validators_root: Root,
     pub fork_schedule: Arc<ForkSchedule>,
     pub shutdown_timeout: Duration,
+    pub timeouts: OperationTimeouts,
 }
 
 impl OrchestratorConfig {
     pub fn new(genesis_validators_root: Root, fork_schedule: Arc<ForkSchedule>) -> Self {
-        Self { genesis_validators_root, fork_schedule, shutdown_timeout: Duration::from_secs(30) }
+        Self {
+            genesis_validators_root,
+            fork_schedule,
+            shutdown_timeout: Duration::from_secs(30),
+            timeouts: OperationTimeouts::default(),
+        }
     }
 
     pub fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
+        self
+    }
+
+    pub fn with_timeouts(mut self, timeouts: OperationTimeouts) -> Self {
+        self.timeouts = timeouts;
         self
     }
 }
@@ -366,7 +353,7 @@ where
         if !self.duty_tracker.is_epoch_cached(epoch).await {
             debug!(epoch, "Fetching attester duties for epoch");
             match tokio::time::timeout(
-                DUTY_FETCH_TIMEOUT,
+                self.config.timeouts.duty_fetch,
                 self.duty_tracker.fetch_duties_for_epoch(epoch),
             )
             .await
@@ -376,7 +363,7 @@ where
                 Err(_) => warn!(
                     epoch,
                     "Attester duty fetch timed out after {}s",
-                    DUTY_FETCH_TIMEOUT.as_secs()
+                    self.config.timeouts.duty_fetch.as_secs()
                 ),
             }
         }
@@ -385,7 +372,7 @@ where
         if !self.duty_tracker.is_proposer_epoch_cached(epoch).await {
             debug!(epoch, "Fetching proposer duties for epoch");
             match tokio::time::timeout(
-                DUTY_FETCH_TIMEOUT,
+                self.config.timeouts.duty_fetch,
                 self.duty_tracker.fetch_proposer_duties(epoch),
             )
             .await
@@ -395,7 +382,7 @@ where
                 Err(_) => warn!(
                     epoch,
                     "Proposer duty fetch timed out after {}s",
-                    DUTY_FETCH_TIMEOUT.as_secs()
+                    self.config.timeouts.duty_fetch.as_secs()
                 ),
             }
         }
@@ -404,7 +391,7 @@ where
         if !self.duty_tracker.is_sync_period_cached(epoch).await {
             debug!(epoch, "Fetching sync committee duties");
             match tokio::time::timeout(
-                DUTY_FETCH_TIMEOUT,
+                self.config.timeouts.duty_fetch,
                 self.duty_tracker.fetch_sync_committee_duties(epoch),
             )
             .await
@@ -414,7 +401,7 @@ where
                 Err(_) => warn!(
                     epoch,
                     "Sync committee duty fetch timed out after {}s",
-                    DUTY_FETCH_TIMEOUT.as_secs()
+                    self.config.timeouts.duty_fetch.as_secs()
                 ),
             }
         }
@@ -424,7 +411,7 @@ where
         for epoch in [current_epoch, current_epoch + 1] {
             let attester_cached = self.duty_tracker.is_epoch_cached(epoch).await;
             match tokio::time::timeout(
-                DUTY_FETCH_TIMEOUT,
+                self.config.timeouts.duty_fetch,
                 self.duty_tracker.check_and_refetch_if_root_changed(epoch),
             )
             .await
@@ -444,14 +431,14 @@ where
                     warn!(
                         epoch,
                         "Attester reorg check timed out after {}s",
-                        DUTY_FETCH_TIMEOUT.as_secs()
+                        self.config.timeouts.duty_fetch.as_secs()
                     );
                 }
             }
 
             let proposer_cached = self.duty_tracker.is_proposer_epoch_cached(epoch).await;
             match tokio::time::timeout(
-                DUTY_FETCH_TIMEOUT,
+                self.config.timeouts.duty_fetch,
                 self.duty_tracker.check_and_refetch_proposer_if_root_changed(epoch),
             )
             .await
@@ -471,7 +458,7 @@ where
                     warn!(
                         epoch,
                         "Proposer reorg check timed out after {}s",
-                        DUTY_FETCH_TIMEOUT.as_secs()
+                        self.config.timeouts.duty_fetch.as_secs()
                     );
                 }
             }
@@ -528,7 +515,7 @@ where
 
         let count = preparations.len();
         match tokio::time::timeout(
-            PREPARATION_TIMEOUT,
+            self.config.timeouts.preparation,
             self.beacon.prepare_beacon_proposer(&preparations),
         )
         .await
@@ -536,7 +523,10 @@ where
             Ok(Ok(_)) => info!(count, "Sent proposer preparations"),
             Ok(Err(e)) => warn!(error = %e, "Failed to send proposer preparations"),
             Err(_) => {
-                warn!("Proposer preparation timed out after {}s", PREPARATION_TIMEOUT.as_secs())
+                warn!(
+                    "Proposer preparation timed out after {}s",
+                    self.config.timeouts.preparation.as_secs()
+                )
             }
         }
     }
@@ -612,7 +602,7 @@ where
 
         let count = subscriptions.len();
         match tokio::time::timeout(
-            PREPARATION_TIMEOUT,
+            self.config.timeouts.preparation,
             self.beacon.submit_beacon_committee_subscriptions(&subscriptions),
         )
         .await
@@ -622,7 +612,7 @@ where
             Err(_) => warn!(
                 epoch,
                 "Committee subscription timed out after {}s",
-                PREPARATION_TIMEOUT.as_secs()
+                self.config.timeouts.preparation.as_secs()
             ),
         }
     }
@@ -668,7 +658,7 @@ where
 
         // Wrap with combined produce + publish timeout
         match tokio::time::timeout(
-            BLOCK_PRODUCE_TIMEOUT + BLOCK_PUBLISH_TIMEOUT,
+            self.config.timeouts.block_production + self.config.timeouts.block_publication,
             self.block_service.propose_block(slot, &pubkey),
         )
         .await
@@ -694,7 +684,9 @@ where
                     slot,
                     epoch,
                     "Block proposal timed out after {}s",
-                    (BLOCK_PRODUCE_TIMEOUT + BLOCK_PUBLISH_TIMEOUT).as_secs()
+                    (self.config.timeouts.block_production
+                        + self.config.timeouts.block_publication)
+                        .as_secs()
                 );
             }
         }
@@ -752,7 +744,7 @@ where
         if !messages.is_empty() {
             let count = messages.len();
             match tokio::time::timeout(
-                SYNC_MESSAGE_TIMEOUT,
+                self.config.timeouts.sync_message,
                 self.beacon.submit_sync_committee_messages(&messages),
             )
             .await
@@ -762,7 +754,7 @@ where
                 Err(_) => warn!(
                     slot,
                     "Sync committee message submit timed out after {}s",
-                    SYNC_MESSAGE_TIMEOUT.as_secs()
+                    self.config.timeouts.sync_message.as_secs()
                 ),
             }
         }
@@ -837,7 +829,7 @@ where
                 );
 
                 let contribution = match tokio::time::timeout(
-                    SYNC_CONTRIBUTION_TIMEOUT,
+                    self.config.timeouts.sync_contribution,
                     self.beacon.get_sync_committee_contribution(
                         slot,
                         *subcommittee_index,
@@ -861,7 +853,7 @@ where
                             slot,
                             subcommittee_index,
                             "Sync committee contribution fetch timed out after {}s",
-                            SYNC_CONTRIBUTION_TIMEOUT.as_secs()
+                            self.config.timeouts.sync_contribution.as_secs()
                         );
                         continue;
                     }
@@ -906,7 +898,7 @@ where
         if !signed_proofs.is_empty() {
             let count = signed_proofs.len();
             match tokio::time::timeout(
-                SYNC_CONTRIBUTION_TIMEOUT,
+                self.config.timeouts.sync_contribution,
                 self.beacon.submit_contribution_and_proofs(&signed_proofs),
             )
             .await
@@ -916,7 +908,7 @@ where
                 Err(_) => warn!(
                     slot,
                     "Contribution and proofs submit timed out after {}s",
-                    SYNC_CONTRIBUTION_TIMEOUT.as_secs()
+                    self.config.timeouts.sync_contribution.as_secs()
                 ),
             }
         }
@@ -992,7 +984,7 @@ where
             };
 
             let attestation_data_response = match tokio::time::timeout(
-                AGGREGATION_TIMEOUT,
+                self.config.timeouts.aggregate_fetch,
                 self.beacon.get_attestation_data(slot, committee_index),
             )
             .await
@@ -1043,7 +1035,7 @@ where
             // Electra: pass committee_index for per-committee aggregation
             let electra_committee_index = if is_electra { Some(committee_index) } else { None };
             let aggregate = match tokio::time::timeout(
-                AGGREGATION_TIMEOUT,
+                self.config.timeouts.aggregate_fetch,
                 self.beacon.get_aggregate_attestation(
                     slot,
                     &att_data_root_hex,
@@ -1118,7 +1110,7 @@ where
             let count = signed_aggregates.len();
             let versioned = VersionedSignedAggregateAndProof::PreElectra(signed_aggregates);
             match tokio::time::timeout(
-                AGGREGATION_TIMEOUT,
+                self.config.timeouts.aggregate_fetch,
                 self.beacon.submit_aggregate_and_proofs(&versioned),
             )
             .await
@@ -1139,7 +1131,7 @@ where
                     warn!(
                         slot,
                         "Aggregate and proofs submit timed out after {}s",
-                        AGGREGATION_TIMEOUT.as_secs()
+                        self.config.timeouts.aggregate_fetch.as_secs()
                     );
                     RVC_AGGREGATIONS_TOTAL
                         .with_label_values(&[attestation_status::FAILED])
@@ -1167,7 +1159,12 @@ where
     }
 
     async fn get_head_block_root(&self) -> Option<Root> {
-        match tokio::time::timeout(SYNC_MESSAGE_TIMEOUT, self.beacon.get_block_root("head")).await {
+        match tokio::time::timeout(
+            self.config.timeouts.sync_message,
+            self.beacon.get_block_root("head"),
+        )
+        .await
+        {
             Ok(Ok(response)) => {
                 let root_hex = response.data.root;
                 match Self::parse_hex_root(&root_hex) {
@@ -1183,7 +1180,10 @@ where
                 None
             }
             Err(_) => {
-                warn!("Head block root fetch timed out after {}s", SYNC_MESSAGE_TIMEOUT.as_secs());
+                warn!(
+                    "Head block root fetch timed out after {}s",
+                    self.config.timeouts.sync_message.as_secs()
+                );
                 None
             }
         }
@@ -1358,7 +1358,7 @@ where
 
         // Apply timeout to beacon client call to prevent blocking
         let attestation_data_result = tokio::time::timeout(
-            ATTESTATION_TIMEOUT,
+            self.config.timeouts.attestation_fetch,
             self.beacon.get_attestation_data(slot, committee_index),
         )
         .await;
@@ -1726,6 +1726,31 @@ mod tests {
         let config = OrchestratorConfig::new([0xcc; 32], create_test_fork_schedule())
             .with_shutdown_timeout(Duration::from_secs(60));
         assert_eq!(config.shutdown_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_orchestrator_config_with_timeouts() {
+        let mut timeouts = OperationTimeouts::default();
+        timeouts.block_production = Duration::from_secs(5);
+        timeouts.duty_fetch = Duration::from_secs(15);
+
+        let config = OrchestratorConfig::new([0xdd; 32], create_test_fork_schedule())
+            .with_timeouts(timeouts);
+
+        assert_eq!(config.timeouts.block_production, Duration::from_secs(5));
+        assert_eq!(config.timeouts.duty_fetch, Duration::from_secs(15));
+        // Other fields remain at default
+        assert_eq!(config.timeouts.block_publication, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_orchestrator_config_default_timeouts() {
+        let config = OrchestratorConfig::new([0xee; 32], create_test_fork_schedule());
+        let defaults = OperationTimeouts::default();
+
+        assert_eq!(config.timeouts.block_production, defaults.block_production);
+        assert_eq!(config.timeouts.duty_fetch, defaults.duty_fetch);
+        assert_eq!(config.timeouts.attestation_fetch, defaults.attestation_fetch);
     }
 
     #[test]
@@ -2126,27 +2151,29 @@ mod tests {
 
     #[test]
     fn test_timeout_constants_are_reasonable() {
+        let timeouts = OperationTimeouts::default();
+
         // Block production must fit within a slot third (~4s for 12s slots)
-        assert!(BLOCK_PRODUCE_TIMEOUT.as_secs() <= 4);
-        assert!(BLOCK_PRODUCE_TIMEOUT.as_secs() >= 1);
+        assert!(timeouts.block_production.as_secs() <= 4);
+        assert!(timeouts.block_production.as_secs() >= 1);
 
         // Block publish must fit within remaining slot time
-        assert!(BLOCK_PUBLISH_TIMEOUT.as_secs() <= 3);
-        assert!(BLOCK_PUBLISH_TIMEOUT.as_secs() >= 1);
+        assert!(timeouts.block_publication.as_secs() <= 3);
+        assert!(timeouts.block_publication.as_secs() >= 1);
 
         // Produce + publish together should fit in one slot third (~4s)
-        assert!(BLOCK_PRODUCE_TIMEOUT + BLOCK_PUBLISH_TIMEOUT <= Duration::from_secs(6));
+        assert!(timeouts.block_production + timeouts.block_publication <= Duration::from_secs(6));
 
         // Sync operations must fit within their slot third
-        assert!(SYNC_MESSAGE_TIMEOUT.as_secs() <= 3);
-        assert!(SYNC_CONTRIBUTION_TIMEOUT.as_secs() <= 3);
+        assert!(timeouts.sync_message.as_secs() <= 3);
+        assert!(timeouts.sync_contribution.as_secs() <= 3);
 
         // Duty fetch is less time-critical but should still be bounded
-        assert!(DUTY_FETCH_TIMEOUT.as_secs() <= 12);
-        assert!(DUTY_FETCH_TIMEOUT.as_secs() >= 5);
+        assert!(timeouts.duty_fetch.as_secs() <= 12);
+        assert!(timeouts.duty_fetch.as_secs() >= 5);
 
         // Attestation timeout must fit within slot third
-        assert!(ATTESTATION_TIMEOUT.as_secs() <= 5);
+        assert!(timeouts.attestation_fetch.as_secs() <= 5);
     }
 
     #[tokio::test]
@@ -2154,9 +2181,10 @@ mod tests {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        let timeouts = OperationTimeouts::default();
         let mock_server = MockServer::start().await;
 
-        // Mock attester duties endpoint with a 15s delay (exceeds DUTY_FETCH_TIMEOUT of 10s)
+        // Mock attester duties endpoint with a 15s delay (exceeds duty_fetch of 10s)
         Mock::given(method("POST"))
             .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
             .respond_with(
@@ -2165,7 +2193,7 @@ mod tests {
                         "data": [],
                         "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
                     }))
-                    .set_delay(DUTY_FETCH_TIMEOUT + Duration::from_secs(5)),
+                    .set_delay(timeouts.duty_fetch + Duration::from_secs(5)),
             )
             .mount(&mock_server)
             .await;
@@ -2176,7 +2204,7 @@ mod tests {
 
         let epoch = 1u64;
         let result =
-            tokio::time::timeout(DUTY_FETCH_TIMEOUT, duty_tracker.fetch_duties_for_epoch(epoch))
+            tokio::time::timeout(timeouts.duty_fetch, duty_tracker.fetch_duties_for_epoch(epoch))
                 .await;
 
         // Should timeout (Err from tokio::time::timeout)
@@ -2188,13 +2216,15 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        let timeouts = OperationTimeouts::default();
         let mock_server = MockServer::start().await;
 
-        // Mock sync committee messages endpoint with delay exceeding SYNC_MESSAGE_TIMEOUT
+        // Mock sync committee messages endpoint with delay exceeding sync_message timeout
         Mock::given(method("POST"))
             .and(path("/eth/v1/beacon/pool/sync_committees"))
             .respond_with(
-                ResponseTemplate::new(200).set_delay(SYNC_MESSAGE_TIMEOUT + Duration::from_secs(5)),
+                ResponseTemplate::new(200)
+                    .set_delay(timeouts.sync_message + Duration::from_secs(5)),
             )
             .mount(&mock_server)
             .await;
@@ -2210,7 +2240,7 @@ mod tests {
         }];
 
         let result = tokio::time::timeout(
-            SYNC_MESSAGE_TIMEOUT,
+            timeouts.sync_message,
             beacon.submit_sync_committee_messages(&messages),
         )
         .await;
@@ -2223,9 +2253,10 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        let timeouts = OperationTimeouts::default();
         let mock_server = MockServer::start().await;
 
-        // Mock block root endpoint with delay exceeding SYNC_MESSAGE_TIMEOUT
+        // Mock block root endpoint with delay exceeding sync_message timeout
         Mock::given(method("GET"))
             .and(path("/eth/v1/beacon/blocks/head/root"))
             .respond_with(
@@ -2235,7 +2266,7 @@ mod tests {
                             "root": "0x0000000000000000000000000000000000000000000000000000000000000000"
                         }
                     }))
-                    .set_delay(SYNC_MESSAGE_TIMEOUT + Duration::from_secs(5)),
+                    .set_delay(timeouts.sync_message + Duration::from_secs(5)),
             )
             .mount(&mock_server)
             .await;
@@ -2244,16 +2275,17 @@ mod tests {
         let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
 
         let result =
-            tokio::time::timeout(SYNC_MESSAGE_TIMEOUT, beacon.get_block_root("head")).await;
+            tokio::time::timeout(timeouts.sync_message, beacon.get_block_root("head")).await;
 
         assert!(result.is_err(), "Head block root fetch should have timed out");
     }
 
     #[test]
     fn test_aggregation_timeout_is_reasonable() {
+        let timeouts = OperationTimeouts::default();
         // Must fit within the 2/3-slot to end-of-slot window (~4s for 12s slots)
-        assert!(AGGREGATION_TIMEOUT.as_secs() <= 4);
-        assert!(AGGREGATION_TIMEOUT.as_secs() >= 1);
+        assert!(timeouts.aggregate_fetch.as_secs() <= 4);
+        assert!(timeouts.aggregate_fetch.as_secs() >= 1);
     }
 
     /// Helper to build an orchestrator wired to a wiremock mock_server for aggregation tests.
@@ -2978,8 +3010,9 @@ mod tests {
 
     #[test]
     fn test_preparation_timeout_is_reasonable() {
-        assert!(PREPARATION_TIMEOUT.as_secs() >= 1);
-        assert!(PREPARATION_TIMEOUT.as_secs() <= 5);
+        let timeouts = OperationTimeouts::default();
+        assert!(timeouts.preparation.as_secs() >= 1);
+        assert!(timeouts.preparation.as_secs() <= 5);
     }
 
     #[test]
@@ -3388,13 +3421,15 @@ mod tests {
             "execution_optimistic": false
         });
 
-        // Respond slower than DUTY_FETCH_TIMEOUT (10s)
+        let timeouts = OperationTimeouts::default();
+
+        // Respond slower than duty_fetch timeout (10s)
         Mock::given(method("POST"))
             .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(&slow_response)
-                    .set_delay(DUTY_FETCH_TIMEOUT + Duration::from_secs(5)),
+                    .set_delay(timeouts.duty_fetch + Duration::from_secs(5)),
             )
             .mount(&mock_server)
             .await;
@@ -3404,12 +3439,12 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(&slow_response)
-                    .set_delay(DUTY_FETCH_TIMEOUT + Duration::from_secs(5)),
+                    .set_delay(timeouts.duty_fetch + Duration::from_secs(5)),
             )
             .mount(&mock_server)
             .await;
 
-        // HTTP timeout must exceed DUTY_FETCH_TIMEOUT so the tokio timeout fires first
+        // HTTP timeout must exceed duty_fetch timeout so the tokio timeout fires first
         let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri())
             .with_timeout(Duration::from_secs(30))
             .with_max_retries(0);
@@ -3444,14 +3479,14 @@ mod tests {
         orchestrator.check_reorg_at_epoch_boundary(10).await;
         let elapsed = start.elapsed();
 
-        // 4 calls each bounded by DUTY_FETCH_TIMEOUT (10s).
+        // 4 calls each bounded by duty_fetch timeout (10s).
         // Without timeout wrapping this would take 4 * 15s = 60s.
         // With timeouts: 4 * 10s = 40s + margin.
         assert!(
-            elapsed < DUTY_FETCH_TIMEOUT * 5,
+            elapsed < timeouts.duty_fetch * 5,
             "Reorg check took {:?}, expected < {:?} (4 timeouts + margin)",
             elapsed,
-            DUTY_FETCH_TIMEOUT * 5
+            timeouts.duty_fetch * 5
         );
     }
 

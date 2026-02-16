@@ -14,7 +14,9 @@ pub use sse::{
     SseConnectionState, SseError, SseEvent, DEFAULT_SSE_TOPICS,
 };
 pub use sync_status::{BnSyncStatus, SharedSyncStatuses};
-pub use traits::{BeaconNodeClient, BnHealthScore, BnManagerConfig, BnSelectionStrategy};
+pub use traits::{
+    BeaconNodeClient, BnHealthScore, BnManagerConfig, BnSelectionStrategy, OperationTimeouts,
+};
 
 // Re-export types used in trait signatures so downstream crates
 // don't need to depend on `beacon` directly.
