@@ -226,15 +226,28 @@ async fn main() -> anyhow::Result<()> {
 
             let mut timeouts = bn_manager::OperationTimeouts::default();
             if let Some(secs) = block_production_timeout {
+                if secs == 0 {
+                    anyhow::bail!("--block-production-timeout must be greater than 0");
+                }
                 timeouts.block_production = std::time::Duration::from_secs(secs);
             }
             if let Some(secs) = attestation_timeout {
+                if secs == 0 {
+                    anyhow::bail!("--attestation-timeout must be greater than 0");
+                }
                 timeouts.attestation_fetch = std::time::Duration::from_secs(secs);
             }
             if let Some(secs) = aggregate_timeout {
+                if secs == 0 {
+                    anyhow::bail!("--aggregate-timeout must be greater than 0");
+                }
                 timeouts.aggregate_fetch = std::time::Duration::from_secs(secs);
+                timeouts.aggregate_submit = std::time::Duration::from_secs(secs);
             }
             if let Some(secs) = duty_fetch_timeout {
+                if secs == 0 {
+                    anyhow::bail!("--duty-fetch-timeout must be greater than 0");
+                }
                 timeouts.duty_fetch = std::time::Duration::from_secs(secs);
             }
 

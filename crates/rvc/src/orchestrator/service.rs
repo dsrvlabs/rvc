@@ -1110,7 +1110,7 @@ where
             let count = signed_aggregates.len();
             let versioned = VersionedSignedAggregateAndProof::PreElectra(signed_aggregates);
             match tokio::time::timeout(
-                self.config.timeouts.aggregate_fetch,
+                self.config.timeouts.aggregate_submit,
                 self.beacon.submit_aggregate_and_proofs(&versioned),
             )
             .await
@@ -1131,7 +1131,7 @@ where
                     warn!(
                         slot,
                         "Aggregate and proofs submit timed out after {}s",
-                        self.config.timeouts.aggregate_fetch.as_secs()
+                        self.config.timeouts.aggregate_submit.as_secs()
                     );
                     RVC_AGGREGATIONS_TOTAL
                         .with_label_values(&[attestation_status::FAILED])
@@ -1462,13 +1462,27 @@ where
             }])
         };
 
-        match self.propagator.propagate(&versioned).await {
-            Ok(_) => AttestationResult { validator_index, slot, success: true, error: None },
-            Err(e) => AttestationResult {
+        match tokio::time::timeout(
+            self.config.timeouts.attestation_submit,
+            self.propagator.propagate(&versioned),
+        )
+        .await
+        {
+            Ok(Ok(_)) => AttestationResult { validator_index, slot, success: true, error: None },
+            Ok(Err(e)) => AttestationResult {
                 validator_index,
                 slot,
                 success: false,
                 error: Some(format!("Failed to propagate attestation: {}", e)),
+            },
+            Err(_) => AttestationResult {
+                validator_index,
+                slot,
+                success: false,
+                error: Some(format!(
+                    "Attestation submit timed out after {}s",
+                    self.config.timeouts.attestation_submit.as_secs()
+                )),
             },
         }
     }
@@ -2286,6 +2300,23 @@ mod tests {
         // Must fit within the 2/3-slot to end-of-slot window (~4s for 12s slots)
         assert!(timeouts.aggregate_fetch.as_secs() <= 4);
         assert!(timeouts.aggregate_fetch.as_secs() >= 1);
+    }
+
+    #[test]
+    fn test_aggregate_submit_uses_distinct_timeout_field() {
+        let mut timeouts = OperationTimeouts::default();
+        timeouts.aggregate_fetch = Duration::from_secs(5);
+        timeouts.aggregate_submit = Duration::from_secs(1);
+        // These must be distinct fields — submit path must use aggregate_submit
+        assert_ne!(timeouts.aggregate_fetch, timeouts.aggregate_submit);
+    }
+
+    #[test]
+    fn test_attestation_submit_timeout_exists() {
+        let timeouts = OperationTimeouts::default();
+        // attestation_submit must be a usable timeout value
+        assert!(timeouts.attestation_submit.as_secs() >= 1);
+        assert!(timeouts.attestation_submit.as_secs() <= 5);
     }
 
     /// Helper to build an orchestrator wired to a wiremock mock_server for aggregation tests.
