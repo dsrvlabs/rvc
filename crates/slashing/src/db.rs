@@ -1,6 +1,7 @@
 //! SQLite database layer for slashing protection.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
@@ -17,6 +18,7 @@ use metrics::definitions as metrics;
 pub struct SlashingDb {
     conn: Mutex<Connection>,
     path: Option<PathBuf>,
+    strict_semantics: AtomicBool,
 }
 
 impl SlashingDb {
@@ -25,7 +27,11 @@ impl SlashingDb {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SlashingError> {
         let path = path.as_ref();
         let conn = Connection::open(path)?;
-        let db = Self { conn: Mutex::new(conn), path: Some(path.to_path_buf()) };
+        let db = Self {
+            conn: Mutex::new(conn),
+            path: Some(path.to_path_buf()),
+            strict_semantics: AtomicBool::new(false),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -33,9 +39,19 @@ impl SlashingDb {
     /// Open an in-memory database for testing.
     pub fn open_in_memory() -> Result<Self, SlashingError> {
         let conn = Connection::open_in_memory()?;
-        let db = Self { conn: Mutex::new(conn), path: None };
+        let db =
+            Self { conn: Mutex::new(conn), path: None, strict_semantics: AtomicBool::new(false) };
         db.migrate()?;
         Ok(db)
+    }
+
+    /// Enable or disable strict slashing semantics.
+    ///
+    /// When enabled, `None == None` signing roots at the same target epoch
+    /// (or slot for blocks) are rejected as potential double votes/proposals.
+    /// Default is `false` (lenient: treats `None == None` as a re-sign).
+    pub fn set_strict_semantics(&self, strict: bool) {
+        self.strict_semantics.store(strict, Ordering::Relaxed);
     }
 
     fn migrate(&self) -> Result<(), SlashingError> {
@@ -517,7 +533,12 @@ impl SlashingDb {
             .optional()?;
 
         if let Some(existing_root) = existing {
-            if existing_root != signing_root {
+            let is_resign = match (&existing_root, &signing_root) {
+                (Some(er), Some(nr)) if er == nr => true,
+                (None, None) if !self.strict_semantics.load(Ordering::Relaxed) => true,
+                _ => false,
+            };
+            if !is_resign {
                 return Err(BlockSlashingViolation::DoubleBlockProposal { slot }.into());
             }
             // Same signing root — idempotent re-sign, commit without inserting
@@ -618,23 +639,35 @@ impl SlashingDb {
         let mut is_duplicate = false;
         for (existing_source, existing_target, existing_root) in &existing {
             if target_epoch == *existing_target {
-                if *existing_root == signing_root {
-                    // FU-32: Defense-in-depth — same signing_root implies identical
-                    // AttestationData, so source_epoch MUST match. If not, something
-                    // is wrong in the signing pipeline.
-                    if source_epoch != *existing_source {
-                        tracing::warn!(
-                            pubkey,
-                            target_epoch,
-                            existing_source = *existing_source,
-                            new_source = source_epoch,
-                            "same signing root but different source epoch — possible signing pipeline bug"
+                let strict = self.strict_semantics.load(Ordering::Relaxed);
+                match (existing_root, &signing_root) {
+                    (Some(er), Some(nr)) if er == nr => {
+                        // Genuine re-sign: identical known roots. Allow.
+                        // FU-32: Defense-in-depth — verify source also matches.
+                        if source_epoch != *existing_source {
+                            tracing::warn!(
+                                pubkey,
+                                target_epoch,
+                                existing_source = *existing_source,
+                                new_source = source_epoch,
+                                "same signing root but different source epoch — possible signing pipeline bug"
+                            );
+                        }
+                        is_duplicate = true;
+                        continue;
+                    }
+                    (None, None) if !strict => {
+                        // Lenient mode (default): treat None==None as re-sign
+                        is_duplicate = true;
+                        continue;
+                    }
+                    _ => {
+                        // Different roots, or None involved in strict mode
+                        return Err(
+                            AttestationSlashingViolation::DoubleVote { target_epoch }.into()
                         );
                     }
-                    is_duplicate = true;
-                    continue;
                 }
-                return Err(AttestationSlashingViolation::DoubleVote { target_epoch }.into());
             }
 
             if source_epoch < *existing_source && target_epoch > *existing_target {
@@ -2305,6 +2338,168 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("double vote"), "expected double vote error, got: {err}");
+    }
+
+    // ── FU-33 strict slashing semantics test matrix ──────────────────
+    // 6 root combinations × 2 modes (lenient/strict) = 12 tests
+    // Attestation tests:
+
+    #[test]
+    fn test_strict_att_some_same_lenient_allows() {
+        // Some("0xA") vs Some("0xA"), lenient → allow (genuine re-sign)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_att_some_same_strict_allows() {
+        // Some("0xA") vs Some("0xA"), strict → allow (genuine re-sign)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_att_some_diff_lenient_rejects() {
+        // Some("0xA") vs Some("0xB"), lenient → reject (double vote)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xB".into()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_att_some_diff_strict_rejects() {
+        // Some("0xA") vs Some("0xB"), strict → reject (double vote)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xB".into()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_att_some_none_lenient_rejects() {
+        // Some("0xA") vs None, lenient → reject (different roots)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_att_some_none_strict_rejects() {
+        // Some("0xA") vs None, strict → reject
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_att_none_some_lenient_rejects() {
+        // None vs Some("0xA"), lenient → reject (different roots)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.check_and_record_attestation("0x1234", 3, 5, None).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_att_none_some_strict_rejects() {
+        // None vs Some("0xA"), strict → reject
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_attestation("0x1234", 3, 5, None).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_att_none_none_lenient_allows() {
+        // None vs None, lenient (default) → allow (treat as re-sign)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.check_and_record_attestation("0x1234", 3, 5, None).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_att_none_none_strict_rejects() {
+        // None vs None, strict → reject (unknown root = potential double vote)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_attestation("0x1234", 3, 5, None).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, None);
+        assert!(result.is_err(), "strict mode should reject None==None as potential double vote");
+    }
+
+    #[test]
+    fn test_strict_att_no_existing_lenient_inserts() {
+        // No existing record, lenient → insert
+        let db = SlashingDb::open_in_memory().expect("open");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        assert!(result.is_ok());
+        assert_eq!(db.get_attestations("0x1234").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_strict_att_no_existing_strict_inserts() {
+        // No existing record, strict → insert
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        assert!(result.is_ok());
+        assert_eq!(db.get_attestations("0x1234").unwrap().len(), 1);
+    }
+
+    // Block proposal strict semantics tests (None==None case)
+
+    #[test]
+    fn test_strict_block_none_none_lenient_allows() {
+        // None vs None block, lenient → allow
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.check_and_record_block("0x1234", 100, None).expect("first");
+        let result = db.check_and_record_block("0x1234", 100, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_block_none_none_strict_rejects() {
+        // None vs None block, strict → reject
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_block("0x1234", 100, None).expect("first");
+        let result = db.check_and_record_block("0x1234", 100, None);
+        assert!(
+            result.is_err(),
+            "strict mode should reject None==None block as potential double proposal"
+        );
+    }
+
+    #[test]
+    fn test_strict_block_some_same_strict_allows() {
+        // Some("0xA") vs Some("0xA") block, strict → allow (genuine re-sign)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_block("0x1234", 100, Some("0xA".into())).expect("first");
+        let result = db.check_and_record_block("0x1234", 100, Some("0xA".into()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_block_none_some_strict_rejects() {
+        // None vs Some("0xA") block, strict → reject
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_block("0x1234", 100, None).expect("first");
+        let result = db.check_and_record_block("0x1234", 100, Some("0xA".into()));
+        assert!(result.is_err());
     }
 
     #[test]

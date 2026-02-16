@@ -122,6 +122,10 @@ enum Commands {
         /// Exit on unsafe slashing DB file permissions (world-readable/writable)
         #[arg(long)]
         strict_permissions: bool,
+
+        /// Reject null-root re-signs as potential double votes (strict EIP-3076 semantics)
+        #[arg(long)]
+        strict_slashing_semantics: bool,
     },
 
     /// Submit a voluntary exit for a validator
@@ -195,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
             keymanager_token_file,
             remote_signer_url,
             strict_permissions,
+            strict_slashing_semantics,
         } => {
             init_logging(&log_level);
 
@@ -233,7 +238,7 @@ async fn main() -> anyhow::Result<()> {
                 return Err(e.into());
             }
 
-            run_validator(cfg, strict_permissions).await?;
+            run_validator(cfg, strict_permissions, strict_slashing_semantics).await?;
         }
         Commands::VoluntaryExit {
             pubkey,
@@ -290,7 +295,11 @@ fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
     }
 }
 
-async fn run_validator(config: Config, strict_permissions: bool) -> anyhow::Result<()> {
+async fn run_validator(
+    config: Config,
+    strict_permissions: bool,
+    strict_slashing_semantics: bool,
+) -> anyhow::Result<()> {
     info!(
         beacon_url = %config.beacon_url,
         beacon_nodes = ?config.effective_beacon_nodes(),
@@ -327,6 +336,12 @@ async fn run_validator(config: Config, strict_permissions: bool) -> anyhow::Resu
     if let Err(e) = startup::check_integrity(&slashing_db) {
         error!("Slashing DB integrity check failed: {}", e);
         return Err(e.into());
+    }
+
+    // Step 2a: Configure strict slashing semantics
+    if strict_slashing_semantics {
+        slashing_db.set_strict_semantics(true);
+        info!("Strict slashing semantics enabled: null-root re-signs will be rejected");
     }
 
     // Step 2b: Check slashing DB file permissions
