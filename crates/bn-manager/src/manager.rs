@@ -773,6 +773,10 @@ impl BeaconNodeClient for BnManager {
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
         self.query_first("get_node_syncing", |c| Box::pin(c.get_node_syncing())).await
     }
+
+    async fn get_node_version(&self) -> Result<String, BeaconError> {
+        self.query_first("get_node_version", |c| Box::pin(c.get_node_version())).await
+    }
 }
 
 /// Implements `BeaconNodeClient` for `BeaconClient` directly, useful for tests
@@ -926,6 +930,10 @@ impl BeaconNodeClient for BeaconClient {
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
         self.get_node_syncing().await
+    }
+
+    async fn get_node_version(&self) -> Result<String, BeaconError> {
+        self.get_node_version().await
     }
 }
 
@@ -2620,5 +2628,93 @@ mod tests {
         assert!(scores[1].latency_ms > 0.0, "BN2 latency should be tracked");
         assert_eq!(scores[0].error_rate, 0.0);
         assert_eq!(scores[1].error_rate, 0.0);
+    }
+
+    // -- get_node_version tests --
+
+    #[tokio::test]
+    async fn test_get_node_version_via_trait() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"version":"Lighthouse/v7.1.0-a1b2c3d/x86_64-linux"}}"#,
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = beacon::BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+        let dyn_client: &dyn BeaconNodeClient = &client;
+        let version = dyn_client.get_node_version().await.unwrap();
+        assert_eq!(version, "Lighthouse/v7.1.0-a1b2c3d/x86_64-linux");
+    }
+
+    #[tokio::test]
+    async fn test_get_node_version_bn_manager_delegates() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/version"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"data":{"version":"Prysm/v5.0.0/linux-amd64"}}"#),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let manager = make_manager(&mock_server.uri());
+        let version = manager.get_node_version().await.unwrap();
+        assert_eq!(version, "Prysm/v5.0.0/linux-amd64");
+    }
+
+    #[tokio::test]
+    async fn test_get_node_version_failover() {
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&primary)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&secondary)
+            .await;
+
+        // Primary fails
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/version"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("error"))
+            .expect(1)
+            .mount(&primary)
+            .await;
+
+        // Secondary succeeds
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/version"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"data":{"version":"Teku/v24.0.0"}}"#),
+            )
+            .expect(1)
+            .mount(&secondary)
+            .await;
+
+        let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+        let version = manager.get_node_version().await.unwrap();
+        assert_eq!(version, "Teku/v24.0.0");
     }
 }

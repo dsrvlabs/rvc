@@ -313,6 +313,15 @@ pub struct SyncingData {
 /// Response type for the node syncing endpoint.
 pub type SyncingResponse = DataResponse<SyncingData>;
 
+/// Node version data from the beacon node's `/eth/v1/node/version` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NodeVersionData {
+    pub version: String,
+}
+
+/// Response type for the node version endpoint.
+pub type NodeVersionResponse = DataResponse<NodeVersionData>;
+
 /// Error details for a single attestation that failed validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedAttestationError {
@@ -930,6 +939,20 @@ mod tests {
         assert_eq!(sub.committees_at_slot, "64");
         assert_eq!(sub.slot, "10000");
         assert!(!sub.is_aggregator);
+    }
+
+    #[test]
+    fn test_node_version_data_deserialize() {
+        let json = r#"{"version": "Lighthouse/v7.1.0-a1b2c3d/x86_64-linux"}"#;
+        let data: NodeVersionData = serde_json::from_str(json).unwrap();
+        assert_eq!(data.version, "Lighthouse/v7.1.0-a1b2c3d/x86_64-linux");
+    }
+
+    #[test]
+    fn test_node_version_response_deserialize() {
+        let json = r#"{"data":{"version":"Lighthouse/v7.1.0-a1b2c3d/x86_64-linux"}}"#;
+        let response: NodeVersionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.data.version, "Lighthouse/v7.1.0-a1b2c3d/x86_64-linux");
     }
 
     #[test]

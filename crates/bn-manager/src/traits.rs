@@ -144,6 +144,8 @@ pub trait BeaconNodeClient: Send + Sync {
     // -- Node status --
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError>;
+
+    async fn get_node_version(&self) -> Result<String, BeaconError>;
 }
 
 /// Strategy for selecting a beacon node when multiple are configured.
@@ -520,6 +522,9 @@ mod tests {
             Err(BeaconError::HttpError("mock".to_string()))
         }
         async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_version(&self) -> Result<String, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
     }

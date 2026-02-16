@@ -605,6 +605,12 @@ impl BeaconClient {
         self.get("/eth/v1/node/syncing").await
     }
 
+    /// Fetches the node version string from the beacon node.
+    pub async fn get_node_version(&self) -> Result<String, BeaconError> {
+        let response: crate::types::NodeVersionResponse = self.get("/eth/v1/node/version").await?;
+        Ok(response.data.version)
+    }
+
     /// Submits signed attestations to the beacon node.
     ///
     /// Accepts a versioned attestation payload and submits to the beacon pool.
@@ -4033,6 +4039,44 @@ mod tests {
         let client = BeaconClient::new(config).unwrap();
 
         let result = client.get_node_syncing().await;
+        assert!(result.is_err());
+    }
+
+    // -- get_node_version tests --
+
+    #[tokio::test]
+    async fn test_get_node_version_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"version":"Lighthouse/v7.1.0-a1b2c3d/x86_64-linux"}}"#,
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+        let version = client.get_node_version().await.unwrap();
+        assert_eq!(version, "Lighthouse/v7.1.0-a1b2c3d/x86_64-linux");
+    }
+
+    #[tokio::test]
+    async fn test_get_node_version_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/version"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+        let client = BeaconClient::new(config).unwrap();
+        let result = client.get_node_version().await;
         assert!(result.is_err());
     }
 

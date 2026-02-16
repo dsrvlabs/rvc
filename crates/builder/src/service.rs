@@ -368,6 +368,9 @@ mod tests {
         async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".into()))
         }
+        async fn get_node_version(&self) -> Result<String, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
     }
 
     // --- Mock Signer ---

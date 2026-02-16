@@ -364,6 +364,9 @@ mod tests {
                 },
             })
         }
+        async fn get_node_version(&self) -> Result<String, BeaconError> {
+            Ok("MockBeacon/v0.0.0".to_string())
+        }
     }
 
     // -- Exit code tests --

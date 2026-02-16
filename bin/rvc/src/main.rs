@@ -391,6 +391,12 @@ async fn run_validator(config: Config, strict_permissions: bool) -> anyhow::Resu
     // Step 5: Check beacon reachability
     startup::check_beacon_reachability(bn_manager.as_ref()).await;
 
+    // Log beacon node version (non-fatal)
+    match bn_manager.get_node_version().await {
+        Ok(version) => info!(bn_version = %version, "connected to beacon node"),
+        Err(e) => warn!(error = %e, "failed to fetch beacon node version"),
+    }
+
     // Load validator keys
     let key_manager = match builder.build_key_manager() {
         Ok(km) => {
