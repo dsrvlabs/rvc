@@ -575,6 +575,25 @@ impl SlashingDb {
     ///
     /// Combines `is_safe_to_sign` and `record_attestation` in a single SQLite
     /// transaction with `IMMEDIATE` locking to prevent TOCTOU races.
+    ///
+    /// ## Edge Case Decisions (FU-32, FU-33)
+    ///
+    /// **FU-32 (same root, different source):**
+    /// Per EIP-3076, `signing_root` = `hash_tree_root(AttestationData)`. Since
+    /// `AttestationData` includes `source_epoch`, identical roots imply identical
+    /// source epochs. If source differs with same root, we log a warning
+    /// (signing pipeline bug indicator) but allow the attestation. This is
+    /// defense-in-depth only — the invariant violation is physically impossible
+    /// under correct SSZ serialization. See EIP-3076 Condition 5.
+    ///
+    /// **FU-33 (None==None signing root):**
+    /// EIP-3076 recommends treating null roots as "unknown" and assigning a
+    /// suitable dummy root internally. With `strict_semantics = false`
+    /// (default): `None==None` is treated as a re-sign for backward
+    /// compatibility with pre-existing records that lack roots. With
+    /// `strict_semantics = true`: `None==None` is rejected as a potential
+    /// double vote, matching Lighthouse/Prysm/Teku conservative behavior.
+    /// See EIP-3076 §Conditions, note on `signing_root` handling.
     pub fn check_and_record_attestation(
         &self,
         pubkey: &str,
@@ -3248,5 +3267,185 @@ mod tests {
             )
             .expect("failed to query tables");
         assert_eq!(table_count, 1);
+    }
+}
+
+/// Living documentation tests for EIP-3076 edge case decisions.
+///
+/// These tests codify the rationale behind FU-32 and FU-33 slashing
+/// protection decisions. Each test documents a specific edge case with
+/// references to the relevant EIP-3076 section. Future developers
+/// should read these tests to understand *why* the code behaves this way.
+#[cfg(test)]
+mod edge_case_tests {
+    use super::*;
+
+    // ── FU-32: Same signing_root but different source_epoch ──────────
+    //
+    // EIP-3076 defines signing_root as hash_tree_root(AttestationData).
+    // AttestationData includes both source and target. Therefore, if two
+    // attestations share the same signing_root, they MUST have identical
+    // source_epoch, target_epoch, and beacon_block_root.
+    //
+    // If we ever see same root + different source, it indicates a bug in
+    // the signing pipeline (e.g., incorrect root computation). We log a
+    // warning but still allow the attestation because:
+    //   1. The signing_root match means it's the same logical message.
+    //   2. Rejecting would be overly strict — the validator already signed
+    //      this exact data.
+    //   3. The mismatch is physically impossible under correct SSZ, so
+    //      rejection would only punish buggy-but-non-slashable clients.
+
+    #[test]
+    fn test_fu32_same_root_same_source_silent_pass() {
+        // EIP-3076 Condition 5: re-signing the same attestation is safe.
+        // When signing_root matches AND source matches, this is a genuine
+        // idempotent re-sign. No warning, no rejection.
+        let db = SlashingDb::open_in_memory().expect("open");
+
+        db.check_and_record_attestation("0xval", 10, 20, Some("0xdeadbeef".into()))
+            .expect("initial attestation");
+
+        // Identical re-sign: same source, same target, same root
+        let result = db.check_and_record_attestation("0xval", 10, 20, Some("0xdeadbeef".into()));
+        assert!(result.is_ok(), "identical re-sign must be allowed silently");
+
+        // Should not create a duplicate record
+        assert_eq!(db.get_attestations("0xval").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_fu32_same_root_different_source_warns_but_allows() {
+        // EIP-3076 Condition 5 + FU-32 defense-in-depth:
+        //
+        // This scenario is physically impossible under correct SSZ because
+        // signing_root = hash_tree_root(AttestationData) which includes
+        // source_epoch. If it occurs, something is wrong in the signing
+        // pipeline (e.g., root was copied from a different attestation).
+        //
+        // Decision: LOG WARNING but ALLOW the attestation.
+        // Rationale: the root match proves it's the same data, so rejecting
+        // would only hurt a client with a minor bookkeeping bug.
+        let db = SlashingDb::open_in_memory().expect("open");
+
+        db.check_and_record_attestation("0xval", 10, 20, Some("0xdeadbeef".into()))
+            .expect("initial attestation");
+
+        // Same root but source_epoch differs (10 → 15): warns internally
+        let result = db.check_and_record_attestation("0xval", 15, 20, Some("0xdeadbeef".into()));
+        assert!(
+            result.is_ok(),
+            "same root with different source must still be allowed (defense-in-depth warning only)"
+        );
+
+        // No duplicate inserted
+        assert_eq!(db.get_attestations("0xval").unwrap().len(), 1);
+    }
+
+    // ── FU-33: None==None signing root semantics ─────────────────────
+    //
+    // EIP-3076 notes that signing_root "can be missing for legacy records."
+    // The spec recommends assigning a dummy root internally.
+    //
+    // Problem: if both the existing record and the new attestation have
+    // None as signing_root, are they the same attestation (re-sign) or
+    // different attestations (double vote)?
+    //
+    // We cannot know — hence the choice is a policy decision:
+    //
+    // - Lenient (default, strict_semantics=false): treat None==None as
+    //   re-sign. This is safer for operators with legacy records that
+    //   pre-date root recording. Avoids false-positive rejections.
+    //
+    // - Strict (strict_semantics=true): treat None==None as a potential
+    //   double vote. This matches the conservative behavior of Lighthouse,
+    //   Prysm, and Teku. Recommended for new deployments where all records
+    //   should have roots.
+
+    #[test]
+    fn test_fu33_none_none_lenient_allows() {
+        // Default (lenient) mode: None==None at same target is treated as
+        // an idempotent re-sign. This preserves backward compatibility with
+        // legacy slashing protection records that lack signing_root.
+        //
+        // EIP-3076 §Conditions: "If signing_root is not provided, the
+        // implementation should treat it as 'unknown'."
+        // Our lenient interpretation: unknown == unknown → same message.
+        let db = SlashingDb::open_in_memory().expect("open");
+
+        db.check_and_record_attestation("0xval", 10, 20, None)
+            .expect("initial attestation without root");
+
+        let result = db.check_and_record_attestation("0xval", 10, 20, None);
+        assert!(result.is_ok(), "lenient mode: None==None must be allowed as re-sign");
+    }
+
+    #[test]
+    fn test_fu33_none_none_strict_rejects() {
+        // Strict mode: None==None at same target is rejected as a potential
+        // double vote. Without a signing_root, we cannot prove the two
+        // attestations contain the same data.
+        //
+        // EIP-3076 §Conditions: "If signing_root is not provided, the
+        // implementation should treat it as 'unknown'."
+        // Our strict interpretation: unknown == unknown → could be different
+        // messages → reject to be safe.
+        //
+        // This matches Lighthouse/Prysm/Teku conservative behavior and is
+        // recommended for new deployments where all attestations should
+        // have signing_root populated.
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+
+        db.check_and_record_attestation("0xval", 10, 20, None)
+            .expect("initial attestation without root");
+
+        let result = db.check_and_record_attestation("0xval", 10, 20, None);
+        assert!(
+            result.is_err(),
+            "strict mode: None==None must be rejected as potential double vote"
+        );
+    }
+
+    #[test]
+    fn test_fu33_none_vs_some_always_rejects() {
+        // Regardless of strict/lenient mode, None vs Some (or Some vs None)
+        // at the same target epoch is ALWAYS rejected as a double vote.
+        //
+        // Rationale: if one attestation has a known root and the other doesn't,
+        // we cannot prove they are the same message. The safe choice is to
+        // reject. This is unambiguous in EIP-3076 — different roots (including
+        // the absence of one) at the same target = double vote.
+        let db = SlashingDb::open_in_memory().expect("open");
+
+        // Case 1: existing=Some, new=None
+        db.check_and_record_attestation("0xval_a", 10, 20, Some("0xroot".into()))
+            .expect("initial with root");
+        let result = db.check_and_record_attestation("0xval_a", 10, 20, None);
+        assert!(result.is_err(), "Some vs None must always reject");
+
+        // Case 2: existing=None, new=Some
+        db.check_and_record_attestation("0xval_b", 10, 20, None).expect("initial without root");
+        let result = db.check_and_record_attestation("0xval_b", 10, 20, Some("0xroot".into()));
+        assert!(result.is_err(), "None vs Some must always reject");
+    }
+
+    #[test]
+    fn test_fu33_strict_block_none_none_rejects() {
+        // FU-33 strict semantics also applies to block proposals.
+        //
+        // EIP-3076 block signing_root = hash_tree_root(BeaconBlock).
+        // Same policy: in strict mode, None==None at the same slot is
+        // rejected because we cannot confirm it's the same block.
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+
+        db.check_and_record_block("0xval", 500, None).expect("initial block without root");
+
+        let result = db.check_and_record_block("0xval", 500, None);
+        assert!(
+            result.is_err(),
+            "strict mode: None==None block must be rejected as potential double proposal"
+        );
     }
 }
