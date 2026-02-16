@@ -619,6 +619,18 @@ impl SlashingDb {
         for (existing_source, existing_target, existing_root) in &existing {
             if target_epoch == *existing_target {
                 if *existing_root == signing_root {
+                    // FU-32: Defense-in-depth — same signing_root implies identical
+                    // AttestationData, so source_epoch MUST match. If not, something
+                    // is wrong in the signing pipeline.
+                    if source_epoch != *existing_source {
+                        tracing::warn!(
+                            pubkey,
+                            target_epoch,
+                            existing_source = *existing_source,
+                            new_source = source_epoch,
+                            "same signing root but different source epoch — possible signing pipeline bug"
+                        );
+                    }
                     is_duplicate = true;
                     continue;
                 }
@@ -2243,6 +2255,56 @@ mod tests {
 
         let attestations = db.get_attestations("0x1234").expect("failed to get");
         assert_eq!(attestations.len(), 1);
+    }
+
+    #[test]
+    fn test_same_root_same_source_no_warning() {
+        // Same signing_root + same source_epoch + same target_epoch → no warning, no error
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xABC".to_string()))
+            .expect("first should succeed");
+
+        // Re-sign with identical source, target, root → should succeed silently
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xABC".to_string()));
+        assert!(result.is_ok());
+
+        // Should not have inserted a duplicate
+        let attestations = db.get_attestations("0x1234").expect("failed to get");
+        assert_eq!(attestations.len(), 1);
+    }
+
+    #[test]
+    fn test_same_root_different_source_warns_but_allows() {
+        // Same signing_root + same target_epoch but different source_epoch
+        // → should log warning but still allow (defense-in-depth, not a rejection)
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xABC".to_string()))
+            .expect("first should succeed");
+
+        // Same root but different source → indicates possible signing pipeline bug
+        // Should still succeed (is_duplicate = true) but log a warning
+        let result = db.check_and_record_attestation("0x1234", 4, 5, Some("0xABC".to_string()));
+        assert!(result.is_ok(), "same root with different source must still be allowed");
+
+        // Should not have inserted a duplicate
+        let attestations = db.get_attestations("0x1234").expect("failed to get");
+        assert_eq!(attestations.len(), 1);
+    }
+
+    #[test]
+    fn test_double_vote_rejection_unchanged() {
+        // Different root + same target → must still be rejected as DoubleVote
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xABC".to_string()))
+            .expect("first should succeed");
+
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xDEF".to_string()));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("double vote"), "expected double vote error, got: {err}");
     }
 
     #[test]
