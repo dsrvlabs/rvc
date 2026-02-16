@@ -3,12 +3,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use beacon::{
-    AggregateAttestationResponse, Attestation, AttestationDataResponse, AttesterDutiesResponse,
+    AggregateAttestationResponse, AttestationDataResponse, AttesterDutiesResponse,
     BeaconCommitteeSubscription, BeaconError, BlockRootResponse, ConfigSpecResponse,
     GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
-    SignedAggregateAndProof, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorsResponse,
+    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    SyncingResponse, ValidatorsResponse, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use eth_types::{
     ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
@@ -80,7 +80,7 @@ pub trait BeaconNodeClient: Send + Sync {
 
     async fn submit_attestation(
         &self,
-        attestations: &[Attestation],
+        attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError>;
 
     // -- Aggregation --
@@ -89,11 +89,12 @@ pub trait BeaconNodeClient: Send + Sync {
         &self,
         slot: u64,
         attestation_data_root: &str,
+        committee_index: Option<u64>,
     ) -> Result<AggregateAttestationResponse, BeaconError>;
 
     async fn submit_aggregate_and_proofs(
         &self,
-        proofs: &[SignedAggregateAndProof],
+        proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError>;
 
     // -- Sync committee --
@@ -143,6 +144,40 @@ pub trait BeaconNodeClient: Send + Sync {
     // -- Node status --
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError>;
+
+    async fn get_node_version(&self) -> Result<String, BeaconError>;
+}
+
+/// Per-operation timeout configuration for beacon node API calls.
+#[derive(Debug, Clone)]
+pub struct OperationTimeouts {
+    pub block_production: Duration,
+    pub block_publication: Duration,
+    pub attestation_fetch: Duration,
+    pub attestation_submit: Duration,
+    pub aggregate_fetch: Duration,
+    pub aggregate_submit: Duration,
+    pub sync_message: Duration,
+    pub sync_contribution: Duration,
+    pub duty_fetch: Duration,
+    pub preparation: Duration,
+}
+
+impl Default for OperationTimeouts {
+    fn default() -> Self {
+        Self {
+            block_production: Duration::from_secs(3),
+            block_publication: Duration::from_secs(2),
+            attestation_fetch: Duration::from_secs(4),
+            attestation_submit: Duration::from_secs(2),
+            aggregate_fetch: Duration::from_secs(2),
+            aggregate_submit: Duration::from_secs(2),
+            sync_message: Duration::from_secs(2),
+            sync_contribution: Duration::from_secs(2),
+            duty_fetch: Duration::from_secs(10),
+            preparation: Duration::from_secs(3),
+        }
+    }
 }
 
 /// Strategy for selecting a beacon node when multiple are configured.
@@ -383,6 +418,38 @@ mod tests {
         assert!(debug.contains("localhost"));
     }
 
+    // -- OperationTimeouts --
+
+    #[test]
+    fn test_operation_timeouts_default_values() {
+        let t = OperationTimeouts::default();
+        assert_eq!(t.block_production, Duration::from_secs(3));
+        assert_eq!(t.block_publication, Duration::from_secs(2));
+        assert_eq!(t.attestation_fetch, Duration::from_secs(4));
+        assert_eq!(t.attestation_submit, Duration::from_secs(2));
+        assert_eq!(t.aggregate_fetch, Duration::from_secs(2));
+        assert_eq!(t.aggregate_submit, Duration::from_secs(2));
+        assert_eq!(t.sync_message, Duration::from_secs(2));
+        assert_eq!(t.sync_contribution, Duration::from_secs(2));
+        assert_eq!(t.duty_fetch, Duration::from_secs(10));
+        assert_eq!(t.preparation, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn test_operation_timeouts_clone() {
+        let t = OperationTimeouts::default();
+        let cloned = t.clone();
+        assert_eq!(t.block_production, cloned.block_production);
+        assert_eq!(t.duty_fetch, cloned.duty_fetch);
+    }
+
+    #[test]
+    fn test_operation_timeouts_debug() {
+        let t = OperationTimeouts::default();
+        let debug = format!("{:?}", t);
+        assert!(debug.contains("OperationTimeouts"));
+    }
+
     // -- Mock trait implementation test --
 
     struct MockBeaconNodeClient;
@@ -459,7 +526,7 @@ mod tests {
         }
         async fn submit_attestation(
             &self,
-            _attestations: &[Attestation],
+            _attestations: &VersionedAttestation,
         ) -> Result<SubmitAttestationResult, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
@@ -467,12 +534,13 @@ mod tests {
             &self,
             _slot: u64,
             _attestation_data_root: &str,
+            _committee_index: Option<u64>,
         ) -> Result<AggregateAttestationResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
         async fn submit_aggregate_and_proofs(
             &self,
-            _proofs: &[SignedAggregateAndProof],
+            _proofs: &VersionedSignedAggregateAndProof,
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
@@ -518,6 +586,9 @@ mod tests {
             Err(BeaconError::HttpError("mock".to_string()))
         }
         async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_version(&self) -> Result<String, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
     }

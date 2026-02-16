@@ -14,18 +14,21 @@ pub use sse::{
     SseConnectionState, SseError, SseEvent, DEFAULT_SSE_TOPICS,
 };
 pub use sync_status::{BnSyncStatus, SharedSyncStatuses};
-pub use traits::{BeaconNodeClient, BnHealthScore, BnManagerConfig, BnSelectionStrategy};
+pub use traits::{
+    BeaconNodeClient, BnHealthScore, BnManagerConfig, BnSelectionStrategy, OperationTimeouts,
+};
 
 // Re-export types used in trait signatures so downstream crates
 // don't need to depend on `beacon` directly.
 pub use beacon::{
-    AggregateAttestationResponse, Attestation, AttestationData, AttestationDataResponse,
-    AttesterDutiesResponse, AttesterDuty, BeaconCommitteeSubscription, BeaconError,
-    BlockRootResponse, Checkpoint, ConfigSpecResponse, GenesisResponse, IndexedAttestationError,
+    AggregateAttestationResponse, AttestationData, AttestationDataResponse, AttesterDutiesResponse,
+    AttesterDuty, BeaconCommitteeSubscription, BeaconError, BlockRootResponse, Checkpoint,
+    ConfigSpecResponse, GenesisResponse, IndexedAttestationError, LegacyAttestation,
     ProduceBlockResponse, ProposerDutiesResponse, ProposerDuty, ProposerPreparation,
-    SignedAggregateAndProof, SignedContributionAndProof, StateForkResponse,
+    SignedAggregateAndProof, SignedContributionAndProof, SingleAttestation, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorsResponse,
+    SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorsResponse, VersionedAttestation,
+    VersionedSignedAggregateAndProof,
 };
 pub use eth_types::{
     ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,

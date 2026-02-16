@@ -7,12 +7,13 @@ use tracing::{debug, warn};
 use eth_types::{ForkSchedule, SignedValidatorRegistration, SignedVoluntaryExit};
 
 use crate::types::{
-    parse_fork_schedule, AggregateAttestationResponse, Attestation, AttestationDataResponse,
+    parse_fork_schedule, AggregateAttestationResponse, AttestationDataResponse,
     AttesterDutiesResponse, BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse,
     GenesisResponse, IndexedAttestationError, ProduceBlockResponse, ProposerDutiesResponse,
-    ProposerPreparation, SignedAggregateAndProof, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
+    ProposerPreparation, SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAttestation,
+    VersionedSignedAggregateAndProof,
 };
 use crate::BeaconError;
 
@@ -218,12 +219,10 @@ impl BeaconClient {
     }
 
     /// SSZ content negotiation Accept header for block production.
-    /// Accept header for block production. SSZ preference is disabled until
-    /// the downstream deserialization pipeline is implemented. The SSZ
-    /// Content-Type branching and field plumbing are in place and ready
-    /// to activate by changing this to:
-    /// "application/octet-stream;q=1.0,application/json;q=0.9"
-    const SSZ_ACCEPT_HEADER: &'static str = "application/json";
+    /// Prefers SSZ for ~67% bandwidth savings with JSON as fallback.
+    /// The full SSZ pipeline (header extraction, block-service SSZ path,
+    /// JSON fallback on failure) is in place.
+    const SSZ_ACCEPT_HEADER: &'static str = "application/octet-stream;q=1.0,application/json;q=0.9";
 
     /// Produces a block for the given slot using the v3 endpoint.
     ///
@@ -284,63 +283,125 @@ impl BeaconClient {
             .to_string();
 
         if content_type.starts_with("application/octet-stream") {
-            // 16 MB guard: no valid beacon block exceeds this, even with Deneb blobs
-            const MAX_SSZ_BLOCK_BYTES: usize = 16 * 1024 * 1024;
-
-            let ssz_bytes = response
-                .bytes()
-                .await
-                .map_err(|e| BeaconError::ParseError(format!("failed to read SSZ bytes: {e}")))?;
-
-            if ssz_bytes.is_empty() {
-                return Err(BeaconError::ParseError(
-                    "received empty SSZ body from beacon node".into(),
-                ));
-            }
-
-            if ssz_bytes.len() > MAX_SSZ_BLOCK_BYTES {
-                return Err(BeaconError::ParseError(format!(
-                    "SSZ response too large: {} bytes (max {})",
-                    ssz_bytes.len(),
-                    MAX_SSZ_BLOCK_BYTES
-                )));
-            }
-
-            let ssz_bytes = ssz_bytes.to_vec();
-
-            debug!(
-                slot = slot,
-                consensus_version = consensus_version,
-                ssz_bytes = ssz_bytes.len(),
-                "received SSZ block response"
-            );
-
-            Ok(ProduceBlockResponse {
-                data: serde_json::Value::Null,
+            match Self::try_process_ssz_body(
+                response,
+                slot,
                 is_blinded,
-                consensus_version,
-                execution_payload_value,
-                is_ssz: true,
-                ssz_bytes: Some(ssz_bytes),
-            })
-        } else {
-            // JSON response (existing path or fallback)
-            let body: serde_json::Value =
-                response.json().await.map_err(|e| BeaconError::ParseError(e.to_string()))?;
-
-            let data = body.get("data").cloned().ok_or_else(|| {
-                BeaconError::ParseError("missing 'data' field in produce block response".into())
-            })?;
-
-            Ok(ProduceBlockResponse {
-                data,
-                is_blinded,
-                consensus_version,
-                execution_payload_value,
-                is_ssz: false,
-                ssz_bytes: None,
-            })
+                &consensus_version,
+                &execution_payload_value,
+            )
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(ssz_err) => {
+                    warn!(
+                        slot = slot,
+                        error = %ssz_err,
+                        "SSZ block response processing failed, retrying with JSON"
+                    );
+                    // Single fallback retry with explicit JSON Accept
+                    let fallback_response = self
+                        .execute_with_retry_raw(|| async {
+                            self.client
+                                .get(&url)
+                                .header(reqwest::header::ACCEPT, "application/json")
+                                .send()
+                                .await
+                        })
+                        .await?;
+                    return Self::parse_produce_block_json(fallback_response).await;
+                }
+            }
         }
+
+        Self::parse_produce_block_json(response).await
+    }
+
+    /// Attempt to read and validate the SSZ body from an HTTP response.
+    async fn try_process_ssz_body(
+        response: reqwest::Response,
+        slot: u64,
+        is_blinded: bool,
+        consensus_version: &str,
+        execution_payload_value: &Option<String>,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        const MAX_SSZ_BLOCK_BYTES: usize = 16 * 1024 * 1024;
+
+        let ssz_bytes = response
+            .bytes()
+            .await
+            .map_err(|e| BeaconError::ParseError(format!("failed to read SSZ bytes: {e}")))?;
+
+        if ssz_bytes.is_empty() {
+            return Err(BeaconError::ParseError("received empty SSZ body from beacon node".into()));
+        }
+
+        if ssz_bytes.len() > MAX_SSZ_BLOCK_BYTES {
+            return Err(BeaconError::ParseError(format!(
+                "SSZ response too large: {} bytes (max {})",
+                ssz_bytes.len(),
+                MAX_SSZ_BLOCK_BYTES
+            )));
+        }
+
+        let ssz_bytes = ssz_bytes.to_vec();
+
+        debug!(
+            slot = slot,
+            consensus_version = consensus_version,
+            ssz_bytes = ssz_bytes.len(),
+            "received SSZ block response"
+        );
+
+        Ok(ProduceBlockResponse {
+            data: serde_json::Value::Null,
+            is_blinded,
+            consensus_version: consensus_version.to_string(),
+            execution_payload_value: execution_payload_value.clone(),
+            is_ssz: true,
+            ssz_bytes: Some(ssz_bytes),
+        })
+    }
+
+    /// Parse a JSON produce-block response (headers + body).
+    async fn parse_produce_block_json(
+        response: reqwest::Response,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        let is_blinded = response
+            .headers()
+            .get("Eth-Execution-Payload-Blinded")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        let consensus_version = response
+            .headers()
+            .get("Eth-Consensus-Version")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let execution_payload_value = response
+            .headers()
+            .get("Eth-Execution-Payload-Value")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string());
+
+        let body: serde_json::Value =
+            response.json().await.map_err(|e| BeaconError::ParseError(e.to_string()))?;
+
+        let data = body.get("data").cloned().ok_or_else(|| {
+            BeaconError::ParseError("missing 'data' field in produce block response".into())
+        })?;
+
+        Ok(ProduceBlockResponse {
+            data,
+            is_blinded,
+            consensus_version,
+            execution_payload_value,
+            is_ssz: false,
+            ssz_bytes: None,
+        })
     }
 
     /// Publishes a signed beacon block to the network.
@@ -369,6 +430,38 @@ impl BeaconClient {
             &[("Eth-Consensus-Version", consensus_version)],
         )
         .await
+    }
+
+    /// Publishes a block as raw SSZ bytes using `Content-Type: application/octet-stream`.
+    ///
+    /// Routes to the blinded or unblinded endpoint based on `is_blinded`.
+    pub async fn publish_block_ssz(
+        &self,
+        ssz_bytes: &[u8],
+        consensus_version: &str,
+        is_blinded: bool,
+    ) -> Result<(), BeaconError> {
+        let path =
+            if is_blinded { "/eth/v1/beacon/blinded_blocks" } else { "/eth/v2/beacon/blocks" };
+        let url = format!("{}{}", self.config.endpoint, path);
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Content-Type", "application/octet-stream")
+            .header("Eth-Consensus-Version", consensus_version)
+            .body(ssz_bytes.to_vec())
+            .send()
+            .await
+            .map_err(|e| BeaconError::HttpError(e.to_string()))?;
+
+        let status = response.status();
+        if status.is_success() {
+            Ok(())
+        } else {
+            let body = response.text().await.unwrap_or_default();
+            Err(BeaconError::ApiError { status: status.as_u16(), message: body })
+        }
     }
 
     /// Fetches sync committee duties for the given epoch and validator indices.
@@ -414,24 +507,38 @@ impl BeaconClient {
     // Aggregation
 
     /// Fetches an aggregate attestation for the given slot and attestation data root.
+    ///
+    /// The `committee_index` parameter is required for Electra and later forks.
+    /// Pass `None` for pre-Electra requests.
     pub async fn get_aggregate_attestation(
         &self,
         slot: u64,
         attestation_data_root: &str,
+        committee_index: Option<u64>,
     ) -> Result<AggregateAttestationResponse, BeaconError> {
-        let path = format!(
+        let mut path = format!(
             "/eth/v1/validator/aggregate_attestation?slot={}&attestation_data_root={}",
             slot, attestation_data_root
         );
+        if let Some(ci) = committee_index {
+            path.push_str(&format!("&committee_index={}", ci));
+        }
         self.get(&path).await
     }
 
     /// Submits signed aggregate and proofs to the beacon node.
     pub async fn submit_aggregate_and_proofs(
         &self,
-        proofs: &[SignedAggregateAndProof],
+        proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError> {
-        self.post_empty("/eth/v1/validator/aggregate_and_proofs", &proofs).await
+        match proofs {
+            VersionedSignedAggregateAndProof::PreElectra(ps) => {
+                self.post_empty("/eth/v1/validator/aggregate_and_proofs", ps).await
+            }
+            VersionedSignedAggregateAndProof::Electra(ps) => {
+                self.post_empty("/eth/v2/validator/aggregate_and_proofs", ps).await
+            }
+        }
     }
 
     /// Sends proposer preparation data to the beacon node.
@@ -498,16 +605,22 @@ impl BeaconClient {
         self.get("/eth/v1/node/syncing").await
     }
 
+    /// Fetches the node version string from the beacon node.
+    pub async fn get_node_version(&self) -> Result<String, BeaconError> {
+        let response: crate::types::NodeVersionResponse = self.get("/eth/v1/node/version").await?;
+        Ok(response.data.version)
+    }
+
     /// Submits signed attestations to the beacon node.
     ///
-    /// Accepts an array of attestations and submits them to the beacon pool.
+    /// Accepts a versioned attestation payload and submits to the beacon pool.
     /// Returns success if all attestations were accepted, or partial failure
     /// with details about which attestations failed validation.
     ///
     /// Server errors (5xx) will trigger retry logic with exponential backoff.
     pub async fn submit_attestation(
         &self,
-        attestations: &[Attestation],
+        attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError> {
         let url = format!("{}/eth/v2/beacon/pool/attestations", self.config.endpoint);
         let mut last_error = None;
@@ -519,7 +632,15 @@ impl BeaconClient {
                 tokio::time::sleep(backoff).await;
             }
 
-            match self.client.post(&url).json(attestations).send().await {
+            let send_result = match attestations {
+                VersionedAttestation::PreElectra(atts) => {
+                    self.client.post(&url).json(atts).send().await
+                }
+                VersionedAttestation::Electra(atts) => {
+                    self.client.post(&url).json(atts).send().await
+                }
+            };
+            match send_result {
                 Ok(response) => {
                     let status = response.status();
 
@@ -802,6 +923,8 @@ mod tests {
     use std::time::Duration;
 
     use serde::{Deserialize, Serialize};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1611,7 +1734,7 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let attestation = crate::types::Attestation {
+        let attestation = crate::types::SingleAttestation {
             attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1633,7 +1756,8 @@ mod tests {
             signature: "0xsignature".to_string(),
         };
 
-        let result = client.submit_attestation(&[attestation]).await.unwrap();
+        let versioned = crate::types::VersionedAttestation::Electra(vec![attestation]);
+        let result = client.submit_attestation(&versioned).await.unwrap();
         assert!(result.is_success());
     }
 
@@ -1662,7 +1786,7 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let attestation = crate::types::Attestation {
+        let attestation = crate::types::SingleAttestation {
             attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1681,7 +1805,8 @@ mod tests {
             signature: "0xinvalid".to_string(),
         };
 
-        let result = client.submit_attestation(&[attestation]).await.unwrap();
+        let versioned = crate::types::VersionedAttestation::Electra(vec![attestation]);
+        let result = client.submit_attestation(&versioned).await.unwrap();
         assert!(!result.is_success());
         assert_eq!(result.failures().len(), 1);
         assert_eq!(result.failures()[0].index, 0);
@@ -1704,7 +1829,7 @@ mod tests {
             .with_initial_backoff(Duration::from_millis(1));
         let client = BeaconClient::new(config).unwrap();
 
-        let attestation = crate::types::Attestation {
+        let attestation = crate::types::SingleAttestation {
             attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1723,7 +1848,8 @@ mod tests {
             signature: "0xsignature".to_string(),
         };
 
-        let result = client.submit_attestation(&[attestation]).await;
+        let versioned = crate::types::VersionedAttestation::Electra(vec![attestation]);
+        let result = client.submit_attestation(&versioned).await;
 
         match result {
             Err(BeaconError::ApiError { status, .. }) => {
@@ -1747,7 +1873,7 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let attestation1 = crate::types::Attestation {
+        let attestation1 = crate::types::SingleAttestation {
             attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1766,7 +1892,7 @@ mod tests {
             signature: "0xsignature1".to_string(),
         };
 
-        let attestation2 = crate::types::Attestation {
+        let attestation2 = crate::types::SingleAttestation {
             attester_index: 1,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1785,7 +1911,9 @@ mod tests {
             signature: "0xsignature2".to_string(),
         };
 
-        let result = client.submit_attestation(&[attestation1, attestation2]).await.unwrap();
+        let versioned =
+            crate::types::VersionedAttestation::Electra(vec![attestation1, attestation2]);
+        let result = client.submit_attestation(&versioned).await.unwrap();
         assert!(result.is_success());
     }
 
@@ -1814,7 +1942,7 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let attestation1 = crate::types::Attestation {
+        let attestation1 = crate::types::SingleAttestation {
             attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1833,7 +1961,7 @@ mod tests {
             signature: "0xvalid".to_string(),
         };
 
-        let attestation2 = crate::types::Attestation {
+        let attestation2 = crate::types::SingleAttestation {
             attester_index: 1,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1852,7 +1980,9 @@ mod tests {
             signature: "0xinvalid".to_string(),
         };
 
-        let result = client.submit_attestation(&[attestation1, attestation2]).await.unwrap();
+        let versioned =
+            crate::types::VersionedAttestation::Electra(vec![attestation1, attestation2]);
+        let result = client.submit_attestation(&versioned).await.unwrap();
         assert!(!result.is_success());
         assert_eq!(result.failures().len(), 1);
         assert_eq!(result.failures()[0].index, 1);
@@ -1878,7 +2008,7 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let attestation = crate::types::Attestation {
+        let attestation = crate::types::SingleAttestation {
             attester_index: 0,
             data: crate::types::AttestationData {
                 slot: "1000".to_string(),
@@ -1897,7 +2027,8 @@ mod tests {
             signature: "0xsignature".to_string(),
         };
 
-        let result = client.submit_attestation(&[attestation]).await;
+        let versioned = crate::types::VersionedAttestation::Electra(vec![attestation]);
+        let result = client.submit_attestation(&versioned).await;
         match result {
             Err(BeaconError::ApiError { status, .. }) => {
                 assert_eq!(status, 400);
@@ -1920,8 +2051,8 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let attestations: Vec<crate::types::Attestation> = vec![];
-        let result = client.submit_attestation(&attestations).await.unwrap();
+        let versioned = crate::types::VersionedAttestation::Electra(vec![]);
+        let result = client.submit_attestation(&versioned).await.unwrap();
         assert!(result.is_success());
     }
 
@@ -2661,18 +2792,129 @@ mod tests {
         assert_eq!(block.block().slot, 100);
     }
 
+    /// Stateful responder: returns `first` on call 0, `second` on all subsequent calls.
+    struct SszThenJsonResponder {
+        call_count: AtomicUsize,
+        first: ResponseTemplate,
+        second: ResponseTemplate,
+    }
+
+    impl wiremock::Respond for SszThenJsonResponder {
+        fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+            let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                self.first.clone()
+            } else {
+                self.second.clone()
+            }
+        }
+    }
+
     #[tokio::test]
-    async fn test_produce_block_v3_ssz_empty_body_rejected() {
+    async fn test_produce_block_v3_ssz_empty_body_falls_back_to_json() {
         let mock_server = MockServer::start().await;
+
+        let block_data = serde_json::json!({
+            "slot": "900",
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "01".repeat(32)),
+            "state_root": format!("0x{}", "02".repeat(32)),
+            "body": "0xdead"
+        });
+        let json_envelope = serde_json::json!({ "version": "deneb", "data": block_data });
+
+        let responder = SszThenJsonResponder {
+            call_count: AtomicUsize::new(0),
+            first: ResponseTemplate::new(200)
+                .set_body_raw(vec![], "application/octet-stream")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "deneb"),
+            second: ResponseTemplate::new(200)
+                .set_body_json(&json_envelope)
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "deneb"),
+        };
 
         Mock::given(method("GET"))
             .and(path("/eth/v3/validator/blocks/900"))
+            .respond_with(responder)
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.produce_block_v3(900, "0xrandao", None, None).await.unwrap();
+
+        // Should have fallen back to JSON
+        assert!(!result.is_ssz);
+        assert!(result.ssz_bytes.is_none());
+        assert_eq!(result.consensus_version, "deneb");
+        let block = result.parse_full_block().unwrap();
+        assert_eq!(block.block().slot, 900);
+    }
+
+    #[tokio::test]
+    async fn test_produce_block_v3_ssz_fallback_json_gets_correct_headers() {
+        let mock_server = MockServer::start().await;
+
+        let block_data = serde_json::json!({
+            "slot": "950",
+            "proposer_index": "55",
+            "parent_root": format!("0x{}", "03".repeat(32)),
+            "state_root": format!("0x{}", "04".repeat(32)),
+            "body": "0xbeef"
+        });
+        let json_envelope = serde_json::json!({ "version": "electra", "data": block_data });
+
+        let responder = SszThenJsonResponder {
+            call_count: AtomicUsize::new(0),
+            first: ResponseTemplate::new(200)
+                .set_body_raw(vec![], "application/octet-stream")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "deneb"),
+            second: ResponseTemplate::new(200)
+                .set_body_json(&json_envelope)
+                .insert_header("Eth-Execution-Payload-Blinded", "true")
+                .insert_header("Eth-Consensus-Version", "electra")
+                .insert_header("Eth-Execution-Payload-Value", "77777"),
+        };
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/950"))
+            .respond_with(responder)
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.produce_block_v3(950, "0xrandao", None, None).await.unwrap();
+
+        // Headers come from the JSON fallback response, not the original SSZ response
+        assert!(!result.is_ssz);
+        assert!(result.is_blinded);
+        assert_eq!(result.consensus_version, "electra");
+        assert_eq!(result.execution_payload_value, Some("77777".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_produce_block_v3_valid_ssz_no_fallback() {
+        let mock_server = MockServer::start().await;
+
+        let ssz_payload = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/960"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_raw(vec![], "application/octet-stream")
+                    .set_body_raw(ssz_payload.clone(), "application/octet-stream")
                     .insert_header("Eth-Execution-Payload-Blinded", "false")
                     .insert_header("Eth-Consensus-Version", "deneb"),
             )
+            // Must be called exactly once — no fallback attempt
             .expect(1)
             .mount(&mock_server)
             .await;
@@ -2680,8 +2922,39 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let result = client.produce_block_v3(900, "0xrandao", None, None).await;
-        assert!(result.is_err(), "empty SSZ body should be rejected");
+        let result = client.produce_block_v3(960, "0xrandao", None, None).await.unwrap();
+
+        assert!(result.is_ssz);
+        assert_eq!(result.ssz_bytes, Some(ssz_payload));
+    }
+
+    #[tokio::test]
+    async fn test_produce_block_v3_ssz_fallback_network_error_propagated() {
+        let mock_server = MockServer::start().await;
+
+        // Both calls return SSZ empty body — fallback also gets SSZ, which fails JSON parse
+        let responder = SszThenJsonResponder {
+            call_count: AtomicUsize::new(0),
+            first: ResponseTemplate::new(200)
+                .set_body_raw(vec![], "application/octet-stream")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "deneb"),
+            second: ResponseTemplate::new(500),
+        };
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/970"))
+            .respond_with(responder)
+            .expect(2)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.produce_block_v3(970, "0xrandao", None, None).await;
+        // The JSON fallback request gets a 500 server error, which propagates
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -3155,7 +3428,7 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let result = client.get_aggregate_attestation(100, &att_data_root).await.unwrap();
+        let result = client.get_aggregate_attestation(100, &att_data_root, None).await.unwrap();
 
         assert_eq!(result.data.data.slot, 100);
         assert_eq!(result.data.data.index, 1);
@@ -3179,7 +3452,7 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let result = client.get_aggregate_attestation(100, &att_data_root).await;
+        let result = client.get_aggregate_attestation(100, &att_data_root, None).await;
 
         match result {
             Err(BeaconError::ApiError { status, message }) => {
@@ -3204,24 +3477,26 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let proofs = vec![eth_types::SignedAggregateAndProof {
-            message: eth_types::AggregateAndProof {
-                aggregator_index: 42,
-                aggregate: eth_types::Attestation {
-                    aggregation_bits: vec![0xff; 4],
-                    data: eth_types::AttestationData {
-                        slot: 100,
-                        index: 1,
-                        beacon_block_root: [1u8; 32],
-                        source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
-                        target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+        let proofs = crate::types::VersionedSignedAggregateAndProof::PreElectra(vec![
+            eth_types::SignedAggregateAndProof {
+                message: eth_types::AggregateAndProof {
+                    aggregator_index: 42,
+                    aggregate: eth_types::Attestation {
+                        aggregation_bits: vec![0xff; 4],
+                        data: eth_types::AttestationData {
+                            slot: 100,
+                            index: 1,
+                            beacon_block_root: [1u8; 32],
+                            source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                            target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                        },
+                        signature: vec![0xaa; 96],
                     },
-                    signature: vec![0xaa; 96],
+                    selection_proof: vec![0xbb; 96],
                 },
-                selection_proof: vec![0xbb; 96],
+                signature: vec![0xcc; 96],
             },
-            signature: vec![0xcc; 96],
-        }];
+        ]);
 
         let result = client.submit_aggregate_and_proofs(&proofs).await;
         assert!(result.is_ok());
@@ -3241,24 +3516,26 @@ mod tests {
         let config = BeaconClientConfig::new(mock_server.uri());
         let client = BeaconClient::new(config).unwrap();
 
-        let proofs = vec![eth_types::SignedAggregateAndProof {
-            message: eth_types::AggregateAndProof {
-                aggregator_index: 42,
-                aggregate: eth_types::Attestation {
-                    aggregation_bits: vec![0xff; 4],
-                    data: eth_types::AttestationData {
-                        slot: 100,
-                        index: 1,
-                        beacon_block_root: [1u8; 32],
-                        source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
-                        target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+        let proofs = crate::types::VersionedSignedAggregateAndProof::PreElectra(vec![
+            eth_types::SignedAggregateAndProof {
+                message: eth_types::AggregateAndProof {
+                    aggregator_index: 42,
+                    aggregate: eth_types::Attestation {
+                        aggregation_bits: vec![0xff; 4],
+                        data: eth_types::AttestationData {
+                            slot: 100,
+                            index: 1,
+                            beacon_block_root: [1u8; 32],
+                            source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                            target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                        },
+                        signature: vec![0xaa; 96],
                     },
-                    signature: vec![0xaa; 96],
+                    selection_proof: vec![0xbb; 96],
                 },
-                selection_proof: vec![0xbb; 96],
+                signature: vec![0xcc; 96],
             },
-            signature: vec![0xcc; 96],
-        }];
+        ]);
 
         let result = client.submit_aggregate_and_proofs(&proofs).await;
 
@@ -3269,6 +3546,126 @@ mod tests {
             }
             _ => panic!("Expected ApiError with status 400"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_submit_attestation_pre_electra_body() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/pool/attestations"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let legacy = crate::types::LegacyAttestation {
+            aggregation_bits: "0xff03".to_string(),
+            data: crate::types::AttestationData {
+                slot: "100".to_string(),
+                index: "1".to_string(),
+                beacon_block_root: "0xroot".to_string(),
+                source: crate::types::Checkpoint {
+                    epoch: "3".to_string(),
+                    root: "0xsource".to_string(),
+                },
+                target: crate::types::Checkpoint {
+                    epoch: "4".to_string(),
+                    root: "0xtarget".to_string(),
+                },
+            },
+            signature: "0xsig".to_string(),
+        };
+
+        let versioned = crate::types::VersionedAttestation::PreElectra(vec![legacy]);
+        let result = client.submit_attestation(&versioned).await.unwrap();
+        assert!(result.is_success());
+    }
+
+    #[tokio::test]
+    async fn test_get_aggregate_attestation_with_committee_index() {
+        let mock_server = MockServer::start().await;
+
+        let att_data_root = format!("0x{}", "ab".repeat(32));
+        let sig_hex = format!("0x{}", "aa".repeat(96));
+        let response_body = serde_json::json!({
+            "data": {
+                "aggregation_bits": format!("0x{}", "ff".repeat(4)),
+                "data": {
+                    "slot": "100",
+                    "index": "1",
+                    "beacon_block_root": format!("0x{}", "01".repeat(32)),
+                    "source": {
+                        "epoch": "3",
+                        "root": format!("0x{}", "02".repeat(32))
+                    },
+                    "target": {
+                        "epoch": "4",
+                        "root": format!("0x{}", "03".repeat(32))
+                    }
+                },
+                "signature": sig_hex
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(wiremock::matchers::query_param("slot", "100"))
+            .and(wiremock::matchers::query_param("attestation_data_root", &att_data_root))
+            .and(wiremock::matchers::query_param("committee_index", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_aggregate_attestation(100, &att_data_root, Some(5)).await.unwrap();
+        assert_eq!(result.data.data.slot, 100);
+    }
+
+    #[tokio::test]
+    async fn test_submit_aggregate_and_proofs_electra() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let proofs = crate::types::VersionedSignedAggregateAndProof::Electra(vec![
+            eth_types::SignedElectraAggregateAndProof {
+                message: eth_types::ElectraAggregateAndProof {
+                    aggregator_index: 42,
+                    aggregate: eth_types::ElectraAttestation {
+                        aggregation_bits: vec![0xff; 4],
+                        data: eth_types::AttestationData {
+                            slot: 100,
+                            index: 1,
+                            beacon_block_root: [1u8; 32],
+                            source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                            target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                        },
+                        signature: vec![0xaa; 96],
+                        committee_bits: vec![0x01; 8],
+                    },
+                    selection_proof: vec![0xbb; 96],
+                },
+                signature: vec![0xcc; 96],
+            },
+        ]);
+
+        let result = client.submit_aggregate_and_proofs(&proofs).await;
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
@@ -3642,6 +4039,44 @@ mod tests {
         let client = BeaconClient::new(config).unwrap();
 
         let result = client.get_node_syncing().await;
+        assert!(result.is_err());
+    }
+
+    // -- get_node_version tests --
+
+    #[tokio::test]
+    async fn test_get_node_version_success() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"version":"Lighthouse/v7.1.0-a1b2c3d/x86_64-linux"}}"#,
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+        let version = client.get_node_version().await.unwrap();
+        assert_eq!(version, "Lighthouse/v7.1.0-a1b2c3d/x86_64-linux");
+    }
+
+    #[tokio::test]
+    async fn test_get_node_version_error() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/version"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+        let client = BeaconClient::new(config).unwrap();
+        let result = client.get_node_version().await;
         assert!(result.is_err());
     }
 

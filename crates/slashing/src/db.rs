@@ -1,6 +1,7 @@
 //! SQLite database layer for slashing protection.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
@@ -17,6 +18,7 @@ use metrics::definitions as metrics;
 pub struct SlashingDb {
     conn: Mutex<Connection>,
     path: Option<PathBuf>,
+    strict_semantics: AtomicBool,
 }
 
 impl SlashingDb {
@@ -25,7 +27,11 @@ impl SlashingDb {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SlashingError> {
         let path = path.as_ref();
         let conn = Connection::open(path)?;
-        let db = Self { conn: Mutex::new(conn), path: Some(path.to_path_buf()) };
+        let db = Self {
+            conn: Mutex::new(conn),
+            path: Some(path.to_path_buf()),
+            strict_semantics: AtomicBool::new(false),
+        };
         db.migrate()?;
         Ok(db)
     }
@@ -33,9 +39,19 @@ impl SlashingDb {
     /// Open an in-memory database for testing.
     pub fn open_in_memory() -> Result<Self, SlashingError> {
         let conn = Connection::open_in_memory()?;
-        let db = Self { conn: Mutex::new(conn), path: None };
+        let db =
+            Self { conn: Mutex::new(conn), path: None, strict_semantics: AtomicBool::new(false) };
         db.migrate()?;
         Ok(db)
+    }
+
+    /// Enable or disable strict slashing semantics.
+    ///
+    /// When enabled, `None == None` signing roots at the same target epoch
+    /// (or slot for blocks) are rejected as potential double votes/proposals.
+    /// Default is `false` (lenient: treats `None == None` as a re-sign).
+    pub fn set_strict_semantics(&self, strict: bool) {
+        self.strict_semantics.store(strict, Ordering::Relaxed);
     }
 
     fn migrate(&self) -> Result<(), SlashingError> {
@@ -517,7 +533,12 @@ impl SlashingDb {
             .optional()?;
 
         if let Some(existing_root) = existing {
-            if existing_root != signing_root {
+            let is_resign = match (&existing_root, &signing_root) {
+                (Some(er), Some(nr)) if er == nr => true,
+                (None, None) if !self.strict_semantics.load(Ordering::Relaxed) => true,
+                _ => false,
+            };
+            if !is_resign {
                 return Err(BlockSlashingViolation::DoubleBlockProposal { slot }.into());
             }
             // Same signing root — idempotent re-sign, commit without inserting
@@ -554,6 +575,25 @@ impl SlashingDb {
     ///
     /// Combines `is_safe_to_sign` and `record_attestation` in a single SQLite
     /// transaction with `IMMEDIATE` locking to prevent TOCTOU races.
+    ///
+    /// ## Edge Case Decisions (FU-32, FU-33)
+    ///
+    /// **FU-32 (same root, different source):**
+    /// Per EIP-3076, `signing_root` = `hash_tree_root(AttestationData)`. Since
+    /// `AttestationData` includes `source_epoch`, identical roots imply identical
+    /// source epochs. If source differs with same root, we log a warning
+    /// (signing pipeline bug indicator) but allow the attestation. This is
+    /// defense-in-depth only — the invariant violation is physically impossible
+    /// under correct SSZ serialization. See EIP-3076 Condition 5.
+    ///
+    /// **FU-33 (None==None signing root):**
+    /// EIP-3076 recommends treating null roots as "unknown" and assigning a
+    /// suitable dummy root internally. With `strict_semantics = false`
+    /// (default): `None==None` is treated as a re-sign for backward
+    /// compatibility with pre-existing records that lack roots. With
+    /// `strict_semantics = true`: `None==None` is rejected as a potential
+    /// double vote, matching Lighthouse/Prysm/Teku conservative behavior.
+    /// See EIP-3076 §Conditions, note on `signing_root` handling.
     pub fn check_and_record_attestation(
         &self,
         pubkey: &str,
@@ -618,11 +658,35 @@ impl SlashingDb {
         let mut is_duplicate = false;
         for (existing_source, existing_target, existing_root) in &existing {
             if target_epoch == *existing_target {
-                if *existing_root == signing_root {
-                    is_duplicate = true;
-                    continue;
+                let strict = self.strict_semantics.load(Ordering::Relaxed);
+                match (existing_root, &signing_root) {
+                    (Some(er), Some(nr)) if er == nr => {
+                        // Genuine re-sign: identical known roots. Allow.
+                        // FU-32: Defense-in-depth — verify source also matches.
+                        if source_epoch != *existing_source {
+                            tracing::warn!(
+                                pubkey,
+                                target_epoch,
+                                existing_source = *existing_source,
+                                new_source = source_epoch,
+                                "same signing root but different source epoch — possible signing pipeline bug"
+                            );
+                        }
+                        is_duplicate = true;
+                        continue;
+                    }
+                    (None, None) if !strict => {
+                        // Lenient mode (default): treat None==None as re-sign
+                        is_duplicate = true;
+                        continue;
+                    }
+                    _ => {
+                        // Different roots, or None involved in strict mode
+                        return Err(
+                            AttestationSlashingViolation::DoubleVote { target_epoch }.into()
+                        );
+                    }
                 }
-                return Err(AttestationSlashingViolation::DoubleVote { target_epoch }.into());
             }
 
             if source_epoch < *existing_source && target_epoch > *existing_target {
@@ -942,26 +1006,39 @@ impl SlashingDb {
         })
     }
 
-    /// Check file permissions and warn if the slashing DB is world-readable or world-writable (Unix only).
+    /// Check file permissions and warn if the slashing DB is group- or world-accessible (Unix only).
     #[cfg(unix)]
     pub fn check_file_permissions(&self) {
         use std::os::unix::fs::PermissionsExt;
         if let Some(path) = &self.path {
             if let Ok(metadata) = std::fs::metadata(path) {
                 let mode = metadata.permissions().mode();
-                let dangerous_bits = 0o006; // world-readable (4) + world-writable (2)
+                let dangerous_bits = 0o077; // group + world bits
                 if mode & dangerous_bits != 0 {
-                    let issues = match (mode & 0o004 != 0, mode & 0o002 != 0) {
-                        (true, true) => "world-readable and world-writable",
-                        (true, false) => "world-readable",
-                        (false, true) => "world-writable",
-                        _ => unreachable!(),
-                    };
+                    let mut issues = Vec::new();
+                    if mode & 0o040 != 0 {
+                        issues.push("group-readable");
+                    }
+                    if mode & 0o020 != 0 {
+                        issues.push("group-writable");
+                    }
+                    if mode & 0o010 != 0 {
+                        issues.push("group-executable");
+                    }
+                    if mode & 0o004 != 0 {
+                        issues.push("world-readable");
+                    }
+                    if mode & 0o002 != 0 {
+                        issues.push("world-writable");
+                    }
+                    if mode & 0o001 != 0 {
+                        issues.push("world-executable");
+                    }
                     tracing::warn!(
                         path = %path.display(),
                         mode = format!("{:o}", mode),
                         "slashing protection database is {}; consider restricting permissions to 0600",
-                        issues,
+                        issues.join(" and "),
                     );
                 }
             }
@@ -971,6 +1048,37 @@ impl SlashingDb {
     /// Check file permissions (no-op on non-Unix platforms).
     #[cfg(not(unix))]
     pub fn check_file_permissions(&self) {}
+
+    /// Check file permissions and return an error if the slashing DB is group- or world-accessible (Unix only).
+    ///
+    /// Use this with the `--strict-permissions` CLI flag to make unsafe permissions fatal at startup.
+    /// Unlike `check_file_permissions`, this also returns an error if file metadata cannot be read.
+    #[cfg(unix)]
+    pub fn check_file_permissions_strict(&self) -> Result<(), SlashingError> {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(path) = &self.path {
+            let metadata =
+                std::fs::metadata(path).map_err(|e| SlashingError::UnsafePermissions {
+                    path: path.display().to_string(),
+                    mode: format!("unreadable: {}", e),
+                })?;
+            let mode = metadata.permissions().mode();
+            let dangerous_bits = 0o077; // group + world bits
+            if mode & dangerous_bits != 0 {
+                return Err(SlashingError::UnsafePermissions {
+                    path: path.display().to_string(),
+                    mode: format!("{:o}", mode),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Check file permissions strictly (no-op on non-Unix platforms).
+    #[cfg(not(unix))]
+    pub fn check_file_permissions_strict(&self) -> Result<(), SlashingError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2202,6 +2310,218 @@ mod tests {
     }
 
     #[test]
+    fn test_same_root_same_source_no_warning() {
+        // Same signing_root + same source_epoch + same target_epoch → no warning, no error
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xABC".to_string()))
+            .expect("first should succeed");
+
+        // Re-sign with identical source, target, root → should succeed silently
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xABC".to_string()));
+        assert!(result.is_ok());
+
+        // Should not have inserted a duplicate
+        let attestations = db.get_attestations("0x1234").expect("failed to get");
+        assert_eq!(attestations.len(), 1);
+    }
+
+    #[test]
+    fn test_same_root_different_source_warns_but_allows() {
+        // Same signing_root + same target_epoch but different source_epoch
+        // → should log warning but still allow (defense-in-depth, not a rejection)
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xABC".to_string()))
+            .expect("first should succeed");
+
+        // Same root but different source → indicates possible signing pipeline bug
+        // Should still succeed (is_duplicate = true) but log a warning
+        let result = db.check_and_record_attestation("0x1234", 4, 5, Some("0xABC".to_string()));
+        assert!(result.is_ok(), "same root with different source must still be allowed");
+
+        // Should not have inserted a duplicate
+        let attestations = db.get_attestations("0x1234").expect("failed to get");
+        assert_eq!(attestations.len(), 1);
+    }
+
+    #[test]
+    fn test_double_vote_rejection_unchanged() {
+        // Different root + same target → must still be rejected as DoubleVote
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xABC".to_string()))
+            .expect("first should succeed");
+
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xDEF".to_string()));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("double vote"), "expected double vote error, got: {err}");
+    }
+
+    // ── FU-33 strict slashing semantics test matrix ──────────────────
+    // 6 root combinations × 2 modes (lenient/strict) = 12 tests
+    // Attestation tests:
+
+    #[test]
+    fn test_strict_att_some_same_lenient_allows() {
+        // Some("0xA") vs Some("0xA"), lenient → allow (genuine re-sign)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_att_some_same_strict_allows() {
+        // Some("0xA") vs Some("0xA"), strict → allow (genuine re-sign)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_att_some_diff_lenient_rejects() {
+        // Some("0xA") vs Some("0xB"), lenient → reject (double vote)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xB".into()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_att_some_diff_strict_rejects() {
+        // Some("0xA") vs Some("0xB"), strict → reject (double vote)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xB".into()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_att_some_none_lenient_rejects() {
+        // Some("0xA") vs None, lenient → reject (different roots)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_att_some_none_strict_rejects() {
+        // Some("0xA") vs None, strict → reject
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_att_none_some_lenient_rejects() {
+        // None vs Some("0xA"), lenient → reject (different roots)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.check_and_record_attestation("0x1234", 3, 5, None).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_att_none_some_strict_rejects() {
+        // None vs Some("0xA"), strict → reject
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_attestation("0x1234", 3, 5, None).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_strict_att_none_none_lenient_allows() {
+        // None vs None, lenient (default) → allow (treat as re-sign)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.check_and_record_attestation("0x1234", 3, 5, None).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_att_none_none_strict_rejects() {
+        // None vs None, strict → reject (unknown root = potential double vote)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_attestation("0x1234", 3, 5, None).expect("first");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, None);
+        assert!(result.is_err(), "strict mode should reject None==None as potential double vote");
+    }
+
+    #[test]
+    fn test_strict_att_no_existing_lenient_inserts() {
+        // No existing record, lenient → insert
+        let db = SlashingDb::open_in_memory().expect("open");
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        assert!(result.is_ok());
+        assert_eq!(db.get_attestations("0x1234").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_strict_att_no_existing_strict_inserts() {
+        // No existing record, strict → insert
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        assert!(result.is_ok());
+        assert_eq!(db.get_attestations("0x1234").unwrap().len(), 1);
+    }
+
+    // Block proposal strict semantics tests (None==None case)
+
+    #[test]
+    fn test_strict_block_none_none_lenient_allows() {
+        // None vs None block, lenient → allow
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.check_and_record_block("0x1234", 100, None).expect("first");
+        let result = db.check_and_record_block("0x1234", 100, None);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_block_none_none_strict_rejects() {
+        // None vs None block, strict → reject
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_block("0x1234", 100, None).expect("first");
+        let result = db.check_and_record_block("0x1234", 100, None);
+        assert!(
+            result.is_err(),
+            "strict mode should reject None==None block as potential double proposal"
+        );
+    }
+
+    #[test]
+    fn test_strict_block_some_same_strict_allows() {
+        // Some("0xA") vs Some("0xA") block, strict → allow (genuine re-sign)
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_block("0x1234", 100, Some("0xA".into())).expect("first");
+        let result = db.check_and_record_block("0x1234", 100, Some("0xA".into()));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_strict_block_none_some_strict_rejects() {
+        // None vs Some("0xA") block, strict → reject
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+        db.check_and_record_block("0x1234", 100, None).expect("first");
+        let result = db.check_and_record_block("0x1234", 100, Some("0xA".into()));
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_check_and_record_block_concurrent_double_proposal() {
         use std::sync::Arc;
         use std::thread;
@@ -2481,6 +2801,139 @@ mod tests {
 
         // Should not warn
         db.check_file_permissions();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_permissions_strict_returns_ok_for_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("strict_safe.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("failed to set permissions");
+
+        assert!(db.check_file_permissions_strict().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_permissions_strict_returns_err_for_0644() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("strict_readable.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+            .expect("failed to set permissions");
+
+        let err = db.check_file_permissions_strict().unwrap_err();
+        match err {
+            SlashingError::UnsafePermissions { ref path, ref mode } => {
+                assert!(path.contains("strict_readable.db"));
+                assert_eq!(mode, "100644");
+            }
+            _ => panic!("expected UnsafePermissions, got {:?}", err),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_permissions_strict_returns_err_for_0666() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("strict_both.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666))
+            .expect("failed to set permissions");
+
+        let err = db.check_file_permissions_strict().unwrap_err();
+        match err {
+            SlashingError::UnsafePermissions { ref path, ref mode } => {
+                assert!(path.contains("strict_both.db"));
+                assert_eq!(mode, "100666");
+            }
+            _ => panic!("expected UnsafePermissions, got {:?}", err),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_permissions_strict_returns_err_for_0660_group_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("strict_group.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
+            .expect("failed to set permissions");
+
+        let err = db.check_file_permissions_strict().unwrap_err();
+        match err {
+            SlashingError::UnsafePermissions { ref path, ref mode } => {
+                assert!(path.contains("strict_group.db"));
+                assert_eq!(mode, "100660");
+            }
+            _ => panic!("expected UnsafePermissions, got {:?}", err),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_permissions_strict_in_memory_returns_ok() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        assert!(db.check_file_permissions_strict().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_permissions_strict_deleted_file_returns_err() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("deleted.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::remove_file(&path).expect("failed to delete file");
+
+        let err = db.check_file_permissions_strict().unwrap_err();
+        match err {
+            SlashingError::UnsafePermissions { ref mode, .. } => {
+                assert!(
+                    mode.starts_with("unreadable:"),
+                    "expected 'unreadable:' prefix, got: {}",
+                    mode
+                );
+            }
+            _ => panic!("expected UnsafePermissions, got {:?}", err),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_check_file_permissions_warn_detects_group_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("perms_group.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660))
+            .expect("failed to set permissions");
+
+        // Should not panic, just log a warning about group-readable and group-writable
+        db.check_file_permissions();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn test_check_file_permissions_strict_returns_ok_on_non_unix() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        assert!(db.check_file_permissions_strict().is_ok());
     }
 
     // --- Watermark and pruning tests ---
@@ -2814,5 +3267,185 @@ mod tests {
             )
             .expect("failed to query tables");
         assert_eq!(table_count, 1);
+    }
+}
+
+/// Living documentation tests for EIP-3076 edge case decisions.
+///
+/// These tests codify the rationale behind FU-32 and FU-33 slashing
+/// protection decisions. Each test documents a specific edge case with
+/// references to the relevant EIP-3076 section. Future developers
+/// should read these tests to understand *why* the code behaves this way.
+#[cfg(test)]
+mod edge_case_tests {
+    use super::*;
+
+    // ── FU-32: Same signing_root but different source_epoch ──────────
+    //
+    // EIP-3076 defines signing_root as hash_tree_root(AttestationData).
+    // AttestationData includes both source and target. Therefore, if two
+    // attestations share the same signing_root, they MUST have identical
+    // source_epoch, target_epoch, and beacon_block_root.
+    //
+    // If we ever see same root + different source, it indicates a bug in
+    // the signing pipeline (e.g., incorrect root computation). We log a
+    // warning but still allow the attestation because:
+    //   1. The signing_root match means it's the same logical message.
+    //   2. Rejecting would be overly strict — the validator already signed
+    //      this exact data.
+    //   3. The mismatch is physically impossible under correct SSZ, so
+    //      rejection would only punish buggy-but-non-slashable clients.
+
+    #[test]
+    fn test_fu32_same_root_same_source_silent_pass() {
+        // EIP-3076 Condition 5: re-signing the same attestation is safe.
+        // When signing_root matches AND source matches, this is a genuine
+        // idempotent re-sign. No warning, no rejection.
+        let db = SlashingDb::open_in_memory().expect("open");
+
+        db.check_and_record_attestation("0xval", 10, 20, Some("0xdeadbeef".into()))
+            .expect("initial attestation");
+
+        // Identical re-sign: same source, same target, same root
+        let result = db.check_and_record_attestation("0xval", 10, 20, Some("0xdeadbeef".into()));
+        assert!(result.is_ok(), "identical re-sign must be allowed silently");
+
+        // Should not create a duplicate record
+        assert_eq!(db.get_attestations("0xval").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_fu32_same_root_different_source_warns_but_allows() {
+        // EIP-3076 Condition 5 + FU-32 defense-in-depth:
+        //
+        // This scenario is physically impossible under correct SSZ because
+        // signing_root = hash_tree_root(AttestationData) which includes
+        // source_epoch. If it occurs, something is wrong in the signing
+        // pipeline (e.g., root was copied from a different attestation).
+        //
+        // Decision: LOG WARNING but ALLOW the attestation.
+        // Rationale: the root match proves it's the same data, so rejecting
+        // would only hurt a client with a minor bookkeeping bug.
+        let db = SlashingDb::open_in_memory().expect("open");
+
+        db.check_and_record_attestation("0xval", 10, 20, Some("0xdeadbeef".into()))
+            .expect("initial attestation");
+
+        // Same root but source_epoch differs (10 → 15): warns internally
+        let result = db.check_and_record_attestation("0xval", 15, 20, Some("0xdeadbeef".into()));
+        assert!(
+            result.is_ok(),
+            "same root with different source must still be allowed (defense-in-depth warning only)"
+        );
+
+        // No duplicate inserted
+        assert_eq!(db.get_attestations("0xval").unwrap().len(), 1);
+    }
+
+    // ── FU-33: None==None signing root semantics ─────────────────────
+    //
+    // EIP-3076 notes that signing_root "can be missing for legacy records."
+    // The spec recommends assigning a dummy root internally.
+    //
+    // Problem: if both the existing record and the new attestation have
+    // None as signing_root, are they the same attestation (re-sign) or
+    // different attestations (double vote)?
+    //
+    // We cannot know — hence the choice is a policy decision:
+    //
+    // - Lenient (default, strict_semantics=false): treat None==None as
+    //   re-sign. This is safer for operators with legacy records that
+    //   pre-date root recording. Avoids false-positive rejections.
+    //
+    // - Strict (strict_semantics=true): treat None==None as a potential
+    //   double vote. This matches the conservative behavior of Lighthouse,
+    //   Prysm, and Teku. Recommended for new deployments where all records
+    //   should have roots.
+
+    #[test]
+    fn test_fu33_none_none_lenient_allows() {
+        // Default (lenient) mode: None==None at same target is treated as
+        // an idempotent re-sign. This preserves backward compatibility with
+        // legacy slashing protection records that lack signing_root.
+        //
+        // EIP-3076 §Conditions: "If signing_root is not provided, the
+        // implementation should treat it as 'unknown'."
+        // Our lenient interpretation: unknown == unknown → same message.
+        let db = SlashingDb::open_in_memory().expect("open");
+
+        db.check_and_record_attestation("0xval", 10, 20, None)
+            .expect("initial attestation without root");
+
+        let result = db.check_and_record_attestation("0xval", 10, 20, None);
+        assert!(result.is_ok(), "lenient mode: None==None must be allowed as re-sign");
+    }
+
+    #[test]
+    fn test_fu33_none_none_strict_rejects() {
+        // Strict mode: None==None at same target is rejected as a potential
+        // double vote. Without a signing_root, we cannot prove the two
+        // attestations contain the same data.
+        //
+        // EIP-3076 §Conditions: "If signing_root is not provided, the
+        // implementation should treat it as 'unknown'."
+        // Our strict interpretation: unknown == unknown → could be different
+        // messages → reject to be safe.
+        //
+        // This matches Lighthouse/Prysm/Teku conservative behavior and is
+        // recommended for new deployments where all attestations should
+        // have signing_root populated.
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+
+        db.check_and_record_attestation("0xval", 10, 20, None)
+            .expect("initial attestation without root");
+
+        let result = db.check_and_record_attestation("0xval", 10, 20, None);
+        assert!(
+            result.is_err(),
+            "strict mode: None==None must be rejected as potential double vote"
+        );
+    }
+
+    #[test]
+    fn test_fu33_none_vs_some_always_rejects() {
+        // Regardless of strict/lenient mode, None vs Some (or Some vs None)
+        // at the same target epoch is ALWAYS rejected as a double vote.
+        //
+        // Rationale: if one attestation has a known root and the other doesn't,
+        // we cannot prove they are the same message. The safe choice is to
+        // reject. This is unambiguous in EIP-3076 — different roots (including
+        // the absence of one) at the same target = double vote.
+        let db = SlashingDb::open_in_memory().expect("open");
+
+        // Case 1: existing=Some, new=None
+        db.check_and_record_attestation("0xval_a", 10, 20, Some("0xroot".into()))
+            .expect("initial with root");
+        let result = db.check_and_record_attestation("0xval_a", 10, 20, None);
+        assert!(result.is_err(), "Some vs None must always reject");
+
+        // Case 2: existing=None, new=Some
+        db.check_and_record_attestation("0xval_b", 10, 20, None).expect("initial without root");
+        let result = db.check_and_record_attestation("0xval_b", 10, 20, Some("0xroot".into()));
+        assert!(result.is_err(), "None vs Some must always reject");
+    }
+
+    #[test]
+    fn test_fu33_strict_block_none_none_rejects() {
+        // FU-33 strict semantics also applies to block proposals.
+        //
+        // EIP-3076 block signing_root = hash_tree_root(BeaconBlock).
+        // Same policy: in strict mode, None==None at the same slot is
+        // rejected because we cannot confirm it's the same block.
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_strict_semantics(true);
+
+        db.check_and_record_block("0xval", 500, None).expect("initial block without root");
+
+        let result = db.check_and_record_block("0xval", 500, None);
+        assert!(
+            result.is_err(),
+            "strict mode: None==None block must be rejected as potential double proposal"
+        );
     }
 }

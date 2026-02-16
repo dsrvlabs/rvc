@@ -226,6 +226,20 @@ lazy_static! {
         histogram
     };
 
+    /// Counter for duty reorg detections.
+    /// Labels: duty_type (attester, proposer)
+    pub static ref RVC_DUTY_REORG_DETECTED_TOTAL: IntCounterVec = {
+        let opts = Opts::new(
+            "rvc_duty_reorg_detected_total",
+            "Total number of duty reorg detections"
+        );
+        let counter = IntCounterVec::new(opts, &["duty_type"])
+            .expect("Failed to create rvc_duty_reorg_detected_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_duty_reorg_detected_total metric");
+        counter
+    };
+
     /// Counter for BN errors per endpoint.
     /// Labels: endpoint
     pub static ref RVC_BN_ERRORS_TOTAL: IntCounterVec = {
@@ -258,6 +272,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS);
     lazy_static::initialize(&RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS);
     lazy_static::initialize(&RVC_SLASHING_DB_PRUNE_TOTAL);
+    lazy_static::initialize(&RVC_DUTY_REORG_DETECTED_TOTAL);
     lazy_static::initialize(&RVC_BN_HEALTH_SCORE);
     lazy_static::initialize(&RVC_BN_LATENCY_SECONDS);
     lazy_static::initialize(&RVC_BN_ERRORS_TOTAL);
@@ -404,6 +419,17 @@ mod tests {
         RVC_DUTY_FETCH_DURATION_SECONDS.with_label_values(&[]).observe(0.1);
         let count = RVC_DUTY_FETCH_DURATION_SECONDS.with_label_values(&[]).get_sample_count();
         assert!(count >= 1, "Histogram should have at least 1 observation");
+    }
+
+    #[test]
+    fn test_duty_reorg_detected_total_increments() {
+        RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["attester"]).inc();
+        let attester_value = RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["attester"]).get();
+        assert!(attester_value >= 1, "Attester reorg counter should be at least 1");
+
+        RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["proposer"]).inc();
+        let proposer_value = RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["proposer"]).get();
+        assert!(proposer_value >= 1, "Proposer reorg counter should be at least 1");
     }
 
     #[test]

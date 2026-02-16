@@ -27,11 +27,40 @@ pub struct AttestationData {
 
 /// A single attestation in the Electra (v2) `SingleAttestation` format.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Attestation {
+pub struct SingleAttestation {
     pub committee_index: u64,
     pub attester_index: u64,
     pub data: AttestationData,
     pub signature: String,
+}
+
+/// A pre-Electra (Phase 0 through Deneb) attestation with aggregation bits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyAttestation {
+    pub aggregation_bits: String,
+    pub data: AttestationData,
+    pub signature: String,
+}
+
+/// Fork-versioned attestation for submission endpoints.
+#[derive(Debug, Clone, Serialize)]
+pub enum VersionedAttestation {
+    PreElectra(Vec<LegacyAttestation>),
+    Electra(Vec<SingleAttestation>),
+}
+
+/// Fork-versioned aggregate attestation for fetch responses.
+#[derive(Debug, Clone)]
+pub enum VersionedAggregateAttestation {
+    PreElectra(eth_types::Attestation),
+    Electra(eth_types::ElectraAttestation),
+}
+
+/// Fork-versioned signed aggregate and proof for submission.
+#[derive(Debug, Clone)]
+pub enum VersionedSignedAggregateAndProof {
+    PreElectra(Vec<eth_types::SignedAggregateAndProof>),
+    Electra(Vec<eth_types::SignedElectraAggregateAndProof>),
 }
 
 /// Header of a beacon block.
@@ -284,6 +313,15 @@ pub struct SyncingData {
 /// Response type for the node syncing endpoint.
 pub type SyncingResponse = DataResponse<SyncingData>;
 
+/// Node version data from the beacon node's `/eth/v1/node/version` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NodeVersionData {
+    pub version: String,
+}
+
+/// Response type for the node version endpoint.
+pub type NodeVersionResponse = DataResponse<NodeVersionData>;
+
 /// Error details for a single attestation that failed validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedAttestationError {
@@ -383,7 +421,7 @@ mod tests {
             "signature": "0xsignature"
         }"#;
 
-        let attestation: Attestation = serde_json::from_str(json).unwrap();
+        let attestation: SingleAttestation = serde_json::from_str(json).unwrap();
         assert_eq!(attestation.committee_index, 1);
         assert_eq!(attestation.attester_index, 42);
         assert_eq!(attestation.data.slot, "1000");
@@ -904,6 +942,20 @@ mod tests {
     }
 
     #[test]
+    fn test_node_version_data_deserialize() {
+        let json = r#"{"version": "Lighthouse/v7.1.0-a1b2c3d/x86_64-linux"}"#;
+        let data: NodeVersionData = serde_json::from_str(json).unwrap();
+        assert_eq!(data.version, "Lighthouse/v7.1.0-a1b2c3d/x86_64-linux");
+    }
+
+    #[test]
+    fn test_node_version_response_deserialize() {
+        let json = r#"{"data":{"version":"Lighthouse/v7.1.0-a1b2c3d/x86_64-linux"}}"#;
+        let response: NodeVersionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.data.version, "Lighthouse/v7.1.0-a1b2c3d/x86_64-linux");
+    }
+
+    #[test]
     fn test_syncing_data_deserialize_synced() {
         let json = r#"{
             "head_slot": "1000",
@@ -952,5 +1004,172 @@ mod tests {
         let response: SyncingResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.data.head_slot, "1000");
         assert!(!response.data.is_syncing);
+    }
+
+    #[test]
+    fn test_legacy_attestation_serde_roundtrip() {
+        let att = LegacyAttestation {
+            aggregation_bits: "0xff03".to_string(),
+            data: AttestationData {
+                slot: "1000".to_string(),
+                index: "1".to_string(),
+                beacon_block_root: "0xroot".to_string(),
+                source: Checkpoint { epoch: "100".to_string(), root: "0xsource".to_string() },
+                target: Checkpoint { epoch: "101".to_string(), root: "0xtarget".to_string() },
+            },
+            signature: "0xsig".to_string(),
+        };
+        let json = serde_json::to_string(&att).unwrap();
+        let deserialized: LegacyAttestation = serde_json::from_str(&json).unwrap();
+        assert_eq!(att, deserialized);
+    }
+
+    #[test]
+    fn test_legacy_attestation_deserialize() {
+        let json = r#"{
+            "aggregation_bits": "0xff03",
+            "data": {
+                "slot": "1000",
+                "index": "1",
+                "beacon_block_root": "0xroot",
+                "source": {
+                    "epoch": "100",
+                    "root": "0xsource"
+                },
+                "target": {
+                    "epoch": "101",
+                    "root": "0xtarget"
+                }
+            },
+            "signature": "0xsig"
+        }"#;
+
+        let att: LegacyAttestation = serde_json::from_str(json).unwrap();
+        assert_eq!(att.aggregation_bits, "0xff03");
+        assert_eq!(att.data.slot, "1000");
+        assert_eq!(att.signature, "0xsig");
+    }
+
+    #[test]
+    fn test_versioned_attestation_pre_electra() {
+        let legacy = LegacyAttestation {
+            aggregation_bits: "0xff".to_string(),
+            data: AttestationData {
+                slot: "100".to_string(),
+                index: "0".to_string(),
+                beacon_block_root: "0xroot".to_string(),
+                source: Checkpoint { epoch: "3".to_string(), root: "0xs".to_string() },
+                target: Checkpoint { epoch: "4".to_string(), root: "0xt".to_string() },
+            },
+            signature: "0xsig".to_string(),
+        };
+        let versioned = VersionedAttestation::PreElectra(vec![legacy]);
+        assert!(matches!(versioned, VersionedAttestation::PreElectra(ref v) if v.len() == 1));
+    }
+
+    #[test]
+    fn test_versioned_attestation_electra() {
+        let single = SingleAttestation {
+            committee_index: 1,
+            attester_index: 42,
+            data: AttestationData {
+                slot: "100".to_string(),
+                index: "0".to_string(),
+                beacon_block_root: "0xroot".to_string(),
+                source: Checkpoint { epoch: "3".to_string(), root: "0xs".to_string() },
+                target: Checkpoint { epoch: "4".to_string(), root: "0xt".to_string() },
+            },
+            signature: "0xsig".to_string(),
+        };
+        let versioned = VersionedAttestation::Electra(vec![single]);
+        assert!(matches!(versioned, VersionedAttestation::Electra(ref v) if v.len() == 1));
+    }
+
+    #[test]
+    fn test_versioned_aggregate_attestation_pre_electra() {
+        let att = eth_types::Attestation {
+            aggregation_bits: vec![0xff],
+            data: eth_types::AttestationData {
+                slot: 100,
+                index: 1,
+                beacon_block_root: [1u8; 32],
+                source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+            },
+            signature: vec![0xaa; 96],
+        };
+        let versioned = VersionedAggregateAttestation::PreElectra(att);
+        assert!(matches!(versioned, VersionedAggregateAttestation::PreElectra(_)));
+    }
+
+    #[test]
+    fn test_versioned_aggregate_attestation_electra() {
+        let att = eth_types::ElectraAttestation {
+            aggregation_bits: vec![0xff],
+            data: eth_types::AttestationData {
+                slot: 100,
+                index: 1,
+                beacon_block_root: [1u8; 32],
+                source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+            },
+            signature: vec![0xaa; 96],
+            committee_bits: vec![0x01; 8],
+        };
+        let versioned = VersionedAggregateAttestation::Electra(att);
+        assert!(matches!(versioned, VersionedAggregateAttestation::Electra(_)));
+    }
+
+    #[test]
+    fn test_versioned_signed_aggregate_and_proof_pre_electra() {
+        let proofs = vec![eth_types::SignedAggregateAndProof {
+            message: eth_types::AggregateAndProof {
+                aggregator_index: 42,
+                aggregate: eth_types::Attestation {
+                    aggregation_bits: vec![0xff],
+                    data: eth_types::AttestationData {
+                        slot: 100,
+                        index: 1,
+                        beacon_block_root: [1u8; 32],
+                        source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                        target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                    },
+                    signature: vec![0xaa; 96],
+                },
+                selection_proof: vec![0xbb; 96],
+            },
+            signature: vec![0xcc; 96],
+        }];
+        let versioned = VersionedSignedAggregateAndProof::PreElectra(proofs);
+        assert!(
+            matches!(versioned, VersionedSignedAggregateAndProof::PreElectra(ref v) if v.len() == 1)
+        );
+    }
+
+    #[test]
+    fn test_versioned_signed_aggregate_and_proof_electra() {
+        let proofs = vec![eth_types::SignedElectraAggregateAndProof {
+            message: eth_types::ElectraAggregateAndProof {
+                aggregator_index: 42,
+                aggregate: eth_types::ElectraAttestation {
+                    aggregation_bits: vec![0xff],
+                    data: eth_types::AttestationData {
+                        slot: 100,
+                        index: 1,
+                        beacon_block_root: [1u8; 32],
+                        source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                        target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                    },
+                    signature: vec![0xaa; 96],
+                    committee_bits: vec![0x01; 8],
+                },
+                selection_proof: vec![0xbb; 96],
+            },
+            signature: vec![0xcc; 96],
+        }];
+        let versioned = VersionedSignedAggregateAndProof::Electra(proofs);
+        assert!(
+            matches!(versioned, VersionedSignedAggregateAndProof::Electra(ref v) if v.len() == 1)
+        );
     }
 }

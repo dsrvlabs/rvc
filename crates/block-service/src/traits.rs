@@ -31,6 +31,14 @@ pub trait BeaconBlockClient {
         signed_block: &SignedBlindedBeaconBlock,
         consensus_version: &str,
     ) -> Result<(), BlockServiceError>;
+
+    /// Publish a block as raw SSZ bytes using `Content-Type: application/octet-stream`.
+    async fn publish_block_ssz(
+        &self,
+        ssz_bytes: &[u8],
+        consensus_version: &str,
+        is_blinded: bool,
+    ) -> Result<(), BlockServiceError>;
 }
 
 /// Response from block production, mirroring beacon API metadata.

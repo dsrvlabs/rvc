@@ -4,12 +4,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use beacon::{
-    AggregateAttestationResponse, Attestation, AttestationDataResponse, AttesterDutiesResponse,
-    BeaconClient, BeaconCommitteeSubscription, BeaconError, BlockRootResponse, ConfigSpecResponse,
+    AggregateAttestationResponse, AttestationDataResponse, AttesterDutiesResponse, BeaconClient,
+    BeaconCommitteeSubscription, BeaconError, BlockRootResponse, ConfigSpecResponse,
     GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
-    SignedAggregateAndProof, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorsResponse,
+    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    SyncingResponse, ValidatorsResponse, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use eth_types::{
     ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
@@ -48,6 +48,7 @@ pub struct BnManager {
     clients: Vec<BeaconClient>,
     sync_statuses: SharedSyncStatuses,
     health_trackers: SharedHealthTrackers,
+    overall_timeout: Option<Duration>,
 }
 
 impl BnManager {
@@ -96,7 +97,7 @@ impl BnManager {
         let sync_statuses = new_shared_sync_statuses(clients.len());
         let endpoints: Vec<String> = clients.iter().map(|c| c.endpoint().to_string()).collect();
         let health_trackers = new_shared_health_trackers(&endpoints);
-        Ok(Self { clients, sync_statuses, health_trackers })
+        Ok(Self { clients, sync_statuses, health_trackers, overall_timeout: None })
     }
 
     /// Returns the shared sync status tracker.
@@ -107,6 +108,16 @@ impl BnManager {
     /// Returns the shared health trackers.
     pub fn health_trackers(&self) -> &SharedHealthTrackers {
         &self.health_trackers
+    }
+
+    /// Sets an overall deadline for multi-BN operations (`query_best`, `broadcast`).
+    ///
+    /// When set, the entire operation (including all BN queries and fallbacks)
+    /// is wrapped in `tokio::time::timeout`. If the deadline expires before any
+    /// BN responds, a timeout error is returned.
+    pub fn with_overall_timeout(mut self, timeout: Duration) -> Self {
+        self.overall_timeout = Some(timeout);
+        self
     }
 
     /// Returns current health scores for all BNs.
@@ -217,6 +228,24 @@ impl BnManager {
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
+        if let Some(deadline) = self.overall_timeout {
+            match tokio::time::timeout(deadline, self.query_first_inner(op_name, &op)).await {
+                Ok(result) => result,
+                Err(_) => Err(BeaconError::HttpError(format!(
+                    "{op_name}: overall deadline of {}s exceeded",
+                    deadline.as_secs()
+                ))),
+            }
+        } else {
+            self.query_first_inner(op_name, &op).await
+        }
+    }
+
+    async fn query_first_inner<'s, T, F>(&'s self, op_name: &str, op: &F) -> Result<T, BeaconError>
+    where
+        T: Send,
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+    {
         let indices = self.synced_indices().await;
         let mut last_err = None;
 
@@ -262,6 +291,32 @@ impl BnManager {
         &'s self,
         op_name: &str,
         op: F,
+        pick_best: fn(&T, &T) -> bool,
+    ) -> Result<T, BeaconError>
+    where
+        T: Send + 'static,
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+    {
+        if let Some(deadline) = self.overall_timeout {
+            match tokio::time::timeout(deadline, self.query_best_inner(op_name, &op, pick_best))
+                .await
+            {
+                Ok(result) => return result,
+                Err(_) => {
+                    return Err(BeaconError::HttpError(format!(
+                        "{op_name}: overall deadline of {}s exceeded",
+                        deadline.as_secs()
+                    )))
+                }
+            }
+        }
+        self.query_best_inner(op_name, &op, pick_best).await
+    }
+
+    async fn query_best_inner<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        op: &F,
         pick_best: fn(&T, &T) -> bool,
     ) -> Result<T, BeaconError>
     where
@@ -418,6 +473,24 @@ impl BnManager {
     where
         F: Fn(&'s BeaconClient) -> BoxFut<'s, ()>,
     {
+        if let Some(deadline) = self.overall_timeout {
+            match tokio::time::timeout(deadline, self.broadcast_inner(op_name, &op)).await {
+                Ok(result) => return result,
+                Err(_) => {
+                    return Err(BeaconError::HttpError(format!(
+                        "{op_name}: overall deadline of {}s exceeded",
+                        deadline.as_secs()
+                    )))
+                }
+            }
+        }
+        self.broadcast_inner(op_name, &op).await
+    }
+
+    async fn broadcast_inner<'s, F>(&'s self, op_name: &str, op: &F) -> Result<(), BeaconError>
+    where
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, ()>,
+    {
         let mut futs: Vec<IndexedTimedResultFut<'_, ()>> = Vec::with_capacity(self.clients.len());
 
         for (i, client) in self.clients.iter().enumerate() {
@@ -482,6 +555,31 @@ impl BnManager {
         &'s self,
         op_name: &str,
         op: F,
+    ) -> Result<T, BeaconError>
+    where
+        T: Send + 'static,
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+    {
+        if let Some(deadline) = self.overall_timeout {
+            match tokio::time::timeout(deadline, self.broadcast_with_result_inner(op_name, &op))
+                .await
+            {
+                Ok(result) => return result,
+                Err(_) => {
+                    return Err(BeaconError::HttpError(format!(
+                        "{op_name}: overall deadline of {}s exceeded",
+                        deadline.as_secs()
+                    )))
+                }
+            }
+        }
+        self.broadcast_with_result_inner(op_name, &op).await
+    }
+
+    async fn broadcast_with_result_inner<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        op: &F,
     ) -> Result<T, BeaconError>
     where
         T: Send + 'static,
@@ -662,7 +760,7 @@ impl BeaconNodeClient for BnManager {
 
     async fn submit_attestation(
         &self,
-        attestations: &[Attestation],
+        attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError> {
         self.broadcast_with_result("submit_attestation", |c| {
             Box::pin(c.submit_attestation(attestations))
@@ -676,16 +774,17 @@ impl BeaconNodeClient for BnManager {
         &self,
         slot: u64,
         attestation_data_root: &str,
+        committee_index: Option<u64>,
     ) -> Result<AggregateAttestationResponse, BeaconError> {
         self.query_first("get_aggregate_attestation", |c| {
-            Box::pin(c.get_aggregate_attestation(slot, attestation_data_root))
+            Box::pin(c.get_aggregate_attestation(slot, attestation_data_root, committee_index))
         })
         .await
     }
 
     async fn submit_aggregate_and_proofs(
         &self,
-        proofs: &[SignedAggregateAndProof],
+        proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError> {
         self.broadcast("submit_aggregate_and_proofs", |c| {
             Box::pin(c.submit_aggregate_and_proofs(proofs))
@@ -772,6 +871,10 @@ impl BeaconNodeClient for BnManager {
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
         self.query_first("get_node_syncing", |c| Box::pin(c.get_node_syncing())).await
     }
+
+    async fn get_node_version(&self) -> Result<String, BeaconError> {
+        self.query_first("get_node_version", |c| Box::pin(c.get_node_version())).await
+    }
 }
 
 /// Implements `BeaconNodeClient` for `BeaconClient` directly, useful for tests
@@ -854,7 +957,7 @@ impl BeaconNodeClient for BeaconClient {
 
     async fn submit_attestation(
         &self,
-        attestations: &[Attestation],
+        attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError> {
         self.submit_attestation(attestations).await
     }
@@ -863,13 +966,14 @@ impl BeaconNodeClient for BeaconClient {
         &self,
         slot: u64,
         attestation_data_root: &str,
+        committee_index: Option<u64>,
     ) -> Result<AggregateAttestationResponse, BeaconError> {
-        self.get_aggregate_attestation(slot, attestation_data_root).await
+        self.get_aggregate_attestation(slot, attestation_data_root, committee_index).await
     }
 
     async fn submit_aggregate_and_proofs(
         &self,
-        proofs: &[SignedAggregateAndProof],
+        proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError> {
         self.submit_aggregate_and_proofs(proofs).await
     }
@@ -924,6 +1028,10 @@ impl BeaconNodeClient for BeaconClient {
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
         self.get_node_syncing().await
+    }
+
+    async fn get_node_version(&self) -> Result<String, BeaconError> {
+        self.get_node_version().await
     }
 }
 
@@ -1278,7 +1386,8 @@ mod tests {
             .await;
 
         let manager = make_manager(&mock_server.uri());
-        let result = manager.submit_aggregate_and_proofs(&[]).await;
+        let proofs = VersionedSignedAggregateAndProof::PreElectra(vec![]);
+        let result = manager.submit_aggregate_and_proofs(&proofs).await;
         assert!(result.is_ok());
     }
 
@@ -1784,7 +1893,8 @@ mod tests {
             .await;
 
         let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
-        let result = manager.submit_aggregate_and_proofs(&[]).await;
+        let proofs = VersionedSignedAggregateAndProof::PreElectra(vec![]);
+        let result = manager.submit_aggregate_and_proofs(&proofs).await;
         assert!(result.is_ok());
     }
 
@@ -2616,5 +2726,179 @@ mod tests {
         assert!(scores[1].latency_ms > 0.0, "BN2 latency should be tracked");
         assert_eq!(scores[0].error_rate, 0.0);
         assert_eq!(scores[1].error_rate, 0.0);
+    }
+
+    // -- get_node_version tests --
+
+    #[tokio::test]
+    async fn test_get_node_version_via_trait() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"version":"Lighthouse/v7.1.0-a1b2c3d/x86_64-linux"}}"#,
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = beacon::BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+        let dyn_client: &dyn BeaconNodeClient = &client;
+        let version = dyn_client.get_node_version().await.unwrap();
+        assert_eq!(version, "Lighthouse/v7.1.0-a1b2c3d/x86_64-linux");
+    }
+
+    #[tokio::test]
+    async fn test_get_node_version_bn_manager_delegates() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/version"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"data":{"version":"Prysm/v5.0.0/linux-amd64"}}"#),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let manager = make_manager(&mock_server.uri());
+        let version = manager.get_node_version().await.unwrap();
+        assert_eq!(version, "Prysm/v5.0.0/linux-amd64");
+    }
+
+    #[tokio::test]
+    async fn test_get_node_version_failover() {
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&primary)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&secondary)
+            .await;
+
+        // Primary fails
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/version"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("error"))
+            .expect(1)
+            .mount(&primary)
+            .await;
+
+        // Secondary succeeds
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/version"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"data":{"version":"Teku/v24.0.0"}}"#),
+            )
+            .expect(1)
+            .mount(&secondary)
+            .await;
+
+        let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+        let version = manager.get_node_version().await.unwrap();
+        assert_eq!(version, "Teku/v24.0.0");
+    }
+
+    #[tokio::test]
+    async fn test_overall_deadline_fires_when_all_bns_slow() {
+        let server = MockServer::start().await;
+
+        // Both syncing + version respond normally for setup
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "head_slot": "100", "sync_distance": "0", "is_syncing": false, "is_optimistic": false, "el_offline": false }
+            })))
+            .mount(&server)
+            .await;
+
+        // Genesis responds slowly — longer than deadline
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({
+                        "data": {
+                            "genesis_time": "1606824023",
+                            "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                            "genesis_fork_version": "0x00000000"
+                        }
+                    }))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = BnManagerConfig::new(vec![server.uri()]);
+        let manager =
+            BnManager::new(config).unwrap().with_overall_timeout(Duration::from_millis(200));
+
+        // Mark BN as synced so query_first is used
+        {
+            let mut statuses = manager.sync_statuses().write().await;
+            statuses[0] = BnSyncStatus::Synced;
+        }
+
+        let result = manager.get_genesis().await;
+        assert!(result.is_err(), "Should timeout when BN is slower than overall deadline");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("deadline") || err_msg.contains("timed out"),
+            "Error should mention deadline/timeout, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_overall_deadline_by_default() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "head_slot": "100", "sync_distance": "0", "is_syncing": false, "is_optimistic": false, "el_offline": false }
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "genesis_time": "1606824023",
+                    "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "genesis_fork_version": "0x00000000"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let config = BnManagerConfig::new(vec![server.uri()]);
+        let manager = BnManager::new(config).unwrap();
+
+        // No overall_timeout set — should default to None
+        {
+            let mut statuses = manager.sync_statuses().write().await;
+            statuses[0] = BnSyncStatus::Synced;
+        }
+
+        let result = manager.get_genesis().await;
+        assert!(result.is_ok(), "Should succeed without overall deadline");
     }
 }

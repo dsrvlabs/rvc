@@ -7,9 +7,12 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-use beacon::{Attestation, AttesterDuty, BeaconCommitteeSubscription, ProposerPreparation};
+use beacon::{
+    AttesterDuty, BeaconCommitteeSubscription, LegacyAttestation, ProposerPreparation,
+    SingleAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+};
 use block_service::{BeaconBlockClient, BlockService};
-use bn_manager::BeaconNodeClient;
+use bn_manager::{BeaconNodeClient, OperationTimeouts};
 use builder::BuilderService;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
@@ -19,8 +22,9 @@ use eth_types::{
 };
 use metrics::definitions::{
     attestation_status, orchestrator_result, RVC_AGGREGATIONS_TOTAL, RVC_ATTESTATIONS_TOTAL,
-    RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
-    RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL, RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
+    RVC_DUTY_REORG_DETECTED_TOTAL, RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS,
+    RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL, RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL,
+    RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
 };
 use propagator::{AttestationSubmitter, Propagator};
 use signer::{is_aggregator, SignerService};
@@ -30,35 +34,33 @@ use tree_hash::TreeHash;
 
 use super::error::OrchestratorError;
 
-/// Timeout for block production beacon API calls.
-const BLOCK_PRODUCE_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Timeout for block publication beacon API calls.
-const BLOCK_PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Timeout for sync committee message operations.
-const SYNC_MESSAGE_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Timeout for sync committee contribution operations.
-const SYNC_CONTRIBUTION_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Timeout for duty fetching operations.
-const DUTY_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Timeout for attestation data fetch.
-const ATTESTATION_TIMEOUT: Duration = Duration::from_secs(4);
-
-/// Timeout for aggregate attestation fetch and submission.
-const AGGREGATION_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Timeout for proposer preparation and committee subscription calls.
-const PREPARATION_TIMEOUT: Duration = Duration::from_secs(3);
-
 /// Total validators in a sync committee.
 const SYNC_COMMITTEE_SIZE: u64 = 512;
 
 /// Number of subnets the sync committee is split across.
 const SYNC_COMMITTEE_SUBNET_COUNT: u64 = 4;
+
+/// Constructs a hex-encoded SSZ bitlist where only the validator's position
+/// in the committee is set (pre-Electra aggregation_bits format).
+fn make_aggregation_bits(duty: &AttesterDuty) -> String {
+    let committee_length: usize = duty.committee_length.parse().unwrap_or(0);
+    let validator_committee_index: usize = duty.validator_committee_index.parse().unwrap_or(0);
+
+    // SSZ bitlist: ceil((committee_length + 1) / 8) bytes
+    // The "+1" is for the length bit at position committee_length
+    let byte_count = (committee_length + 8) / 8;
+    let mut bits = vec![0u8; byte_count];
+
+    // Set the validator's bit
+    if validator_committee_index < committee_length {
+        bits[validator_committee_index / 8] |= 1 << (validator_committee_index % 8);
+    }
+
+    // Set the length bit (sentinel) at position committee_length
+    bits[committee_length / 8] |= 1 << (committee_length % 8);
+
+    format!("0x{}", hex::encode(bits))
+}
 
 /// Configuration for the duty orchestrator.
 #[derive(Clone)]
@@ -66,15 +68,26 @@ pub struct OrchestratorConfig {
     pub genesis_validators_root: Root,
     pub fork_schedule: Arc<ForkSchedule>,
     pub shutdown_timeout: Duration,
+    pub timeouts: OperationTimeouts,
 }
 
 impl OrchestratorConfig {
     pub fn new(genesis_validators_root: Root, fork_schedule: Arc<ForkSchedule>) -> Self {
-        Self { genesis_validators_root, fork_schedule, shutdown_timeout: Duration::from_secs(30) }
+        Self {
+            genesis_validators_root,
+            fork_schedule,
+            shutdown_timeout: Duration::from_secs(30),
+            timeouts: OperationTimeouts::default(),
+        }
     }
 
     pub fn with_shutdown_timeout(mut self, timeout: Duration) -> Self {
         self.shutdown_timeout = timeout;
+        self
+    }
+
+    pub fn with_timeouts(mut self, timeouts: OperationTimeouts) -> Self {
+        self.timeouts = timeouts;
         self
     }
 }
@@ -206,6 +219,7 @@ where
 
             // Proposer preparation and committee subscriptions (non-fatal)
             if current_slot % SLOTS_PER_EPOCH == 0 {
+                self.check_reorg_at_epoch_boundary(current_epoch).await;
                 self.prepare_proposers().await;
                 self.submit_committee_subscriptions(current_epoch).await;
                 self.submit_committee_subscriptions(current_epoch + 1).await;
@@ -339,7 +353,7 @@ where
         if !self.duty_tracker.is_epoch_cached(epoch).await {
             debug!(epoch, "Fetching attester duties for epoch");
             match tokio::time::timeout(
-                DUTY_FETCH_TIMEOUT,
+                self.config.timeouts.duty_fetch,
                 self.duty_tracker.fetch_duties_for_epoch(epoch),
             )
             .await
@@ -349,7 +363,7 @@ where
                 Err(_) => warn!(
                     epoch,
                     "Attester duty fetch timed out after {}s",
-                    DUTY_FETCH_TIMEOUT.as_secs()
+                    self.config.timeouts.duty_fetch.as_secs()
                 ),
             }
         }
@@ -358,7 +372,7 @@ where
         if !self.duty_tracker.is_proposer_epoch_cached(epoch).await {
             debug!(epoch, "Fetching proposer duties for epoch");
             match tokio::time::timeout(
-                DUTY_FETCH_TIMEOUT,
+                self.config.timeouts.duty_fetch,
                 self.duty_tracker.fetch_proposer_duties(epoch),
             )
             .await
@@ -368,7 +382,7 @@ where
                 Err(_) => warn!(
                     epoch,
                     "Proposer duty fetch timed out after {}s",
-                    DUTY_FETCH_TIMEOUT.as_secs()
+                    self.config.timeouts.duty_fetch.as_secs()
                 ),
             }
         }
@@ -377,7 +391,7 @@ where
         if !self.duty_tracker.is_sync_period_cached(epoch).await {
             debug!(epoch, "Fetching sync committee duties");
             match tokio::time::timeout(
-                DUTY_FETCH_TIMEOUT,
+                self.config.timeouts.duty_fetch,
                 self.duty_tracker.fetch_sync_committee_duties(epoch),
             )
             .await
@@ -387,8 +401,66 @@ where
                 Err(_) => warn!(
                     epoch,
                     "Sync committee duty fetch timed out after {}s",
-                    DUTY_FETCH_TIMEOUT.as_secs()
+                    self.config.timeouts.duty_fetch.as_secs()
                 ),
+            }
+        }
+    }
+
+    async fn check_reorg_at_epoch_boundary(&self, current_epoch: u64) {
+        for epoch in [current_epoch, current_epoch + 1] {
+            let attester_cached = self.duty_tracker.is_epoch_cached(epoch).await;
+            match tokio::time::timeout(
+                self.config.timeouts.duty_fetch,
+                self.duty_tracker.check_and_refetch_if_root_changed(epoch),
+            )
+            .await
+            {
+                Ok(Ok(true)) if attester_cached => {
+                    warn!(epoch, "Reorg detected: attester duties refetched");
+                    RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["attester"]).inc();
+                }
+                Ok(Ok(true)) => {
+                    debug!(epoch, "Attester duties fetched (was uncached)");
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => {
+                    warn!(epoch, error = %e, "Failed to check attester dependent root");
+                }
+                Err(_) => {
+                    warn!(
+                        epoch,
+                        "Attester reorg check timed out after {}s",
+                        self.config.timeouts.duty_fetch.as_secs()
+                    );
+                }
+            }
+
+            let proposer_cached = self.duty_tracker.is_proposer_epoch_cached(epoch).await;
+            match tokio::time::timeout(
+                self.config.timeouts.duty_fetch,
+                self.duty_tracker.check_and_refetch_proposer_if_root_changed(epoch),
+            )
+            .await
+            {
+                Ok(Ok(true)) if proposer_cached => {
+                    warn!(epoch, "Reorg detected: proposer duties refetched");
+                    RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["proposer"]).inc();
+                }
+                Ok(Ok(true)) => {
+                    debug!(epoch, "Proposer duties fetched (was uncached)");
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => {
+                    warn!(epoch, error = %e, "Failed to check proposer dependent root");
+                }
+                Err(_) => {
+                    warn!(
+                        epoch,
+                        "Proposer reorg check timed out after {}s",
+                        self.config.timeouts.duty_fetch.as_secs()
+                    );
+                }
             }
         }
     }
@@ -443,7 +515,7 @@ where
 
         let count = preparations.len();
         match tokio::time::timeout(
-            PREPARATION_TIMEOUT,
+            self.config.timeouts.preparation,
             self.beacon.prepare_beacon_proposer(&preparations),
         )
         .await
@@ -451,7 +523,10 @@ where
             Ok(Ok(_)) => info!(count, "Sent proposer preparations"),
             Ok(Err(e)) => warn!(error = %e, "Failed to send proposer preparations"),
             Err(_) => {
-                warn!("Proposer preparation timed out after {}s", PREPARATION_TIMEOUT.as_secs())
+                warn!(
+                    "Proposer preparation timed out after {}s",
+                    self.config.timeouts.preparation.as_secs()
+                )
             }
         }
     }
@@ -527,7 +602,7 @@ where
 
         let count = subscriptions.len();
         match tokio::time::timeout(
-            PREPARATION_TIMEOUT,
+            self.config.timeouts.preparation,
             self.beacon.submit_beacon_committee_subscriptions(&subscriptions),
         )
         .await
@@ -537,7 +612,7 @@ where
             Err(_) => warn!(
                 epoch,
                 "Committee subscription timed out after {}s",
-                PREPARATION_TIMEOUT.as_secs()
+                self.config.timeouts.preparation.as_secs()
             ),
         }
     }
@@ -583,7 +658,7 @@ where
 
         // Wrap with combined produce + publish timeout
         match tokio::time::timeout(
-            BLOCK_PRODUCE_TIMEOUT + BLOCK_PUBLISH_TIMEOUT,
+            self.config.timeouts.block_production + self.config.timeouts.block_publication,
             self.block_service.propose_block(slot, &pubkey),
         )
         .await
@@ -609,7 +684,9 @@ where
                     slot,
                     epoch,
                     "Block proposal timed out after {}s",
-                    (BLOCK_PRODUCE_TIMEOUT + BLOCK_PUBLISH_TIMEOUT).as_secs()
+                    (self.config.timeouts.block_production
+                        + self.config.timeouts.block_publication)
+                        .as_secs()
                 );
             }
         }
@@ -667,7 +744,7 @@ where
         if !messages.is_empty() {
             let count = messages.len();
             match tokio::time::timeout(
-                SYNC_MESSAGE_TIMEOUT,
+                self.config.timeouts.sync_message,
                 self.beacon.submit_sync_committee_messages(&messages),
             )
             .await
@@ -677,7 +754,7 @@ where
                 Err(_) => warn!(
                     slot,
                     "Sync committee message submit timed out after {}s",
-                    SYNC_MESSAGE_TIMEOUT.as_secs()
+                    self.config.timeouts.sync_message.as_secs()
                 ),
             }
         }
@@ -752,7 +829,7 @@ where
                 );
 
                 let contribution = match tokio::time::timeout(
-                    SYNC_CONTRIBUTION_TIMEOUT,
+                    self.config.timeouts.sync_contribution,
                     self.beacon.get_sync_committee_contribution(
                         slot,
                         *subcommittee_index,
@@ -776,7 +853,7 @@ where
                             slot,
                             subcommittee_index,
                             "Sync committee contribution fetch timed out after {}s",
-                            SYNC_CONTRIBUTION_TIMEOUT.as_secs()
+                            self.config.timeouts.sync_contribution.as_secs()
                         );
                         continue;
                     }
@@ -821,7 +898,7 @@ where
         if !signed_proofs.is_empty() {
             let count = signed_proofs.len();
             match tokio::time::timeout(
-                SYNC_CONTRIBUTION_TIMEOUT,
+                self.config.timeouts.sync_contribution,
                 self.beacon.submit_contribution_and_proofs(&signed_proofs),
             )
             .await
@@ -831,13 +908,13 @@ where
                 Err(_) => warn!(
                     slot,
                     "Contribution and proofs submit timed out after {}s",
-                    SYNC_CONTRIBUTION_TIMEOUT.as_secs()
+                    self.config.timeouts.sync_contribution.as_secs()
                 ),
             }
         }
     }
 
-    async fn maybe_produce_aggregations(&self, slot: Slot, _epoch: u64) {
+    async fn maybe_produce_aggregations(&self, slot: Slot, epoch: u64) {
         let duties = match self.get_duties_for_slot(slot).await {
             Ok(d) => d,
             Err(_) => return,
@@ -846,6 +923,9 @@ where
         if duties.is_empty() {
             return;
         }
+
+        let fork_name = ForkName::from_epoch(epoch, &self.config.fork_schedule);
+        let is_electra = fork_name >= ForkName::Electra;
 
         let mut signed_aggregates: Vec<SignedAggregateAndProof> = Vec::new();
 
@@ -904,7 +984,7 @@ where
             };
 
             let attestation_data_response = match tokio::time::timeout(
-                AGGREGATION_TIMEOUT,
+                self.config.timeouts.aggregate_fetch,
                 self.beacon.get_attestation_data(slot, committee_index),
             )
             .await
@@ -952,9 +1032,15 @@ where
             let att_data_root_hex = format!("0x{}", hex::encode(att_data_root.0));
 
             // Fetch the aggregate attestation
+            // Electra: pass committee_index for per-committee aggregation
+            let electra_committee_index = if is_electra { Some(committee_index) } else { None };
             let aggregate = match tokio::time::timeout(
-                AGGREGATION_TIMEOUT,
-                self.beacon.get_aggregate_attestation(slot, &att_data_root_hex),
+                self.config.timeouts.aggregate_fetch,
+                self.beacon.get_aggregate_attestation(
+                    slot,
+                    &att_data_root_hex,
+                    electra_committee_index,
+                ),
             )
             .await
             {
@@ -1022,9 +1108,10 @@ where
 
         if !signed_aggregates.is_empty() {
             let count = signed_aggregates.len();
+            let versioned = VersionedSignedAggregateAndProof::PreElectra(signed_aggregates);
             match tokio::time::timeout(
-                AGGREGATION_TIMEOUT,
-                self.beacon.submit_aggregate_and_proofs(&signed_aggregates),
+                self.config.timeouts.aggregate_submit,
+                self.beacon.submit_aggregate_and_proofs(&versioned),
             )
             .await
             {
@@ -1044,7 +1131,7 @@ where
                     warn!(
                         slot,
                         "Aggregate and proofs submit timed out after {}s",
-                        AGGREGATION_TIMEOUT.as_secs()
+                        self.config.timeouts.aggregate_submit.as_secs()
                     );
                     RVC_AGGREGATIONS_TOTAL
                         .with_label_values(&[attestation_status::FAILED])
@@ -1072,7 +1159,12 @@ where
     }
 
     async fn get_head_block_root(&self) -> Option<Root> {
-        match tokio::time::timeout(SYNC_MESSAGE_TIMEOUT, self.beacon.get_block_root("head")).await {
+        match tokio::time::timeout(
+            self.config.timeouts.sync_message,
+            self.beacon.get_block_root("head"),
+        )
+        .await
+        {
             Ok(Ok(response)) => {
                 let root_hex = response.data.root;
                 match Self::parse_hex_root(&root_hex) {
@@ -1088,7 +1180,10 @@ where
                 None
             }
             Err(_) => {
-                warn!("Head block root fetch timed out after {}s", SYNC_MESSAGE_TIMEOUT.as_secs());
+                warn!(
+                    "Head block root fetch timed out after {}s",
+                    self.config.timeouts.sync_message.as_secs()
+                );
                 None
             }
         }
@@ -1263,7 +1358,7 @@ where
 
         // Apply timeout to beacon client call to prevent blocking
         let attestation_data_result = tokio::time::timeout(
-            ATTESTATION_TIMEOUT,
+            self.config.timeouts.attestation_fetch,
             self.beacon.get_attestation_data(slot, committee_index),
         )
         .await;
@@ -1290,21 +1385,29 @@ where
 
         let beacon_attestation_data = attestation_data_response.data;
 
-        let crypto_attestation_data = match Self::convert_attestation_data(&beacon_attestation_data)
-        {
-            Ok(data) => data,
-            Err(e) => {
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!("Failed to convert attestation data: {}", e)),
-                };
-            }
-        };
+        let mut crypto_attestation_data =
+            match Self::convert_attestation_data(&beacon_attestation_data) {
+                Ok(data) => data,
+                Err(e) => {
+                    return AttestationResult {
+                        validator_index,
+                        slot,
+                        success: false,
+                        error: Some(format!("Failed to convert attestation data: {}", e)),
+                    };
+                }
+            };
 
         let target_epoch = crypto_attestation_data.target.epoch;
         let fork = self.derive_fork_for_epoch(target_epoch);
+        let fork_name = ForkName::from_epoch(target_epoch, &self.config.fork_schedule);
+        let is_electra = fork_name >= ForkName::Electra;
+
+        // EIP-7549: For Electra, set data.index = 0 BEFORE signing because
+        // the index field is part of the signed AttestationData.
+        if is_electra {
+            crypto_attestation_data.index = 0;
+        }
 
         let signature = match self
             .signer
@@ -1340,20 +1443,46 @@ where
             }
         };
 
-        let attestation = Attestation {
-            committee_index,
-            attester_index,
-            data: beacon_attestation_data,
-            signature: format!("0x{}", hex::encode(signature.to_bytes())),
+        let sig_hex = format!("0x{}", hex::encode(signature.to_bytes()));
+
+        let versioned = if is_electra {
+            let mut electra_data = beacon_attestation_data.clone();
+            electra_data.index = "0".to_string();
+            VersionedAttestation::Electra(vec![SingleAttestation {
+                committee_index,
+                attester_index,
+                data: electra_data,
+                signature: sig_hex,
+            }])
+        } else {
+            VersionedAttestation::PreElectra(vec![LegacyAttestation {
+                aggregation_bits: make_aggregation_bits(&duty),
+                data: beacon_attestation_data,
+                signature: sig_hex,
+            }])
         };
 
-        match self.propagator.propagate(attestation).await {
-            Ok(()) => AttestationResult { validator_index, slot, success: true, error: None },
-            Err(e) => AttestationResult {
+        match tokio::time::timeout(
+            self.config.timeouts.attestation_submit,
+            self.propagator.propagate(&versioned),
+        )
+        .await
+        {
+            Ok(Ok(_)) => AttestationResult { validator_index, slot, success: true, error: None },
+            Ok(Err(e)) => AttestationResult {
                 validator_index,
                 slot,
                 success: false,
                 error: Some(format!("Failed to propagate attestation: {}", e)),
+            },
+            Err(_) => AttestationResult {
+                validator_index,
+                slot,
+                success: false,
+                error: Some(format!(
+                    "Attestation submit timed out after {}s",
+                    self.config.timeouts.attestation_submit.as_secs()
+                )),
             },
         }
     }
@@ -1531,7 +1660,7 @@ mod tests {
     impl AttestationSubmitter for MockSubmitter {
         fn submit_attestation<'a>(
             &'a self,
-            _attestations: &'a [Attestation],
+            _attestations: &'a VersionedAttestation,
         ) -> Pin<
             Box<
                 dyn Future<Output = Result<beacon::SubmitAttestationResult, beacon::BeaconError>>
@@ -1580,6 +1709,15 @@ mod tests {
         ) -> Result<(), block_service::BlockServiceError> {
             Ok(())
         }
+
+        async fn publish_block_ssz(
+            &self,
+            _ssz_bytes: &[u8],
+            _consensus_version: &str,
+            _is_blinded: bool,
+        ) -> Result<(), block_service::BlockServiceError> {
+            Ok(())
+        }
     }
 
     fn create_mock_block_beacon() -> Arc<MockBlockBeacon> {
@@ -1602,6 +1740,31 @@ mod tests {
         let config = OrchestratorConfig::new([0xcc; 32], create_test_fork_schedule())
             .with_shutdown_timeout(Duration::from_secs(60));
         assert_eq!(config.shutdown_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_orchestrator_config_with_timeouts() {
+        let mut timeouts = OperationTimeouts::default();
+        timeouts.block_production = Duration::from_secs(5);
+        timeouts.duty_fetch = Duration::from_secs(15);
+
+        let config = OrchestratorConfig::new([0xdd; 32], create_test_fork_schedule())
+            .with_timeouts(timeouts);
+
+        assert_eq!(config.timeouts.block_production, Duration::from_secs(5));
+        assert_eq!(config.timeouts.duty_fetch, Duration::from_secs(15));
+        // Other fields remain at default
+        assert_eq!(config.timeouts.block_publication, Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_orchestrator_config_default_timeouts() {
+        let config = OrchestratorConfig::new([0xee; 32], create_test_fork_schedule());
+        let defaults = OperationTimeouts::default();
+
+        assert_eq!(config.timeouts.block_production, defaults.block_production);
+        assert_eq!(config.timeouts.duty_fetch, defaults.duty_fetch);
+        assert_eq!(config.timeouts.attestation_fetch, defaults.attestation_fetch);
     }
 
     #[test]
@@ -2002,27 +2165,29 @@ mod tests {
 
     #[test]
     fn test_timeout_constants_are_reasonable() {
+        let timeouts = OperationTimeouts::default();
+
         // Block production must fit within a slot third (~4s for 12s slots)
-        assert!(BLOCK_PRODUCE_TIMEOUT.as_secs() <= 4);
-        assert!(BLOCK_PRODUCE_TIMEOUT.as_secs() >= 1);
+        assert!(timeouts.block_production.as_secs() <= 4);
+        assert!(timeouts.block_production.as_secs() >= 1);
 
         // Block publish must fit within remaining slot time
-        assert!(BLOCK_PUBLISH_TIMEOUT.as_secs() <= 3);
-        assert!(BLOCK_PUBLISH_TIMEOUT.as_secs() >= 1);
+        assert!(timeouts.block_publication.as_secs() <= 3);
+        assert!(timeouts.block_publication.as_secs() >= 1);
 
         // Produce + publish together should fit in one slot third (~4s)
-        assert!(BLOCK_PRODUCE_TIMEOUT + BLOCK_PUBLISH_TIMEOUT <= Duration::from_secs(6));
+        assert!(timeouts.block_production + timeouts.block_publication <= Duration::from_secs(6));
 
         // Sync operations must fit within their slot third
-        assert!(SYNC_MESSAGE_TIMEOUT.as_secs() <= 3);
-        assert!(SYNC_CONTRIBUTION_TIMEOUT.as_secs() <= 3);
+        assert!(timeouts.sync_message.as_secs() <= 3);
+        assert!(timeouts.sync_contribution.as_secs() <= 3);
 
         // Duty fetch is less time-critical but should still be bounded
-        assert!(DUTY_FETCH_TIMEOUT.as_secs() <= 12);
-        assert!(DUTY_FETCH_TIMEOUT.as_secs() >= 5);
+        assert!(timeouts.duty_fetch.as_secs() <= 12);
+        assert!(timeouts.duty_fetch.as_secs() >= 5);
 
         // Attestation timeout must fit within slot third
-        assert!(ATTESTATION_TIMEOUT.as_secs() <= 5);
+        assert!(timeouts.attestation_fetch.as_secs() <= 5);
     }
 
     #[tokio::test]
@@ -2030,9 +2195,10 @@ mod tests {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        let timeouts = OperationTimeouts::default();
         let mock_server = MockServer::start().await;
 
-        // Mock attester duties endpoint with a 15s delay (exceeds DUTY_FETCH_TIMEOUT of 10s)
+        // Mock attester duties endpoint with a 15s delay (exceeds duty_fetch of 10s)
         Mock::given(method("POST"))
             .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
             .respond_with(
@@ -2041,7 +2207,7 @@ mod tests {
                         "data": [],
                         "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
                     }))
-                    .set_delay(DUTY_FETCH_TIMEOUT + Duration::from_secs(5)),
+                    .set_delay(timeouts.duty_fetch + Duration::from_secs(5)),
             )
             .mount(&mock_server)
             .await;
@@ -2052,7 +2218,7 @@ mod tests {
 
         let epoch = 1u64;
         let result =
-            tokio::time::timeout(DUTY_FETCH_TIMEOUT, duty_tracker.fetch_duties_for_epoch(epoch))
+            tokio::time::timeout(timeouts.duty_fetch, duty_tracker.fetch_duties_for_epoch(epoch))
                 .await;
 
         // Should timeout (Err from tokio::time::timeout)
@@ -2064,13 +2230,15 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        let timeouts = OperationTimeouts::default();
         let mock_server = MockServer::start().await;
 
-        // Mock sync committee messages endpoint with delay exceeding SYNC_MESSAGE_TIMEOUT
+        // Mock sync committee messages endpoint with delay exceeding sync_message timeout
         Mock::given(method("POST"))
             .and(path("/eth/v1/beacon/pool/sync_committees"))
             .respond_with(
-                ResponseTemplate::new(200).set_delay(SYNC_MESSAGE_TIMEOUT + Duration::from_secs(5)),
+                ResponseTemplate::new(200)
+                    .set_delay(timeouts.sync_message + Duration::from_secs(5)),
             )
             .mount(&mock_server)
             .await;
@@ -2086,7 +2254,7 @@ mod tests {
         }];
 
         let result = tokio::time::timeout(
-            SYNC_MESSAGE_TIMEOUT,
+            timeouts.sync_message,
             beacon.submit_sync_committee_messages(&messages),
         )
         .await;
@@ -2099,9 +2267,10 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        let timeouts = OperationTimeouts::default();
         let mock_server = MockServer::start().await;
 
-        // Mock block root endpoint with delay exceeding SYNC_MESSAGE_TIMEOUT
+        // Mock block root endpoint with delay exceeding sync_message timeout
         Mock::given(method("GET"))
             .and(path("/eth/v1/beacon/blocks/head/root"))
             .respond_with(
@@ -2111,7 +2280,7 @@ mod tests {
                             "root": "0x0000000000000000000000000000000000000000000000000000000000000000"
                         }
                     }))
-                    .set_delay(SYNC_MESSAGE_TIMEOUT + Duration::from_secs(5)),
+                    .set_delay(timeouts.sync_message + Duration::from_secs(5)),
             )
             .mount(&mock_server)
             .await;
@@ -2120,16 +2289,34 @@ mod tests {
         let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
 
         let result =
-            tokio::time::timeout(SYNC_MESSAGE_TIMEOUT, beacon.get_block_root("head")).await;
+            tokio::time::timeout(timeouts.sync_message, beacon.get_block_root("head")).await;
 
         assert!(result.is_err(), "Head block root fetch should have timed out");
     }
 
     #[test]
     fn test_aggregation_timeout_is_reasonable() {
+        let timeouts = OperationTimeouts::default();
         // Must fit within the 2/3-slot to end-of-slot window (~4s for 12s slots)
-        assert!(AGGREGATION_TIMEOUT.as_secs() <= 4);
-        assert!(AGGREGATION_TIMEOUT.as_secs() >= 1);
+        assert!(timeouts.aggregate_fetch.as_secs() <= 4);
+        assert!(timeouts.aggregate_fetch.as_secs() >= 1);
+    }
+
+    #[test]
+    fn test_aggregate_submit_uses_distinct_timeout_field() {
+        let mut timeouts = OperationTimeouts::default();
+        timeouts.aggregate_fetch = Duration::from_secs(5);
+        timeouts.aggregate_submit = Duration::from_secs(1);
+        // These must be distinct fields — submit path must use aggregate_submit
+        assert_ne!(timeouts.aggregate_fetch, timeouts.aggregate_submit);
+    }
+
+    #[test]
+    fn test_attestation_submit_timeout_exists() {
+        let timeouts = OperationTimeouts::default();
+        // attestation_submit must be a usable timeout value
+        assert!(timeouts.attestation_submit.as_secs() >= 1);
+        assert!(timeouts.attestation_submit.as_secs() <= 5);
     }
 
     /// Helper to build an orchestrator wired to a wiremock mock_server for aggregation tests.
@@ -2854,8 +3041,9 @@ mod tests {
 
     #[test]
     fn test_preparation_timeout_is_reasonable() {
-        assert!(PREPARATION_TIMEOUT.as_secs() >= 1);
-        assert!(PREPARATION_TIMEOUT.as_secs() <= 5);
+        let timeouts = OperationTimeouts::default();
+        assert!(timeouts.preparation.as_secs() >= 1);
+        assert!(timeouts.preparation.as_secs() <= 5);
     }
 
     #[test]
@@ -3107,5 +3295,797 @@ mod tests {
 
         orchestrator.register_builders().await;
         // wiremock expect(0) verifies no registration call was made
+    }
+
+    #[tokio::test]
+    async fn test_check_reorg_at_epoch_boundary_no_change() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let attester_response = serde_json::json!({
+            "data": [],
+            "dependent_root": "0xstable_root",
+            "execution_optimistic": false
+        });
+
+        let proposer_response = serde_json::json!({
+            "data": [],
+            "dependent_root": "0xstable_root",
+            "execution_optimistic": false
+        });
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&attester_response))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/eth/v1/validator/duties/proposer/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&proposer_response))
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri())
+            .with_timeout(Duration::from_secs(5))
+            .with_max_retries(1);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+        // Pre-populate caches
+        duty_tracker.fetch_duties_for_epoch(10).await.unwrap();
+        duty_tracker.fetch_duties_for_epoch(11).await.unwrap();
+        duty_tracker.fetch_proposer_duties(10).await.unwrap();
+        duty_tracker.fetch_proposer_duties(11).await.unwrap();
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(320);
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+        let config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        // Should not panic, should complete successfully
+        orchestrator.check_reorg_at_epoch_boundary(10).await;
+    }
+
+    #[tokio::test]
+    async fn test_check_reorg_at_epoch_boundary_uncached_fetches() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let attester_response = serde_json::json!({
+            "data": [],
+            "dependent_root": "0xnew_root",
+            "execution_optimistic": false
+        });
+
+        let proposer_response = serde_json::json!({
+            "data": [],
+            "dependent_root": "0xnew_root",
+            "execution_optimistic": false
+        });
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&attester_response))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/eth/v1/validator/duties/proposer/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&proposer_response))
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri())
+            .with_timeout(Duration::from_secs(5))
+            .with_max_retries(1);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(320);
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+        let config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker.clone(),
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        // No caches populated — should fetch and not panic
+        orchestrator.check_reorg_at_epoch_boundary(10).await;
+
+        // Caches should now be populated
+        assert!(duty_tracker.is_epoch_cached(10).await);
+        assert!(duty_tracker.is_epoch_cached(11).await);
+        assert!(duty_tracker.is_proposer_epoch_cached(10).await);
+        assert!(duty_tracker.is_proposer_epoch_cached(11).await);
+    }
+
+    #[tokio::test]
+    async fn test_check_reorg_at_epoch_boundary_timeout_bounds_slow_beacon() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let slow_response = serde_json::json!({
+            "data": [],
+            "dependent_root": "0xslow_root",
+            "execution_optimistic": false
+        });
+
+        let timeouts = OperationTimeouts::default();
+
+        // Respond slower than duty_fetch timeout (10s)
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&slow_response)
+                    .set_delay(timeouts.duty_fetch + Duration::from_secs(5)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/eth/v1/validator/duties/proposer/.*"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&slow_response)
+                    .set_delay(timeouts.duty_fetch + Duration::from_secs(5)),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // HTTP timeout must exceed duty_fetch timeout so the tokio timeout fires first
+        let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri())
+            .with_timeout(Duration::from_secs(30))
+            .with_max_retries(0);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(320);
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+        let config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        let start = std::time::Instant::now();
+        orchestrator.check_reorg_at_epoch_boundary(10).await;
+        let elapsed = start.elapsed();
+
+        // 4 calls each bounded by duty_fetch timeout (10s).
+        // Without timeout wrapping this would take 4 * 15s = 60s.
+        // With timeouts: 4 * 10s = 40s + margin.
+        assert!(
+            elapsed < timeouts.duty_fetch * 5,
+            "Reorg check took {:?}, expected < {:?} (4 timeouts + margin)",
+            elapsed,
+            timeouts.duty_fetch * 5
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_reorg_at_epoch_boundary_survives_error() {
+        // Use a broken beacon endpoint to verify errors are logged not propagated
+        let beacon_config = beacon::BeaconClientConfig::new("http://127.0.0.1:1")
+            .with_timeout(Duration::from_millis(100))
+            .with_max_retries(0);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(320);
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+        let config = create_test_config();
+        let pubkey_map = HashMap::new();
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        // Should not panic even with broken beacon
+        orchestrator.check_reorg_at_epoch_boundary(10).await;
+    }
+
+    // -- Fork-aware attestation construction tests (G-1-05) --
+
+    #[test]
+    fn test_make_aggregation_bits_first_position() {
+        let duty = AttesterDuty {
+            pubkey: "0xaabb".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: "4".to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: "0".to_string(),
+            slot: "100".to_string(),
+        };
+        let bits = make_aggregation_bits(&duty);
+        // committee_length=4, validator_committee_index=0
+        // Byte 0: bit 0 set (validator) = 0x01
+        // Length bit at position 4 → byte 0, bit 4 = 0x10
+        // Combined: 0x11
+        assert_eq!(bits, "0x11");
+    }
+
+    #[test]
+    fn test_make_aggregation_bits_middle_position() {
+        let duty = AttesterDuty {
+            pubkey: "0xaabb".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: "8".to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: "3".to_string(),
+            slot: "100".to_string(),
+        };
+        let bits = make_aggregation_bits(&duty);
+        // committee_length=8, validator_committee_index=3
+        // Byte 0: bit 3 set = 0x08
+        // Length bit at position 8 → byte 1, bit 0 = 0x01
+        // Result: [0x08, 0x01]
+        assert_eq!(bits, "0x0801");
+    }
+
+    #[test]
+    fn test_make_aggregation_bits_last_position() {
+        let duty = AttesterDuty {
+            pubkey: "0xaabb".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: "4".to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: "3".to_string(),
+            slot: "100".to_string(),
+        };
+        let bits = make_aggregation_bits(&duty);
+        // committee_length=4, validator_committee_index=3
+        // Byte 0: bit 3 set = 0x08, length bit at position 4 = 0x10
+        // Combined: 0x18
+        assert_eq!(bits, "0x18");
+    }
+
+    #[test]
+    fn test_fork_name_electra_detection() {
+        let schedule = create_test_fork_schedule();
+        // electra_fork_epoch = 50
+
+        // Pre-Electra (Deneb)
+        let fork_name = ForkName::from_epoch(49, &schedule);
+        assert!(fork_name < ForkName::Electra);
+
+        // Electra boundary
+        let fork_name = ForkName::from_epoch(50, &schedule);
+        assert!(fork_name >= ForkName::Electra);
+
+        // Post-Electra
+        let fork_name = ForkName::from_epoch(100, &schedule);
+        assert!(fork_name >= ForkName::Electra);
+    }
+
+    // --- G-1-06: Electra fork transition integration tests ---
+
+    /// A submitter that captures the submitted VersionedAttestation for assertion.
+    struct CapturingSubmitter {
+        captured: std::sync::Mutex<Vec<VersionedAttestation>>,
+    }
+
+    impl CapturingSubmitter {
+        fn new() -> Self {
+            Self { captured: std::sync::Mutex::new(Vec::new()) }
+        }
+
+        fn captured(&self) -> Vec<VersionedAttestation> {
+            self.captured.lock().unwrap().clone()
+        }
+    }
+
+    impl AttestationSubmitter for CapturingSubmitter {
+        fn submit_attestation<'a>(
+            &'a self,
+            attestations: &'a VersionedAttestation,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<beacon::SubmitAttestationResult, beacon::BeaconError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            self.captured.lock().unwrap().push(attestations.clone());
+            Box::pin(async move { Ok(beacon::SubmitAttestationResult::Success) })
+        }
+    }
+
+    /// Builds an orchestrator with a CapturingSubmitter for fork transition tests.
+    /// Returns the orchestrator, handle, pubkey hex, and a reference to the capturing submitter.
+    async fn build_fork_transition_orchestrator(
+        mock_server_uri: &str,
+        slot: u64,
+    ) -> (
+        DutyOrchestrator<MockSlotClock, CapturingSubmitter, MockBlockBeacon>,
+        OrchestratorHandle,
+        String,
+        Arc<CapturingSubmitter>,
+    ) {
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(slot);
+
+        let beacon_config = BeaconClientConfig::new(mock_server_uri);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let secret_key = SecretKey::generate();
+        let pubkey_hex = format!("0x{}", hex::encode(secret_key.public_key().to_bytes()));
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+
+        let pubkey = secret_key.public_key();
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let capturing_submitter = Arc::new(CapturingSubmitter::new());
+        let propagator = Arc::new(Propagator::new(capturing_submitter.clone()));
+
+        let config = create_test_config();
+        let mut pubkey_map = HashMap::new();
+        pubkey_map.insert(pubkey_hex.clone(), pubkey);
+
+        let (orchestrator, handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        (orchestrator, handle, pubkey_hex, capturing_submitter)
+    }
+
+    /// Mounts attestation data and attester duties on the mock server for a given slot.
+    async fn mount_attestation_mocks(
+        mock_server: &wiremock::MockServer,
+        slot: u64,
+        pubkey_hex: &str,
+    ) {
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        // Mock attester duties — small committee (always aggregator)
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "3",
+                    "committee_length": "8",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "2",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(mock_server)
+            .await;
+
+        // Mock attestation data
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "3",
+                    "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source": {
+                        "epoch": (epoch.saturating_sub(1)).to_string(),
+                        "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    },
+                    "target": {
+                        "epoch": epoch.to_string(),
+                        "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    }
+                }
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_pre_electra_attestation_produces_legacy_format() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        // Slot 96 = epoch 3, well before electra_fork_epoch=50
+        let slot = 96u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        // Fetch duties so they're cached
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        // Process the slot
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+
+        // Verify the captured attestation is PreElectra
+        let captured = capturing.captured();
+        assert_eq!(captured.len(), 1, "Expected exactly one submission");
+
+        match &captured[0] {
+            VersionedAttestation::PreElectra(attestations) => {
+                assert_eq!(attestations.len(), 1);
+                let att = &attestations[0];
+                // aggregation_bits should be set (not empty)
+                assert!(!att.aggregation_bits.is_empty());
+                // data.index should be the committee index from the duty ("3")
+                assert_eq!(att.data.index, "3");
+            }
+            VersionedAttestation::Electra(_) => {
+                panic!(
+                    "Expected PreElectra attestation for slot in epoch 3 (< electra_fork_epoch=50)"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_electra_attestation_produces_single_attestation_format() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        // Slot 1600 = epoch 50 = electra_fork_epoch, first Electra slot
+        let slot = 1600u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        assert_eq!(epoch, 50, "Slot 1600 should be epoch 50");
+
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+
+        let captured = capturing.captured();
+        assert_eq!(captured.len(), 1);
+
+        match &captured[0] {
+            VersionedAttestation::Electra(attestations) => {
+                assert_eq!(attestations.len(), 1);
+                let att = &attestations[0];
+                // EIP-7549: data.index must be "0" in Electra
+                assert_eq!(
+                    att.data.index, "0",
+                    "Electra attestation data.index must be 0 (EIP-7549)"
+                );
+                // committee_index carries the original committee index
+                assert_eq!(
+                    att.committee_index, 3,
+                    "committee_index should be the duty committee index"
+                );
+                // attester_index should be the validator index
+                assert_eq!(att.attester_index, 42);
+            }
+            VersionedAttestation::PreElectra(_) => {
+                panic!("Expected Electra attestation for slot in epoch 50 (= electra_fork_epoch)");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fork_boundary_last_pre_electra_slot() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        // Slot 1599 = last slot of epoch 49 (pre-Electra)
+        let slot = 1599u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        assert_eq!(epoch, 49, "Slot 1599 should be epoch 49");
+
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+
+        let captured = capturing.captured();
+        assert_eq!(captured.len(), 1);
+
+        match &captured[0] {
+            VersionedAttestation::PreElectra(attestations) => {
+                assert_eq!(attestations.len(), 1);
+                // Last pre-Electra slot should still use legacy format
+                assert!(!attestations[0].aggregation_bits.is_empty());
+                assert_eq!(attestations[0].data.index, "3");
+            }
+            VersionedAttestation::Electra(_) => {
+                panic!(
+                    "Expected PreElectra attestation for slot 1599 (epoch 49, last pre-Electra)"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_electra_aggregation_passes_committee_index() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Slot 1600 = epoch 50 = electra_fork_epoch, small committee → always aggregator
+        let slot = 1600u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        let (orchestrator, _handle, pubkey_hex, _capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        // Mock aggregate attestation endpoint — expect committee_index query param for Electra
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(query_param("slot", slot.to_string()))
+            .and(query_param("committee_index", "3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "aggregation_bits": "0xff01",
+                    "data": {
+                        "slot": slot.to_string(),
+                        "index": "3",
+                        "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "source": {
+                            "epoch": (epoch - 1).to_string(),
+                            "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                        },
+                        "target": {
+                            "epoch": epoch.to_string(),
+                            "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                        }
+                    },
+                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Mock aggregate submission
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+
+        // wiremock expect(1) on aggregate_attestation with committee_index=3
+        // confirms Electra path passes the committee_index query parameter
+    }
+
+    #[tokio::test]
+    async fn test_pre_electra_aggregation_no_committee_index() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Slot 96 = epoch 3, pre-Electra
+        let slot = 96u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        let (orchestrator, _handle, pubkey_hex, _capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        // Pre-Electra: aggregate_attestation WITHOUT committee_index param
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "aggregation_bits": "0xff01",
+                    "data": {
+                        "slot": slot.to_string(),
+                        "index": "3",
+                        "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "source": {
+                            "epoch": (epoch.saturating_sub(1)).to_string(),
+                            "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                        },
+                        "target": {
+                            "epoch": epoch.to_string(),
+                            "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                        }
+                    },
+                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+    }
+
+    #[tokio::test]
+    async fn test_electra_attestation_data_index_zero_before_signing() {
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Post-Electra: epoch 51
+        let slot = 1632u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        assert_eq!(epoch, 51);
+
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+        // BN returns attestation data with index "7" — different from 0
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "99",
+                    "committee_index": "7",
+                    "committee_length": "16",
+                    "committees_at_slot": "8",
+                    "validator_committee_index": "5",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "7",
+                    "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source": {
+                        "epoch": (epoch - 1).to_string(),
+                        "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    },
+                    "target": {
+                        "epoch": epoch.to_string(),
+                        "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+
+        let captured = capturing.captured();
+        assert_eq!(captured.len(), 1);
+
+        match &captured[0] {
+            VersionedAttestation::Electra(atts) => {
+                // EIP-7549: data.index must be "0" even though BN returned "7"
+                assert_eq!(
+                    atts[0].data.index, "0",
+                    "EIP-7549: data.index must be zeroed before signing"
+                );
+                // committee_index preserves the original value
+                assert_eq!(atts[0].committee_index, 7);
+                assert_eq!(atts[0].attester_index, 99);
+            }
+            VersionedAttestation::PreElectra(_) => {
+                panic!("Expected Electra attestation for epoch 51");
+            }
+        }
     }
 }
