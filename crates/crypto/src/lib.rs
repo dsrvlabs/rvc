@@ -6,6 +6,7 @@ mod bls;
 mod builder_signing;
 mod composite_signer;
 mod decryption_tracker;
+pub mod eip2333;
 mod error;
 mod key_manager;
 mod keystore;

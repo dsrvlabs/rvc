@@ -73,6 +73,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 secrecy = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }
 subtle = "2.6"
+hkdf = "0.12"
+num-bigint = "0.4"
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
