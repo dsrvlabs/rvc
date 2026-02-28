@@ -53,6 +53,10 @@ enum Commands {
         /// Read keystore password from file instead of prompting
         #[arg(long)]
         password_file: Option<PathBuf>,
+
+        /// Derive keys and show output without writing files to disk
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Regenerate keys from an existing mnemonic
@@ -88,6 +92,10 @@ enum Commands {
         /// Read keystore password from file instead of prompting
         #[arg(long)]
         password_file: Option<PathBuf>,
+
+        /// Derive keys and show output without writing files to disk
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Generate a BLS-to-execution-change message
@@ -154,6 +162,7 @@ fn main() -> anyhow::Result<()> {
             mnemonic_passphrase,
             pbkdf2,
             password_file,
+            dry_run,
         } => {
             let keystore_password = password::resolve_password(password_file.as_deref())?;
             new_mnemonic::run(
@@ -165,6 +174,7 @@ fn main() -> anyhow::Result<()> {
                 &mnemonic_passphrase,
                 pbkdf2,
                 &keystore_password,
+                dry_run,
             )
         }
         Commands::ExistingMnemonic {
@@ -176,6 +186,7 @@ fn main() -> anyhow::Result<()> {
             mnemonic_passphrase,
             pbkdf2,
             password_file,
+            dry_run,
         } => {
             let keystore_password = password::resolve_password(password_file.as_deref())?;
             existing_mnemonic::run(
@@ -187,6 +198,7 @@ fn main() -> anyhow::Result<()> {
                 &mnemonic_passphrase,
                 pbkdf2,
                 &keystore_password,
+                dry_run,
             )
         }
         Commands::BlsToExecution {

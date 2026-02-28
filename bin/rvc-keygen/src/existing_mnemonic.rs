@@ -18,6 +18,7 @@ pub fn run(
     mnemonic_passphrase: &str,
     pbkdf2: bool,
     keystore_password: &Zeroizing<String>,
+    dry_run: bool,
 ) -> Result<()> {
     let net = network::from_name(network_name)?;
 
@@ -41,6 +42,7 @@ pub fn run(
         withdrawal_addr_bytes.as_ref(),
         pbkdf2,
         keystore_password,
+        dry_run,
     )
 }
 
@@ -79,6 +81,7 @@ mod tests {
             None,
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -91,6 +94,7 @@ mod tests {
             None,
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -124,6 +128,7 @@ mod tests {
             None,
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -136,6 +141,7 @@ mod tests {
             None,
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -168,6 +174,7 @@ mod tests {
             None,
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -181,6 +188,7 @@ mod tests {
             None,
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -214,6 +222,7 @@ mod tests {
             Some(&addr),
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -242,6 +251,7 @@ mod tests {
             None,
             true,
             &password,
+            false,
         )
         .unwrap();
 

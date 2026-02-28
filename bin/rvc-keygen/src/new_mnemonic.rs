@@ -22,6 +22,7 @@ pub fn run(
     mnemonic_passphrase: &str,
     pbkdf2: bool,
     keystore_password: &Zeroizing<String>,
+    dry_run: bool,
 ) -> Result<()> {
     let net = network::from_name(network_name)?;
 
@@ -47,6 +48,7 @@ pub fn run(
         withdrawal_addr_bytes.as_ref(),
         pbkdf2,
         keystore_password,
+        dry_run,
     )
 }
 
@@ -61,9 +63,13 @@ pub fn generate_from_seed(
     withdrawal_addr_bytes: Option<&[u8; 20]>,
     pbkdf2: bool,
     keystore_password: &Zeroizing<String>,
+    dry_run: bool,
 ) -> Result<()> {
-    std::fs::create_dir_all(output_dir)
-        .with_context(|| format!("Failed to create output directory: {}", output_dir.display()))?;
+    if !dry_run {
+        std::fs::create_dir_all(output_dir).with_context(|| {
+            format!("Failed to create output directory: {}", output_dir.display())
+        })?;
+    }
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -102,33 +108,49 @@ pub fn generate_from_seed(
 
         let keystore_filename = keystore_filename(i, timestamp);
         let keystore_path = output_dir.join(&keystore_filename);
-        keystore
-            .to_file(&keystore_path)
-            .with_context(|| format!("Failed to write keystore: {}", keystore_path.display()))?;
 
-        // Verify keystore by decrypting and checking the key roundtrips
-        let status = match verify::verify_keystore(&keystore_path, keystore_password.as_bytes()) {
-            Ok(pubkey) => {
-                let expected_pubkey = hex::encode(signing_key.public_key().to_bytes());
-                if pubkey == expected_pubkey {
-                    "Verified".to_string()
-                } else {
-                    format!("MISMATCH (expected {}, got {})", expected_pubkey, pubkey)
-                }
-            }
-            Err(e) => format!("FAILED: {}", e),
-        };
+        if dry_run {
+            eprintln!("[DRY RUN] Would write keystore: {}", keystore_path.display());
+            summaries.push(verify::ValidatorSummary {
+                index: i,
+                pubkey: hex::encode(signing_key.public_key().to_bytes()),
+                status: "Dry run".to_string(),
+            });
+        } else {
+            keystore
+                .to_file(&keystore_path)
+                .with_context(|| format!("Failed to write keystore: {}", keystore_path.display()))?;
 
-        summaries.push(verify::ValidatorSummary {
-            index: i,
-            pubkey: hex::encode(signing_key.public_key().to_bytes()),
-            status,
-        });
+            let status =
+                match verify::verify_keystore(&keystore_path, keystore_password.as_bytes()) {
+                    Ok(pubkey) => {
+                        let expected_pubkey = hex::encode(signing_key.public_key().to_bytes());
+                        if pubkey == expected_pubkey {
+                            "Verified".to_string()
+                        } else {
+                            format!("MISMATCH (expected {}, got {})", expected_pubkey, pubkey)
+                        }
+                    }
+                    Err(e) => format!("FAILED: {}", e),
+                };
+
+            summaries.push(verify::ValidatorSummary {
+                index: i,
+                pubkey: hex::encode(signing_key.public_key().to_bytes()),
+                status,
+            });
+        }
     }
 
     let deposit_json = deposit::to_launchpad_json(&deposits, net.genesis_fork_version, net.name)?;
     let deposit_path = output_dir.join(deposit_data_filename(timestamp));
-    write_with_permissions(&deposit_path, deposit_json.as_bytes())?;
+
+    if dry_run {
+        eprintln!("[DRY RUN] Would write deposit data: {}", deposit_path.display());
+        println!("{}", deposit_json);
+    } else {
+        write_with_permissions(&deposit_path, deposit_json.as_bytes())?;
+    }
 
     verify::print_summary(&summaries, net.name, output_dir);
 
@@ -208,6 +230,7 @@ mod tests {
             Some(&[0xAB; 20]),
             true, // Use PBKDF2 for speed
             &password,
+            false,
         )
         .unwrap();
 
@@ -246,6 +269,7 @@ mod tests {
             Some(&[0xAB; 20]),
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -283,6 +307,7 @@ mod tests {
             Some(&[0xAB; 20]),
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -320,6 +345,7 @@ mod tests {
             None, // No withdrawal address → BLS credentials
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -354,6 +380,7 @@ mod tests {
             Some(&[0xAB; 20]),
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -404,6 +431,7 @@ mod tests {
             Some(&[0xAB; 20]),
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -435,6 +463,7 @@ mod tests {
             Some(&[0xAB; 20]),
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -470,8 +499,18 @@ mod tests {
         let seed = crypto::mnemonic::mnemonic_to_seed(&mnemonic, "");
 
         let net = network::from_name("mainnet").unwrap();
-        generate_from_seed(seed.as_ref(), net, &nested, 1, 0, Some(&[0xAB; 20]), true, &password)
-            .unwrap();
+        generate_from_seed(
+            seed.as_ref(),
+            net,
+            &nested,
+            1,
+            0,
+            Some(&[0xAB; 20]),
+            true,
+            &password,
+            false,
+        )
+        .unwrap();
 
         assert!(nested.exists());
         assert!(nested.is_dir());
@@ -498,6 +537,7 @@ mod tests {
             Some(&[0xAB; 20]),
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -531,6 +571,7 @@ mod tests {
             Some(&[0xAB; 20]),
             true,
             &password,
+            false,
         )
         .unwrap();
 
@@ -545,5 +586,56 @@ mod tests {
 
         assert_eq!(deposits[0]["fork_version"], "10000910");
         assert_eq!(deposits[0]["network_name"], "hoodi");
+    }
+
+    #[test]
+    fn test_dry_run_creates_no_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("dry_run_output");
+        let password = Zeroizing::new("testpassword123".to_string());
+
+        let mnemonic = crypto::mnemonic::generate_mnemonic();
+        let seed = crypto::mnemonic::mnemonic_to_seed(&mnemonic, "");
+
+        let net = network::from_name("mainnet").unwrap();
+        generate_from_seed(
+            seed.as_ref(),
+            net,
+            &output,
+            2,
+            0,
+            Some(&[0xAB; 20]),
+            true,
+            &password,
+            true,
+        )
+        .unwrap();
+
+        // Output directory should NOT be created in dry-run mode
+        assert!(!output.exists(), "Output directory should not exist in dry-run mode");
+    }
+
+    #[test]
+    fn test_dry_run_still_derives_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = Zeroizing::new("testpassword123".to_string());
+
+        let mnemonic = crypto::mnemonic::generate_mnemonic();
+        let seed = crypto::mnemonic::mnemonic_to_seed(&mnemonic, "");
+
+        let net = network::from_name("mainnet").unwrap();
+        // Should succeed without error — derivation runs, just no file I/O
+        let result = generate_from_seed(
+            seed.as_ref(),
+            net,
+            dir.path(),
+            1,
+            0,
+            Some(&[0xAB; 20]),
+            true,
+            &password,
+            true,
+        );
+        assert!(result.is_ok());
     }
 }
