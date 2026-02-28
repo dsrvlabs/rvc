@@ -9,6 +9,7 @@ use crypto::{EncryptionKdf, Keystore};
 use crate::deposit;
 use crate::network;
 use crate::password;
+use crate::verify;
 
 /// Runs the new-mnemonic subcommand with all resolved inputs.
 #[allow(clippy::too_many_arguments)]
@@ -72,6 +73,7 @@ pub fn generate_from_seed(
     let kdf = if pbkdf2 { EncryptionKdf::Pbkdf2 } else { EncryptionKdf::Scrypt };
 
     let mut deposits = Vec::with_capacity(num_validators as usize);
+    let mut summaries = Vec::with_capacity(num_validators as usize);
 
     for i in start_index..start_index + num_validators {
         let signing_path = format!("m/12381/3600/{}/0/0", i);
@@ -104,18 +106,32 @@ pub fn generate_from_seed(
             .to_file(&keystore_path)
             .with_context(|| format!("Failed to write keystore: {}", keystore_path.display()))?;
 
-        eprintln!(
-            "Generated validator {} (pubkey: {})",
-            i,
-            hex::encode(signing_key.public_key().to_bytes())
-        );
+        // Verify keystore by decrypting and checking the key roundtrips
+        let status = match verify::verify_keystore(&keystore_path, keystore_password.as_bytes()) {
+            Ok(pubkey) => {
+                let expected_pubkey = hex::encode(signing_key.public_key().to_bytes());
+                if pubkey == expected_pubkey {
+                    "Verified".to_string()
+                } else {
+                    format!("MISMATCH (expected {}, got {})", expected_pubkey, pubkey)
+                }
+            }
+            Err(e) => format!("FAILED: {}", e),
+        };
+
+        summaries.push(verify::ValidatorSummary {
+            index: i,
+            pubkey: hex::encode(signing_key.public_key().to_bytes()),
+            status,
+        });
     }
 
     let deposit_json = deposit::to_launchpad_json(&deposits, net.genesis_fork_version, net.name)?;
     let deposit_path = output_dir.join(deposit_data_filename(timestamp));
     write_with_permissions(&deposit_path, deposit_json.as_bytes())?;
 
-    eprintln!("\nDeposit data written to: {}", deposit_path.display());
+    verify::print_summary(&summaries, net.name, output_dir);
+
     Ok(())
 }
 

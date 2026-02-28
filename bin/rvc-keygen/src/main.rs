@@ -5,6 +5,7 @@ mod existing_mnemonic;
 mod network;
 mod new_mnemonic;
 mod password;
+mod verify;
 
 use std::path::PathBuf;
 
