@@ -29,7 +29,7 @@ metrics_port = 8080
 grpc_port = 50051
 
 # Network preset
-# Options: mainnet, goerli, sepolia, holesky, custom
+# Options: mainnet, hoodi, custom
 # Each preset provides default genesis_time and genesis_validators_root
 network = "mainnet"
 
