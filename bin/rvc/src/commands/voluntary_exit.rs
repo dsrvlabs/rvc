@@ -233,8 +233,7 @@ mod tests {
         use rvc::config::Network;
 
         assert_eq!("mainnet".parse::<Network>().unwrap(), Network::Mainnet);
-        assert_eq!("goerli".parse::<Network>().unwrap(), Network::Goerli);
-        assert_eq!("sepolia".parse::<Network>().unwrap(), Network::Sepolia);
-        assert_eq!("holesky".parse::<Network>().unwrap(), Network::Holesky);
+        assert_eq!("hoodi".parse::<Network>().unwrap(), Network::Hoodi);
+        assert_eq!("custom".parse::<Network>().unwrap(), Network::Custom);
     }
 }

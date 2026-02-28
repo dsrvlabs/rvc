@@ -130,6 +130,13 @@ mod tests {
     }
 
     #[test]
+    fn test_network_serde_deprecated_networks_rejected() {
+        assert!(serde_json::from_str::<Network>("\"goerli\"").is_err());
+        assert!(serde_json::from_str::<Network>("\"sepolia\"").is_err());
+        assert!(serde_json::from_str::<Network>("\"holesky\"").is_err());
+    }
+
+    #[test]
     fn test_network_constants() {
         assert_eq!(Network::Mainnet.seconds_per_slot(), 12);
         assert_eq!(Network::Mainnet.slots_per_epoch(), 32);
