@@ -1,5 +1,6 @@
 mod deposit;
 mod exit;
+mod existing_mnemonic;
 mod network;
 mod new_mnemonic;
 mod password;
@@ -69,6 +70,14 @@ enum Commands {
         /// Execution address for 0x01 withdrawal credentials
         #[arg(long)]
         withdrawal_address: Option<String>,
+
+        /// Passphrase for mnemonic seed derivation
+        #[arg(long, default_value = "")]
+        mnemonic_passphrase: String,
+
+        /// Use PBKDF2 instead of Scrypt for keystore encryption
+        #[arg(long)]
+        pbkdf2: bool,
     },
 
     /// Generate a BLS-to-execution-change message
@@ -139,8 +148,26 @@ fn main() -> anyhow::Result<()> {
                 &keystore_password,
             )
         }
-        Commands::ExistingMnemonic { .. } => {
-            todo!("existing-mnemonic subcommand not yet implemented")
+        Commands::ExistingMnemonic {
+            network,
+            output_dir,
+            num_validators,
+            start_index,
+            withdrawal_address,
+            mnemonic_passphrase,
+            pbkdf2,
+        } => {
+            let keystore_password = password::prompt_password()?;
+            existing_mnemonic::run(
+                &network,
+                &output_dir,
+                num_validators,
+                start_index,
+                withdrawal_address.as_deref(),
+                &mnemonic_passphrase,
+                pbkdf2,
+                &keystore_password,
+            )
         }
         Commands::BlsToExecution { .. } => {
             todo!("bls-to-execution subcommand not yet implemented")
