@@ -333,7 +333,7 @@ keystore_path = "/data/keystores"
 slashing_db_path = "/data/slashing.db"
 metrics_port = 9090
 grpc_port = 50052
-network = "sepolia"
+network = "hoodi"
 log_level = "debug"
 "#
         )
@@ -345,7 +345,7 @@ log_level = "debug"
         assert_eq!(config.slashing_db_path, PathBuf::from("/data/slashing.db"));
         assert_eq!(config.metrics_port, 9090);
         assert_eq!(config.grpc_port, 50052);
-        assert_eq!(config.network, Network::Sepolia);
+        assert_eq!(config.network, Network::Hoodi);
         assert_eq!(config.log_level, "debug");
     }
 
@@ -469,7 +469,7 @@ log_level = "debug"
         let cli = CliOverrides {
             beacon_url: Some("http://custom:5052".to_string()),
             metrics_port: Some(9999),
-            network: Some(Network::Sepolia),
+            network: Some(Network::Hoodi),
             ..Default::default()
         };
 
@@ -477,7 +477,7 @@ log_level = "debug"
 
         assert_eq!(config.beacon_url, "http://custom:5052");
         assert_eq!(config.metrics_port, 9999);
-        assert_eq!(config.network, Network::Sepolia);
+        assert_eq!(config.network, Network::Hoodi);
         assert_eq!(config.grpc_port, 50051);
         assert_eq!(config.grpc_address, "127.0.0.1");
     }
@@ -502,7 +502,7 @@ beacon_url = "http://beacon:5052"
 keystore_path = "/data/keystores"
 slashing_db_path = "/data/slashing.db"
 grpc_address = "192.168.1.1"
-network = "sepolia"
+network = "hoodi"
 log_level = "debug"
 "#
         )
