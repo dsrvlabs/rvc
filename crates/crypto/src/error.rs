@@ -86,6 +86,9 @@ pub enum KeyManagerError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("failed to create decryption thread pool: {0}")]
+    ThreadPoolError(String),
 }
 
 #[cfg(test)]

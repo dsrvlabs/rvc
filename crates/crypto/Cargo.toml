@@ -33,6 +33,7 @@ zeroize.workspace = true
 hkdf.workspace = true
 num-bigint.workspace = true
 bip39.workspace = true
+rayon.workspace = true
 
 [features]
 test-utils = []

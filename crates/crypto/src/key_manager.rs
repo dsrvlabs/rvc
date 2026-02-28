@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use secrecy::{ExposeSecret, SecretString};
 use tracing::warn;
@@ -9,6 +9,31 @@ use super::bls::{PublicKey, SecretKey, PUBLIC_KEY_BYTES_LEN};
 use super::decryption_tracker::DecryptionAttemptTracker;
 use super::error::KeyManagerError;
 use super::keystore::Keystore;
+
+/// A prepared decryption work item. Produced by Phase 1, consumed by Phase 2.
+#[allow(dead_code)]
+struct DecryptionTask<'a> {
+    file_path: PathBuf,
+    keystore: Keystore,
+    password: &'a [u8],
+    declared_pubkey_hex: String,
+}
+
+/// Result of a single decryption attempt. Produced by Phase 2, consumed by Phase 3.
+#[allow(dead_code)]
+enum DecryptionOutcome {
+    Success {
+        pubkey_bytes: [u8; PUBLIC_KEY_BYTES_LEN],
+        secret_key: SecretKey,
+        pubkey_hex: String,
+        file_path: PathBuf,
+    },
+    Failure {
+        pubkey_hex: String,
+        file_path: PathBuf,
+        error: String,
+    },
+}
 
 pub struct KeyManager {
     keys: HashMap<[u8; PUBLIC_KEY_BYTES_LEN], SecretKey>,
