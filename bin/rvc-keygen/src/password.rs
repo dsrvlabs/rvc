@@ -30,6 +30,7 @@ pub fn prompt_password() -> Result<Zeroizing<String>> {
 }
 
 /// Reads a password from a file, trims trailing newlines.
+#[allow(dead_code)]
 pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read password file: {}", path.display()))?;

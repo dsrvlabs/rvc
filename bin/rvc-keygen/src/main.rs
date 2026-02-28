@@ -1,9 +1,7 @@
-mod exit;
-#[allow(dead_code)]
 mod deposit;
-#[allow(dead_code)]
+mod exit;
 mod network;
-#[allow(dead_code)]
+mod new_mnemonic;
 mod password;
 
 use std::path::PathBuf;
@@ -40,6 +38,14 @@ enum Commands {
         /// Execution address for 0x01 withdrawal credentials
         #[arg(long)]
         withdrawal_address: Option<String>,
+
+        /// Passphrase for mnemonic seed derivation
+        #[arg(long, default_value = "")]
+        mnemonic_passphrase: String,
+
+        /// Use PBKDF2 instead of Scrypt for keystore encryption
+        #[arg(long)]
+        pbkdf2: bool,
     },
 
     /// Regenerate keys from an existing mnemonic
@@ -112,8 +118,26 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::NewMnemonic { .. } => {
-            todo!("new-mnemonic subcommand not yet implemented")
+        Commands::NewMnemonic {
+            network,
+            output_dir,
+            num_validators,
+            start_index,
+            withdrawal_address,
+            mnemonic_passphrase,
+            pbkdf2,
+        } => {
+            let keystore_password = password::prompt_password()?;
+            new_mnemonic::run(
+                &network,
+                &output_dir,
+                num_validators,
+                start_index,
+                withdrawal_address.as_deref(),
+                &mnemonic_passphrase,
+                pbkdf2,
+                &keystore_password,
+            )
         }
         Commands::ExistingMnemonic { .. } => {
             todo!("existing-mnemonic subcommand not yet implemented")
