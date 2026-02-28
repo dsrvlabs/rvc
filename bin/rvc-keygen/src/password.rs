@@ -29,8 +29,18 @@ pub fn prompt_password() -> Result<Zeroizing<String>> {
     Ok(password)
 }
 
+/// Resolves a password from a file or interactive prompt.
+///
+/// If `password_file` is `Some`, reads the password from the file.
+/// Otherwise, prompts the user interactively with double-prompt confirmation.
+pub fn resolve_password(password_file: Option<&Path>) -> Result<Zeroizing<String>> {
+    match password_file {
+        Some(path) => read_password_file(path),
+        None => prompt_password(),
+    }
+}
+
 /// Reads a password from a file, trims trailing newlines.
-#[allow(dead_code)]
 pub fn read_password_file(path: &Path) -> Result<Zeroizing<String>> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read password file: {}", path.display()))?;
@@ -185,6 +195,32 @@ mod tests {
     #[test]
     fn test_read_password_file_not_found() {
         let result = read_password_file(Path::new("/nonexistent/password.txt"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_password_with_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("password.txt");
+        std::fs::write(&path, "mypassword123\n").unwrap();
+
+        let password = resolve_password(Some(&path)).unwrap();
+        assert_eq!(*password, "mypassword123");
+    }
+
+    #[test]
+    fn test_resolve_password_with_file_too_short() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("password.txt");
+        std::fs::write(&path, "short\n").unwrap();
+
+        let result = resolve_password(Some(&path));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_password_with_nonexistent_file() {
+        let result = resolve_password(Some(Path::new("/nonexistent/password.txt")));
         assert!(result.is_err());
     }
 }

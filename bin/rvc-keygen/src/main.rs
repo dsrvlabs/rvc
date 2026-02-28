@@ -1,7 +1,7 @@
 mod bls_to_execution;
 mod deposit;
-mod exit;
 mod existing_mnemonic;
+mod exit;
 mod network;
 mod new_mnemonic;
 mod password;
@@ -49,6 +49,10 @@ enum Commands {
         /// Use PBKDF2 instead of Scrypt for keystore encryption
         #[arg(long)]
         pbkdf2: bool,
+
+        /// Read keystore password from file instead of prompting
+        #[arg(long)]
+        password_file: Option<PathBuf>,
     },
 
     /// Regenerate keys from an existing mnemonic
@@ -80,6 +84,10 @@ enum Commands {
         /// Use PBKDF2 instead of Scrypt for keystore encryption
         #[arg(long)]
         pbkdf2: bool,
+
+        /// Read keystore password from file instead of prompting
+        #[arg(long)]
+        password_file: Option<PathBuf>,
     },
 
     /// Generate a BLS-to-execution-change message
@@ -126,6 +134,10 @@ enum Commands {
         /// Path to the EIP-2335 keystore file
         #[arg(long)]
         keystore: PathBuf,
+
+        /// Read keystore password from file instead of prompting
+        #[arg(long)]
+        password_file: Option<PathBuf>,
     },
 }
 
@@ -141,8 +153,9 @@ fn main() -> anyhow::Result<()> {
             withdrawal_address,
             mnemonic_passphrase,
             pbkdf2,
+            password_file,
         } => {
-            let keystore_password = password::prompt_password()?;
+            let keystore_password = password::resolve_password(password_file.as_deref())?;
             new_mnemonic::run(
                 &network,
                 &output_dir,
@@ -162,8 +175,9 @@ fn main() -> anyhow::Result<()> {
             withdrawal_address,
             mnemonic_passphrase,
             pbkdf2,
+            password_file,
         } => {
-            let keystore_password = password::prompt_password()?;
+            let keystore_password = password::resolve_password(password_file.as_deref())?;
             existing_mnemonic::run(
                 &network,
                 &output_dir,
@@ -188,8 +202,15 @@ fn main() -> anyhow::Result<()> {
             execution_address,
             bls_withdrawal_index,
         }),
-        Commands::Exit { network, output_dir, validator_index, epoch, keystore } => {
-            exit::run(exit::ExitArgs { network, output_dir, validator_index, epoch, keystore })
+        Commands::Exit { network, output_dir, validator_index, epoch, keystore, password_file } => {
+            exit::run(exit::ExitArgs {
+                network,
+                output_dir,
+                validator_index,
+                epoch,
+                keystore,
+                password_file,
+            })
         }
     }
 }

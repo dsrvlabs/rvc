@@ -15,6 +15,7 @@ pub struct ExitArgs {
     pub validator_index: u64,
     pub epoch: u64,
     pub keystore: PathBuf,
+    pub password_file: Option<PathBuf>,
 }
 
 pub fn run(args: ExitArgs) -> Result<()> {
@@ -22,7 +23,7 @@ pub fn run(args: ExitArgs) -> Result<()> {
 
     let keystore = Keystore::from_file(&args.keystore).context("Failed to load keystore file")?;
 
-    let password = password::prompt_password()?;
+    let password = password::resolve_password(args.password_file.as_deref())?;
 
     let secret_key = keystore.decrypt(password.as_bytes()).context("Failed to decrypt keystore")?;
 
