@@ -1040,6 +1040,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use serde_json::json;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1231,7 +1232,7 @@ mod tests {
         let manager = make_manager(&mock_server.uri());
         let result = manager.get_config_spec().await;
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().data.get("SECONDS_PER_SLOT").unwrap(), "12");
+        assert_eq!(result.unwrap().data.get("SECONDS_PER_SLOT").unwrap(), &json!("12"));
     }
 
     #[tokio::test]

@@ -923,6 +923,7 @@ mod tests {
     use std::time::Duration;
 
     use serde::{Deserialize, Serialize};
+    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use wiremock::matchers::{body_json, method, path};
@@ -2087,13 +2088,13 @@ mod tests {
         let client = BeaconClient::new(config).unwrap();
 
         let result = client.get_config_spec().await.unwrap();
-        assert_eq!(result.data.get("GENESIS_FORK_VERSION").unwrap(), "0x00000000");
-        assert_eq!(result.data.get("ALTAIR_FORK_EPOCH").unwrap(), "74240");
-        assert_eq!(result.data.get("BELLATRIX_FORK_EPOCH").unwrap(), "144896");
-        assert_eq!(result.data.get("CAPELLA_FORK_EPOCH").unwrap(), "194048");
-        assert_eq!(result.data.get("DENEB_FORK_EPOCH").unwrap(), "269568");
-        assert_eq!(result.data.get("SECONDS_PER_SLOT").unwrap(), "12");
-        assert_eq!(result.data.get("SLOTS_PER_EPOCH").unwrap(), "32");
+        assert_eq!(result.data.get("GENESIS_FORK_VERSION").unwrap(), &json!("0x00000000"));
+        assert_eq!(result.data.get("ALTAIR_FORK_EPOCH").unwrap(), &json!("74240"));
+        assert_eq!(result.data.get("BELLATRIX_FORK_EPOCH").unwrap(), &json!("144896"));
+        assert_eq!(result.data.get("CAPELLA_FORK_EPOCH").unwrap(), &json!("194048"));
+        assert_eq!(result.data.get("DENEB_FORK_EPOCH").unwrap(), &json!("269568"));
+        assert_eq!(result.data.get("SECONDS_PER_SLOT").unwrap(), &json!("12"));
+        assert_eq!(result.data.get("SLOTS_PER_EPOCH").unwrap(), &json!("32"));
         assert_eq!(result.data.len(), 11);
     }
 
