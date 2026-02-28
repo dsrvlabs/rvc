@@ -1,3 +1,4 @@
+mod exit;
 #[allow(dead_code)]
 mod deposit;
 #[allow(dead_code)]
@@ -100,6 +101,10 @@ enum Commands {
         /// Epoch at which to exit
         #[arg(long)]
         epoch: u64,
+
+        /// Path to the EIP-2335 keystore file
+        #[arg(long)]
+        keystore: PathBuf,
     },
 }
 
@@ -116,8 +121,8 @@ fn main() -> anyhow::Result<()> {
         Commands::BlsToExecution { .. } => {
             todo!("bls-to-execution subcommand not yet implemented")
         }
-        Commands::Exit { .. } => {
-            todo!("exit subcommand not yet implemented")
+        Commands::Exit { network, output_dir, validator_index, epoch, keystore } => {
+            exit::run(exit::ExitArgs { network, output_dir, validator_index, epoch, keystore })
         }
     }
 }
