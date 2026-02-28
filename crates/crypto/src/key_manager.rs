@@ -938,4 +938,231 @@ mod tests {
         let debug_output = format!("{:?}", secret);
         assert!(!debug_output.contains(&test_password_string()));
     }
+
+    // ── Parallel decryption tests ─────────────────────────────────────────
+
+    /// Helper: generates a random key, encrypts it as PBKDF2 keystore, writes JSON
+    /// to the given directory, and returns (pubkey_hex, password_string).
+    fn create_generated_keystore(dir: &TempDir, index: usize) -> (String, String) {
+        use crate::keystore::EncryptionKdf;
+
+        let sk = SecretKey::generate();
+        let password = format!("password-{}", index);
+        let keystore = Keystore::encrypt(
+            &sk,
+            password.as_bytes(),
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::Pbkdf2,
+        )
+        .expect("should encrypt");
+        let pubkey_hex = keystore.pubkey.clone().unwrap();
+        let json = keystore.to_json().expect("should serialize");
+        let filename = format!("keystore-{}.json", index);
+        create_test_keystore_file(dir, &filename, &json);
+        (pubkey_hex, password)
+    }
+
+    #[test]
+    fn test_parallel_load_single_key() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2))
+                .unwrap();
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_parallel_load_multiple_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut passwords = HashMap::new();
+
+        for i in 0..3 {
+            let (pubkey_hex, password) = create_generated_keystore(&temp_dir, i);
+            passwords.insert(pubkey_hex, SecretString::from(password));
+        }
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2))
+                .unwrap();
+        assert_eq!(manager.len(), 3);
+    }
+
+    #[test]
+    fn test_parallel_load_mixed_success_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+        create_test_keystore_file(&temp_dir, "corrupted.json", "{ invalid json }");
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2))
+                .unwrap();
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_parallel_load_wrong_password_skipped() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords
+            .insert(TEST_PUBKEY_HEX.to_string(), SecretString::from("wrong_password".to_string()));
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2))
+                .unwrap();
+        assert!(manager.is_empty());
+    }
+
+    #[test]
+    fn test_parallel_load_pubkey_mismatch_skipped() {
+        let keystore_with_wrong_pubkey = r#"
+        {
+            "crypto": {
+                "kdf": {
+                    "function": "pbkdf2",
+                    "params": {
+                        "dklen": 32,
+                        "c": 262144,
+                        "prf": "hmac-sha256",
+                        "salt": "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"
+                    },
+                    "message": ""
+                },
+                "checksum": {
+                    "function": "sha256",
+                    "params": {},
+                    "message": "8a9f5d9912ed7e75ea794bc5a89bca5f193721d30868ade6f73043c6ea6febf1"
+                },
+                "cipher": {
+                    "function": "aes-128-ctr",
+                    "params": {
+                        "iv": "264daa3f303d7259501c93d997d84fe6"
+                    },
+                    "message": "cee03fde2af33149775b7223e7845e4fb2c8ae1792e5f99fe9ecf474cc8c16ad"
+                }
+            },
+            "description": "Test keystore with wrong pubkey",
+            "pubkey": "a99a76ed7796f7be22d5b7e85deeb7c5677e88e511e0b337618f8c4eb61349b4bf2d153f649f7b53359fe8b94a38e44c",
+            "path": "m/12381/60/0/0",
+            "uuid": "64625def-3331-4eea-ab6f-782f3ed16a84",
+            "version": 4
+        }
+        "#;
+
+        let wrong_pubkey_hex =
+            "a99a76ed7796f7be22d5b7e85deeb7c5677e88e511e0b337618f8c4eb61349b4bf2d153f649f7b53359fe8b94a38e44c";
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "wrong_pubkey.json", keystore_with_wrong_pubkey);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(wrong_pubkey_hex.to_string(), SecretString::from(test_password_string()));
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2))
+                .unwrap();
+        assert!(manager.is_empty());
+    }
+
+    #[test]
+    fn test_parallel_load_thread_count_1() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(1))
+                .unwrap();
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_parallel_load_thread_count_capped_at_32() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(100))
+                .unwrap();
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_parallel_load_no_keystores_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let passwords = HashMap::new();
+
+        let result =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2));
+        assert!(matches!(result, Err(KeyManagerError::NoKeystoreFiles)));
+    }
+
+    #[test]
+    fn test_load_from_directory_delegates_to_parallel() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+        let manager_default = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
+        let manager_explicit =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, None)
+                .unwrap();
+
+        assert_eq!(manager_default.len(), manager_explicit.len());
+
+        let keys_default: std::collections::BTreeSet<_> =
+            manager_default.list_public_keys().iter().map(|pk| pk.to_bytes()).collect();
+        let keys_explicit: std::collections::BTreeSet<_> =
+            manager_explicit.list_public_keys().iter().map(|pk| pk.to_bytes()).collect();
+        assert_eq!(keys_default, keys_explicit);
+    }
+
+    #[cfg(unix)]
+    mod parallel_symlink_tests {
+        use super::*;
+        use std::os::unix::fs::symlink;
+
+        #[test]
+        fn test_parallel_load_preserves_symlink_check() {
+            let keystore_dir = TempDir::new().unwrap();
+            let outside_dir = TempDir::new().unwrap();
+
+            let outside_keystore = outside_dir.path().join("secret_keystore.json");
+            let mut file = File::create(&outside_keystore).unwrap();
+            file.write_all(TEST_KEYSTORE_PBKDF2.as_bytes()).unwrap();
+
+            let symlink_path = keystore_dir.path().join("malicious_link.json");
+            symlink(&outside_keystore, &symlink_path).unwrap();
+
+            let mut passwords = HashMap::new();
+            passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+            let result = KeyManager::load_from_directory_with_threads(
+                keystore_dir.path(),
+                &passwords,
+                Some(2),
+            );
+
+            assert!(
+                matches!(result, Err(KeyManagerError::NoKeystoreFiles)),
+                "Symlink pointing outside directory should be skipped in parallel load"
+            );
+        }
+    }
 }
