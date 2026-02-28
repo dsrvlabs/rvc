@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+mod deposit;
+#[allow(dead_code)]
 mod network;
 #[allow(dead_code)]
 mod password;

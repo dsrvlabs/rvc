@@ -20,6 +20,8 @@ zeroize.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rpassword.workspace = true
+sha2.workspace = true
+tree_hash.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

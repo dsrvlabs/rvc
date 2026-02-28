@@ -2976,7 +2976,9 @@ dependencies = [
  "rvc-eth-types",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
+ "tree_hash",
  "zeroize",
 ]
 
