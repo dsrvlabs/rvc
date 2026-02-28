@@ -75,6 +75,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 subtle = "2.6"
 hkdf = "0.12"
 num-bigint = "0.4"
+bip39 = { version = "2.2", features = ["zeroize", "rand"] }
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
