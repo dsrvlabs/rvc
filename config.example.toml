@@ -1,52 +1,95 @@
 # rvc - Rust Validator Client Configuration
-# This is an example configuration file.
 # Copy this file to config.toml and customize as needed.
+#
+# CLI flags override values set here.
+# Run `rvc start -c config.toml` to use this file.
 
-# Beacon node URL
-# The HTTP endpoint of your beacon node (Prysm, Lighthouse, Teku, Nimbus, Lodestar)
-beacon_url = "http://localhost:5052"
+# ---------------------------------------------------------------------------
+# Beacon Node
+# ---------------------------------------------------------------------------
 
-# Path to the keystore directory
-# This directory should contain EIP-2335 keystore files (keystore-*.json)
+# Primary beacon node HTTP endpoint (Lighthouse, Prysm, Teku, Nimbus, Lodestar)
+beacon_url = "http://141.253.112.63:5052"
+
+# Multi-BN failover: comma-separated list of beacon node URLs.
+# When set, takes precedence over beacon_url.
+# beacon_nodes = ["http://bn1:5052", "http://bn2:5052", "http://bn3:5052"]
+
+# ---------------------------------------------------------------------------
+# Validator Keys
+# ---------------------------------------------------------------------------
+
+# Directory containing EIP-2335 keystore JSON files (keystore-*.json)
 keystore_path = "./keystores"
 
-# Path to the password file (optional)
-# Format: one password per line, or pubkey=password per line
-# If not specified, passwords will be prompted interactively
-# WARNING: Ensure password files have restrictive permissions (chmod 600)
+# Password file for keystore decryption (optional).
+# Format: one `pubkey=password` per line. Lines starting with # are comments.
+# If omitted, passwords are prompted interactively.
+# WARNING: Ensure restrictive permissions (chmod 600).
 # password_file = "./passwords.txt"
 
-# Path to the slashing protection database
-# This SQLite database stores attestation history to prevent slashing
-slashing_db_path = "./slashing_protection.sqlite"
-
-# Metrics HTTP server port
-# Exposes /metrics (Prometheus format), /health, /livez, /readyz endpoints
-metrics_port = 8080
-
-# gRPC server port
-# For duty tracker service
-grpc_port = 50051
-
-# Network preset
-# Options: mainnet, hoodi, custom
-# Each preset provides default genesis_time and genesis_validators_root
-network = "mainnet"
-
-# Genesis time override (optional)
-# Unix timestamp of chain genesis
-# Only required if network = "custom"
-# genesis_time = 1606824023
-
-# Genesis validators root override (optional)
-# 32-byte hex string with 0x prefix
-# Only required if network = "custom"
-# genesis_validators_root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
-
-# Graffiti string for blocks (optional)
-# Maximum 32 bytes
+# Block graffiti included in proposed blocks (optional, max 32 bytes)
 # graffiti = "rvc"
 
-# Log level
-# Options: trace, debug, info, warn, error
+# ---------------------------------------------------------------------------
+# Slashing Protection
+# ---------------------------------------------------------------------------
+
+# SQLite database storing attestation/block history to prevent slashing.
+# Created automatically on first run.
+slashing_db_path = "./slashing_protection.sqlite"
+
+# ---------------------------------------------------------------------------
+# Network
+# ---------------------------------------------------------------------------
+
+# Network preset: mainnet, sepolia, holesky, goerli, custom
+# Each preset provides genesis_time and genesis_validators_root automatically.
+network = "hoodi"
+
+# Genesis overrides (required only when network = "custom")
+# genesis_time = 1606824023
+# genesis_validators_root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+
+# ---------------------------------------------------------------------------
+# Doppelganger Detection
+# ---------------------------------------------------------------------------
+
+# Check for duplicate validators on the network before attesting.
+# Monitors for ~2 epochs at startup. Disable with --no-doppelganger-detection CLI flag.
+doppelganger_detection = true
+
+# ---------------------------------------------------------------------------
+# Servers
+# ---------------------------------------------------------------------------
+
+# Prometheus metrics HTTP server (/metrics, /health, /livez, /readyz)
+metrics_port = 8080
+
+# gRPC server for duty tracker service
+grpc_port = 50051
+grpc_address = "127.0.0.1"
+
+# ---------------------------------------------------------------------------
+# Keymanager API (EIP-3076 key management at runtime)
+# ---------------------------------------------------------------------------
+
+# Enable the Keymanager API server (GET/POST/DELETE /eth/v1/keystores, /eth/v1/remotekeys)
+keymanager_enabled = false
+
+# Listen address for the Keymanager API
+# keymanager_address = "127.0.0.1:5062"
+
+# Path to the bearer token file (auto-generated if missing)
+# keymanager_token_file = "./keymanager-api-token.txt"
+
+# Web3Signer URL for remote signing (used with Keymanager API remote keys)
+# remote_signer_url = "https://web3signer:9000"
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+# Log level: trace, debug, info, warn, error
+# Can also be set via RUST_LOG environment variable.
 log_level = "info"
