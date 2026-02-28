@@ -29,7 +29,7 @@ pub use decryption_tracker::DecryptionAttemptTracker;
 pub use error::{BlsError, KeyManagerError, KeystoreError};
 pub use eth_types::{DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
 pub use key_manager::KeyManager;
-pub use keystore::{KdfParams, Keystore, Pbkdf2Params, ScryptParams};
+pub use keystore::{EncryptionKdf, KdfParams, Keystore, Pbkdf2Params, ScryptParams};
 pub use remote_signer::{RemoteSigner, RemoteSignerConfig};
 pub use signer_trait::{LocalSigner, Signer, SigningError};
 pub use signing::{
