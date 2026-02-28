@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use rayon::prelude::*;
 use secrecy::{ExposeSecret, SecretString};
@@ -178,12 +179,21 @@ impl KeyManager {
             .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
         let num_threads = num_threads.clamp(1, 32);
 
+        if num_threads > 8 {
+            warn!(
+                threads = num_threads,
+                peak_memory_mib = num_threads * 256,
+                "High parallelism for keystore decryption; peak scrypt memory may be significant"
+            );
+        }
+
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .thread_name(|i| format!("rvc-decrypt-{}", i))
             .build()
             .map_err(|e| KeyManagerError::ThreadPoolError(e.to_string()))?;
 
+        let start = Instant::now();
         let results: Vec<DecryptionOutcome> = pool.install(|| {
             tasks
                 .into_par_iter()
@@ -246,14 +256,19 @@ impl KeyManager {
                 .collect()
         });
 
+        let elapsed = start.elapsed();
+
         // ── Phase 3: Sequential aggregation ───────────────────────────────
         let mut keys = HashMap::new();
+        let mut success_count: usize = 0;
+        let mut fail_count: usize = 0;
 
         for outcome in results {
             match outcome {
                 DecryptionOutcome::Success { pubkey_bytes, secret_key, pubkey_hex, file_path } => {
                     debug!(pubkey = %pubkey_hex, file = ?file_path, "Loaded validator key");
                     keys.insert(pubkey_bytes, secret_key);
+                    success_count += 1;
                 }
                 DecryptionOutcome::Failure { pubkey_hex, file_path, error } => {
                     warn!(
@@ -262,16 +277,17 @@ impl KeyManager {
                         error = %error,
                         "Failed to decrypt keystore"
                     );
+                    fail_count += 1;
                 }
             }
         }
 
-        let loaded_pubkeys: Vec<String> =
-            keys.keys().map(|k| format!("0x{}", hex::encode(k))).collect();
         info!(
-            loaded = keys.len(),
-            pubkeys = ?loaded_pubkeys,
-            path = ?canonical_dir,
+            total = success_count + fail_count,
+            loaded = success_count,
+            failed = fail_count,
+            elapsed_ms = elapsed.as_millis(),
+            threads = num_threads,
             "Finished loading validator keys"
         );
 
