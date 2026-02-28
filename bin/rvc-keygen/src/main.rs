@@ -1,3 +1,4 @@
+mod bls_to_execution;
 mod deposit;
 mod exit;
 mod existing_mnemonic;
@@ -97,6 +98,10 @@ enum Commands {
         /// Execution address to set as withdrawal target
         #[arg(long)]
         execution_address: String,
+
+        /// BLS withdrawal key index for derivation path m/12381/3600/{index}/0
+        #[arg(long, default_value_t = 0)]
+        bls_withdrawal_index: u32,
     },
 
     /// Generate a signed voluntary exit message
@@ -169,9 +174,19 @@ fn main() -> anyhow::Result<()> {
                 &keystore_password,
             )
         }
-        Commands::BlsToExecution { .. } => {
-            todo!("bls-to-execution subcommand not yet implemented")
-        }
+        Commands::BlsToExecution {
+            network,
+            output_dir,
+            validator_index,
+            execution_address,
+            bls_withdrawal_index,
+        } => bls_to_execution::run(bls_to_execution::BlsToExecutionArgs {
+            network,
+            output_dir,
+            validator_index,
+            execution_address,
+            bls_withdrawal_index,
+        }),
         Commands::Exit { network, output_dir, validator_index, epoch, keystore } => {
             exit::run(exit::ExitArgs { network, output_dir, validator_index, epoch, keystore })
         }
