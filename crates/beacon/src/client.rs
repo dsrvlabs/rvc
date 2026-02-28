@@ -724,10 +724,18 @@ impl BeaconClient {
                     let status = response.status();
 
                     if status.is_success() {
-                        return response
-                            .json::<T>()
-                            .await
-                            .map_err(|e| BeaconError::ParseError(e.to_string()));
+                        let body = response.text().await.map_err(|e| {
+                            BeaconError::ParseError(format!("failed to read response body: {e}"))
+                        })?;
+                        return serde_json::from_str::<T>(&body).map_err(|e| {
+                            let preview = body.get(..1024).unwrap_or(&body);
+                            warn!(
+                                error = %e,
+                                body_preview = preview,
+                                "Failed to parse beacon API response"
+                            );
+                            BeaconError::ParseError(format!("error decoding response body: {e}"))
+                        });
                     }
 
                     if status.is_client_error() {
@@ -4164,6 +4172,67 @@ mod tests {
                 assert_eq!(message, "Invalid registration data");
             }
             _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_error_includes_body_preview() {
+        let mock_server = MockServer::start().await;
+
+        let invalid_body = "this is not valid json at all";
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(invalid_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result: Result<TestData, _> = client.get("/eth/v1/test").await;
+
+        match result {
+            Err(BeaconError::ParseError(msg)) => {
+                // New format: "error decoding response body: <serde error>"
+                // Old format was just "error decoding response body" from reqwest
+                assert!(
+                    msg.starts_with("error decoding response body: "),
+                    "Expected error message to start with 'error decoding response body: ', got: {msg}"
+                );
+            }
+            other => panic!("Expected ParseError, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_error_truncates_large_body() {
+        let mock_server = MockServer::start().await;
+
+        // Create a body larger than 1024 bytes that is invalid JSON
+        let large_body = "x".repeat(2048);
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&large_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result: Result<TestData, _> = client.get("/eth/v1/test").await;
+
+        match result {
+            Err(BeaconError::ParseError(msg)) => {
+                assert!(
+                    msg.starts_with("error decoding response body: "),
+                    "Expected error message to start with 'error decoding response body: ', got: {msg}"
+                );
+            }
+            other => panic!("Expected ParseError, got: {other:?}"),
         }
     }
 }
