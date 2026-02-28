@@ -143,6 +143,10 @@ enum Commands {
         /// Duty fetch timeout in seconds (default: 10)
         #[arg(long)]
         duty_fetch_timeout: Option<u64>,
+
+        /// Number of threads for parallel keystore decryption (default: auto-detect)
+        #[arg(long)]
+        key_decrypt_threads: Option<usize>,
     },
 
     /// Submit a voluntary exit for a validator
@@ -221,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
             attestation_timeout,
             aggregate_timeout,
             duty_fetch_timeout,
+            key_decrypt_threads,
         } => {
             init_logging(&log_level);
 
@@ -251,6 +256,12 @@ async fn main() -> anyhow::Result<()> {
                 timeouts.duty_fetch = std::time::Duration::from_secs(secs);
             }
 
+            if let Some(n) = key_decrypt_threads {
+                if n == 0 {
+                    anyhow::bail!("--key-decrypt-threads must be greater than 0");
+                }
+            }
+
             let cli_overrides = CliOverrides {
                 beacon_url,
                 beacon_nodes,
@@ -276,6 +287,7 @@ async fn main() -> anyhow::Result<()> {
                 keymanager_address,
                 keymanager_token_file,
                 remote_signer_url,
+                key_decrypt_threads,
             };
 
             let mut cfg = load_config(config)?;

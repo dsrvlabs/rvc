@@ -55,6 +55,9 @@ pub struct Config {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_signer_url: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_decrypt_threads: Option<usize>,
 }
 
 impl Default for Config {
@@ -78,6 +81,7 @@ impl Default for Config {
             keymanager_address: None,
             keymanager_token_file: None,
             remote_signer_url: None,
+            key_decrypt_threads: None,
         }
     }
 }
@@ -278,6 +282,10 @@ impl Config {
         if let Some(ref remote_signer_url) = cli.remote_signer_url {
             self.remote_signer_url = Some(remote_signer_url.clone());
         }
+
+        if let Some(n) = cli.key_decrypt_threads {
+            self.key_decrypt_threads = Some(n);
+        }
     }
 }
 
@@ -301,6 +309,7 @@ pub struct CliOverrides {
     pub keymanager_address: Option<String>,
     pub keymanager_token_file: Option<PathBuf>,
     pub remote_signer_url: Option<String>,
+    pub key_decrypt_threads: Option<usize>,
 }
 
 #[cfg(test)]
@@ -686,5 +695,70 @@ remote_signer_url = "https://signer.example.com"
         assert!(config.keymanager_address.is_none());
         assert!(config.keymanager_token_file.is_none());
         assert!(config.remote_signer_url.is_none());
+    }
+
+    // -- key_decrypt_threads tests --
+
+    #[test]
+    fn test_default_config_key_decrypt_threads_none() {
+        let config = Config::default();
+        assert!(config.key_decrypt_threads.is_none());
+    }
+
+    #[test]
+    fn test_merge_with_cli_key_decrypt_threads() {
+        let mut config = Config::default();
+        assert!(config.key_decrypt_threads.is_none());
+
+        let cli = CliOverrides { key_decrypt_threads: Some(4), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.key_decrypt_threads, Some(4));
+    }
+
+    #[test]
+    fn test_merge_with_cli_key_decrypt_threads_none_preserves_default() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+        config.merge_with_cli(&cli);
+        assert!(config.key_decrypt_threads.is_none());
+    }
+
+    #[test]
+    fn test_config_from_file_with_key_decrypt_threads() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+key_decrypt_threads = 4
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(config.key_decrypt_threads, Some(4));
+    }
+
+    #[test]
+    fn test_config_from_file_without_key_decrypt_threads() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert!(config.key_decrypt_threads.is_none());
     }
 }

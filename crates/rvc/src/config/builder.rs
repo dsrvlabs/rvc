@@ -99,7 +99,11 @@ impl ServiceBuilder {
             return Err(ConfigError::KeystorePathNotFound(self.config.keystore_path.clone()));
         }
 
-        let key_manager = KeyManager::load_from_directory(&self.config.keystore_path, &passwords)?;
+        let key_manager = KeyManager::load_from_directory_with_threads(
+            &self.config.keystore_path,
+            &passwords,
+            self.config.key_decrypt_threads,
+        )?;
         info!(
             key_count = key_manager.len(),
             path = ?self.config.keystore_path,
