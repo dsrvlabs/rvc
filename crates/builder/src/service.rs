@@ -52,6 +52,7 @@ impl BuilderService {
         }
     }
 
+    #[tracing::instrument(name = "rvc.builder.register", skip_all, fields(rvc.builder.batch_size))]
     pub async fn register_validators(&self) -> Result<(), BuilderServiceError> {
         let enabled_pubkeys = self.validator_store.list_enabled_pubkeys();
         let builder_pubkeys: Vec<[u8; 48]> = enabled_pubkeys
@@ -131,6 +132,7 @@ impl BuilderService {
             return Ok(());
         }
 
+        tracing::Span::current().record("rvc.builder.batch_size", registrations.len());
         debug!(count = registrations.len(), "submitting builder registrations");
         self.bn.register_validators(&registrations).await?;
 
@@ -151,6 +153,7 @@ impl BuilderService {
         Ok(())
     }
 
+    #[tracing::instrument(name = "rvc.builder.prepare_proposers", skip_all)]
     pub async fn prepare_proposers(
         &self,
         validator_indices: &HashMap<[u8; 48], u64>,

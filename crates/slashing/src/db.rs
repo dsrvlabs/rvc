@@ -498,6 +498,7 @@ impl SlashingDb {
     ///
     /// Combines `is_safe_to_propose` and `record_block` in a single SQLite
     /// transaction with `IMMEDIATE` locking to prevent TOCTOU races.
+    #[tracing::instrument(name = "rvc.slashing.db.block", skip_all, fields(rvc.slashing.result))]
     pub fn check_and_record_block(
         &self,
         pubkey: &str,
@@ -517,6 +518,7 @@ impl SlashingDb {
             .optional()?;
         if let Some(wm) = watermark {
             if (slot as i64) < wm {
+                tracing::Span::current().record("rvc.slashing.result", "blocked");
                 return Err(SlashingError::BelowBlockWatermark {
                     slot,
                     watermark_slot: wm as Slot,
@@ -539,10 +541,12 @@ impl SlashingDb {
                 _ => false,
             };
             if !is_resign {
+                tracing::Span::current().record("rvc.slashing.result", "blocked");
                 return Err(BlockSlashingViolation::DoubleBlockProposal { slot }.into());
             }
             // Same signing root — idempotent re-sign, commit without inserting
             tx.commit()?;
+            tracing::Span::current().record("rvc.slashing.result", "safe");
             return Ok(());
         }
 
@@ -554,6 +558,7 @@ impl SlashingDb {
 
         if let Some(min) = min_slot {
             if (slot as i64) < min {
+                tracing::Span::current().record("rvc.slashing.result", "blocked");
                 return Err(BlockSlashingViolation::SlotBelowMinimum {
                     slot,
                     min_slot: min as Slot,
@@ -568,6 +573,7 @@ impl SlashingDb {
         )?;
 
         tx.commit()?;
+        tracing::Span::current().record("rvc.slashing.result", "safe");
         Ok(())
     }
 
@@ -594,6 +600,7 @@ impl SlashingDb {
     /// `strict_semantics = true`: `None==None` is rejected as a potential
     /// double vote, matching Lighthouse/Prysm/Teku conservative behavior.
     /// See EIP-3076 §Conditions, note on `signing_root` handling.
+    #[tracing::instrument(name = "rvc.slashing.db.attestation", skip_all, fields(rvc.slashing.result))]
     pub fn check_and_record_attestation(
         &self,
         pubkey: &str,
@@ -614,6 +621,7 @@ impl SlashingDb {
             .optional()?;
         if let Some(ws) = wm_source {
             if (source_epoch as i64) < ws {
+                tracing::Span::current().record("rvc.slashing.result", "blocked");
                 return Err(SlashingError::BelowAttestationSourceWatermark {
                     source_epoch,
                     watermark_source: ws as Epoch,
@@ -630,6 +638,7 @@ impl SlashingDb {
             .optional()?;
         if let Some(wt) = wm_target {
             if (target_epoch as i64) < wt {
+                tracing::Span::current().record("rvc.slashing.result", "blocked");
                 return Err(SlashingError::BelowAttestationWatermark {
                     target_epoch,
                     watermark_target: wt as Epoch,
@@ -682,6 +691,7 @@ impl SlashingDb {
                     }
                     _ => {
                         // Different roots, or None involved in strict mode
+                        tracing::Span::current().record("rvc.slashing.result", "blocked");
                         return Err(
                             AttestationSlashingViolation::DoubleVote { target_epoch }.into()
                         );
@@ -690,6 +700,7 @@ impl SlashingDb {
             }
 
             if source_epoch < *existing_source && target_epoch > *existing_target {
+                tracing::Span::current().record("rvc.slashing.result", "blocked");
                 return Err(AttestationSlashingViolation::SurroundingVote {
                     new_source: source_epoch,
                     new_target: target_epoch,
@@ -700,6 +711,7 @@ impl SlashingDb {
             }
 
             if *existing_source < source_epoch && *existing_target > target_epoch {
+                tracing::Span::current().record("rvc.slashing.result", "blocked");
                 return Err(AttestationSlashingViolation::SurroundedVote {
                     new_source: source_epoch,
                     new_target: target_epoch,
@@ -715,6 +727,7 @@ impl SlashingDb {
             let min_target = existing.iter().map(|(_, t, _)| *t).min();
             if let Some(min) = min_target {
                 if target_epoch < min {
+                    tracing::Span::current().record("rvc.slashing.result", "blocked");
                     return Err(AttestationSlashingViolation::TargetEpochBelowMinimum {
                         target_epoch,
                         min_target: min,
@@ -731,6 +744,7 @@ impl SlashingDb {
         }
 
         tx.commit()?;
+        tracing::Span::current().record("rvc.slashing.result", "safe");
         Ok(())
     }
 
