@@ -10,6 +10,10 @@ repository.workspace = true
 name = "rvc"
 path = "src/main.rs"
 
+[features]
+default = []
+gcp-trace = ["telemetry/gcp-trace"]
+
 [dependencies]
 beacon.workspace = true
 bn-manager.workspace = true
