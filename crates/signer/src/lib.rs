@@ -63,6 +63,7 @@ impl SignerService {
     }
 
     /// Signs an attestation after checking slashing protection.
+    #[tracing::instrument(name = "rvc.sign.attestation", skip_all, fields(rvc.operation = "attestation", rvc.slashing.result))]
     pub async fn sign_attestation(
         &self,
         attestation_data: &AttestationData,
@@ -112,12 +113,18 @@ impl SignerService {
             "Computed attestation signing root"
         );
 
-        if let Err(e) = self.slashing_db.check_and_record_attestation(
-            &pubkey_hex,
-            source_epoch,
-            target_epoch,
-            Some(signing_root_hex),
-        ) {
+        let slashing_check_result = {
+            let _span = tracing::info_span!("rvc.slashing.check").entered();
+            self.slashing_db.check_and_record_attestation(
+                &pubkey_hex,
+                source_epoch,
+                target_epoch,
+                Some(signing_root_hex),
+            )
+        };
+
+        if let Err(e) = slashing_check_result {
+            tracing::Span::current().record("rvc.slashing.result", "blocked");
             RVC_SLASHING_PROTECTION_CHECKS_TOTAL
                 .with_label_values(&[slashing_result::BLOCKED])
                 .inc();
@@ -125,6 +132,7 @@ impl SignerService {
             return Err(SignerError::SlashingProtectionBlocked(e));
         }
 
+        tracing::Span::current().record("rvc.slashing.result", "safe");
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
 
         let pubkey_bytes = pubkey.to_bytes();
@@ -138,6 +146,7 @@ impl SignerService {
     }
 
     /// Signs a block after checking slashing protection.
+    #[tracing::instrument(name = "rvc.sign.block", skip_all, fields(rvc.operation = "block", rvc.slashing.result))]
     pub async fn sign_block(
         &self,
         block_root: &Root,
@@ -160,15 +169,20 @@ impl SignerService {
         let signing_root = crypto::compute_signing_root(block_root, domain);
         let signing_root_hex = hex::encode(signing_root);
 
-        if let Err(e) =
+        let slashing_check_result = {
+            let _span = tracing::info_span!("rvc.slashing.check").entered();
             self.slashing_db.check_and_record_block(&pubkey_hex, slot, Some(signing_root_hex))
-        {
+        };
+
+        if let Err(e) = slashing_check_result {
+            tracing::Span::current().record("rvc.slashing.result", "blocked");
             RVC_SLASHING_PROTECTION_CHECKS_TOTAL
                 .with_label_values(&[slashing_result::BLOCKED])
                 .inc();
             return Err(SignerError::SlashingProtectionBlocked(e));
         }
 
+        tracing::Span::current().record("rvc.slashing.result", "safe");
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
 
         let pubkey_bytes = pubkey.to_bytes();
@@ -181,6 +195,7 @@ impl SignerService {
     }
 
     /// Signs a RANDAO reveal for the given epoch.
+    #[tracing::instrument(name = "rvc.sign.randao", skip_all, fields(rvc.operation = "randao"))]
     pub async fn sign_randao_reveal(
         &self,
         epoch: Epoch,
@@ -202,6 +217,7 @@ impl SignerService {
     }
 
     /// Signs a sync committee message for the given beacon block root and slot.
+    #[tracing::instrument(name = "rvc.sign.sync_committee_message", skip_all, fields(rvc.operation = "sync_committee_message"))]
     pub async fn sign_sync_committee_message(
         &self,
         beacon_block_root: &Root,
@@ -222,6 +238,7 @@ impl SignerService {
     }
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
+    #[tracing::instrument(name = "rvc.sign.selection_proof", skip_all, fields(rvc.operation = "selection_proof"))]
     pub async fn sign_selection_proof(
         &self,
         slot: Slot,
@@ -244,6 +261,7 @@ impl SignerService {
     }
 
     /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
+    #[tracing::instrument(name = "rvc.sign.aggregate_and_proof", skip_all, fields(rvc.operation = "aggregate_and_proof"))]
     pub async fn sign_aggregate_and_proof(
         &self,
         aggregate_and_proof: &AggregateAndProof,
@@ -267,6 +285,7 @@ impl SignerService {
     }
 
     /// Signs a voluntary exit with DOMAIN_VOLUNTARY_EXIT.
+    #[tracing::instrument(name = "rvc.sign.voluntary_exit", skip_all, fields(rvc.operation = "voluntary_exit"))]
     pub async fn sign_voluntary_exit(
         &self,
         voluntary_exit: &VoluntaryExit,
@@ -296,6 +315,7 @@ impl SignerService {
     /// Signs a builder registration with DOMAIN_APPLICATION_BUILDER.
     ///
     /// No slashing check is needed — builder registrations are not slashable.
+    #[tracing::instrument(name = "rvc.sign.builder_registration", skip_all, fields(rvc.operation = "builder_registration"))]
     pub async fn sign_builder_registration(
         &self,
         registration: &ValidatorRegistrationV1,
@@ -312,6 +332,7 @@ impl SignerService {
     }
 
     /// Signs a sync committee selection proof for the given slot and subcommittee.
+    #[tracing::instrument(name = "rvc.sign.sync_committee_selection_proof", skip_all, fields(rvc.operation = "sync_committee_selection_proof"))]
     pub async fn sign_sync_committee_selection_proof(
         &self,
         slot: Slot,
@@ -336,6 +357,7 @@ impl SignerService {
     }
 
     /// Signs a ContributionAndProof with DOMAIN_CONTRIBUTION_AND_PROOF.
+    #[tracing::instrument(name = "rvc.sign.contribution_and_proof", skip_all, fields(rvc.operation = "contribution_and_proof"))]
     pub async fn sign_contribution_and_proof(
         &self,
         contribution_and_proof: &ContributionAndProof,
