@@ -1811,9 +1811,11 @@ mod tests {
 
     #[test]
     fn test_orchestrator_config_with_timeouts() {
-        let mut timeouts = OperationTimeouts::default();
-        timeouts.block_production = Duration::from_secs(5);
-        timeouts.duty_fetch = Duration::from_secs(15);
+        let timeouts = OperationTimeouts {
+            block_production: Duration::from_secs(5),
+            duty_fetch: Duration::from_secs(15),
+            ..Default::default()
+        };
 
         let config = OrchestratorConfig::new([0xdd; 32], create_test_fork_schedule())
             .with_timeouts(timeouts);
@@ -2371,9 +2373,11 @@ mod tests {
 
     #[test]
     fn test_aggregate_submit_uses_distinct_timeout_field() {
-        let mut timeouts = OperationTimeouts::default();
-        timeouts.aggregate_fetch = Duration::from_secs(5);
-        timeouts.aggregate_submit = Duration::from_secs(1);
+        let timeouts = OperationTimeouts {
+            aggregate_fetch: Duration::from_secs(5),
+            aggregate_submit: Duration::from_secs(1),
+            ..Default::default()
+        };
         // These must be distinct fields — submit path must use aggregate_submit
         assert_ne!(timeouts.aggregate_fetch, timeouts.aggregate_submit);
     }

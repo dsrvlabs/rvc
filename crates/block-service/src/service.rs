@@ -604,7 +604,8 @@ mod tests {
         is_blinded: bool,
         consensus_version: &str,
     ) -> Vec<u8> {
-        let use_block_contents = !is_blinded && matches!(consensus_version, "deneb" | "electra" | "fulu");
+        let use_block_contents =
+            !is_blinded && matches!(consensus_version, "deneb" | "electra" | "fulu");
         let mut bytes = Vec::new();
         if use_block_contents {
             // BlockContents: 3 × 4-byte offsets, then BeaconBlock at offset 12
