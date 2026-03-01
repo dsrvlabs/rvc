@@ -225,6 +225,8 @@ impl ServiceBuilder {
             deneb_version = %format_version(schedule.deneb_fork_version),
             electra_epoch = schedule.electra_fork_epoch,
             electra_version = %format_version(schedule.electra_fork_version),
+            fulu_epoch = schedule.fulu_fork_epoch,
+            fulu_version = %format_version(schedule.fulu_fork_version),
             "Loaded fork schedule from beacon node"
         );
         Ok(Arc::new(schedule))
