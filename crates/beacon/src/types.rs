@@ -246,8 +246,12 @@ pub fn parse_fork_schedule(
         deneb_fork_version: parse_version(spec, "DENEB_FORK_VERSION")?,
         electra_fork_epoch: parse_epoch(spec, "ELECTRA_FORK_EPOCH")?,
         electra_fork_version: parse_version(spec, "ELECTRA_FORK_VERSION")?,
-        fulu_fork_epoch: parse_epoch(spec, "FULU_FORK_EPOCH")?,
-        fulu_fork_version: parse_version(spec, "FULU_FORK_VERSION")?,
+        fulu_fork_epoch: parse_epoch_optional(spec, "FULU_FORK_EPOCH", u64::MAX)?,
+        fulu_fork_version: parse_version_optional(
+            spec,
+            "FULU_FORK_VERSION",
+            [0xFF, 0xFF, 0xFF, 0xFF],
+        )?,
     })
 }
 
@@ -291,6 +295,10 @@ fn parse_version(
     let value = spec
         .get(key)
         .ok_or_else(|| BeaconError::ParseError(format!("missing config key: {}", key)))?;
+    parse_version_value(value, key)
+}
+
+fn parse_version_value(value: &serde_json::Value, key: &str) -> Result<Version, BeaconError> {
     let s = value_to_string(value, key)?;
     let hex_str = s.strip_prefix("0x").unwrap_or(&s);
     let bytes = hex::decode(hex_str)
@@ -299,6 +307,32 @@ fn parse_version(
         .try_into()
         .map_err(|_| BeaconError::ParseError(format!("version must be 4 bytes for {}", key)))?;
     Ok(arr)
+}
+
+fn parse_epoch_optional(
+    spec: &HashMap<String, serde_json::Value>,
+    key: &str,
+    default: u64,
+) -> Result<Epoch, BeaconError> {
+    match spec.get(key) {
+        None => Ok(default),
+        Some(value) => {
+            let s = value_to_string(value, key)?;
+            s.parse::<u64>()
+                .map_err(|e| BeaconError::ParseError(format!("invalid epoch for {}: {}", key, e)))
+        }
+    }
+}
+
+fn parse_version_optional(
+    spec: &HashMap<String, serde_json::Value>,
+    key: &str,
+    default: Version,
+) -> Result<Version, BeaconError> {
+    match spec.get(key) {
+        None => Ok(default),
+        Some(value) => parse_version_value(value, key),
+    }
 }
 
 /// Proposer preparation data sent to the beacon node to register fee recipients.
@@ -1272,5 +1306,74 @@ mod tests {
         assert_eq!(schedule.deneb_fork_epoch, 269568);
         assert_eq!(schedule.electra_fork_epoch, 364544);
         assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_with_fulu() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("FULU_FORK_EPOCH".to_string(), json!("500000"));
+        spec.insert("FULU_FORK_VERSION".to_string(), json!("0x06000000"));
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(schedule.fulu_fork_epoch, 500000);
+        assert_eq!(schedule.fulu_fork_version, [6, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_without_fulu() {
+        let mut spec = mainnet_config_spec();
+        spec.remove("FULU_FORK_EPOCH");
+        spec.remove("FULU_FORK_VERSION");
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
+        assert_eq!(schedule.fulu_fork_version, [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_parse_epoch_optional_missing() {
+        let spec: HashMap<String, serde_json::Value> = HashMap::new();
+        let result = parse_epoch_optional(&spec, "MISSING_KEY", 42).unwrap();
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_parse_epoch_optional_present() {
+        let mut spec = HashMap::new();
+        spec.insert("FULU_FORK_EPOCH".to_string(), json!("123456"));
+        let result = parse_epoch_optional(&spec, "FULU_FORK_EPOCH", u64::MAX).unwrap();
+        assert_eq!(result, 123456);
+    }
+
+    #[test]
+    fn test_parse_epoch_optional_invalid() {
+        let mut spec = HashMap::new();
+        spec.insert("FULU_FORK_EPOCH".to_string(), json!("not_a_number"));
+        let result = parse_epoch_optional(&spec, "FULU_FORK_EPOCH", u64::MAX);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("FULU_FORK_EPOCH"));
+    }
+
+    #[test]
+    fn test_parse_version_optional_missing() {
+        let spec: HashMap<String, serde_json::Value> = HashMap::new();
+        let result = parse_version_optional(&spec, "MISSING_KEY", [0xAA; 4]).unwrap();
+        assert_eq!(result, [0xAA, 0xAA, 0xAA, 0xAA]);
+    }
+
+    #[test]
+    fn test_parse_version_optional_present() {
+        let mut spec = HashMap::new();
+        spec.insert("FULU_FORK_VERSION".to_string(), json!("0x06000000"));
+        let result =
+            parse_version_optional(&spec, "FULU_FORK_VERSION", [0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+        assert_eq!(result, [6, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_parse_version_optional_invalid() {
+        let mut spec = HashMap::new();
+        spec.insert("FULU_FORK_VERSION".to_string(), json!("0xZZZZZZZZ"));
+        let result = parse_version_optional(&spec, "FULU_FORK_VERSION", [0xFF; 4]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("FULU_FORK_VERSION"));
     }
 }
