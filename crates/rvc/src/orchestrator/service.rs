@@ -1108,6 +1108,10 @@ where
 
         if !signed_aggregates.is_empty() {
             let count = signed_aggregates.len();
+            // TODO: For Electra/Fulu, aggregation should build ElectraAggregateAndProof
+            // and dispatch via VersionedSignedAggregateAndProof::Electra/Fulu.
+            // Currently uses PreElectra for all forks because the aggregate building
+            // logic constructs SignedAggregateAndProof (pre-Electra type).
             let versioned = VersionedSignedAggregateAndProof::PreElectra(signed_aggregates);
             match tokio::time::timeout(
                 self.config.timeouts.aggregate_submit,
@@ -1493,7 +1497,16 @@ where
 
         let sig_hex = format!("0x{}", hex::encode(signature.to_bytes()));
 
-        let versioned = if is_electra {
+        let versioned = if fork_name >= ForkName::Fulu {
+            let mut fulu_data = beacon_attestation_data.clone();
+            fulu_data.index = "0".to_string();
+            VersionedAttestation::Fulu(vec![SingleAttestation {
+                committee_index,
+                attester_index,
+                data: fulu_data,
+                signature: sig_hex,
+            }])
+        } else if is_electra {
             let mut electra_data = beacon_attestation_data.clone();
             electra_data.index = "0".to_string();
             VersionedAttestation::Electra(vec![SingleAttestation {
@@ -1511,6 +1524,7 @@ where
         };
 
         let versioned_type = match &versioned {
+            VersionedAttestation::Fulu(_) => "Fulu",
             VersionedAttestation::Electra(_) => "Electra",
             VersionedAttestation::PreElectra(_) => "PreElectra",
         };
@@ -1547,19 +1561,12 @@ where
 
     fn derive_fork_for_epoch(&self, epoch: u64) -> eth_types::Fork {
         let schedule = &self.config.fork_schedule;
-        let fork_name = ForkName::from_epoch(epoch, schedule);
-        let current_version = fork_name.fork_version(schedule);
-        let prior_fork_name = if epoch > 0 {
-            ForkName::from_epoch(epoch - 1, schedule)
-        } else {
-            ForkName::from_epoch(0, schedule)
-        };
-        let previous_version = prior_fork_name.fork_version(schedule);
-
+        let current = ForkName::from_epoch(epoch, schedule);
+        let previous = current.previous_fork(schedule);
         eth_types::Fork {
-            previous_version,
-            current_version,
-            epoch: if current_version != previous_version { epoch } else { 0 },
+            previous_version: previous.fork_version(schedule),
+            current_version: current.fork_version(schedule),
+            epoch: current.activation_epoch(schedule),
         }
     }
 
@@ -3866,7 +3873,7 @@ mod tests {
                 // data.index should be the committee index from the duty ("3")
                 assert_eq!(att.data.index, "3");
             }
-            VersionedAttestation::Electra(_) => {
+            VersionedAttestation::Electra(_) | VersionedAttestation::Fulu(_) => {
                 panic!(
                     "Expected PreElectra attestation for slot in epoch 3 (< electra_fork_epoch=50)"
                 );
@@ -3914,7 +3921,7 @@ mod tests {
                 // attester_index should be the validator index
                 assert_eq!(att.attester_index, 42);
             }
-            VersionedAttestation::PreElectra(_) => {
+            VersionedAttestation::PreElectra(_) | VersionedAttestation::Fulu(_) => {
                 panic!("Expected Electra attestation for slot in epoch 50 (= electra_fork_epoch)");
             }
         }
@@ -3950,7 +3957,7 @@ mod tests {
                 assert!(!attestations[0].aggregation_bits.is_empty());
                 assert_eq!(attestations[0].data.index, "3");
             }
-            VersionedAttestation::Electra(_) => {
+            VersionedAttestation::Electra(_) | VersionedAttestation::Fulu(_) => {
                 panic!(
                     "Expected PreElectra attestation for slot 1599 (epoch 49, last pre-Electra)"
                 );
@@ -4143,7 +4150,7 @@ mod tests {
                 assert_eq!(atts[0].committee_index, 7);
                 assert_eq!(atts[0].attester_index, 99);
             }
-            VersionedAttestation::PreElectra(_) => {
+            VersionedAttestation::PreElectra(_) | VersionedAttestation::Fulu(_) => {
                 panic!("Expected Electra attestation for epoch 51");
             }
         }
@@ -4276,7 +4283,7 @@ mod tests {
                 );
                 assert_eq!(att.attester_index, 77);
             }
-            VersionedAttestation::PreElectra(_) => {
+            VersionedAttestation::PreElectra(_) | VersionedAttestation::Fulu(_) => {
                 panic!("Expected Electra attestation for epoch 52");
             }
         }
@@ -4385,5 +4392,129 @@ mod tests {
         assert_eq!(crypto_data.beacon_block_root, submitted_crypto_data.beacon_block_root);
         assert_eq!(crypto_data.source, submitted_crypto_data.source);
         assert_eq!(crypto_data.target, submitted_crypto_data.target);
+    }
+
+    // --- H-05: derive_fork_for_epoch refactor and Fulu attestation versioning tests ---
+
+    /// Helper: derives a Fork from ForkSchedule using the same logic as the refactored
+    /// derive_fork_for_epoch (activation_epoch + previous_fork helpers).
+    fn derive_fork_for_epoch_standalone(epoch: u64, schedule: &ForkSchedule) -> eth_types::Fork {
+        let current = ForkName::from_epoch(epoch, schedule);
+        let previous = current.previous_fork(schedule);
+        eth_types::Fork {
+            previous_version: previous.fork_version(schedule),
+            current_version: current.fork_version(schedule),
+            epoch: current.activation_epoch(schedule),
+        }
+    }
+
+    #[test]
+    fn test_derive_fork_for_epoch_fulu() {
+        let schedule = create_test_fork_schedule();
+        // fulu_fork_epoch = 60 in test schedule
+        let fork = derive_fork_for_epoch_standalone(60, &schedule);
+        // At fulu epoch: current = fulu version, previous = electra version
+        assert_eq!(fork.current_version, [0, 0, 0, 7]); // fulu_fork_version
+        assert_eq!(fork.previous_version, [0, 0, 0, 6]); // electra_fork_version
+        assert_eq!(fork.epoch, 60); // fulu activation epoch
+    }
+
+    #[test]
+    fn test_derive_fork_for_epoch_at_boundary() {
+        let schedule = create_test_fork_schedule();
+        // epoch 59 = Electra, epoch 60 = Fulu
+        let fork_before = derive_fork_for_epoch_standalone(59, &schedule);
+        assert_eq!(fork_before.current_version, [0, 0, 0, 6]); // electra
+        let fork_at = derive_fork_for_epoch_standalone(60, &schedule);
+        assert_eq!(fork_at.current_version, [0, 0, 0, 7]); // fulu
+    }
+
+    #[tokio::test]
+    async fn test_fulu_attestation_versioning() {
+        let mock_server = wiremock::MockServer::start().await;
+        // Fulu epoch = 60, slot = 60*32 = 1920
+        let slot = 1920;
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+
+        let captured = capturing.captured();
+        assert_eq!(captured.len(), 1);
+
+        match &captured[0] {
+            VersionedAttestation::Fulu(atts) => {
+                assert_eq!(atts.len(), 1);
+                let att = &atts[0];
+                // EIP-7549: data.index must be "0" for Fulu (since Fulu >= Electra)
+                assert_eq!(att.data.index, "0", "Fulu attestation data.index must be 0 (EIP-7549)");
+            }
+            other => {
+                panic!(
+                    "Expected Fulu attestation for slot in epoch 60 (= fulu_fork_epoch), got {:?}",
+                    std::mem::discriminant(other)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_fulu_eip7549_index_zeroing() {
+        let mock_server = wiremock::MockServer::start().await;
+        // Fulu epoch = 60, slot = 60*32 = 1920
+        let slot = 1920;
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert!(results[0].success);
+
+        let captured = capturing.captured();
+        match &captured[0] {
+            VersionedAttestation::Fulu(atts) => {
+                assert_eq!(
+                    atts[0].data.index, "0",
+                    "EIP-7549: data.index must be zeroed for Fulu attestations"
+                );
+                // committee_index should carry the original committee index from duty
+                assert_eq!(atts[0].committee_index, 3);
+            }
+            other => {
+                panic!("Expected Fulu attestation, got {:?}", std::mem::discriminant(other));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_electra_attestation_unchanged() {
+        let mock_server = wiremock::MockServer::start().await;
+        // Electra epoch = 50, slot = 50*32 = 1600 (same as existing test, just verify it's still Electra, not Fulu)
+        let slot = 1600;
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+        mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+
+        let captured = capturing.captured();
+        assert_eq!(captured.len(), 1);
+
+        match &captured[0] {
+            VersionedAttestation::Electra(atts) => {
+                assert_eq!(atts.len(), 1);
+                assert_eq!(atts[0].data.index, "0", "Electra attestation data.index must be 0");
+            }
+            other => {
+                panic!(
+                    "Expected Electra attestation for epoch 50, got {:?}",
+                    std::mem::discriminant(other)
+                );
+            }
+        }
     }
 }

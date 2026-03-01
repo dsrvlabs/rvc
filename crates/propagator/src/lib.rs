@@ -62,12 +62,16 @@ fn extract_attestation_context(attestations: &VersionedAttestation) -> (String, 
             Some(a) => (a.data.slot.clone(), a.data.target.epoch.clone(), a.data.index.clone()),
             None => ("unknown".into(), "unknown".into(), "unknown".into()),
         },
-        VersionedAttestation::Electra(atts) => match atts.first() {
-            Some(a) => {
-                (a.data.slot.clone(), a.data.target.epoch.clone(), a.committee_index.to_string())
+        VersionedAttestation::Electra(atts) | VersionedAttestation::Fulu(atts) => {
+            match atts.first() {
+                Some(a) => (
+                    a.data.slot.clone(),
+                    a.data.target.epoch.clone(),
+                    a.committee_index.to_string(),
+                ),
+                None => ("unknown".into(), "unknown".into(), "unknown".into()),
             }
-            None => ("unknown".into(), "unknown".into(), "unknown".into()),
-        },
+        }
     }
 }
 
@@ -88,7 +92,7 @@ impl<S: AttestationSubmitter> Propagator<S> {
     ) -> Result<PropagationResult, PropagatorError> {
         let total = match attestations {
             VersionedAttestation::PreElectra(a) => a.len(),
-            VersionedAttestation::Electra(a) => a.len(),
+            VersionedAttestation::Electra(a) | VersionedAttestation::Fulu(a) => a.len(),
         };
 
         if total == 0 {
