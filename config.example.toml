@@ -93,3 +93,18 @@ keymanager_enabled = false
 # Log level: trace, debug, info, warn, error
 # Can also be set via RUST_LOG environment variable.
 log_level = "info"
+
+# ---------------------------------------------------------------------------
+# Distributed Tracing (OpenTelemetry)
+# ---------------------------------------------------------------------------
+
+# OTLP exporter endpoint. Enables tracing when set.
+# Env var fallback: OTEL_EXPORTER_OTLP_ENDPOINT
+# tracing_endpoint = "http://localhost:4318"
+
+# Exporter backend: "otlp" (default) or "gcp"
+# tracing_exporter = "otlp"
+
+# Head-based sampling ratio 0.0–1.0 (default: 0.01 = 1%).
+# Env var fallback: OTEL_TRACES_SAMPLER_ARG (only if this field is at default)
+# tracing_sample_rate = 0.01

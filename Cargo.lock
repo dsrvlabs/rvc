@@ -3287,12 +3287,14 @@ dependencies = [
  "rvc-metrics",
  "rvc-signer",
  "rvc-slashing",
+ "rvc-telemetry",
  "rvc-timing",
  "tempfile",
  "tokio",
  "tonic 0.12.3",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

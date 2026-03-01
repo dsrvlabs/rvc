@@ -21,6 +21,7 @@ keymanager-api.workspace = true
 metrics.workspace = true
 rvc.workspace = true
 signer.workspace = true
+telemetry.workspace = true
 slashing.workspace = true
 timing.workspace = true
 tokio.workspace = true
@@ -29,6 +30,7 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow.workspace = true
 tonic.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -66,6 +66,23 @@ pub struct Config {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_decrypt_threads: Option<usize>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracing_endpoint: Option<String>,
+
+    #[serde(default = "default_tracing_exporter")]
+    pub tracing_exporter: String,
+
+    #[serde(default = "default_tracing_sample_rate")]
+    pub tracing_sample_rate: f64,
+}
+
+fn default_tracing_exporter() -> String {
+    "otlp".to_string()
+}
+
+fn default_tracing_sample_rate() -> f64 {
+    0.01
 }
 
 impl Default for Config {
@@ -92,6 +109,9 @@ impl Default for Config {
             remote_signer_url: None,
             remote_signer_allowed_hosts: None,
             key_decrypt_threads: None,
+            tracing_endpoint: None,
+            tracing_exporter: default_tracing_exporter(),
+            tracing_sample_rate: default_tracing_sample_rate(),
         }
     }
 }
@@ -311,6 +331,18 @@ impl Config {
         if let Some(n) = cli.key_decrypt_threads {
             self.key_decrypt_threads = Some(n);
         }
+
+        if let Some(ref tracing_endpoint) = cli.tracing_endpoint {
+            self.tracing_endpoint = Some(tracing_endpoint.clone());
+        }
+
+        if let Some(ref tracing_exporter) = cli.tracing_exporter {
+            self.tracing_exporter = tracing_exporter.clone();
+        }
+
+        if let Some(tracing_sample_rate) = cli.tracing_sample_rate {
+            self.tracing_sample_rate = tracing_sample_rate;
+        }
     }
 }
 
@@ -354,6 +386,9 @@ pub struct CliOverrides {
     pub remote_signer_url: Option<String>,
     pub remote_signer_allowed_hosts: Option<String>,
     pub key_decrypt_threads: Option<usize>,
+    pub tracing_endpoint: Option<String>,
+    pub tracing_exporter: Option<String>,
+    pub tracing_sample_rate: Option<f64>,
 }
 
 #[cfg(test)]
@@ -809,6 +844,98 @@ key_decrypt_threads = 4
 
         let config = Config::from_file(file.path()).unwrap();
         assert_eq!(config.key_decrypt_threads, Some(4));
+    }
+
+    // -- tracing config tests --
+
+    #[test]
+    fn test_default_config_tracing_fields() {
+        let config = Config::default();
+        assert!(config.tracing_endpoint.is_none());
+        assert_eq!(config.tracing_exporter, "otlp");
+        assert!((config.tracing_sample_rate - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_merge_with_cli_tracing_endpoint() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            tracing_endpoint: Some("http://collector:4318".to_string()),
+            ..Default::default()
+        };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.tracing_endpoint.as_deref(), Some("http://collector:4318"));
+    }
+
+    #[test]
+    fn test_merge_with_cli_tracing_exporter() {
+        let mut config = Config::default();
+        let cli = CliOverrides { tracing_exporter: Some("gcp".to_string()), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.tracing_exporter, "gcp");
+    }
+
+    #[test]
+    fn test_merge_with_cli_tracing_sample_rate() {
+        let mut config = Config::default();
+        let cli = CliOverrides { tracing_sample_rate: Some(0.5), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert!((config.tracing_sample_rate - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_merge_with_cli_tracing_none_preserves_defaults() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+        config.merge_with_cli(&cli);
+        assert!(config.tracing_endpoint.is_none());
+        assert_eq!(config.tracing_exporter, "otlp");
+        assert!((config.tracing_sample_rate - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_config_from_file_with_tracing() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+tracing_endpoint = "http://otel-collector:4318"
+tracing_exporter = "otlp"
+tracing_sample_rate = 0.1
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(config.tracing_endpoint.as_deref(), Some("http://otel-collector:4318"));
+        assert_eq!(config.tracing_exporter, "otlp");
+        assert!((config.tracing_sample_rate - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_config_from_file_without_tracing_uses_defaults() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert!(config.tracing_endpoint.is_none());
+        assert_eq!(config.tracing_exporter, "otlp");
+        assert!((config.tracing_sample_rate - 0.01).abs() < f64::EPSILON);
     }
 
     // -- redact_url tests --

@@ -157,6 +157,18 @@ enum Commands {
         /// Number of threads for parallel keystore decryption (default: auto-detect)
         #[arg(long)]
         key_decrypt_threads: Option<usize>,
+
+        /// OTLP exporter endpoint (e.g., http://localhost:4318). Enables tracing when set.
+        #[arg(long)]
+        tracing_endpoint: Option<String>,
+
+        /// Exporter backend: "otlp" (default) or "gcp"
+        #[arg(long, default_value = "otlp")]
+        tracing_exporter: String,
+
+        /// Head-based sampling ratio 0.0–1.0 (default: 0.01)
+        #[arg(long, default_value_t = 0.01)]
+        tracing_sample_rate: f64,
     },
 
     /// Submit a voluntary exit for a validator
@@ -238,6 +250,9 @@ async fn main() -> anyhow::Result<()> {
             aggregate_timeout,
             duty_fetch_timeout,
             key_decrypt_threads,
+            tracing_endpoint,
+            tracing_exporter,
+            tracing_sample_rate,
         } => {
             init_logging(&log_level);
 
@@ -302,6 +317,9 @@ async fn main() -> anyhow::Result<()> {
                 remote_signer_url,
                 remote_signer_allowed_hosts,
                 key_decrypt_threads,
+                tracing_endpoint,
+                tracing_exporter: Some(tracing_exporter),
+                tracing_sample_rate: Some(tracing_sample_rate),
             };
 
             let mut cfg = load_config(config)?;
@@ -367,6 +385,59 @@ fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
             Ok(Config::default())
         }
     }
+}
+
+// Called by the orchestrator startup path (wired in H-07).
+#[allow(dead_code)]
+fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfig> {
+    let endpoint = config
+        .tracing_endpoint
+        .clone()
+        .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())?;
+
+    let mut sample_rate = config.tracing_sample_rate;
+    // If sample_rate is still at default, check env var
+    if (sample_rate - 0.01).abs() < f64::EPSILON {
+        if let Ok(env_rate) = std::env::var("OTEL_TRACES_SAMPLER_ARG") {
+            if let Ok(parsed) = env_rate.parse::<f64>() {
+                sample_rate = parsed;
+            }
+        }
+    }
+
+    if !(0.0..=1.0).contains(&sample_rate) {
+        warn!(sample_rate, "tracing_sample_rate out of range 0.0..=1.0, clamping");
+        sample_rate = sample_rate.clamp(0.0, 1.0);
+    }
+
+    // Warn on non-localhost http://
+    if endpoint.starts_with("http://") {
+        if let Ok(url) = url::Url::parse(&endpoint) {
+            if let Some(host) = url.host_str() {
+                if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+                    warn!(
+                        endpoint = %endpoint,
+                        "tracing endpoint uses http:// with non-localhost host; consider using https://"
+                    );
+                }
+            }
+        }
+    }
+
+    let exporter = match config.tracing_exporter.as_str() {
+        "otlp" => telemetry::ExporterKind::Otlp,
+        other => {
+            warn!(exporter = %other, "unknown tracing exporter, defaulting to otlp");
+            telemetry::ExporterKind::Otlp
+        }
+    };
+
+    Some(telemetry::TelemetryConfig {
+        endpoint,
+        exporter,
+        sample_rate,
+        network: config.network.to_string(),
+    })
 }
 
 async fn run_validator(
@@ -867,4 +938,147 @@ async fn finalize_health_status(health_status: &SharedHealthStatus) {
     let mut status = health_status.write().await;
     status.update_healthy();
     info!(healthy = status.healthy, "Health status finalized");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_tracing_config_no_endpoint_returns_none() {
+        // Clear env vars that could interfere
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config::default();
+        assert!(build_tracing_config(&config).is_none());
+    }
+
+    #[test]
+    fn test_build_tracing_config_with_endpoint_returns_some() {
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert_eq!(tc.endpoint, "http://localhost:4318");
+        assert_eq!(tc.exporter, telemetry::ExporterKind::Otlp);
+        assert!((tc.sample_rate - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_build_tracing_config_env_var_fallback() {
+        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://env-collector:4318");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config::default(); // no tracing_endpoint set
+        let tc = build_tracing_config(&config).expect("should fall back to env var");
+        assert_eq!(tc.endpoint, "http://env-collector:4318");
+
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+
+    #[test]
+    fn test_build_tracing_config_cli_overrides_env() {
+        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://env-collector:4318");
+
+        let config = Config {
+            tracing_endpoint: Some("http://cli-collector:4318".to_string()),
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should use config value");
+        assert_eq!(tc.endpoint, "http://cli-collector:4318");
+
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+
+    #[test]
+    fn test_build_tracing_config_sample_rate_env_fallback() {
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.5");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            // sample_rate at default 0.01, so env var should be checked
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert!((tc.sample_rate - 0.5).abs() < f64::EPSILON);
+
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+    }
+
+    #[test]
+    fn test_build_tracing_config_explicit_sample_rate_overrides_env() {
+        std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.5");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            tracing_sample_rate: 0.75, // non-default, so env var should NOT be checked
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert!((tc.sample_rate - 0.75).abs() < f64::EPSILON);
+
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+    }
+
+    #[test]
+    fn test_build_tracing_config_sample_rate_clamped() {
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            tracing_sample_rate: 2.0,
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert!((tc.sample_rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_build_tracing_config_negative_sample_rate_clamped() {
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            tracing_sample_rate: -0.5,
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert!(tc.sample_rate.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_build_tracing_config_network_propagated() {
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            network: rvc::config::Network::Hoodi,
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert_eq!(tc.network, "hoodi");
+    }
+
+    #[test]
+    fn test_build_tracing_config_unknown_exporter_defaults_to_otlp() {
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            tracing_exporter: "unknown".to_string(),
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert_eq!(tc.exporter, telemetry::ExporterKind::Otlp);
+    }
 }
