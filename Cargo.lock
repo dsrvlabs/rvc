@@ -2949,6 +2949,7 @@ dependencies = [
  "hkdf",
  "num-bigint",
  "pbkdf2",
+ "proptest",
  "rand 0.8.5",
  "rayon",
  "reqwest",

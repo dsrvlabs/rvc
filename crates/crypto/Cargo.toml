@@ -39,6 +39,7 @@ rayon.workspace = true
 test-utils = []
 
 [dev-dependencies]
+proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 wiremock.workspace = true
