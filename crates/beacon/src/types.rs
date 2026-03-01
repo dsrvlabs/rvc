@@ -47,6 +47,7 @@ pub struct LegacyAttestation {
 pub enum VersionedAttestation {
     PreElectra(Vec<LegacyAttestation>),
     Electra(Vec<SingleAttestation>),
+    Fulu(Vec<SingleAttestation>),
 }
 
 /// Fork-versioned aggregate attestation for fetch responses.
@@ -54,6 +55,7 @@ pub enum VersionedAttestation {
 pub enum VersionedAggregateAttestation {
     PreElectra(eth_types::Attestation),
     Electra(eth_types::ElectraAttestation),
+    Fulu(eth_types::ElectraAttestation),
 }
 
 /// Fork-versioned signed aggregate and proof for submission.
@@ -61,6 +63,7 @@ pub enum VersionedAggregateAttestation {
 pub enum VersionedSignedAggregateAndProof {
     PreElectra(Vec<eth_types::SignedAggregateAndProof>),
     Electra(Vec<eth_types::SignedElectraAggregateAndProof>),
+    Fulu(Vec<eth_types::SignedElectraAggregateAndProof>),
 }
 
 /// Header of a beacon block.

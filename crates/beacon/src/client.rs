@@ -535,7 +535,8 @@ impl BeaconClient {
             VersionedSignedAggregateAndProof::PreElectra(ps) => {
                 self.post_empty("/eth/v1/validator/aggregate_and_proofs", ps).await
             }
-            VersionedSignedAggregateAndProof::Electra(ps) => {
+            VersionedSignedAggregateAndProof::Electra(ps)
+            | VersionedSignedAggregateAndProof::Fulu(ps) => {
                 self.post_empty("/eth/v2/validator/aggregate_and_proofs", ps).await
             }
         }
@@ -635,6 +636,7 @@ impl BeaconClient {
             let (consensus_version, attestation_count) = match attestations {
                 VersionedAttestation::PreElectra(atts) => ("phase0", atts.len()),
                 VersionedAttestation::Electra(atts) => ("electra", atts.len()),
+                VersionedAttestation::Fulu(atts) => ("fulu", atts.len()),
             };
 
             debug!(
@@ -652,7 +654,7 @@ impl BeaconClient {
                         .send()
                         .await
                 }
-                VersionedAttestation::Electra(atts) => {
+                VersionedAttestation::Electra(atts) | VersionedAttestation::Fulu(atts) => {
                     self.client
                         .post(&url)
                         .header("Eth-Consensus-Version", consensus_version)
