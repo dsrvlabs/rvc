@@ -131,7 +131,7 @@ impl SignerService {
         let signature = self.signer.sign(&signing_root, &pubkey_bytes).await?;
 
         let duration = start.elapsed().as_secs_f64();
-        RVC_SIGNING_DURATION_SECONDS.with_label_values(&[]).observe(duration);
+        RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
         RVC_ATTESTATIONS_TOTAL.with_label_values(&["success"]).inc();
 
         Ok(signature)
@@ -175,7 +175,7 @@ impl SignerService {
         let signature = self.signer.sign(&signing_root, &pubkey_bytes).await?;
 
         let duration = start.elapsed().as_secs_f64();
-        RVC_SIGNING_DURATION_SECONDS.with_label_values(&[]).observe(duration);
+        RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
 
         Ok(signature)
     }

@@ -1202,15 +1202,16 @@ where
         &self,
         slot: Slot,
     ) -> Result<Vec<AttestationResult>, OrchestratorError> {
-        let _timer =
-            RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS.with_label_values(&[]).start_timer();
+        let _timer = RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS
+            .with_label_values(&[] as &[&str])
+            .start_timer();
 
         info!(slot = slot, "Processing attestation duties for slot");
 
         let current_slot = self.clock.current_slot()?;
 
         if current_slot > slot {
-            RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL.with_label_values(&[]).inc();
+            RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL.with_label_values(&[] as &[&str]).inc();
             return Err(OrchestratorError::SlotMissed { slot, current_slot });
         }
 

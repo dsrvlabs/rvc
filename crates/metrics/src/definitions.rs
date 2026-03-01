@@ -340,15 +340,16 @@ mod tests {
 
     #[test]
     fn test_duties_fetched_total_increments() {
-        RVC_DUTIES_FETCHED_TOTAL.with_label_values(&[]).inc();
-        let value = RVC_DUTIES_FETCHED_TOTAL.with_label_values(&[]).get();
+        RVC_DUTIES_FETCHED_TOTAL.with_label_values(&[] as &[&str]).inc();
+        let value = RVC_DUTIES_FETCHED_TOTAL.with_label_values(&[] as &[&str]).get();
         assert!(value >= 1, "Counter should be at least 1 after increment");
     }
 
     #[test]
     fn test_signing_duration_observes() {
-        RVC_SIGNING_DURATION_SECONDS.with_label_values(&[]).observe(0.05);
-        let count = RVC_SIGNING_DURATION_SECONDS.with_label_values(&[]).get_sample_count();
+        RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(0.05);
+        let count =
+            RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).get_sample_count();
         assert!(count >= 1, "Histogram should have at least 1 observation");
     }
 
@@ -409,15 +410,16 @@ mod tests {
 
     #[test]
     fn test_dependent_root_changes_total_increments() {
-        RVC_DEPENDENT_ROOT_CHANGES_TOTAL.with_label_values(&[]).inc();
-        let value = RVC_DEPENDENT_ROOT_CHANGES_TOTAL.with_label_values(&[]).get();
+        RVC_DEPENDENT_ROOT_CHANGES_TOTAL.with_label_values(&[] as &[&str]).inc();
+        let value = RVC_DEPENDENT_ROOT_CHANGES_TOTAL.with_label_values(&[] as &[&str]).get();
         assert!(value >= 1, "Counter should be at least 1 after increment");
     }
 
     #[test]
     fn test_duty_fetch_duration_observes() {
-        RVC_DUTY_FETCH_DURATION_SECONDS.with_label_values(&[]).observe(0.1);
-        let count = RVC_DUTY_FETCH_DURATION_SECONDS.with_label_values(&[]).get_sample_count();
+        RVC_DUTY_FETCH_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(0.1);
+        let count =
+            RVC_DUTY_FETCH_DURATION_SECONDS.with_label_values(&[] as &[&str]).get_sample_count();
         assert!(count >= 1, "Histogram should have at least 1 observation");
     }
 
@@ -437,16 +439,16 @@ mod tests {
         init_metrics();
 
         RVC_ATTESTATIONS_TOTAL.with_label_values(&[attestation_status::SUCCESS]).inc();
-        RVC_DUTIES_FETCHED_TOTAL.with_label_values(&[]).inc();
+        RVC_DUTIES_FETCHED_TOTAL.with_label_values(&[] as &[&str]).inc();
         RVC_DUTY_CACHE_OPERATIONS_TOTAL.with_label_values(&[cache_operation::HIT]).inc();
-        RVC_DEPENDENT_ROOT_CHANGES_TOTAL.with_label_values(&[]).inc();
-        RVC_DUTY_FETCH_DURATION_SECONDS.with_label_values(&[]).observe(0.001);
-        RVC_SIGNING_DURATION_SECONDS.with_label_values(&[]).observe(0.001);
+        RVC_DEPENDENT_ROOT_CHANGES_TOTAL.with_label_values(&[] as &[&str]).inc();
+        RVC_DUTY_FETCH_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(0.001);
+        RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(0.001);
         RVC_BEACON_REQUESTS_TOTAL.with_label_values(&["/test", request_status::SUCCESS]).inc();
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
 
         let metrics = REGISTRY.gather();
-        let metric_names: Vec<&str> = metrics.iter().map(|m| m.get_name()).collect();
+        let metric_names: Vec<&str> = metrics.iter().map(|m| m.name()).collect();
 
         assert!(
             metric_names.contains(&"rvc_attestations_total"),

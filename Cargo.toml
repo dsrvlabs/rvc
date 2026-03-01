@@ -49,7 +49,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 reqwest-eventsource = "0.6"
 
 # Metrics
-prometheus = "0.13"
+prometheus = { version = "0.14", default-features = false }
 lazy_static = "1.5"
 
 # Serde utils

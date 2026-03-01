@@ -92,7 +92,7 @@ impl DutyTracker {
             .await
             .map_err(DutyTrackerError::BeaconError)?;
 
-        RVC_DUTIES_FETCHED_TOTAL.with_label_values(&[]).inc();
+        RVC_DUTIES_FETCHED_TOTAL.with_label_values(&[] as &[&str]).inc();
 
         let mut cache = self.cache.write().await;
 
