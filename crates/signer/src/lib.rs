@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use thiserror::Error;
+use tracing::debug;
 
 use crypto::{CompositeSigner, PublicKey, Signature, Signer, SigningError};
 use eth_types::{
@@ -76,13 +77,40 @@ impl SignerService {
         let source_epoch = attestation_data.source.epoch;
         let target_epoch = attestation_data.target.epoch;
 
+        let (fork_version, fork_version_branch) = if target_epoch >= fork.epoch {
+            (fork.current_version, "current")
+        } else {
+            (fork.previous_version, "previous")
+        };
         let domain = crypto::compute_domain(
             crypto::DOMAIN_BEACON_ATTESTER,
-            if target_epoch >= fork.epoch { fork.current_version } else { fork.previous_version },
+            fork_version,
             genesis_validators_root,
         );
+
+        debug!(
+            pubkey = %format!("0x{}", &pubkey_hex[..16]),
+            fork_version_used = %format!("0x{}", hex::encode(fork_version)),
+            genesis_validators_root = %format!("0x{}", hex::encode(genesis_validators_root)),
+            domain = %format!("0x{}", hex::encode(domain)),
+            fork_version_branch = fork_version_branch,
+            target_epoch = target_epoch,
+            fork_epoch = fork.epoch,
+            "Computed attestation domain"
+        );
+
         let signing_root = crypto::compute_signing_root(attestation_data, domain);
         let signing_root_hex = hex::encode(signing_root);
+
+        debug!(
+            pubkey = %format!("0x{}", &pubkey_hex[..16]),
+            signing_root = %format!("0x{}", &signing_root_hex),
+            slot = attestation_data.slot,
+            index = attestation_data.index,
+            source_epoch = attestation_data.source.epoch,
+            target_epoch = attestation_data.target.epoch,
+            "Computed attestation signing root"
+        );
 
         if let Err(e) = self.slashing_db.check_and_record_attestation(
             &pubkey_hex,
