@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, warn, Instrument};
 use url::Url;
 
 /// Redact credentials from a URL for safe inclusion in span attributes.
@@ -172,8 +172,9 @@ impl BeaconClient {
         validator_indices: &[String],
     ) -> Result<AttesterDutiesResponse, BeaconError> {
         let path = format!("/eth/v1/validator/duties/attester/{}", epoch);
-        let _span = tracing::info_span!("rvc.beacon.get_attester_duties", epoch = epoch).entered();
-        self.post(&path, &validator_indices).await
+        self.post(&path, &validator_indices)
+            .instrument(tracing::info_span!("rvc.beacon.get_attester_duties", epoch = epoch))
+            .await
     }
 
     /// Resolves public keys to validator data including numeric indices.
@@ -187,8 +188,9 @@ impl BeaconClient {
         let ids: String =
             pubkeys.iter().map(|pk| format!("id={}", pk)).collect::<Vec<_>>().join("&");
         let path = format!("/eth/v1/beacon/states/head/validators?{}", ids);
-        let _span = tracing::info_span!("rvc.beacon.get_validators").entered();
-        self.get(&path).await
+        self.get(&path)
+            .instrument(tracing::info_span!("rvc.beacon.get_validators"))
+            .await
     }
 
     /// Fetches attestation data for the given slot and committee index.
@@ -207,8 +209,9 @@ impl BeaconClient {
             "/eth/v1/validator/attestation_data?slot={}&committee_index={}",
             slot, committee_index
         );
-        let _span = tracing::info_span!("rvc.beacon.get_attestation_data", slot = slot).entered();
-        self.get(&path).await
+        self.get(&path)
+            .instrument(tracing::info_span!("rvc.beacon.get_attestation_data", slot = slot))
+            .await
     }
 
     /// Fetches the chain configuration specification from the beacon node.
@@ -255,8 +258,9 @@ impl BeaconClient {
         epoch: u64,
     ) -> Result<ProposerDutiesResponse, BeaconError> {
         let path = format!("/eth/v1/validator/duties/proposer/{}", epoch);
-        let _span = tracing::info_span!("rvc.beacon.get_proposer_duties", epoch = epoch).entered();
-        self.get(&path).await
+        self.get(&path)
+            .instrument(tracing::info_span!("rvc.beacon.get_proposer_duties", epoch = epoch))
+            .await
     }
 
     /// SSZ content negotiation Accept header for block production.
@@ -277,7 +281,6 @@ impl BeaconClient {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, BeaconError> {
-        let _span = tracing::info_span!("rvc.beacon.produce_block_v3", slot = slot).entered();
         let mut query = format!("randao_reveal={}", randao_reveal);
         if let Some(g) = graffiti {
             query.push_str(&format!("&graffiti={}", g));
@@ -461,12 +464,12 @@ impl BeaconClient {
         signed_block: &B,
         consensus_version: &str,
     ) -> Result<(), BeaconError> {
-        let _span = tracing::info_span!("rvc.beacon.publish_block").entered();
         self.post_empty_with_headers(
             "/eth/v2/beacon/blocks",
             signed_block,
             &[("Eth-Consensus-Version", consensus_version)],
         )
+        .instrument(tracing::info_span!("rvc.beacon.publish_block"))
         .await
     }
 
@@ -476,12 +479,12 @@ impl BeaconClient {
         signed_blinded_block: &B,
         consensus_version: &str,
     ) -> Result<(), BeaconError> {
-        let _span = tracing::info_span!("rvc.beacon.publish_blinded_block").entered();
         self.post_empty_with_headers(
             "/eth/v1/beacon/blinded_blocks",
             signed_blinded_block,
             &[("Eth-Consensus-Version", consensus_version)],
         )
+        .instrument(tracing::info_span!("rvc.beacon.publish_blinded_block"))
         .await
     }
 
@@ -504,7 +507,6 @@ impl BeaconClient {
             http.url = %redact_url(&url),
             http.status_code = tracing::field::Empty,
         );
-        let _enter = span.enter();
 
         let mut headers = reqwest::header::HeaderMap::new();
         telemetry::inject_trace_context(&mut headers);
@@ -538,9 +540,9 @@ impl BeaconClient {
         validator_indices: &[String],
     ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
         let path = format!("/eth/v1/validator/duties/sync/{}", epoch);
-        let _span =
-            tracing::info_span!("rvc.beacon.get_sync_committee_duties", epoch = epoch).entered();
-        self.post(&path, &validator_indices).await
+        self.post(&path, &validator_indices)
+            .instrument(tracing::info_span!("rvc.beacon.get_sync_committee_duties", epoch = epoch))
+            .await
     }
 
     /// Submits sync committee messages to the beacon node pool.
@@ -548,8 +550,9 @@ impl BeaconClient {
         &self,
         messages: &[SyncCommitteeMessage],
     ) -> Result<(), BeaconError> {
-        let _span = tracing::info_span!("rvc.beacon.submit_sync_committee_messages").entered();
-        self.post_empty("/eth/v1/beacon/pool/sync_committees", &messages).await
+        self.post_empty("/eth/v1/beacon/pool/sync_committees", &messages)
+            .instrument(tracing::info_span!("rvc.beacon.submit_sync_committee_messages"))
+            .await
     }
 
     /// Fetches a sync committee contribution for the given slot, subcommittee index, and block root.
@@ -571,8 +574,9 @@ impl BeaconClient {
         &self,
         proofs: &[SignedContributionAndProof],
     ) -> Result<(), BeaconError> {
-        let _span = tracing::info_span!("rvc.beacon.submit_contribution_and_proofs").entered();
-        self.post_empty("/eth/v1/validator/contribution_and_proofs", &proofs).await
+        self.post_empty("/eth/v1/validator/contribution_and_proofs", &proofs)
+            .instrument(tracing::info_span!("rvc.beacon.submit_contribution_and_proofs"))
+            .await
     }
 
     // Aggregation
@@ -602,14 +606,18 @@ impl BeaconClient {
         &self,
         proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError> {
-        let _span = tracing::info_span!("rvc.beacon.submit_aggregate_and_proofs").entered();
+        let span = tracing::info_span!("rvc.beacon.submit_aggregate_and_proofs");
         match proofs {
             VersionedSignedAggregateAndProof::PreElectra(ps) => {
-                self.post_empty("/eth/v1/validator/aggregate_and_proofs", ps).await
+                self.post_empty("/eth/v1/validator/aggregate_and_proofs", ps)
+                    .instrument(span)
+                    .await
             }
             VersionedSignedAggregateAndProof::Electra(ps)
             | VersionedSignedAggregateAndProof::Fulu(ps) => {
-                self.post_empty("/eth/v2/validator/aggregate_and_proofs", ps).await
+                self.post_empty("/eth/v2/validator/aggregate_and_proofs", ps)
+                    .instrument(span)
+                    .await
             }
         }
     }
@@ -622,8 +630,9 @@ impl BeaconClient {
         &self,
         preparations: &[ProposerPreparation],
     ) -> Result<(), BeaconError> {
-        let _span = tracing::info_span!("rvc.beacon.prepare_beacon_proposer").entered();
-        self.post_empty("/eth/v1/validator/prepare_beacon_proposer", &preparations).await
+        self.post_empty("/eth/v1/validator/prepare_beacon_proposer", &preparations)
+            .instrument(tracing::info_span!("rvc.beacon.prepare_beacon_proposer"))
+            .await
     }
 
     /// Posts validator indices to check liveness for the given epoch.
@@ -648,8 +657,9 @@ impl BeaconClient {
         &self,
         signed_exit: &SignedVoluntaryExit,
     ) -> Result<(), BeaconError> {
-        let _span = tracing::info_span!("rvc.beacon.submit_voluntary_exit").entered();
-        self.post_empty("/eth/v1/beacon/pool/voluntary_exits", signed_exit).await
+        self.post_empty("/eth/v1/beacon/pool/voluntary_exits", signed_exit)
+            .instrument(tracing::info_span!("rvc.beacon.submit_voluntary_exit"))
+            .await
     }
 
     /// Subscribes validators to beacon committees for attestation subnet management.
@@ -660,9 +670,9 @@ impl BeaconClient {
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
-        let _span =
-            tracing::info_span!("rvc.beacon.submit_beacon_committee_subscriptions").entered();
-        self.post_empty("/eth/v1/validator/beacon_committee_subscriptions", &subscriptions).await
+        self.post_empty("/eth/v1/validator/beacon_committee_subscriptions", &subscriptions)
+            .instrument(tracing::info_span!("rvc.beacon.submit_beacon_committee_subscriptions"))
+            .await
     }
 
     // Builder
@@ -671,8 +681,9 @@ impl BeaconClient {
         &self,
         registrations: &[SignedValidatorRegistration],
     ) -> Result<(), BeaconError> {
-        let _span = tracing::info_span!("rvc.beacon.register_validators").entered();
-        self.post_empty("/eth/v1/validator/register_validator", &registrations).await
+        self.post_empty("/eth/v1/validator/register_validator", &registrations)
+            .instrument(tracing::info_span!("rvc.beacon.register_validators"))
+            .await
     }
 
     /// Fetches the sync status of the beacon node.
@@ -708,8 +719,6 @@ impl BeaconClient {
             http.url = %redact_url(&url),
             http.status_code = tracing::field::Empty,
         );
-        let _enter = span.enter();
-
         let mut trace_headers = reqwest::header::HeaderMap::new();
         telemetry::inject_trace_context(&mut trace_headers);
 
@@ -825,7 +834,7 @@ impl BeaconClient {
         }
 
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
-        tracing::error!(error = %err, "Request failed after retries exhausted");
+        span.in_scope(|| tracing::error!(error = %err, "Request failed after retries exhausted"));
         Err(err)
     }
 
@@ -846,8 +855,6 @@ impl BeaconClient {
             http.url = %redact_url(url),
             http.status_code = tracing::field::Empty,
         );
-        let _enter = span.enter();
-
         let mut last_error = None;
 
         for attempt in 0..=self.config.max_retries {
@@ -916,7 +923,7 @@ impl BeaconClient {
         }
 
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
-        tracing::error!(error = %err, "Request failed after retries exhausted");
+        span.in_scope(|| tracing::error!(error = %err, "Request failed after retries exhausted"));
         Err(err)
     }
 
@@ -935,8 +942,6 @@ impl BeaconClient {
             http.url = %redact_url(&url),
             http.status_code = tracing::field::Empty,
         );
-        let _enter = span.enter();
-
         let mut trace_headers = reqwest::header::HeaderMap::new();
         telemetry::inject_trace_context(&mut trace_headers);
 
@@ -1005,7 +1010,7 @@ impl BeaconClient {
         }
 
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
-        tracing::error!(error = %err, "Request failed after retries exhausted");
+        span.in_scope(|| tracing::error!(error = %err, "Request failed after retries exhausted"));
         Err(err)
     }
 
@@ -1026,8 +1031,6 @@ impl BeaconClient {
             http.url = %redact_url(url),
             http.status_code = tracing::field::Empty,
         );
-        let _enter = span.enter();
-
         let mut last_error = None;
 
         for attempt in 0..=self.config.max_retries {
@@ -1085,7 +1088,7 @@ impl BeaconClient {
         }
 
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
-        tracing::error!(error = %err, "Request failed after retries exhausted");
+        span.in_scope(|| tracing::error!(error = %err, "Request failed after retries exhausted"));
         Err(err)
     }
 
