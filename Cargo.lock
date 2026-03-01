@@ -3263,6 +3263,7 @@ dependencies = [
  "tonic-build",
  "tower 0.5.3",
  "tracing",
+ "tracing-subscriber",
  "tree_hash",
  "url",
  "wiremock",

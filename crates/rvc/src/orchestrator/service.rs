@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, info_span, warn};
 
 use beacon::{
     AttesterDuty, BeaconCommitteeSubscription, LegacyAttestation, ProposerPreparation,
@@ -213,12 +213,18 @@ where
 
             let current_epoch = current_slot / SLOTS_PER_EPOCH;
 
+            let _slot_span =
+                info_span!("rvc.slot.process", rvc.slot = current_slot, rvc.epoch = current_epoch,)
+                    .entered();
+
             // === Epoch boundary: fetch all duty types ===
             self.fetch_epoch_duties(current_epoch).await;
             self.fetch_epoch_duties(current_epoch + 1).await;
 
             // Proposer preparation and committee subscriptions (non-fatal)
             if current_slot % SLOTS_PER_EPOCH == 0 {
+                let _epoch_span =
+                    info_span!("rvc.epoch.boundary", rvc.epoch = current_epoch).entered();
                 self.check_reorg_at_epoch_boundary(current_epoch).await;
                 self.prepare_proposers().await;
                 self.submit_committee_subscriptions(current_epoch).await;
@@ -226,91 +232,102 @@ where
             }
 
             // === Phase 1: t=0 — Block proposal ===
-            self.maybe_propose_block(current_slot, current_epoch).await;
+            {
+                let _phase = info_span!("rvc.slot.phase.block").entered();
+                self.maybe_propose_block(current_slot, current_epoch).await;
+            }
 
             if self.check_shutdown() {
                 return Ok(());
             }
 
             // === Phase 2: t=slot/3 — Attestations + sync committee messages ===
-            let time_until_attestation = self.clock.time_until_attestation(current_slot)?;
-            if !time_until_attestation.is_zero() {
-                debug!(
-                    slot = current_slot,
-                    wait_ms = time_until_attestation.as_millis(),
-                    "Waiting for attestation time"
-                );
+            {
+                let _phase = info_span!("rvc.slot.phase.attestation").entered();
 
-                tokio::select! {
-                    _ = tokio::time::sleep(time_until_attestation) => {}
-                    _ = self.shutdown_rx.changed() => {
-                        if self.check_shutdown() {
-                            return Ok(());
+                let time_until_attestation = self.clock.time_until_attestation(current_slot)?;
+                if !time_until_attestation.is_zero() {
+                    debug!(
+                        slot = current_slot,
+                        wait_ms = time_until_attestation.as_millis(),
+                        "Waiting for attestation time"
+                    );
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(time_until_attestation) => {}
+                        _ = self.shutdown_rx.changed() => {
+                            if self.check_shutdown() {
+                                return Ok(());
+                            }
                         }
                     }
                 }
-            }
 
-            if self.check_shutdown() {
-                return Ok(());
-            }
-
-            if let Err(e) = self.process_slot(current_slot).await {
-                match &e {
-                    OrchestratorError::SlotMissed { slot, current_slot } => {
-                        warn!(slot = slot, current_slot = current_slot, "Missed slot");
-                        RVC_ATTESTATIONS_TOTAL
-                            .with_label_values(&[attestation_status::SKIPPED])
-                            .inc();
-                    }
-                    OrchestratorError::NoDutiesForSlot { slot } => {
-                        debug!(slot = slot, "No duties for slot");
-                    }
-                    _ => {
-                        error!(slot = current_slot, error = %e, "Error processing slot");
-                    }
+                if self.check_shutdown() {
+                    return Ok(());
                 }
-            }
 
-            self.maybe_produce_sync_messages(current_slot, current_epoch).await;
-
-            if self.check_shutdown() {
-                return Ok(());
-            }
-
-            // === Phase 3: t=2*slot/3 — Sync committee contributions ===
-            let slot_duration = self.clock.slot_duration();
-            let two_thirds_offset = slot_duration.as_secs() * 2 / 3;
-            let two_thirds_time = self.clock.slot_start_time(current_slot) + two_thirds_offset;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time went backwards")
-                .as_secs();
-
-            if now < two_thirds_time {
-                let wait_duration = Duration::from_secs(two_thirds_time - now);
-                debug!(
-                    slot = current_slot,
-                    wait_ms = wait_duration.as_millis(),
-                    "Waiting for 2/3 slot time"
-                );
-
-                tokio::select! {
-                    _ = tokio::time::sleep(wait_duration) => {}
-                    _ = self.shutdown_rx.changed() => {
-                        if self.check_shutdown() {
-                            return Ok(());
+                if let Err(e) = self.process_slot(current_slot).await {
+                    match &e {
+                        OrchestratorError::SlotMissed { slot, current_slot } => {
+                            warn!(slot = slot, current_slot = current_slot, "Missed slot");
+                            RVC_ATTESTATIONS_TOTAL
+                                .with_label_values(&[attestation_status::SKIPPED])
+                                .inc();
+                        }
+                        OrchestratorError::NoDutiesForSlot { slot } => {
+                            debug!(slot = slot, "No duties for slot");
+                        }
+                        _ => {
+                            error!(slot = current_slot, error = %e, "Error processing slot");
                         }
                     }
                 }
+
+                self.maybe_produce_sync_messages(current_slot, current_epoch).await;
             }
 
             if self.check_shutdown() {
                 return Ok(());
             }
 
-            self.maybe_produce_sync_contributions(current_slot, current_epoch).await;
-            self.maybe_produce_aggregations(current_slot, current_epoch).await;
+            // === Phase 3: t=2*slot/3 — Aggregation + sync committee contributions ===
+            {
+                let _phase = info_span!("rvc.slot.phase.aggregation").entered();
+
+                let slot_duration = self.clock.slot_duration();
+                let two_thirds_offset = slot_duration.as_secs() * 2 / 3;
+                let two_thirds_time = self.clock.slot_start_time(current_slot) + two_thirds_offset;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("time went backwards")
+                    .as_secs();
+
+                if now < two_thirds_time {
+                    let wait_duration = Duration::from_secs(two_thirds_time - now);
+                    debug!(
+                        slot = current_slot,
+                        wait_ms = wait_duration.as_millis(),
+                        "Waiting for 2/3 slot time"
+                    );
+
+                    tokio::select! {
+                        _ = tokio::time::sleep(wait_duration) => {}
+                        _ = self.shutdown_rx.changed() => {
+                            if self.check_shutdown() {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+
+                if self.check_shutdown() {
+                    return Ok(());
+                }
+
+                self.maybe_produce_sync_contributions(current_slot, current_epoch).await;
+                self.maybe_produce_aggregations(current_slot, current_epoch).await;
+            }
 
             // === Post-duty: builder registration (epoch boundary only) ===
             // Runs after all time-sensitive phases to avoid blocking block proposal.
@@ -4521,5 +4538,150 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- H-08: Orchestrator slot lifecycle span tests ---
+
+    use std::sync::Mutex;
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// A tracing layer that captures span names for test verification.
+    struct SpanCapture {
+        names: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanCapture {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.names.lock().unwrap().push(attrs.metadata().name().to_string());
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_slot_processing_creates_root_and_phase_spans() {
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(65); // slot 65 = epoch 2, not at epoch boundary
+                            // Advance past 2/3 of slot so all phases run without waiting
+        clock.advance_time(9);
+
+        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+
+        let (mut orchestrator, handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            HashMap::new(),
+        );
+
+        // Capture spans via thread-local subscriber
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let layer = SpanCapture { names: captured.clone() };
+        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Shutdown after enough time for all phases (HTTP failures are fast)
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            handle.shutdown();
+        });
+
+        let _ = orchestrator.run().await;
+
+        let span_names = captured.lock().unwrap();
+        assert!(
+            span_names.contains(&"rvc.slot.process".to_string()),
+            "Expected rvc.slot.process span, got: {:?}",
+            *span_names
+        );
+        assert!(
+            span_names.contains(&"rvc.slot.phase.block".to_string()),
+            "Expected rvc.slot.phase.block span, got: {:?}",
+            *span_names
+        );
+        assert!(
+            span_names.contains(&"rvc.slot.phase.attestation".to_string()),
+            "Expected rvc.slot.phase.attestation span, got: {:?}",
+            *span_names
+        );
+        assert!(
+            span_names.contains(&"rvc.slot.phase.aggregation".to_string()),
+            "Expected rvc.slot.phase.aggregation span, got: {:?}",
+            *span_names
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_epoch_boundary_creates_epoch_span() {
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(32); // slot 32 = epoch 1, IS at epoch boundary (32 % 32 == 0)
+        clock.advance_time(9);
+
+        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+
+        let (mut orchestrator, handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            HashMap::new(),
+        );
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let layer = SpanCapture { names: captured.clone() };
+        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            handle.shutdown();
+        });
+
+        let _ = orchestrator.run().await;
+
+        let span_names = captured.lock().unwrap();
+        assert!(
+            span_names.contains(&"rvc.epoch.boundary".to_string()),
+            "Expected rvc.epoch.boundary span at epoch boundary slot, got: {:?}",
+            *span_names
+        );
     }
 }
