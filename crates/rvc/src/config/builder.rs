@@ -28,6 +28,10 @@ use validator_store::ValidatorStore;
 use super::error::ConfigError;
 use super::types::Config;
 
+fn format_version(v: eth_types::Version) -> String {
+    format!("0x{}", hex::encode(v))
+}
+
 /// Contains all the built services ready for use.
 pub struct BuiltServices<C, S>
 where
@@ -210,7 +214,17 @@ impl ServiceBuilder {
         info!("Fetching fork schedule from beacon node");
         let schedule = beacon.get_fork_schedule().await?;
         info!(
-            genesis_fork = ?schedule.genesis_fork_version,
+            genesis_version = %format_version(schedule.genesis_fork_version),
+            altair_epoch = schedule.altair_fork_epoch,
+            altair_version = %format_version(schedule.altair_fork_version),
+            bellatrix_epoch = schedule.bellatrix_fork_epoch,
+            bellatrix_version = %format_version(schedule.bellatrix_fork_version),
+            capella_epoch = schedule.capella_fork_epoch,
+            capella_version = %format_version(schedule.capella_fork_version),
+            deneb_epoch = schedule.deneb_fork_epoch,
+            deneb_version = %format_version(schedule.deneb_fork_version),
+            electra_epoch = schedule.electra_fork_epoch,
+            electra_version = %format_version(schedule.electra_fork_version),
             "Loaded fork schedule from beacon node"
         );
         Ok(Arc::new(schedule))
@@ -289,6 +303,10 @@ impl ServiceBuilder {
         };
 
         let genesis_validators_root = self.parse_genesis_validators_root()?;
+        info!(
+            genesis_validators_root = %format!("0x{}", hex::encode(genesis_validators_root)),
+            "Parsed genesis validators root"
+        );
 
         let genesis_fork_version = fork_schedule.genesis_fork_version;
         let builder_service = Some(self.build_builder_service(
