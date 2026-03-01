@@ -8,6 +8,7 @@ pub enum ForkName {
     Capella,
     Deneb,
     Electra,
+    Fulu,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +24,8 @@ pub struct ForkSchedule {
     pub deneb_fork_version: Version,
     pub electra_fork_epoch: Epoch,
     pub electra_fork_version: Version,
+    pub fulu_fork_epoch: Epoch,
+    pub fulu_fork_version: Version,
 }
 
 impl AsRef<str> for ForkName {
@@ -34,13 +37,16 @@ impl AsRef<str> for ForkName {
             Self::Capella => "capella",
             Self::Deneb => "deneb",
             Self::Electra => "electra",
+            Self::Fulu => "fulu",
         }
     }
 }
 
 impl ForkName {
     pub fn from_epoch(epoch: Epoch, schedule: &ForkSchedule) -> Self {
-        if epoch >= schedule.electra_fork_epoch {
+        if epoch >= schedule.fulu_fork_epoch {
+            Self::Fulu
+        } else if epoch >= schedule.electra_fork_epoch {
             Self::Electra
         } else if epoch >= schedule.deneb_fork_epoch {
             Self::Deneb
@@ -63,6 +69,7 @@ impl ForkName {
             Self::Capella => schedule.capella_fork_version,
             Self::Deneb => schedule.deneb_fork_version,
             Self::Electra => schedule.electra_fork_version,
+            Self::Fulu => schedule.fulu_fork_version,
         }
     }
 }
@@ -84,6 +91,8 @@ mod tests {
             deneb_fork_version: [4, 0, 0, 0],
             electra_fork_epoch: 364544,
             electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: 500000,
+            fulu_fork_version: [6, 0, 0, 0],
         }
     }
 
@@ -131,7 +140,7 @@ mod tests {
     #[test]
     fn test_fork_name_from_epoch_far_future() {
         let schedule = test_schedule();
-        assert_eq!(ForkName::from_epoch(u64::MAX, &schedule), ForkName::Electra);
+        assert_eq!(ForkName::from_epoch(u64::MAX, &schedule), ForkName::Fulu);
     }
 
     #[test]
@@ -148,6 +157,8 @@ mod tests {
             deneb_fork_version: [4, 0, 0, 0],
             electra_fork_epoch: u64::MAX,
             electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: u64::MAX,
+            fulu_fork_version: [6, 0, 0, 0],
         };
         assert_eq!(ForkName::from_epoch(0, &schedule), ForkName::Phase0);
         assert_eq!(ForkName::from_epoch(10, &schedule), ForkName::Altair);
@@ -213,5 +224,48 @@ mod tests {
     fn test_fork_name_equality() {
         assert_eq!(ForkName::Phase0, ForkName::Phase0);
         assert_ne!(ForkName::Phase0, ForkName::Altair);
+    }
+
+    #[test]
+    fn test_fork_name_from_epoch_fulu_boundary() {
+        let schedule = test_schedule();
+        assert_eq!(ForkName::from_epoch(499999, &schedule), ForkName::Electra);
+        assert_eq!(ForkName::from_epoch(500000, &schedule), ForkName::Fulu);
+    }
+
+    #[test]
+    fn test_fork_version_fulu() {
+        let schedule = test_schedule();
+        assert_eq!(ForkName::Fulu.fork_version(&schedule), [6, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_fork_name_as_ref_fulu() {
+        assert_eq!(ForkName::Fulu.as_ref(), "fulu");
+    }
+
+    #[test]
+    fn test_fork_name_ordering_fulu() {
+        assert!(ForkName::Electra < ForkName::Fulu);
+    }
+
+    #[test]
+    fn test_fork_name_from_epoch_unscheduled_fulu() {
+        let schedule = ForkSchedule {
+            genesis_fork_version: [0, 0, 0, 0],
+            altair_fork_epoch: 74240,
+            altair_fork_version: [1, 0, 0, 0],
+            bellatrix_fork_epoch: 144896,
+            bellatrix_fork_version: [2, 0, 0, 0],
+            capella_fork_epoch: 194048,
+            capella_fork_version: [3, 0, 0, 0],
+            deneb_fork_epoch: 269568,
+            deneb_fork_version: [4, 0, 0, 0],
+            electra_fork_epoch: 364544,
+            electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: u64::MAX,
+            fulu_fork_version: [6, 0, 0, 0],
+        };
+        assert_eq!(ForkName::from_epoch(1_000_000, &schedule), ForkName::Electra);
     }
 }

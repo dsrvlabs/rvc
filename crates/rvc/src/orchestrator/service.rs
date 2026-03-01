@@ -1684,6 +1684,8 @@ mod tests {
             deneb_fork_version: [0, 0, 0, 5],
             electra_fork_epoch: 50,
             electra_fork_version: [0, 0, 0, 6],
+            fulu_fork_epoch: 60,
+            fulu_fork_version: [0, 0, 0, 7],
         })
     }
 

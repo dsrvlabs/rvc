@@ -2420,6 +2420,8 @@ mod tests {
                 "DENEB_FORK_VERSION": "0x04000000",
                 "ELECTRA_FORK_EPOCH": "364544",
                 "ELECTRA_FORK_VERSION": "0x05000000",
+                "FULU_FORK_EPOCH": "18446744073709551615",
+                "FULU_FORK_VERSION": "0x06000000",
                 "SECONDS_PER_SLOT": "12",
                 "SLOTS_PER_EPOCH": "32"
             }

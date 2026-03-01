@@ -56,6 +56,8 @@ pub fn exit_fork_schedule(network: &KeygenNetwork) -> ForkSchedule {
         deneb_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
         electra_fork_epoch: u64::MAX,
         electra_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
+        fulu_fork_epoch: u64::MAX,
+        fulu_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
     }
 }
 

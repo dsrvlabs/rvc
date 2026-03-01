@@ -288,6 +288,8 @@ mod tests {
             deneb_fork_version: [0x04, 0x00, 0x00, 0x00],
             electra_fork_epoch: 50,
             electra_fork_version: [0x05, 0x00, 0x00, 0x00],
+            fulu_fork_epoch: 60,
+            fulu_fork_version: [0x06, 0x00, 0x00, 0x00],
         }
     }
 

@@ -246,6 +246,8 @@ pub fn parse_fork_schedule(
         deneb_fork_version: parse_version(spec, "DENEB_FORK_VERSION")?,
         electra_fork_epoch: parse_epoch(spec, "ELECTRA_FORK_EPOCH")?,
         electra_fork_version: parse_version(spec, "ELECTRA_FORK_VERSION")?,
+        fulu_fork_epoch: parse_epoch(spec, "FULU_FORK_EPOCH")?,
+        fulu_fork_version: parse_version(spec, "FULU_FORK_VERSION")?,
     })
 }
 
@@ -666,6 +668,8 @@ mod tests {
         spec.insert("DENEB_FORK_VERSION".to_string(), json!("0x04000000"));
         spec.insert("ELECTRA_FORK_EPOCH".to_string(), json!("364544"));
         spec.insert("ELECTRA_FORK_VERSION".to_string(), json!("0x05000000"));
+        spec.insert("FULU_FORK_EPOCH".to_string(), json!("18446744073709551615"));
+        spec.insert("FULU_FORK_VERSION".to_string(), json!("0x06000000"));
         spec
     }
 
@@ -1260,11 +1264,13 @@ mod tests {
         spec.insert("CAPELLA_FORK_EPOCH".to_string(), json!(194048));
         spec.insert("DENEB_FORK_EPOCH".to_string(), json!(269568));
         spec.insert("ELECTRA_FORK_EPOCH".to_string(), json!(364544));
+        spec.insert("FULU_FORK_EPOCH".to_string(), json!(18446744073709551615_u64));
         let schedule = parse_fork_schedule(&spec).unwrap();
         assert_eq!(schedule.altair_fork_epoch, 74240);
         assert_eq!(schedule.bellatrix_fork_epoch, 144896);
         assert_eq!(schedule.capella_fork_epoch, 194048);
         assert_eq!(schedule.deneb_fork_epoch, 269568);
         assert_eq!(schedule.electra_fork_epoch, 364544);
+        assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
     }
 }
