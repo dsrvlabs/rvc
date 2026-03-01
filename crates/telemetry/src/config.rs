@@ -68,10 +68,21 @@ impl TelemetryConfig {
         if !self.sample_rate.is_finite() || !(0.0..=1.0).contains(&self.sample_rate) {
             bail!("sample_rate must be a finite value in 0.0..=1.0, got {}", self.sample_rate);
         }
-        if !self.endpoint.starts_with("http://") && !self.endpoint.starts_with("https://") {
+        if self.requires_endpoint()
+            && !self.endpoint.starts_with("http://")
+            && !self.endpoint.starts_with("https://")
+        {
             bail!("endpoint must start with http:// or https://, got {:?}", self.endpoint);
         }
         Ok(())
+    }
+
+    fn requires_endpoint(&self) -> bool {
+        match self.exporter {
+            ExporterKind::Otlp => true,
+            #[cfg(feature = "gcp-trace")]
+            ExporterKind::Gcp => false,
+        }
     }
 }
 
@@ -251,5 +262,23 @@ mod tests {
         let config =
             TelemetryConfig { service_version: Some("1.2.3".to_string()), ..Default::default() };
         assert_eq!(config.service_version.as_deref(), Some("1.2.3"));
+    }
+
+    #[cfg(feature = "gcp-trace")]
+    #[test]
+    fn test_validate_gcp_skips_endpoint_check() {
+        let config = TelemetryConfig {
+            endpoint: String::new(),
+            exporter: ExporterKind::Gcp,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok(), "GCP exporter should not require a valid HTTP endpoint");
+    }
+
+    #[cfg(feature = "gcp-trace")]
+    #[test]
+    fn test_exporter_kind_gcp_debug() {
+        let kind = ExporterKind::Gcp;
+        assert_eq!(format!("{kind:?}"), "Gcp");
     }
 }

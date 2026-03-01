@@ -459,6 +459,16 @@ fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfig> {
 
     let exporter = match config.tracing_exporter.as_str() {
         "otlp" => telemetry::ExporterKind::Otlp,
+        #[cfg(feature = "gcp-trace")]
+        "gcp" => telemetry::ExporterKind::Gcp,
+        #[cfg(not(feature = "gcp-trace"))]
+        "gcp" => {
+            eprintln!(
+                "ERROR: --tracing-exporter=gcp requires the `gcp-trace` feature. \
+                 Rebuild with: cargo build --features gcp-trace"
+            );
+            return None;
+        }
         other => {
             warn!(exporter = %other, "unknown tracing exporter, defaulting to otlp");
             telemetry::ExporterKind::Otlp

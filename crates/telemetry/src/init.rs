@@ -29,8 +29,6 @@ pub fn init_tracing(
 
     global::set_text_map_propagator(TraceContextPropagator::new());
 
-    let exporter = build_exporter(config)?;
-
     let version =
         config.service_version.clone().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
 
@@ -44,11 +42,7 @@ pub fn init_tracing(
 
     let sampler = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(config.sample_rate)));
 
-    let provider = SdkTracerProvider::builder()
-        .with_sampler(sampler)
-        .with_resource(resource)
-        .with_batch_exporter(exporter)
-        .build();
+    let provider = build_provider(config, resource, sampler)?;
 
     let tracer = provider.tracer(SERVICE_NAME);
     let layer = OpenTelemetryLayer::new(tracer).boxed();
@@ -56,20 +50,50 @@ pub fn init_tracing(
     Ok((layer, TracingGuard { provider }))
 }
 
-fn build_exporter(config: &TelemetryConfig) -> Result<opentelemetry_otlp::SpanExporter> {
+fn build_provider(
+    config: &TelemetryConfig,
+    resource: Resource,
+    sampler: Sampler,
+) -> Result<SdkTracerProvider> {
     match config.exporter {
         ExporterKind::Otlp => {
             let exporter = opentelemetry_otlp::SpanExporter::builder()
                 .with_http()
                 .with_endpoint(&config.endpoint)
                 .build()?;
-            Ok(exporter)
+            Ok(SdkTracerProvider::builder()
+                .with_sampler(sampler)
+                .with_resource(resource)
+                .with_batch_exporter(exporter)
+                .build())
         }
         #[cfg(feature = "gcp-trace")]
-        ExporterKind::Gcp => {
-            todo!("GCP exporter implementation in Phase 3")
-        }
+        ExporterKind::Gcp => build_gcp_provider(resource, sampler),
     }
+}
+
+#[cfg(feature = "gcp-trace")]
+fn build_gcp_provider(resource: Resource, sampler: Sampler) -> Result<SdkTracerProvider> {
+    let handle = tokio::runtime::Handle::current();
+
+    tokio::task::block_in_place(|| {
+        let gcp_builder = handle
+            .block_on(
+                opentelemetry_gcloud_trace::GcpCloudTraceExporterBuilder::for_default_project_id(),
+            )
+            .map_err(|e| anyhow::anyhow!("GCP project ID detection failed: {e}"))?;
+
+        let provider_builder =
+            SdkTracerProvider::builder().with_sampler(sampler).with_resource(resource.clone());
+
+        let provider = handle
+            .block_on(
+                gcp_builder.with_resource(resource).create_provider_from_builder(provider_builder),
+            )
+            .map_err(|e| anyhow::anyhow!("GCP Cloud Trace exporter initialization failed: {e}"))?;
+
+        Ok(provider)
+    })
 }
 
 #[cfg(test)]
@@ -153,10 +177,14 @@ mod tests {
     }
 
     #[test]
-    fn test_build_exporter_otlp() {
+    fn test_build_provider_otlp() {
         let config = TelemetryConfig::default();
-        let result = build_exporter(&config);
+        let resource = Resource::builder().with_service_name("test").build();
+        let sampler =
+            Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(config.sample_rate)));
+        let result = build_provider(&config, resource, sampler);
         assert!(result.is_ok());
+        result.unwrap().shutdown().ok();
     }
 
     #[test]
@@ -167,5 +195,62 @@ mod tests {
         assert!(result.is_ok());
         let (_layer, guard) = result.unwrap();
         guard.provider.shutdown().ok();
+    }
+
+    #[cfg(feature = "gcp-trace")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_init_tracing_gcp_does_not_panic() {
+        let config = TelemetryConfig {
+            endpoint: String::new(),
+            exporter: ExporterKind::Gcp,
+            ..Default::default()
+        };
+        match init_tracing(&config) {
+            Ok((_layer, guard)) => {
+                guard.provider.shutdown().ok();
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("GCP") || msg.contains("project") || msg.contains("gcloud"),
+                    "GCP error should reference GCP/project: {msg}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "gcp-trace")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_init_tracing_gcp_respects_sample_rate_validation() {
+        let config = TelemetryConfig {
+            endpoint: String::new(),
+            exporter: ExporterKind::Gcp,
+            sample_rate: f64::NAN,
+            ..Default::default()
+        };
+        let err = init_tracing(&config).err().expect("NaN sample_rate should fail");
+        assert!(err.to_string().contains("sample_rate"));
+    }
+
+    #[cfg(feature = "gcp-trace")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_init_tracing_gcp_custom_network() {
+        let config = TelemetryConfig {
+            endpoint: String::new(),
+            exporter: ExporterKind::Gcp,
+            sample_rate: 0.5,
+            network: "hoodi".to_string(),
+            ..Default::default()
+        };
+        match init_tracing(&config) {
+            Ok((_layer, guard)) => {
+                guard.provider.shutdown().ok();
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(!msg.contains("sample_rate"), "Should not fail on sample_rate: {msg}");
+                assert!(!msg.contains("network"), "Should not fail on network: {msg}");
+            }
+        }
     }
 }
