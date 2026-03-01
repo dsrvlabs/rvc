@@ -632,12 +632,27 @@ impl BeaconClient {
                 tokio::time::sleep(backoff).await;
             }
 
+            let consensus_version = match attestations {
+                VersionedAttestation::PreElectra(_) => "phase0",
+                VersionedAttestation::Electra(_) => "electra",
+            };
+
             let send_result = match attestations {
                 VersionedAttestation::PreElectra(atts) => {
-                    self.client.post(&url).json(atts).send().await
+                    self.client
+                        .post(&url)
+                        .header("Eth-Consensus-Version", consensus_version)
+                        .json(atts)
+                        .send()
+                        .await
                 }
                 VersionedAttestation::Electra(atts) => {
-                    self.client.post(&url).json(atts).send().await
+                    self.client
+                        .post(&url)
+                        .header("Eth-Consensus-Version", consensus_version)
+                        .json(atts)
+                        .send()
+                        .await
                 }
             };
             match send_result {
@@ -1735,6 +1750,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock_server)
@@ -1787,6 +1803,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
             .respond_with(ResponseTemplate::new(400).set_body_json(&error_response))
             .expect(1)
             .mount(&mock_server)
@@ -1828,6 +1845,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
             .expect(4)
             .mount(&mock_server)
@@ -1874,6 +1892,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock_server)
@@ -1943,6 +1962,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
             .respond_with(ResponseTemplate::new(400).set_body_json(&error_response))
             .expect(1)
             .mount(&mock_server)
@@ -2009,6 +2029,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
             .respond_with(ResponseTemplate::new(400).set_body_json(&error_response))
             .expect(1)
             .mount(&mock_server)
@@ -2052,6 +2073,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock_server)
@@ -3563,6 +3585,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "phase0"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock_server)

@@ -25,6 +25,19 @@ pub struct ForkSchedule {
     pub electra_fork_version: Version,
 }
 
+impl AsRef<str> for ForkName {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::Phase0 => "phase0",
+            Self::Altair => "altair",
+            Self::Bellatrix => "bellatrix",
+            Self::Capella => "capella",
+            Self::Deneb => "deneb",
+            Self::Electra => "electra",
+        }
+    }
+}
+
 impl ForkName {
     pub fn from_epoch(epoch: Epoch, schedule: &ForkSchedule) -> Self {
         if epoch >= schedule.electra_fork_epoch {
@@ -175,6 +188,16 @@ mod tests {
     fn test_fork_version_electra() {
         let schedule = test_schedule();
         assert_eq!(ForkName::Electra.fork_version(&schedule), [5, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_fork_name_as_ref() {
+        assert_eq!(ForkName::Phase0.as_ref(), "phase0");
+        assert_eq!(ForkName::Altair.as_ref(), "altair");
+        assert_eq!(ForkName::Bellatrix.as_ref(), "bellatrix");
+        assert_eq!(ForkName::Capella.as_ref(), "capella");
+        assert_eq!(ForkName::Deneb.as_ref(), "deneb");
+        assert_eq!(ForkName::Electra.as_ref(), "electra");
     }
 
     #[test]
