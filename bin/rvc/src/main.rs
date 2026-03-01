@@ -553,7 +553,10 @@ async fn run_validator(
                 .await
                 {
                     Ok(safe_validators) => {
-                        info!(safe_count = safe_validators.len(), "Doppelganger detection complete");
+                        info!(
+                            safe_count = safe_validators.len(),
+                            "Doppelganger detection complete"
+                        );
                     }
                     Err(e) => {
                         error!("Doppelganger detection failed: {}", e);

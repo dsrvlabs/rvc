@@ -30,8 +30,8 @@ const DEPOSIT_AMOUNT: u64 = 32_000_000_000;
 
 /// Fixed execution address for deterministic 0x01 withdrawal credentials.
 const EXECUTION_ADDRESS: [u8; 20] = [
-    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00,
 ];
 
 fn derive_seed() -> Zeroizing<[u8; 64]> {
@@ -61,10 +61,7 @@ fn test_signing_pubkey_format() {
     let pubkey_bytes = key.public_key().to_bytes();
     assert_eq!(pubkey_bytes.len(), 48, "BLS pubkey must be 48 bytes");
     // Compressed G1 point: first byte flags should be 0x80..0xBF range
-    assert!(
-        pubkey_bytes[0] & 0x80 != 0,
-        "BLS compressed pubkey should have high bit set"
-    );
+    assert!(pubkey_bytes[0] & 0x80 != 0, "BLS compressed pubkey should have high bit set");
 }
 
 /// Withdrawal key at m/12381/3600/0/0 (4 levels) must differ from signing key
@@ -73,8 +70,7 @@ fn test_signing_pubkey_format() {
 fn test_withdrawal_key_differs_from_signing_key() {
     let seed = derive_seed();
     let signing = crypto::eip2333::derive_key_from_path(seed.as_ref(), SIGNING_PATH).unwrap();
-    let withdrawal =
-        crypto::eip2333::derive_key_from_path(seed.as_ref(), WITHDRAWAL_PATH).unwrap();
+    let withdrawal = crypto::eip2333::derive_key_from_path(seed.as_ref(), WITHDRAWAL_PATH).unwrap();
     assert_ne!(
         signing.to_bytes(),
         withdrawal.to_bytes(),
@@ -236,11 +232,7 @@ fn test_keystore_roundtrip_pbkdf2() {
     let loaded = Keystore::from_file(&path).unwrap();
     let decrypted = loaded.decrypt(password).unwrap();
 
-    assert_eq!(
-        signing_key.to_bytes(),
-        decrypted.to_bytes(),
-        "Decrypted key must match original"
-    );
+    assert_eq!(signing_key.to_bytes(), decrypted.to_bytes(), "Decrypted key must match original");
 }
 
 /// Keystore round-trip with Scrypt KDF.
@@ -260,11 +252,7 @@ fn test_keystore_roundtrip_scrypt() {
     let loaded = Keystore::from_file(&path).unwrap();
     let decrypted = loaded.decrypt(password).unwrap();
 
-    assert_eq!(
-        signing_key.to_bytes(),
-        decrypted.to_bytes(),
-        "Decrypted key must match original"
-    );
+    assert_eq!(signing_key.to_bytes(), decrypted.to_bytes(), "Decrypted key must match original");
 }
 
 /// Keystore JSON has all required EIP-2335 v4 fields.

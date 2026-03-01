@@ -117,22 +117,22 @@ pub fn generate_from_seed(
                 status: "Dry run".to_string(),
             });
         } else {
-            keystore
-                .to_file(&keystore_path)
-                .with_context(|| format!("Failed to write keystore: {}", keystore_path.display()))?;
+            keystore.to_file(&keystore_path).with_context(|| {
+                format!("Failed to write keystore: {}", keystore_path.display())
+            })?;
 
-            let status =
-                match verify::verify_keystore(&keystore_path, keystore_password.as_bytes()) {
-                    Ok(pubkey) => {
-                        let expected_pubkey = hex::encode(signing_key.public_key().to_bytes());
-                        if pubkey == expected_pubkey {
-                            "Verified".to_string()
-                        } else {
-                            format!("MISMATCH (expected {}, got {})", expected_pubkey, pubkey)
-                        }
+            let status = match verify::verify_keystore(&keystore_path, keystore_password.as_bytes())
+            {
+                Ok(pubkey) => {
+                    let expected_pubkey = hex::encode(signing_key.public_key().to_bytes());
+                    if pubkey == expected_pubkey {
+                        "Verified".to_string()
+                    } else {
+                        format!("MISMATCH (expected {}, got {})", expected_pubkey, pubkey)
                     }
-                    Err(e) => format!("FAILED: {}", e),
-                };
+                }
+                Err(e) => format!("FAILED: {}", e),
+            };
 
             summaries.push(verify::ValidatorSummary {
                 index: i,
