@@ -44,6 +44,7 @@ macro_rules! bytes_hex_mod {
 bytes_hex_mod!(bytes_20_hex, 20);
 bytes_hex_mod!(bytes_32_hex, 32);
 bytes_hex_mod!(bytes_48_hex, 48);
+bytes_hex_mod!(bytes_96_hex, 96);
 
 #[cfg(test)]
 mod tests {
@@ -130,5 +131,25 @@ mod tests {
     fn test_bytes_48_hex_deserialize_wrong_length() {
         let json = r#"{"val":"0xabcd"}"#;
         assert!(serde_json::from_str::<Wrapper48>(json).is_err());
+    }
+
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct Wrapper96 {
+        #[serde(with = "super::bytes_96_hex")]
+        val: [u8; 96],
+    }
+
+    #[test]
+    fn test_bytes_96_hex_roundtrip() {
+        let original = Wrapper96 { val: [0xef; 96] };
+        let json = serde_json::to_string(&original).unwrap();
+        let decoded: Wrapper96 = serde_json::from_str(&json).unwrap();
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_bytes_96_hex_deserialize_wrong_length() {
+        let json = r#"{"val":"0xabcd"}"#;
+        assert!(serde_json::from_str::<Wrapper96>(json).is_err());
     }
 }

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use aes::cipher::{KeyIvInit, StreamCipher};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -20,6 +21,18 @@ const CHECKSUM_SHA256: &str = "sha256";
 const DERIVED_KEY_LEN: usize = 32;
 const AES_KEY_LEN: usize = 16;
 
+const SALT_LEN: usize = 32;
+const IV_LEN: usize = 16;
+
+const DEFAULT_SCRYPT_N: u32 = 262_144; // 2^18
+const DEFAULT_SCRYPT_R: u32 = 8;
+const DEFAULT_SCRYPT_P: u32 = 1;
+const DEFAULT_SCRYPT_DKLEN: u32 = 32;
+
+const DEFAULT_PBKDF2_C: u32 = 262_144; // 2^18
+const DEFAULT_PBKDF2_DKLEN: u32 = 32;
+const DEFAULT_PBKDF2_PRF: &str = "hmac-sha256";
+
 const MIN_PBKDF2_C: u32 = 10_000;
 const MAX_PBKDF2_C: u32 = 10_000_000;
 
@@ -27,6 +40,12 @@ const MAX_SCRYPT_N: u32 = 1 << 22;
 const MAX_SCRYPT_R: u32 = 16;
 const MAX_SCRYPT_P: u32 = 16;
 const MAX_SCRYPT_DKLEN: u32 = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncryptionKdf {
+    Scrypt,
+    Pbkdf2,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Keystore {
@@ -284,6 +303,117 @@ impl Keystore {
             Some(pk) => Ok(Some(hex::decode(pk)?)),
             None => Ok(None),
         }
+    }
+
+    pub fn encrypt(
+        secret_key: &SecretKey,
+        password: &[u8],
+        path: &str,
+        kdf: EncryptionKdf,
+    ) -> Result<Self, KeystoreError> {
+        let mut salt = [0u8; SALT_LEN];
+        rand::thread_rng().fill_bytes(&mut salt);
+
+        let mut iv = [0u8; IV_LEN];
+        rand::thread_rng().fill_bytes(&mut iv);
+
+        let uuid = Uuid::new_v4();
+
+        let (kdf_function, kdf_params) = match kdf {
+            EncryptionKdf::Scrypt => (
+                KDF_SCRYPT.to_string(),
+                KdfParams::Scrypt(ScryptParams {
+                    dklen: DEFAULT_SCRYPT_DKLEN,
+                    n: DEFAULT_SCRYPT_N,
+                    p: DEFAULT_SCRYPT_P,
+                    r: DEFAULT_SCRYPT_R,
+                    salt: hex::encode(salt),
+                }),
+            ),
+            EncryptionKdf::Pbkdf2 => (
+                KDF_PBKDF2.to_string(),
+                KdfParams::Pbkdf2(Pbkdf2Params {
+                    dklen: DEFAULT_PBKDF2_DKLEN,
+                    c: DEFAULT_PBKDF2_C,
+                    prf: DEFAULT_PBKDF2_PRF.to_string(),
+                    salt: hex::encode(salt),
+                }),
+            ),
+        };
+
+        let keystore = Keystore {
+            crypto: Crypto {
+                kdf: KdfModule {
+                    function: kdf_function,
+                    params: kdf_params,
+                    message: String::new(),
+                },
+                checksum: ChecksumModule {
+                    function: CHECKSUM_SHA256.to_string(),
+                    params: ChecksumParams {},
+                    message: String::new(),
+                },
+                cipher: CipherModule {
+                    function: CIPHER_AES_128_CTR.to_string(),
+                    params: CipherParams { iv: hex::encode(iv) },
+                    message: String::new(),
+                },
+            },
+            description: None,
+            pubkey: Some(hex::encode(secret_key.public_key().to_bytes())),
+            path: path.to_string(),
+            uuid,
+            version: KEYSTORE_VERSION,
+        };
+
+        let derived_key = keystore.derive_key(password)?;
+
+        let plaintext = secret_key.to_bytes();
+        let aes_key = &derived_key[..AES_KEY_LEN];
+        let mut cipher = Aes128Ctr::new(aes_key.into(), iv.as_slice().into());
+        let mut ciphertext = plaintext.to_vec();
+        cipher.apply_keystream(&mut ciphertext);
+
+        let mut hasher = Sha256::new();
+        hasher.update(&derived_key[AES_KEY_LEN..DERIVED_KEY_LEN]);
+        hasher.update(&ciphertext);
+        let checksum = hasher.finalize();
+
+        let mut keystore = keystore;
+        keystore.crypto.cipher.message = hex::encode(&ciphertext);
+        keystore.crypto.checksum.message = hex::encode(checksum);
+
+        Ok(keystore)
+    }
+
+    pub fn to_json(&self) -> Result<String, KeystoreError> {
+        serde_json::to_string_pretty(self).map_err(KeystoreError::from)
+    }
+
+    pub fn to_file<P: AsRef<Path>>(&self, path: P) -> Result<(), KeystoreError> {
+        let json = self.to_json()?;
+
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(path)?;
+            file.write_all(json.as_bytes())?;
+        }
+
+        #[cfg(not(unix))]
+        {
+            fs::write(path, json)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -1036,5 +1166,245 @@ mod tests {
         let keystore = Keystore::from_json(json).expect("should parse");
         let result = keystore.decrypt(EIP2335_PASSWORD);
         assert!(matches!(result, Err(KeystoreError::InvalidHex(_))));
+    }
+
+    // ========== Encryption tests ==========
+
+    #[test]
+    fn test_encrypt_scrypt_produces_valid_keystore() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
+                .expect("should encrypt");
+        assert_eq!(keystore.version, 4);
+        assert_eq!(keystore.crypto.kdf.function, "scrypt");
+        assert_eq!(keystore.crypto.cipher.function, "aes-128-ctr");
+        assert_eq!(keystore.crypto.checksum.function, "sha256");
+    }
+
+    #[test]
+    fn test_encrypt_pbkdf2_produces_valid_keystore() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Pbkdf2)
+                .expect("should encrypt");
+        assert_eq!(keystore.version, 4);
+        assert_eq!(keystore.crypto.kdf.function, "pbkdf2");
+        assert_eq!(keystore.crypto.cipher.function, "aes-128-ctr");
+        assert_eq!(keystore.crypto.checksum.function, "sha256");
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip_scrypt() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
+                .expect("should encrypt");
+        let decrypted = keystore.decrypt(password).expect("should decrypt");
+        assert_eq!(sk.to_bytes(), decrypted.to_bytes());
+    }
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip_pbkdf2() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Pbkdf2)
+                .expect("should encrypt");
+        let decrypted = keystore.decrypt(password).expect("should decrypt");
+        assert_eq!(sk.to_bytes(), decrypted.to_bytes());
+    }
+
+    #[test]
+    fn test_encrypt_pubkey_matches() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
+                .expect("should encrypt");
+        let expected_pubkey = hex::encode(sk.public_key().to_bytes());
+        assert_eq!(keystore.pubkey.as_deref(), Some(expected_pubkey.as_str()));
+    }
+
+    #[test]
+    fn test_encrypt_path_preserved() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let path = "m/12381/3600/42/0/0";
+        let keystore =
+            Keystore::encrypt(&sk, password, path, EncryptionKdf::Scrypt).expect("should encrypt");
+        assert_eq!(keystore.path, path);
+    }
+
+    #[test]
+    fn test_encrypt_uuid_is_v4() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
+                .expect("should encrypt");
+        assert_eq!(keystore.uuid.get_version(), Some(uuid::Version::Random));
+    }
+
+    #[test]
+    fn test_encrypt_wrong_password_fails_decrypt() {
+        let sk = SecretKey::generate();
+        let password = b"correctpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
+                .expect("should encrypt");
+        let result = keystore.decrypt(b"wrongpassword");
+        assert!(matches!(result, Err(KeystoreError::ChecksumMismatch)));
+    }
+
+    #[test]
+    fn test_encrypt_scrypt_params_correct() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
+                .expect("should encrypt");
+        match &keystore.crypto.kdf.params {
+            KdfParams::Scrypt(params) => {
+                assert_eq!(params.dklen, 32);
+                assert_eq!(params.n, 262144);
+                assert_eq!(params.r, 8);
+                assert_eq!(params.p, 1);
+                assert_eq!(params.salt.len(), 64); // 32 bytes hex-encoded
+            }
+            _ => panic!("expected scrypt params"),
+        }
+    }
+
+    #[test]
+    fn test_encrypt_pbkdf2_params_correct() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Pbkdf2)
+                .expect("should encrypt");
+        match &keystore.crypto.kdf.params {
+            KdfParams::Pbkdf2(params) => {
+                assert_eq!(params.dklen, 32);
+                assert_eq!(params.c, 262144);
+                assert_eq!(params.prf, "hmac-sha256");
+                assert_eq!(params.salt.len(), 64); // 32 bytes hex-encoded
+            }
+            _ => panic!("expected pbkdf2 params"),
+        }
+    }
+
+    #[test]
+    fn test_encrypt_iv_is_32_hex_chars() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
+                .expect("should encrypt");
+        assert_eq!(keystore.crypto.cipher.params.iv.len(), 32); // 16 bytes hex-encoded
+    }
+
+    #[test]
+    fn test_to_json_produces_valid_json() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
+                .expect("should encrypt");
+        let json = keystore.to_json().expect("should serialize");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("should be valid JSON");
+        assert_eq!(parsed["version"], 4);
+        assert_eq!(parsed["crypto"]["kdf"]["function"], "scrypt");
+        assert_eq!(parsed["crypto"]["cipher"]["function"], "aes-128-ctr");
+        assert_eq!(parsed["crypto"]["checksum"]["function"], "sha256");
+    }
+
+    #[test]
+    fn test_to_json_then_from_json_roundtrip() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Pbkdf2)
+                .expect("should encrypt");
+        let json = keystore.to_json().expect("should serialize");
+        let reloaded = Keystore::from_json(&json).expect("should parse back");
+        let decrypted = reloaded.decrypt(password).expect("should decrypt");
+        assert_eq!(sk.to_bytes(), decrypted.to_bytes());
+    }
+
+    #[test]
+    fn test_to_file_creates_file_and_roundtrips() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
+                .expect("should encrypt");
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let file_path = dir.path().join("keystore.json");
+        keystore.to_file(&file_path).expect("should write to file");
+
+        let loaded = Keystore::from_file(&file_path).expect("should load from file");
+        let decrypted = loaded.decrypt(password).expect("should decrypt");
+        assert_eq!(sk.to_bytes(), decrypted.to_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_to_file_permissions_0600() {
+        use std::os::unix::fs::MetadataExt;
+
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
+                .expect("should encrypt");
+        let dir = tempfile::tempdir().expect("should create temp dir");
+        let file_path = dir.path().join("keystore.json");
+        keystore.to_file(&file_path).expect("should write to file");
+
+        let metadata = fs::metadata(&file_path).expect("should read metadata");
+        let permissions = metadata.mode() & 0o777;
+        assert_eq!(permissions, 0o600, "file permissions should be 0600");
+    }
+
+    #[test]
+    fn test_encrypt_different_keys_produce_different_ciphertext() {
+        let sk1 = SecretKey::generate();
+        let sk2 = SecretKey::generate();
+        let password = b"testpassword";
+        let ks1 = Keystore::encrypt(&sk1, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
+            .expect("should encrypt");
+        let ks2 = Keystore::encrypt(&sk2, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
+            .expect("should encrypt");
+        assert_ne!(ks1.crypto.cipher.message, ks2.crypto.cipher.message);
+    }
+
+    #[test]
+    fn test_encrypt_pubkey_no_0x_prefix() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
+                .expect("should encrypt");
+        let pubkey = keystore.pubkey.as_ref().expect("should have pubkey");
+        assert!(!pubkey.starts_with("0x"), "pubkey should not have 0x prefix");
+        assert_eq!(pubkey.len(), 96, "pubkey hex should be 96 chars (48 bytes)");
+    }
+
+    #[test]
+    fn test_decrypted_key_can_sign_after_encrypt() {
+        let sk = SecretKey::generate();
+        let password = b"testpassword";
+        let keystore =
+            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
+                .expect("should encrypt");
+        let decrypted = keystore.decrypt(password).expect("should decrypt");
+        let message = b"test message";
+        let signature = decrypted.sign(message);
+        let public_key = decrypted.public_key();
+        assert!(signature.verify(&public_key, message).is_ok());
     }
 }

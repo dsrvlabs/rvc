@@ -1,14 +1,39 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use rayon::prelude::*;
 use secrecy::{ExposeSecret, SecretString};
-use tracing::warn;
+use tracing::{debug, info, warn};
 
 use super::bls::{PublicKey, SecretKey, PUBLIC_KEY_BYTES_LEN};
 use super::decryption_tracker::DecryptionAttemptTracker;
 use super::error::KeyManagerError;
 use super::keystore::Keystore;
+
+/// A prepared decryption work item. Produced by Phase 1, consumed by Phase 2.
+struct DecryptionTask<'a> {
+    file_path: PathBuf,
+    keystore: Keystore,
+    password: &'a [u8],
+    declared_pubkey_hex: String,
+}
+
+/// Result of a single decryption attempt. Produced by Phase 2, consumed by Phase 3.
+enum DecryptionOutcome {
+    Success {
+        pubkey_bytes: [u8; PUBLIC_KEY_BYTES_LEN],
+        secret_key: SecretKey,
+        pubkey_hex: String,
+        file_path: PathBuf,
+    },
+    Failure {
+        pubkey_hex: String,
+        file_path: PathBuf,
+        error: String,
+    },
+}
 
 pub struct KeyManager {
     keys: HashMap<[u8; PUBLIC_KEY_BYTES_LEN], SecretKey>,
@@ -28,9 +53,29 @@ impl KeyManager {
     /// Corrupted or unreadable keystores are logged and skipped.
     /// Files outside the directory boundary (e.g., via symlinks) are also skipped
     /// to prevent directory traversal attacks.
+    ///
+    /// Delegates to `load_from_directory_with_threads` with auto-detected thread count.
     pub fn load_from_directory<P: AsRef<Path>>(
         path: P,
         passwords: &HashMap<String, SecretString>,
+    ) -> Result<Self, KeyManagerError> {
+        Self::load_from_directory_with_threads(path, passwords, None)
+    }
+
+    /// Loads all keystore files from a directory using parallel decryption.
+    ///
+    /// Uses a dedicated rayon thread pool to decrypt keystores in parallel.
+    /// The `num_threads` parameter controls the pool size; `None` auto-detects
+    /// from available CPU parallelism (clamped to 1..=32).
+    ///
+    /// The pipeline runs in 3 phases:
+    /// 1. **Sequential** — directory scan, validation, keystore parsing, task collection
+    /// 2. **Parallel** — keystore decryption and public key verification via rayon
+    /// 3. **Sequential** — result aggregation, logging, KeyManager construction
+    pub fn load_from_directory_with_threads<P: AsRef<Path>>(
+        path: P,
+        passwords: &HashMap<String, SecretString>,
+        num_threads: Option<usize>,
     ) -> Result<Self, KeyManagerError> {
         let dir_path = path.as_ref();
 
@@ -44,7 +89,10 @@ impl KeyManager {
 
         let canonical_dir = dir_path.canonicalize().map_err(KeyManagerError::Io)?;
 
-        let mut manager = Self::new();
+        info!(path = ?canonical_dir, "Loading validator keys from directory");
+
+        // ── Phase 1: Sequential scan ──────────────────────────────────────
+        let mut tasks: Vec<DecryptionTask<'_>> = Vec::new();
         let mut found_any_keystore = false;
 
         let entries = fs::read_dir(&canonical_dir)?;
@@ -114,58 +162,136 @@ impl KeyManager {
                 }
             };
 
-            let secret_key = match keystore.decrypt(password.expose_secret().as_bytes()) {
-                Ok(sk) => sk,
-                Err(e) => {
-                    warn!(
-                        pubkey = %pubkey_hex,
-                        file = ?file_path,
-                        error = %e,
-                        "Failed decryption attempt for keystore"
-                    );
-                    continue;
-                }
-            };
-
-            let derived_pubkey = secret_key.public_key();
-
-            let expected_pubkey_bytes = match hex::decode(&pubkey_hex) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    warn!(
-                        "Invalid public key hex format in keystore {:?}: {}",
-                        file_path, pubkey_hex
-                    );
-                    continue;
-                }
-            };
-
-            let expected_pubkey = match PublicKey::from_bytes(&expected_pubkey_bytes) {
-                Ok(pk) => pk,
-                Err(_) => {
-                    warn!("Invalid public key format in keystore {:?}: {}", file_path, pubkey_hex);
-                    continue;
-                }
-            };
-
-            if derived_pubkey.to_bytes() != expected_pubkey.to_bytes() {
-                warn!(
-                    "Public key mismatch in keystore {:?}: declared {} but derived {}",
-                    file_path,
-                    pubkey_hex,
-                    hex::encode(derived_pubkey.to_bytes())
-                );
-                continue;
-            }
-
-            manager.keys.insert(derived_pubkey.to_bytes(), secret_key);
+            tasks.push(DecryptionTask {
+                file_path,
+                keystore,
+                password: password.expose_secret().as_bytes(),
+                declared_pubkey_hex: pubkey_hex,
+            });
         }
 
         if !found_any_keystore {
             return Err(KeyManagerError::NoKeystoreFiles);
         }
 
-        Ok(manager)
+        // ── Phase 2: Parallel decryption ──────────────────────────────────
+        let num_threads = num_threads
+            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1));
+        let num_threads = num_threads.clamp(1, 32);
+
+        if num_threads > 8 {
+            warn!(
+                threads = num_threads,
+                peak_memory_mib = num_threads * 256,
+                "High parallelism for keystore decryption; peak scrypt memory may be significant"
+            );
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .thread_name(|i| format!("rvc-decrypt-{}", i))
+            .build()
+            .map_err(|e| KeyManagerError::ThreadPoolError(e.to_string()))?;
+
+        let start = Instant::now();
+        let results: Vec<DecryptionOutcome> = pool.install(|| {
+            tasks
+                .into_par_iter()
+                .map(|task| {
+                    let secret_key = match task.keystore.decrypt(task.password) {
+                        Ok(sk) => sk,
+                        Err(e) => {
+                            return DecryptionOutcome::Failure {
+                                pubkey_hex: task.declared_pubkey_hex,
+                                file_path: task.file_path,
+                                error: e.to_string(),
+                            };
+                        }
+                    };
+
+                    let derived = secret_key.public_key();
+
+                    let expected_bytes = match hex::decode(&task.declared_pubkey_hex) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            return DecryptionOutcome::Failure {
+                                pubkey_hex: task.declared_pubkey_hex,
+                                file_path: task.file_path,
+                                error: "invalid pubkey hex".to_string(),
+                            };
+                        }
+                    };
+
+                    let expected = match PublicKey::from_bytes(&expected_bytes) {
+                        Ok(pk) => pk,
+                        Err(_) => {
+                            return DecryptionOutcome::Failure {
+                                pubkey_hex: task.declared_pubkey_hex,
+                                file_path: task.file_path,
+                                error: "invalid pubkey format".to_string(),
+                            };
+                        }
+                    };
+
+                    if derived.to_bytes() != expected.to_bytes() {
+                        let error = format!(
+                            "pubkey mismatch: declared {} but derived {}",
+                            task.declared_pubkey_hex,
+                            hex::encode(derived.to_bytes())
+                        );
+                        return DecryptionOutcome::Failure {
+                            pubkey_hex: task.declared_pubkey_hex,
+                            file_path: task.file_path,
+                            error,
+                        };
+                    }
+
+                    DecryptionOutcome::Success {
+                        pubkey_bytes: derived.to_bytes(),
+                        secret_key,
+                        pubkey_hex: task.declared_pubkey_hex,
+                        file_path: task.file_path,
+                    }
+                })
+                .collect()
+        });
+
+        let elapsed = start.elapsed();
+
+        // ── Phase 3: Sequential aggregation ───────────────────────────────
+        let mut keys = HashMap::new();
+        let mut success_count: usize = 0;
+        let mut fail_count: usize = 0;
+
+        for outcome in results {
+            match outcome {
+                DecryptionOutcome::Success { pubkey_bytes, secret_key, pubkey_hex, file_path } => {
+                    debug!(pubkey = %pubkey_hex, file = ?file_path, "Loaded validator key");
+                    keys.insert(pubkey_bytes, secret_key);
+                    success_count += 1;
+                }
+                DecryptionOutcome::Failure { pubkey_hex, file_path, error } => {
+                    warn!(
+                        pubkey = %pubkey_hex,
+                        file = ?file_path,
+                        error = %error,
+                        "Failed to decrypt keystore"
+                    );
+                    fail_count += 1;
+                }
+            }
+        }
+
+        info!(
+            total = success_count + fail_count,
+            loaded = success_count,
+            failed = fail_count,
+            elapsed_ms = elapsed.as_millis(),
+            threads = num_threads,
+            "Finished loading validator keys"
+        );
+
+        Ok(Self { keys })
     }
 
     /// Loads all keystore files from a directory with decryption attempt tracking.
@@ -827,5 +953,232 @@ mod tests {
         let secret = test_password_secret();
         let debug_output = format!("{:?}", secret);
         assert!(!debug_output.contains(&test_password_string()));
+    }
+
+    // ── Parallel decryption tests ─────────────────────────────────────────
+
+    /// Helper: generates a random key, encrypts it as PBKDF2 keystore, writes JSON
+    /// to the given directory, and returns (pubkey_hex, password_string).
+    fn create_generated_keystore(dir: &TempDir, index: usize) -> (String, String) {
+        use crate::keystore::EncryptionKdf;
+
+        let sk = SecretKey::generate();
+        let password = format!("password-{}", index);
+        let keystore = Keystore::encrypt(
+            &sk,
+            password.as_bytes(),
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::Pbkdf2,
+        )
+        .expect("should encrypt");
+        let pubkey_hex = keystore.pubkey.clone().unwrap();
+        let json = keystore.to_json().expect("should serialize");
+        let filename = format!("keystore-{}.json", index);
+        create_test_keystore_file(dir, &filename, &json);
+        (pubkey_hex, password)
+    }
+
+    #[test]
+    fn test_parallel_load_single_key() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2))
+                .unwrap();
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_parallel_load_multiple_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut passwords = HashMap::new();
+
+        for i in 0..3 {
+            let (pubkey_hex, password) = create_generated_keystore(&temp_dir, i);
+            passwords.insert(pubkey_hex, SecretString::from(password));
+        }
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2))
+                .unwrap();
+        assert_eq!(manager.len(), 3);
+    }
+
+    #[test]
+    fn test_parallel_load_mixed_success_failure() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+        create_test_keystore_file(&temp_dir, "corrupted.json", "{ invalid json }");
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2))
+                .unwrap();
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_parallel_load_wrong_password_skipped() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords
+            .insert(TEST_PUBKEY_HEX.to_string(), SecretString::from("wrong_password".to_string()));
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2))
+                .unwrap();
+        assert!(manager.is_empty());
+    }
+
+    #[test]
+    fn test_parallel_load_pubkey_mismatch_skipped() {
+        let keystore_with_wrong_pubkey = r#"
+        {
+            "crypto": {
+                "kdf": {
+                    "function": "pbkdf2",
+                    "params": {
+                        "dklen": 32,
+                        "c": 262144,
+                        "prf": "hmac-sha256",
+                        "salt": "d4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"
+                    },
+                    "message": ""
+                },
+                "checksum": {
+                    "function": "sha256",
+                    "params": {},
+                    "message": "8a9f5d9912ed7e75ea794bc5a89bca5f193721d30868ade6f73043c6ea6febf1"
+                },
+                "cipher": {
+                    "function": "aes-128-ctr",
+                    "params": {
+                        "iv": "264daa3f303d7259501c93d997d84fe6"
+                    },
+                    "message": "cee03fde2af33149775b7223e7845e4fb2c8ae1792e5f99fe9ecf474cc8c16ad"
+                }
+            },
+            "description": "Test keystore with wrong pubkey",
+            "pubkey": "a99a76ed7796f7be22d5b7e85deeb7c5677e88e511e0b337618f8c4eb61349b4bf2d153f649f7b53359fe8b94a38e44c",
+            "path": "m/12381/60/0/0",
+            "uuid": "64625def-3331-4eea-ab6f-782f3ed16a84",
+            "version": 4
+        }
+        "#;
+
+        let wrong_pubkey_hex =
+            "a99a76ed7796f7be22d5b7e85deeb7c5677e88e511e0b337618f8c4eb61349b4bf2d153f649f7b53359fe8b94a38e44c";
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "wrong_pubkey.json", keystore_with_wrong_pubkey);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(wrong_pubkey_hex.to_string(), SecretString::from(test_password_string()));
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2))
+                .unwrap();
+        assert!(manager.is_empty());
+    }
+
+    #[test]
+    fn test_parallel_load_thread_count_1() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(1))
+                .unwrap();
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_parallel_load_thread_count_capped_at_32() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(100))
+                .unwrap();
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn test_parallel_load_no_keystores_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let passwords = HashMap::new();
+
+        let result =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2));
+        assert!(matches!(result, Err(KeyManagerError::NoKeystoreFiles)));
+    }
+
+    #[test]
+    fn test_load_from_directory_delegates_to_parallel() {
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+        let manager_default = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
+        let manager_explicit =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, None)
+                .unwrap();
+
+        assert_eq!(manager_default.len(), manager_explicit.len());
+
+        let keys_default: std::collections::BTreeSet<_> =
+            manager_default.list_public_keys().iter().map(|pk| pk.to_bytes()).collect();
+        let keys_explicit: std::collections::BTreeSet<_> =
+            manager_explicit.list_public_keys().iter().map(|pk| pk.to_bytes()).collect();
+        assert_eq!(keys_default, keys_explicit);
+    }
+
+    #[cfg(unix)]
+    mod parallel_symlink_tests {
+        use super::*;
+        use std::os::unix::fs::symlink;
+
+        #[test]
+        fn test_parallel_load_preserves_symlink_check() {
+            let keystore_dir = TempDir::new().unwrap();
+            let outside_dir = TempDir::new().unwrap();
+
+            let outside_keystore = outside_dir.path().join("secret_keystore.json");
+            let mut file = File::create(&outside_keystore).unwrap();
+            file.write_all(TEST_KEYSTORE_PBKDF2.as_bytes()).unwrap();
+
+            let symlink_path = keystore_dir.path().join("malicious_link.json");
+            symlink(&outside_keystore, &symlink_path).unwrap();
+
+            let mut passwords = HashMap::new();
+            passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_secret());
+
+            let result = KeyManager::load_from_directory_with_threads(
+                keystore_dir.path(),
+                &passwords,
+                Some(2),
+            );
+
+            assert!(
+                matches!(result, Err(KeyManagerError::NoKeystoreFiles)),
+                "Symlink pointing outside directory should be skipped in parallel load"
+            );
+        }
     }
 }

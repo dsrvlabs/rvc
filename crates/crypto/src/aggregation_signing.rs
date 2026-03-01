@@ -71,6 +71,8 @@ mod tests {
             deneb_fork_version: [4, 0, 0, 0],
             electra_fork_epoch: 364544,
             electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: u64::MAX,
+            fulu_fork_version: [6, 0, 0, 0],
         }
     }
 

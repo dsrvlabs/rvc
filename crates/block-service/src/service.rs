@@ -216,7 +216,7 @@ fn ssz_block_format(
         return SszBlockFormat::BeaconBlock;
     }
     match consensus_version {
-        "deneb" | "electra" => SszBlockFormat::BlockContents,
+        "deneb" | "electra" | "fulu" => SszBlockFormat::BlockContents,
         _ => SszBlockFormat::BeaconBlock,
     }
 }
@@ -540,6 +540,8 @@ mod tests {
             deneb_fork_version: [4, 0, 0, 0],
             electra_fork_epoch: 50,
             electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: 60,
+            fulu_fork_version: [6, 0, 0, 0],
         }
     }
 
@@ -602,7 +604,8 @@ mod tests {
         is_blinded: bool,
         consensus_version: &str,
     ) -> Vec<u8> {
-        let use_block_contents = !is_blinded && matches!(consensus_version, "deneb" | "electra");
+        let use_block_contents =
+            !is_blinded && matches!(consensus_version, "deneb" | "electra" | "fulu");
         let mut bytes = Vec::new();
         if use_block_contents {
             // BlockContents: 3 × 4-byte offsets, then BeaconBlock at offset 12
@@ -1225,6 +1228,7 @@ mod tests {
         use beacon::ssz_deser::SszBlockFormat;
         assert_eq!(ssz_block_format(false, "deneb"), SszBlockFormat::BlockContents);
         assert_eq!(ssz_block_format(false, "electra"), SszBlockFormat::BlockContents);
+        assert_eq!(ssz_block_format(false, "fulu"), SszBlockFormat::BlockContents);
     }
 
     #[tokio::test]

@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/rvc", "crates/rvc", "crates/beacon", "crates/bn-manager", "crates/builder", "crates/doppelganger", "crates/eth-types", "crates/keymanager-api", "crates/metrics", "crates/slashing", "crates/timing", "crates/crypto", "crates/duty-tracker", "crates/propagator", "crates/signer", "crates/validator-store", "crates/block-service", "crates/sync-service"]
+members = ["bin/rvc", "bin/rvc-keygen", "crates/rvc", "crates/beacon", "crates/bn-manager", "crates/builder", "crates/doppelganger", "crates/eth-types", "crates/keymanager-api", "crates/metrics", "crates/slashing", "crates/timing", "crates/crypto", "crates/duty-tracker", "crates/propagator", "crates/signer", "crates/validator-store", "crates/block-service", "crates/sync-service"]
 default-members = ["bin/rvc"]
 resolver = "2"
 
@@ -73,6 +73,11 @@ uuid = { version = "1", features = ["v4", "serde"] }
 secrecy = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }
 subtle = "2.6"
+hkdf = "0.12"
+num-bigint = "0.4"
+bip39 = { version = "2.2", features = ["zeroize", "rand"] }
+rpassword = "5"
+rayon = "1"
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }

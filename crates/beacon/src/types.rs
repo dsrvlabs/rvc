@@ -47,6 +47,7 @@ pub struct LegacyAttestation {
 pub enum VersionedAttestation {
     PreElectra(Vec<LegacyAttestation>),
     Electra(Vec<SingleAttestation>),
+    Fulu(Vec<SingleAttestation>),
 }
 
 /// Fork-versioned aggregate attestation for fetch responses.
@@ -54,6 +55,7 @@ pub enum VersionedAttestation {
 pub enum VersionedAggregateAttestation {
     PreElectra(eth_types::Attestation),
     Electra(eth_types::ElectraAttestation),
+    Fulu(eth_types::ElectraAttestation),
 }
 
 /// Fork-versioned signed aggregate and proof for submission.
@@ -61,6 +63,7 @@ pub enum VersionedAggregateAttestation {
 pub enum VersionedSignedAggregateAndProof {
     PreElectra(Vec<eth_types::SignedAggregateAndProof>),
     Electra(Vec<eth_types::SignedElectraAggregateAndProof>),
+    Fulu(Vec<eth_types::SignedElectraAggregateAndProof>),
 }
 
 /// Header of a beacon block.
@@ -205,7 +208,7 @@ pub struct GenesisData {
 pub type GenesisResponse = DataResponse<GenesisData>;
 
 /// Response type for the config spec endpoint.
-pub type ConfigSpecResponse = DataResponse<HashMap<String, String>>;
+pub type ConfigSpecResponse = DataResponse<HashMap<String, serde_json::Value>>;
 
 /// Fork information from the beacon state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,7 +234,9 @@ pub type StateForkResponse = StateResponse<StateFork>;
 /// Extracts fork epoch and version fields from the config spec map.
 /// Version fields are hex-encoded (e.g., "0x00000000") and epoch fields
 /// are decimal strings (e.g., "74240").
-pub fn parse_fork_schedule(spec: &HashMap<String, String>) -> Result<ForkSchedule, BeaconError> {
+pub fn parse_fork_schedule(
+    spec: &HashMap<String, serde_json::Value>,
+) -> Result<ForkSchedule, BeaconError> {
     Ok(ForkSchedule {
         genesis_fork_version: parse_version(spec, "GENESIS_FORK_VERSION")?,
         altair_fork_epoch: parse_epoch(spec, "ALTAIR_FORK_EPOCH")?,
@@ -244,29 +249,93 @@ pub fn parse_fork_schedule(spec: &HashMap<String, String>) -> Result<ForkSchedul
         deneb_fork_version: parse_version(spec, "DENEB_FORK_VERSION")?,
         electra_fork_epoch: parse_epoch(spec, "ELECTRA_FORK_EPOCH")?,
         electra_fork_version: parse_version(spec, "ELECTRA_FORK_VERSION")?,
+        fulu_fork_epoch: parse_epoch_optional(spec, "FULU_FORK_EPOCH", u64::MAX)?,
+        fulu_fork_version: parse_version_optional(
+            spec,
+            "FULU_FORK_VERSION",
+            [0xFF, 0xFF, 0xFF, 0xFF],
+        )?,
     })
 }
 
-fn parse_epoch(spec: &HashMap<String, String>, key: &str) -> Result<Epoch, BeaconError> {
+fn value_to_string(value: &serde_json::Value, key: &str) -> Result<String, BeaconError> {
+    match value {
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        serde_json::Value::Bool(b) => Ok(b.to_string()),
+        other => Err(BeaconError::ParseError(format!(
+            "unsupported value type for {}: expected string or number, got {}",
+            key,
+            json_type_name(other)
+        ))),
+    }
+}
+
+fn json_type_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn parse_epoch(spec: &HashMap<String, serde_json::Value>, key: &str) -> Result<Epoch, BeaconError> {
     let value = spec
         .get(key)
         .ok_or_else(|| BeaconError::ParseError(format!("missing config key: {}", key)))?;
-    value
-        .parse::<u64>()
+    let s = value_to_string(value, key)?;
+    s.parse::<u64>()
         .map_err(|e| BeaconError::ParseError(format!("invalid epoch for {}: {}", key, e)))
 }
 
-fn parse_version(spec: &HashMap<String, String>, key: &str) -> Result<Version, BeaconError> {
+fn parse_version(
+    spec: &HashMap<String, serde_json::Value>,
+    key: &str,
+) -> Result<Version, BeaconError> {
     let value = spec
         .get(key)
         .ok_or_else(|| BeaconError::ParseError(format!("missing config key: {}", key)))?;
-    let hex_str = value.strip_prefix("0x").unwrap_or(value);
+    parse_version_value(value, key)
+}
+
+fn parse_version_value(value: &serde_json::Value, key: &str) -> Result<Version, BeaconError> {
+    let s = value_to_string(value, key)?;
+    let hex_str = s.strip_prefix("0x").unwrap_or(&s);
     let bytes = hex::decode(hex_str)
         .map_err(|e| BeaconError::ParseError(format!("invalid hex for {}: {}", key, e)))?;
     let arr: [u8; 4] = bytes
         .try_into()
         .map_err(|_| BeaconError::ParseError(format!("version must be 4 bytes for {}", key)))?;
     Ok(arr)
+}
+
+fn parse_epoch_optional(
+    spec: &HashMap<String, serde_json::Value>,
+    key: &str,
+    default: u64,
+) -> Result<Epoch, BeaconError> {
+    match spec.get(key) {
+        None => Ok(default),
+        Some(value) => {
+            let s = value_to_string(value, key)?;
+            s.parse::<u64>()
+                .map_err(|e| BeaconError::ParseError(format!("invalid epoch for {}: {}", key, e)))
+        }
+    }
+}
+
+fn parse_version_optional(
+    spec: &HashMap<String, serde_json::Value>,
+    key: &str,
+    default: Version,
+) -> Result<Version, BeaconError> {
+    match spec.get(key) {
+        None => Ok(default),
+        Some(value) => parse_version_value(value, key),
+    }
 }
 
 /// Proposer preparation data sent to the beacon node to register fee recipients.
@@ -352,6 +421,7 @@ impl SubmitAttestationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn test_checkpoint_deserialize() {
@@ -622,19 +692,21 @@ mod tests {
         assert_eq!(response.data.epoch, "269568");
     }
 
-    fn mainnet_config_spec() -> HashMap<String, String> {
+    fn mainnet_config_spec() -> HashMap<String, serde_json::Value> {
         let mut spec = HashMap::new();
-        spec.insert("GENESIS_FORK_VERSION".to_string(), "0x00000000".to_string());
-        spec.insert("ALTAIR_FORK_EPOCH".to_string(), "74240".to_string());
-        spec.insert("ALTAIR_FORK_VERSION".to_string(), "0x01000000".to_string());
-        spec.insert("BELLATRIX_FORK_EPOCH".to_string(), "144896".to_string());
-        spec.insert("BELLATRIX_FORK_VERSION".to_string(), "0x02000000".to_string());
-        spec.insert("CAPELLA_FORK_EPOCH".to_string(), "194048".to_string());
-        spec.insert("CAPELLA_FORK_VERSION".to_string(), "0x03000000".to_string());
-        spec.insert("DENEB_FORK_EPOCH".to_string(), "269568".to_string());
-        spec.insert("DENEB_FORK_VERSION".to_string(), "0x04000000".to_string());
-        spec.insert("ELECTRA_FORK_EPOCH".to_string(), "364544".to_string());
-        spec.insert("ELECTRA_FORK_VERSION".to_string(), "0x05000000".to_string());
+        spec.insert("GENESIS_FORK_VERSION".to_string(), json!("0x00000000"));
+        spec.insert("ALTAIR_FORK_EPOCH".to_string(), json!("74240"));
+        spec.insert("ALTAIR_FORK_VERSION".to_string(), json!("0x01000000"));
+        spec.insert("BELLATRIX_FORK_EPOCH".to_string(), json!("144896"));
+        spec.insert("BELLATRIX_FORK_VERSION".to_string(), json!("0x02000000"));
+        spec.insert("CAPELLA_FORK_EPOCH".to_string(), json!("194048"));
+        spec.insert("CAPELLA_FORK_VERSION".to_string(), json!("0x03000000"));
+        spec.insert("DENEB_FORK_EPOCH".to_string(), json!("269568"));
+        spec.insert("DENEB_FORK_VERSION".to_string(), json!("0x04000000"));
+        spec.insert("ELECTRA_FORK_EPOCH".to_string(), json!("364544"));
+        spec.insert("ELECTRA_FORK_VERSION".to_string(), json!("0x05000000"));
+        spec.insert("FULU_FORK_EPOCH".to_string(), json!("18446744073709551615"));
+        spec.insert("FULU_FORK_VERSION".to_string(), json!("0x06000000"));
         spec
     }
 
@@ -659,7 +731,7 @@ mod tests {
     #[test]
     fn test_parse_fork_schedule_unscheduled_forks() {
         let mut spec = mainnet_config_spec();
-        spec.insert("ELECTRA_FORK_EPOCH".to_string(), "18446744073709551615".to_string());
+        spec.insert("ELECTRA_FORK_EPOCH".to_string(), json!("18446744073709551615"));
         let schedule = parse_fork_schedule(&spec).unwrap();
         assert_eq!(schedule.electra_fork_epoch, u64::MAX);
     }
@@ -677,7 +749,7 @@ mod tests {
     #[test]
     fn test_parse_fork_schedule_invalid_epoch() {
         let mut spec = mainnet_config_spec();
-        spec.insert("DENEB_FORK_EPOCH".to_string(), "not_a_number".to_string());
+        spec.insert("DENEB_FORK_EPOCH".to_string(), json!("not_a_number"));
         let result = parse_fork_schedule(&spec);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -687,7 +759,7 @@ mod tests {
     #[test]
     fn test_parse_fork_schedule_invalid_version_hex() {
         let mut spec = mainnet_config_spec();
-        spec.insert("CAPELLA_FORK_VERSION".to_string(), "0xZZZZZZZZ".to_string());
+        spec.insert("CAPELLA_FORK_VERSION".to_string(), json!("0xZZZZZZZZ"));
         let result = parse_fork_schedule(&spec);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -697,7 +769,7 @@ mod tests {
     #[test]
     fn test_parse_fork_schedule_wrong_version_length() {
         let mut spec = mainnet_config_spec();
-        spec.insert("GENESIS_FORK_VERSION".to_string(), "0x0000".to_string());
+        spec.insert("GENESIS_FORK_VERSION".to_string(), json!("0x0000"));
         let result = parse_fork_schedule(&spec);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -707,7 +779,7 @@ mod tests {
     #[test]
     fn test_parse_fork_schedule_version_without_0x_prefix() {
         let mut spec = mainnet_config_spec();
-        spec.insert("GENESIS_FORK_VERSION".to_string(), "00000000".to_string());
+        spec.insert("GENESIS_FORK_VERSION".to_string(), json!("00000000"));
         let schedule = parse_fork_schedule(&spec).unwrap();
         assert_eq!(schedule.genesis_fork_version, [0, 0, 0, 0]);
     }
@@ -1171,5 +1243,140 @@ mod tests {
         assert!(
             matches!(versioned, VersionedSignedAggregateAndProof::Electra(ref v) if v.len() == 1)
         );
+    }
+
+    #[test]
+    fn test_parse_epoch_from_number_value() {
+        let mut spec = HashMap::new();
+        spec.insert("ALTAIR_FORK_EPOCH".to_string(), json!(74240));
+        let epoch = parse_epoch(&spec, "ALTAIR_FORK_EPOCH").unwrap();
+        assert_eq!(epoch, 74240);
+    }
+
+    #[test]
+    fn test_parse_epoch_from_string_value() {
+        let mut spec = HashMap::new();
+        spec.insert("ALTAIR_FORK_EPOCH".to_string(), json!("74240"));
+        let epoch = parse_epoch(&spec, "ALTAIR_FORK_EPOCH").unwrap();
+        assert_eq!(epoch, 74240);
+    }
+
+    #[test]
+    fn test_parse_version_from_string_value() {
+        let mut spec = HashMap::new();
+        spec.insert("ALTAIR_FORK_VERSION".to_string(), json!("0x01000000"));
+        let version = parse_version(&spec, "ALTAIR_FORK_VERSION").unwrap();
+        assert_eq!(version, [1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_value_to_string_unsupported_type() {
+        let result = value_to_string(&json!([1, 2]), "TEST_KEY");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("TEST_KEY"));
+        assert!(err.contains("array"));
+    }
+
+    #[test]
+    fn test_config_spec_response_deserialize_mixed_types() {
+        let json_str = r#"{
+            "data": {
+                "ALTAIR_FORK_EPOCH": "74240",
+                "SECONDS_PER_SLOT": 12,
+                "GENESIS_FORK_VERSION": "0x00000000"
+            }
+        }"#;
+        let response: ConfigSpecResponse = serde_json::from_str(json_str).unwrap();
+        assert_eq!(response.data.get("ALTAIR_FORK_EPOCH").unwrap(), &json!("74240"));
+        assert_eq!(response.data.get("SECONDS_PER_SLOT").unwrap(), &json!(12));
+        assert_eq!(response.data.get("GENESIS_FORK_VERSION").unwrap(), &json!("0x00000000"));
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_with_numeric_epochs() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("ALTAIR_FORK_EPOCH".to_string(), json!(74240));
+        spec.insert("BELLATRIX_FORK_EPOCH".to_string(), json!(144896));
+        spec.insert("CAPELLA_FORK_EPOCH".to_string(), json!(194048));
+        spec.insert("DENEB_FORK_EPOCH".to_string(), json!(269568));
+        spec.insert("ELECTRA_FORK_EPOCH".to_string(), json!(364544));
+        spec.insert("FULU_FORK_EPOCH".to_string(), json!(18446744073709551615_u64));
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(schedule.altair_fork_epoch, 74240);
+        assert_eq!(schedule.bellatrix_fork_epoch, 144896);
+        assert_eq!(schedule.capella_fork_epoch, 194048);
+        assert_eq!(schedule.deneb_fork_epoch, 269568);
+        assert_eq!(schedule.electra_fork_epoch, 364544);
+        assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_with_fulu() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("FULU_FORK_EPOCH".to_string(), json!("500000"));
+        spec.insert("FULU_FORK_VERSION".to_string(), json!("0x06000000"));
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(schedule.fulu_fork_epoch, 500000);
+        assert_eq!(schedule.fulu_fork_version, [6, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_without_fulu() {
+        let mut spec = mainnet_config_spec();
+        spec.remove("FULU_FORK_EPOCH");
+        spec.remove("FULU_FORK_VERSION");
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
+        assert_eq!(schedule.fulu_fork_version, [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_parse_epoch_optional_missing() {
+        let spec: HashMap<String, serde_json::Value> = HashMap::new();
+        let result = parse_epoch_optional(&spec, "MISSING_KEY", 42).unwrap();
+        assert_eq!(result, 42);
+    }
+
+    #[test]
+    fn test_parse_epoch_optional_present() {
+        let mut spec = HashMap::new();
+        spec.insert("FULU_FORK_EPOCH".to_string(), json!("123456"));
+        let result = parse_epoch_optional(&spec, "FULU_FORK_EPOCH", u64::MAX).unwrap();
+        assert_eq!(result, 123456);
+    }
+
+    #[test]
+    fn test_parse_epoch_optional_invalid() {
+        let mut spec = HashMap::new();
+        spec.insert("FULU_FORK_EPOCH".to_string(), json!("not_a_number"));
+        let result = parse_epoch_optional(&spec, "FULU_FORK_EPOCH", u64::MAX);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("FULU_FORK_EPOCH"));
+    }
+
+    #[test]
+    fn test_parse_version_optional_missing() {
+        let spec: HashMap<String, serde_json::Value> = HashMap::new();
+        let result = parse_version_optional(&spec, "MISSING_KEY", [0xAA; 4]).unwrap();
+        assert_eq!(result, [0xAA, 0xAA, 0xAA, 0xAA]);
+    }
+
+    #[test]
+    fn test_parse_version_optional_present() {
+        let mut spec = HashMap::new();
+        spec.insert("FULU_FORK_VERSION".to_string(), json!("0x06000000"));
+        let result =
+            parse_version_optional(&spec, "FULU_FORK_VERSION", [0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+        assert_eq!(result, [6, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_parse_version_optional_invalid() {
+        let mut spec = HashMap::new();
+        spec.insert("FULU_FORK_VERSION".to_string(), json!("0xZZZZZZZZ"));
+        let result = parse_version_optional(&spec, "FULU_FORK_VERSION", [0xFF; 4]);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("FULU_FORK_VERSION"));
     }
 }

@@ -30,11 +30,16 @@ tree_hash.workspace = true
 tree_hash_derive.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
+hkdf.workspace = true
+num-bigint.workspace = true
+bip39.workspace = true
+rayon.workspace = true
 
 [features]
 test-utils = []
 
 [dev-dependencies]
+proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 wiremock.workspace = true

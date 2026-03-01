@@ -535,7 +535,8 @@ impl BeaconClient {
             VersionedSignedAggregateAndProof::PreElectra(ps) => {
                 self.post_empty("/eth/v1/validator/aggregate_and_proofs", ps).await
             }
-            VersionedSignedAggregateAndProof::Electra(ps) => {
+            VersionedSignedAggregateAndProof::Electra(ps)
+            | VersionedSignedAggregateAndProof::Fulu(ps) => {
                 self.post_empty("/eth/v2/validator/aggregate_and_proofs", ps).await
             }
         }
@@ -632,12 +633,34 @@ impl BeaconClient {
                 tokio::time::sleep(backoff).await;
             }
 
+            let (consensus_version, attestation_count) = match attestations {
+                VersionedAttestation::PreElectra(atts) => ("phase0", atts.len()),
+                VersionedAttestation::Electra(atts) => ("electra", atts.len()),
+                VersionedAttestation::Fulu(atts) => ("fulu", atts.len()),
+            };
+
+            debug!(
+                consensus_version = consensus_version,
+                attestation_count = attestation_count,
+                "Submitting attestations to beacon node"
+            );
+
             let send_result = match attestations {
                 VersionedAttestation::PreElectra(atts) => {
-                    self.client.post(&url).json(atts).send().await
+                    self.client
+                        .post(&url)
+                        .header("Eth-Consensus-Version", consensus_version)
+                        .json(atts)
+                        .send()
+                        .await
                 }
-                VersionedAttestation::Electra(atts) => {
-                    self.client.post(&url).json(atts).send().await
+                VersionedAttestation::Electra(atts) | VersionedAttestation::Fulu(atts) => {
+                    self.client
+                        .post(&url)
+                        .header("Eth-Consensus-Version", consensus_version)
+                        .json(atts)
+                        .send()
+                        .await
                 }
             };
             match send_result {
@@ -650,6 +673,10 @@ impl BeaconClient {
 
                     if status.as_u16() == 400 {
                         let body = response.text().await.unwrap_or_default();
+                        warn!(
+                            response_body = %body,
+                            "Attestation submission returned 400"
+                        );
                         if let Ok(error_response) =
                             serde_json::from_str::<AttestationSubmissionError>(&body)
                         {
@@ -724,10 +751,18 @@ impl BeaconClient {
                     let status = response.status();
 
                     if status.is_success() {
-                        return response
-                            .json::<T>()
-                            .await
-                            .map_err(|e| BeaconError::ParseError(e.to_string()));
+                        let body = response.text().await.map_err(|e| {
+                            BeaconError::ParseError(format!("failed to read response body: {e}"))
+                        })?;
+                        return serde_json::from_str::<T>(&body).map_err(|e| {
+                            let preview = body.get(..1024).unwrap_or(&body);
+                            warn!(
+                                error = %e,
+                                body_preview = preview,
+                                "Failed to parse beacon API response"
+                            );
+                            BeaconError::ParseError(format!("error decoding response body: {e}"))
+                        });
                     }
 
                     if status.is_client_error() {
@@ -923,6 +958,7 @@ mod tests {
     use std::time::Duration;
 
     use serde::{Deserialize, Serialize};
+    use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use wiremock::matchers::{body_json, method, path};
@@ -1726,6 +1762,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock_server)
@@ -1778,6 +1815,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
             .respond_with(ResponseTemplate::new(400).set_body_json(&error_response))
             .expect(1)
             .mount(&mock_server)
@@ -1819,6 +1857,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
             .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
             .expect(4)
             .mount(&mock_server)
@@ -1865,6 +1904,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock_server)
@@ -1934,6 +1974,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
             .respond_with(ResponseTemplate::new(400).set_body_json(&error_response))
             .expect(1)
             .mount(&mock_server)
@@ -2000,6 +2041,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
             .respond_with(ResponseTemplate::new(400).set_body_json(&error_response))
             .expect(1)
             .mount(&mock_server)
@@ -2043,6 +2085,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock_server)
@@ -2087,13 +2130,13 @@ mod tests {
         let client = BeaconClient::new(config).unwrap();
 
         let result = client.get_config_spec().await.unwrap();
-        assert_eq!(result.data.get("GENESIS_FORK_VERSION").unwrap(), "0x00000000");
-        assert_eq!(result.data.get("ALTAIR_FORK_EPOCH").unwrap(), "74240");
-        assert_eq!(result.data.get("BELLATRIX_FORK_EPOCH").unwrap(), "144896");
-        assert_eq!(result.data.get("CAPELLA_FORK_EPOCH").unwrap(), "194048");
-        assert_eq!(result.data.get("DENEB_FORK_EPOCH").unwrap(), "269568");
-        assert_eq!(result.data.get("SECONDS_PER_SLOT").unwrap(), "12");
-        assert_eq!(result.data.get("SLOTS_PER_EPOCH").unwrap(), "32");
+        assert_eq!(result.data.get("GENESIS_FORK_VERSION").unwrap(), &json!("0x00000000"));
+        assert_eq!(result.data.get("ALTAIR_FORK_EPOCH").unwrap(), &json!("74240"));
+        assert_eq!(result.data.get("BELLATRIX_FORK_EPOCH").unwrap(), &json!("144896"));
+        assert_eq!(result.data.get("CAPELLA_FORK_EPOCH").unwrap(), &json!("194048"));
+        assert_eq!(result.data.get("DENEB_FORK_EPOCH").unwrap(), &json!("269568"));
+        assert_eq!(result.data.get("SECONDS_PER_SLOT").unwrap(), &json!("12"));
+        assert_eq!(result.data.get("SLOTS_PER_EPOCH").unwrap(), &json!("32"));
         assert_eq!(result.data.len(), 11);
     }
 
@@ -2379,6 +2422,8 @@ mod tests {
                 "DENEB_FORK_VERSION": "0x04000000",
                 "ELECTRA_FORK_EPOCH": "364544",
                 "ELECTRA_FORK_VERSION": "0x05000000",
+                "FULU_FORK_EPOCH": "18446744073709551615",
+                "FULU_FORK_VERSION": "0x06000000",
                 "SECONDS_PER_SLOT": "12",
                 "SLOTS_PER_EPOCH": "32"
             }
@@ -2404,6 +2449,8 @@ mod tests {
         assert_eq!(schedule.deneb_fork_version, [4, 0, 0, 0]);
         assert_eq!(schedule.electra_fork_epoch, 364544);
         assert_eq!(schedule.electra_fork_version, [5, 0, 0, 0]);
+        assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
+        assert_eq!(schedule.fulu_fork_version, [6, 0, 0, 0]);
     }
 
     #[tokio::test]
@@ -3554,6 +3601,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/eth/v2/beacon/pool/attestations"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "phase0"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock_server)
@@ -4163,6 +4211,67 @@ mod tests {
                 assert_eq!(message, "Invalid registration data");
             }
             _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_error_includes_body_preview() {
+        let mock_server = MockServer::start().await;
+
+        let invalid_body = "this is not valid json at all";
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(invalid_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result: Result<TestData, _> = client.get("/eth/v1/test").await;
+
+        match result {
+            Err(BeaconError::ParseError(msg)) => {
+                // New format: "error decoding response body: <serde error>"
+                // Old format was just "error decoding response body" from reqwest
+                assert!(
+                    msg.starts_with("error decoding response body: "),
+                    "Expected error message to start with 'error decoding response body: ', got: {msg}"
+                );
+            }
+            other => panic!("Expected ParseError, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_error_truncates_large_body() {
+        let mock_server = MockServer::start().await;
+
+        // Create a body larger than 1024 bytes that is invalid JSON
+        let large_body = "x".repeat(2048);
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&large_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result: Result<TestData, _> = client.get("/eth/v1/test").await;
+
+        match result {
+            Err(BeaconError::ParseError(msg)) => {
+                assert!(
+                    msg.starts_with("error decoding response body: "),
+                    "Expected error message to start with 'error decoding response body: ', got: {msg}"
+                );
+            }
+            other => panic!("Expected ParseError, got: {other:?}"),
         }
     }
 }

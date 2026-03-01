@@ -6,6 +6,7 @@ mod aggregation;
 mod attestation;
 mod block;
 mod builder;
+mod deposit;
 mod domains;
 mod duties;
 mod fork;
@@ -21,11 +22,12 @@ pub use block::{
     BlockContents, ProducedBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
 };
 pub use builder::{SignedValidatorRegistration, ValidatorRegistrationV1};
+pub use deposit::{BLSToExecutionChange, DepositData, DepositMessage, SignedBLSToExecutionChange};
 pub use domains::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_DEPOSIT, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
-    DOMAIN_VOLUNTARY_EXIT,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_BLS_TO_EXECUTION_CHANGE, DOMAIN_CONTRIBUTION_AND_PROOF,
+    DOMAIN_DEPOSIT, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 pub use duties::{ProposerDuty, SignedVoluntaryExit, VoluntaryExit};
 pub use fork::{ForkName, ForkSchedule};

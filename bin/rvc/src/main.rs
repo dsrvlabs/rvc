@@ -76,7 +76,7 @@ enum Commands {
         #[arg(long, default_value = DEFAULT_GRPC_ADDRESS)]
         grpc_address: String,
 
-        /// Network preset (mainnet, goerli, sepolia, holesky, custom)
+        /// Network preset (mainnet, hoodi, custom)
         #[arg(long)]
         network: Option<String>,
 
@@ -143,6 +143,10 @@ enum Commands {
         /// Duty fetch timeout in seconds (default: 10)
         #[arg(long)]
         duty_fetch_timeout: Option<u64>,
+
+        /// Number of threads for parallel keystore decryption (default: auto-detect)
+        #[arg(long)]
+        key_decrypt_threads: Option<usize>,
     },
 
     /// Submit a voluntary exit for a validator
@@ -175,7 +179,7 @@ enum Commands {
         #[arg(long)]
         slashing_db_path: Option<PathBuf>,
 
-        /// Network preset (mainnet, goerli, sepolia, holesky, custom)
+        /// Network preset (mainnet, hoodi, custom)
         #[arg(long)]
         network: Option<String>,
 
@@ -221,6 +225,7 @@ async fn main() -> anyhow::Result<()> {
             attestation_timeout,
             aggregate_timeout,
             duty_fetch_timeout,
+            key_decrypt_threads,
         } => {
             init_logging(&log_level);
 
@@ -251,6 +256,12 @@ async fn main() -> anyhow::Result<()> {
                 timeouts.duty_fetch = std::time::Duration::from_secs(secs);
             }
 
+            if let Some(n) = key_decrypt_threads {
+                if n == 0 {
+                    anyhow::bail!("--key-decrypt-threads must be greater than 0");
+                }
+            }
+
             let cli_overrides = CliOverrides {
                 beacon_url,
                 beacon_nodes,
@@ -276,6 +287,7 @@ async fn main() -> anyhow::Result<()> {
                 keymanager_address,
                 keymanager_token_file,
                 remote_signer_url,
+                key_decrypt_threads,
             };
 
             let mut cfg = load_config(config)?;
@@ -494,10 +506,12 @@ async fn run_validator(
         let validator_index_map = match validator_index_map {
             Ok(ref map) if !map.is_empty() => map.clone(),
             Ok(_) => {
-                error!("No validator indices resolved; cannot run doppelganger detection");
-                return Err(anyhow::anyhow!(
-                    "validator index resolution returned empty; doppelganger detection requires indices"
-                ));
+                warn!(
+                    total = pubkey_map.len(),
+                    "No validator indices resolved; validators may be pending activation. \
+                     Skipping doppelganger detection"
+                );
+                std::collections::HashMap::new()
             }
             Err(ref e) => {
                 error!("Failed to resolve validator indices: {}", e);
@@ -507,42 +521,47 @@ async fn run_validator(
             }
         };
 
-        let doppelganger_service =
-            builder.build_doppelganger_service(beacon_client.clone(), slashing_db.clone());
+        if !validator_index_map.is_empty() {
+            let doppelganger_service =
+                builder.build_doppelganger_service(beacon_client.clone(), slashing_db.clone());
 
-        let pubkeys: Vec<String> = pubkey_map.keys().cloned().collect();
+            let pubkeys: Vec<String> = pubkey_map.keys().cloned().collect();
 
-        let slot_clock = match builder.build_slot_clock() {
-            Ok(clock) => clock,
-            Err(e) => {
-                error!("Failed to create slot clock: {}", e);
-                return Err(e.into());
-            }
-        };
-
-        let current_epoch = match slot_clock.current_slot() {
-            Ok(slot) => slot / timing::SLOTS_PER_EPOCH,
-            Err(e) => {
-                error!(error = %e, "Cannot determine current epoch; refusing to skip doppelganger detection");
-                return Err(anyhow::anyhow!("slot clock failure during doppelganger check"));
-            }
-        };
-
-        if current_epoch > 0 {
-            match startup::run_doppelganger_detection(
-                &doppelganger_service,
-                &pubkeys,
-                &validator_index_map,
-                current_epoch,
-            )
-            .await
-            {
-                Ok(safe_validators) => {
-                    info!(safe_count = safe_validators.len(), "Doppelganger detection complete");
-                }
+            let slot_clock = match builder.build_slot_clock() {
+                Ok(clock) => clock,
                 Err(e) => {
-                    error!("Doppelganger detection failed: {}", e);
+                    error!("Failed to create slot clock: {}", e);
                     return Err(e.into());
+                }
+            };
+
+            let current_epoch = match slot_clock.current_slot() {
+                Ok(slot) => slot / timing::SLOTS_PER_EPOCH,
+                Err(e) => {
+                    error!(error = %e, "Cannot determine current epoch; refusing to skip doppelganger detection");
+                    return Err(anyhow::anyhow!("slot clock failure during doppelganger check"));
+                }
+            };
+
+            if current_epoch > 0 {
+                match startup::run_doppelganger_detection(
+                    &doppelganger_service,
+                    &pubkeys,
+                    &validator_index_map,
+                    current_epoch,
+                )
+                .await
+                {
+                    Ok(safe_validators) => {
+                        info!(
+                            safe_count = safe_validators.len(),
+                            "Doppelganger detection complete"
+                        );
+                    }
+                    Err(e) => {
+                        error!("Doppelganger detection failed: {}", e);
+                        return Err(e.into());
+                    }
                 }
             }
         }

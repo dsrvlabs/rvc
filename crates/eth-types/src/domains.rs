@@ -10,6 +10,7 @@ pub const DOMAIN_AGGREGATE_AND_PROOF: DomainType = [0x06, 0x00, 0x00, 0x00];
 pub const DOMAIN_SYNC_COMMITTEE: DomainType = [0x07, 0x00, 0x00, 0x00];
 pub const DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF: DomainType = [0x08, 0x00, 0x00, 0x00];
 pub const DOMAIN_CONTRIBUTION_AND_PROOF: DomainType = [0x09, 0x00, 0x00, 0x00];
+pub const DOMAIN_BLS_TO_EXECUTION_CHANGE: DomainType = [0x0A, 0x00, 0x00, 0x00];
 pub const DOMAIN_APPLICATION_BUILDER: DomainType = [0x00, 0x00, 0x00, 0x01];
 
 #[cfg(test)]
@@ -67,6 +68,11 @@ mod tests {
     }
 
     #[test]
+    fn test_domain_bls_to_execution_change() {
+        assert_eq!(DOMAIN_BLS_TO_EXECUTION_CHANGE, [0x0A, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
     fn test_domain_application_builder() {
         assert_eq!(DOMAIN_APPLICATION_BUILDER, [0x00, 0x00, 0x00, 0x01]);
     }
@@ -84,6 +90,7 @@ mod tests {
             DOMAIN_SYNC_COMMITTEE,
             DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
             DOMAIN_CONTRIBUTION_AND_PROOF,
+            DOMAIN_BLS_TO_EXECUTION_CHANGE,
             DOMAIN_APPLICATION_BUILDER,
         ];
         for i in 0..domains.len() {
