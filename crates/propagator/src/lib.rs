@@ -56,6 +56,21 @@ impl PropagationResult {
     }
 }
 
+fn extract_attestation_context(attestations: &VersionedAttestation) -> (String, String, String) {
+    match attestations {
+        VersionedAttestation::PreElectra(atts) => match atts.first() {
+            Some(a) => (a.data.slot.clone(), a.data.target.epoch.clone(), a.data.index.clone()),
+            None => ("unknown".into(), "unknown".into(), "unknown".into()),
+        },
+        VersionedAttestation::Electra(atts) => match atts.first() {
+            Some(a) => {
+                (a.data.slot.clone(), a.data.target.epoch.clone(), a.committee_index.to_string())
+            }
+            None => ("unknown".into(), "unknown".into(), "unknown".into()),
+        },
+    }
+}
+
 /// Service responsible for propagating attestations to the beacon node.
 pub struct Propagator<S: AttestationSubmitter> {
     submitter: Arc<S>,
@@ -106,10 +121,16 @@ impl<S: AttestationSubmitter> Propagator<S> {
                     return Ok(PropagationResult { total, success_count: total, failure_count: 0 });
                 }
 
+                let (batch_slot, batch_target_epoch, batch_committee_index) =
+                    extract_attestation_context(attestations);
+
                 for failure in &failures {
                     warn!(
                         index = failure.index,
                         message = %failure.message,
+                        slot = %batch_slot,
+                        target_epoch = %batch_target_epoch,
+                        committee_index = %batch_committee_index,
                         "Attestation failed validation"
                     );
                 }

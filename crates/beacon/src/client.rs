@@ -632,10 +632,16 @@ impl BeaconClient {
                 tokio::time::sleep(backoff).await;
             }
 
-            let consensus_version = match attestations {
-                VersionedAttestation::PreElectra(_) => "phase0",
-                VersionedAttestation::Electra(_) => "electra",
+            let (consensus_version, attestation_count) = match attestations {
+                VersionedAttestation::PreElectra(atts) => ("phase0", atts.len()),
+                VersionedAttestation::Electra(atts) => ("electra", atts.len()),
             };
+
+            debug!(
+                consensus_version = consensus_version,
+                attestation_count = attestation_count,
+                "Submitting attestations to beacon node"
+            );
 
             let send_result = match attestations {
                 VersionedAttestation::PreElectra(atts) => {
@@ -665,6 +671,10 @@ impl BeaconClient {
 
                     if status.as_u16() == 400 {
                         let body = response.text().await.unwrap_or_default();
+                        warn!(
+                            response_body = %body,
+                            "Attestation submission returned 400"
+                        );
                         if let Ok(error_response) =
                             serde_json::from_str::<AttestationSubmissionError>(&body)
                         {
