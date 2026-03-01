@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
-use tracing::info;
+use tracing::{info, Instrument};
 use tree_hash::TreeHash;
 
 use crypto::PublicKey;
@@ -42,6 +42,16 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         Self { signer, beacon, validator_store, fork_schedule, genesis_validators_root }
     }
 
+    #[tracing::instrument(
+        name = "rvc.block.propose",
+        skip_all,
+        fields(
+            rvc.slot = slot,
+            rvc.block.blinded = tracing::field::Empty,
+            rvc.block.consensus_version = tracing::field::Empty,
+            rvc.block.value_wei = tracing::field::Empty,
+        )
+    )]
     pub async fn propose_block(
         &self,
         slot: Slot,
@@ -53,6 +63,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let randao_bytes = self
             .signer
             .sign_randao_reveal(epoch, pubkey, &self.fork_schedule, &self.genesis_validators_root)
+            .instrument(tracing::info_span!("rvc.sign.randao"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
         let randao_hex = format!("0x{}", hex::encode(&randao_bytes));
@@ -67,7 +78,16 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let response = self
             .beacon
             .produce_block_v3(slot, &randao_hex, graffiti_hex.as_deref(), Some(boost))
+            .instrument(tracing::info_span!("rvc.beacon.produce_block_v3"))
             .await?;
+
+        // Record dynamic attributes after block production
+        let span = tracing::Span::current();
+        span.record("rvc.block.blinded", response.is_blinded);
+        span.record("rvc.block.consensus_version", &response.consensus_version);
+        if let Some(ref value) = response.execution_payload_value {
+            span.record("rvc.block.value_wei", value.as_str());
+        }
 
         // 4. Sign and publish based on block type
         let (block_root, is_blinded) = if response.is_ssz {
@@ -128,11 +148,13 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 &self.fork_schedule,
                 &self.genesis_validators_root,
             )
+            .instrument(tracing::info_span!("rvc.sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
 
         self.beacon
             .publish_block_ssz(ssz_bytes, &response.consensus_version, response.is_blinded)
+            .instrument(tracing::info_span!("rvc.beacon.publish_block"))
             .await?;
 
         Ok((block_root, response.is_blinded))
@@ -157,11 +179,15 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 &self.fork_schedule,
                 &self.genesis_validators_root,
             )
+            .instrument(tracing::info_span!("rvc.sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
 
         let signed = eth_types::SignedBeaconBlock { message: block, signature: sig };
-        self.beacon.publish_block(&signed, &response.consensus_version).await?;
+        self.beacon
+            .publish_block(&signed, &response.consensus_version)
+            .instrument(tracing::info_span!("rvc.beacon.publish_block"))
+            .await?;
 
         Ok((block_root, false))
     }
@@ -184,11 +210,15 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 &self.fork_schedule,
                 &self.genesis_validators_root,
             )
+            .instrument(tracing::info_span!("rvc.sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
 
         let signed = eth_types::SignedBlindedBeaconBlock { message: block, signature: sig };
-        self.beacon.publish_blinded_block(&signed, &response.consensus_version).await?;
+        self.beacon
+            .publish_blinded_block(&signed, &response.consensus_version)
+            .instrument(tracing::info_span!("rvc.beacon.publish_block"))
+            .await?;
 
         Ok((block_root, true))
     }
