@@ -4577,7 +4577,9 @@ mod tests {
 
     // --- H-08: Orchestrator slot lifecycle span tests ---
 
+    use std::collections::HashMap as SpanMap;
     use std::sync::Mutex;
+    use tracing::span::Id;
     use tracing_subscriber::layer::SubscriberExt;
 
     /// A tracing layer that captures span names for test verification.
@@ -4594,6 +4596,57 @@ mod tests {
         ) {
             self.names.lock().unwrap().push(attrs.metadata().name().to_string());
         }
+    }
+
+    /// Recorded span entry with name and optional parent span ID.
+    #[derive(Debug, Clone)]
+    struct SpanEntry {
+        name: String,
+        parent_id: Option<Id>,
+    }
+
+    /// A tracing layer that captures span names and parent-child relationships.
+    struct HierarchyCapture {
+        spans: Arc<Mutex<SpanMap<u64, SpanEntry>>>,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for HierarchyCapture
+    where
+        S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &Id,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let parent_id = attrs.parent().cloned().or_else(|| ctx.current_span().id().cloned());
+            self.spans.lock().unwrap().insert(
+                id.into_u64(),
+                SpanEntry { name: attrs.metadata().name().to_string(), parent_id },
+            );
+        }
+    }
+
+    impl HierarchyCapture {
+        fn new() -> (Self, Arc<Mutex<SpanMap<u64, SpanEntry>>>) {
+            let spans = Arc::new(Mutex::new(SpanMap::new()));
+            (Self { spans: spans.clone() }, spans)
+        }
+    }
+
+    /// Returns the parent span name for a given child span name, if both exist.
+    fn find_parent_name(spans: &SpanMap<u64, SpanEntry>, child_name: &str) -> Option<String> {
+        for entry in spans.values() {
+            if entry.name == child_name {
+                if let Some(ref parent_id) = entry.parent_id {
+                    if let Some(parent) = spans.get(&parent_id.into_u64()) {
+                        return Some(parent.name.clone());
+                    }
+                }
+            }
+        }
+        None
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4766,5 +4819,207 @@ mod tests {
     fn test_truncate_pubkey_empty() {
         let result = truncate_pubkey("");
         assert_eq!(result, "0x");
+    }
+
+    // --- H-14: End-to-end span hierarchy integration tests ---
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_phase_spans_are_children_of_slot_process() {
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(65); // non-boundary slot
+        clock.advance_time(9);
+
+        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+
+        let (mut orchestrator, handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            HashMap::new(),
+        );
+
+        let (layer, spans) = HierarchyCapture::new();
+        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            handle.shutdown();
+        });
+
+        let _ = orchestrator.run().await;
+
+        let span_map = spans.lock().unwrap();
+
+        // Verify phase spans are children of rvc.slot.process
+        let block_parent = find_parent_name(&span_map, "rvc.slot.phase.block");
+        assert_eq!(
+            block_parent.as_deref(),
+            Some("rvc.slot.process"),
+            "rvc.slot.phase.block should be child of rvc.slot.process"
+        );
+
+        let att_parent = find_parent_name(&span_map, "rvc.slot.phase.attestation");
+        assert_eq!(
+            att_parent.as_deref(),
+            Some("rvc.slot.process"),
+            "rvc.slot.phase.attestation should be child of rvc.slot.process"
+        );
+
+        let agg_parent = find_parent_name(&span_map, "rvc.slot.phase.aggregation");
+        assert_eq!(
+            agg_parent.as_deref(),
+            Some("rvc.slot.process"),
+            "rvc.slot.phase.aggregation should be child of rvc.slot.process"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_epoch_boundary_span_is_child_of_slot_process() {
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(32); // epoch boundary
+        clock.advance_time(9);
+
+        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+
+        let (mut orchestrator, handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            HashMap::new(),
+        );
+
+        let (layer, spans) = HierarchyCapture::new();
+        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            handle.shutdown();
+        });
+
+        let _ = orchestrator.run().await;
+
+        let span_map = spans.lock().unwrap();
+
+        let epoch_parent = find_parent_name(&span_map, "rvc.epoch.boundary");
+        assert_eq!(
+            epoch_parent.as_deref(),
+            Some("rvc.slot.process"),
+            "rvc.epoch.boundary should be child of rvc.slot.process"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_signer_span_created_on_sign_attestation() {
+        use crypto::SecretKey;
+        use eth_types::{AttestationData, Checkpoint, Fork};
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+
+        let mut manager = KeyManager::new();
+        manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = SignerService::new(composite, slashing_db);
+
+        let attestation_data = AttestationData {
+            slot: 1000,
+            index: 5,
+            beacon_block_root: [0x11; 32],
+            source: Checkpoint { epoch: 100, root: [0x22; 32] },
+            target: Checkpoint { epoch: 101, root: [0x33; 32] },
+        };
+        let fork =
+            Fork { previous_version: [0, 0, 0, 1], current_version: [0, 0, 0, 2], epoch: 50 };
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let layer = SpanCapture { names: captured.clone() };
+        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let result = signer.sign_attestation(&attestation_data, &pubkey, &fork, [0xaa; 32]).await;
+        assert!(result.is_ok());
+
+        let span_names = captured.lock().unwrap();
+        assert!(
+            span_names.contains(&"rvc.sign.attestation".to_string()),
+            "Expected rvc.sign.attestation span, got: {:?}",
+            *span_names
+        );
+        assert!(
+            span_names.contains(&"rvc.slashing.check".to_string()),
+            "Expected rvc.slashing.check span within sign_attestation, got: {:?}",
+            *span_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_beacon_http_span_created() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "version": "mock/v1.0.0" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = BeaconClientConfig::new(&mock_server.uri());
+        let beacon = BeaconClient::new(beacon_config).unwrap();
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let layer = SpanCapture { names: captured.clone() };
+        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let _ = beacon.get_node_version().await;
+
+        let span_names = captured.lock().unwrap();
+        assert!(
+            span_names.contains(&"rvc.beacon.http".to_string()),
+            "Expected rvc.beacon.http span, got: {:?}",
+            *span_names
+        );
     }
 }
