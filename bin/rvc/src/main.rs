@@ -11,7 +11,7 @@ use bn_manager::BeaconNodeClient;
 use clap::{Parser, Subcommand};
 use crypto::PublicKey;
 use metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
-use rvc::config::{CliOverrides, Config, Network, ServiceBuilder};
+use rvc::config::{redact_url, CliOverrides, Config, Network, ServiceBuilder};
 use rvc::duty_tracker::DutyTrackerService;
 use rvc::keymanager_adapters::{
     DoppelgangerMonitorAdapter, KeystoreManagerAdapter, RemoteKeyManagerAdapter,
@@ -375,9 +375,11 @@ async fn run_validator(
     strict_slashing_semantics: bool,
     timeouts: bn_manager::OperationTimeouts,
 ) -> anyhow::Result<()> {
+    let redacted_nodes: Vec<String> =
+        config.effective_beacon_nodes().iter().map(|u| redact_url(u)).collect();
     info!(
-        beacon_url = %config.beacon_url,
-        beacon_nodes = ?config.effective_beacon_nodes(),
+        beacon_url = %redact_url(&config.beacon_url),
+        beacon_nodes = ?redacted_nodes,
         network = %config.network,
         metrics_address = %config.metrics_address,
         metrics_port = config.metrics_port,

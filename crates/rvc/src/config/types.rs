@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
+use url::Url;
+
 use super::error::ConfigError;
 use super::network::Network;
 
@@ -309,6 +311,23 @@ impl Config {
         if let Some(n) = cli.key_decrypt_threads {
             self.key_decrypt_threads = Some(n);
         }
+    }
+}
+
+/// Redacts credentials from a URL for safe logging.
+///
+/// If the URL contains a username, both the username and password are replaced
+/// with `***`. Unparseable URLs are returned as-is.
+pub fn redact_url(raw: &str) -> String {
+    match Url::parse(raw) {
+        Ok(mut parsed) => {
+            if !parsed.username().is_empty() {
+                let _ = parsed.set_username("***");
+                let _ = parsed.set_password(Some("***"));
+            }
+            parsed.to_string()
+        }
+        Err(_) => raw.to_string(),
     }
 }
 
@@ -790,6 +809,44 @@ key_decrypt_threads = 4
 
         let config = Config::from_file(file.path()).unwrap();
         assert_eq!(config.key_decrypt_threads, Some(4));
+    }
+
+    // -- redact_url tests --
+
+    #[test]
+    fn test_redact_url_with_credentials() {
+        let result = redact_url("http://user:pass@host:5052");
+        assert_eq!(result, "http://***:***@host:5052/");
+    }
+
+    #[test]
+    fn test_redact_url_with_username_only() {
+        let result = redact_url("http://user@host:5052");
+        assert_eq!(result, "http://***:***@host:5052/");
+    }
+
+    #[test]
+    fn test_redact_url_without_credentials() {
+        let result = redact_url("http://host:5052");
+        assert_eq!(result, "http://host:5052/");
+    }
+
+    #[test]
+    fn test_redact_url_https_without_credentials() {
+        let result = redact_url("https://beacon.example.com:5052/eth/v1");
+        assert_eq!(result, "https://beacon.example.com:5052/eth/v1");
+    }
+
+    #[test]
+    fn test_redact_url_invalid_input() {
+        let result = redact_url("not-a-url");
+        assert_eq!(result, "not-a-url");
+    }
+
+    #[test]
+    fn test_redact_url_empty_input() {
+        let result = redact_url("");
+        assert_eq!(result, "");
     }
 
     #[test]
