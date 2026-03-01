@@ -1385,6 +1385,18 @@ where
 
         let beacon_attestation_data = attestation_data_response.data;
 
+        debug!(
+            validator = %validator_index,
+            slot = %beacon_attestation_data.slot,
+            index = %beacon_attestation_data.index,
+            beacon_block_root = %beacon_attestation_data.beacon_block_root,
+            source_epoch = %beacon_attestation_data.source.epoch,
+            source_root = %beacon_attestation_data.source.root,
+            target_epoch = %beacon_attestation_data.target.epoch,
+            target_root = %beacon_attestation_data.target.root,
+            "Attestation data fetched from BN"
+        );
+
         let mut crypto_attestation_data =
             match Self::convert_attestation_data(&beacon_attestation_data) {
                 Ok(data) => data,
@@ -1399,14 +1411,42 @@ where
             };
 
         let target_epoch = crypto_attestation_data.target.epoch;
+
+        debug!(
+            validator = %validator_index,
+            slot = crypto_attestation_data.slot,
+            index = crypto_attestation_data.index,
+            target_epoch = target_epoch,
+            source_epoch = crypto_attestation_data.source.epoch,
+            "Converted attestation data"
+        );
+
         let fork = self.derive_fork_for_epoch(target_epoch);
         let fork_name = ForkName::from_epoch(target_epoch, &self.config.fork_schedule);
         let is_electra = fork_name >= ForkName::Electra;
 
+        debug!(
+            validator = %validator_index,
+            fork_name = ?fork_name,
+            is_electra = is_electra,
+            previous_version = %format!("0x{}", hex::encode(fork.previous_version)),
+            current_version = %format!("0x{}", hex::encode(fork.current_version)),
+            fork_epoch = fork.epoch,
+            target_epoch = target_epoch,
+            "Fork derived for attestation"
+        );
+
         // EIP-7549: For Electra, set data.index = 0 BEFORE signing because
         // the index field is part of the signed AttestationData.
         if is_electra {
+            let original_index = crypto_attestation_data.index;
             crypto_attestation_data.index = 0;
+            debug!(
+                validator = %validator_index,
+                original_index = original_index,
+                zeroed_index = 0u64,
+                "EIP-7549: zeroed attestation data index for Electra signing"
+            );
         }
 
         let signature = match self
@@ -1419,7 +1459,15 @@ where
             )
             .await
         {
-            Ok(sig) => sig,
+            Ok(sig) => {
+                let sig_bytes = sig.to_bytes();
+                debug!(
+                    validator = %validator_index,
+                    signature_prefix = %format!("0x{}", hex::encode(&sig_bytes[..8])),
+                    "Attestation signed successfully"
+                );
+                sig
+            }
             Err(e) => {
                 return AttestationResult {
                     validator_index,
@@ -1461,6 +1509,16 @@ where
                 signature: sig_hex,
             }])
         };
+
+        let versioned_type = match &versioned {
+            VersionedAttestation::Electra(_) => "Electra",
+            VersionedAttestation::PreElectra(_) => "PreElectra",
+        };
+        debug!(
+            validator = %validator_index,
+            versioned_type = versioned_type,
+            "Propagating attestation"
+        );
 
         match tokio::time::timeout(
             self.config.timeouts.attestation_submit,
