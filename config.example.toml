@@ -108,3 +108,7 @@ log_level = "info"
 # Head-based sampling ratio 0.0–1.0 (default: 0.01 = 1%).
 # Env var fallback: OTEL_TRACES_SAMPLER_ARG (only if this field is at default)
 # tracing_sample_rate = 0.01
+
+# GCP Cloud Trace: set tracing_exporter = "gcp" (requires --features gcp-trace).
+# Uses Application Default Credentials (ADC) — no endpoint needed.
+# On shutdown, pending spans are flushed with a 5-second timeout.
