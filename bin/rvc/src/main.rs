@@ -642,7 +642,7 @@ async fn run_validator(
             .unwrap_or_else(|| std::path::PathBuf::from("./keymanager-api-token.txt"));
         let token = match keymanager_api::auth::ensure_token(&token_path) {
             Ok(t) => {
-                keymanager_api::auth::warn_if_world_readable(&token_path);
+                keymanager_api::auth::warn_if_insecure_permissions(&token_path);
                 t
             }
             Err(e) => {
