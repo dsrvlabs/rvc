@@ -126,6 +126,10 @@ enum Commands {
         #[arg(long)]
         remote_signer_url: Option<String>,
 
+        /// Comma-separated list of allowed remote signer hostnames
+        #[arg(long)]
+        remote_signer_allowed_hosts: Option<String>,
+
         /// Exit on unsafe slashing DB file permissions (world-readable/writable)
         #[arg(long)]
         strict_permissions: bool,
@@ -226,6 +230,7 @@ async fn main() -> anyhow::Result<()> {
             keymanager_address,
             keymanager_token_file,
             remote_signer_url,
+            remote_signer_allowed_hosts,
             strict_permissions,
             strict_slashing_semantics,
             block_production_timeout,
@@ -295,6 +300,7 @@ async fn main() -> anyhow::Result<()> {
                 keymanager_address,
                 keymanager_token_file,
                 remote_signer_url,
+                remote_signer_allowed_hosts,
                 key_decrypt_threads,
             };
 
@@ -677,7 +683,10 @@ async fn run_validator(
         let validator_mgr =
             std::sync::Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
         let doppelganger_mon = std::sync::Arc::new(DoppelgangerMonitorAdapter::new());
-        let remote_key_mgr = std::sync::Arc::new(RemoteKeyManagerAdapter::new(km_composite));
+        let remote_key_mgr = std::sync::Arc::new(RemoteKeyManagerAdapter::new(
+            km_composite,
+            config.remote_signer_allowed_hosts.clone(),
+        ));
 
         let km_server = keymanager_api::KeymanagerServer::new(
             keystore_mgr,

@@ -59,6 +59,9 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_signer_url: Option<String>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_signer_allowed_hosts: Option<Vec<String>>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_decrypt_threads: Option<usize>,
 }
@@ -85,6 +88,7 @@ impl Default for Config {
             keymanager_address: None,
             keymanager_token_file: None,
             remote_signer_url: None,
+            remote_signer_allowed_hosts: None,
             key_decrypt_threads: None,
         }
     }
@@ -291,6 +295,17 @@ impl Config {
             self.remote_signer_url = Some(remote_signer_url.clone());
         }
 
+        if let Some(ref hosts_csv) = cli.remote_signer_allowed_hosts {
+            let hosts: Vec<String> = hosts_csv
+                .split(',')
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+                .collect();
+            if !hosts.is_empty() {
+                self.remote_signer_allowed_hosts = Some(hosts);
+            }
+        }
+
         if let Some(n) = cli.key_decrypt_threads {
             self.key_decrypt_threads = Some(n);
         }
@@ -318,6 +333,7 @@ pub struct CliOverrides {
     pub keymanager_address: Option<String>,
     pub keymanager_token_file: Option<PathBuf>,
     pub remote_signer_url: Option<String>,
+    pub remote_signer_allowed_hosts: Option<String>,
     pub key_decrypt_threads: Option<usize>,
 }
 
@@ -793,5 +809,72 @@ log_level = "info"
 
         let config = Config::from_file(file.path()).unwrap();
         assert!(config.key_decrypt_threads.is_none());
+    }
+
+    // -- remote_signer_allowed_hosts tests --
+
+    #[test]
+    fn test_default_config_remote_signer_allowed_hosts_none() {
+        let config = Config::default();
+        assert!(config.remote_signer_allowed_hosts.is_none());
+    }
+
+    #[test]
+    fn test_merge_with_cli_remote_signer_allowed_hosts() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            remote_signer_allowed_hosts: Some("host1.com,host2.com".to_string()),
+            ..Default::default()
+        };
+        config.merge_with_cli(&cli);
+        assert_eq!(
+            config.remote_signer_allowed_hosts,
+            Some(vec!["host1.com".to_string(), "host2.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_merge_with_cli_remote_signer_allowed_hosts_with_spaces() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            remote_signer_allowed_hosts: Some(" host1.com , host2.com ".to_string()),
+            ..Default::default()
+        };
+        config.merge_with_cli(&cli);
+        assert_eq!(
+            config.remote_signer_allowed_hosts,
+            Some(vec!["host1.com".to_string(), "host2.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_merge_with_cli_remote_signer_allowed_hosts_none_preserves_default() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+        config.merge_with_cli(&cli);
+        assert!(config.remote_signer_allowed_hosts.is_none());
+    }
+
+    #[test]
+    fn test_config_from_file_with_remote_signer_allowed_hosts() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+remote_signer_allowed_hosts = ["signer1.com", "signer2.com"]
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(
+            config.remote_signer_allowed_hosts,
+            Some(vec!["signer1.com".to_string(), "signer2.com".to_string()])
+        );
     }
 }

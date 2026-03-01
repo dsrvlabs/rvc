@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crypto::{CompositeSigner, Keystore, RemoteSigner, RemoteSignerConfig};
@@ -208,11 +209,18 @@ impl DoppelgangerMonitor for DoppelgangerMonitorAdapter {
 pub struct RemoteKeyManagerAdapter {
     composite_signer: Arc<CompositeSigner>,
     tracked_keys: Mutex<Vec<(Pubkey, String)>>,
+    allowed_hosts: Option<Vec<String>>,
+    warned_no_allowlist: AtomicBool,
 }
 
 impl RemoteKeyManagerAdapter {
-    pub fn new(composite_signer: Arc<CompositeSigner>) -> Self {
-        Self { composite_signer, tracked_keys: Mutex::new(Vec::new()) }
+    pub fn new(composite_signer: Arc<CompositeSigner>, allowed_hosts: Option<Vec<String>>) -> Self {
+        Self {
+            composite_signer,
+            tracked_keys: Mutex::new(Vec::new()),
+            allowed_hosts,
+            warned_no_allowlist: AtomicBool::new(false),
+        }
     }
 }
 
@@ -230,12 +238,31 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
     }
 
     fn import_remote_key(&self, pubkey: Pubkey, url: String) -> Result<(), ImportRemoteKeyError> {
-        // Validate URL scheme to prevent SSRF
-        if !url.starts_with("https://") && !url.starts_with("http://") {
-            return Err(ImportRemoteKeyError::Other(format!(
-                "invalid URL scheme: must be http:// or https://, got: {}",
-                url
-            )));
+        let parsed = url::Url::parse(&url)
+            .map_err(|e| ImportRemoteKeyError::Other(format!("invalid remote signer URL: {e}")))?;
+
+        match parsed.scheme() {
+            "http" | "https" => {}
+            scheme => {
+                return Err(ImportRemoteKeyError::Other(format!(
+                    "invalid URL scheme: must be http:// or https://, got: {scheme}://"
+                )));
+            }
+        }
+
+        if let Some(ref allowed) = self.allowed_hosts {
+            let host = parsed.host_str().unwrap_or("");
+            if !allowed.iter().any(|h| h == host) {
+                return Err(ImportRemoteKeyError::Other(format!(
+                    "remote signer host '{}' is not in the allowed hosts list",
+                    host
+                )));
+            }
+        } else if !self.warned_no_allowlist.swap(true, Ordering::Relaxed) {
+            warn!(
+                "No remote signer host allowlist configured; all HTTP/HTTPS hosts are accepted. \
+                 Consider setting --remote-signer-allowed-hosts for production use"
+            );
         }
 
         let mut keys = self.tracked_keys.lock().expect("tracked_keys lock poisoned");
@@ -397,20 +424,20 @@ mod tests {
 
     #[test]
     fn test_remote_key_adapter_empty_list() {
-        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer());
+        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer(), None);
         assert!(adapter.list_remote_keys().is_empty());
     }
 
     #[test]
     fn test_remote_key_adapter_has_key_false() {
-        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer());
+        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer(), None);
         assert!(!adapter.has_remote_key(&test_pubkey(1)));
     }
 
     #[test]
     fn test_remote_key_adapter_import_and_list() {
         let composite = create_empty_composite_signer();
-        let adapter = RemoteKeyManagerAdapter::new(composite.clone());
+        let adapter = RemoteKeyManagerAdapter::new(composite.clone(), None);
 
         let pk = test_pubkey(1);
         let url = "https://signer.example.com".to_string();
@@ -427,7 +454,7 @@ mod tests {
 
     #[test]
     fn test_remote_key_adapter_import_duplicate() {
-        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer());
+        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer(), None);
         let pk = test_pubkey(1);
         adapter.import_remote_key(pk, "https://signer.example.com".to_string()).unwrap();
         let result = adapter.import_remote_key(pk, "https://signer.example.com".to_string());
@@ -437,7 +464,7 @@ mod tests {
     #[test]
     fn test_remote_key_adapter_delete() {
         let composite = create_empty_composite_signer();
-        let adapter = RemoteKeyManagerAdapter::new(composite.clone());
+        let adapter = RemoteKeyManagerAdapter::new(composite.clone(), None);
 
         let pk = test_pubkey(1);
         adapter.import_remote_key(pk, "https://signer.example.com".to_string()).unwrap();
@@ -451,13 +478,13 @@ mod tests {
 
     #[test]
     fn test_remote_key_adapter_delete_nonexistent() {
-        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer());
+        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer(), None);
         assert!(!adapter.delete_remote_key(&test_pubkey(99)).unwrap());
     }
 
     #[test]
     fn test_remote_key_adapter_import_rejects_invalid_url_scheme() {
-        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer());
+        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer(), None);
         let pk = test_pubkey(1);
 
         // file:// scheme — SSRF risk
@@ -518,7 +545,7 @@ mod tests {
         ));
         let validator_mgr = Arc::new(ValidatorManagerAdapter::new(validator_store));
         let doppelganger_mon = Arc::new(DoppelgangerMonitorAdapter::new());
-        let remote_key_mgr = Arc::new(RemoteKeyManagerAdapter::new(composite));
+        let remote_key_mgr = Arc::new(RemoteKeyManagerAdapter::new(composite, None));
 
         let token = "deadbeef".repeat(8);
         let addr = "127.0.0.1:0".parse().unwrap();
@@ -625,7 +652,7 @@ mod tests {
         ));
         let validator_mgr = Arc::new(ValidatorManagerAdapter::new(validator_store));
         let doppelganger_mon = Arc::new(DoppelgangerMonitorAdapter::new());
-        let remote_key_mgr = Arc::new(RemoteKeyManagerAdapter::new(composite.clone()));
+        let remote_key_mgr = Arc::new(RemoteKeyManagerAdapter::new(composite.clone(), None));
 
         let token = "deadbeef".repeat(8);
         let addr = "127.0.0.1:0".parse().unwrap();
@@ -713,5 +740,79 @@ mod tests {
 
         // 5. Verify composite signer no longer has the key
         assert!(!composite.public_keys().contains(&pk));
+    }
+
+    // --- Remote signer host allowlist tests ---
+
+    #[test]
+    fn test_import_remote_key_allowed_host_accepted() {
+        let adapter = RemoteKeyManagerAdapter::new(
+            create_empty_composite_signer(),
+            Some(vec!["signer.example.com".to_string()]),
+        );
+        let pk = test_pubkey(1);
+        let result = adapter.import_remote_key(pk, "https://signer.example.com/api".to_string());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_import_remote_key_blocked_host_rejected() {
+        let adapter = RemoteKeyManagerAdapter::new(
+            create_empty_composite_signer(),
+            Some(vec!["trusted.host".to_string()]),
+        );
+        let pk = test_pubkey(1);
+        let result = adapter.import_remote_key(pk, "https://evil.attacker.com/api".to_string());
+        assert!(
+            matches!(result, Err(ImportRemoteKeyError::Other(ref msg)) if msg.contains("not in the allowed hosts list"))
+        );
+    }
+
+    #[test]
+    fn test_import_remote_key_no_allowlist_allows_all() {
+        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer(), None);
+        let pk = test_pubkey(1);
+        let result = adapter.import_remote_key(pk, "https://any.host.com".to_string());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_import_remote_key_allowlist_multiple_hosts() {
+        let adapter = RemoteKeyManagerAdapter::new(
+            create_empty_composite_signer(),
+            Some(vec!["signer1.example.com".to_string(), "signer2.example.com".to_string()]),
+        );
+        let pk1 = test_pubkey(1);
+        assert!(adapter.import_remote_key(pk1, "https://signer1.example.com".to_string()).is_ok());
+
+        let pk2 = test_pubkey(2);
+        assert!(adapter.import_remote_key(pk2, "https://signer2.example.com".to_string()).is_ok());
+
+        let pk3 = test_pubkey(3);
+        let result = adapter.import_remote_key(pk3, "https://signer3.example.com".to_string());
+        assert!(matches!(result, Err(ImportRemoteKeyError::Other(_))));
+    }
+
+    #[test]
+    fn test_import_remote_key_invalid_url_parse_error() {
+        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer(), None);
+        let pk = test_pubkey(1);
+        let result = adapter.import_remote_key(pk, "not a valid url".to_string());
+        assert!(
+            matches!(result, Err(ImportRemoteKeyError::Other(ref msg)) if msg.contains("invalid remote signer URL"))
+        );
+    }
+
+    #[test]
+    fn test_import_remote_key_allowlist_with_port() {
+        let adapter = RemoteKeyManagerAdapter::new(
+            create_empty_composite_signer(),
+            Some(vec!["signer.example.com".to_string()]),
+        );
+        let pk = test_pubkey(1);
+        // host_str() returns the host without port
+        let result =
+            adapter.import_remote_key(pk, "https://signer.example.com:9000/api".to_string());
+        assert!(result.is_ok());
     }
 }
