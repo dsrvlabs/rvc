@@ -4,6 +4,7 @@
 
 mod commands;
 
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
 use bn_manager::BeaconNodeClient;
@@ -24,6 +25,7 @@ use tracing::{error, info, warn};
 
 const DEFAULT_GRPC_ADDRESS: &str = "127.0.0.1";
 const DEFAULT_GRPC_PORT: u16 = 50051;
+const DEFAULT_METRICS_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_METRICS_PORT: u16 = 8080;
 
 #[derive(Parser)]
@@ -63,6 +65,10 @@ enum Commands {
         /// Path to the slashing protection database
         #[arg(long)]
         slashing_db_path: Option<PathBuf>,
+
+        /// Bind address for the metrics HTTP server (default: 127.0.0.1)
+        #[arg(long, default_value_t = DEFAULT_METRICS_ADDRESS)]
+        metrics_address: IpAddr,
 
         /// Port for the metrics HTTP server
         #[arg(long, default_value_t = DEFAULT_METRICS_PORT)]
@@ -205,6 +211,7 @@ async fn main() -> anyhow::Result<()> {
             keystore_path,
             password_file,
             slashing_db_path,
+            metrics_address,
             metrics_port,
             grpc_port,
             grpc_address,
@@ -268,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
                 keystore_path,
                 password_file,
                 slashing_db_path,
+                metrics_address: Some(metrics_address),
                 metrics_port: Some(metrics_port),
                 grpc_port: Some(grpc_port),
                 grpc_address: Some(grpc_address),
@@ -365,6 +373,7 @@ async fn run_validator(
         beacon_url = %config.beacon_url,
         beacon_nodes = ?config.effective_beacon_nodes(),
         network = %config.network,
+        metrics_address = %config.metrics_address,
         metrics_port = config.metrics_port,
         grpc_address = %config.grpc_address,
         grpc_port = config.grpc_port,
@@ -376,6 +385,7 @@ async fn run_validator(
     let health_status = new_health_status();
 
     let grpc_port = config.grpc_port;
+    let metrics_address = config.metrics_address;
     let metrics_port = config.metrics_port;
     let doppelganger_enabled = config.doppelganger_detection;
 
@@ -714,9 +724,19 @@ async fn run_validator(
             shutdown_signal().await;
         });
 
-    info!(port = metrics_port, "Starting metrics server");
-    let metrics_handle =
-        tokio::spawn(serve_metrics_with_health(metrics_port, health_status.clone()));
+    if !metrics_address.is_loopback() {
+        warn!(
+            addr = %metrics_address,
+            "Metrics server is bound to a non-loopback address; this exposes metrics over the network"
+        );
+    }
+
+    info!(addr = %metrics_address, port = metrics_port, "Starting metrics server");
+    let metrics_handle = tokio::spawn(serve_metrics_with_health(
+        metrics_address,
+        metrics_port,
+        health_status.clone(),
+    ));
 
     info!("Starting duty orchestrator");
 

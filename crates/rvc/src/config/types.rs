@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 use secrecy::SecretString;
@@ -23,6 +24,8 @@ pub struct Config {
     pub password_file: Option<PathBuf>,
 
     pub slashing_db_path: PathBuf,
+
+    pub metrics_address: IpAddr,
 
     pub metrics_port: u16,
 
@@ -68,6 +71,7 @@ impl Default for Config {
             keystore_path: PathBuf::from("./keystores"),
             password_file: None,
             slashing_db_path: PathBuf::from("./slashing_protection.sqlite"),
+            metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             metrics_port: 8080,
             grpc_port: 50051,
             grpc_address: "127.0.0.1".to_string(),
@@ -231,6 +235,10 @@ impl Config {
             self.slashing_db_path = slashing_db_path.clone();
         }
 
+        if let Some(metrics_address) = cli.metrics_address {
+            self.metrics_address = metrics_address;
+        }
+
         if let Some(metrics_port) = cli.metrics_port {
             self.metrics_port = metrics_port;
         }
@@ -296,6 +304,7 @@ pub struct CliOverrides {
     pub keystore_path: Option<PathBuf>,
     pub password_file: Option<PathBuf>,
     pub slashing_db_path: Option<PathBuf>,
+    pub metrics_address: Option<IpAddr>,
     pub metrics_port: Option<u16>,
     pub grpc_port: Option<u16>,
     pub grpc_address: Option<String>,
@@ -324,11 +333,35 @@ mod tests {
         assert_eq!(config.beacon_url, "http://localhost:5052");
         assert_eq!(config.keystore_path, PathBuf::from("./keystores"));
         assert_eq!(config.metrics_port, 8080);
+        assert_eq!(config.metrics_address, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         assert_eq!(config.grpc_port, 50051);
         assert_eq!(config.grpc_address, "127.0.0.1");
         assert_eq!(config.network, Network::Mainnet);
         assert!(config.genesis_time.is_none());
         assert!(config.genesis_validators_root.is_none());
+    }
+
+    #[test]
+    fn test_merge_with_cli_metrics_address() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            metrics_address: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            ..Default::default()
+        };
+
+        config.merge_with_cli(&cli);
+
+        assert_eq!(config.metrics_address, std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn test_merge_with_cli_metrics_address_none_preserves_default() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+
+        config.merge_with_cli(&cli);
+
+        assert_eq!(config.metrics_address, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     }
 
     #[test]
