@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use zeroize::Zeroizing;
 
 use crypto::{compute_domain, compute_signing_root, eip2333, mnemonic};
 use eth_types::{BLSToExecutionChange, SignedBLSToExecutionChange, DOMAIN_BLS_TO_EXECUTION_CHANGE};
@@ -23,8 +24,10 @@ pub fn run(args: BlsToExecutionArgs) -> Result<()> {
 
     let execution_address = password::validate_address(&args.execution_address)?;
 
-    let mnemonic_phrase = rpassword::prompt_password_stderr("Enter your mnemonic: ")
-        .context("Failed to read mnemonic")?;
+    let mnemonic_phrase = Zeroizing::new(
+        rpassword::prompt_password_stderr("Enter your mnemonic: ")
+            .context("Failed to read mnemonic")?,
+    );
 
     let mnemonic =
         mnemonic::validate_mnemonic(mnemonic_phrase.trim()).context("Invalid mnemonic phrase")?;
