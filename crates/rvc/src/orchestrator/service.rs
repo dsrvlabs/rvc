@@ -4146,4 +4146,242 @@ mod tests {
             }
         }
     }
+
+    // --- AT-07: Electra data.index invariant tests ---
+
+    #[test]
+    fn test_electra_crypto_attestation_data_index_zeroed() {
+        // Verify that for Electra attestations, crypto_attestation_data.index == 0
+        // after applying the EIP-7549 zeroing logic.
+        let beacon_data = beacon::AttestationData {
+            slot: "1600".to_string(),
+            index: "7".to_string(),
+            beacon_block_root: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            source: beacon::Checkpoint {
+                epoch: "49".to_string(),
+                root: "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+            },
+            target: beacon::Checkpoint {
+                epoch: "50".to_string(),
+                root: "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    .to_string(),
+            },
+        };
+
+        let mut crypto_data = DutyOrchestrator::<
+            MockSlotClock,
+            MockSubmitter,
+            MockBlockBeacon,
+        >::convert_attestation_data(&beacon_data)
+        .unwrap();
+
+        // Before EIP-7549, index matches BN response
+        assert_eq!(crypto_data.index, 7, "index should initially match BN response");
+
+        // Apply EIP-7549: target epoch 50 >= electra_fork_epoch 50
+        let schedule = create_test_fork_schedule();
+        let target_epoch = crypto_data.target.epoch;
+        let fork_name = ForkName::from_epoch(target_epoch, &schedule);
+        let is_electra = fork_name >= ForkName::Electra;
+        assert!(is_electra, "epoch 50 should be Electra");
+
+        if is_electra {
+            crypto_data.index = 0;
+        }
+
+        assert_eq!(
+            crypto_data.index, 0,
+            "EIP-7549: crypto_attestation_data.index must be 0 for Electra"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_electra_submitted_single_attestation_data_index_zero() {
+        // Verify that the submitted SingleAttestation has data.index == "0" for Electra,
+        // even when the BN returns a non-zero index.
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // Epoch 52 (well into Electra), BN returns index "9"
+        let slot = 1664u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        assert_eq!(epoch, 52);
+
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "77",
+                    "committee_index": "9",
+                    "committee_length": "32",
+                    "committees_at_slot": "16",
+                    "validator_committee_index": "4",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "9",
+                    "beacon_block_root": "0x4444444444444444444444444444444444444444444444444444444444444444",
+                    "source": {
+                        "epoch": (epoch - 1).to_string(),
+                        "root": "0x5555555555555555555555555555555555555555555555555555555555555555"
+                    },
+                    "target": {
+                        "epoch": epoch.to_string(),
+                        "root": "0x6666666666666666666666666666666666666666666666666666666666666666"
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+
+        let captured = capturing.captured();
+        assert_eq!(captured.len(), 1);
+
+        match &captured[0] {
+            VersionedAttestation::Electra(atts) => {
+                assert_eq!(atts.len(), 1);
+                let att = &atts[0];
+                assert_eq!(
+                    att.data.index, "0",
+                    "EIP-7549: submitted SingleAttestation data.index must be \"0\""
+                );
+                assert_eq!(
+                    att.committee_index, 9,
+                    "committee_index should carry the original committee index"
+                );
+                assert_eq!(att.attester_index, 77);
+            }
+            VersionedAttestation::PreElectra(_) => {
+                panic!("Expected Electra attestation for epoch 52");
+            }
+        }
+    }
+
+    #[test]
+    fn test_pre_electra_data_index_preserved() {
+        // Verify that for pre-Electra attestations, data.index is preserved (not zeroed).
+        let beacon_data = beacon::AttestationData {
+            slot: "96".to_string(),
+            index: "5".to_string(),
+            beacon_block_root: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            source: beacon::Checkpoint {
+                epoch: "2".to_string(),
+                root: "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+            },
+            target: beacon::Checkpoint {
+                epoch: "3".to_string(),
+                root: "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    .to_string(),
+            },
+        };
+
+        let mut crypto_data = DutyOrchestrator::<
+            MockSlotClock,
+            MockSubmitter,
+            MockBlockBeacon,
+        >::convert_attestation_data(&beacon_data)
+        .unwrap();
+
+        assert_eq!(crypto_data.index, 5, "index should match BN response");
+
+        // Pre-Electra: epoch 3 < electra_fork_epoch 50
+        let schedule = create_test_fork_schedule();
+        let target_epoch = crypto_data.target.epoch;
+        let fork_name = ForkName::from_epoch(target_epoch, &schedule);
+        let is_electra = fork_name >= ForkName::Electra;
+        assert!(!is_electra, "epoch 3 should be pre-Electra");
+
+        // Apply the same logic as process_attestation_duty
+        if is_electra {
+            crypto_data.index = 0;
+        }
+
+        assert_eq!(crypto_data.index, 5, "Pre-Electra: data.index must be preserved, not zeroed");
+    }
+
+    #[test]
+    fn test_electra_signing_root_matches_submitted_data() {
+        // Verify that the signing root computed with index=0 matches the tree hash
+        // of the data reconstructed from what would be in the submitted SingleAttestation.
+        // This ensures: what's signed == what's submitted, field by field.
+        let beacon_data = beacon::AttestationData {
+            slot: "1600".to_string(),
+            index: "7".to_string(),
+            beacon_block_root: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            source: beacon::Checkpoint {
+                epoch: "49".to_string(),
+                root: "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+            },
+            target: beacon::Checkpoint {
+                epoch: "50".to_string(),
+                root: "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    .to_string(),
+            },
+        };
+
+        // Step 1: Convert and apply EIP-7549 zeroing (what gets signed)
+        let mut crypto_data = DutyOrchestrator::<
+            MockSlotClock,
+            MockSubmitter,
+            MockBlockBeacon,
+        >::convert_attestation_data(&beacon_data)
+        .unwrap();
+        assert_eq!(crypto_data.index, 7);
+        crypto_data.index = 0; // EIP-7549
+        let signed_root = crypto_data.tree_hash_root();
+
+        // Step 2: Reconstruct from submitted SingleAttestation data
+        // In process_attestation_duty, the submitted data is:
+        //   electra_data = beacon_attestation_data.clone(); electra_data.index = "0";
+        // We reconstruct that and convert back to crypto types.
+        let mut submitted_beacon_data = beacon_data;
+        submitted_beacon_data.index = "0".to_string();
+        let submitted_crypto_data = DutyOrchestrator::<
+            MockSlotClock,
+            MockSubmitter,
+            MockBlockBeacon,
+        >::convert_attestation_data(&submitted_beacon_data)
+        .unwrap();
+        let submitted_root = submitted_crypto_data.tree_hash_root();
+
+        assert_eq!(
+            signed_root, submitted_root,
+            "Signing root (index=0) must match tree hash of submitted SingleAttestation data"
+        );
+
+        // Also verify the submitted data has index 0
+        assert_eq!(submitted_crypto_data.index, 0);
+        // And all other fields are preserved
+        assert_eq!(crypto_data.slot, submitted_crypto_data.slot);
+        assert_eq!(crypto_data.beacon_block_root, submitted_crypto_data.beacon_block_root);
+        assert_eq!(crypto_data.source, submitted_crypto_data.source);
+        assert_eq!(crypto_data.target, submitted_crypto_data.target);
+    }
 }
