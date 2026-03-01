@@ -17,6 +17,7 @@ use crate::config::ConfigError;
 pub const EXIT_INTEGRITY_CHECK_FAILED: i32 = 10;
 pub const EXIT_GENESIS_ROOT_MISMATCH: i32 = 11;
 pub const EXIT_DOPPELGANGER_DETECTED: i32 = 12;
+pub const EXIT_UNSUPPORTED_FORK_VERSION: i32 = 13;
 
 /// Errors specific to the startup sequence.
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +30,9 @@ pub enum StartupError {
 
     #[error("doppelganger detected for validators: {0:?}")]
     DoppelgangerDetected(Vec<String>),
+
+    #[error("unsupported consensus fork version {version}; upgrade rvc")]
+    UnsupportedForkVersion { version: String },
 
     #[error("config error: {0}")]
     Config(#[from] ConfigError),
@@ -52,6 +56,7 @@ impl StartupError {
             Self::IntegrityCheckFailed(_) => EXIT_INTEGRITY_CHECK_FAILED,
             Self::GenesisRootMismatch { .. } => EXIT_GENESIS_ROOT_MISMATCH,
             Self::DoppelgangerDetected(_) => EXIT_DOPPELGANGER_DETECTED,
+            Self::UnsupportedForkVersion { .. } => EXIT_UNSUPPORTED_FORK_VERSION,
             _ => 1,
         }
     }
@@ -177,6 +182,49 @@ pub async fn run_doppelganger_detection(
     Ok(all_safe)
 }
 
+/// Check that the beacon node's current head fork version is known in the schedule.
+///
+/// Prevents future fork-version drift from silently producing invalid signatures.
+/// A syncing beacon node may report an older known version, which is fine.
+pub async fn check_fork_compatibility(
+    beacon: &dyn BeaconNodeClient,
+    schedule: &eth_types::ForkSchedule,
+) -> Result<(), StartupError> {
+    let fork_response = beacon.get_fork("head").await?;
+    let current_version = &fork_response.data.current_version;
+
+    let version_bytes = parse_version_hex(current_version)?;
+
+    let known_versions = [
+        schedule.genesis_fork_version,
+        schedule.altair_fork_version,
+        schedule.bellatrix_fork_version,
+        schedule.capella_fork_version,
+        schedule.deneb_fork_version,
+        schedule.electra_fork_version,
+        schedule.fulu_fork_version,
+    ];
+
+    if !known_versions.contains(&version_bytes) {
+        return Err(StartupError::UnsupportedForkVersion { version: current_version.clone() });
+    }
+
+    info!(fork_version = %current_version, "Beacon node fork version is supported");
+    Ok(())
+}
+
+fn parse_version_hex(hex_str: &str) -> Result<[u8; 4], StartupError> {
+    let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    let bytes = hex::decode(stripped)
+        .map_err(|_| StartupError::UnsupportedForkVersion { version: hex_str.to_string() })?;
+    if bytes.len() != 4 {
+        return Err(StartupError::UnsupportedForkVersion { version: hex_str.to_string() });
+    }
+    let mut arr = [0u8; 4];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
+}
+
 fn normalize_hex(s: &str) -> String {
     s.to_lowercase().trim_start_matches("0x").to_string()
 }
@@ -189,7 +237,7 @@ mod tests {
         AggregateAttestationResponse, AttestationDataResponse, AttesterDutiesResponse,
         BeaconCommitteeSubscription, BeaconError, BlockRootResponse, ConfigSpecResponse,
         DataResponse, GenesisData, GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse,
-        ProposerPreparation, SignedContributionAndProof, StateForkResponse,
+        ProposerPreparation, SignedContributionAndProof, StateForkResponse, StateResponse,
         SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
         SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorsResponse,
         VersionedAttestation, VersionedSignedAggregateAndProof,
@@ -200,16 +248,29 @@ mod tests {
 
     struct MockBeacon {
         genesis_root: String,
+        fork_version: String,
         should_fail: bool,
     }
 
     impl MockBeacon {
         fn with_root(root: &str) -> Self {
-            Self { genesis_root: root.to_string(), should_fail: false }
+            Self {
+                genesis_root: root.to_string(),
+                fork_version: "0x05000000".to_string(),
+                should_fail: false,
+            }
+        }
+
+        fn with_fork_version(version: &str) -> Self {
+            Self {
+                genesis_root: "0xdead".to_string(),
+                fork_version: version.to_string(),
+                should_fail: false,
+            }
         }
 
         fn failing() -> Self {
-            Self { genesis_root: String::new(), should_fail: true }
+            Self { genesis_root: String::new(), fork_version: String::new(), should_fail: true }
         }
     }
 
@@ -234,7 +295,18 @@ mod tests {
             Err(BeaconError::HttpError("mock".to_string()))
         }
         async fn get_fork(&self, _state_id: &str) -> Result<StateForkResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
+            if self.should_fail {
+                return Err(BeaconError::HttpError("mock failure".to_string()));
+            }
+            Ok(StateResponse {
+                execution_optimistic: false,
+                finalized: true,
+                data: beacon::StateFork {
+                    previous_version: "0x04000000".to_string(),
+                    current_version: self.fork_version.clone(),
+                    epoch: "0".to_string(),
+                },
+            })
         }
         async fn get_validators(
             &self,
@@ -541,5 +613,83 @@ mod tests {
     fn test_startup_error_from_beacon_error() {
         let err: StartupError = BeaconError::HttpError("test".to_string()).into();
         assert_eq!(err.exit_code(), 1);
+    }
+
+    // -- Fork compatibility tests --
+
+    fn test_fork_schedule() -> ForkSchedule {
+        ForkSchedule {
+            genesis_fork_version: [0, 0, 0, 0],
+            altair_fork_epoch: 74240,
+            altair_fork_version: [1, 0, 0, 0],
+            bellatrix_fork_epoch: 144896,
+            bellatrix_fork_version: [2, 0, 0, 0],
+            capella_fork_epoch: 194048,
+            capella_fork_version: [3, 0, 0, 0],
+            deneb_fork_epoch: 269568,
+            deneb_fork_version: [4, 0, 0, 0],
+            electra_fork_epoch: 364544,
+            electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: u64::MAX,
+            fulu_fork_version: [6, 0, 0, 0],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_check_fork_compatibility_known_version() {
+        let beacon = MockBeacon::with_fork_version("0x05000000");
+        let schedule = test_fork_schedule();
+        let result = check_fork_compatibility(&beacon, &schedule).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_check_fork_compatibility_unknown_version() {
+        let beacon = MockBeacon::with_fork_version("0xdeadbeef");
+        let schedule = test_fork_schedule();
+        let result = check_fork_compatibility(&beacon, &schedule).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.exit_code(), EXIT_UNSUPPORTED_FORK_VERSION);
+        assert!(matches!(err, StartupError::UnsupportedForkVersion { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_check_fork_compatibility_fulu_version() {
+        let beacon = MockBeacon::with_fork_version("0x06000000");
+        let schedule = test_fork_schedule();
+        let result = check_fork_compatibility(&beacon, &schedule).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_check_fork_compatibility_genesis_version() {
+        let beacon = MockBeacon::with_fork_version("0x00000000");
+        let schedule = test_fork_schedule();
+        let result = check_fork_compatibility(&beacon, &schedule).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_check_fork_compatibility_beacon_unreachable() {
+        let beacon = MockBeacon::failing();
+        let schedule = test_fork_schedule();
+        let result = check_fork_compatibility(&beacon, &schedule).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), StartupError::Beacon(_)));
+    }
+
+    #[test]
+    fn test_exit_code_unsupported_fork_version() {
+        let err = StartupError::UnsupportedForkVersion { version: "0xdeadbeef".to_string() };
+        assert_eq!(err.exit_code(), EXIT_UNSUPPORTED_FORK_VERSION);
+    }
+
+    #[test]
+    fn test_startup_error_display_unsupported_fork_version() {
+        let err = StartupError::UnsupportedForkVersion { version: "0xdeadbeef".to_string() };
+        let msg = err.to_string();
+        assert!(msg.contains("0xdeadbeef"));
+        assert!(msg.contains("upgrade rvc"));
     }
 }

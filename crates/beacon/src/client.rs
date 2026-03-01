@@ -2449,6 +2449,8 @@ mod tests {
         assert_eq!(schedule.deneb_fork_version, [4, 0, 0, 0]);
         assert_eq!(schedule.electra_fork_epoch, 364544);
         assert_eq!(schedule.electra_fork_version, [5, 0, 0, 0]);
+        assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
+        assert_eq!(schedule.fulu_fork_version, [6, 0, 0, 0]);
     }
 
     #[tokio::test]
