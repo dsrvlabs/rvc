@@ -125,6 +125,7 @@ impl SignerService {
 
         if let Err(e) = slashing_check_result {
             tracing::Span::current().record("rvc.slashing.result", "blocked");
+            tracing::error!(error = %e, "Attestation slashing protection blocked signing");
             RVC_SLASHING_PROTECTION_CHECKS_TOTAL
                 .with_label_values(&[slashing_result::BLOCKED])
                 .inc();
@@ -136,7 +137,13 @@ impl SignerService {
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
 
         let pubkey_bytes = pubkey.to_bytes();
-        let signature = self.signer.sign(&signing_root, &pubkey_bytes).await?;
+        let signature = match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => sig,
+            Err(e) => {
+                tracing::error!(error = %e, "Attestation signing failed");
+                return Err(e.into());
+            }
+        };
 
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
@@ -176,6 +183,7 @@ impl SignerService {
 
         if let Err(e) = slashing_check_result {
             tracing::Span::current().record("rvc.slashing.result", "blocked");
+            tracing::error!(error = %e, "Block slashing protection blocked signing");
             RVC_SLASHING_PROTECTION_CHECKS_TOTAL
                 .with_label_values(&[slashing_result::BLOCKED])
                 .inc();
@@ -186,7 +194,13 @@ impl SignerService {
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
 
         let pubkey_bytes = pubkey.to_bytes();
-        let signature = self.signer.sign(&signing_root, &pubkey_bytes).await?;
+        let signature = match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => sig,
+            Err(e) => {
+                tracing::error!(error = %e, "Block signing failed");
+                return Err(e.into());
+            }
+        };
 
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);

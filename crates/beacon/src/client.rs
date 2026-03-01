@@ -824,7 +824,9 @@ impl BeaconClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string())))
+        let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
+        tracing::error!(error = %err, "Request failed after retries exhausted");
+        Err(err)
     }
 
     async fn execute_with_retry<F, Fut, T>(
@@ -913,7 +915,9 @@ impl BeaconClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string())))
+        let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
+        tracing::error!(error = %err, "Request failed after retries exhausted");
+        Err(err)
     }
 
     /// Performs a POST request with retry logic and optional headers, expecting an empty success response.
@@ -1000,7 +1004,9 @@ impl BeaconClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string())))
+        let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
+        tracing::error!(error = %err, "Request failed after retries exhausted");
+        Err(err)
     }
 
     /// Executes a request with retry logic and returns the raw response on success.
@@ -1078,7 +1084,9 @@ impl BeaconClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string())))
+        let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
+        tracing::error!(error = %err, "Request failed after retries exhausted");
+        Err(err)
     }
 
     fn calculate_backoff(&self, attempt: u32) -> Duration {

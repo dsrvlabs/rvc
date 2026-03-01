@@ -34,6 +34,9 @@ pub struct TelemetryConfig {
     pub sample_rate: f64,
     /// Ethereum network name (e.g. "mainnet", "hoodi").
     pub network: String,
+    /// Binary version for `service.version` resource attribute.
+    /// When `None`, falls back to the telemetry crate's own version.
+    pub service_version: Option<String>,
 }
 
 impl fmt::Debug for TelemetryConfig {
@@ -54,6 +57,7 @@ impl Default for TelemetryConfig {
             exporter: ExporterKind::default(),
             sample_rate: 1.0,
             network: "mainnet".to_string(),
+            service_version: None,
         }
     }
 }
@@ -112,6 +116,7 @@ mod tests {
             exporter: ExporterKind::Otlp,
             sample_rate: 0.5,
             network: "hoodi".to_string(),
+            ..Default::default()
         };
         assert_eq!(config.endpoint, "http://collector:4318");
         assert_eq!(config.sample_rate, 0.5);
@@ -233,5 +238,18 @@ mod tests {
     #[test]
     fn test_redact_endpoint_no_scheme() {
         assert_eq!(redact_endpoint("localhost:4318"), "localhost:4318");
+    }
+
+    #[test]
+    fn test_service_version_default_is_none() {
+        let config = TelemetryConfig::default();
+        assert!(config.service_version.is_none());
+    }
+
+    #[test]
+    fn test_service_version_custom() {
+        let config =
+            TelemetryConfig { service_version: Some("1.2.3".to_string()), ..Default::default() };
+        assert_eq!(config.service_version.as_deref(), Some("1.2.3"));
     }
 }

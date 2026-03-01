@@ -65,7 +65,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .sign_randao_reveal(epoch, pubkey, &self.fork_schedule, &self.genesis_validators_root)
             .instrument(tracing::info_span!("rvc.sign.randao"))
             .await
-            .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+            .map_err(|e| {
+                let err = BlockServiceError::Signer(e.to_string());
+                tracing::error!(error = %err, "RANDAO signing failed");
+                err
+            })?;
         let randao_hex = format!("0x{}", hex::encode(&randao_bytes));
 
         // 2. Get validator preferences
@@ -79,7 +83,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .beacon
             .produce_block_v3(slot, &randao_hex, graffiti_hex.as_deref(), Some(boost))
             .instrument(tracing::info_span!("rvc.beacon.produce_block_v3"))
-            .await?;
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "Block production failed");
+                e
+            })?;
 
         // Record dynamic attributes after block production
         let span = tracing::Span::current();
@@ -91,12 +99,16 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
 
         // 4. Sign and publish based on block type
         let (block_root, is_blinded) = if response.is_ssz {
-            self.sign_and_publish_ssz(&response, slot, pubkey).await?
+            self.sign_and_publish_ssz(&response, slot, pubkey).await
         } else if response.is_blinded {
-            self.sign_and_publish_blinded(&response, slot, pubkey).await?
+            self.sign_and_publish_blinded(&response, slot, pubkey).await
         } else {
-            self.sign_and_publish_full(&response, slot, pubkey).await?
-        };
+            self.sign_and_publish_full(&response, slot, pubkey).await
+        }
+        .map_err(|e| {
+            tracing::error!(error = %e, "Block sign/publish failed");
+            e
+        })?;
 
         let block_type = if is_blinded { "blinded" } else { "unblinded" };
         info!(

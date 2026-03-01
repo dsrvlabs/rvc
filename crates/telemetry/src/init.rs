@@ -31,10 +31,13 @@ pub fn init_tracing(
 
     let exporter = build_exporter(config)?;
 
+    let version =
+        config.service_version.clone().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+
     let resource = Resource::builder()
         .with_service_name(SERVICE_NAME)
         .with_attributes([
-            KeyValue::new("service.version", env!("CARGO_PKG_VERSION").to_string()),
+            KeyValue::new("service.version", version),
             KeyValue::new("network.name", config.network.clone()),
         ])
         .build();
@@ -154,5 +157,15 @@ mod tests {
         let config = TelemetryConfig::default();
         let result = build_exporter(&config);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_init_tracing_with_service_version() {
+        let config =
+            TelemetryConfig { service_version: Some("0.99.0".to_string()), ..Default::default() };
+        let result = init_tracing(&config);
+        assert!(result.is_ok());
+        let (_layer, guard) = result.unwrap();
+        guard.provider.shutdown().ok();
     }
 }

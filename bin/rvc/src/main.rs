@@ -470,6 +470,7 @@ fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfig> {
         exporter,
         sample_rate,
         network: config.network.to_string(),
+        service_version: Some(env!("CARGO_PKG_VERSION").to_string()),
     })
 }
 
@@ -1163,6 +1164,7 @@ mod tests {
             exporter: telemetry::ExporterKind::Otlp,
             sample_rate: 0.5,
             network: "mainnet".to_string(),
+            ..Default::default()
         };
         let result = telemetry::init_tracing(&tc);
         assert!(result.is_ok(), "init_tracing should return Ok with layer and guard");
@@ -1177,6 +1179,7 @@ mod tests {
             exporter: telemetry::ExporterKind::Otlp,
             sample_rate: 0.5,
             network: "mainnet".to_string(),
+            ..Default::default()
         };
         let result = telemetry::init_tracing(&tc);
         assert!(result.is_err(), "init_tracing should fail with invalid endpoint scheme");

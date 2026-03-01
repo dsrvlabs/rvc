@@ -1515,6 +1515,7 @@ where
                 sig
             }
             Err(e) => {
+                tracing::error!(error = %e, validator = %validator_index, slot, "Attestation signing failed");
                 return AttestationResult {
                     validator_index,
                     slot,
@@ -1587,21 +1588,27 @@ where
 
         match submit_result {
             Ok(Ok(_)) => AttestationResult { validator_index, slot, success: true, error: None },
-            Ok(Err(e)) => AttestationResult {
-                validator_index,
-                slot,
-                success: false,
-                error: Some(format!("Failed to propagate attestation: {}", e)),
-            },
-            Err(_) => AttestationResult {
-                validator_index,
-                slot,
-                success: false,
-                error: Some(format!(
-                    "Attestation submit timed out after {}s",
-                    self.config.timeouts.attestation_submit.as_secs()
-                )),
-            },
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, validator = %validator_index, slot, "Attestation submission failed");
+                AttestationResult {
+                    validator_index,
+                    slot,
+                    success: false,
+                    error: Some(format!("Failed to propagate attestation: {}", e)),
+                }
+            }
+            Err(_) => {
+                tracing::error!(validator = %validator_index, slot, "Attestation submission timed out");
+                AttestationResult {
+                    validator_index,
+                    slot,
+                    success: false,
+                    error: Some(format!(
+                        "Attestation submit timed out after {}s",
+                        self.config.timeouts.attestation_submit.as_secs()
+                    )),
+                }
+            }
         }
     }
 
