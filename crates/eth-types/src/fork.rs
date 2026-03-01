@@ -72,6 +72,27 @@ impl ForkName {
             Self::Fulu => schedule.fulu_fork_version,
         }
     }
+
+    pub fn activation_epoch(&self, schedule: &ForkSchedule) -> Epoch {
+        match self {
+            Self::Phase0 => 0,
+            Self::Altair => schedule.altair_fork_epoch,
+            Self::Bellatrix => schedule.bellatrix_fork_epoch,
+            Self::Capella => schedule.capella_fork_epoch,
+            Self::Deneb => schedule.deneb_fork_epoch,
+            Self::Electra => schedule.electra_fork_epoch,
+            Self::Fulu => schedule.fulu_fork_epoch,
+        }
+    }
+
+    pub fn previous_fork(&self, schedule: &ForkSchedule) -> ForkName {
+        let epoch = self.activation_epoch(schedule);
+        if epoch == 0 {
+            ForkName::Phase0
+        } else {
+            ForkName::from_epoch(epoch - 1, schedule)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -267,5 +288,42 @@ mod tests {
             fulu_fork_version: [6, 0, 0, 0],
         };
         assert_eq!(ForkName::from_epoch(1_000_000, &schedule), ForkName::Electra);
+    }
+
+    #[test]
+    fn test_activation_epoch_all_forks() {
+        let schedule = test_schedule();
+        assert_eq!(ForkName::Phase0.activation_epoch(&schedule), 0);
+        assert_eq!(ForkName::Altair.activation_epoch(&schedule), 74240);
+        assert_eq!(ForkName::Bellatrix.activation_epoch(&schedule), 144896);
+        assert_eq!(ForkName::Capella.activation_epoch(&schedule), 194048);
+        assert_eq!(ForkName::Deneb.activation_epoch(&schedule), 269568);
+        assert_eq!(ForkName::Electra.activation_epoch(&schedule), 364544);
+        assert_eq!(ForkName::Fulu.activation_epoch(&schedule), 500000);
+    }
+
+    #[test]
+    fn test_previous_fork_fulu() {
+        let schedule = test_schedule();
+        assert_eq!(ForkName::Fulu.previous_fork(&schedule), ForkName::Electra);
+    }
+
+    #[test]
+    fn test_previous_fork_electra() {
+        let schedule = test_schedule();
+        assert_eq!(ForkName::Electra.previous_fork(&schedule), ForkName::Deneb);
+    }
+
+    #[test]
+    fn test_previous_fork_phase0() {
+        let schedule = test_schedule();
+        assert_eq!(ForkName::Phase0.previous_fork(&schedule), ForkName::Phase0);
+    }
+
+    #[test]
+    fn test_previous_fork_same_epoch() {
+        let mut schedule = test_schedule();
+        schedule.altair_fork_epoch = 0;
+        assert_eq!(ForkName::Altair.previous_fork(&schedule), ForkName::Phase0);
     }
 }
