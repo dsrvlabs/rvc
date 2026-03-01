@@ -34,6 +34,19 @@ use tree_hash::TreeHash;
 
 use super::error::OrchestratorError;
 
+/// Truncates a hex-encoded public key for display in tracing spans.
+///
+/// Returns `0x` + first 10 hex chars + `...` + last 8 hex chars for keys
+/// longer than 18 hex characters. Shorter keys are returned as-is with `0x` prefix.
+fn truncate_pubkey(hex: &str) -> String {
+    let hex = hex.strip_prefix("0x").unwrap_or(hex);
+    if hex.len() > 18 {
+        format!("0x{}...{}", &hex[..10], &hex[hex.len() - 8..])
+    } else {
+        format!("0x{hex}")
+    }
+}
+
 /// Total validators in a sync committee.
 const SYNC_COMMITTEE_SIZE: u64 = 512;
 
@@ -1359,6 +1372,14 @@ where
             }
         };
 
+        let _att_span = info_span!(
+            "rvc.attestation.produce",
+            rvc.slot = slot,
+            rvc.validator_index = %validator_index,
+            rvc.pubkey = %truncate_pubkey(&duty.pubkey),
+        )
+        .entered();
+
         debug!(
             validator = %validator_index,
             slot = slot,
@@ -1379,11 +1400,14 @@ where
         };
 
         // Apply timeout to beacon client call to prevent blocking
-        let attestation_data_result = tokio::time::timeout(
-            self.config.timeouts.attestation_fetch,
-            self.beacon.get_attestation_data(slot, committee_index),
-        )
-        .await;
+        let attestation_data_result = {
+            let _fetch_span = info_span!("rvc.beacon.get_attestation_data").entered();
+            tokio::time::timeout(
+                self.config.timeouts.attestation_fetch,
+                self.beacon.get_attestation_data(slot, committee_index),
+            )
+            .await
+        };
 
         let attestation_data_response = match attestation_data_result {
             Ok(Ok(response)) => response,
@@ -1552,12 +1576,16 @@ where
             "Propagating attestation"
         );
 
-        match tokio::time::timeout(
-            self.config.timeouts.attestation_submit,
-            self.propagator.propagate(&versioned),
-        )
-        .await
-        {
+        let submit_result = {
+            let _submit_span = info_span!("rvc.beacon.submit_attestation").entered();
+            tokio::time::timeout(
+                self.config.timeouts.attestation_submit,
+                self.propagator.propagate(&versioned),
+            )
+            .await
+        };
+
+        match submit_result {
             Ok(Ok(_)) => AttestationResult { validator_index, slot, success: true, error: None },
             Ok(Err(e)) => AttestationResult {
                 validator_index,
@@ -4683,5 +4711,53 @@ mod tests {
             "Expected rvc.epoch.boundary span at epoch boundary slot, got: {:?}",
             *span_names
         );
+    }
+
+    // --- H-12: truncate_pubkey tests ---
+
+    #[test]
+    fn test_truncate_pubkey_full_hex_with_prefix() {
+        let pubkey = "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a";
+        let result = truncate_pubkey(pubkey);
+        assert_eq!(result, "0x93247f2209...611df74a");
+    }
+
+    #[test]
+    fn test_truncate_pubkey_full_hex_without_prefix() {
+        let pubkey = "93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a";
+        let result = truncate_pubkey(pubkey);
+        assert_eq!(result, "0x93247f2209...611df74a");
+    }
+
+    #[test]
+    fn test_truncate_pubkey_short_hex() {
+        let result = truncate_pubkey("0xabcdef");
+        assert_eq!(result, "0xabcdef");
+    }
+
+    #[test]
+    fn test_truncate_pubkey_short_hex_without_prefix() {
+        let result = truncate_pubkey("abcdef");
+        assert_eq!(result, "0xabcdef");
+    }
+
+    #[test]
+    fn test_truncate_pubkey_exactly_18_chars() {
+        // 18 hex chars = not truncated
+        let result = truncate_pubkey("0x123456789012345678");
+        assert_eq!(result, "0x123456789012345678");
+    }
+
+    #[test]
+    fn test_truncate_pubkey_19_chars_truncated() {
+        // 19 hex chars = truncated (first 10 + ... + last 8)
+        let result = truncate_pubkey("0x1234567890123456789");
+        assert_eq!(result, "0x1234567890...23456789");
+    }
+
+    #[test]
+    fn test_truncate_pubkey_empty() {
+        let result = truncate_pubkey("");
+        assert_eq!(result, "0x");
     }
 }
