@@ -3,8 +3,9 @@ use sha2::{Digest, Sha256};
 use super::bls::{SecretKey, Signature};
 use super::signing::{compute_domain, compute_signing_root};
 use eth_types::{
-    AggregateAndProof, ForkName, ForkSchedule, Root, Slot, DOMAIN_AGGREGATE_AND_PROOF,
-    DOMAIN_SELECTION_PROOF, SLOTS_PER_EPOCH, TARGET_AGGREGATORS_PER_COMMITTEE,
+    AggregateAndProof, ElectraAggregateAndProof, ForkName, ForkSchedule, Root, Slot,
+    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_SELECTION_PROOF, SLOTS_PER_EPOCH,
+    TARGET_AGGREGATORS_PER_COMMITTEE,
 };
 
 /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof
@@ -38,6 +39,21 @@ pub fn sign_aggregate_and_proof(
     secret_key.sign(&signing_root)
 }
 
+/// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
+pub fn sign_electra_aggregate_and_proof(
+    aggregate_and_proof: &ElectraAggregateAndProof,
+    secret_key: &SecretKey,
+    fork_schedule: &ForkSchedule,
+    genesis_validators_root: Root,
+) -> Signature {
+    let epoch = aggregate_and_proof.aggregate.data.slot / SLOTS_PER_EPOCH;
+    let fork_name = ForkName::from_epoch(epoch, fork_schedule);
+    let fork_version = fork_name.fork_version(fork_schedule);
+    let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, fork_version, genesis_validators_root);
+    let signing_root = compute_signing_root(aggregate_and_proof, domain);
+    secret_key.sign(&signing_root)
+}
+
 /// Determines whether a validator is an aggregator for a given committee.
 ///
 /// Per the Ethereum consensus spec:
@@ -56,7 +72,7 @@ pub fn is_aggregator(committee_length: u64, selection_proof: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::signing::compute_domain;
-    use eth_types::{AttestationData, Checkpoint};
+    use eth_types::{AttestationData, Checkpoint, ElectraAggregateAndProof, ElectraAttestation};
 
     fn test_fork_schedule() -> ForkSchedule {
         ForkSchedule {
@@ -287,5 +303,84 @@ mod tests {
         assert_eq!(modulo, 16);
 
         let _ = is_aggregator(256, &[0xaa; 96]);
+    }
+
+    fn sample_electra_aggregate_and_proof(slot: Slot) -> ElectraAggregateAndProof {
+        ElectraAggregateAndProof {
+            aggregator_index: 42,
+            aggregate: ElectraAttestation {
+                aggregation_bits: vec![0xff; 4],
+                data: AttestationData {
+                    slot,
+                    index: 0,
+                    beacon_block_root: [1u8; 32],
+                    source: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [2u8; 32] },
+                    target: Checkpoint { epoch: slot / SLOTS_PER_EPOCH + 1, root: [3u8; 32] },
+                },
+                signature: vec![0xaa; 96],
+                committee_bits: vec![0x01, 0, 0, 0, 0, 0, 0, 0],
+            },
+            selection_proof: vec![0xbb; 96],
+        }
+    }
+
+    #[test]
+    fn test_sign_electra_aggregate_and_proof_valid() {
+        let secret_key = SecretKey::generate();
+        let public_key = secret_key.public_key();
+        let schedule = test_fork_schedule();
+        let genesis_root = test_genesis_validators_root();
+
+        let slot = schedule.electra_fork_epoch * SLOTS_PER_EPOCH;
+        let agg_and_proof = sample_electra_aggregate_and_proof(slot);
+
+        let signature =
+            sign_electra_aggregate_and_proof(&agg_and_proof, &secret_key, &schedule, genesis_root);
+
+        let epoch = agg_and_proof.aggregate.data.slot / SLOTS_PER_EPOCH;
+        let fork_name = ForkName::from_epoch(epoch, &schedule);
+        let fork_version = fork_name.fork_version(&schedule);
+        let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, fork_version, genesis_root);
+        let signing_root = compute_signing_root(&agg_and_proof, domain);
+
+        assert!(signature.verify(&public_key, &signing_root).is_ok());
+    }
+
+    #[test]
+    fn test_sign_electra_aggregate_and_proof_different_root_from_pre_electra() {
+        let secret_key = SecretKey::generate();
+        let schedule = test_fork_schedule();
+        let genesis_root = test_genesis_validators_root();
+
+        let slot = schedule.electra_fork_epoch * SLOTS_PER_EPOCH;
+
+        let pre_electra = sample_aggregate_and_proof(slot);
+        let electra = sample_electra_aggregate_and_proof(slot);
+
+        let sig_pre = sign_aggregate_and_proof(&pre_electra, &secret_key, &schedule, genesis_root);
+        let sig_electra =
+            sign_electra_aggregate_and_proof(&electra, &secret_key, &schedule, genesis_root);
+
+        assert_ne!(sig_pre.to_bytes(), sig_electra.to_bytes());
+    }
+
+    #[test]
+    fn test_sign_electra_aggregate_and_proof_uses_correct_domain() {
+        let secret_key = SecretKey::generate();
+        let public_key = secret_key.public_key();
+        let schedule = test_fork_schedule();
+        let genesis_root = test_genesis_validators_root();
+
+        let slot = schedule.electra_fork_epoch * SLOTS_PER_EPOCH;
+        let agg_and_proof = sample_electra_aggregate_and_proof(slot);
+
+        let signature =
+            sign_electra_aggregate_and_proof(&agg_and_proof, &secret_key, &schedule, genesis_root);
+
+        // Wrong domain should fail
+        let wrong_domain =
+            compute_domain(DOMAIN_SELECTION_PROOF, schedule.genesis_fork_version, genesis_root);
+        let wrong_signing_root = compute_signing_root(&agg_and_proof, wrong_domain);
+        assert!(signature.verify(&public_key, &wrong_signing_root).is_err());
     }
 }

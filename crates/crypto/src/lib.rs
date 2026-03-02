@@ -17,7 +17,9 @@ mod signing;
 mod sync_signing;
 mod voluntary_exit_signing;
 
-pub use aggregation_signing::{is_aggregator, sign_aggregate_and_proof, sign_selection_proof};
+pub use aggregation_signing::{
+    is_aggregator, sign_aggregate_and_proof, sign_electra_aggregate_and_proof, sign_selection_proof,
+};
 pub use block_signing::{sign_block, sign_randao_reveal};
 pub use bls::{
     PublicKey, SecretKey, Signature, PUBLIC_KEY_BYTES_LEN, SECRET_KEY_BYTES_LEN,
