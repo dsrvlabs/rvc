@@ -17,10 +17,10 @@ use tracing::debug;
 
 use crypto::{CompositeSigner, PublicKey, Signature, Signer, SigningError};
 use eth_types::{
-    AggregateAndProof, AttestationData, ContributionAndProof, Epoch, Fork, ForkSchedule, Root,
-    Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
-    DOMAIN_APPLICATION_BUILDER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_SYNC_COMMITTEE,
-    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SLOTS_PER_EPOCH,
+    AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
+    Fork, ForkSchedule, Root, Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1,
+    VoluntaryExit, DOMAIN_APPLICATION_BUILDER, DOMAIN_CONTRIBUTION_AND_PROOF,
+    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SLOTS_PER_EPOCH,
 };
 use metrics::definitions::{
     slashing_result, RVC_ATTESTATIONS_TOTAL, RVC_SIGNING_DURATION_SECONDS,
@@ -298,6 +298,30 @@ impl SignerService {
         Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
     }
 
+    /// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
+    #[tracing::instrument(name = "rvc.sign.electra_aggregate_and_proof", skip_all, fields(rvc.operation = "electra_aggregate_and_proof"))]
+    pub async fn sign_electra_aggregate_and_proof(
+        &self,
+        aggregate_and_proof: &ElectraAggregateAndProof,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let slot = aggregate_and_proof.aggregate.data.slot;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
+        let fork_version = fork_name.fork_version(fork_schedule);
+        let domain = crypto::compute_domain(
+            eth_types::DOMAIN_AGGREGATE_AND_PROOF,
+            fork_version,
+            *genesis_validators_root,
+        );
+        let signing_root = crypto::compute_signing_root(aggregate_and_proof, domain);
+
+        let pubkey_bytes = pubkey.to_bytes();
+        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+    }
+
     /// Signs a voluntary exit with DOMAIN_VOLUNTARY_EXIT.
     #[tracing::instrument(name = "rvc.sign.voluntary_exit", skip_all, fields(rvc.operation = "voluntary_exit"))]
     pub async fn sign_voluntary_exit(
@@ -520,6 +544,24 @@ impl ValidatorSigner for SignerService {
         genesis_validators_root: &Root,
     ) -> Result<Vec<u8>, SignerError> {
         let signature = SignerService::sign_aggregate_and_proof(
+            self,
+            aggregate_and_proof,
+            pubkey,
+            fork_schedule,
+            genesis_validators_root,
+        )
+        .await?;
+        Ok(signature.to_bytes().to_vec())
+    }
+
+    async fn sign_electra_aggregate_and_proof(
+        &self,
+        aggregate_and_proof: &ElectraAggregateAndProof,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError> {
+        let signature = SignerService::sign_electra_aggregate_and_proof(
             self,
             aggregate_and_proof,
             pubkey,
@@ -1179,6 +1221,54 @@ mod tests {
     fn test_is_aggregator_reexported() {
         assert!(is_aggregator(0, &[0xaa; 96]));
         assert!(is_aggregator(1, &[0xaa; 96]));
+    }
+
+    fn create_test_electra_aggregate_and_proof(slot: Slot) -> eth_types::ElectraAggregateAndProof {
+        eth_types::ElectraAggregateAndProof {
+            aggregator_index: 42,
+            aggregate: eth_types::ElectraAttestation {
+                aggregation_bits: vec![0xff; 4],
+                data: AttestationData {
+                    slot,
+                    index: 0,
+                    beacon_block_root: [1u8; 32],
+                    source: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [2u8; 32] },
+                    target: Checkpoint { epoch: slot / SLOTS_PER_EPOCH + 1, root: [3u8; 32] },
+                },
+                signature: vec![0xaa; 96],
+                committee_bits: vec![0x01, 0, 0, 0, 0, 0, 0, 0],
+            },
+            selection_proof: vec![0xbb; 96],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sign_electra_aggregate_and_proof_success() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(signer, slashing_db);
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let slot = schedule.electra_fork_epoch * SLOTS_PER_EPOCH;
+        let agg_and_proof = create_test_electra_aggregate_and_proof(slot);
+
+        let result = service
+            .sign_electra_aggregate_and_proof(&agg_and_proof, &pubkey, &schedule, &genesis_root)
+            .await;
+        assert!(result.is_ok());
+
+        let signature = result.unwrap();
+
+        let fork_name = eth_types::ForkName::from_epoch(slot / SLOTS_PER_EPOCH, &schedule);
+        let fork_version = fork_name.fork_version(&schedule);
+        let domain =
+            compute_domain(eth_types::DOMAIN_AGGREGATE_AND_PROOF, fork_version, genesis_root);
+        let signing_root = compute_signing_root(&agg_and_proof, domain);
+        assert!(signature.verify(&pubkey, &signing_root).is_ok());
     }
 
     // --- Voluntary exit signing tests ---

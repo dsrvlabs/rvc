@@ -206,7 +206,10 @@ mod tests {
         VersionedSignedAggregateAndProof,
     };
     use crypto::PublicKey;
-    use eth_types::{AggregateAndProof, AttestationData, Epoch, Root, Slot, VoluntaryExit};
+    use eth_types::{
+        AggregateAndProof, AttestationData, ElectraAggregateAndProof, Epoch, Root, Slot,
+        VoluntaryExit,
+    };
     use validator_store::ValidatorConfig;
 
     // --- Mock BN ---
@@ -446,6 +449,15 @@ mod tests {
         async fn sign_aggregate_and_proof(
             &self,
             _: &AggregateAndProof,
+            _: &PublicKey,
+            _: &eth_types::ForkSchedule,
+            _: &Root,
+        ) -> Result<Vec<u8>, SignerError> {
+            Err(SignerError::KeyNotFound("mock".into()))
+        }
+        async fn sign_electra_aggregate_and_proof(
+            &self,
+            _: &ElectraAggregateAndProof,
             _: &PublicKey,
             _: &eth_types::ForkSchedule,
             _: &Root,

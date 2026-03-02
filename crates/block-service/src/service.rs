@@ -376,6 +376,16 @@ mod tests {
             Ok(vec![0xdd; 96])
         }
 
+        async fn sign_electra_aggregate_and_proof(
+            &self,
+            _aggregate_and_proof: &eth_types::ElectraAggregateAndProof,
+            _pubkey: &PublicKey,
+            _fork_schedule: &ForkSchedule,
+            _genesis_validators_root: &Root,
+        ) -> Result<Vec<u8>, SignerError> {
+            Ok(vec![0xdd; 96])
+        }
+
         async fn sign_voluntary_exit(
             &self,
             _voluntary_exit: &eth_types::VoluntaryExit,
