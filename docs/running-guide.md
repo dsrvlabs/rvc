@@ -98,6 +98,16 @@ rvc start [OPTIONS]
 | `--aggregate-timeout` | 2 | Aggregate fetch/submit deadline |
 | `--duty-fetch-timeout` | 10 | Duty resolution deadline |
 
+#### Tracing Options (OpenTelemetry)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--tracing-endpoint <URL>` | none | OTLP endpoint (enables tracing when set) |
+| `--tracing-exporter <KIND>` | `otlp` | Exporter: `otlp` or `gcp` |
+| `--tracing-sample-rate <FLOAT>` | `0.01` | Head-based sampling ratio (0.0–1.0) |
+| `--tracing-max-queue-size <N>` | `2048` | Max spans queued for export |
+| `--tracing-max-export-batch-size <N>` | `512` | Max spans per export batch |
+
 #### Genesis Overrides (for custom networks)
 
 | Flag | Description |
@@ -216,7 +226,7 @@ Requires bearer token authentication.
 
 ## Startup Sequence
 
-1. Initialize logging
+1. Initialize logging and telemetry (if `--tracing-endpoint` set)
 2. Validate CLI timeouts (must be > 0)
 3. Load config file (or defaults) and merge CLI overrides
 4. Open slashing protection database
@@ -281,4 +291,20 @@ rvc start \
   --keymanager-enabled \
   --remote-signer-url https://web3signer:9000 \
   --keymanager-address 127.0.0.1:5062
+```
+
+### With OpenTelemetry Tracing
+
+```bash
+rvc start -c config.toml \
+  --tracing-endpoint http://localhost:4318 \
+  --tracing-sample-rate 0.1
+```
+
+For GCP Cloud Trace (requires `--features gcp-trace`):
+
+```bash
+rvc start -c config.toml \
+  --tracing-exporter gcp \
+  --tracing-sample-rate 0.01
 ```

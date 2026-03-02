@@ -71,7 +71,7 @@ grpc_port = 50051
 grpc_address = "127.0.0.1"
 
 # ---------------------------------------------------------------------------
-# Keymanager API (EIP-3076 key management at runtime)
+# Keymanager API (runtime key management via Beacon APIs)
 # ---------------------------------------------------------------------------
 
 # Enable the Keymanager API server (GET/POST/DELETE /eth/v1/keystores, /eth/v1/remotekeys)
