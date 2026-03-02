@@ -24,13 +24,13 @@ fn redact_url(url: &str) -> String {
 use eth_types::{ForkSchedule, SignedValidatorRegistration, SignedVoluntaryExit};
 
 use crate::types::{
-    parse_fork_schedule, AggregateAttestationResponse, AttestationDataResponse,
-    AttesterDutiesResponse, BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse,
+    parse_fork_schedule, AttestationDataResponse, AttesterDutiesResponse,
+    BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, DataResponse,
     GenesisResponse, IndexedAttestationError, ProduceBlockResponse, ProposerDutiesResponse,
     ProposerPreparation, SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
     SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAttestation,
-    VersionedSignedAggregateAndProof,
+    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use crate::BeaconError;
 
@@ -595,7 +595,7 @@ impl BeaconClient {
         slot: u64,
         attestation_data_root: &str,
         committee_index: Option<u64>,
-    ) -> Result<AggregateAttestationResponse, BeaconError> {
+    ) -> Result<VersionedAggregateAttestation, BeaconError> {
         let mut path = format!(
             "/eth/v1/validator/aggregate_attestation?slot={}&attestation_data_root={}",
             slot, attestation_data_root
@@ -603,7 +603,14 @@ impl BeaconClient {
         if let Some(ci) = committee_index {
             path.push_str(&format!("&committee_index={}", ci));
         }
-        self.get(&path).await
+
+        if committee_index.is_some() {
+            let resp: DataResponse<eth_types::ElectraAttestation> = self.get(&path).await?;
+            Ok(VersionedAggregateAttestation::Electra(resp.data))
+        } else {
+            let resp: DataResponse<eth_types::Attestation> = self.get(&path).await?;
+            Ok(VersionedAggregateAttestation::PreElectra(resp.data))
+        }
     }
 
     /// Submits signed aggregate and proofs to the beacon node.
@@ -616,9 +623,23 @@ impl BeaconClient {
             VersionedSignedAggregateAndProof::PreElectra(ps) => {
                 self.post_empty("/eth/v1/validator/aggregate_and_proofs", ps).instrument(span).await
             }
-            VersionedSignedAggregateAndProof::Electra(ps)
-            | VersionedSignedAggregateAndProof::Fulu(ps) => {
-                self.post_empty("/eth/v2/validator/aggregate_and_proofs", ps).instrument(span).await
+            VersionedSignedAggregateAndProof::Electra(ps) => {
+                self.post_empty_with_headers(
+                    "/eth/v2/validator/aggregate_and_proofs",
+                    ps,
+                    &[("Eth-Consensus-Version", "electra")],
+                )
+                .instrument(span)
+                .await
+            }
+            VersionedSignedAggregateAndProof::Fulu(ps) => {
+                self.post_empty_with_headers(
+                    "/eth/v2/validator/aggregate_and_proofs",
+                    ps,
+                    &[("Eth-Consensus-Version", "fulu")],
+                )
+                .instrument(span)
+                .await
             }
         }
     }
@@ -3629,10 +3650,15 @@ mod tests {
 
         let result = client.get_aggregate_attestation(100, &att_data_root, None).await.unwrap();
 
-        assert_eq!(result.data.data.slot, 100);
-        assert_eq!(result.data.data.index, 1);
-        assert_eq!(result.data.aggregation_bits, vec![0xff; 4]);
-        assert_eq!(result.data.signature, vec![0xaa; 96]);
+        match result {
+            crate::types::VersionedAggregateAttestation::PreElectra(att) => {
+                assert_eq!(att.data.slot, 100);
+                assert_eq!(att.data.index, 1);
+                assert_eq!(att.aggregation_bits, vec![0xff; 4]);
+                assert_eq!(att.signature, vec![0xaa; 96]);
+            }
+            other => panic!("Expected PreElectra variant, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3791,6 +3817,7 @@ mod tests {
 
         let att_data_root = format!("0x{}", "ab".repeat(32));
         let sig_hex = format!("0x{}", "aa".repeat(96));
+        let committee_bits_hex = "0x2000000000000000";
         let response_body = serde_json::json!({
             "data": {
                 "aggregation_bits": format!("0x{}", "ff".repeat(4)),
@@ -3807,7 +3834,8 @@ mod tests {
                         "root": format!("0x{}", "03".repeat(32))
                     }
                 },
-                "signature": sig_hex
+                "signature": sig_hex,
+                "committee_bits": committee_bits_hex
             }
         });
 
@@ -3825,7 +3853,12 @@ mod tests {
         let client = BeaconClient::new(config).unwrap();
 
         let result = client.get_aggregate_attestation(100, &att_data_root, Some(5)).await.unwrap();
-        assert_eq!(result.data.data.slot, 100);
+        match result {
+            crate::types::VersionedAggregateAttestation::Electra(att) => {
+                assert_eq!(att.data.slot, 100);
+            }
+            other => panic!("Expected Electra variant, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -4425,5 +4458,189 @@ mod tests {
             }
             other => panic!("Expected ParseError, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_aggregate_attestation_pre_electra() {
+        let mock_server = MockServer::start().await;
+
+        let att_data_root = format!("0x{}", "ab".repeat(32));
+        let block_root_hex = format!("0x{}", "01".repeat(32));
+        let source_root_hex = format!("0x{}", "02".repeat(32));
+        let target_root_hex = format!("0x{}", "03".repeat(32));
+        let sig_hex = format!("0x{}", "aa".repeat(96));
+        let bits_hex = format!("0x{}", "ff".repeat(4));
+
+        let response_body = serde_json::json!({
+            "data": {
+                "aggregation_bits": bits_hex,
+                "data": {
+                    "slot": "100",
+                    "index": "1",
+                    "beacon_block_root": block_root_hex,
+                    "source": { "epoch": "3", "root": source_root_hex },
+                    "target": { "epoch": "4", "root": target_root_hex }
+                },
+                "signature": sig_hex
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(wiremock::matchers::query_param("slot", "100"))
+            .and(wiremock::matchers::query_param("attestation_data_root", &att_data_root))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_aggregate_attestation(100, &att_data_root, None).await.unwrap();
+        match result {
+            crate::types::VersionedAggregateAttestation::PreElectra(att) => {
+                assert_eq!(att.data.slot, 100);
+                assert_eq!(att.data.index, 1);
+                assert_eq!(att.aggregation_bits, vec![0xff; 4]);
+                assert_eq!(att.signature, vec![0xaa; 96]);
+            }
+            other => panic!("Expected PreElectra variant, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_aggregate_attestation_electra() {
+        let mock_server = MockServer::start().await;
+
+        let att_data_root = format!("0x{}", "ab".repeat(32));
+        let block_root_hex = format!("0x{}", "01".repeat(32));
+        let source_root_hex = format!("0x{}", "02".repeat(32));
+        let target_root_hex = format!("0x{}", "03".repeat(32));
+        let sig_hex = format!("0x{}", "aa".repeat(96));
+        let bits_hex = format!("0x{}", "ff".repeat(4));
+        let committee_bits_hex = "0x2000000000000000";
+
+        let response_body = serde_json::json!({
+            "data": {
+                "aggregation_bits": bits_hex,
+                "data": {
+                    "slot": "100",
+                    "index": "1",
+                    "beacon_block_root": block_root_hex,
+                    "source": { "epoch": "3", "root": source_root_hex },
+                    "target": { "epoch": "4", "root": target_root_hex }
+                },
+                "signature": sig_hex,
+                "committee_bits": committee_bits_hex
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(wiremock::matchers::query_param("slot", "100"))
+            .and(wiremock::matchers::query_param("attestation_data_root", &att_data_root))
+            .and(wiremock::matchers::query_param("committee_index", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_aggregate_attestation(100, &att_data_root, Some(5)).await.unwrap();
+        match result {
+            crate::types::VersionedAggregateAttestation::Electra(att) => {
+                assert_eq!(att.data.slot, 100);
+                assert_eq!(att.data.index, 1);
+                assert_eq!(att.aggregation_bits, vec![0xff; 4]);
+                assert_eq!(att.signature, vec![0xaa; 96]);
+                assert_eq!(att.committee_bits, vec![0x20, 0, 0, 0, 0, 0, 0, 0]);
+            }
+            other => panic!("Expected Electra variant, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_aggregate_and_proofs_electra_has_version_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/validator/aggregate_and_proofs"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let proofs = crate::types::VersionedSignedAggregateAndProof::Electra(vec![
+            eth_types::SignedElectraAggregateAndProof {
+                message: eth_types::ElectraAggregateAndProof {
+                    aggregator_index: 42,
+                    aggregate: eth_types::ElectraAttestation {
+                        aggregation_bits: vec![0xff; 4],
+                        data: eth_types::AttestationData {
+                            slot: 100,
+                            index: 1,
+                            beacon_block_root: [1u8; 32],
+                            source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                            target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                        },
+                        signature: vec![0xaa; 96],
+                        committee_bits: vec![0x01; 8],
+                    },
+                    selection_proof: vec![0xbb; 96],
+                },
+                signature: vec![0xcc; 96],
+            },
+        ]);
+
+        let result = client.submit_aggregate_and_proofs(&proofs).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_submit_aggregate_and_proofs_fulu_has_version_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/validator/aggregate_and_proofs"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "fulu"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let proofs = crate::types::VersionedSignedAggregateAndProof::Fulu(vec![
+            eth_types::SignedElectraAggregateAndProof {
+                message: eth_types::ElectraAggregateAndProof {
+                    aggregator_index: 42,
+                    aggregate: eth_types::ElectraAttestation {
+                        aggregation_bits: vec![0xff; 4],
+                        data: eth_types::AttestationData {
+                            slot: 100,
+                            index: 1,
+                            beacon_block_root: [1u8; 32],
+                            source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                            target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                        },
+                        signature: vec![0xaa; 96],
+                        committee_bits: vec![0x01; 8],
+                    },
+                    selection_proof: vec![0xbb; 96],
+                },
+                signature: vec![0xcc; 96],
+            },
+        ]);
+
+        let result = client.submit_aggregate_and_proofs(&proofs).await;
+        assert!(result.is_ok());
     }
 }
