@@ -197,12 +197,12 @@ mod tests {
 
     use async_trait::async_trait;
     use bn_manager::{
-        AggregateAttestationResponse, AttestationDataResponse, AttesterDutiesResponse,
-        BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, ForkSchedule,
-        GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse, SignedBeaconBlock,
-        SignedBlindedBeaconBlock, SignedContributionAndProof, StateForkResponse,
-        SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-        SyncCommitteeMessage, SyncingResponse, ValidatorsResponse, VersionedAttestation,
+        AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription,
+        BlockRootResponse, ConfigSpecResponse, ForkSchedule, GenesisResponse, ProduceBlockResponse,
+        ProposerDutiesResponse, SignedBeaconBlock, SignedBlindedBeaconBlock,
+        SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+        SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+        SyncingResponse, ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
         VersionedSignedAggregateAndProof,
     };
     use crypto::PublicKey;
@@ -313,7 +313,7 @@ mod tests {
             _: u64,
             _: &str,
             _: Option<u64>,
-        ) -> Result<AggregateAttestationResponse, BeaconError> {
+        ) -> Result<VersionedAggregateAttestation, BeaconError> {
             Err(BeaconError::HttpError("mock".into()))
         }
         async fn submit_aggregate_and_proofs(

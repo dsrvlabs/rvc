@@ -4,12 +4,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use beacon::{
-    AggregateAttestationResponse, AttestationDataResponse, AttesterDutiesResponse, BeaconClient,
-    BeaconCommitteeSubscription, BeaconError, BlockRootResponse, ConfigSpecResponse,
-    GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
-    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorsResponse, VersionedAttestation, VersionedSignedAggregateAndProof,
+    AttestationDataResponse, AttesterDutiesResponse, BeaconClient, BeaconCommitteeSubscription,
+    BeaconError, BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
+    ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof, StateForkResponse,
+    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorsResponse, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use eth_types::{
     ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
@@ -862,7 +862,7 @@ impl BeaconNodeClient for BnManager {
         slot: u64,
         attestation_data_root: &str,
         committee_index: Option<u64>,
-    ) -> Result<AggregateAttestationResponse, BeaconError> {
+    ) -> Result<VersionedAggregateAttestation, BeaconError> {
         self.query_first("get_aggregate_attestation", |c| {
             Box::pin(c.get_aggregate_attestation(slot, attestation_data_root, committee_index))
         })
@@ -1054,7 +1054,7 @@ impl BeaconNodeClient for BeaconClient {
         slot: u64,
         attestation_data_root: &str,
         committee_index: Option<u64>,
-    ) -> Result<AggregateAttestationResponse, BeaconError> {
+    ) -> Result<VersionedAggregateAttestation, BeaconError> {
         self.get_aggregate_attestation(slot, attestation_data_root, committee_index).await
     }
 

@@ -3,12 +3,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use beacon::{
-    AggregateAttestationResponse, AttestationDataResponse, AttesterDutiesResponse,
-    BeaconCommitteeSubscription, BeaconError, BlockRootResponse, ConfigSpecResponse,
-    GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
-    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorsResponse, VersionedAttestation, VersionedSignedAggregateAndProof,
+    AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
+    BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
+    ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof, StateForkResponse,
+    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorsResponse, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use eth_types::{
     ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
@@ -90,7 +90,7 @@ pub trait BeaconNodeClient: Send + Sync {
         slot: u64,
         attestation_data_root: &str,
         committee_index: Option<u64>,
-    ) -> Result<AggregateAttestationResponse, BeaconError>;
+    ) -> Result<VersionedAggregateAttestation, BeaconError>;
 
     async fn submit_aggregate_and_proofs(
         &self,
@@ -535,7 +535,7 @@ mod tests {
             _slot: u64,
             _attestation_data_root: &str,
             _committee_index: Option<u64>,
-        ) -> Result<AggregateAttestationResponse, BeaconError> {
+        ) -> Result<VersionedAggregateAttestation, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
         async fn submit_aggregate_and_proofs(

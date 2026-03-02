@@ -21,14 +21,14 @@ pub use traits::{
 // Re-export types used in trait signatures so downstream crates
 // don't need to depend on `beacon` directly.
 pub use beacon::{
-    AggregateAttestationResponse, AttestationData, AttestationDataResponse, AttesterDutiesResponse,
-    AttesterDuty, BeaconCommitteeSubscription, BeaconError, BlockRootResponse, Checkpoint,
-    ConfigSpecResponse, GenesisResponse, IndexedAttestationError, LegacyAttestation,
-    ProduceBlockResponse, ProposerDutiesResponse, ProposerDuty, ProposerPreparation,
-    SignedAggregateAndProof, SignedContributionAndProof, SingleAttestation, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorsResponse, VersionedAttestation,
-    VersionedSignedAggregateAndProof,
+    AttestationData, AttestationDataResponse, AttesterDutiesResponse, AttesterDuty,
+    BeaconCommitteeSubscription, BeaconError, BlockRootResponse, Checkpoint, ConfigSpecResponse,
+    GenesisResponse, IndexedAttestationError, LegacyAttestation, ProduceBlockResponse,
+    ProposerDutiesResponse, ProposerDuty, ProposerPreparation, SignedAggregateAndProof,
+    SignedContributionAndProof, SingleAttestation, StateForkResponse, SubmitAttestationResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    SyncingData, SyncingResponse, ValidatorsResponse, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 pub use eth_types::{
     ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,

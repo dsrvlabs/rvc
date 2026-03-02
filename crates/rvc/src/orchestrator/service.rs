@@ -9,7 +9,8 @@ use tracing::{debug, error, info, info_span, warn};
 
 use beacon::{
     AttesterDuty, BeaconCommitteeSubscription, LegacyAttestation, ProposerPreparation,
-    SingleAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    SingleAttestation, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof,
 };
 use block_service::{BeaconBlockClient, BlockService};
 use bn_manager::{BeaconNodeClient, OperationTimeouts};
@@ -1093,7 +1094,21 @@ where
             )
             .await
             {
-                Ok(Ok(resp)) => resp.data,
+                Ok(Ok(resp)) => match resp {
+                    VersionedAggregateAttestation::PreElectra(att) => att,
+                    VersionedAggregateAttestation::Electra(_)
+                    | VersionedAggregateAttestation::Fulu(_) => {
+                        warn!(
+                            slot,
+                            validator_index = %duty.validator_index,
+                            "Electra/Fulu aggregate not yet supported in this path"
+                        );
+                        RVC_AGGREGATIONS_TOTAL
+                            .with_label_values(&[attestation_status::FAILED])
+                            .inc();
+                        continue;
+                    }
+                },
                 Ok(Err(e)) => {
                     warn!(
                         slot,
