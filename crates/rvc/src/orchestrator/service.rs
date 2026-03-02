@@ -958,8 +958,17 @@ where
         let is_electra = fork_name >= ForkName::Electra;
 
         let mut signed_aggregates: Vec<SignedAggregateAndProof> = Vec::new();
+        let mut source_validators: Vec<String> = Vec::new();
 
         for duty in &duties {
+            let _agg_span = info_span!(
+                "rvc.aggregation.produce",
+                rvc.slot = slot,
+                rvc.validator_index = %duty.validator_index,
+                rvc.pubkey = %truncate_pubkey(&duty.pubkey),
+            )
+            .entered();
+
             let committee_length: u64 = match duty.committee_length.parse() {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -1006,6 +1015,7 @@ where
                 validator_index = %duty.validator_index,
                 "Selected as attestation aggregator"
             );
+            source_validators.push(duty.validator_index.clone());
 
             // Compute attestation data root for fetching the aggregate
             let committee_index: u64 = match duty.committee_index.parse() {
@@ -1138,6 +1148,16 @@ where
 
         if !signed_aggregates.is_empty() {
             let count = signed_aggregates.len();
+            let source_validators_str = source_validators.join(",");
+
+            let _submit_span = info_span!(
+                "rvc.aggregation.submit",
+                rvc.slot = slot,
+                rvc.aggregation.count = count,
+                rvc.aggregation.source_validators = %source_validators_str,
+            )
+            .entered();
+
             // TODO: For Electra/Fulu, aggregation should build ElectraAggregateAndProof
             // and dispatch via VersionedSignedAggregateAndProof::Electra/Fulu.
             // Currently uses PreElectra for all forks because the aggregate building
@@ -4819,6 +4839,166 @@ mod tests {
     fn test_truncate_pubkey_empty() {
         let result = truncate_pubkey("");
         assert_eq!(result, "0x");
+    }
+
+    // --- H-25: Aggregation span link tests ---
+
+    #[tokio::test]
+    async fn test_aggregation_creates_produce_span() {
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, _, pubkey_hex) =
+            build_aggregation_orchestrator(&mock_server.uri()).await;
+
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        // Mock attester duties — small committee (always aggregator)
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "1",
+                    "committee_length": "8",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "0",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock attestation data
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "1",
+                    "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source": { "epoch": (epoch - 1).to_string(), "root": "0x2222222222222222222222222222222222222222222222222222222222222222" },
+                    "target": { "epoch": epoch.to_string(), "root": "0x3333333333333333333333333333333333333333333333333333333333333333" }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock aggregate attestation
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "aggregation_bits": "0xffffffff",
+                    "data": {
+                        "slot": slot.to_string(),
+                        "index": "1",
+                        "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "source": { "epoch": (epoch - 1).to_string(), "root": "0x2222222222222222222222222222222222222222222222222222222222222222" },
+                        "target": { "epoch": epoch.to_string(), "root": "0x3333333333333333333333333333333333333333333333333333333333333333" }
+                    },
+                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Mock submit aggregate and proofs
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let layer = SpanCapture { names: captured.clone() };
+        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+
+        let span_names = captured.lock().unwrap();
+        assert!(
+            span_names.contains(&"rvc.aggregation.produce".to_string()),
+            "Expected rvc.aggregation.produce span, got: {:?}",
+            *span_names
+        );
+        assert!(
+            span_names.contains(&"rvc.aggregation.submit".to_string()),
+            "Expected rvc.aggregation.submit span, got: {:?}",
+            *span_names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_non_aggregator_creates_produce_span_without_submit() {
+        use wiremock::matchers::{method, path, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, _, pubkey_hex) =
+            build_aggregation_orchestrator(&mock_server.uri()).await;
+
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        // Large committee → unlikely to be aggregator
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "1",
+                    "committee_length": "100000",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "0",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Should NOT call aggregate attestation or submit
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let layer = SpanCapture { names: captured.clone() };
+        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+
+        let span_names = captured.lock().unwrap();
+        // produce span should still be created (it wraps the entire per-validator loop body)
+        assert!(
+            span_names.contains(&"rvc.aggregation.produce".to_string()),
+            "Expected rvc.aggregation.produce span even for non-aggregator, got: {:?}",
+            *span_names
+        );
+        // submit span should NOT be created (no aggregates to submit)
+        assert!(
+            !span_names.contains(&"rvc.aggregation.submit".to_string()),
+            "Did not expect rvc.aggregation.submit span for non-aggregator, got: {:?}",
+            *span_names
+        );
     }
 
     // --- H-14: End-to-end span hierarchy integration tests ---
