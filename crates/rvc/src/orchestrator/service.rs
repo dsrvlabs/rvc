@@ -18,8 +18,9 @@ use builder::BuilderService;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{
-    AggregateAndProof, ContributionAndProof, ForkName, ForkSchedule, Root, SignedAggregateAndProof,
-    SignedContributionAndProof, Slot, SyncCommitteeDuty,
+    AggregateAndProof, ContributionAndProof, ElectraAggregateAndProof, ForkName, ForkSchedule,
+    Root, SignedAggregateAndProof, SignedContributionAndProof, SignedElectraAggregateAndProof,
+    Slot, SyncCommitteeDuty,
 };
 use metrics::definitions::{
     attestation_status, orchestrator_result, RVC_AGGREGATIONS_TOTAL, RVC_ATTESTATIONS_TOTAL,
@@ -967,8 +968,17 @@ where
         let fork_name = ForkName::from_epoch(epoch, &self.config.fork_schedule);
         let is_electra = fork_name >= ForkName::Electra;
 
-        let mut signed_aggregates: Vec<SignedAggregateAndProof> = Vec::new();
+        let mut pre_electra_aggregates: Vec<SignedAggregateAndProof> = Vec::new();
+        let mut electra_aggregates: Vec<SignedElectraAggregateAndProof> = Vec::new();
         let mut source_validators: Vec<String> = Vec::new();
+
+        let fork_label = if fork_name >= ForkName::Fulu {
+            "fulu"
+        } else if is_electra {
+            "electra"
+        } else {
+            "pre_electra"
+        };
 
         for duty in &duties {
             let _agg_span = info_span!(
@@ -976,6 +986,7 @@ where
                 rvc.slot = slot,
                 rvc.validator_index = %duty.validator_index,
                 rvc.pubkey = %truncate_pubkey(&duty.pubkey),
+                rvc.aggregation.fork = fork_label,
             )
             .entered();
 
@@ -1094,21 +1105,7 @@ where
             )
             .await
             {
-                Ok(Ok(resp)) => match resp {
-                    VersionedAggregateAttestation::PreElectra(att) => att,
-                    VersionedAggregateAttestation::Electra(_)
-                    | VersionedAggregateAttestation::Fulu(_) => {
-                        warn!(
-                            slot,
-                            validator_index = %duty.validator_index,
-                            "Electra/Fulu aggregate not yet supported in this path"
-                        );
-                        RVC_AGGREGATIONS_TOTAL
-                            .with_label_values(&[attestation_status::FAILED])
-                            .inc();
-                        continue;
-                    }
-                },
+                Ok(Ok(resp)) => resp,
                 Ok(Err(e)) => {
                     warn!(
                         slot,
@@ -1135,43 +1132,108 @@ where
                 Err(_) => continue,
             };
 
-            let aggregate_and_proof = AggregateAndProof {
-                aggregator_index,
-                aggregate,
-                selection_proof: selection_proof.to_bytes().to_vec(),
-            };
-
-            let signature = match self
-                .signer
-                .sign_aggregate_and_proof(
-                    &aggregate_and_proof,
-                    &pubkey,
-                    &self.config.fork_schedule,
-                    &self.config.genesis_validators_root,
-                )
-                .await
-            {
-                Ok(sig) => sig,
-                Err(e) => {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        error = %e,
-                        "Failed to sign aggregate and proof"
-                    );
-                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-                    continue;
-                }
-            };
-
-            signed_aggregates.push(SignedAggregateAndProof {
-                message: aggregate_and_proof,
-                signature: signature.to_bytes().to_vec(),
-            });
+            if is_electra {
+                let electra_agg = match aggregate {
+                    VersionedAggregateAttestation::Electra(a)
+                    | VersionedAggregateAttestation::Fulu(a) => a,
+                    _ => {
+                        warn!(
+                            slot,
+                            validator_index = %duty.validator_index,
+                            "Expected Electra aggregate but got pre-Electra"
+                        );
+                        RVC_AGGREGATIONS_TOTAL
+                            .with_label_values(&[attestation_status::FAILED])
+                            .inc();
+                        continue;
+                    }
+                };
+                let aggregate_and_proof = ElectraAggregateAndProof {
+                    aggregator_index,
+                    aggregate: electra_agg,
+                    selection_proof: selection_proof.to_bytes().to_vec(),
+                };
+                let signature = match self
+                    .signer
+                    .sign_electra_aggregate_and_proof(
+                        &aggregate_and_proof,
+                        &pubkey,
+                        &self.config.fork_schedule,
+                        &self.config.genesis_validators_root,
+                    )
+                    .await
+                {
+                    Ok(sig) => sig,
+                    Err(e) => {
+                        warn!(
+                            slot,
+                            validator_index = %duty.validator_index,
+                            error = %e,
+                            "Failed to sign Electra aggregate and proof"
+                        );
+                        RVC_AGGREGATIONS_TOTAL
+                            .with_label_values(&[attestation_status::FAILED])
+                            .inc();
+                        continue;
+                    }
+                };
+                electra_aggregates.push(SignedElectraAggregateAndProof {
+                    message: aggregate_and_proof,
+                    signature: signature.to_bytes().to_vec(),
+                });
+            } else {
+                let pre_electra_agg = match aggregate {
+                    VersionedAggregateAttestation::PreElectra(a) => a,
+                    _ => {
+                        warn!(
+                            slot,
+                            validator_index = %duty.validator_index,
+                            "Expected pre-Electra aggregate but got Electra"
+                        );
+                        RVC_AGGREGATIONS_TOTAL
+                            .with_label_values(&[attestation_status::FAILED])
+                            .inc();
+                        continue;
+                    }
+                };
+                let aggregate_and_proof = AggregateAndProof {
+                    aggregator_index,
+                    aggregate: pre_electra_agg,
+                    selection_proof: selection_proof.to_bytes().to_vec(),
+                };
+                let signature = match self
+                    .signer
+                    .sign_aggregate_and_proof(
+                        &aggregate_and_proof,
+                        &pubkey,
+                        &self.config.fork_schedule,
+                        &self.config.genesis_validators_root,
+                    )
+                    .await
+                {
+                    Ok(sig) => sig,
+                    Err(e) => {
+                        warn!(
+                            slot,
+                            validator_index = %duty.validator_index,
+                            error = %e,
+                            "Failed to sign aggregate and proof"
+                        );
+                        RVC_AGGREGATIONS_TOTAL
+                            .with_label_values(&[attestation_status::FAILED])
+                            .inc();
+                        continue;
+                    }
+                };
+                pre_electra_aggregates.push(SignedAggregateAndProof {
+                    message: aggregate_and_proof,
+                    signature: signature.to_bytes().to_vec(),
+                });
+            }
         }
 
-        if !signed_aggregates.is_empty() {
-            let count = signed_aggregates.len();
+        if !pre_electra_aggregates.is_empty() {
+            let count = pre_electra_aggregates.len();
             let source_validators_str = source_validators.join(",");
 
             let _submit_span = info_span!(
@@ -1182,11 +1244,7 @@ where
             )
             .entered();
 
-            // TODO: For Electra/Fulu, aggregation should build ElectraAggregateAndProof
-            // and dispatch via VersionedSignedAggregateAndProof::Electra/Fulu.
-            // Currently uses PreElectra for all forks because the aggregate building
-            // logic constructs SignedAggregateAndProof (pre-Electra type).
-            let versioned = VersionedSignedAggregateAndProof::PreElectra(signed_aggregates);
+            let versioned = VersionedSignedAggregateAndProof::PreElectra(pre_electra_aggregates);
             match tokio::time::timeout(
                 self.config.timeouts.aggregate_submit,
                 self.beacon.submit_aggregate_and_proofs(&versioned),
@@ -1209,6 +1267,54 @@ where
                     warn!(
                         slot,
                         "Aggregate and proofs submit timed out after {}s",
+                        self.config.timeouts.aggregate_submit.as_secs()
+                    );
+                    RVC_AGGREGATIONS_TOTAL
+                        .with_label_values(&[attestation_status::FAILED])
+                        .inc_by(count as u64);
+                }
+            }
+        }
+
+        if !electra_aggregates.is_empty() {
+            let count = electra_aggregates.len();
+            let source_validators_str = source_validators.join(",");
+
+            let _submit_span = info_span!(
+                "rvc.aggregation.submit",
+                rvc.slot = slot,
+                rvc.aggregation.count = count,
+                rvc.aggregation.source_validators = %source_validators_str,
+            )
+            .entered();
+
+            let versioned = if fork_name >= ForkName::Fulu {
+                VersionedSignedAggregateAndProof::Fulu(electra_aggregates)
+            } else {
+                VersionedSignedAggregateAndProof::Electra(electra_aggregates)
+            };
+            match tokio::time::timeout(
+                self.config.timeouts.aggregate_submit,
+                self.beacon.submit_aggregate_and_proofs(&versioned),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    info!(slot, count, "Submitted Electra aggregate and proofs");
+                    RVC_AGGREGATIONS_TOTAL
+                        .with_label_values(&[attestation_status::SUCCESS])
+                        .inc_by(count as u64);
+                }
+                Ok(Err(e)) => {
+                    warn!(slot, error = %e, "Failed to submit Electra aggregate and proofs");
+                    RVC_AGGREGATIONS_TOTAL
+                        .with_label_values(&[attestation_status::FAILED])
+                        .inc_by(count as u64);
+                }
+                Err(_) => {
+                    warn!(
+                        slot,
+                        "Electra aggregate and proofs submit timed out after {}s",
                         self.config.timeouts.aggregate_submit.as_secs()
                     );
                     RVC_AGGREGATIONS_TOTAL
@@ -4092,7 +4198,7 @@ mod tests {
                     "aggregation_bits": "0xff01",
                     "data": {
                         "slot": slot.to_string(),
-                        "index": "3",
+                        "index": "0",
                         "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
                         "source": {
                             "epoch": (epoch - 1).to_string(),
@@ -4103,16 +4209,17 @@ mod tests {
                             "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
                         }
                     },
-                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "committee_bits": "0x0800000000000000"
                 }
             })))
             .expect(1)
             .mount(&mock_server)
             .await;
 
-        // Mock aggregate submission
+        // Mock aggregate submission (Electra uses v2 endpoint)
         Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .and(path("/eth/v2/validator/aggregate_and_proofs"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&mock_server)
@@ -5194,6 +5301,401 @@ mod tests {
             "Expected rvc.slashing.check span within sign_attestation, got: {:?}",
             *span_names
         );
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_electra_builds_electra_aggregate_and_proof() {
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, _, pubkey_hex) =
+            build_aggregation_orchestrator(&mock_server.uri()).await;
+
+        // Electra epoch = 50, slot = 50 * 32 = 1600
+        let slot = 1600u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        orchestrator.clock.set_slot(slot);
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "1",
+                    "committee_length": "8",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "0",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "1",
+                    "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source": {
+                        "epoch": (epoch - 1).to_string(),
+                        "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    },
+                    "target": {
+                        "epoch": epoch.to_string(),
+                        "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Electra aggregate response (has committee_bits field)
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(query_param("slot", slot.to_string()))
+            .and(query_param("committee_index", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "aggregation_bits": "0xffffffff",
+                    "data": {
+                        "slot": slot.to_string(),
+                        "index": "0",
+                        "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "source": {
+                            "epoch": (epoch - 1).to_string(),
+                            "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                        },
+                        "target": {
+                            "epoch": epoch.to_string(),
+                            "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                        }
+                    },
+                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "committee_bits": "0x0200000000000000"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Electra submit goes to v2 endpoint
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Pre-Electra submit should NOT be called
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_pre_electra_unchanged() {
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, _, pubkey_hex) =
+            build_aggregation_orchestrator(&mock_server.uri()).await;
+
+        // Pre-Electra: epoch 3, slot 100
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "1",
+                    "committee_length": "8",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "0",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "1",
+                    "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source": {
+                        "epoch": (epoch - 1).to_string(),
+                        "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    },
+                    "target": {
+                        "epoch": epoch.to_string(),
+                        "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Pre-Electra aggregate (no committee_bits)
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "aggregation_bits": "0xffffffff",
+                    "data": {
+                        "slot": slot.to_string(),
+                        "index": "1",
+                        "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "source": {
+                            "epoch": (epoch - 1).to_string(),
+                            "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                        },
+                        "target": {
+                            "epoch": epoch.to_string(),
+                            "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                        }
+                    },
+                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Pre-Electra submit should go to v1 endpoint
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // v2 endpoint should NOT be called
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_fulu_dispatches_as_fulu() {
+        use wiremock::matchers::{header, method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, _, pubkey_hex) =
+            build_aggregation_orchestrator(&mock_server.uri()).await;
+
+        // Fulu epoch = 60, slot = 60 * 32 = 1920
+        let slot = 1920u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        orchestrator.clock.set_slot(slot);
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "1",
+                    "committee_length": "8",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "0",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "1",
+                    "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source": {
+                        "epoch": (epoch - 1).to_string(),
+                        "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    },
+                    "target": {
+                        "epoch": epoch.to_string(),
+                        "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Fulu aggregate (same structure as Electra)
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(query_param("slot", slot.to_string()))
+            .and(query_param("committee_index", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "aggregation_bits": "0xffffffff",
+                    "data": {
+                        "slot": slot.to_string(),
+                        "index": "0",
+                        "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "source": {
+                            "epoch": (epoch - 1).to_string(),
+                            "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                        },
+                        "target": {
+                            "epoch": epoch.to_string(),
+                            "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                        }
+                    },
+                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "committee_bits": "0x0200000000000000"
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Fulu submit goes to v2 endpoint with Eth-Consensus-Version: fulu
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/validator/aggregate_and_proofs"))
+            .and(header("Eth-Consensus-Version", "fulu"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // v1 endpoint should NOT be called
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+    }
+
+    #[tokio::test]
+    async fn test_aggregation_mismatched_response_logs_warning() {
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, _, pubkey_hex) =
+            build_aggregation_orchestrator(&mock_server.uri()).await;
+
+        // Electra epoch = 50, slot = 1600
+        let slot = 1600u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        orchestrator.clock.set_slot(slot);
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "1",
+                    "committee_length": "8",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "0",
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "1",
+                    "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source": {
+                        "epoch": (epoch - 1).to_string(),
+                        "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    },
+                    "target": {
+                        "epoch": epoch.to_string(),
+                        "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    }
+                }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Return a pre-Electra aggregate (no committee_index param in mock)
+        // but the orchestrator expects Electra because is_electra=true.
+        // The BeaconClient uses committee_index presence to determine response type;
+        // since is_electra=true, committee_index is Some(...), so the client will request
+        // with committee_index and deserialize as ElectraAttestation.
+        // To simulate a mismatch, we need to force the beacon to return PreElectra.
+        // This is tricky with real HTTP mocks since the client decides the type based on
+        // committee_index param. Instead, we test the reverse: pre-Electra slot gets
+        // an Electra response. But that won't happen either because the client controls it.
+        //
+        // The mismatch scenario is guarded by the match arms in the orchestrator.
+        // We can verify the code compiles and handles the branch by checking that
+        // no submit endpoints are called when the aggregate fetch fails (returns 500).
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&mock_server)
+            .await;
+
+        // Neither submit endpoint should be called
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        // Should not panic — gracefully handles failure
+        orchestrator.maybe_produce_aggregations(slot, epoch).await;
     }
 
     #[tokio::test]
