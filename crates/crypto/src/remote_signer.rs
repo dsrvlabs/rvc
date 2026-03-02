@@ -3,10 +3,25 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
+
+use url::Url;
 
 use super::bls::{Signature, PUBLIC_KEY_BYTES_LEN};
 use super::signer_trait::{Signer, SigningError};
 use eth_types::Root;
+
+fn redact_url(url: &str) -> String {
+    if let Ok(mut parsed) = Url::parse(url) {
+        if parsed.password().is_some() || !parsed.username().is_empty() {
+            let _ = parsed.set_username("***");
+            let _ = parsed.set_password(Some("***"));
+        }
+        parsed.to_string()
+    } else {
+        url.to_string()
+    }
+}
 
 const DEFAULT_TIMEOUT_SECS: u64 = 12;
 
@@ -77,33 +92,48 @@ impl Signer for RemoteSigner {
         let identifier = format!("0x{}", hex::encode(pubkey));
         let url = format!("{}/api/v1/eth2/sign/{}", self.url, identifier);
 
-        let request_body = SignRequest { signing_root: format!("0x{}", hex::encode(signing_root)) };
+        let span = tracing::info_span!(
+            "rvc.sign.remote",
+            http.method = "POST",
+            http.url = %redact_url(&url),
+            http.status_code = tracing::field::Empty,
+            rvc.signer_type = "remote",
+        );
 
-        let response =
-            self.client.post(&url).json(&request_body).send().await.map_err(|e| {
-                SigningError::RemoteSignerError(format!("HTTP request failed: {e}"))
+        async {
+            let request_body =
+                SignRequest { signing_root: format!("0x{}", hex::encode(signing_root)) };
+
+            let response =
+                self.client.post(&url).json(&request_body).send().await.map_err(|e| {
+                    SigningError::RemoteSignerError(format!("HTTP request failed: {e}"))
+                })?;
+
+            let status = response.status();
+            tracing::Span::current().record("http.status_code", status.as_u16());
+
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(SigningError::RemoteSignerError(format!(
+                    "Web3Signer returned {status}: {body}"
+                )));
+            }
+
+            let sign_response: SignResponse = response.json().await.map_err(|e| {
+                SigningError::RemoteSignerError(format!("invalid response body: {e}"))
             })?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(SigningError::RemoteSignerError(format!(
-                "Web3Signer returned {status}: {body}"
-            )));
+            let sig_hex =
+                sign_response.signature.strip_prefix("0x").unwrap_or(&sign_response.signature);
+            let sig_bytes = hex::decode(sig_hex).map_err(|e| {
+                SigningError::RemoteSignerError(format!("invalid signature hex: {e}"))
+            })?;
+
+            Signature::from_bytes(&sig_bytes)
+                .map_err(|e| SigningError::RemoteSignerError(format!("invalid BLS signature: {e}")))
         }
-
-        let sign_response: SignResponse = response
-            .json()
-            .await
-            .map_err(|e| SigningError::RemoteSignerError(format!("invalid response body: {e}")))?;
-
-        let sig_hex =
-            sign_response.signature.strip_prefix("0x").unwrap_or(&sign_response.signature);
-        let sig_bytes = hex::decode(sig_hex)
-            .map_err(|e| SigningError::RemoteSignerError(format!("invalid signature hex: {e}")))?;
-
-        Signature::from_bytes(&sig_bytes)
-            .map_err(|e| SigningError::RemoteSignerError(format!("invalid BLS signature: {e}")))
+        .instrument(span)
+        .await
     }
 
     fn public_keys(&self) -> Vec<[u8; PUBLIC_KEY_BYTES_LEN]> {
@@ -321,6 +351,251 @@ mod tests {
         let config = RemoteSignerConfig::new("http://localhost:9000");
         let signer = RemoteSigner::new(config, vec![]).unwrap();
         assert!(signer.public_keys().is_empty());
+    }
+
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    struct SpanCapture {
+        spans: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SpanCapture {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.spans.lock().unwrap().push(attrs.metadata().name().to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sign_creates_remote_span() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let signing_root: Root = [0xab; 32];
+
+        let expected_sig = sk.sign(&signing_root);
+        let sig_hex = format!("0x{}", hex::encode(expected_sig.to_bytes()));
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/api/v1/eth2/sign/.*"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"signature": sig_hex})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = RemoteSignerConfig::new(mock_server.uri());
+        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+
+        let spans = Arc::new(Mutex::new(Vec::new()));
+        let layer = SpanCapture { spans: spans.clone() };
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result = signer.sign(&signing_root, &pk_bytes).await;
+        assert!(result.is_ok());
+
+        let captured = spans.lock().unwrap();
+        assert!(
+            captured.contains(&"rvc.sign.remote".to_string()),
+            "Expected rvc.sign.remote span, got: {:?}",
+            *captured
+        );
+    }
+
+    struct FieldCapture {
+        fields: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl<S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>>
+        tracing_subscriber::Layer<S> for FieldCapture
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = FieldVisitor(self.fields.clone());
+            attrs.record(&mut visitor);
+        }
+
+        fn on_record(
+            &self,
+            _id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut visitor = FieldVisitor(self.fields.clone());
+            values.record(&mut visitor);
+        }
+    }
+
+    struct FieldVisitor(Arc<Mutex<Vec<(String, String)>>>);
+
+    impl tracing::field::Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.lock().unwrap().push((field.name().to_string(), format!("{:?}", value)));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.lock().unwrap().push((field.name().to_string(), value.to_string()));
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.lock().unwrap().push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sign_span_records_status_code() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let signing_root: Root = [0xab; 32];
+
+        let expected_sig = sk.sign(&signing_root);
+        let sig_hex = format!("0x{}", hex::encode(expected_sig.to_bytes()));
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/api/v1/eth2/sign/.*"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"signature": sig_hex})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = RemoteSignerConfig::new(mock_server.uri());
+        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+
+        let fields = Arc::new(Mutex::new(Vec::new()));
+        let layer = FieldCapture { fields: fields.clone() };
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result = signer.sign(&signing_root, &pk_bytes).await;
+        assert!(result.is_ok());
+
+        let captured = fields.lock().unwrap();
+        assert!(
+            captured.iter().any(|(k, v)| k == "http.method" && v == "POST"),
+            "Expected http.method=POST, got: {:?}",
+            *captured
+        );
+        assert!(
+            captured.iter().any(|(k, v)| k == "rvc.signer_type" && v == "remote"),
+            "Expected rvc.signer_type=remote, got: {:?}",
+            *captured
+        );
+        assert!(
+            captured.iter().any(|(k, v)| k == "http.status_code" && v == "200"),
+            "Expected http.status_code=200, got: {:?}",
+            *captured
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sign_span_records_error_status_code() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/api/v1/eth2/sign/.*"))
+            .respond_with(
+                ResponseTemplate::new(500).set_body_json(serde_json::json!({"error": "internal"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let pk_bytes = [0xaa; PUBLIC_KEY_BYTES_LEN];
+        let config = RemoteSignerConfig::new(mock_server.uri());
+        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+
+        let fields = Arc::new(Mutex::new(Vec::new()));
+        let layer = FieldCapture { fields: fields.clone() };
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result = signer.sign(&[0xab; 32], &pk_bytes).await;
+        assert!(result.is_err());
+
+        let captured = fields.lock().unwrap();
+        assert!(
+            captured.iter().any(|(k, v)| k == "http.status_code" && v == "500"),
+            "Expected http.status_code=500, got: {:?}",
+            *captured
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sign_span_redacts_url_credentials() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let signing_root: Root = [0xab; 32];
+
+        let expected_sig = sk.sign(&signing_root);
+        let sig_hex = format!("0x{}", hex::encode(expected_sig.to_bytes()));
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/api/v1/eth2/sign/.*"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"signature": sig_hex})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        // Use mock server URI but construct a URL with credentials for redaction test
+        // We test the redact_url function directly since wiremock uses http://127.0.0.1:PORT
+        let url_with_creds = "http://user:secret@signer.example.com:9000";
+        let config = RemoteSignerConfig::new(url_with_creds);
+        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+
+        let fields = Arc::new(Mutex::new(Vec::new()));
+        let layer = FieldCapture { fields: fields.clone() };
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        // This will fail to connect but we just want to check the span field
+        let _ = signer.sign(&signing_root, &pk_bytes).await;
+
+        let captured = fields.lock().unwrap();
+        let http_url = captured.iter().find(|(k, _)| k == "http.url");
+        assert!(http_url.is_some(), "Expected http.url field, got: {:?}", *captured);
+        let (_, url_value) = http_url.unwrap();
+        assert!(!url_value.contains("user"), "URL should not contain username: {url_value}");
+        assert!(!url_value.contains("secret"), "URL should not contain password: {url_value}");
+        assert!(url_value.contains("***"), "URL should contain redacted marker: {url_value}");
+    }
+
+    #[test]
+    fn test_redact_url_hides_credentials() {
+        let url = "http://user:pass@example.com:9000/api";
+        let redacted = redact_url(url);
+        assert!(!redacted.contains("user"));
+        assert!(!redacted.contains("pass"));
+        assert!(redacted.contains("***"));
+        assert!(redacted.contains("example.com"));
+    }
+
+    #[test]
+    fn test_redact_url_preserves_url_without_credentials() {
+        let url = "http://example.com:9000/api";
+        let redacted = redact_url(url);
+        assert_eq!(redacted, "http://example.com:9000/api");
+    }
+
+    #[test]
+    fn test_redact_url_handles_invalid_url() {
+        let url = "not-a-url";
+        let redacted = redact_url(url);
+        assert_eq!(redacted, "not-a-url");
     }
 
     #[tokio::test]
