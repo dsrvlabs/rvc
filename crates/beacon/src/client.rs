@@ -216,11 +216,13 @@ impl BeaconClient {
     ///
     /// Returns a map of all configuration parameters as string key-value pairs.
     /// Includes fork versions, fork epochs, slot timing, and other consensus parameters.
+    #[tracing::instrument(name = "rvc.beacon.get_config_spec", skip_all)]
     pub async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
         self.get("/eth/v1/config/spec").await
     }
 
     /// Fetches the config spec and parses fork epoch and version fields into a `ForkSchedule`.
+    #[tracing::instrument(name = "rvc.beacon.get_fork_schedule", skip_all)]
     pub async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
         let spec = self.get_config_spec().await?;
         parse_fork_schedule(&spec.data)
@@ -229,6 +231,7 @@ impl BeaconClient {
     /// Fetches genesis information from the beacon node.
     ///
     /// Returns the genesis time, genesis validators root, and genesis fork version.
+    #[tracing::instrument(name = "rvc.beacon.get_genesis", skip_all)]
     pub async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
         self.get("/eth/v1/beacon/genesis").await
     }
@@ -237,6 +240,7 @@ impl BeaconClient {
     ///
     /// Returns the previous and current fork versions along with the fork epoch.
     /// Common state_id values: "head", "finalized", "justified", or a specific slot number.
+    #[tracing::instrument(name = "rvc.beacon.get_fork", skip_all)]
     pub async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError> {
         let path = format!("/eth/v1/beacon/states/{}/fork", state_id);
         self.get(&path).await
@@ -245,6 +249,7 @@ impl BeaconClient {
     /// Fetches the block root for the given block identifier.
     ///
     /// Common block_id values: "head", "finalized", "justified", or a slot number.
+    #[tracing::instrument(name = "rvc.beacon.get_block_root", skip_all)]
     pub async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
         let path = format!("/eth/v1/beacon/blocks/{}/root", block_id);
         self.get(&path).await
@@ -554,6 +559,7 @@ impl BeaconClient {
     }
 
     /// Fetches a sync committee contribution for the given slot, subcommittee index, and block root.
+    #[tracing::instrument(name = "rvc.beacon.get_sync_committee_contribution", skip_all, fields(rvc.slot = slot))]
     pub async fn get_sync_committee_contribution(
         &self,
         slot: u64,
@@ -583,6 +589,7 @@ impl BeaconClient {
     ///
     /// The `committee_index` parameter is required for Electra and later forks.
     /// Pass `None` for pre-Electra requests.
+    #[tracing::instrument(name = "rvc.beacon.get_aggregate_attestation", skip_all, fields(rvc.slot = slot))]
     pub async fn get_aggregate_attestation(
         &self,
         slot: u64,
@@ -633,6 +640,7 @@ impl BeaconClient {
     ///
     /// Returns liveness data indicating whether each validator was active
     /// during the specified epoch. Used for doppelganger detection.
+    #[tracing::instrument(name = "rvc.beacon.post_validator_liveness", skip_all, fields(rvc.epoch = epoch))]
     pub async fn post_validator_liveness(
         &self,
         epoch: u64,
@@ -684,11 +692,13 @@ impl BeaconClient {
     ///
     /// Returns whether the node is syncing, its head slot, sync distance,
     /// and whether the execution layer is offline.
+    #[tracing::instrument(name = "rvc.beacon.get_node_syncing", skip_all)]
     pub async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
         self.get("/eth/v1/node/syncing").await
     }
 
     /// Fetches the node version string from the beacon node.
+    #[tracing::instrument(name = "rvc.beacon.get_node_version", skip_all)]
     pub async fn get_node_version(&self) -> Result<String, BeaconError> {
         let response: crate::types::NodeVersionResponse = self.get("/eth/v1/node/version").await?;
         Ok(response.data.version)

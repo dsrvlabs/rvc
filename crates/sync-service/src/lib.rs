@@ -110,6 +110,7 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
         Self { signer, beacon, fork_schedule, genesis_validators_root }
     }
 
+    #[tracing::instrument(name = "rvc.sync.produce_messages", skip_all, fields(rvc.slot = slot, rvc.duty_count = duties.len()))]
     pub async fn produce_sync_messages(
         &self,
         slot: Slot,
@@ -155,6 +156,7 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
         Ok(SyncMessagesResult { count: messages.len() })
     }
 
+    #[tracing::instrument(name = "rvc.sync.produce_contributions", skip_all, fields(rvc.slot = slot, rvc.duty_count = duties.len()))]
     pub async fn produce_contributions(
         &self,
         slot: Slot,

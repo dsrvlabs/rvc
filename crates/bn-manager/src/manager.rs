@@ -135,6 +135,7 @@ impl BnManager {
     }
 
     /// Returns current health scores for all BNs.
+    #[tracing::instrument(name = "rvc.bn_manager.health_scores", skip_all)]
     pub async fn health_scores(&self) -> Vec<BnHealthScore> {
         let guard = self.health_trackers.read().await;
         guard
@@ -153,6 +154,7 @@ impl BnManager {
     }
 
     /// Checks sync status of all configured BNs immediately.
+    #[tracing::instrument(name = "rvc.bn_manager.check_sync_status", skip_all)]
     pub async fn check_sync_status(&self) {
         check_all_sync_statuses(&self.clients, &self.sync_statuses).await;
     }
@@ -195,6 +197,7 @@ impl BnManager {
 
     /// Returns indices of synced+healthy BNs, ordered by health score (highest first).
     /// Falls back to all BNs if none are synced (single-BN mode logs a warning).
+    #[tracing::instrument(name = "rvc.bn_manager.synced_indices", skip_all)]
     async fn synced_indices(&self) -> Vec<usize> {
         let sync_guard = self.sync_statuses.read().await;
         let health_guard = self.health_trackers.read().await;

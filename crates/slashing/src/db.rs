@@ -318,6 +318,7 @@ impl SlashingDb {
         Ok(pubkeys)
     }
 
+    #[tracing::instrument(name = "rvc.slashing.db.export", skip_all)]
     pub fn export(
         &self,
         genesis_validators_root: &str,
@@ -358,6 +359,7 @@ impl SlashingDb {
         })
     }
 
+    #[tracing::instrument(name = "rvc.slashing.db.import", skip_all)]
     pub fn import(
         &self,
         interchange: &InterchangeFormat,
@@ -971,6 +973,7 @@ impl SlashingDb {
     /// Delete slashing protection records below all set watermarks.
     ///
     /// Returns an error if no watermarks are set (safety: prevents accidental deletion of all records).
+    #[tracing::instrument(name = "rvc.slashing.db.prune", skip_all)]
     pub fn prune_below_watermarks(&self) -> Result<PruneStats, SlashingError> {
         let mut conn = self.conn.lock().expect("mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;

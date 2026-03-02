@@ -375,6 +375,7 @@ where
         }
     }
 
+    #[tracing::instrument(name = "rvc.orchestrator.fetch_epoch_duties", skip_all, fields(rvc.epoch = epoch))]
     async fn fetch_epoch_duties(&self, epoch: u64) {
         // Evict old caches to prevent unbounded growth
         self.duty_tracker.evict_old_caches(epoch).await;
@@ -437,6 +438,7 @@ where
         }
     }
 
+    #[tracing::instrument(name = "rvc.orchestrator.check_reorg", skip_all, fields(rvc.epoch = current_epoch))]
     async fn check_reorg_at_epoch_boundary(&self, current_epoch: u64) {
         for epoch in [current_epoch, current_epoch + 1] {
             let attester_cached = self.duty_tracker.is_epoch_cached(epoch).await;
@@ -495,6 +497,7 @@ where
         }
     }
 
+    #[tracing::instrument(name = "rvc.orchestrator.prepare_proposers", skip_all)]
     async fn prepare_proposers(&self) {
         let mut preparations = Vec::new();
 
@@ -561,6 +564,7 @@ where
         }
     }
 
+    #[tracing::instrument(name = "rvc.orchestrator.submit_committee_subscriptions", skip_all, fields(rvc.epoch = epoch))]
     async fn submit_committee_subscriptions(&self, epoch: u64) {
         let mut subscriptions = Vec::new();
 
@@ -647,6 +651,7 @@ where
         }
     }
 
+    #[tracing::instrument(name = "rvc.orchestrator.register_builders", skip_all)]
     async fn register_builders(&self) {
         let builder_service = match &self.builder_service {
             Some(bs) => bs.clone(),
@@ -672,6 +677,7 @@ where
         }
     }
 
+    #[tracing::instrument(name = "rvc.orchestrator.maybe_propose_block", skip_all, fields(rvc.slot = slot, rvc.epoch = epoch))]
     async fn maybe_propose_block(&self, slot: Slot, epoch: u64) {
         let proposer_duty = match self.duty_tracker.get_proposer_duty(slot).await {
             Some(duty) => duty,
@@ -722,6 +728,7 @@ where
         }
     }
 
+    #[tracing::instrument(name = "rvc.orchestrator.produce_sync_messages", skip_all, fields(rvc.slot = slot))]
     async fn maybe_produce_sync_messages(&self, slot: Slot, _epoch: u64) {
         let duties = self.duty_tracker.get_sync_committee_duties(slot).await;
         if duties.is_empty() {
@@ -790,6 +797,7 @@ where
         }
     }
 
+    #[tracing::instrument(name = "rvc.orchestrator.produce_sync_contributions", skip_all, fields(rvc.slot = slot))]
     async fn maybe_produce_sync_contributions(&self, slot: Slot, _epoch: u64) {
         let duties = self.duty_tracker.get_sync_committee_duties(slot).await;
         if duties.is_empty() {
@@ -944,6 +952,7 @@ where
         }
     }
 
+    #[tracing::instrument(name = "rvc.orchestrator.produce_aggregations", skip_all, fields(rvc.slot = slot, rvc.epoch = epoch))]
     async fn maybe_produce_aggregations(&self, slot: Slot, epoch: u64) {
         let duties = match self.get_duties_for_slot(slot).await {
             Ok(d) => d,
@@ -1248,6 +1257,7 @@ where
     /// Validators are processed sequentially within each slot to work with
     /// the non-Send/Sync `SlashingDb`. For high validator counts, consider
     /// making `SlashingDb` thread-safe with proper locking for concurrent processing.
+    #[tracing::instrument(name = "rvc.orchestrator.process_slot", skip_all, fields(rvc.slot = slot))]
     pub async fn process_slot(
         &self,
         slot: Slot,
