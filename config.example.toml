@@ -109,6 +109,12 @@ log_level = "info"
 # Env var fallback: OTEL_TRACES_SAMPLER_ARG (only if this field is at default)
 # tracing_sample_rate = 0.01
 
+# Maximum number of spans queued for export (OTel SDK default: 2048).
+# tracing_max_queue_size = 2048
+
+# Maximum number of spans per export batch (OTel SDK default: 512).
+# tracing_max_export_batch_size = 512
+
 # GCP Cloud Trace: set tracing_exporter = "gcp" (requires --features gcp-trace).
 # Uses Application Default Credentials (ADC) — no endpoint needed.
 # On shutdown, pending spans are flushed with a 5-second timeout.

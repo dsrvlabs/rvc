@@ -75,6 +75,12 @@ pub struct Config {
 
     #[serde(default = "default_tracing_sample_rate")]
     pub tracing_sample_rate: f64,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracing_max_queue_size: Option<usize>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracing_max_export_batch_size: Option<usize>,
 }
 
 fn default_tracing_exporter() -> String {
@@ -112,6 +118,8 @@ impl Default for Config {
             tracing_endpoint: None,
             tracing_exporter: default_tracing_exporter(),
             tracing_sample_rate: default_tracing_sample_rate(),
+            tracing_max_queue_size: None,
+            tracing_max_export_batch_size: None,
         }
     }
 }
@@ -343,6 +351,14 @@ impl Config {
         if let Some(tracing_sample_rate) = cli.tracing_sample_rate {
             self.tracing_sample_rate = tracing_sample_rate;
         }
+
+        if let Some(n) = cli.tracing_max_queue_size {
+            self.tracing_max_queue_size = Some(n);
+        }
+
+        if let Some(n) = cli.tracing_max_export_batch_size {
+            self.tracing_max_export_batch_size = Some(n);
+        }
     }
 }
 
@@ -389,6 +405,8 @@ pub struct CliOverrides {
     pub tracing_endpoint: Option<String>,
     pub tracing_exporter: Option<String>,
     pub tracing_sample_rate: Option<f64>,
+    pub tracing_max_queue_size: Option<usize>,
+    pub tracing_max_export_batch_size: Option<usize>,
 }
 
 #[cfg(test)]
@@ -936,6 +954,82 @@ log_level = "info"
         assert!(config.tracing_endpoint.is_none());
         assert_eq!(config.tracing_exporter, "otlp");
         assert!((config.tracing_sample_rate - 0.01).abs() < f64::EPSILON);
+    }
+
+    // -- tracing batch config tests --
+
+    #[test]
+    fn test_default_config_tracing_batch_fields_none() {
+        let config = Config::default();
+        assert!(config.tracing_max_queue_size.is_none());
+        assert!(config.tracing_max_export_batch_size.is_none());
+    }
+
+    #[test]
+    fn test_merge_with_cli_tracing_max_queue_size() {
+        let mut config = Config::default();
+        let cli = CliOverrides { tracing_max_queue_size: Some(4096), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.tracing_max_queue_size, Some(4096));
+    }
+
+    #[test]
+    fn test_merge_with_cli_tracing_max_export_batch_size() {
+        let mut config = Config::default();
+        let cli = CliOverrides { tracing_max_export_batch_size: Some(1024), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.tracing_max_export_batch_size, Some(1024));
+    }
+
+    #[test]
+    fn test_merge_with_cli_tracing_batch_none_preserves_defaults() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+        config.merge_with_cli(&cli);
+        assert!(config.tracing_max_queue_size.is_none());
+        assert!(config.tracing_max_export_batch_size.is_none());
+    }
+
+    #[test]
+    fn test_config_from_file_with_tracing_batch() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+tracing_max_queue_size = 4096
+tracing_max_export_batch_size = 1024
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(config.tracing_max_queue_size, Some(4096));
+        assert_eq!(config.tracing_max_export_batch_size, Some(1024));
+    }
+
+    #[test]
+    fn test_config_from_file_without_tracing_batch_uses_defaults() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert!(config.tracing_max_queue_size.is_none());
+        assert!(config.tracing_max_export_batch_size.is_none());
     }
 
     // -- redact_url tests --

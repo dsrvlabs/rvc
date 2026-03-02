@@ -37,6 +37,10 @@ pub struct TelemetryConfig {
     /// Binary version for `service.version` resource attribute.
     /// When `None`, falls back to the telemetry crate's own version.
     pub service_version: Option<String>,
+    /// Maximum number of spans queued for export (OTel SDK default: 2048).
+    pub max_queue_size: Option<usize>,
+    /// Maximum number of spans per export batch (OTel SDK default: 512).
+    pub max_export_batch_size: Option<usize>,
 }
 
 impl fmt::Debug for TelemetryConfig {
@@ -58,6 +62,8 @@ impl Default for TelemetryConfig {
             sample_rate: 1.0,
             network: "mainnet".to_string(),
             service_version: None,
+            max_queue_size: None,
+            max_export_batch_size: None,
         }
     }
 }
@@ -262,6 +268,29 @@ mod tests {
         let config =
             TelemetryConfig { service_version: Some("1.2.3".to_string()), ..Default::default() };
         assert_eq!(config.service_version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn test_max_queue_size_default_is_none() {
+        let config = TelemetryConfig::default();
+        assert!(config.max_queue_size.is_none());
+    }
+
+    #[test]
+    fn test_max_export_batch_size_default_is_none() {
+        let config = TelemetryConfig::default();
+        assert!(config.max_export_batch_size.is_none());
+    }
+
+    #[test]
+    fn test_batch_config_custom_values() {
+        let config = TelemetryConfig {
+            max_queue_size: Some(4096),
+            max_export_batch_size: Some(1024),
+            ..Default::default()
+        };
+        assert_eq!(config.max_queue_size, Some(4096));
+        assert_eq!(config.max_export_batch_size, Some(1024));
     }
 
     #[cfg(feature = "gcp-trace")]

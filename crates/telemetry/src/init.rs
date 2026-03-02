@@ -4,7 +4,9 @@ use opentelemetry::trace::TracerProvider;
 use opentelemetry::KeyValue;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
-use opentelemetry_sdk::trace::{Sampler, SdkTracerProvider};
+use opentelemetry_sdk::trace::{
+    BatchConfigBuilder, BatchSpanProcessor, Sampler, SdkTracerProvider,
+};
 use opentelemetry_sdk::Resource;
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::layer::Layer;
@@ -61,10 +63,22 @@ fn build_provider(
                 .with_http()
                 .with_endpoint(&config.endpoint)
                 .build()?;
+
+            let mut batch_config = BatchConfigBuilder::default();
+            if let Some(queue_size) = config.max_queue_size {
+                batch_config = batch_config.with_max_queue_size(queue_size);
+            }
+            if let Some(batch_size) = config.max_export_batch_size {
+                batch_config = batch_config.with_max_export_batch_size(batch_size);
+            }
+            let processor = BatchSpanProcessor::builder(exporter)
+                .with_batch_config(batch_config.build())
+                .build();
+
             Ok(SdkTracerProvider::builder()
                 .with_sampler(sampler)
                 .with_resource(resource)
-                .with_batch_exporter(exporter)
+                .with_span_processor(processor)
                 .build())
         }
         #[cfg(feature = "gcp-trace")]
@@ -191,6 +205,41 @@ mod tests {
     fn test_init_tracing_with_service_version() {
         let config =
             TelemetryConfig { service_version: Some("0.99.0".to_string()), ..Default::default() };
+        let result = init_tracing(&config);
+        assert!(result.is_ok());
+        let (_layer, guard) = result.unwrap();
+        guard.provider.shutdown().ok();
+    }
+
+    #[test]
+    fn test_init_tracing_with_custom_batch_config() {
+        let config = TelemetryConfig {
+            max_queue_size: Some(4096),
+            max_export_batch_size: Some(1024),
+            ..Default::default()
+        };
+        let result = init_tracing(&config);
+        assert!(result.is_ok());
+        let (_layer, guard) = result.unwrap();
+        guard.provider.shutdown().ok();
+    }
+
+    #[test]
+    fn test_init_tracing_with_partial_batch_config() {
+        let config = TelemetryConfig { max_queue_size: Some(8192), ..Default::default() };
+        let result = init_tracing(&config);
+        assert!(result.is_ok());
+        let (_layer, guard) = result.unwrap();
+        guard.provider.shutdown().ok();
+    }
+
+    #[test]
+    fn test_init_tracing_batch_size_one() {
+        let config = TelemetryConfig {
+            max_queue_size: Some(1),
+            max_export_batch_size: Some(1),
+            ..Default::default()
+        };
         let result = init_tracing(&config);
         assert!(result.is_ok());
         let (_layer, guard) = result.unwrap();

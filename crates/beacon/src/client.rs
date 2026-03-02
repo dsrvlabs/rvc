@@ -188,9 +188,7 @@ impl BeaconClient {
         let ids: String =
             pubkeys.iter().map(|pk| format!("id={}", pk)).collect::<Vec<_>>().join("&");
         let path = format!("/eth/v1/beacon/states/head/validators?{}", ids);
-        self.get(&path)
-            .instrument(tracing::info_span!("rvc.beacon.get_validators"))
-            .await
+        self.get(&path).instrument(tracing::info_span!("rvc.beacon.get_validators")).await
     }
 
     /// Fetches attestation data for the given slot and committee index.
@@ -609,15 +607,11 @@ impl BeaconClient {
         let span = tracing::info_span!("rvc.beacon.submit_aggregate_and_proofs");
         match proofs {
             VersionedSignedAggregateAndProof::PreElectra(ps) => {
-                self.post_empty("/eth/v1/validator/aggregate_and_proofs", ps)
-                    .instrument(span)
-                    .await
+                self.post_empty("/eth/v1/validator/aggregate_and_proofs", ps).instrument(span).await
             }
             VersionedSignedAggregateAndProof::Electra(ps)
             | VersionedSignedAggregateAndProof::Fulu(ps) => {
-                self.post_empty("/eth/v2/validator/aggregate_and_proofs", ps)
-                    .instrument(span)
-                    .await
+                self.post_empty("/eth/v2/validator/aggregate_and_proofs", ps).instrument(span).await
             }
         }
     }

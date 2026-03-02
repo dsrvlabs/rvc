@@ -169,6 +169,14 @@ enum Commands {
         /// Head-based sampling ratio 0.0–1.0 (default: 0.01)
         #[arg(long, default_value_t = 0.01)]
         tracing_sample_rate: f64,
+
+        /// Maximum number of spans queued for export (OTel SDK default: 2048)
+        #[arg(long)]
+        tracing_max_queue_size: Option<usize>,
+
+        /// Maximum number of spans per export batch (OTel SDK default: 512)
+        #[arg(long)]
+        tracing_max_export_batch_size: Option<usize>,
     },
 
     /// Submit a voluntary exit for a validator
@@ -253,6 +261,8 @@ async fn main() -> anyhow::Result<()> {
             tracing_endpoint,
             tracing_exporter,
             tracing_sample_rate,
+            tracing_max_queue_size,
+            tracing_max_export_batch_size,
         } => {
             let mut timeouts = bn_manager::OperationTimeouts::default();
             if let Some(secs) = block_production_timeout {
@@ -318,6 +328,8 @@ async fn main() -> anyhow::Result<()> {
                 tracing_endpoint,
                 tracing_exporter: Some(tracing_exporter),
                 tracing_sample_rate: Some(tracing_sample_rate),
+                tracing_max_queue_size,
+                tracing_max_export_batch_size,
             };
 
             let mut cfg = load_config(config)?;
@@ -481,6 +493,8 @@ fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfig> {
         sample_rate,
         network: config.network.to_string(),
         service_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        max_queue_size: config.tracing_max_queue_size,
+        max_export_batch_size: config.tracing_max_export_batch_size,
     })
 }
 
@@ -1130,6 +1144,36 @@ mod tests {
         };
         let tc = build_tracing_config(&config).expect("should return Some");
         assert_eq!(tc.exporter, telemetry::ExporterKind::Otlp);
+    }
+
+    #[test]
+    fn test_build_tracing_config_batch_fields_passthrough() {
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            tracing_max_queue_size: Some(4096),
+            tracing_max_export_batch_size: Some(1024),
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert_eq!(tc.max_queue_size, Some(4096));
+        assert_eq!(tc.max_export_batch_size, Some(1024));
+    }
+
+    #[test]
+    fn test_build_tracing_config_batch_fields_none_by_default() {
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert!(tc.max_queue_size.is_none());
+        assert!(tc.max_export_batch_size.is_none());
     }
 
     // H-07: init_logging wiring tests
