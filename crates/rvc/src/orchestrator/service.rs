@@ -1148,6 +1148,9 @@ where
                         continue;
                     }
                 };
+                // NOTE: FU-36 — vec_u8_tree_hash_root does not apply mix_in_length for
+                // Bitlist fields (aggregation_bits). This affects signing root correctness
+                // for both pre-Electra and Electra aggregates. Tracked as a separate fix.
                 let aggregate_and_proof = ElectraAggregateAndProof {
                     aggregator_index,
                     aggregate: electra_agg,
