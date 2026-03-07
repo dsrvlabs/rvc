@@ -30,3 +30,4 @@ required-features = ["test-utils"]
 [dev-dependencies]
 crypto.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber.workspace = true

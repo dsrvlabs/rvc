@@ -161,6 +161,7 @@ impl SecretProvider for GcpSecretProvider {
         "gcp"
     }
 
+    #[tracing::instrument(name = "rvc.secret_provider.gcp.list", skip_all, fields(keys.count = tracing::field::Empty))]
     async fn list_keys(&self) -> Result<Vec<SecretKeyEntry>, SecretProviderError> {
         use google_cloud_gax::paginator::ItemPaginator as _;
 
@@ -189,10 +190,12 @@ impl SecretProvider for GcpSecretProvider {
             entries.push(SecretKeyEntry { id: secret_id.to_string(), pubkey_hex });
         }
 
+        tracing::Span::current().record("keys.count", entries.len());
         debug!(count = entries.len(), "listed GCP secrets");
         Ok(entries)
     }
 
+    #[tracing::instrument(name = "rvc.secret_provider.gcp.fetch", skip_all, fields(key.id = %id))]
     async fn fetch_key(&self, id: &str) -> Result<KeyMaterial, SecretProviderError> {
         let data = self.access_secret_payload(id).await?;
 
