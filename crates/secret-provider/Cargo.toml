@@ -1,0 +1,18 @@
+[package]
+name = "rvc-secret-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+gcp-secret = []
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+hex.workspace = true

@@ -3498,6 +3498,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvc-secret-provider"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "thiserror 2.0.18",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
 name = "rvc-signer"
 version = "0.1.0"
 dependencies = [

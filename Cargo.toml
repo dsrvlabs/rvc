@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/rvc", "bin/rvc-keygen", "crates/rvc", "crates/beacon", "crates/bn-manager", "crates/builder", "crates/doppelganger", "crates/eth-types", "crates/keymanager-api", "crates/metrics", "crates/slashing", "crates/telemetry", "crates/timing", "crates/crypto", "crates/duty-tracker", "crates/propagator", "crates/signer", "crates/validator-store", "crates/block-service", "crates/sync-service"]
+members = ["bin/rvc", "bin/rvc-keygen", "crates/rvc", "crates/beacon", "crates/bn-manager", "crates/builder", "crates/doppelganger", "crates/eth-types", "crates/keymanager-api", "crates/metrics", "crates/secret-provider", "crates/slashing", "crates/telemetry", "crates/timing", "crates/crypto", "crates/duty-tracker", "crates/propagator", "crates/signer", "crates/validator-store", "crates/block-service", "crates/sync-service"]
 default-members = ["bin/rvc"]
 resolver = "2"
 
@@ -30,6 +30,7 @@ builder = { path = "crates/builder", package = "rvc-builder" }
 doppelganger = { path = "crates/doppelganger", package = "rvc-doppelganger" }
 keymanager-api = { path = "crates/keymanager-api", package = "rvc-keymanager-api" }
 telemetry = { path = "crates/telemetry", package = "rvc-telemetry" }
+secret-provider = { path = "crates/secret-provider", package = "rvc-secret-provider" }
 
 # External
 async-trait = "0.1"
