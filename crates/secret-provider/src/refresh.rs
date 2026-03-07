@@ -45,6 +45,20 @@ impl RefreshService {
             };
 
             for entry in &entries {
+                // Skip entries whose pubkey_hex is already known (avoids unnecessary fetch)
+                if let Some(ref hex_str) = entry.pubkey_hex {
+                    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+                    if let Ok(bytes) = hex::decode(hex_str) {
+                        if bytes.len() == 48 {
+                            let mut arr = [0u8; 48];
+                            arr.copy_from_slice(&bytes);
+                            if self.known_pubkeys.contains(&arr) {
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 let material = match provider.fetch_key(&entry.id).await {
                     Ok(m) => m,
                     Err(e) => {
@@ -80,9 +94,7 @@ impl RefreshService {
                 warn!(
                     provider = %provider_name,
                     pubkey = %pubkey_hex,
-                    "Discovered new key from {provider}: {pubkey}",
-                    provider = provider_name,
-                    pubkey = pubkey_hex,
+                    "Discovered new key during refresh"
                 );
 
                 self.known_pubkeys.insert(pubkey);
@@ -136,6 +148,18 @@ mod tests {
         let bytes: [u8; 32] = sk.to_bytes();
         (
             SecretKeyEntry { id: id.to_string(), pubkey_hex: None },
+            Ok(KeyMaterial::RawKey(Zeroizing::new(bytes))),
+        )
+    }
+
+    fn make_raw_key_entry_with_pubkey(
+        id: &str,
+        sk: &SecretKey,
+    ) -> (SecretKeyEntry, Result<KeyMaterial, SecretProviderError>) {
+        let bytes: [u8; 32] = sk.to_bytes();
+        let pubkey_hex = format!("0x{}", hex::encode(sk.public_key().to_bytes()));
+        (
+            SecretKeyEntry { id: id.to_string(), pubkey_hex: Some(pubkey_hex) },
             Ok(KeyMaterial::RawKey(Zeroizing::new(bytes))),
         )
     }
@@ -331,5 +355,33 @@ mod tests {
         let keys = captured_keys.lock().unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0], expected_pubkey);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_skips_known_pubkey_hex_early() {
+        let sk1 = SecretKey::generate();
+        let sk2 = SecretKey::generate();
+
+        // sk1 has pubkey_hex set and is already known — should be skipped without fetch
+        // sk2 has no pubkey_hex — will be fetched but is also known, skipped after fetch
+        let provider = MockSecretProvider {
+            name: "test-provider".to_string(),
+            keys: vec![
+                make_raw_key_entry_with_pubkey("key-1", &sk1),
+                make_raw_key_entry("key-2", &sk2),
+            ],
+            list_error: None,
+        };
+
+        let mut known = HashSet::new();
+        known.insert(sk1.public_key().to_bytes());
+        known.insert(sk2.public_key().to_bytes());
+
+        let cancel = CancellationToken::new();
+        let mut service =
+            RefreshService::new(vec![Arc::new(provider)], known, Duration::from_secs(60), cancel);
+
+        let new_keys = service.refresh().await;
+        assert_eq!(new_keys.len(), 0);
     }
 }

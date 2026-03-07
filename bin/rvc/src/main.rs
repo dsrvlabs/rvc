@@ -731,6 +731,7 @@ async fn run_validator(
                     signer_for_refresh.add_local_key(sk);
                 })
                 .await;
+            tracing::error!("Secret provider refresh task exited unexpectedly");
         });
         info!(interval_secs = refresh_interval, "Secret provider refresh task started");
     }
