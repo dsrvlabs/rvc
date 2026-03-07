@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+gcp-secret = ["secret-provider/gcp-secret"]
+
 [dependencies]
 async-trait.workspace = true
 builder.workspace = true
@@ -23,6 +27,7 @@ propagator.workspace = true
 prost.workspace = true
 secrecy.workspace = true
 serde_json.workspace = true
+secret-provider.workspace = true
 signer.workspace = true
 slashing.workspace = true
 sync-service.workspace = true

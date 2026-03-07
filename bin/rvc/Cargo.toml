@@ -13,7 +13,7 @@ path = "src/main.rs"
 [features]
 default = []
 gcp-trace = ["telemetry/gcp-trace"]
-gcp-secret = ["dep:rustls"]
+gcp-secret = ["rvc/gcp-secret", "dep:rustls"]
 
 [dependencies]
 beacon.workspace = true

@@ -8,4 +8,4 @@ mod types;
 pub use builder::{BuiltServices, ServiceBuilder};
 pub use error::ConfigError;
 pub use network::Network;
-pub use types::{redact_url, CliOverrides, Config};
+pub use types::{redact_url, CliOverrides, Config, SecretProviderConfig};

@@ -81,6 +81,36 @@ pub struct Config {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracing_max_export_batch_size: Option<usize>,
+
+    #[serde(default)]
+    pub secret_provider: SecretProviderConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecretProviderConfig {
+    #[serde(default)]
+    pub providers: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gcp_project_id: Option<String>,
+
+    #[serde(default = "default_gcp_secret_prefix")]
+    pub gcp_secret_prefix: String,
+}
+
+impl Default for SecretProviderConfig {
+    fn default() -> Self {
+        Self {
+            providers: Vec::new(),
+            gcp_project_id: None,
+            gcp_secret_prefix: default_gcp_secret_prefix(),
+        }
+    }
+}
+
+fn default_gcp_secret_prefix() -> String {
+    "validator-key-".to_string()
 }
 
 fn default_tracing_exporter() -> String {
@@ -120,6 +150,7 @@ impl Default for Config {
             tracing_sample_rate: default_tracing_sample_rate(),
             tracing_max_queue_size: None,
             tracing_max_export_batch_size: None,
+            secret_provider: SecretProviderConfig::default(),
         }
     }
 }
@@ -197,6 +228,14 @@ impl Config {
                     "graffiti must be 32 bytes or less".to_string(),
                 ));
             }
+        }
+
+        if self.secret_provider.providers.contains(&"gcp".to_string())
+            && self.secret_provider.gcp_project_id.is_none()
+        {
+            return Err(ConfigError::MissingField(
+                "gcp_project_id is required when secret_providers contains 'gcp'".to_string(),
+            ));
         }
 
         self.effective_genesis_time()?;
@@ -359,6 +398,25 @@ impl Config {
         if let Some(n) = cli.tracing_max_export_batch_size {
             self.tracing_max_export_batch_size = Some(n);
         }
+
+        if let Some(ref provider_csv) = cli.secret_provider {
+            let providers: Vec<String> = provider_csv
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !providers.is_empty() {
+                self.secret_provider.providers = providers;
+            }
+        }
+
+        if let Some(ref gcp_project_id) = cli.gcp_project_id {
+            self.secret_provider.gcp_project_id = Some(gcp_project_id.clone());
+        }
+
+        if let Some(ref gcp_secret_prefix) = cli.gcp_secret_prefix {
+            self.secret_provider.gcp_secret_prefix = gcp_secret_prefix.clone();
+        }
     }
 }
 
@@ -407,6 +465,9 @@ pub struct CliOverrides {
     pub tracing_sample_rate: Option<f64>,
     pub tracing_max_queue_size: Option<usize>,
     pub tracing_max_export_batch_size: Option<usize>,
+    pub secret_provider: Option<String>,
+    pub gcp_project_id: Option<String>,
+    pub gcp_secret_prefix: Option<String>,
 }
 
 #[cfg(test)]
@@ -1154,5 +1215,114 @@ remote_signer_allowed_hosts = ["signer1.com", "signer2.com"]
             config.remote_signer_allowed_hosts,
             Some(vec!["signer1.com".to_string(), "signer2.com".to_string()])
         );
+    }
+
+    // -- secret provider config tests --
+
+    #[test]
+    fn test_default_config_secret_providers_empty() {
+        let config = Config::default();
+        assert!(config.secret_provider.providers.is_empty());
+        assert!(config.secret_provider.gcp_project_id.is_none());
+        assert_eq!(config.secret_provider.gcp_secret_prefix, "validator-key-");
+    }
+
+    #[test]
+    fn test_merge_with_cli_secret_provider() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            secret_provider: Some("gcp".to_string()),
+            gcp_project_id: Some("my-project".to_string()),
+            gcp_secret_prefix: Some("key-".to_string()),
+            ..Default::default()
+        };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.secret_provider.providers, vec!["gcp".to_string()]);
+        assert_eq!(config.secret_provider.gcp_project_id, Some("my-project".to_string()));
+        assert_eq!(config.secret_provider.gcp_secret_prefix, "key-");
+    }
+
+    #[test]
+    fn test_merge_with_cli_secret_provider_comma_separated() {
+        let mut config = Config::default();
+        let cli =
+            CliOverrides { secret_provider: Some("gcp,aws".to_string()), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.secret_provider.providers, vec!["gcp".to_string(), "aws".to_string()]);
+    }
+
+    #[test]
+    fn test_merge_with_cli_secret_provider_none_preserves_defaults() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+        config.merge_with_cli(&cli);
+        assert!(config.secret_provider.providers.is_empty());
+        assert!(config.secret_provider.gcp_project_id.is_none());
+        assert_eq!(config.secret_provider.gcp_secret_prefix, "validator-key-");
+    }
+
+    #[test]
+    fn test_validate_gcp_provider_missing_project_id() {
+        let config = Config {
+            secret_provider: SecretProviderConfig {
+                providers: vec!["gcp".to_string()],
+                gcp_project_id: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("gcp_project_id"),
+            "error should mention gcp_project_id: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_gcp_provider_with_project_id_ok() {
+        let config = Config {
+            secret_provider: SecretProviderConfig {
+                providers: vec!["gcp".to_string()],
+                gcp_project_id: Some("my-project".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_no_providers_ok() {
+        let config = Config::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_from_file_with_secret_provider() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+
+[secret_provider]
+providers = ["gcp"]
+gcp_project_id = "my-gcp-project"
+gcp_secret_prefix = "val-key-"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(config.secret_provider.providers, vec!["gcp".to_string()]);
+        assert_eq!(config.secret_provider.gcp_project_id, Some("my-gcp-project".to_string()));
+        assert_eq!(config.secret_provider.gcp_secret_prefix, "val-key-");
     }
 }

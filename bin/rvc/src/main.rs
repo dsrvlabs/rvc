@@ -177,6 +177,18 @@ enum Commands {
         /// Maximum number of spans per export batch (OTel SDK default: 512)
         #[arg(long)]
         tracing_max_export_batch_size: Option<usize>,
+
+        /// Secret provider(s) to use for loading validator keys (e.g., "gcp")
+        #[arg(long)]
+        secret_provider: Option<String>,
+
+        /// GCP project ID (required when --secret-provider includes "gcp")
+        #[arg(long)]
+        gcp_project_id: Option<String>,
+
+        /// Prefix for GCP secret names (default: "validator-key-")
+        #[arg(long, default_value = "validator-key-")]
+        gcp_secret_prefix: String,
     },
 
     /// Submit a voluntary exit for a validator
@@ -269,6 +281,9 @@ async fn main() -> anyhow::Result<()> {
             tracing_sample_rate,
             tracing_max_queue_size,
             tracing_max_export_batch_size,
+            secret_provider,
+            gcp_project_id,
+            gcp_secret_prefix,
         } => {
             let mut timeouts = bn_manager::OperationTimeouts::default();
             if let Some(secs) = block_production_timeout {
@@ -336,6 +351,9 @@ async fn main() -> anyhow::Result<()> {
                 tracing_sample_rate: Some(tracing_sample_rate),
                 tracing_max_queue_size,
                 tracing_max_export_batch_size,
+                secret_provider,
+                gcp_project_id,
+                gcp_secret_prefix: Some(gcp_secret_prefix),
             };
 
             let mut cfg = load_config(config)?;

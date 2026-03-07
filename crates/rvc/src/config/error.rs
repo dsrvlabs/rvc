@@ -50,4 +50,10 @@ pub enum ConfigError {
 
     #[error("beacon client error: {0}")]
     BeaconClientError(#[from] beacon::BeaconError),
+
+    #[error("feature not enabled: {0}")]
+    FeatureNotEnabled(String),
+
+    #[error("secret provider error: {0}")]
+    SecretProviderError(String),
 }

@@ -3648,6 +3648,7 @@ dependencies = [
  "rvc-keymanager-api",
  "rvc-metrics",
  "rvc-propagator",
+ "rvc-secret-provider",
  "rvc-signer",
  "rvc-slashing",
  "rvc-sync-service",
