@@ -2,6 +2,8 @@ use async_trait::async_trait;
 use zeroize::Zeroizing;
 
 pub mod format;
+#[cfg(feature = "gcp-secret")]
+pub mod gcp;
 pub mod key_source_manager;
 
 pub use format::parse_secret_data;

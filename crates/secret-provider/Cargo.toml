@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = []
-gcp-secret = []
+gcp-secret = ["dep:google-cloud-secretmanager-v1", "dep:google-cloud-gax"]
 test-utils = []
 
 [dependencies]
@@ -20,6 +20,8 @@ tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 zeroize.workspace = true
 hex.workspace = true
+google-cloud-secretmanager-v1 = { version = "1.5", default-features = false, optional = true }
+google-cloud-gax = { version = "1", default-features = false, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
