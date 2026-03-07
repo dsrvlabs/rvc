@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use zeroize::Zeroizing;
 
+pub mod format;
+pub use format::parse_secret_data;
+
 /// Metadata about a key available in a secret provider.
 pub struct SecretKeyEntry {
     /// Unique identifier within the provider (e.g., secret name, file path).
