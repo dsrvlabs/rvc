@@ -279,7 +279,12 @@ impl ServiceBuilder {
                                 .secret_provider
                                 .gcp_project_id
                                 .clone()
-                                .expect("gcp_project_id validated before build"),
+                                .ok_or_else(|| {
+                                    ConfigError::MissingField(
+                                        "gcp_project_id is required for GCP secret provider"
+                                            .into(),
+                                    )
+                                })?,
                             prefix: self.config.secret_provider.gcp_secret_prefix.clone(),
                             ..Default::default()
                         };

@@ -230,12 +230,21 @@ impl Config {
             }
         }
 
-        if self.secret_provider.providers.contains(&"gcp".to_string())
-            && self.secret_provider.gcp_project_id.is_none()
-        {
-            return Err(ConfigError::MissingField(
-                "gcp_project_id is required when secret_providers contains 'gcp'".to_string(),
-            ));
+        if self.secret_provider.providers.contains(&"gcp".to_string()) {
+            match &self.secret_provider.gcp_project_id {
+                None => {
+                    return Err(ConfigError::MissingField(
+                        "gcp_project_id is required when secret_providers contains 'gcp'"
+                            .to_string(),
+                    ));
+                }
+                Some(id) if id.trim().is_empty() => {
+                    return Err(ConfigError::MissingField(
+                        "gcp_project_id must not be empty or whitespace-only".to_string(),
+                    ));
+                }
+                _ => {}
+            }
         }
 
         self.effective_genesis_time()?;
@@ -1324,5 +1333,51 @@ gcp_secret_prefix = "val-key-"
         assert_eq!(config.secret_provider.providers, vec!["gcp".to_string()]);
         assert_eq!(config.secret_provider.gcp_project_id, Some("my-gcp-project".to_string()));
         assert_eq!(config.secret_provider.gcp_secret_prefix, "val-key-");
+    }
+
+    #[test]
+    fn test_merge_with_cli_no_gcp_secret_prefix_preserves_config_file() {
+        let mut config = Config {
+            secret_provider: SecretProviderConfig {
+                providers: vec!["gcp".to_string()],
+                gcp_project_id: Some("my-project".to_string()),
+                gcp_secret_prefix: "custom-prefix-".to_string(),
+            },
+            ..Default::default()
+        };
+        let cli = CliOverrides { gcp_secret_prefix: None, ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(
+            config.secret_provider.gcp_secret_prefix, "custom-prefix-",
+            "config file gcp_secret_prefix should be preserved when CLI does not specify it"
+        );
+    }
+
+    #[test]
+    fn test_validate_gcp_provider_empty_project_id() {
+        let config = Config {
+            secret_provider: SecretProviderConfig {
+                providers: vec!["gcp".to_string()],
+                gcp_project_id: Some("".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err(), "empty gcp_project_id should fail validation");
+    }
+
+    #[test]
+    fn test_validate_gcp_provider_whitespace_project_id() {
+        let config = Config {
+            secret_provider: SecretProviderConfig {
+                providers: vec!["gcp".to_string()],
+                gcp_project_id: Some("   ".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err(), "whitespace-only gcp_project_id should fail validation");
     }
 }

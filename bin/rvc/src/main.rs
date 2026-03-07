@@ -187,8 +187,8 @@ enum Commands {
         gcp_project_id: Option<String>,
 
         /// Prefix for GCP secret names (default: "validator-key-")
-        #[arg(long, default_value = "validator-key-")]
-        gcp_secret_prefix: String,
+        #[arg(long)]
+        gcp_secret_prefix: Option<String>,
     },
 
     /// Submit a voluntary exit for a validator
@@ -353,7 +353,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing_max_export_batch_size,
                 secret_provider,
                 gcp_project_id,
-                gcp_secret_prefix: Some(gcp_secret_prefix),
+                gcp_secret_prefix,
             };
 
             let mut cfg = load_config(config)?;
