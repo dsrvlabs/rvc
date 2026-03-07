@@ -9,11 +9,17 @@ repository.workspace = true
 [features]
 default = []
 gcp-secret = []
+test-utils = []
 
 [dependencies]
 async-trait.workspace = true
+crypto.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 zeroize.workspace = true
 hex.workspace = true
-serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

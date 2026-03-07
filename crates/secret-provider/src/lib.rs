@@ -2,7 +2,12 @@ use async_trait::async_trait;
 use zeroize::Zeroizing;
 
 pub mod format;
+pub mod key_source_manager;
+
 pub use format::parse_secret_data;
+#[cfg(any(test, feature = "test-utils"))]
+pub use key_source_manager::mock::MockSecretProvider;
+pub use key_source_manager::KeySourceManager;
 
 /// Metadata about a key available in a secret provider.
 pub struct SecretKeyEntry {
