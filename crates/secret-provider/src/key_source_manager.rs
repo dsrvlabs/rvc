@@ -3,6 +3,10 @@ use std::sync::Arc;
 use crypto::{KeyManager, Keystore, SecretKey};
 use tracing::{info_span, warn, Instrument};
 
+use crate::metrics::{
+    classify_error, RVC_SECRET_PROVIDER_ERRORS_TOTAL, RVC_SECRET_PROVIDER_KEYS_LOADED,
+    RVC_SECRET_PROVIDER_LOAD_DURATION_SECONDS,
+};
 use crate::{KeyMaterial, LoadSummary, ProviderSummary, SecretProvider, SecretProviderError};
 
 pub struct KeySourceManager {
@@ -27,6 +31,7 @@ impl KeySourceManager {
 
         for provider in &self.providers {
             let provider_name = provider.name().to_string();
+            let timer = std::time::Instant::now();
 
             let list_span = info_span!(
                 "rvc.secret_provider.list_keys",
@@ -90,6 +95,9 @@ impl KeySourceManager {
                                 error = %e,
                                 "Failed to convert key material, skipping"
                             );
+                            RVC_SECRET_PROVIDER_ERRORS_TOTAL
+                                .with_label_values(&[provider_name.as_str(), classify_error(&e)])
+                                .inc();
                             provider_summary.skipped += 1;
                             provider_summary.errors.push(format!("{}: {}", entry_id, e));
                         }
@@ -103,11 +111,21 @@ impl KeySourceManager {
                                 "Failed to fetch key"
                             );
                         });
+                        RVC_SECRET_PROVIDER_ERRORS_TOTAL
+                            .with_label_values(&[provider_name.as_str(), classify_error(&e)])
+                            .inc();
                         provider_summary.skipped += 1;
                         provider_summary.errors.push(format!("{}: {}", entry_id, e));
                     }
                 }
             }
+
+            RVC_SECRET_PROVIDER_KEYS_LOADED
+                .with_label_values(&[&provider_name])
+                .set(provider_summary.loaded as f64);
+            RVC_SECRET_PROVIDER_LOAD_DURATION_SECONDS
+                .with_label_values(&[&provider_name])
+                .observe(timer.elapsed().as_secs_f64());
 
             summary.per_provider.push(provider_summary);
         }
@@ -620,5 +638,101 @@ mod tests {
             "Expected provider.name=my-prov on list_keys span, got: {:?}",
             *captured
         );
+    }
+
+    #[tokio::test]
+    async fn test_metrics_keys_loaded_after_successful_load() {
+        use crate::metrics::RVC_SECRET_PROVIDER_KEYS_LOADED;
+
+        let sk1 = SecretKey::generate();
+        let sk2 = SecretKey::generate();
+        let provider = MockSecretProvider {
+            name: "metrics-test-loaded".to_string(),
+            keys: vec![make_raw_key_entry("k1", &sk1), make_raw_key_entry("k2", &sk2)],
+            list_error: None,
+        };
+
+        let ksm = KeySourceManager::new(vec![Box::new(provider)]);
+        let mut km = KeyManager::new();
+        ksm.load_all(&mut km).await.unwrap();
+
+        let value =
+            RVC_SECRET_PROVIDER_KEYS_LOADED.with_label_values(&["metrics-test-loaded"]).get();
+        assert_eq!(value, 2.0, "Expected 2 keys loaded for metrics-test-loaded");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_errors_total_after_fetch_failure() {
+        use crate::metrics::RVC_SECRET_PROVIDER_ERRORS_TOTAL;
+
+        let sk = SecretKey::generate();
+        let provider = MockSecretProvider {
+            name: "metrics-test-err".to_string(),
+            keys: vec![
+                make_raw_key_entry("ok-key", &sk),
+                (
+                    SecretKeyEntry { id: "bad-key".to_string(), pubkey_hex: None },
+                    Err(SecretProviderError::Provider("fail".into())),
+                ),
+            ],
+            list_error: None,
+        };
+
+        let before = RVC_SECRET_PROVIDER_ERRORS_TOTAL
+            .with_label_values(&["metrics-test-err", "provider"])
+            .get();
+
+        let ksm = KeySourceManager::new(vec![Box::new(provider)]);
+        let mut km = KeyManager::new();
+        ksm.load_all(&mut km).await.unwrap();
+
+        let after = RVC_SECRET_PROVIDER_ERRORS_TOTAL
+            .with_label_values(&["metrics-test-err", "provider"])
+            .get();
+        assert_eq!(after, before + 1, "Expected error counter to increment by 1");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_load_duration_recorded() {
+        use crate::metrics::RVC_SECRET_PROVIDER_LOAD_DURATION_SECONDS;
+
+        let sk = SecretKey::generate();
+        let provider = MockSecretProvider {
+            name: "metrics-test-dur".to_string(),
+            keys: vec![make_raw_key_entry("k1", &sk)],
+            list_error: None,
+        };
+
+        let before = RVC_SECRET_PROVIDER_LOAD_DURATION_SECONDS
+            .with_label_values(&["metrics-test-dur"])
+            .get_sample_count();
+
+        let ksm = KeySourceManager::new(vec![Box::new(provider)]);
+        let mut km = KeyManager::new();
+        ksm.load_all(&mut km).await.unwrap();
+
+        let after = RVC_SECRET_PROVIDER_LOAD_DURATION_SECONDS
+            .with_label_values(&["metrics-test-dur"])
+            .get_sample_count();
+        assert_eq!(after, before + 1, "Expected one duration observation");
+    }
+
+    #[tokio::test]
+    async fn test_metrics_keys_loaded_zero_for_empty_provider() {
+        use crate::metrics::RVC_SECRET_PROVIDER_KEYS_LOADED;
+
+        let provider = MockSecretProvider {
+            name: "metrics-test-empty".to_string(),
+            keys: vec![],
+            list_error: None,
+        };
+
+        let ksm = KeySourceManager::new(vec![Box::new(provider)]);
+        let mut km = KeyManager::new();
+        ksm.load_all(&mut km).await.unwrap();
+
+        let value =
+            RVC_SECRET_PROVIDER_KEYS_LOADED.with_label_values(&["metrics-test-empty"]).get();
+        assert_eq!(value, 0.0, "Expected 0 keys loaded for empty provider");
     }
 }

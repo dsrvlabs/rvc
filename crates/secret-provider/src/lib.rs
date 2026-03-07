@@ -5,6 +5,7 @@ pub mod format;
 #[cfg(feature = "gcp-secret")]
 pub mod gcp;
 pub mod key_source_manager;
+pub mod metrics;
 
 pub use format::parse_secret_data;
 #[cfg(any(test, feature = "test-utils"))]
