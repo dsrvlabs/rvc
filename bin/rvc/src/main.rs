@@ -189,6 +189,10 @@ enum Commands {
         /// Prefix for GCP secret names (default: "validator-key-")
         #[arg(long)]
         gcp_secret_prefix: Option<String>,
+
+        /// Interval in seconds to refresh keys from secret providers (0 = disabled)
+        #[arg(long)]
+        secret_refresh_interval: Option<u64>,
     },
 
     /// Submit a voluntary exit for a validator
@@ -284,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
             secret_provider,
             gcp_project_id,
             gcp_secret_prefix,
+            secret_refresh_interval,
         } => {
             let mut timeouts = bn_manager::OperationTimeouts::default();
             if let Some(secs) = block_production_timeout {
@@ -354,6 +359,7 @@ async fn main() -> anyhow::Result<()> {
                 secret_provider,
                 gcp_project_id,
                 gcp_secret_prefix,
+                secret_refresh_interval,
             };
 
             let mut cfg = load_config(config)?;
@@ -545,6 +551,7 @@ async fn run_validator(
     );
 
     let health_status = new_health_status();
+    let shutdown_token = tokio_util::sync::CancellationToken::new();
 
     let grpc_port = config.grpc_port;
     let metrics_address = config.metrics_address;
@@ -662,15 +669,16 @@ async fn run_validator(
     };
 
     // Load keys from cloud secret providers (if configured)
+    let secret_providers: Vec<std::sync::Arc<dyn secret_provider::SecretProvider>> =
+        builder.build_secret_providers().await?.into_iter().map(std::sync::Arc::from).collect();
     let key_manager = {
-        let providers = builder.build_secret_providers().await?;
-        if providers.is_empty() {
+        if secret_providers.is_empty() {
             key_manager
         } else {
             let mut km = std::sync::Arc::try_unwrap(key_manager).unwrap_or_else(|_| {
                 panic!("single reference to key_manager before cloud key loading")
             });
-            let ksm = secret_provider::KeySourceManager::new(providers);
+            let ksm = secret_provider::KeySourceManager::from_arc(secret_providers.clone());
             let summary = ksm.load_all(&mut km).await?;
             let mut total_loaded = 0usize;
             let mut total_skipped = 0usize;
@@ -702,8 +710,30 @@ async fn run_validator(
     // Create shared CompositeSigner from loaded keys
     let key_manager_owned = std::sync::Arc::try_unwrap(key_manager)
         .unwrap_or_else(|_| panic!("single reference to key_manager after pubkey_map build"));
+    let known_pubkeys: std::collections::HashSet<[u8; 48]> =
+        key_manager_owned.list_public_keys().iter().map(|pk| pk.to_bytes()).collect();
     let local_signer = crypto::LocalSigner::new(key_manager_owned);
     let composite_signer = std::sync::Arc::new(crypto::CompositeSigner::new(local_signer));
+
+    // Spawn secret provider refresh task (if configured)
+    let refresh_interval = config.secret_provider.refresh_interval.unwrap_or(0);
+    if refresh_interval > 0 && !secret_providers.is_empty() {
+        let refresh_service = secret_provider::RefreshService::new(
+            secret_providers,
+            known_pubkeys,
+            std::time::Duration::from_secs(refresh_interval),
+            shutdown_token.clone(),
+        );
+        let signer_for_refresh = std::sync::Arc::clone(&composite_signer);
+        tokio::spawn(async move {
+            refresh_service
+                .run(move |sk| {
+                    signer_for_refresh.add_local_key(sk);
+                })
+                .await;
+        });
+        info!(interval_secs = refresh_interval, "Secret provider refresh task started");
+    }
 
     // Resolve validator indices using BnManager (via trait)
     let beacon_for_resolve: &dyn BeaconNodeClient = bn_manager.as_ref();
@@ -960,6 +990,7 @@ async fn run_validator(
     }
 
     info!("Initiating graceful shutdown...");
+    shutdown_token.cancel();
     orchestrator_handle.shutdown();
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;

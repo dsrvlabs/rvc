@@ -31,6 +31,7 @@ telemetry.workspace = true
 slashing.workspace = true
 timing.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

@@ -432,6 +432,10 @@ impl Config {
         if let Some(ref gcp_secret_prefix) = cli.gcp_secret_prefix {
             self.secret_provider.gcp.secret_prefix = gcp_secret_prefix.clone();
         }
+
+        if let Some(interval) = cli.secret_refresh_interval {
+            self.secret_provider.refresh_interval = Some(interval);
+        }
     }
 }
 
@@ -483,6 +487,7 @@ pub struct CliOverrides {
     pub secret_provider: Option<String>,
     pub gcp_project_id: Option<String>,
     pub gcp_secret_prefix: Option<String>,
+    pub secret_refresh_interval: Option<u64>,
 }
 
 #[cfg(test)]
@@ -1478,5 +1483,27 @@ log_level = "info"
     fn test_default_config_refresh_interval_none() {
         let config = Config::default();
         assert!(config.secret_provider.refresh_interval.is_none());
+    }
+
+    #[test]
+    fn test_merge_with_cli_secret_refresh_interval() {
+        let mut config = Config::default();
+        let cli = CliOverrides { secret_refresh_interval: Some(120), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.secret_provider.refresh_interval, Some(120));
+    }
+
+    #[test]
+    fn test_merge_with_cli_no_secret_refresh_interval_preserves_config() {
+        let mut config = Config {
+            secret_provider: SecretProviderConfig {
+                refresh_interval: Some(300),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cli = CliOverrides::default();
+        config.merge_with_cli(&cli);
+        assert_eq!(config.secret_provider.refresh_interval, Some(300));
     }
 }

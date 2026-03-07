@@ -18,6 +18,10 @@ impl KeySourceManager {
         Self { providers: providers.into_iter().map(Arc::from).collect() }
     }
 
+    pub fn from_arc(providers: Vec<Arc<dyn SecretProvider>>) -> Self {
+        Self { providers }
+    }
+
     #[tracing::instrument(
         name = "rvc.secret_provider.load_all",
         skip_all,
@@ -149,7 +153,10 @@ impl KeySourceManager {
     }
 }
 
-fn convert_key_material(id: &str, material: KeyMaterial) -> Result<SecretKey, SecretProviderError> {
+pub fn convert_key_material(
+    id: &str,
+    material: KeyMaterial,
+) -> Result<SecretKey, SecretProviderError> {
     match material {
         KeyMaterial::RawKey(bytes) => SecretKey::from_bytes(&*bytes).map_err(|e| {
             SecretProviderError::InvalidKeyMaterial(format!("invalid raw key for {}: {}", id, e))
