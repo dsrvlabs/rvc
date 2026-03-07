@@ -3689,6 +3689,7 @@ dependencies = [
  "rvc-eth-types",
  "rvc-keymanager-api",
  "rvc-metrics",
+ "rvc-secret-provider",
  "rvc-signer",
  "rvc-slashing",
  "rvc-telemetry",

@@ -281,8 +281,7 @@ impl ServiceBuilder {
                                 .clone()
                                 .ok_or_else(|| {
                                     ConfigError::MissingField(
-                                        "gcp_project_id is required for GCP secret provider"
-                                            .into(),
+                                        "gcp_project_id is required for GCP secret provider".into(),
                                     )
                                 })?,
                             prefix: self.config.secret_provider.gcp_secret_prefix.clone(),

@@ -95,9 +95,7 @@ fn detect_format(data: &[u8]) -> KeyMaterialFormat {
         Err(_) => return KeyMaterialFormat::Unknown,
     };
 
-    if trimmed.starts_with('{')
-        && serde_json::from_str::<serde_json::Value>(trimmed).is_ok()
-    {
+    if trimmed.starts_with('{') && serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
         return KeyMaterialFormat::KeystoreJson;
     }
 

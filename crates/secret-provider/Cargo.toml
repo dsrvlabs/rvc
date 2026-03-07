@@ -23,5 +23,10 @@ hex.workspace = true
 google-cloud-secretmanager-v1 = { version = "1.5", default-features = false, optional = true }
 google-cloud-gax = { version = "1", default-features = false, optional = true }
 
+[[test]]
+name = "integration"
+required-features = ["test-utils"]
+
 [dev-dependencies]
+crypto.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

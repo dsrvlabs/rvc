@@ -25,6 +25,7 @@ hex.workspace = true
 keymanager-api.workspace = true
 metrics.workspace = true
 rvc.workspace = true
+secret-provider.workspace = true
 signer.workspace = true
 telemetry.workspace = true
 slashing.workspace = true

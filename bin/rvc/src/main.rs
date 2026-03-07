@@ -661,6 +661,42 @@ async fn run_validator(
         }
     };
 
+    // Load keys from cloud secret providers (if configured)
+    let key_manager = {
+        let providers = builder.build_secret_providers().await?;
+        if providers.is_empty() {
+            key_manager
+        } else {
+            let mut km = std::sync::Arc::try_unwrap(key_manager).unwrap_or_else(|_| {
+                panic!("single reference to key_manager before cloud key loading")
+            });
+            let ksm = secret_provider::KeySourceManager::new(providers);
+            let summary = ksm.load_all(&mut km).await?;
+            let mut total_loaded = 0usize;
+            let mut total_skipped = 0usize;
+            let mut total_errors = 0usize;
+            for ps in &summary.per_provider {
+                info!(
+                    provider = %ps.name,
+                    loaded = ps.loaded,
+                    skipped = ps.skipped,
+                    "Loaded keys from cloud provider"
+                );
+                total_loaded += ps.loaded;
+                total_skipped += ps.skipped;
+                total_errors += ps.errors.len();
+            }
+            info!(
+                loaded = total_loaded,
+                providers = summary.per_provider.len(),
+                skipped = total_skipped,
+                errors = total_errors,
+                "Loaded keys from cloud providers"
+            );
+            std::sync::Arc::new(km)
+        }
+    };
+
     let pubkey_map = builder.build_pubkey_map(&key_manager);
 
     // Create shared CompositeSigner from loaded keys
