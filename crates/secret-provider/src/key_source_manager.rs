@@ -472,6 +472,7 @@ mod tests {
         let layer = SpanCapture { spans: spans.clone() };
         let subscriber = tracing_subscriber::registry().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
 
         ksm.load_all(&mut km).await.unwrap();
 
@@ -499,6 +500,7 @@ mod tests {
         let layer = SpanCapture { spans: spans.clone() };
         let subscriber = tracing_subscriber::registry().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
 
         ksm.load_all(&mut km).await.unwrap();
 
@@ -526,6 +528,7 @@ mod tests {
         let layer = SpanCapture { spans: spans.clone() };
         let subscriber = tracing_subscriber::registry().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
 
         ksm.load_all(&mut km).await.unwrap();
 
@@ -559,6 +562,7 @@ mod tests {
         let layer = FieldCapture { fields: fields.clone() };
         let subscriber = tracing_subscriber::registry().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
 
         ksm.load_all(&mut km).await.unwrap();
 
@@ -591,6 +595,7 @@ mod tests {
         let layer = FieldCapture { fields: fields.clone() };
         let subscriber = tracing_subscriber::registry().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
 
         ksm.load_all(&mut km).await.unwrap();
 
@@ -620,6 +625,7 @@ mod tests {
         let layer = FieldCapture { fields: fields.clone() };
         let subscriber = tracing_subscriber::registry().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
 
         ksm.load_all(&mut km).await.unwrap();
 
@@ -649,6 +655,7 @@ mod tests {
         let layer = FieldCapture { fields: fields.clone() };
         let subscriber = tracing_subscriber::registry().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
 
         ksm.load_all(&mut km).await.unwrap();
 

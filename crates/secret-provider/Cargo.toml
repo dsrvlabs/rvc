@@ -31,6 +31,10 @@ google-cloud-gax = { version = "1", default-features = false, optional = true }
 name = "integration"
 required-features = ["test-utils"]
 
+[[test]]
+name = "tracing_hierarchy"
+required-features = ["test-utils"]
+
 [dev-dependencies]
 crypto.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

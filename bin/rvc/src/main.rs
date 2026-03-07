@@ -668,6 +668,9 @@ async fn run_validator(
         }
     };
 
+    // Initialize secret provider metrics eagerly so they appear in /metrics output
+    secret_provider::metrics::init_secret_provider_metrics();
+
     // Load keys from cloud secret providers (if configured)
     let secret_providers: Vec<std::sync::Arc<dyn secret_provider::SecretProvider>> =
         builder.build_secret_providers().await?.into_iter().map(std::sync::Arc::from).collect();
