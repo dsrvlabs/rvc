@@ -277,14 +277,15 @@ impl ServiceBuilder {
                             project_id: self
                                 .config
                                 .secret_provider
-                                .gcp_project_id
+                                .gcp
+                                .project_id
                                 .clone()
                                 .ok_or_else(|| {
                                     ConfigError::MissingField(
                                         "gcp_project_id is required for GCP secret provider".into(),
                                     )
                                 })?,
-                            prefix: self.config.secret_provider.gcp_secret_prefix.clone(),
+                            prefix: self.config.secret_provider.gcp.secret_prefix.clone(),
                             ..Default::default()
                         };
                         let gcp_provider =
@@ -627,11 +628,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_build_secret_providers_gcp_without_feature() {
-        use super::super::types::SecretProviderConfig;
+        use super::super::types::{GcpSecretConfig, SecretProviderConfig};
         let config = Config {
             secret_provider: SecretProviderConfig {
                 providers: vec!["gcp".to_string()],
-                gcp_project_id: Some("my-project".to_string()),
+                gcp: GcpSecretConfig {
+                    project_id: Some("my-project".to_string()),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..create_minimal_config()

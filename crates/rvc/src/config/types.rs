@@ -86,26 +86,32 @@ pub struct Config {
     pub secret_provider: SecretProviderConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecretProviderConfig {
     #[serde(default)]
     pub providers: Vec<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub gcp_project_id: Option<String>,
+    pub refresh_interval: Option<u64>,
 
-    #[serde(default = "default_gcp_secret_prefix")]
-    pub gcp_secret_prefix: String,
+    #[serde(default)]
+    pub gcp: GcpSecretConfig,
 }
 
-impl Default for SecretProviderConfig {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GcpSecretConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+
+    #[serde(default = "default_gcp_secret_prefix")]
+    pub secret_prefix: String,
+}
+
+impl Default for GcpSecretConfig {
     fn default() -> Self {
-        Self {
-            providers: Vec::new(),
-            gcp_project_id: None,
-            gcp_secret_prefix: default_gcp_secret_prefix(),
-        }
+        Self { project_id: None, secret_prefix: default_gcp_secret_prefix() }
     }
 }
 
@@ -231,7 +237,7 @@ impl Config {
         }
 
         if self.secret_provider.providers.contains(&"gcp".to_string()) {
-            match &self.secret_provider.gcp_project_id {
+            match &self.secret_provider.gcp.project_id {
                 None => {
                     return Err(ConfigError::MissingField(
                         "gcp_project_id is required when secret_providers contains 'gcp'"
@@ -420,11 +426,11 @@ impl Config {
         }
 
         if let Some(ref gcp_project_id) = cli.gcp_project_id {
-            self.secret_provider.gcp_project_id = Some(gcp_project_id.clone());
+            self.secret_provider.gcp.project_id = Some(gcp_project_id.clone());
         }
 
         if let Some(ref gcp_secret_prefix) = cli.gcp_secret_prefix {
-            self.secret_provider.gcp_secret_prefix = gcp_secret_prefix.clone();
+            self.secret_provider.gcp.secret_prefix = gcp_secret_prefix.clone();
         }
     }
 }
@@ -1232,8 +1238,8 @@ remote_signer_allowed_hosts = ["signer1.com", "signer2.com"]
     fn test_default_config_secret_providers_empty() {
         let config = Config::default();
         assert!(config.secret_provider.providers.is_empty());
-        assert!(config.secret_provider.gcp_project_id.is_none());
-        assert_eq!(config.secret_provider.gcp_secret_prefix, "validator-key-");
+        assert!(config.secret_provider.gcp.project_id.is_none());
+        assert_eq!(config.secret_provider.gcp.secret_prefix, "validator-key-");
     }
 
     #[test]
@@ -1247,8 +1253,8 @@ remote_signer_allowed_hosts = ["signer1.com", "signer2.com"]
         };
         config.merge_with_cli(&cli);
         assert_eq!(config.secret_provider.providers, vec!["gcp".to_string()]);
-        assert_eq!(config.secret_provider.gcp_project_id, Some("my-project".to_string()));
-        assert_eq!(config.secret_provider.gcp_secret_prefix, "key-");
+        assert_eq!(config.secret_provider.gcp.project_id, Some("my-project".to_string()));
+        assert_eq!(config.secret_provider.gcp.secret_prefix, "key-");
     }
 
     #[test]
@@ -1266,8 +1272,8 @@ remote_signer_allowed_hosts = ["signer1.com", "signer2.com"]
         let cli = CliOverrides::default();
         config.merge_with_cli(&cli);
         assert!(config.secret_provider.providers.is_empty());
-        assert!(config.secret_provider.gcp_project_id.is_none());
-        assert_eq!(config.secret_provider.gcp_secret_prefix, "validator-key-");
+        assert!(config.secret_provider.gcp.project_id.is_none());
+        assert_eq!(config.secret_provider.gcp.secret_prefix, "validator-key-");
     }
 
     #[test]
@@ -1275,7 +1281,7 @@ remote_signer_allowed_hosts = ["signer1.com", "signer2.com"]
         let config = Config {
             secret_provider: SecretProviderConfig {
                 providers: vec!["gcp".to_string()],
-                gcp_project_id: None,
+                gcp: GcpSecretConfig { project_id: None, ..Default::default() },
                 ..Default::default()
             },
             ..Default::default()
@@ -1295,7 +1301,10 @@ remote_signer_allowed_hosts = ["signer1.com", "signer2.com"]
         let config = Config {
             secret_provider: SecretProviderConfig {
                 providers: vec!["gcp".to_string()],
-                gcp_project_id: Some("my-project".to_string()),
+                gcp: GcpSecretConfig {
+                    project_id: Some("my-project".to_string()),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             ..Default::default()
@@ -1323,16 +1332,18 @@ log_level = "info"
 
 [secret_provider]
 providers = ["gcp"]
-gcp_project_id = "my-gcp-project"
-gcp_secret_prefix = "val-key-"
+
+[secret_provider.gcp]
+project_id = "my-gcp-project"
+secret_prefix = "val-key-"
 "#
         )
         .unwrap();
 
         let config = Config::from_file(file.path()).unwrap();
         assert_eq!(config.secret_provider.providers, vec!["gcp".to_string()]);
-        assert_eq!(config.secret_provider.gcp_project_id, Some("my-gcp-project".to_string()));
-        assert_eq!(config.secret_provider.gcp_secret_prefix, "val-key-");
+        assert_eq!(config.secret_provider.gcp.project_id, Some("my-gcp-project".to_string()));
+        assert_eq!(config.secret_provider.gcp.secret_prefix, "val-key-");
     }
 
     #[test]
@@ -1340,15 +1351,18 @@ gcp_secret_prefix = "val-key-"
         let mut config = Config {
             secret_provider: SecretProviderConfig {
                 providers: vec!["gcp".to_string()],
-                gcp_project_id: Some("my-project".to_string()),
-                gcp_secret_prefix: "custom-prefix-".to_string(),
+                gcp: GcpSecretConfig {
+                    project_id: Some("my-project".to_string()),
+                    secret_prefix: "custom-prefix-".to_string(),
+                },
+                ..Default::default()
             },
             ..Default::default()
         };
         let cli = CliOverrides { gcp_secret_prefix: None, ..Default::default() };
         config.merge_with_cli(&cli);
         assert_eq!(
-            config.secret_provider.gcp_secret_prefix, "custom-prefix-",
+            config.secret_provider.gcp.secret_prefix, "custom-prefix-",
             "config file gcp_secret_prefix should be preserved when CLI does not specify it"
         );
     }
@@ -1358,7 +1372,7 @@ gcp_secret_prefix = "val-key-"
         let config = Config {
             secret_provider: SecretProviderConfig {
                 providers: vec!["gcp".to_string()],
-                gcp_project_id: Some("".to_string()),
+                gcp: GcpSecretConfig { project_id: Some("".to_string()), ..Default::default() },
                 ..Default::default()
             },
             ..Default::default()
@@ -1372,12 +1386,97 @@ gcp_secret_prefix = "val-key-"
         let config = Config {
             secret_provider: SecretProviderConfig {
                 providers: vec!["gcp".to_string()],
-                gcp_project_id: Some("   ".to_string()),
+                gcp: GcpSecretConfig { project_id: Some("   ".to_string()), ..Default::default() },
                 ..Default::default()
             },
             ..Default::default()
         };
         let result = config.validate();
         assert!(result.is_err(), "whitespace-only gcp_project_id should fail validation");
+    }
+
+    #[test]
+    fn test_config_from_file_with_nested_gcp_section() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+
+[secret_provider]
+providers = ["gcp"]
+refresh_interval = 300
+
+[secret_provider.gcp]
+project_id = "my-project"
+secret_prefix = "validator-key-"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(config.secret_provider.providers, vec!["gcp".to_string()]);
+        assert_eq!(config.secret_provider.refresh_interval, Some(300));
+        assert_eq!(config.secret_provider.gcp.project_id, Some("my-project".to_string()));
+        assert_eq!(config.secret_provider.gcp.secret_prefix, "validator-key-");
+    }
+
+    #[test]
+    fn test_config_from_file_without_secret_provider_uses_defaults() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert!(config.secret_provider.providers.is_empty());
+        assert!(config.secret_provider.refresh_interval.is_none());
+        assert!(config.secret_provider.gcp.project_id.is_none());
+        assert_eq!(config.secret_provider.gcp.secret_prefix, "validator-key-");
+    }
+
+    #[test]
+    fn test_merge_with_cli_overrides_gcp_project_id() {
+        let mut config = Config {
+            secret_provider: SecretProviderConfig {
+                providers: vec!["gcp".to_string()],
+                gcp: GcpSecretConfig {
+                    project_id: Some("config-project".to_string()),
+                    secret_prefix: "config-prefix-".to_string(),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cli =
+            CliOverrides { gcp_project_id: Some("cli-project".to_string()), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(
+            config.secret_provider.gcp.project_id,
+            Some("cli-project".to_string()),
+            "CLI should override config.toml gcp project_id"
+        );
+        assert_eq!(
+            config.secret_provider.gcp.secret_prefix, "config-prefix-",
+            "config.toml secret_prefix should be preserved when CLI does not specify it"
+        );
+    }
+
+    #[test]
+    fn test_default_config_refresh_interval_none() {
+        let config = Config::default();
+        assert!(config.secret_provider.refresh_interval.is_none());
     }
 }
