@@ -3281,6 +3281,7 @@ dependencies = [
  "hex",
  "libc",
  "reqwest",
+ "rustls",
  "rvc",
  "rvc-bn-manager",
  "rvc-builder",

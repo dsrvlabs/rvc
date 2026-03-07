@@ -227,6 +227,12 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    #[cfg(feature = "gcp-secret")]
+    {
+        use rustls::crypto::{ring::default_provider, CryptoProvider};
+        let _ = CryptoProvider::install_default(default_provider());
+    }
+
     match cli.command {
         Commands::Start {
             config,
