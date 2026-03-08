@@ -98,6 +98,15 @@ rvc start [OPTIONS]
 | `--aggregate-timeout` | 2 | Aggregate fetch/submit deadline |
 | `--duty-fetch-timeout` | 10 | Duty resolution deadline |
 
+#### Secret Provider Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--secret-provider <NAME>` | none | Secret provider to use for loading validator keys (e.g., `gcp`) |
+| `--gcp-project-id <ID>` | none | GCP project ID (required when `--secret-provider` includes `gcp`) |
+| `--gcp-secret-prefix <PREFIX>` | `validator-key-` | Prefix for GCP secret names |
+| `--secret-refresh-interval <SECS>` | `0` | Interval in seconds to refresh keys from secret providers (0 = disabled) |
+
 #### Tracing Options (OpenTelemetry)
 
 | Flag | Default | Description |
@@ -171,6 +180,13 @@ log_level = "info"
 # keymanager_address = "127.0.0.1:5062"
 # keymanager_token_file = "./keymanager-api-token.txt"
 # remote_signer_url = "https://web3signer:9000"
+
+# Secret provider
+# [secret_provider]
+# provider = "gcp"
+# gcp_project_id = "my-project"
+# gcp_secret_prefix = "validator-key-"
+# refresh_interval = 3600
 ```
 
 CLI flags override config file values.
@@ -237,11 +253,13 @@ Requires bearer token authentication.
 9. Validate genesis root against beacon node
 10. Check beacon reachability and log beacon node version
 11. Load validator keys from keystores
-12. Run doppelganger detection (if enabled, ~2 epochs)
-13. Build services (signer, propagator, duty tracker, builder)
-14. Start Keymanager API server (if enabled)
-15. Start duty orchestrator (slot-by-slot validation)
-16. Start gRPC and metrics servers
+12. Load keys from secret providers (if `--secret-provider` configured)
+13. Start periodic key refresh (if `--secret-refresh-interval` > 0)
+14. Run doppelganger detection (if enabled, ~2 epochs)
+15. Build services (signer, propagator, duty tracker, builder)
+16. Start Keymanager API server (if enabled)
+17. Start duty orchestrator (slot-by-slot validation)
+18. Start gRPC and metrics servers
 
 ## Environment Variables
 
@@ -291,6 +309,17 @@ rvc start \
   --keymanager-enabled \
   --remote-signer-url https://web3signer:9000 \
   --keymanager-address 127.0.0.1:5062
+```
+
+### With GCP Secret Manager
+
+```bash
+# Requires building with --features gcp-secret
+rvc start -c config.toml \
+  --secret-provider gcp \
+  --gcp-project-id my-gcp-project \
+  --gcp-secret-prefix validator-key- \
+  --secret-refresh-interval 3600
 ```
 
 ### With OpenTelemetry Tracing

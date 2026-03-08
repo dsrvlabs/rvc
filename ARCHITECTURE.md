@@ -1,6 +1,6 @@
 # Architecture
 
-RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 20 crates (2 binaries + 18 libraries). It handles the full validator lifecycle: block proposals, attestations, sync committee participation, aggregation duties, slashing protection, multi-BN failover, doppelganger detection, MEV/builder integration, runtime key management via the Keymanager API, key generation, and distributed tracing via OpenTelemetry.
+RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 21 crates (2 binaries + 19 libraries). It handles the full validator lifecycle: block proposals, attestations, sync committee participation, aggregation duties, slashing protection, multi-BN failover, doppelganger detection, MEV/builder integration, runtime key management via the Keymanager API, key generation, and distributed tracing via OpenTelemetry.
 
 ## System Overview
 
@@ -10,6 +10,7 @@ graph TB
         BN[Beacon Nodes]
         KS[Keystore Files<br/>EIP-2335]
         W3S[Web3Signer]
+        GCP[GCP Secret Manager]
         DB[(SQLite<br/>Slashing DB)]
         PROM[Prometheus]
         OTEL[OTel Collector]
@@ -31,6 +32,7 @@ graph TB
     BNM <-->|HTTP API| BN
     KS -->|load keys| BIN
     KS -->|load keys| KEYGEN
+    GCP -->|fetch keys| RVC
     W3S <-->|HTTP signing| RVC
     DB <-->|read/write| ORCH
     KMA <-->|key mgmt| RVC
@@ -62,6 +64,7 @@ graph TD
     VSTORE["validator-store<br/><i>validator config</i>"]
     KMA["keymanager-api<br/><i>key mgmt REST</i>"]
     TEL["telemetry<br/><i>OTel tracing</i>"]
+    SP["secret-provider<br/><i>cloud key mgmt</i>"]
 
     BIN --> RVC
     BIN --> BNM
@@ -70,6 +73,7 @@ graph TD
     BIN --> KMA
     BIN --> SLASHING
     BIN --> TEL
+    BIN --> SP
 
     KEYGEN --> CRYPTO
     KEYGEN --> ETH
@@ -125,6 +129,9 @@ graph TD
     SLASHING --> ETH
     SLASHING --> METRICS
 
+    SP --> CRYPTO
+    SP --> METRICS
+
     style BIN fill:#4a9eff,color:#fff
     style KEYGEN fill:#4a9eff,color:#fff
     style RVC fill:#ff6b6b,color:#fff
@@ -145,6 +152,7 @@ graph TD
     style SYNC fill:#ffd43b,color:#333
     style DOPP fill:#ffd43b,color:#333
     style BUILD fill:#ffd43b,color:#333
+    style SP fill:#51cf66,color:#fff
 ```
 
 **Layer colors:**
@@ -194,6 +202,7 @@ block-beta
         ETH["eth-types"]
         KMA["keymanager-api"]
         TEL["telemetry"]
+        SP["secret-provider"]
     end
 
     BIN --> RVC
@@ -324,7 +333,8 @@ flowchart TD
     D --> E[Validate genesis_validators_root<br/>against beacon node]
     E -->|Mismatch| X2[Refuse to start]
     E -->|Match| F[Check beacon node sync status]
-    F --> G[Load validator keys<br/>→ CompositeSigner]
+    F --> F1[Load cloud keys<br/>→ KeySourceManager]
+    F1 --> G[Load validator keys<br/>→ CompositeSigner]
     G --> H{Doppelganger<br/>enabled?}
     H -->|Yes| I[Run 2-epoch monitoring]
     I -->|Detected| X3[Exit code 2]
@@ -350,6 +360,9 @@ flowchart LR
     BIN --> SDB[SlashingDb]
     BIN --> SC[SystemSlotClock]
     BIN --> VS[ValidatorStore]
+    BIN --> KSM[KeySourceManager<br/>secret providers]
+
+    KSM -->|load keys| CS
 
     BNM --> DT[DutyTracker]
     BNM --> PROP[Propagator]
@@ -535,6 +548,17 @@ Slot timing abstraction:
 
 Global Prometheus metrics registry. Runs an Axum HTTP server exposing `/metrics` and `/healthz` endpoints. Metrics cover slot processing, attestations, blocks, sync committees, aggregation, slashing protection, BN health, builder registrations, keymanager requests, and DB pruning.
 
+### `crates/secret-provider` — Cloud Secret Management
+
+Pluggable secret provider abstraction for loading validator keys from cloud key management services:
+
+- **`SecretProvider` trait** — Async trait with `list_keys()` and `fetch_key(id)`. Implementations: `GcpSecretProvider` (gated behind `gcp-secret` feature), `MockSecretProvider` (test-utils).
+- **`KeySourceManager`** — Orchestrates multiple `SecretProvider` instances, loads keys into `CompositeSigner`, returns `LoadSummary` per provider.
+- **`RefreshService`** — Periodic key refresh via `CancellationToken`-aware loop, pre-loads new keys into `CompositeSigner`.
+- **Format detection** — `parse_secret_data` auto-detects raw hex, 0x-prefixed hex, and EIP-2335 keystore JSON.
+- **Observability** — `rvc.secret_provider.*` OTel spans, Prometheus metrics (`keys_loaded`, `errors_total`, `load_duration`).
+- **Security** — `Zeroizing<T>` for all key material, `KeyMaterial` intentionally excludes `Debug`.
+
 ### `crates/telemetry` — OpenTelemetry Distributed Tracing
 
 Provides distributed tracing infrastructure using OpenTelemetry:
@@ -557,6 +581,7 @@ Provides distributed tracing infrastructure using OpenTelemetry:
 - **Downward-only dependencies** — Binary → Orchestrator → Domain → Foundation. Never upward.
 - **Graceful shutdown** — `tokio::watch` channel signals completion of current slot before exiting.
 - **Distributed tracing** — OpenTelemetry spans across slot lifecycle, block proposals, attestations, signing, and beacon HTTP requests with W3C trace context propagation.
+- **Pluggable secret providers** — `SecretProvider` trait enables cloud key management (GCP Secret Manager) with periodic refresh and `Zeroizing` key material.
 
 ## Consensus Protocol Parameters
 
@@ -593,4 +618,5 @@ The validator client is configured via a TOML file (`config.toml`) or CLI flags:
 - Per-operation timeouts (attestation, block production, aggregate, sync committee)
 - Strict slashing semantics (`--strict-slashing-semantics`)
 - Strict file permissions checking (`--strict-permissions`)
+- Secret provider (`--secret-provider gcp`, `--gcp-project-id`, `--secret-refresh-interval`)
 - OpenTelemetry tracing endpoint, exporter (`otlp` or `gcp`), sample rate, batch processor tuning

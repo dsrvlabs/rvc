@@ -15,6 +15,7 @@ An Ethereum Validator Client built in Rust. Handles the full validator lifecycle
 - **Keymanager API** — Runtime key add/remove via standard Ethereum Keymanager REST API
 - **Remote signing** — Web3Signer support via CompositeSigner routing
 - **Key generation** — BIP-39 mnemonic generation, EIP-2333 HD derivation, deposit data, voluntary exits, BLS-to-execution changes
+- **Secret management** — Pluggable secret providers (GCP Secret Manager) with periodic key refresh, format auto-detection, and observability
 - **Distributed tracing** — OpenTelemetry with OTLP/HTTP and GCP Cloud Trace exporters
 - **Electra ready** — EIP-7549 single attestation support with fork-aware orchestration
 
@@ -45,7 +46,7 @@ slashing_db_path = "./slashing_protection.sqlite"
 network = "mainnet"
 ```
 
-See `config.example.toml` for all options including multi-BN failover, Keymanager API, remote signing, and tracing.
+See `config.example.toml` for all options including multi-BN failover, Keymanager API, remote signing, secret providers, and tracing.
 
 ## Binaries
 
@@ -65,13 +66,13 @@ rvc-keygen exit                  # Generate signed voluntary exit messages
 
 ## Architecture
 
-RVC is a modular workspace of 20 crates (2 binaries + 18 libraries) organized in four layers:
+RVC is a modular workspace of 21 crates (2 binaries + 19 libraries) organized in four layers:
 
 ```
 Binary         bin/rvc, bin/rvc-keygen
 Orchestrator   rvc (DutyOrchestrator)
 Domain         signer, duty-tracker, propagator, timing, block-service, sync-service, builder
-Foundation     crypto, slashing, bn-manager, beacon, metrics, eth-types, keymanager-api, telemetry, validator-store, doppelganger
+Foundation     crypto, slashing, bn-manager, beacon, metrics, eth-types, keymanager-api, telemetry, validator-store, doppelganger, secret-provider
 ```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed diagrams and crate descriptions.
