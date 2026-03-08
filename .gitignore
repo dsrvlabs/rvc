@@ -24,3 +24,10 @@ target
 *.swp
 
 .mcp.json
+
+# Validator secrets
+mnemonic
+password
+validator_keys/
+deposit_data-*.json
+slashing_protection.sqlite

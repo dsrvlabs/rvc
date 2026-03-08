@@ -52,6 +52,7 @@ impl BuilderService {
         }
     }
 
+    #[tracing::instrument(name = "rvc.builder.register", skip_all, fields(rvc.builder.batch_size))]
     pub async fn register_validators(&self) -> Result<(), BuilderServiceError> {
         let enabled_pubkeys = self.validator_store.list_enabled_pubkeys();
         let builder_pubkeys: Vec<[u8; 48]> = enabled_pubkeys
@@ -131,6 +132,7 @@ impl BuilderService {
             return Ok(());
         }
 
+        tracing::Span::current().record("rvc.builder.batch_size", registrations.len());
         debug!(count = registrations.len(), "submitting builder registrations");
         self.bn.register_validators(&registrations).await?;
 
@@ -151,6 +153,7 @@ impl BuilderService {
         Ok(())
     }
 
+    #[tracing::instrument(name = "rvc.builder.prepare_proposers", skip_all)]
     pub async fn prepare_proposers(
         &self,
         validator_indices: &HashMap<[u8; 48], u64>,
@@ -194,16 +197,19 @@ mod tests {
 
     use async_trait::async_trait;
     use bn_manager::{
-        AggregateAttestationResponse, AttestationDataResponse, AttesterDutiesResponse,
-        BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, ForkSchedule,
-        GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse, SignedBeaconBlock,
-        SignedBlindedBeaconBlock, SignedContributionAndProof, StateForkResponse,
-        SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-        SyncCommitteeMessage, SyncingResponse, ValidatorsResponse, VersionedAttestation,
+        AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription,
+        BlockRootResponse, ConfigSpecResponse, ForkSchedule, GenesisResponse, ProduceBlockResponse,
+        ProposerDutiesResponse, SignedBeaconBlock, SignedBlindedBeaconBlock,
+        SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+        SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+        SyncingResponse, ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
         VersionedSignedAggregateAndProof,
     };
     use crypto::PublicKey;
-    use eth_types::{AggregateAndProof, AttestationData, Epoch, Root, Slot, VoluntaryExit};
+    use eth_types::{
+        AggregateAndProof, AttestationData, ElectraAggregateAndProof, Epoch, Root, Slot,
+        VoluntaryExit,
+    };
     use validator_store::ValidatorConfig;
 
     // --- Mock BN ---
@@ -307,7 +313,7 @@ mod tests {
             _: u64,
             _: &str,
             _: Option<u64>,
-        ) -> Result<AggregateAttestationResponse, BeaconError> {
+        ) -> Result<VersionedAggregateAttestation, BeaconError> {
             Err(BeaconError::HttpError("mock".into()))
         }
         async fn submit_aggregate_and_proofs(
@@ -443,6 +449,15 @@ mod tests {
         async fn sign_aggregate_and_proof(
             &self,
             _: &AggregateAndProof,
+            _: &PublicKey,
+            _: &eth_types::ForkSchedule,
+            _: &Root,
+        ) -> Result<Vec<u8>, SignerError> {
+            Err(SignerError::KeyNotFound("mock".into()))
+        }
+        async fn sign_electra_aggregate_and_proof(
+            &self,
+            _: &ElectraAggregateAndProof,
             _: &PublicKey,
             _: &eth_types::ForkSchedule,
             _: &Root,

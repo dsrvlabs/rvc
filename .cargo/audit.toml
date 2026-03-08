@@ -1,0 +1,10 @@
+[advisories]
+ignore = [
+    # derivative: unmaintained, transitive via ark-ff → ruint → alloy-primitives.
+    # No direct upgrade path — ark-ff depends on derivative.
+    "RUSTSEC-2024-0388",
+
+    # paste: unmaintained, transitive via ark-ff and alloy-primitives.
+    # No direct upgrade path — multiple upstream crates depend on paste.
+    "RUSTSEC-2024-0436",
+]

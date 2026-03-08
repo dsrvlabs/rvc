@@ -1,81 +1,102 @@
-# rvc
+# RVC — Rust Validator Client
 
 > [!WARNING]
-> This is an experimental project still under active development. DO NOT USE ON MAINNET.
+> This project is under active development and not yet ready for production use. APIs and behavior may change without notice.
 
+An Ethereum Validator Client built in Rust. Handles the full validator lifecycle: block proposals, attestations, sync committee participation, aggregation duties, slashing protection, multi-BN failover, doppelganger detection, MEV/builder integration, runtime key management, and distributed tracing.
 
-## Overview
+## Features
 
-`rvc` is an Ethereum validator client that manages validator keys,
-performs attestation duties, and submits signed attestations to the beacon chain.
+- **3-phase slot processing** — Block proposals (t=0), attestations + sync messages (t=slot/3), aggregations + contributions (t=2*slot/3)
+- **Multi-beacon-node failover** — Health-scored selection strategies (First, Best, Broadcast) with EMA latency tracking
+- **Slashing protection** — EIP-3076 compliant SQLite-backed attestation and block checks with interchange import/export
+- **Doppelganger detection** — 2-epoch monitoring before activating signing (Lodestar pattern)
+- **MEV/builder integration** — Validator registration with jitter, blinded block support
+- **Keymanager API** — Runtime key add/remove via standard Ethereum Keymanager REST API
+- **Remote signing** — Web3Signer support via CompositeSigner routing
+- **Key generation** — BIP-39 mnemonic generation, EIP-2333 HD derivation, deposit data, voluntary exits, BLS-to-execution changes
+- **Secret management** — Pluggable secret providers (GCP Secret Manager) with periodic key refresh, format auto-detection, and observability
+- **Distributed tracing** — OpenTelemetry with OTLP/HTTP and GCP Cloud Trace exporters
+- **Electra ready** — EIP-7549 single attestation support with fork-aware orchestration
 
-The entire codebase is written by a customized AI agent and plugins, developed as part of a *Fully Automated Development* process while preserving development history and observability for humans.
-
-One of the tools used in this project can be found [here](https://github.com/rootwarp/claude-plugin-dev-assistant.git).
-
-
-## Prerequisites
-
-- Rust 1.92+
-- Protocol Buffers compiler (`protoc`)
-- Access to an Ethereum beacon node (Prysm, Lighthouse, Teku, Nimbus, or Lodestar)
-
-## Build
+## Quick Start
 
 ```bash
-cargo build
+# Build
 cargo build --release
+
+# Generate validator keys
+./target/release/rvc-keygen new-mnemonic \
+    --network mainnet \
+    --num-validators 1 \
+    --output-dir ./validators
+
+# Run the validator client
+./target/release/rvc start -c config.toml
 ```
 
-## Usage
+## Configuration
+
+Copy `config.example.toml` to `config.toml` and customize. CLI flags override config file values.
+
+```toml
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing_protection.sqlite"
+network = "mainnet"
+```
+
+See `config.example.toml` for all options including multi-BN failover, Keymanager API, remote signing, secret providers, and tracing.
+
+## Binaries
+
+| Binary | Description |
+|--------|-------------|
+| `rvc` | Main validator client — runs duties, signs messages, manages keys |
+| `rvc-keygen` | Key generation tool — mnemonics, deposits, exits, BLS-to-execution changes |
+
+### rvc-keygen Subcommands
 
 ```bash
-rvc start \
-  --config config.toml \
-  --beacon-url http://localhost:5052 \
-  --keystore-path ./keystores \
-  --network hoodi
+rvc-keygen new-mnemonic          # Generate new mnemonic and derive keys
+rvc-keygen existing-mnemonic     # Derive keys from existing mnemonic
+rvc-keygen bls-to-execution      # Generate BLS-to-execution-change messages
+rvc-keygen exit                  # Generate signed voluntary exit messages
 ```
 
-See `config.example.toml` for all configuration options.
+## Architecture
 
-### CLI Options
+RVC is a modular workspace of 21 crates (2 binaries + 19 libraries) organized in four layers:
 
-| Option | Description | Default |
-|---|---|---|
-| `--config` | Path to TOML config file | |
-| `--beacon-url` | Beacon node HTTP endpoint | |
-| `--keystore-path` | Directory containing EIP-2335 keystores | |
-| `--password-file` | Keystore password file | |
-| `--slashing-db-path` | Slashing protection SQLite database path | |
-| `--metrics-port` | Prometheus metrics HTTP port | `8080` |
-| `--grpc-port` | gRPC server port | `50051` |
-| `--network` | Network preset (mainnet, goerli, sepolia, holesky, custom) | |
-| `--log-level` | Log level (trace, debug, info, warn, error) | `info` |
+```
+Binary         bin/rvc, bin/rvc-keygen
+Orchestrator   rvc (DutyOrchestrator)
+Domain         signer, duty-tracker, propagator, timing, block-service, sync-service, builder
+Foundation     crypto, slashing, bn-manager, beacon, metrics, eth-types, keymanager-api, telemetry, validator-store, doppelganger, secret-provider
+```
 
-### Endpoints
-
-- `GET /metrics` - Prometheus metrics
-- `GET /health` - Health status (JSON)
-- `GET /livez` - Liveness probe
-- `GET /readyz` - Readiness probe
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed diagrams and crate descriptions.
 
 ## Development
 
 ```bash
-cargo check
-cargo fmt
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
+cargo check                       # Type check
+cargo fmt                         # Format
+cargo clippy                      # Lint
+cargo test                        # Run all tests
+cargo test test_name              # Run single test
+cargo test -- --nocapture         # Run with output
 ```
 
-### Code Coverage
+## Supported Networks
 
-```bash
-# Requires cargo-llvm-cov
-cargo llvm-cov --workspace
-cargo llvm-cov --workspace --html
-```
+- Mainnet
+- Hoodi
+- Custom (with explicit genesis parameters)
+
+## Supported Forks
+
+Phase0, Altair, Bellatrix, Capella, Deneb, Electra
 
 ## License
 

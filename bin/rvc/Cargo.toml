@@ -10,6 +10,11 @@ repository.workspace = true
 name = "rvc"
 path = "src/main.rs"
 
+[features]
+default = []
+gcp-trace = ["telemetry/gcp-trace"]
+gcp-secret = ["rvc/gcp-secret", "dep:rustls"]
+
 [dependencies]
 beacon.workspace = true
 bn-manager.workspace = true
@@ -20,15 +25,20 @@ hex.workspace = true
 keymanager-api.workspace = true
 metrics.workspace = true
 rvc.workspace = true
+secret-provider.workspace = true
 signer.workspace = true
+telemetry.workspace = true
 slashing.workspace = true
 timing.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 clap.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow.workspace = true
 tonic.workspace = true
+url.workspace = true
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
 
 [dev-dependencies]
 tempfile.workspace = true

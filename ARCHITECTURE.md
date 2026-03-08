@@ -1,6 +1,6 @@
 # Architecture
 
-RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 18 crates. It handles the full validator lifecycle: block proposals, attestations, sync committee participation, aggregation duties, slashing protection, multi-BN failover, doppelganger detection, MEV/builder integration, and runtime key management via the Keymanager API.
+RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 21 crates (2 binaries + 19 libraries). It handles the full validator lifecycle: block proposals, attestations, sync committee participation, aggregation duties, slashing protection, multi-BN failover, doppelganger detection, MEV/builder integration, runtime key management via the Keymanager API, key generation, and distributed tracing via OpenTelemetry.
 
 ## System Overview
 
@@ -10,16 +10,20 @@ graph TB
         BN[Beacon Nodes]
         KS[Keystore Files<br/>EIP-2335]
         W3S[Web3Signer]
+        GCP[GCP Secret Manager]
         DB[(SQLite<br/>Slashing DB)]
         PROM[Prometheus]
+        OTEL[OTel Collector]
     end
 
     subgraph RVC["RVC Validator Client"]
         BIN[bin/rvc<br/>CLI & Bootstrap]
+        KEYGEN[bin/rvc-keygen<br/>Key Generation]
         ORCH[DutyOrchestrator]
         BNM[BnManager<br/>Multi-BN Failover]
         KMA[Keymanager API<br/>:5062]
         MS[Metrics Server<br/>:8080]
+        TEL[Telemetry<br/>OTel Tracing]
 
         BIN -->|builds| ORCH
         ORCH -->|queries/submits| BNM
@@ -27,10 +31,13 @@ graph TB
 
     BNM <-->|HTTP API| BN
     KS -->|load keys| BIN
+    KS -->|load keys| KEYGEN
+    GCP -->|fetch keys| RVC
     W3S <-->|HTTP signing| RVC
     DB <-->|read/write| ORCH
     KMA <-->|key mgmt| RVC
     MS -->|expose| PROM
+    TEL -->|OTLP/HTTP| OTEL
 ```
 
 ## Crate Dependency Graph
@@ -38,6 +45,7 @@ graph TB
 ```mermaid
 graph TD
     BIN["bin/rvc<br/><i>CLI entry point</i>"]
+    KEYGEN["bin/rvc-keygen<br/><i>key generation</i>"]
     RVC["rvc<br/><i>orchestrator</i>"]
     BEACON["beacon<br/><i>HTTP client</i>"]
     BNM["bn-manager<br/><i>multi-BN</i>"]
@@ -55,6 +63,8 @@ graph TD
     BUILD["builder<br/><i>MEV registration</i>"]
     VSTORE["validator-store<br/><i>validator config</i>"]
     KMA["keymanager-api<br/><i>key mgmt REST</i>"]
+    TEL["telemetry<br/><i>OTel tracing</i>"]
+    SP["secret-provider<br/><i>cloud key mgmt</i>"]
 
     BIN --> RVC
     BIN --> BNM
@@ -62,6 +72,11 @@ graph TD
     BIN --> METRICS
     BIN --> KMA
     BIN --> SLASHING
+    BIN --> TEL
+    BIN --> SP
+
+    KEYGEN --> CRYPTO
+    KEYGEN --> ETH
 
     RVC --> SIGNER
     RVC --> DUTY
@@ -114,7 +129,11 @@ graph TD
     SLASHING --> ETH
     SLASHING --> METRICS
 
+    SP --> CRYPTO
+    SP --> METRICS
+
     style BIN fill:#4a9eff,color:#fff
+    style KEYGEN fill:#4a9eff,color:#fff
     style RVC fill:#ff6b6b,color:#fff
     style ETH fill:#51cf66,color:#fff
     style METRICS fill:#51cf66,color:#fff
@@ -122,6 +141,7 @@ graph TD
     style BNM fill:#51cf66,color:#fff
     style KMA fill:#51cf66,color:#fff
     style VSTORE fill:#51cf66,color:#fff
+    style TEL fill:#51cf66,color:#fff
     style SIGNER fill:#ffd43b,color:#333
     style CRYPTO fill:#ffd43b,color:#333
     style SLASHING fill:#ffd43b,color:#333
@@ -132,6 +152,7 @@ graph TD
     style SYNC fill:#ffd43b,color:#333
     style DOPP fill:#ffd43b,color:#333
     style BUILD fill:#ffd43b,color:#333
+    style SP fill:#51cf66,color:#fff
 ```
 
 **Layer colors:**
@@ -144,21 +165,22 @@ graph TD
 
 ```mermaid
 block-beta
-    columns 7
+    columns 8
 
-    block:binary:7
+    block:binary:8
         BIN["bin/rvc"]
+        KEYGEN["bin/rvc-keygen"]
     end
 
-    space:7
+    space:8
 
-    block:orchestrator:7
+    block:orchestrator:8
         RVC["rvc (orchestrator)"]
     end
 
-    space:7
+    space:8
 
-    block:domain:7
+    block:domain:8
         SIGNER["signer"]
         DUTY["duty-tracker"]
         PROP["propagator"]
@@ -166,11 +188,12 @@ block-beta
         BLOCK["block-service"]
         SYNC["sync-service"]
         BUILD["builder"]
+        DOPP["doppelganger"]
     end
 
-    space:7
+    space:8
 
-    block:foundation:7
+    block:foundation:8
         CRYPTO["crypto"]
         SLASHING["slashing"]
         BNM["bn-manager"]
@@ -178,9 +201,12 @@ block-beta
         METRICS["metrics"]
         ETH["eth-types"]
         KMA["keymanager-api"]
+        TEL["telemetry"]
+        SP["secret-provider"]
     end
 
     BIN --> RVC
+    KEYGEN --> CRYPTO
     RVC --> SIGNER
     RVC --> DUTY
     RVC --> PROP
@@ -299,14 +325,16 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    A[Parse CLI + Config] --> B[Open SlashingDb]
+    A[Parse CLI + Config] --> A1[Init Telemetry<br/>TracingGuard]
+    A1 --> B[Open SlashingDb]
     B --> C[Integrity check<br/>PRAGMA integrity_check]
     C -->|Fail| X1[Refuse to start]
     C -->|Pass| D[Create BnManager]
     D --> E[Validate genesis_validators_root<br/>against beacon node]
     E -->|Mismatch| X2[Refuse to start]
     E -->|Match| F[Check beacon node sync status]
-    F --> G[Load validator keys<br/>→ CompositeSigner]
+    F --> F1[Load cloud keys<br/>→ KeySourceManager]
+    F1 --> G[Load validator keys<br/>→ CompositeSigner]
     G --> H{Doppelganger<br/>enabled?}
     H -->|Yes| I[Run 2-epoch monitoring]
     I -->|Detected| X3[Exit code 2]
@@ -332,6 +360,9 @@ flowchart LR
     BIN --> SDB[SlashingDb]
     BIN --> SC[SystemSlotClock]
     BIN --> VS[ValidatorStore]
+    BIN --> KSM[KeySourceManager<br/>secret providers]
+
+    KSM -->|load keys| CS
 
     BNM --> DT[DutyTracker]
     BNM --> PROP[Propagator]
@@ -364,6 +395,17 @@ flowchart LR
 ### `bin/rvc` — CLI Entry Point
 
 Binary crate. Parses CLI arguments (via `clap`), loads TOML configuration, initializes logging, runs the startup sequence (slashing integrity → genesis validation → BN sync check → doppelganger detection), builds all services, and runs the `DutyOrchestrator`. Manages graceful shutdown on SIGTERM/SIGINT. Optionally starts the Keymanager API server and configures remote signing.
+
+### `bin/rvc-keygen` — Key Generation Tool
+
+Binary crate for offline key generation and signing operations. Subcommands:
+
+- **`new-mnemonic`** — Generates a BIP-39 mnemonic (24 words, 256-bit entropy), derives validator keys via EIP-2333 (`m/12381/3600/i/0`), encrypts to EIP-2335 keystores (Scrypt or PBKDF2), and produces Launchpad-compatible deposit data JSON.
+- **`existing-mnemonic`** — Regenerates keys from an existing mnemonic with configurable `--start-index` and `--num-validators`.
+- **`bls-to-execution`** — Generates `SignedBLSToExecutionChange` messages (`DOMAIN_BLS_TO_EXECUTION_CHANGE` with Capella fork version and actual `genesis_validators_root`).
+- **`exit`** — Generates `SignedVoluntaryExit` messages with EIP-7044 fork version cap at Capella.
+
+Supports `--dry-run`, `--password-file`, `--pbkdf2`, `--withdrawal-address`. Networks: mainnet, hoodi, custom.
 
 ### `crates/rvc` — Core Orchestrator
 
@@ -426,19 +468,22 @@ Used internally by `bn-manager`; domain crates depend on `BeaconNodeClient` trai
 
 ### `crates/eth-types` — Ethereum Consensus Types
 
-Pure data types with SSZ encoding/decoding and tree hashing. Defines all consensus types: `Slot`, `Epoch`, `Root`, `ForkName`, `ForkSchedule`, `AttestationData`, `BeaconBlock`, `BlindedBeaconBlock`, `SyncCommitteeMessage`, `SyncCommitteeContribution`, `ValidatorRegistrationV1`, `VoluntaryExit`, and all domain constants.
+Pure data types with SSZ encoding/decoding and tree hashing. Defines all consensus types: `Slot`, `Epoch`, `Root`, `ForkName`, `ForkSchedule`, `AttestationData`, `SingleAttestation` (EIP-7549), `BeaconBlock`, `BlindedBeaconBlock`, `SyncCommitteeMessage`, `SyncCommitteeContribution`, `ValidatorRegistrationV1`, `VoluntaryExit`, `DepositMessage`, `DepositData`, `BLSToExecutionChange`, `SignedBLSToExecutionChange`, and all domain constants.
 
 Quoted-integer serde via `ethereum_serde_utils` for API compatibility. No business logic. No internal dependencies.
 
-### `crates/crypto` — BLS Cryptography & Signing
+### `crates/crypto` — BLS Cryptography, Signing & Key Derivation
 
-Wraps the `blst` library for BLS12-381 operations:
+Wraps the `blst` library for BLS12-381 operations and provides key generation:
 
 - **`Signer` trait** — Async, object-safe (`dyn Signer`), `Send + Sync`. Abstracts local vs remote signing.
 - **`LocalSigner`** — In-memory key manager wrapping `KeyManager`.
 - **`RemoteSigner`** — Web3Signer HTTP client (`POST /api/v1/eth2/sign/{identifier}`).
 - **`CompositeSigner`** — Routes: remote → dynamic local → base local. Supports runtime key add/remove.
 - **`KeyManager`** — Loads EIP-2335 keystores, stores keys in `HashMap<pubkey_hex, SecretKey>`.
+- **EIP-2333 HD derivation** — `derive_master_sk`, `derive_child_sk` using HKDF-SHA256 and Lamport scheme. Path: `m/12381/3600/i/0` for signing keys, `m/12381/3600/i/0/0` for withdrawal keys.
+- **BIP-39 mnemonic** — Generation (24 words, 256-bit entropy) and seed derivation with optional passphrase.
+- **EIP-2335 keystore encryption** — Scrypt and PBKDF2 KDFs, AES-128-CTR cipher, checksum verification.
 - **Signing functions** — `sign_attestation`, `sign_block`, `sign_randao_reveal`, `sign_sync_committee_message`, `sign_contribution_and_proof`, `sign_aggregate_and_proof`, `sign_selection_proof`, `sign_voluntary_exit`, `sign_builder_registration`.
 - **`Zeroize` on drop**, `SecretString` for passwords, `DecryptionAttemptTracker` for brute-force protection.
 
@@ -503,6 +548,28 @@ Slot timing abstraction:
 
 Global Prometheus metrics registry. Runs an Axum HTTP server exposing `/metrics` and `/healthz` endpoints. Metrics cover slot processing, attestations, blocks, sync committees, aggregation, slashing protection, BN health, builder registrations, keymanager requests, and DB pruning.
 
+### `crates/secret-provider` — Cloud Secret Management
+
+Pluggable secret provider abstraction for loading validator keys from cloud key management services:
+
+- **`SecretProvider` trait** — Async trait with `list_keys()` and `fetch_key(id)`. Implementations: `GcpSecretProvider` (gated behind `gcp-secret` feature), `MockSecretProvider` (test-utils).
+- **`KeySourceManager`** — Orchestrates multiple `SecretProvider` instances, loads keys into `CompositeSigner`, returns `LoadSummary` per provider.
+- **`RefreshService`** — Periodic key refresh via `CancellationToken`-aware loop, pre-loads new keys into `CompositeSigner`.
+- **Format detection** — `parse_secret_data` auto-detects raw hex, 0x-prefixed hex, and EIP-2335 keystore JSON.
+- **Observability** — `rvc.secret_provider.*` OTel spans, Prometheus metrics (`keys_loaded`, `errors_total`, `load_duration`).
+- **Security** — `Zeroizing<T>` for all key material, `KeyMaterial` intentionally excludes `Debug`.
+
+### `crates/telemetry` — OpenTelemetry Distributed Tracing
+
+Provides distributed tracing infrastructure using OpenTelemetry:
+
+- **`TelemetryConfig`** — Endpoint, exporter kind, sample rate, batch processor tuning (max queue size, max export batch size).
+- **`ExporterKind`** — `Otlp` (OTLP/HTTP on port 4318) or `Gcp` (Cloud Trace, gated behind `gcp-trace` feature).
+- **`init_tracing`** — Sets up `tracing-opentelemetry` layer with `ParentBased(TraceIdRatioBased)` sampler. Returns `TracingGuard`.
+- **`TracingGuard`** — RAII `#[must_use]` guard that flushes pending spans on drop (5-second timeout).
+- **W3C propagation** — Injects `traceparent` headers into outbound beacon node HTTP requests.
+- **Instrumentation pattern** — `#[tracing::instrument(name = "rvc.xxx", skip_all, fields(...))]` with dynamic field recording via `Span::current().record()`.
+
 ## Key Design Patterns
 
 - **3-phase slot processing** — t=0 blocks, t=slot/3 attestations + sync messages, t=2*slot/3 aggregations + contributions.
@@ -513,6 +580,8 @@ Global Prometheus metrics registry. Runs an Axum HTTP server exposing `/metrics`
 - **Fail-closed signing** — Any error in the slashing protection path refuses to sign.
 - **Downward-only dependencies** — Binary → Orchestrator → Domain → Foundation. Never upward.
 - **Graceful shutdown** — `tokio::watch` channel signals completion of current slot before exiting.
+- **Distributed tracing** — OpenTelemetry spans across slot lifecycle, block proposals, attestations, signing, and beacon HTTP requests with W3C trace context propagation.
+- **Pluggable secret providers** — `SecretProvider` trait enables cloud key management (GCP Secret Manager) with periodic refresh and `Zeroizing` key material.
 
 ## Consensus Protocol Parameters
 
@@ -532,7 +601,7 @@ Global Prometheus metrics registry. Runs an Axum HTTP server exposing `/metrics`
 
 ## Configuration & Deployment
 
-The validator client is configured via a TOML file or CLI flags:
+The validator client is configured via a TOML file (`config.toml`) or CLI flags:
 
 - Beacon node endpoint(s) (multi-BN supported)
 - Keystore directory path and password file
@@ -546,3 +615,8 @@ The validator client is configured via a TOML file or CLI flags:
 - Metrics port (default 8080) with `/metrics` and `/healthz`
 - gRPC port (default 50051) with `Healthz` RPC
 - Network preset or custom genesis parameters
+- Per-operation timeouts (attestation, block production, aggregate, sync committee)
+- Strict slashing semantics (`--strict-slashing-semantics`)
+- Strict file permissions checking (`--strict-permissions`)
+- Secret provider (`--secret-provider gcp`, `--gcp-project-id`, `--secret-refresh-interval`)
+- OpenTelemetry tracing endpoint, exporter (`otlp` or `gcp`), sample rate, batch processor tuning

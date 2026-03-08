@@ -2,10 +2,13 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+
+use url::Url;
 
 use super::error::ConfigError;
 use super::network::Network;
@@ -23,6 +26,8 @@ pub struct Config {
     pub password_file: Option<PathBuf>,
 
     pub slashing_db_path: PathBuf,
+
+    pub metrics_address: IpAddr,
 
     pub metrics_port: u16,
 
@@ -56,8 +61,70 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_signer_url: Option<String>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_signer_allowed_hosts: Option<Vec<String>>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_decrypt_threads: Option<usize>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracing_endpoint: Option<String>,
+
+    #[serde(default = "default_tracing_exporter")]
+    pub tracing_exporter: String,
+
+    #[serde(default = "default_tracing_sample_rate")]
+    pub tracing_sample_rate: f64,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracing_max_queue_size: Option<usize>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracing_max_export_batch_size: Option<usize>,
+
+    #[serde(default)]
+    pub secret_provider: SecretProviderConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecretProviderConfig {
+    #[serde(default)]
+    pub providers: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_interval: Option<u64>,
+
+    #[serde(default)]
+    pub gcp: GcpSecretConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GcpSecretConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+
+    #[serde(default = "default_gcp_secret_prefix")]
+    pub secret_prefix: String,
+}
+
+impl Default for GcpSecretConfig {
+    fn default() -> Self {
+        Self { project_id: None, secret_prefix: default_gcp_secret_prefix() }
+    }
+}
+
+fn default_gcp_secret_prefix() -> String {
+    "validator-key-".to_string()
+}
+
+fn default_tracing_exporter() -> String {
+    "otlp".to_string()
+}
+
+fn default_tracing_sample_rate() -> f64 {
+    0.01
 }
 
 impl Default for Config {
@@ -68,6 +135,7 @@ impl Default for Config {
             keystore_path: PathBuf::from("./keystores"),
             password_file: None,
             slashing_db_path: PathBuf::from("./slashing_protection.sqlite"),
+            metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             metrics_port: 8080,
             grpc_port: 50051,
             grpc_address: "127.0.0.1".to_string(),
@@ -81,7 +149,14 @@ impl Default for Config {
             keymanager_address: None,
             keymanager_token_file: None,
             remote_signer_url: None,
+            remote_signer_allowed_hosts: None,
             key_decrypt_threads: None,
+            tracing_endpoint: None,
+            tracing_exporter: default_tracing_exporter(),
+            tracing_sample_rate: default_tracing_sample_rate(),
+            tracing_max_queue_size: None,
+            tracing_max_export_batch_size: None,
+            secret_provider: SecretProviderConfig::default(),
         }
     }
 }
@@ -161,6 +236,23 @@ impl Config {
             }
         }
 
+        if self.secret_provider.providers.contains(&"gcp".to_string()) {
+            match &self.secret_provider.gcp.project_id {
+                None => {
+                    return Err(ConfigError::MissingField(
+                        "gcp_project_id is required when secret_providers contains 'gcp'"
+                            .to_string(),
+                    ));
+                }
+                Some(id) if id.trim().is_empty() => {
+                    return Err(ConfigError::MissingField(
+                        "gcp_project_id must not be empty or whitespace-only".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
         self.effective_genesis_time()?;
         self.effective_genesis_validators_root()?;
 
@@ -231,6 +323,10 @@ impl Config {
             self.slashing_db_path = slashing_db_path.clone();
         }
 
+        if let Some(metrics_address) = cli.metrics_address {
+            self.metrics_address = metrics_address;
+        }
+
         if let Some(metrics_port) = cli.metrics_port {
             self.metrics_port = metrics_port;
         }
@@ -283,9 +379,80 @@ impl Config {
             self.remote_signer_url = Some(remote_signer_url.clone());
         }
 
+        if let Some(ref hosts_csv) = cli.remote_signer_allowed_hosts {
+            let hosts: Vec<String> = hosts_csv
+                .split(',')
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty())
+                .collect();
+            if !hosts.is_empty() {
+                self.remote_signer_allowed_hosts = Some(hosts);
+            }
+        }
+
         if let Some(n) = cli.key_decrypt_threads {
             self.key_decrypt_threads = Some(n);
         }
+
+        if let Some(ref tracing_endpoint) = cli.tracing_endpoint {
+            self.tracing_endpoint = Some(tracing_endpoint.clone());
+        }
+
+        if let Some(ref tracing_exporter) = cli.tracing_exporter {
+            self.tracing_exporter = tracing_exporter.clone();
+        }
+
+        if let Some(tracing_sample_rate) = cli.tracing_sample_rate {
+            self.tracing_sample_rate = tracing_sample_rate;
+        }
+
+        if let Some(n) = cli.tracing_max_queue_size {
+            self.tracing_max_queue_size = Some(n);
+        }
+
+        if let Some(n) = cli.tracing_max_export_batch_size {
+            self.tracing_max_export_batch_size = Some(n);
+        }
+
+        if let Some(ref provider_csv) = cli.secret_provider {
+            let providers: Vec<String> = provider_csv
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !providers.is_empty() {
+                self.secret_provider.providers = providers;
+            }
+        }
+
+        if let Some(ref gcp_project_id) = cli.gcp_project_id {
+            self.secret_provider.gcp.project_id = Some(gcp_project_id.clone());
+        }
+
+        if let Some(ref gcp_secret_prefix) = cli.gcp_secret_prefix {
+            self.secret_provider.gcp.secret_prefix = gcp_secret_prefix.clone();
+        }
+
+        if let Some(interval) = cli.secret_refresh_interval {
+            self.secret_provider.refresh_interval = Some(interval);
+        }
+    }
+}
+
+/// Redacts credentials from a URL for safe logging.
+///
+/// If the URL contains a username, both the username and password are replaced
+/// with `***`. Unparseable URLs are returned as-is.
+pub fn redact_url(raw: &str) -> String {
+    match Url::parse(raw) {
+        Ok(mut parsed) => {
+            if !parsed.username().is_empty() {
+                let _ = parsed.set_username("***");
+                let _ = parsed.set_password(Some("***"));
+            }
+            parsed.to_string()
+        }
+        Err(_) => raw.to_string(),
     }
 }
 
@@ -296,6 +463,7 @@ pub struct CliOverrides {
     pub keystore_path: Option<PathBuf>,
     pub password_file: Option<PathBuf>,
     pub slashing_db_path: Option<PathBuf>,
+    pub metrics_address: Option<IpAddr>,
     pub metrics_port: Option<u16>,
     pub grpc_port: Option<u16>,
     pub grpc_address: Option<String>,
@@ -309,7 +477,17 @@ pub struct CliOverrides {
     pub keymanager_address: Option<String>,
     pub keymanager_token_file: Option<PathBuf>,
     pub remote_signer_url: Option<String>,
+    pub remote_signer_allowed_hosts: Option<String>,
     pub key_decrypt_threads: Option<usize>,
+    pub tracing_endpoint: Option<String>,
+    pub tracing_exporter: Option<String>,
+    pub tracing_sample_rate: Option<f64>,
+    pub tracing_max_queue_size: Option<usize>,
+    pub tracing_max_export_batch_size: Option<usize>,
+    pub secret_provider: Option<String>,
+    pub gcp_project_id: Option<String>,
+    pub gcp_secret_prefix: Option<String>,
+    pub secret_refresh_interval: Option<u64>,
 }
 
 #[cfg(test)]
@@ -324,11 +502,35 @@ mod tests {
         assert_eq!(config.beacon_url, "http://localhost:5052");
         assert_eq!(config.keystore_path, PathBuf::from("./keystores"));
         assert_eq!(config.metrics_port, 8080);
+        assert_eq!(config.metrics_address, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
         assert_eq!(config.grpc_port, 50051);
         assert_eq!(config.grpc_address, "127.0.0.1");
         assert_eq!(config.network, Network::Mainnet);
         assert!(config.genesis_time.is_none());
         assert!(config.genesis_validators_root.is_none());
+    }
+
+    #[test]
+    fn test_merge_with_cli_metrics_address() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            metrics_address: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            ..Default::default()
+        };
+
+        config.merge_with_cli(&cli);
+
+        assert_eq!(config.metrics_address, std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn test_merge_with_cli_metrics_address_none_preserves_default() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+
+        config.merge_with_cli(&cli);
+
+        assert_eq!(config.metrics_address, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     }
 
     #[test]
@@ -743,6 +945,212 @@ key_decrypt_threads = 4
         assert_eq!(config.key_decrypt_threads, Some(4));
     }
 
+    // -- tracing config tests --
+
+    #[test]
+    fn test_default_config_tracing_fields() {
+        let config = Config::default();
+        assert!(config.tracing_endpoint.is_none());
+        assert_eq!(config.tracing_exporter, "otlp");
+        assert!((config.tracing_sample_rate - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_merge_with_cli_tracing_endpoint() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            tracing_endpoint: Some("http://collector:4318".to_string()),
+            ..Default::default()
+        };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.tracing_endpoint.as_deref(), Some("http://collector:4318"));
+    }
+
+    #[test]
+    fn test_merge_with_cli_tracing_exporter() {
+        let mut config = Config::default();
+        let cli = CliOverrides { tracing_exporter: Some("gcp".to_string()), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.tracing_exporter, "gcp");
+    }
+
+    #[test]
+    fn test_merge_with_cli_tracing_sample_rate() {
+        let mut config = Config::default();
+        let cli = CliOverrides { tracing_sample_rate: Some(0.5), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert!((config.tracing_sample_rate - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_merge_with_cli_tracing_none_preserves_defaults() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+        config.merge_with_cli(&cli);
+        assert!(config.tracing_endpoint.is_none());
+        assert_eq!(config.tracing_exporter, "otlp");
+        assert!((config.tracing_sample_rate - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_config_from_file_with_tracing() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+tracing_endpoint = "http://otel-collector:4318"
+tracing_exporter = "otlp"
+tracing_sample_rate = 0.1
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(config.tracing_endpoint.as_deref(), Some("http://otel-collector:4318"));
+        assert_eq!(config.tracing_exporter, "otlp");
+        assert!((config.tracing_sample_rate - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_config_from_file_without_tracing_uses_defaults() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert!(config.tracing_endpoint.is_none());
+        assert_eq!(config.tracing_exporter, "otlp");
+        assert!((config.tracing_sample_rate - 0.01).abs() < f64::EPSILON);
+    }
+
+    // -- tracing batch config tests --
+
+    #[test]
+    fn test_default_config_tracing_batch_fields_none() {
+        let config = Config::default();
+        assert!(config.tracing_max_queue_size.is_none());
+        assert!(config.tracing_max_export_batch_size.is_none());
+    }
+
+    #[test]
+    fn test_merge_with_cli_tracing_max_queue_size() {
+        let mut config = Config::default();
+        let cli = CliOverrides { tracing_max_queue_size: Some(4096), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.tracing_max_queue_size, Some(4096));
+    }
+
+    #[test]
+    fn test_merge_with_cli_tracing_max_export_batch_size() {
+        let mut config = Config::default();
+        let cli = CliOverrides { tracing_max_export_batch_size: Some(1024), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.tracing_max_export_batch_size, Some(1024));
+    }
+
+    #[test]
+    fn test_merge_with_cli_tracing_batch_none_preserves_defaults() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+        config.merge_with_cli(&cli);
+        assert!(config.tracing_max_queue_size.is_none());
+        assert!(config.tracing_max_export_batch_size.is_none());
+    }
+
+    #[test]
+    fn test_config_from_file_with_tracing_batch() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+tracing_max_queue_size = 4096
+tracing_max_export_batch_size = 1024
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(config.tracing_max_queue_size, Some(4096));
+        assert_eq!(config.tracing_max_export_batch_size, Some(1024));
+    }
+
+    #[test]
+    fn test_config_from_file_without_tracing_batch_uses_defaults() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert!(config.tracing_max_queue_size.is_none());
+        assert!(config.tracing_max_export_batch_size.is_none());
+    }
+
+    // -- redact_url tests --
+
+    #[test]
+    fn test_redact_url_with_credentials() {
+        let result = redact_url("http://user:pass@host:5052");
+        assert_eq!(result, "http://***:***@host:5052/");
+    }
+
+    #[test]
+    fn test_redact_url_with_username_only() {
+        let result = redact_url("http://user@host:5052");
+        assert_eq!(result, "http://***:***@host:5052/");
+    }
+
+    #[test]
+    fn test_redact_url_without_credentials() {
+        let result = redact_url("http://host:5052");
+        assert_eq!(result, "http://host:5052/");
+    }
+
+    #[test]
+    fn test_redact_url_https_without_credentials() {
+        let result = redact_url("https://beacon.example.com:5052/eth/v1");
+        assert_eq!(result, "https://beacon.example.com:5052/eth/v1");
+    }
+
+    #[test]
+    fn test_redact_url_invalid_input() {
+        let result = redact_url("not-a-url");
+        assert_eq!(result, "not-a-url");
+    }
+
+    #[test]
+    fn test_redact_url_empty_input() {
+        let result = redact_url("");
+        assert_eq!(result, "");
+    }
+
     #[test]
     fn test_config_from_file_without_key_decrypt_threads() {
         let mut file = NamedTempFile::new().unwrap();
@@ -760,5 +1168,342 @@ log_level = "info"
 
         let config = Config::from_file(file.path()).unwrap();
         assert!(config.key_decrypt_threads.is_none());
+    }
+
+    // -- remote_signer_allowed_hosts tests --
+
+    #[test]
+    fn test_default_config_remote_signer_allowed_hosts_none() {
+        let config = Config::default();
+        assert!(config.remote_signer_allowed_hosts.is_none());
+    }
+
+    #[test]
+    fn test_merge_with_cli_remote_signer_allowed_hosts() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            remote_signer_allowed_hosts: Some("host1.com,host2.com".to_string()),
+            ..Default::default()
+        };
+        config.merge_with_cli(&cli);
+        assert_eq!(
+            config.remote_signer_allowed_hosts,
+            Some(vec!["host1.com".to_string(), "host2.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_merge_with_cli_remote_signer_allowed_hosts_with_spaces() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            remote_signer_allowed_hosts: Some(" host1.com , host2.com ".to_string()),
+            ..Default::default()
+        };
+        config.merge_with_cli(&cli);
+        assert_eq!(
+            config.remote_signer_allowed_hosts,
+            Some(vec!["host1.com".to_string(), "host2.com".to_string()])
+        );
+    }
+
+    #[test]
+    fn test_merge_with_cli_remote_signer_allowed_hosts_none_preserves_default() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+        config.merge_with_cli(&cli);
+        assert!(config.remote_signer_allowed_hosts.is_none());
+    }
+
+    #[test]
+    fn test_config_from_file_with_remote_signer_allowed_hosts() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+remote_signer_allowed_hosts = ["signer1.com", "signer2.com"]
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(
+            config.remote_signer_allowed_hosts,
+            Some(vec!["signer1.com".to_string(), "signer2.com".to_string()])
+        );
+    }
+
+    // -- secret provider config tests --
+
+    #[test]
+    fn test_default_config_secret_providers_empty() {
+        let config = Config::default();
+        assert!(config.secret_provider.providers.is_empty());
+        assert!(config.secret_provider.gcp.project_id.is_none());
+        assert_eq!(config.secret_provider.gcp.secret_prefix, "validator-key-");
+    }
+
+    #[test]
+    fn test_merge_with_cli_secret_provider() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            secret_provider: Some("gcp".to_string()),
+            gcp_project_id: Some("my-project".to_string()),
+            gcp_secret_prefix: Some("key-".to_string()),
+            ..Default::default()
+        };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.secret_provider.providers, vec!["gcp".to_string()]);
+        assert_eq!(config.secret_provider.gcp.project_id, Some("my-project".to_string()));
+        assert_eq!(config.secret_provider.gcp.secret_prefix, "key-");
+    }
+
+    #[test]
+    fn test_merge_with_cli_secret_provider_comma_separated() {
+        let mut config = Config::default();
+        let cli =
+            CliOverrides { secret_provider: Some("gcp,aws".to_string()), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.secret_provider.providers, vec!["gcp".to_string(), "aws".to_string()]);
+    }
+
+    #[test]
+    fn test_merge_with_cli_secret_provider_none_preserves_defaults() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+        config.merge_with_cli(&cli);
+        assert!(config.secret_provider.providers.is_empty());
+        assert!(config.secret_provider.gcp.project_id.is_none());
+        assert_eq!(config.secret_provider.gcp.secret_prefix, "validator-key-");
+    }
+
+    #[test]
+    fn test_validate_gcp_provider_missing_project_id() {
+        let config = Config {
+            secret_provider: SecretProviderConfig {
+                providers: vec!["gcp".to_string()],
+                gcp: GcpSecretConfig { project_id: None, ..Default::default() },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("gcp_project_id"),
+            "error should mention gcp_project_id: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_gcp_provider_with_project_id_ok() {
+        let config = Config {
+            secret_provider: SecretProviderConfig {
+                providers: vec!["gcp".to_string()],
+                gcp: GcpSecretConfig {
+                    project_id: Some("my-project".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_no_providers_ok() {
+        let config = Config::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_from_file_with_secret_provider() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+
+[secret_provider]
+providers = ["gcp"]
+
+[secret_provider.gcp]
+project_id = "my-gcp-project"
+secret_prefix = "val-key-"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(config.secret_provider.providers, vec!["gcp".to_string()]);
+        assert_eq!(config.secret_provider.gcp.project_id, Some("my-gcp-project".to_string()));
+        assert_eq!(config.secret_provider.gcp.secret_prefix, "val-key-");
+    }
+
+    #[test]
+    fn test_merge_with_cli_no_gcp_secret_prefix_preserves_config_file() {
+        let mut config = Config {
+            secret_provider: SecretProviderConfig {
+                providers: vec!["gcp".to_string()],
+                gcp: GcpSecretConfig {
+                    project_id: Some("my-project".to_string()),
+                    secret_prefix: "custom-prefix-".to_string(),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cli = CliOverrides { gcp_secret_prefix: None, ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(
+            config.secret_provider.gcp.secret_prefix, "custom-prefix-",
+            "config file gcp_secret_prefix should be preserved when CLI does not specify it"
+        );
+    }
+
+    #[test]
+    fn test_validate_gcp_provider_empty_project_id() {
+        let config = Config {
+            secret_provider: SecretProviderConfig {
+                providers: vec!["gcp".to_string()],
+                gcp: GcpSecretConfig { project_id: Some("".to_string()), ..Default::default() },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err(), "empty gcp_project_id should fail validation");
+    }
+
+    #[test]
+    fn test_validate_gcp_provider_whitespace_project_id() {
+        let config = Config {
+            secret_provider: SecretProviderConfig {
+                providers: vec!["gcp".to_string()],
+                gcp: GcpSecretConfig { project_id: Some("   ".to_string()), ..Default::default() },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err(), "whitespace-only gcp_project_id should fail validation");
+    }
+
+    #[test]
+    fn test_config_from_file_with_nested_gcp_section() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+
+[secret_provider]
+providers = ["gcp"]
+refresh_interval = 300
+
+[secret_provider.gcp]
+project_id = "my-project"
+secret_prefix = "validator-key-"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(config.secret_provider.providers, vec!["gcp".to_string()]);
+        assert_eq!(config.secret_provider.refresh_interval, Some(300));
+        assert_eq!(config.secret_provider.gcp.project_id, Some("my-project".to_string()));
+        assert_eq!(config.secret_provider.gcp.secret_prefix, "validator-key-");
+    }
+
+    #[test]
+    fn test_config_from_file_without_secret_provider_uses_defaults() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert!(config.secret_provider.providers.is_empty());
+        assert!(config.secret_provider.refresh_interval.is_none());
+        assert!(config.secret_provider.gcp.project_id.is_none());
+        assert_eq!(config.secret_provider.gcp.secret_prefix, "validator-key-");
+    }
+
+    #[test]
+    fn test_merge_with_cli_overrides_gcp_project_id() {
+        let mut config = Config {
+            secret_provider: SecretProviderConfig {
+                providers: vec!["gcp".to_string()],
+                gcp: GcpSecretConfig {
+                    project_id: Some("config-project".to_string()),
+                    secret_prefix: "config-prefix-".to_string(),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cli =
+            CliOverrides { gcp_project_id: Some("cli-project".to_string()), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(
+            config.secret_provider.gcp.project_id,
+            Some("cli-project".to_string()),
+            "CLI should override config.toml gcp project_id"
+        );
+        assert_eq!(
+            config.secret_provider.gcp.secret_prefix, "config-prefix-",
+            "config.toml secret_prefix should be preserved when CLI does not specify it"
+        );
+    }
+
+    #[test]
+    fn test_default_config_refresh_interval_none() {
+        let config = Config::default();
+        assert!(config.secret_provider.refresh_interval.is_none());
+    }
+
+    #[test]
+    fn test_merge_with_cli_secret_refresh_interval() {
+        let mut config = Config::default();
+        let cli = CliOverrides { secret_refresh_interval: Some(120), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.secret_provider.refresh_interval, Some(120));
+    }
+
+    #[test]
+    fn test_merge_with_cli_no_secret_refresh_interval_preserves_config() {
+        let mut config = Config {
+            secret_provider: SecretProviderConfig {
+                refresh_interval: Some(300),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cli = CliOverrides::default();
+        config.merge_with_cli(&cli);
+        assert_eq!(config.secret_provider.refresh_interval, Some(300));
     }
 }

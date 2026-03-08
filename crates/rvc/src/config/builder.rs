@@ -25,6 +25,8 @@ use slashing::SlashingDb;
 use timing::{SlotClock, SystemSlotClock};
 use validator_store::ValidatorStore;
 
+use secret_provider::SecretProvider;
+
 use super::error::ConfigError;
 use super::types::Config;
 
@@ -248,6 +250,65 @@ impl ServiceBuilder {
         let service = BuilderService::new(signer, beacon, validator_store, genesis_fork_version);
         info!("Created builder service");
         Arc::new(service)
+    }
+
+    pub async fn build_secret_providers(
+        &self,
+    ) -> Result<Vec<Box<dyn SecretProvider>>, ConfigError> {
+        #[allow(unused_mut)]
+        let mut providers: Vec<Box<dyn SecretProvider>> = Vec::new();
+
+        #[allow(clippy::never_loop)] // loop continues when gcp-secret feature is enabled
+        for provider_name in &self.config.secret_provider.providers {
+            match provider_name.as_str() {
+                "gcp" => {
+                    #[cfg(not(feature = "gcp-secret"))]
+                    {
+                        return Err(ConfigError::FeatureNotEnabled(
+                            "gcp provider requires the `gcp-secret` feature. \
+                             Rebuild with: cargo build --features gcp-secret"
+                                .to_string(),
+                        ));
+                    }
+                    #[cfg(feature = "gcp-secret")]
+                    {
+                        use secret_provider::gcp::{GcpSecretProvider, GcpSecretProviderConfig};
+                        let gcp_config = GcpSecretProviderConfig {
+                            project_id: self
+                                .config
+                                .secret_provider
+                                .gcp
+                                .project_id
+                                .clone()
+                                .ok_or_else(|| {
+                                    ConfigError::MissingField(
+                                        "gcp_project_id is required for GCP secret provider".into(),
+                                    )
+                                })?,
+                            prefix: self.config.secret_provider.gcp.secret_prefix.clone(),
+                            ..Default::default()
+                        };
+                        let gcp_provider =
+                            GcpSecretProvider::new(gcp_config).await.map_err(|e| {
+                                ConfigError::SecretProviderError(format!(
+                                    "failed to create GCP secret provider: {}",
+                                    e
+                                ))
+                            })?;
+                        providers.push(Box::new(gcp_provider));
+                        info!("Created GCP secret provider");
+                    }
+                }
+                other => {
+                    return Err(ConfigError::SecretProviderError(format!(
+                        "unknown secret provider: {}",
+                        other
+                    )));
+                }
+            }
+        }
+
+        Ok(providers)
     }
 
     pub fn build_orchestrator_config(
@@ -554,6 +615,52 @@ mod tests {
         let beacon = builder.build_beacon().unwrap();
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let _service = builder.build_doppelganger_service(beacon, slashing_db);
+    }
+
+    #[tokio::test]
+    async fn test_build_secret_providers_empty() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let result = builder.build_secret_providers().await;
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_build_secret_providers_gcp_without_feature() {
+        use super::super::types::{GcpSecretConfig, SecretProviderConfig};
+        let config = Config {
+            secret_provider: SecretProviderConfig {
+                providers: vec!["gcp".to_string()],
+                gcp: GcpSecretConfig {
+                    project_id: Some("my-project".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..create_minimal_config()
+        };
+        let builder = ServiceBuilder::new(config);
+        let result = builder.build_secret_providers().await;
+        // Without gcp-secret feature, should return an error
+        #[cfg(not(feature = "gcp-secret"))]
+        assert!(result.is_err());
+        #[cfg(feature = "gcp-secret")]
+        {
+            // With feature, would attempt GCP client construction (may fail without credentials)
+            let _ = result;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_secret_providers_unknown_provider() {
+        let mut config = create_minimal_config();
+        config.secret_provider.providers = vec!["unknown".to_string()];
+        let builder = ServiceBuilder::new(config);
+        let result = builder.build_secret_providers().await;
+        assert!(result.is_err());
+        let err = result.err().unwrap();
+        assert!(err.to_string().contains("unknown secret provider"));
     }
 
     #[test]

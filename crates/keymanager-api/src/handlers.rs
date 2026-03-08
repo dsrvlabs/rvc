@@ -52,6 +52,12 @@ pub async fn import_keystores(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ImportKeystoresRequest>,
 ) -> Result<Json<ImportKeystoresResponse>, ApiError> {
+    let _span = tracing::info_span!(
+        "rvc.keymanager.import_keystores",
+        rvc.keymanager.count = request.keystores.len(),
+    )
+    .entered();
+
     if request.keystores.len() != request.passwords.len() {
         return Err(ApiError::BadRequest(
             "keystores and passwords arrays must have the same length".into(),
@@ -100,6 +106,12 @@ pub async fn delete_keystores(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DeleteKeystoresRequest>,
 ) -> Result<Json<DeleteKeystoresResponse>, ApiError> {
+    let _span = tracing::info_span!(
+        "rvc.keymanager.delete_keystores",
+        rvc.keymanager.count = request.pubkeys.len(),
+    )
+    .entered();
+
     // Parse all pubkeys and identify which ones exist for slashing export
     let parsed: Vec<Result<Pubkey, String>> =
         request.pubkeys.iter().map(|s| parse_pubkey(s)).collect();
@@ -176,6 +188,12 @@ pub async fn import_remote_keys(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ImportRemoteKeysRequest>,
 ) -> Json<ImportRemoteKeysResponse> {
+    let _span = tracing::info_span!(
+        "rvc.keymanager.import_remote_keys",
+        rvc.keymanager.count = request.remote_keys.len(),
+    )
+    .entered();
+
     let mut results = Vec::with_capacity(request.remote_keys.len());
 
     for key_import in &request.remote_keys {
@@ -218,6 +236,12 @@ pub async fn delete_remote_keys(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DeleteRemoteKeysRequest>,
 ) -> Json<DeleteRemoteKeysResponse> {
+    let _span = tracing::info_span!(
+        "rvc.keymanager.delete_remote_keys",
+        rvc.keymanager.count = request.pubkeys.len(),
+    )
+    .entered();
+
     let mut results = Vec::with_capacity(request.pubkeys.len());
 
     for pubkey_str in &request.pubkeys {

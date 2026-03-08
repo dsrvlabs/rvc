@@ -234,12 +234,12 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use beacon::{
-        AggregateAttestationResponse, AttestationDataResponse, AttesterDutiesResponse,
-        BeaconCommitteeSubscription, BeaconError, BlockRootResponse, ConfigSpecResponse,
-        DataResponse, GenesisData, GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse,
-        ProposerPreparation, SignedContributionAndProof, StateForkResponse, StateResponse,
-        SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-        SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorsResponse,
+        AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
+        BlockRootResponse, ConfigSpecResponse, DataResponse, GenesisData, GenesisResponse,
+        ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
+        SignedContributionAndProof, StateForkResponse, StateResponse, SubmitAttestationResult,
+        SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+        SyncingData, SyncingResponse, ValidatorsResponse, VersionedAggregateAttestation,
         VersionedAttestation, VersionedSignedAggregateAndProof,
     };
     use eth_types::{ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock};
@@ -375,7 +375,7 @@ mod tests {
             _slot: u64,
             _attestation_data_root: &str,
             _committee_index: Option<u64>,
-        ) -> Result<AggregateAttestationResponse, BeaconError> {
+        ) -> Result<VersionedAggregateAttestation, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
         async fn submit_aggregate_and_proofs(

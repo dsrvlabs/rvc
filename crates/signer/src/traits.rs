@@ -2,8 +2,8 @@ use async_trait::async_trait;
 
 use crypto::PublicKey;
 use eth_types::{
-    AggregateAndProof, AttestationData, ContributionAndProof, Epoch, ForkSchedule, Root, Slot,
-    ValidatorRegistrationV1, VoluntaryExit,
+    AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
+    ForkSchedule, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
 };
 
 use crate::SignerError;
@@ -66,6 +66,15 @@ pub trait ValidatorSigner {
     async fn sign_aggregate_and_proof(
         &self,
         aggregate_and_proof: &AggregateAndProof,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError>;
+
+    /// Sign an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
+    async fn sign_electra_aggregate_and_proof(
+        &self,
+        aggregate_and_proof: &ElectraAggregateAndProof,
         pubkey: &PublicKey,
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,

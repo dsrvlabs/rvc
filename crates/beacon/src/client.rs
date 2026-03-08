@@ -2,18 +2,35 @@ use std::time::Duration;
 
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::{debug, warn, Instrument};
+use url::Url;
+
+/// Redact credentials from a URL for safe inclusion in span attributes.
+///
+/// Replaces username and password with `***` if present, leaving the rest
+/// of the URL intact. Returns the original string if parsing fails.
+fn redact_url(url: &str) -> String {
+    if let Ok(mut parsed) = Url::parse(url) {
+        if parsed.password().is_some() || !parsed.username().is_empty() {
+            let _ = parsed.set_username("***");
+            let _ = parsed.set_password(Some("***"));
+        }
+        parsed.to_string()
+    } else {
+        url.to_string()
+    }
+}
 
 use eth_types::{ForkSchedule, SignedValidatorRegistration, SignedVoluntaryExit};
 
 use crate::types::{
-    parse_fork_schedule, AggregateAttestationResponse, AttestationDataResponse,
-    AttesterDutiesResponse, BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse,
+    parse_fork_schedule, AttestationDataResponse, AttesterDutiesResponse,
+    BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, DataResponse,
     GenesisResponse, IndexedAttestationError, ProduceBlockResponse, ProposerDutiesResponse,
     ProposerPreparation, SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
     SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAttestation,
-    VersionedSignedAggregateAndProof,
+    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use crate::BeaconError;
 
@@ -107,7 +124,17 @@ impl BeaconClient {
     /// Performs a GET request with retry logic.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, BeaconError> {
         let url = format!("{}{}", self.config.endpoint, path);
-        self.execute_with_retry(|| async { self.client.get(&url).send().await }).await
+        let mut trace_headers = reqwest::header::HeaderMap::new();
+        telemetry::inject_trace_context(&mut trace_headers);
+        let hdrs = trace_headers.clone();
+        self.execute_with_retry("GET", &url, || async {
+            let mut req = self.client.get(&url);
+            for (name, value) in &hdrs {
+                req = req.header(name.clone(), value.clone());
+            }
+            req.send().await
+        })
+        .await
     }
 
     /// Performs a POST request with retry logic.
@@ -117,7 +144,17 @@ impl BeaconClient {
         body: &B,
     ) -> Result<T, BeaconError> {
         let url = format!("{}{}", self.config.endpoint, path);
-        self.execute_with_retry(|| async { self.client.post(&url).json(body).send().await }).await
+        let mut trace_headers = reqwest::header::HeaderMap::new();
+        telemetry::inject_trace_context(&mut trace_headers);
+        let hdrs = trace_headers.clone();
+        self.execute_with_retry("POST", &url, || async {
+            let mut req = self.client.post(&url).json(body);
+            for (name, value) in &hdrs {
+                req = req.header(name.clone(), value.clone());
+            }
+            req.send().await
+        })
+        .await
     }
 
     /// Performs a POST request expecting an empty success response.
@@ -135,7 +172,9 @@ impl BeaconClient {
         validator_indices: &[String],
     ) -> Result<AttesterDutiesResponse, BeaconError> {
         let path = format!("/eth/v1/validator/duties/attester/{}", epoch);
-        self.post(&path, &validator_indices).await
+        self.post(&path, &validator_indices)
+            .instrument(tracing::info_span!("rvc.beacon.get_attester_duties", epoch = epoch))
+            .await
     }
 
     /// Resolves public keys to validator data including numeric indices.
@@ -149,7 +188,7 @@ impl BeaconClient {
         let ids: String =
             pubkeys.iter().map(|pk| format!("id={}", pk)).collect::<Vec<_>>().join("&");
         let path = format!("/eth/v1/beacon/states/head/validators?{}", ids);
-        self.get(&path).await
+        self.get(&path).instrument(tracing::info_span!("rvc.beacon.get_validators")).await
     }
 
     /// Fetches attestation data for the given slot and committee index.
@@ -168,18 +207,22 @@ impl BeaconClient {
             "/eth/v1/validator/attestation_data?slot={}&committee_index={}",
             slot, committee_index
         );
-        self.get(&path).await
+        self.get(&path)
+            .instrument(tracing::info_span!("rvc.beacon.get_attestation_data", slot = slot))
+            .await
     }
 
     /// Fetches the chain configuration specification from the beacon node.
     ///
     /// Returns a map of all configuration parameters as string key-value pairs.
     /// Includes fork versions, fork epochs, slot timing, and other consensus parameters.
+    #[tracing::instrument(name = "rvc.beacon.get_config_spec", skip_all)]
     pub async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
         self.get("/eth/v1/config/spec").await
     }
 
     /// Fetches the config spec and parses fork epoch and version fields into a `ForkSchedule`.
+    #[tracing::instrument(name = "rvc.beacon.get_fork_schedule", skip_all)]
     pub async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
         let spec = self.get_config_spec().await?;
         parse_fork_schedule(&spec.data)
@@ -188,6 +231,7 @@ impl BeaconClient {
     /// Fetches genesis information from the beacon node.
     ///
     /// Returns the genesis time, genesis validators root, and genesis fork version.
+    #[tracing::instrument(name = "rvc.beacon.get_genesis", skip_all)]
     pub async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
         self.get("/eth/v1/beacon/genesis").await
     }
@@ -196,6 +240,7 @@ impl BeaconClient {
     ///
     /// Returns the previous and current fork versions along with the fork epoch.
     /// Common state_id values: "head", "finalized", "justified", or a specific slot number.
+    #[tracing::instrument(name = "rvc.beacon.get_fork", skip_all)]
     pub async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError> {
         let path = format!("/eth/v1/beacon/states/{}/fork", state_id);
         self.get(&path).await
@@ -204,6 +249,7 @@ impl BeaconClient {
     /// Fetches the block root for the given block identifier.
     ///
     /// Common block_id values: "head", "finalized", "justified", or a slot number.
+    #[tracing::instrument(name = "rvc.beacon.get_block_root", skip_all)]
     pub async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
         let path = format!("/eth/v1/beacon/blocks/{}/root", block_id);
         self.get(&path).await
@@ -215,7 +261,9 @@ impl BeaconClient {
         epoch: u64,
     ) -> Result<ProposerDutiesResponse, BeaconError> {
         let path = format!("/eth/v1/validator/duties/proposer/{}", epoch);
-        self.get(&path).await
+        self.get(&path)
+            .instrument(tracing::info_span!("rvc.beacon.get_proposer_duties", epoch = epoch))
+            .await
     }
 
     /// SSZ content negotiation Accept header for block production.
@@ -245,13 +293,18 @@ impl BeaconClient {
         }
         let url = format!("{}/eth/v3/validator/blocks/{}?{}", self.config.endpoint, slot, query);
 
+        let mut trace_headers = reqwest::header::HeaderMap::new();
+        telemetry::inject_trace_context(&mut trace_headers);
+        let hdrs = trace_headers.clone();
+
         let response = self
-            .execute_with_retry_raw(|| async {
-                self.client
-                    .get(&url)
-                    .header(reqwest::header::ACCEPT, Self::SSZ_ACCEPT_HEADER)
-                    .send()
-                    .await
+            .execute_with_retry_raw("GET", &url, || async {
+                let mut req =
+                    self.client.get(&url).header(reqwest::header::ACCEPT, Self::SSZ_ACCEPT_HEADER);
+                for (name, value) in &hdrs {
+                    req = req.header(name.clone(), value.clone());
+                }
+                req.send().await
             })
             .await?;
 
@@ -300,13 +353,17 @@ impl BeaconClient {
                         "SSZ block response processing failed, retrying with JSON"
                     );
                     // Single fallback retry with explicit JSON Accept
+                    let hdrs2 = trace_headers.clone();
                     let fallback_response = self
-                        .execute_with_retry_raw(|| async {
-                            self.client
+                        .execute_with_retry_raw("GET", &url, || async {
+                            let mut req = self
+                                .client
                                 .get(&url)
-                                .header(reqwest::header::ACCEPT, "application/json")
-                                .send()
-                                .await
+                                .header(reqwest::header::ACCEPT, "application/json");
+                            for (name, value) in &hdrs2 {
+                                req = req.header(name.clone(), value.clone());
+                            }
+                            req.send().await
                         })
                         .await?;
                     return Self::parse_produce_block_json(fallback_response).await;
@@ -415,6 +472,7 @@ impl BeaconClient {
             signed_block,
             &[("Eth-Consensus-Version", consensus_version)],
         )
+        .instrument(tracing::info_span!("rvc.beacon.publish_block"))
         .await
     }
 
@@ -429,6 +487,7 @@ impl BeaconClient {
             signed_blinded_block,
             &[("Eth-Consensus-Version", consensus_version)],
         )
+        .instrument(tracing::info_span!("rvc.beacon.publish_blinded_block"))
         .await
     }
 
@@ -445,17 +504,30 @@ impl BeaconClient {
             if is_blinded { "/eth/v1/beacon/blinded_blocks" } else { "/eth/v2/beacon/blocks" };
         let url = format!("{}{}", self.config.endpoint, path);
 
-        let response = self
+        let span = tracing::info_span!(
+            "rvc.beacon.publish_block_ssz",
+            http.method = "POST",
+            http.url = %redact_url(&url),
+            http.status_code = tracing::field::Empty,
+        );
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        telemetry::inject_trace_context(&mut headers);
+
+        let mut request = self
             .client
             .post(&url)
             .header("Content-Type", "application/octet-stream")
             .header("Eth-Consensus-Version", consensus_version)
-            .body(ssz_bytes.to_vec())
-            .send()
-            .await
-            .map_err(|e| BeaconError::HttpError(e.to_string()))?;
+            .body(ssz_bytes.to_vec());
+        for (name, value) in &headers {
+            request = request.header(name.clone(), value.clone());
+        }
+
+        let response = request.send().await.map_err(|e| BeaconError::HttpError(e.to_string()))?;
 
         let status = response.status();
+        span.record("http.status_code", status.as_u16());
         if status.is_success() {
             Ok(())
         } else {
@@ -471,7 +543,9 @@ impl BeaconClient {
         validator_indices: &[String],
     ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
         let path = format!("/eth/v1/validator/duties/sync/{}", epoch);
-        self.post(&path, &validator_indices).await
+        self.post(&path, &validator_indices)
+            .instrument(tracing::info_span!("rvc.beacon.get_sync_committee_duties", epoch = epoch))
+            .await
     }
 
     /// Submits sync committee messages to the beacon node pool.
@@ -479,10 +553,13 @@ impl BeaconClient {
         &self,
         messages: &[SyncCommitteeMessage],
     ) -> Result<(), BeaconError> {
-        self.post_empty("/eth/v1/beacon/pool/sync_committees", &messages).await
+        self.post_empty("/eth/v1/beacon/pool/sync_committees", &messages)
+            .instrument(tracing::info_span!("rvc.beacon.submit_sync_committee_messages"))
+            .await
     }
 
     /// Fetches a sync committee contribution for the given slot, subcommittee index, and block root.
+    #[tracing::instrument(name = "rvc.beacon.get_sync_committee_contribution", skip_all, fields(rvc.slot = slot))]
     pub async fn get_sync_committee_contribution(
         &self,
         slot: u64,
@@ -501,7 +578,9 @@ impl BeaconClient {
         &self,
         proofs: &[SignedContributionAndProof],
     ) -> Result<(), BeaconError> {
-        self.post_empty("/eth/v1/validator/contribution_and_proofs", &proofs).await
+        self.post_empty("/eth/v1/validator/contribution_and_proofs", &proofs)
+            .instrument(tracing::info_span!("rvc.beacon.submit_contribution_and_proofs"))
+            .await
     }
 
     // Aggregation
@@ -510,12 +589,13 @@ impl BeaconClient {
     ///
     /// The `committee_index` parameter is required for Electra and later forks.
     /// Pass `None` for pre-Electra requests.
+    #[tracing::instrument(name = "rvc.beacon.get_aggregate_attestation", skip_all, fields(rvc.slot = slot))]
     pub async fn get_aggregate_attestation(
         &self,
         slot: u64,
         attestation_data_root: &str,
         committee_index: Option<u64>,
-    ) -> Result<AggregateAttestationResponse, BeaconError> {
+    ) -> Result<VersionedAggregateAttestation, BeaconError> {
         let mut path = format!(
             "/eth/v1/validator/aggregate_attestation?slot={}&attestation_data_root={}",
             slot, attestation_data_root
@@ -523,7 +603,14 @@ impl BeaconClient {
         if let Some(ci) = committee_index {
             path.push_str(&format!("&committee_index={}", ci));
         }
-        self.get(&path).await
+
+        if committee_index.is_some() {
+            let resp: DataResponse<eth_types::ElectraAttestation> = self.get(&path).await?;
+            Ok(VersionedAggregateAttestation::Electra(resp.data))
+        } else {
+            let resp: DataResponse<eth_types::Attestation> = self.get(&path).await?;
+            Ok(VersionedAggregateAttestation::PreElectra(resp.data))
+        }
     }
 
     /// Submits signed aggregate and proofs to the beacon node.
@@ -531,13 +618,28 @@ impl BeaconClient {
         &self,
         proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError> {
+        let span = tracing::info_span!("rvc.beacon.submit_aggregate_and_proofs");
         match proofs {
             VersionedSignedAggregateAndProof::PreElectra(ps) => {
-                self.post_empty("/eth/v1/validator/aggregate_and_proofs", ps).await
+                self.post_empty("/eth/v1/validator/aggregate_and_proofs", ps).instrument(span).await
             }
-            VersionedSignedAggregateAndProof::Electra(ps)
-            | VersionedSignedAggregateAndProof::Fulu(ps) => {
-                self.post_empty("/eth/v2/validator/aggregate_and_proofs", ps).await
+            VersionedSignedAggregateAndProof::Electra(ps) => {
+                self.post_empty_with_headers(
+                    "/eth/v2/validator/aggregate_and_proofs",
+                    ps,
+                    &[("Eth-Consensus-Version", "electra")],
+                )
+                .instrument(span)
+                .await
+            }
+            VersionedSignedAggregateAndProof::Fulu(ps) => {
+                self.post_empty_with_headers(
+                    "/eth/v2/validator/aggregate_and_proofs",
+                    ps,
+                    &[("Eth-Consensus-Version", "fulu")],
+                )
+                .instrument(span)
+                .await
             }
         }
     }
@@ -550,13 +652,16 @@ impl BeaconClient {
         &self,
         preparations: &[ProposerPreparation],
     ) -> Result<(), BeaconError> {
-        self.post_empty("/eth/v1/validator/prepare_beacon_proposer", &preparations).await
+        self.post_empty("/eth/v1/validator/prepare_beacon_proposer", &preparations)
+            .instrument(tracing::info_span!("rvc.beacon.prepare_beacon_proposer"))
+            .await
     }
 
     /// Posts validator indices to check liveness for the given epoch.
     ///
     /// Returns liveness data indicating whether each validator was active
     /// during the specified epoch. Used for doppelganger detection.
+    #[tracing::instrument(name = "rvc.beacon.post_validator_liveness", skip_all, fields(rvc.epoch = epoch))]
     pub async fn post_validator_liveness(
         &self,
         epoch: u64,
@@ -575,7 +680,9 @@ impl BeaconClient {
         &self,
         signed_exit: &SignedVoluntaryExit,
     ) -> Result<(), BeaconError> {
-        self.post_empty("/eth/v1/beacon/pool/voluntary_exits", signed_exit).await
+        self.post_empty("/eth/v1/beacon/pool/voluntary_exits", signed_exit)
+            .instrument(tracing::info_span!("rvc.beacon.submit_voluntary_exit"))
+            .await
     }
 
     /// Subscribes validators to beacon committees for attestation subnet management.
@@ -586,7 +693,9 @@ impl BeaconClient {
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
-        self.post_empty("/eth/v1/validator/beacon_committee_subscriptions", &subscriptions).await
+        self.post_empty("/eth/v1/validator/beacon_committee_subscriptions", &subscriptions)
+            .instrument(tracing::info_span!("rvc.beacon.submit_beacon_committee_subscriptions"))
+            .await
     }
 
     // Builder
@@ -595,18 +704,22 @@ impl BeaconClient {
         &self,
         registrations: &[SignedValidatorRegistration],
     ) -> Result<(), BeaconError> {
-        self.post_empty("/eth/v1/validator/register_validator", &registrations).await
+        self.post_empty("/eth/v1/validator/register_validator", &registrations)
+            .instrument(tracing::info_span!("rvc.beacon.register_validators"))
+            .await
     }
 
     /// Fetches the sync status of the beacon node.
     ///
     /// Returns whether the node is syncing, its head slot, sync distance,
     /// and whether the execution layer is offline.
+    #[tracing::instrument(name = "rvc.beacon.get_node_syncing", skip_all)]
     pub async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
         self.get("/eth/v1/node/syncing").await
     }
 
     /// Fetches the node version string from the beacon node.
+    #[tracing::instrument(name = "rvc.beacon.get_node_version", skip_all)]
     pub async fn get_node_version(&self) -> Result<String, BeaconError> {
         let response: crate::types::NodeVersionResponse = self.get("/eth/v1/node/version").await?;
         Ok(response.data.version)
@@ -624,6 +737,16 @@ impl BeaconClient {
         attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError> {
         let url = format!("{}/eth/v2/beacon/pool/attestations", self.config.endpoint);
+
+        let span = tracing::info_span!(
+            "rvc.beacon.submit_attestations",
+            http.method = "POST",
+            http.url = %redact_url(&url),
+            http.status_code = tracing::field::Empty,
+        );
+        let mut trace_headers = reqwest::header::HeaderMap::new();
+        telemetry::inject_trace_context(&mut trace_headers);
+
         let mut last_error = None;
 
         for attempt in 0..=self.config.max_retries {
@@ -647,25 +770,32 @@ impl BeaconClient {
 
             let send_result = match attestations {
                 VersionedAttestation::PreElectra(atts) => {
-                    self.client
+                    let mut req = self
+                        .client
                         .post(&url)
                         .header("Eth-Consensus-Version", consensus_version)
-                        .json(atts)
-                        .send()
-                        .await
+                        .json(atts);
+                    for (name, value) in &trace_headers {
+                        req = req.header(name.clone(), value.clone());
+                    }
+                    req.send().await
                 }
                 VersionedAttestation::Electra(atts) | VersionedAttestation::Fulu(atts) => {
-                    self.client
+                    let mut req = self
+                        .client
                         .post(&url)
                         .header("Eth-Consensus-Version", consensus_version)
-                        .json(atts)
-                        .send()
-                        .await
+                        .json(atts);
+                    for (name, value) in &trace_headers {
+                        req = req.header(name.clone(), value.clone());
+                    }
+                    req.send().await
                 }
             };
             match send_result {
                 Ok(response) => {
                     let status = response.status();
+                    span.record("http.status_code", status.as_u16());
 
                     if status.is_success() {
                         return Ok(SubmitAttestationResult::Success);
@@ -728,15 +858,28 @@ impl BeaconClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string())))
+        let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
+        span.in_scope(|| tracing::error!(error = %err, "Request failed after retries exhausted"));
+        Err(err)
     }
 
-    async fn execute_with_retry<F, Fut, T>(&self, request_fn: F) -> Result<T, BeaconError>
+    async fn execute_with_retry<F, Fut, T>(
+        &self,
+        http_method: &str,
+        url: &str,
+        request_fn: F,
+    ) -> Result<T, BeaconError>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
         T: DeserializeOwned,
     {
+        let span = tracing::info_span!(
+            "rvc.beacon.http",
+            http.method = %http_method,
+            http.url = %redact_url(url),
+            http.status_code = tracing::field::Empty,
+        );
         let mut last_error = None;
 
         for attempt in 0..=self.config.max_retries {
@@ -749,6 +892,7 @@ impl BeaconClient {
             match request_fn().await {
                 Ok(response) => {
                     let status = response.status();
+                    span.record("http.status_code", status.as_u16());
 
                     if status.is_success() {
                         let body = response.text().await.map_err(|e| {
@@ -803,7 +947,9 @@ impl BeaconClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string())))
+        let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
+        span.in_scope(|| tracing::error!(error = %err, "Request failed after retries exhausted"));
+        Err(err)
     }
 
     /// Performs a POST request with retry logic and optional headers, expecting an empty success response.
@@ -814,6 +960,16 @@ impl BeaconClient {
         headers: &[(&str, &str)],
     ) -> Result<(), BeaconError> {
         let url = format!("{}{}", self.config.endpoint, path);
+
+        let span = tracing::info_span!(
+            "rvc.beacon.http",
+            http.method = "POST",
+            http.url = %redact_url(&url),
+            http.status_code = tracing::field::Empty,
+        );
+        let mut trace_headers = reqwest::header::HeaderMap::new();
+        telemetry::inject_trace_context(&mut trace_headers);
+
         let mut last_error = None;
 
         for attempt in 0..=self.config.max_retries {
@@ -827,10 +983,14 @@ impl BeaconClient {
             for &(name, value) in headers {
                 request = request.header(name, value);
             }
+            for (name, value) in &trace_headers {
+                request = request.header(name.clone(), value.clone());
+            }
 
             match request.send().await {
                 Ok(response) => {
                     let status = response.status();
+                    span.record("http.status_code", status.as_u16());
 
                     if status.is_success() {
                         return Ok(());
@@ -874,18 +1034,28 @@ impl BeaconClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string())))
+        let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
+        span.in_scope(|| tracing::error!(error = %err, "Request failed after retries exhausted"));
+        Err(err)
     }
 
     /// Executes a request with retry logic and returns the raw response on success.
     async fn execute_with_retry_raw<F, Fut>(
         &self,
+        http_method: &str,
+        url: &str,
         request_fn: F,
     ) -> Result<reqwest::Response, BeaconError>
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
     {
+        let span = tracing::info_span!(
+            "rvc.beacon.http",
+            http.method = %http_method,
+            http.url = %redact_url(url),
+            http.status_code = tracing::field::Empty,
+        );
         let mut last_error = None;
 
         for attempt in 0..=self.config.max_retries {
@@ -898,6 +1068,7 @@ impl BeaconClient {
             match request_fn().await {
                 Ok(response) => {
                     let status = response.status();
+                    span.record("http.status_code", status.as_u16());
 
                     if status.is_success() {
                         return Ok(response);
@@ -941,7 +1112,9 @@ impl BeaconClient {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string())))
+        let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
+        span.in_scope(|| tracing::error!(error = %err, "Request failed after retries exhausted"));
+        Err(err)
     }
 
     fn calculate_backoff(&self, attempt: u32) -> Duration {
@@ -3477,10 +3650,15 @@ mod tests {
 
         let result = client.get_aggregate_attestation(100, &att_data_root, None).await.unwrap();
 
-        assert_eq!(result.data.data.slot, 100);
-        assert_eq!(result.data.data.index, 1);
-        assert_eq!(result.data.aggregation_bits, vec![0xff; 4]);
-        assert_eq!(result.data.signature, vec![0xaa; 96]);
+        match result {
+            crate::types::VersionedAggregateAttestation::PreElectra(att) => {
+                assert_eq!(att.data.slot, 100);
+                assert_eq!(att.data.index, 1);
+                assert_eq!(att.aggregation_bits, vec![0xff; 4]);
+                assert_eq!(att.signature, vec![0xaa; 96]);
+            }
+            other => panic!("Expected PreElectra variant, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -3639,6 +3817,7 @@ mod tests {
 
         let att_data_root = format!("0x{}", "ab".repeat(32));
         let sig_hex = format!("0x{}", "aa".repeat(96));
+        let committee_bits_hex = "0x2000000000000000";
         let response_body = serde_json::json!({
             "data": {
                 "aggregation_bits": format!("0x{}", "ff".repeat(4)),
@@ -3655,7 +3834,8 @@ mod tests {
                         "root": format!("0x{}", "03".repeat(32))
                     }
                 },
-                "signature": sig_hex
+                "signature": sig_hex,
+                "committee_bits": committee_bits_hex
             }
         });
 
@@ -3673,7 +3853,12 @@ mod tests {
         let client = BeaconClient::new(config).unwrap();
 
         let result = client.get_aggregate_attestation(100, &att_data_root, Some(5)).await.unwrap();
-        assert_eq!(result.data.data.slot, 100);
+        match result {
+            crate::types::VersionedAggregateAttestation::Electra(att) => {
+                assert_eq!(att.data.slot, 100);
+            }
+            other => panic!("Expected Electra variant, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -4273,5 +4458,189 @@ mod tests {
             }
             other => panic!("Expected ParseError, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_get_aggregate_attestation_pre_electra() {
+        let mock_server = MockServer::start().await;
+
+        let att_data_root = format!("0x{}", "ab".repeat(32));
+        let block_root_hex = format!("0x{}", "01".repeat(32));
+        let source_root_hex = format!("0x{}", "02".repeat(32));
+        let target_root_hex = format!("0x{}", "03".repeat(32));
+        let sig_hex = format!("0x{}", "aa".repeat(96));
+        let bits_hex = format!("0x{}", "ff".repeat(4));
+
+        let response_body = serde_json::json!({
+            "data": {
+                "aggregation_bits": bits_hex,
+                "data": {
+                    "slot": "100",
+                    "index": "1",
+                    "beacon_block_root": block_root_hex,
+                    "source": { "epoch": "3", "root": source_root_hex },
+                    "target": { "epoch": "4", "root": target_root_hex }
+                },
+                "signature": sig_hex
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(wiremock::matchers::query_param("slot", "100"))
+            .and(wiremock::matchers::query_param("attestation_data_root", &att_data_root))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_aggregate_attestation(100, &att_data_root, None).await.unwrap();
+        match result {
+            crate::types::VersionedAggregateAttestation::PreElectra(att) => {
+                assert_eq!(att.data.slot, 100);
+                assert_eq!(att.data.index, 1);
+                assert_eq!(att.aggregation_bits, vec![0xff; 4]);
+                assert_eq!(att.signature, vec![0xaa; 96]);
+            }
+            other => panic!("Expected PreElectra variant, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_aggregate_attestation_electra() {
+        let mock_server = MockServer::start().await;
+
+        let att_data_root = format!("0x{}", "ab".repeat(32));
+        let block_root_hex = format!("0x{}", "01".repeat(32));
+        let source_root_hex = format!("0x{}", "02".repeat(32));
+        let target_root_hex = format!("0x{}", "03".repeat(32));
+        let sig_hex = format!("0x{}", "aa".repeat(96));
+        let bits_hex = format!("0x{}", "ff".repeat(4));
+        let committee_bits_hex = "0x2000000000000000";
+
+        let response_body = serde_json::json!({
+            "data": {
+                "aggregation_bits": bits_hex,
+                "data": {
+                    "slot": "100",
+                    "index": "1",
+                    "beacon_block_root": block_root_hex,
+                    "source": { "epoch": "3", "root": source_root_hex },
+                    "target": { "epoch": "4", "root": target_root_hex }
+                },
+                "signature": sig_hex,
+                "committee_bits": committee_bits_hex
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(wiremock::matchers::query_param("slot", "100"))
+            .and(wiremock::matchers::query_param("attestation_data_root", &att_data_root))
+            .and(wiremock::matchers::query_param("committee_index", "5"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.get_aggregate_attestation(100, &att_data_root, Some(5)).await.unwrap();
+        match result {
+            crate::types::VersionedAggregateAttestation::Electra(att) => {
+                assert_eq!(att.data.slot, 100);
+                assert_eq!(att.data.index, 1);
+                assert_eq!(att.aggregation_bits, vec![0xff; 4]);
+                assert_eq!(att.signature, vec![0xaa; 96]);
+                assert_eq!(att.committee_bits, vec![0x20, 0, 0, 0, 0, 0, 0, 0]);
+            }
+            other => panic!("Expected Electra variant, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_submit_aggregate_and_proofs_electra_has_version_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/validator/aggregate_and_proofs"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let proofs = crate::types::VersionedSignedAggregateAndProof::Electra(vec![
+            eth_types::SignedElectraAggregateAndProof {
+                message: eth_types::ElectraAggregateAndProof {
+                    aggregator_index: 42,
+                    aggregate: eth_types::ElectraAttestation {
+                        aggregation_bits: vec![0xff; 4],
+                        data: eth_types::AttestationData {
+                            slot: 100,
+                            index: 1,
+                            beacon_block_root: [1u8; 32],
+                            source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                            target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                        },
+                        signature: vec![0xaa; 96],
+                        committee_bits: vec![0x01; 8],
+                    },
+                    selection_proof: vec![0xbb; 96],
+                },
+                signature: vec![0xcc; 96],
+            },
+        ]);
+
+        let result = client.submit_aggregate_and_proofs(&proofs).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_submit_aggregate_and_proofs_fulu_has_version_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/validator/aggregate_and_proofs"))
+            .and(wiremock::matchers::header("Eth-Consensus-Version", "fulu"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let proofs = crate::types::VersionedSignedAggregateAndProof::Fulu(vec![
+            eth_types::SignedElectraAggregateAndProof {
+                message: eth_types::ElectraAggregateAndProof {
+                    aggregator_index: 42,
+                    aggregate: eth_types::ElectraAttestation {
+                        aggregation_bits: vec![0xff; 4],
+                        data: eth_types::AttestationData {
+                            slot: 100,
+                            index: 1,
+                            beacon_block_root: [1u8; 32],
+                            source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                            target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                        },
+                        signature: vec![0xaa; 96],
+                        committee_bits: vec![0x01; 8],
+                    },
+                    selection_proof: vec![0xbb; 96],
+                },
+                signature: vec![0xcc; 96],
+            },
+        ]);
+
+        let result = client.submit_aggregate_and_proofs(&proofs).await;
+        assert!(result.is_ok());
     }
 }

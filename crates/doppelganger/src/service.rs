@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use eth_types::Epoch;
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument};
 
 use crate::error::DoppelgangerError;
 use crate::traits::{LivenessChecker, SlashingDbReader};
@@ -39,6 +39,7 @@ impl DoppelgangerService {
     /// If the validator signed within the last `monitoring_epochs` epochs,
     /// it is considered a restart and marked `Safe` immediately.
     /// Otherwise, it needs monitoring.
+    #[tracing::instrument(name = "rvc.doppelganger.check_validators", skip_all, fields(rvc.operation = "check_validators", rvc.doppelganger.validator_count = pubkeys.len()))]
     pub fn check_validators(
         &self,
         pubkeys: &[String],
@@ -83,6 +84,7 @@ impl DoppelgangerService {
     /// (no slashing DB entry for that epoch), that validator has a doppelganger.
     ///
     /// `validator_indices` maps pubkey -> validator index (as string).
+    #[tracing::instrument(name = "rvc.doppelganger.monitor", skip_all, fields(rvc.operation = "monitor", rvc.doppelganger.validator_count = pubkeys_to_monitor.len(), rvc.doppelganger.detected_count))]
     pub async fn run_monitoring(
         &self,
         pubkeys_to_monitor: &[String],
@@ -120,7 +122,16 @@ impl DoppelgangerService {
             }
             let check_epoch = base_epoch - epoch_offset;
 
-            let liveness_data = self.liveness_checker.check_liveness(check_epoch, &indices).await?;
+            let epoch_span =
+                tracing::info_span!("rvc.doppelganger.epoch_check", rvc.epoch = check_epoch,);
+
+            let liveness_data = self
+                .liveness_checker
+                .check_liveness(check_epoch, &indices)
+                .instrument(epoch_span.clone())
+                .await?;
+
+            let _epoch_guard = epoch_span.enter();
 
             // Build index -> pubkey reverse map for this check
             let index_to_pubkey: HashMap<&str, &str> = pubkeys_to_monitor
@@ -138,7 +149,7 @@ impl DoppelgangerService {
                         let we_signed = our_last.is_some_and(|e| e == check_epoch);
 
                         if !we_signed {
-                            warn!(
+                            tracing::error!(
                                 pubkey = %pubkey,
                                 epoch = check_epoch,
                                 "doppelganger detected: validator is live but we did not sign"
@@ -154,6 +165,8 @@ impl DoppelgangerService {
 
         let safe_validators: Vec<String> =
             checked_pubkeys.iter().filter(|pk| !detected.contains(pk)).cloned().cloned().collect();
+
+        tracing::Span::current().record("rvc.doppelganger.detected_count", detected.len() as u64);
 
         Ok(DoppelgangerResult { safe_validators, detected })
     }

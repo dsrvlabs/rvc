@@ -80,6 +80,7 @@ impl DutyTracker {
         }
     }
 
+    #[tracing::instrument(name = "rvc.duty_tracker.fetch_attester_duties", skip_all, fields(rvc.epoch = epoch))]
     pub async fn fetch_duties_for_epoch(
         &self,
         epoch: u64,
@@ -92,7 +93,7 @@ impl DutyTracker {
             .await
             .map_err(DutyTrackerError::BeaconError)?;
 
-        RVC_DUTIES_FETCHED_TOTAL.with_label_values(&[]).inc();
+        RVC_DUTIES_FETCHED_TOTAL.with_label_values(&[] as &[&str]).inc();
 
         let mut cache = self.cache.write().await;
 
@@ -160,6 +161,7 @@ impl DutyTracker {
         Err(DutyTrackerError::DutyNotFound { slot, committee_index })
     }
 
+    #[tracing::instrument(name = "rvc.duty_tracker.check_attester_reorg", skip_all, fields(rvc.epoch = epoch))]
     pub async fn check_and_refetch_if_root_changed(
         &self,
         epoch: u64,
@@ -217,6 +219,7 @@ impl DutyTracker {
         Ok(false)
     }
 
+    #[tracing::instrument(name = "rvc.duty_tracker.evict_old_caches", skip_all, fields(rvc.epoch = current_epoch))]
     pub async fn evict_old_caches(&self, current_epoch: u64) {
         let retain_epoch = current_epoch.saturating_sub(2);
 
@@ -280,6 +283,7 @@ impl DutyTracker {
         cache.get(&epoch).map(|c| c.dependent_root.clone())
     }
 
+    #[tracing::instrument(name = "rvc.duty_tracker.fetch_proposer_duties", skip_all, fields(rvc.epoch = epoch))]
     pub async fn fetch_proposer_duties(
         &self,
         epoch: u64,
@@ -320,6 +324,7 @@ impl DutyTracker {
         cache.get(&epoch).map(|c| c.dependent_root.clone())
     }
 
+    #[tracing::instrument(name = "rvc.duty_tracker.check_proposer_reorg", skip_all, fields(rvc.epoch = epoch))]
     pub async fn check_and_refetch_proposer_if_root_changed(
         &self,
         epoch: u64,
@@ -370,6 +375,7 @@ impl DutyTracker {
         cache.contains_key(&epoch)
     }
 
+    #[tracing::instrument(name = "rvc.duty_tracker.fetch_sync_committee_duties", skip_all, fields(rvc.epoch = epoch))]
     pub async fn fetch_sync_committee_duties(
         &self,
         epoch: u64,

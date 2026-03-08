@@ -1,0 +1,25 @@
+[package]
+name = "rvc-telemetry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+gcp-trace = ["dep:opentelemetry-gcloud-trace"]
+
+[dependencies]
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+# GCP (optional)
+opentelemetry-gcloud-trace = { version = "0.22", optional = true }

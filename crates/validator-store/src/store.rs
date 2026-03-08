@@ -58,6 +58,7 @@ impl ValidatorStore {
         }
     }
 
+    #[tracing::instrument(name = "rvc.validator_store.load_from_config", skip_all)]
     pub fn load_from_config(path: &Path) -> Result<Self, ValidatorStoreError> {
         let content = std::fs::read_to_string(path)?;
         let toml_config: TomlConfig = toml::from_str(&content)?;
@@ -132,6 +133,7 @@ impl ValidatorStore {
         self.validators.read().unwrap().get(pubkey).map(|c| c.builder_boost_factor).unwrap_or(100)
     }
 
+    #[tracing::instrument(name = "rvc.validator_store.list_enabled_pubkeys", skip_all)]
     pub fn list_enabled_pubkeys(&self) -> Vec<[u8; 48]> {
         self.validators.read().unwrap().values().filter(|c| c.enabled).map(|c| c.pubkey).collect()
     }
@@ -170,6 +172,7 @@ impl ValidatorStore {
         }
     }
 
+    #[tracing::instrument(name = "rvc.validator_store.reload_config", skip_all)]
     pub fn reload_config(&self) -> Result<(), ValidatorStoreError> {
         let path = self.config_path.as_ref().ok_or_else(|| {
             ValidatorStoreError::Config("no config path set for reload".to_string())

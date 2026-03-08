@@ -228,8 +228,8 @@ mod tests {
         let metrics = REGISTRY.gather();
 
         // Find our metrics in the gathered result
-        let counter_found = metrics.iter().any(|m| m.get_name() == "gather_test_counter");
-        let gauge_found = metrics.iter().any(|m| m.get_name() == "gather_test_gauge");
+        let counter_found = metrics.iter().any(|m| m.name() == "gather_test_counter");
+        let gauge_found = metrics.iter().any(|m| m.name() == "gather_test_gauge");
 
         assert!(counter_found, "Counter should be in gathered metrics");
         assert!(gauge_found, "Gauge should be in gathered metrics");

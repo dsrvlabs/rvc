@@ -90,17 +90,17 @@ pub fn ensure_token(path: &std::path::Path) -> Result<Zeroizing<String>, AuthErr
     }
 }
 
-pub fn warn_if_world_readable(path: &std::path::Path) -> bool {
+pub fn warn_if_insecure_permissions(path: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(metadata) = std::fs::metadata(path) {
             let mode = metadata.permissions().mode();
-            if mode & 0o044 != 0 {
+            if mode & 0o077 != 0 {
                 tracing::warn!(
                     path = %path.display(),
                     mode = format!("{:o}", mode & 0o777),
-                    "API token file is world-readable; consider restricting permissions to 0o400"
+                    "API token file has insecure permissions; group/other can read or write. Consider restricting to 0o400"
                 );
                 return true;
             }
@@ -194,7 +194,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_warn_if_world_readable_returns_true_for_world_readable() {
+    fn test_warn_if_insecure_permissions_world_readable() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -202,12 +202,12 @@ mod tests {
         std::fs::write(&path, "token").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        assert!(warn_if_world_readable(&path));
+        assert!(warn_if_insecure_permissions(&path));
     }
 
     #[cfg(unix)]
     #[test]
-    fn test_warn_if_world_readable_returns_false_for_owner_only() {
+    fn test_warn_if_insecure_permissions_owner_only() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -215,7 +215,46 @@ mod tests {
         std::fs::write(&path, "token").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
 
-        assert!(!warn_if_world_readable(&path));
+        assert!(!warn_if_insecure_permissions(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_warn_if_insecure_permissions_group_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token.txt");
+        std::fs::write(&path, "token").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o620)).unwrap();
+
+        assert!(warn_if_insecure_permissions(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_warn_if_insecure_permissions_world_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token.txt");
+        std::fs::write(&path, "token").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o602)).unwrap();
+
+        assert!(warn_if_insecure_permissions(&path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_warn_if_insecure_permissions_owner_rw_ok() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api-token.txt");
+        std::fs::write(&path, "token").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        assert!(!warn_if_insecure_permissions(&path));
     }
 
     #[test]

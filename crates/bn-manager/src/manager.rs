@@ -4,19 +4,33 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use beacon::{
-    AggregateAttestationResponse, AttestationDataResponse, AttesterDutiesResponse, BeaconClient,
-    BeaconCommitteeSubscription, BeaconError, BlockRootResponse, ConfigSpecResponse,
-    GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
-    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorsResponse, VersionedAttestation, VersionedSignedAggregateAndProof,
+    AttestationDataResponse, AttesterDutiesResponse, BeaconClient, BeaconCommitteeSubscription,
+    BeaconError, BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
+    ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof, StateForkResponse,
+    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorsResponse, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use eth_types::{
     ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
 };
 use futures::future::join_all;
+use tracing::Instrument;
 use tracing::{debug, warn};
 use url::Url;
+
+/// Redact credentials from a URL for safe inclusion in tracing spans.
+fn redact_url(url: &str) -> String {
+    if let Ok(mut parsed) = Url::parse(url) {
+        if parsed.password().is_some() || !parsed.username().is_empty() {
+            let _ = parsed.set_username("***");
+            let _ = parsed.set_password(Some("***"));
+        }
+        parsed.to_string()
+    } else {
+        url.to_string()
+    }
+}
 
 use crate::health::{new_shared_health_trackers, SharedHealthTrackers};
 use crate::sse::{self, SseConfig, SseEvent};
@@ -121,6 +135,7 @@ impl BnManager {
     }
 
     /// Returns current health scores for all BNs.
+    #[tracing::instrument(name = "rvc.bn_manager.health_scores", skip_all)]
     pub async fn health_scores(&self) -> Vec<BnHealthScore> {
         let guard = self.health_trackers.read().await;
         guard
@@ -139,6 +154,7 @@ impl BnManager {
     }
 
     /// Checks sync status of all configured BNs immediately.
+    #[tracing::instrument(name = "rvc.bn_manager.check_sync_status", skip_all)]
     pub async fn check_sync_status(&self) {
         check_all_sync_statuses(&self.clients, &self.sync_statuses).await;
     }
@@ -181,6 +197,7 @@ impl BnManager {
 
     /// Returns indices of synced+healthy BNs, ordered by health score (highest first).
     /// Falls back to all BNs if none are synced (single-BN mode logs a warning).
+    #[tracing::instrument(name = "rvc.bn_manager.synced_indices", skip_all)]
     async fn synced_indices(&self) -> Vec<usize> {
         let sync_guard = self.sync_statuses.read().await;
         let health_guard = self.health_trackers.read().await;
@@ -228,8 +245,18 @@ impl BnManager {
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
+        let strategy_span = tracing::info_span!(
+            "rvc.bn.strategy.first",
+            rvc.bn.strategy = "first",
+            rvc.bn.tried = tracing::field::Empty,
+        );
         if let Some(deadline) = self.overall_timeout {
-            match tokio::time::timeout(deadline, self.query_first_inner(op_name, &op)).await {
+            match tokio::time::timeout(
+                deadline,
+                self.query_first_inner(op_name, &op).instrument(strategy_span),
+            )
+            .await
+            {
                 Ok(result) => result,
                 Err(_) => Err(BeaconError::HttpError(format!(
                     "{op_name}: overall deadline of {}s exceeded",
@@ -237,7 +264,7 @@ impl BnManager {
                 ))),
             }
         } else {
-            self.query_first_inner(op_name, &op).await
+            self.query_first_inner(op_name, &op).instrument(strategy_span).await
         }
     }
 
@@ -248,11 +275,17 @@ impl BnManager {
     {
         let indices = self.synced_indices().await;
         let mut last_err = None;
+        let mut tried: usize = 0;
 
         for i in indices {
             let client = &self.clients[i];
+            tried += 1;
+            let attempt_span = tracing::info_span!(
+                "rvc.bn.attempt",
+                rvc.bn.url = %redact_url(client.endpoint()),
+            );
             let start = tokio::time::Instant::now();
-            match op(client).await {
+            match op(client).instrument(attempt_span).await {
                 Ok(result) => {
                     let elapsed = start.elapsed();
                     self.health_trackers.write().await[i].record_success(elapsed);
@@ -263,6 +296,7 @@ impl BnManager {
                         latency_ms = elapsed.as_millis() as u64,
                         "query succeeded"
                     );
+                    tracing::Span::current().record("rvc.bn.tried", tried);
                     return Ok(result);
                 }
                 Err(e) => {
@@ -279,6 +313,7 @@ impl BnManager {
             }
         }
 
+        tracing::Span::current().record("rvc.bn.tried", tried);
         Err(last_err.expect("at least one client exists"))
     }
 
@@ -297,9 +332,17 @@ impl BnManager {
         T: Send + 'static,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
+        let strategy_span = tracing::info_span!(
+            "rvc.bn.strategy.best",
+            rvc.bn.strategy = "best",
+            rvc.bn.tried = tracing::field::Empty,
+        );
         if let Some(deadline) = self.overall_timeout {
-            match tokio::time::timeout(deadline, self.query_best_inner(op_name, &op, pick_best))
-                .await
+            match tokio::time::timeout(
+                deadline,
+                self.query_best_inner(op_name, &op, pick_best).instrument(strategy_span),
+            )
+            .await
             {
                 Ok(result) => return result,
                 Err(_) => {
@@ -310,7 +353,7 @@ impl BnManager {
                 }
             }
         }
-        self.query_best_inner(op_name, &op, pick_best).await
+        self.query_best_inner(op_name, &op, pick_best).instrument(strategy_span).await
     }
 
     async fn query_best_inner<'s, T, F>(
@@ -324,12 +367,17 @@ impl BnManager {
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
         let indices = self.synced_indices().await;
+        tracing::Span::current().record("rvc.bn.tried", indices.len());
 
         if indices.len() == 1 {
             let client = &self.clients[indices[0]];
             let i = indices[0];
+            let attempt_span = tracing::info_span!(
+                "rvc.bn.attempt",
+                rvc.bn.url = %redact_url(client.endpoint()),
+            );
             let start = tokio::time::Instant::now();
-            match op(client).await {
+            match op(client).instrument(attempt_span).await {
                 Ok(result) => {
                     self.health_trackers.write().await[i].record_success(start.elapsed());
                     debug!(
@@ -361,12 +409,19 @@ impl BnManager {
             let endpoint = client.endpoint().to_string();
             let idx = *i;
             let fut = op(client);
-            futs.push(Box::pin(async move {
-                let start = tokio::time::Instant::now();
-                let result = fut.await;
-                let elapsed = start.elapsed();
-                (idx, endpoint, result, elapsed)
-            }));
+            let attempt_span = tracing::info_span!(
+                "rvc.bn.attempt",
+                rvc.bn.url = %redact_url(client.endpoint()),
+            );
+            futs.push(Box::pin(
+                async move {
+                    let start = tokio::time::Instant::now();
+                    let result = fut.await;
+                    let elapsed = start.elapsed();
+                    (idx, endpoint, result, elapsed)
+                }
+                .instrument(attempt_span),
+            ));
         }
 
         let results = join_all(futs).await;
@@ -473,8 +528,18 @@ impl BnManager {
     where
         F: Fn(&'s BeaconClient) -> BoxFut<'s, ()>,
     {
+        let strategy_span = tracing::info_span!(
+            "rvc.bn.strategy.broadcast",
+            rvc.bn.strategy = "broadcast",
+            rvc.bn.tried = self.clients.len(),
+        );
         if let Some(deadline) = self.overall_timeout {
-            match tokio::time::timeout(deadline, self.broadcast_inner(op_name, &op)).await {
+            match tokio::time::timeout(
+                deadline,
+                self.broadcast_inner(op_name, &op).instrument(strategy_span),
+            )
+            .await
+            {
                 Ok(result) => return result,
                 Err(_) => {
                     return Err(BeaconError::HttpError(format!(
@@ -484,7 +549,7 @@ impl BnManager {
                 }
             }
         }
-        self.broadcast_inner(op_name, &op).await
+        self.broadcast_inner(op_name, &op).instrument(strategy_span).await
     }
 
     async fn broadcast_inner<'s, F>(&'s self, op_name: &str, op: &F) -> Result<(), BeaconError>
@@ -496,12 +561,19 @@ impl BnManager {
         for (i, client) in self.clients.iter().enumerate() {
             let endpoint = client.endpoint().to_string();
             let fut = op(client);
-            futs.push(Box::pin(async move {
-                let start = tokio::time::Instant::now();
-                let result = fut.await;
-                let elapsed = start.elapsed();
-                (i, endpoint, result, elapsed)
-            }));
+            let attempt_span = tracing::info_span!(
+                "rvc.bn.attempt",
+                rvc.bn.url = %redact_url(client.endpoint()),
+            );
+            futs.push(Box::pin(
+                async move {
+                    let start = tokio::time::Instant::now();
+                    let result = fut.await;
+                    let elapsed = start.elapsed();
+                    (i, endpoint, result, elapsed)
+                }
+                .instrument(attempt_span),
+            ));
         }
 
         let results = join_all(futs).await;
@@ -560,9 +632,17 @@ impl BnManager {
         T: Send + 'static,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
+        let strategy_span = tracing::info_span!(
+            "rvc.bn.strategy.broadcast",
+            rvc.bn.strategy = "broadcast",
+            rvc.bn.tried = self.clients.len(),
+        );
         if let Some(deadline) = self.overall_timeout {
-            match tokio::time::timeout(deadline, self.broadcast_with_result_inner(op_name, &op))
-                .await
+            match tokio::time::timeout(
+                deadline,
+                self.broadcast_with_result_inner(op_name, &op).instrument(strategy_span),
+            )
+            .await
             {
                 Ok(result) => return result,
                 Err(_) => {
@@ -573,7 +653,7 @@ impl BnManager {
                 }
             }
         }
-        self.broadcast_with_result_inner(op_name, &op).await
+        self.broadcast_with_result_inner(op_name, &op).instrument(strategy_span).await
     }
 
     async fn broadcast_with_result_inner<'s, T, F>(
@@ -590,12 +670,19 @@ impl BnManager {
         for (i, client) in self.clients.iter().enumerate() {
             let endpoint = client.endpoint().to_string();
             let fut = op(client);
-            futs.push(Box::pin(async move {
-                let start = tokio::time::Instant::now();
-                let result = fut.await;
-                let elapsed = start.elapsed();
-                (i, endpoint, result, elapsed)
-            }));
+            let attempt_span = tracing::info_span!(
+                "rvc.bn.attempt",
+                rvc.bn.url = %redact_url(client.endpoint()),
+            );
+            futs.push(Box::pin(
+                async move {
+                    let start = tokio::time::Instant::now();
+                    let result = fut.await;
+                    let elapsed = start.elapsed();
+                    (i, endpoint, result, elapsed)
+                }
+                .instrument(attempt_span),
+            ));
         }
 
         let results = join_all(futs).await;
@@ -775,7 +862,7 @@ impl BeaconNodeClient for BnManager {
         slot: u64,
         attestation_data_root: &str,
         committee_index: Option<u64>,
-    ) -> Result<AggregateAttestationResponse, BeaconError> {
+    ) -> Result<VersionedAggregateAttestation, BeaconError> {
         self.query_first("get_aggregate_attestation", |c| {
             Box::pin(c.get_aggregate_attestation(slot, attestation_data_root, committee_index))
         })
@@ -967,7 +1054,7 @@ impl BeaconNodeClient for BeaconClient {
         slot: u64,
         attestation_data_root: &str,
         committee_index: Option<u64>,
-    ) -> Result<AggregateAttestationResponse, BeaconError> {
+    ) -> Result<VersionedAggregateAttestation, BeaconError> {
         self.get_aggregate_attestation(slot, attestation_data_root, committee_index).await
     }
 

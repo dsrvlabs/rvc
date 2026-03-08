@@ -1,0 +1,41 @@
+[package]
+name = "rvc-secret-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+gcp-secret = ["dep:google-cloud-secretmanager-v1", "dep:google-cloud-gax"]
+test-utils = []
+
+[dependencies]
+async-trait.workspace = true
+crypto.workspace = true
+lazy_static.workspace = true
+metrics.workspace = true
+prometheus.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
+tokio-util.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+hex.workspace = true
+google-cloud-secretmanager-v1 = { version = "1.5", optional = true }
+google-cloud-gax = { version = "1", default-features = false, optional = true }
+
+[[test]]
+name = "integration"
+required-features = ["test-utils"]
+
+[[test]]
+name = "tracing_hierarchy"
+required-features = ["test-utils"]
+
+[dev-dependencies]
+crypto.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber.workspace = true

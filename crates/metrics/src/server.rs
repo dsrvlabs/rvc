@@ -4,7 +4,7 @@
 //! - `/metrics` endpoint that returns metrics in Prometheus text format
 //! - `/health` endpoint that returns service health status
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::{
@@ -64,37 +64,40 @@ pub fn create_metrics_router_with_health(health_status: SharedHealthStatus) -> R
         .with_state(health_status)
 }
 
-/// Starts the metrics HTTP server on the specified port.
+/// Starts the metrics HTTP server on the specified address and port.
 ///
 /// # Arguments
+/// * `addr` - The IP address to bind to
 /// * `port` - The port number to listen on
 ///
 /// # Errors
 /// Returns an error if the server fails to bind or serve.
-pub async fn serve_metrics(port: u16) -> Result<(), std::io::Error> {
+pub async fn serve_metrics(addr: IpAddr, port: u16) -> Result<(), std::io::Error> {
     let router = create_metrics_router();
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = TcpListener::bind(addr).await?;
-    tracing::info!("Metrics server listening on {}", addr);
+    let socket_addr = SocketAddr::from((addr, port));
+    let listener = TcpListener::bind(socket_addr).await?;
+    tracing::info!("Metrics server listening on {}", socket_addr);
     axum::serve(listener, router).await
 }
 
-/// Starts the metrics HTTP server with health endpoint on the specified port.
+/// Starts the metrics HTTP server with health endpoint on the specified address and port.
 ///
 /// # Arguments
+/// * `addr` - The IP address to bind to
 /// * `port` - The port number to listen on
 /// * `health_status` - Shared health status for the health endpoint
 ///
 /// # Errors
 /// Returns an error if the server fails to bind or serve.
 pub async fn serve_metrics_with_health(
+    addr: IpAddr,
     port: u16,
     health_status: SharedHealthStatus,
 ) -> Result<(), std::io::Error> {
     let router = create_metrics_router_with_health(health_status);
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let listener = TcpListener::bind(addr).await?;
-    tracing::info!("Metrics server with health endpoint listening on {}", addr);
+    let socket_addr = SocketAddr::from((addr, port));
+    let listener = TcpListener::bind(socket_addr).await?;
+    tracing::info!("Metrics server with health endpoint listening on {}", socket_addr);
     axum::serve(listener, router).await
 }
 
@@ -352,5 +355,37 @@ mod tests {
         let response = router.oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_serve_metrics_accepts_ip_addr() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let handle = tokio::spawn(serve_metrics(addr, 0));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_serve_metrics_with_health_accepts_ip_addr() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let health_status = new_health_status();
+        let handle = tokio::spawn(serve_metrics_with_health(addr, 0, health_status));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_serve_metrics_with_health_binds_to_specified_addr() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let addr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let health_status = new_health_status();
+        let handle = tokio::spawn(serve_metrics_with_health(addr, 0, health_status));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        handle.abort();
     }
 }

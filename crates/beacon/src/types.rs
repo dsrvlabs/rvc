@@ -176,9 +176,6 @@ pub use eth_types::SignedAggregateAndProof;
 pub use eth_types::SignedContributionAndProof;
 pub use eth_types::SyncCommitteeMessage;
 
-/// Response type for the aggregate attestation endpoint.
-pub type AggregateAttestationResponse = DataResponse<eth_types::Attestation>;
-
 /// Validator information from the beacon state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatorData {

@@ -71,7 +71,7 @@ grpc_port = 50051
 grpc_address = "127.0.0.1"
 
 # ---------------------------------------------------------------------------
-# Keymanager API (EIP-3076 key management at runtime)
+# Keymanager API (runtime key management via Beacon APIs)
 # ---------------------------------------------------------------------------
 
 # Enable the Keymanager API server (GET/POST/DELETE /eth/v1/keystores, /eth/v1/remotekeys)
@@ -93,3 +93,28 @@ keymanager_enabled = false
 # Log level: trace, debug, info, warn, error
 # Can also be set via RUST_LOG environment variable.
 log_level = "info"
+
+# ---------------------------------------------------------------------------
+# Distributed Tracing (OpenTelemetry)
+# ---------------------------------------------------------------------------
+
+# OTLP exporter endpoint. Enables tracing when set.
+# Env var fallback: OTEL_EXPORTER_OTLP_ENDPOINT
+# tracing_endpoint = "http://localhost:4318"
+
+# Exporter backend: "otlp" (default) or "gcp"
+# tracing_exporter = "otlp"
+
+# Head-based sampling ratio 0.0–1.0 (default: 0.01 = 1%).
+# Env var fallback: OTEL_TRACES_SAMPLER_ARG (only if this field is at default)
+# tracing_sample_rate = 0.01
+
+# Maximum number of spans queued for export (OTel SDK default: 2048).
+# tracing_max_queue_size = 2048
+
+# Maximum number of spans per export batch (OTel SDK default: 512).
+# tracing_max_export_batch_size = 512
+
+# GCP Cloud Trace: set tracing_exporter = "gcp" (requires --features gcp-trace).
+# Uses Application Default Credentials (ADC) — no endpoint needed.
+# On shutdown, pending spans are flushed with a 5-second timeout.

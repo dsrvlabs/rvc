@@ -17,10 +17,10 @@ use tracing::debug;
 
 use crypto::{CompositeSigner, PublicKey, Signature, Signer, SigningError};
 use eth_types::{
-    AggregateAndProof, AttestationData, ContributionAndProof, Epoch, Fork, ForkSchedule, Root,
-    Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
-    DOMAIN_APPLICATION_BUILDER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_SYNC_COMMITTEE,
-    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SLOTS_PER_EPOCH,
+    AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
+    Fork, ForkSchedule, Root, Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1,
+    VoluntaryExit, DOMAIN_APPLICATION_BUILDER, DOMAIN_CONTRIBUTION_AND_PROOF,
+    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SLOTS_PER_EPOCH,
 };
 use metrics::definitions::{
     slashing_result, RVC_ATTESTATIONS_TOTAL, RVC_SIGNING_DURATION_SECONDS,
@@ -63,6 +63,7 @@ impl SignerService {
     }
 
     /// Signs an attestation after checking slashing protection.
+    #[tracing::instrument(name = "rvc.sign.attestation", skip_all, fields(rvc.operation = "attestation", rvc.slashing.result))]
     pub async fn sign_attestation(
         &self,
         attestation_data: &AttestationData,
@@ -112,12 +113,19 @@ impl SignerService {
             "Computed attestation signing root"
         );
 
-        if let Err(e) = self.slashing_db.check_and_record_attestation(
-            &pubkey_hex,
-            source_epoch,
-            target_epoch,
-            Some(signing_root_hex),
-        ) {
+        let slashing_check_result = {
+            let _span = tracing::info_span!("rvc.slashing.check").entered();
+            self.slashing_db.check_and_record_attestation(
+                &pubkey_hex,
+                source_epoch,
+                target_epoch,
+                Some(signing_root_hex),
+            )
+        };
+
+        if let Err(e) = slashing_check_result {
+            tracing::Span::current().record("rvc.slashing.result", "blocked");
+            tracing::error!(error = %e, "Attestation slashing protection blocked signing");
             RVC_SLASHING_PROTECTION_CHECKS_TOTAL
                 .with_label_values(&[slashing_result::BLOCKED])
                 .inc();
@@ -125,19 +133,27 @@ impl SignerService {
             return Err(SignerError::SlashingProtectionBlocked(e));
         }
 
+        tracing::Span::current().record("rvc.slashing.result", "safe");
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
 
         let pubkey_bytes = pubkey.to_bytes();
-        let signature = self.signer.sign(&signing_root, &pubkey_bytes).await?;
+        let signature = match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => sig,
+            Err(e) => {
+                tracing::error!(error = %e, "Attestation signing failed");
+                return Err(e.into());
+            }
+        };
 
         let duration = start.elapsed().as_secs_f64();
-        RVC_SIGNING_DURATION_SECONDS.with_label_values(&[]).observe(duration);
+        RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
         RVC_ATTESTATIONS_TOTAL.with_label_values(&["success"]).inc();
 
         Ok(signature)
     }
 
     /// Signs a block after checking slashing protection.
+    #[tracing::instrument(name = "rvc.sign.block", skip_all, fields(rvc.operation = "block", rvc.slashing.result))]
     pub async fn sign_block(
         &self,
         block_root: &Root,
@@ -160,27 +176,40 @@ impl SignerService {
         let signing_root = crypto::compute_signing_root(block_root, domain);
         let signing_root_hex = hex::encode(signing_root);
 
-        if let Err(e) =
+        let slashing_check_result = {
+            let _span = tracing::info_span!("rvc.slashing.check").entered();
             self.slashing_db.check_and_record_block(&pubkey_hex, slot, Some(signing_root_hex))
-        {
+        };
+
+        if let Err(e) = slashing_check_result {
+            tracing::Span::current().record("rvc.slashing.result", "blocked");
+            tracing::error!(error = %e, "Block slashing protection blocked signing");
             RVC_SLASHING_PROTECTION_CHECKS_TOTAL
                 .with_label_values(&[slashing_result::BLOCKED])
                 .inc();
             return Err(SignerError::SlashingProtectionBlocked(e));
         }
 
+        tracing::Span::current().record("rvc.slashing.result", "safe");
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
 
         let pubkey_bytes = pubkey.to_bytes();
-        let signature = self.signer.sign(&signing_root, &pubkey_bytes).await?;
+        let signature = match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => sig,
+            Err(e) => {
+                tracing::error!(error = %e, "Block signing failed");
+                return Err(e.into());
+            }
+        };
 
         let duration = start.elapsed().as_secs_f64();
-        RVC_SIGNING_DURATION_SECONDS.with_label_values(&[]).observe(duration);
+        RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
 
         Ok(signature)
     }
 
     /// Signs a RANDAO reveal for the given epoch.
+    #[tracing::instrument(name = "rvc.sign.randao", skip_all, fields(rvc.operation = "randao"))]
     pub async fn sign_randao_reveal(
         &self,
         epoch: Epoch,
@@ -202,6 +231,7 @@ impl SignerService {
     }
 
     /// Signs a sync committee message for the given beacon block root and slot.
+    #[tracing::instrument(name = "rvc.sign.sync_committee_message", skip_all, fields(rvc.operation = "sync_committee_message"))]
     pub async fn sign_sync_committee_message(
         &self,
         beacon_block_root: &Root,
@@ -222,6 +252,7 @@ impl SignerService {
     }
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
+    #[tracing::instrument(name = "rvc.sign.selection_proof", skip_all, fields(rvc.operation = "selection_proof"))]
     pub async fn sign_selection_proof(
         &self,
         slot: Slot,
@@ -244,6 +275,7 @@ impl SignerService {
     }
 
     /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
+    #[tracing::instrument(name = "rvc.sign.aggregate_and_proof", skip_all, fields(rvc.operation = "aggregate_and_proof"))]
     pub async fn sign_aggregate_and_proof(
         &self,
         aggregate_and_proof: &AggregateAndProof,
@@ -266,7 +298,32 @@ impl SignerService {
         Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
     }
 
+    /// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
+    #[tracing::instrument(name = "rvc.sign.electra_aggregate_and_proof", skip_all, fields(rvc.operation = "electra_aggregate_and_proof"))]
+    pub async fn sign_electra_aggregate_and_proof(
+        &self,
+        aggregate_and_proof: &ElectraAggregateAndProof,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let slot = aggregate_and_proof.aggregate.data.slot;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
+        let fork_version = fork_name.fork_version(fork_schedule);
+        let domain = crypto::compute_domain(
+            eth_types::DOMAIN_AGGREGATE_AND_PROOF,
+            fork_version,
+            *genesis_validators_root,
+        );
+        let signing_root = crypto::compute_signing_root(aggregate_and_proof, domain);
+
+        let pubkey_bytes = pubkey.to_bytes();
+        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+    }
+
     /// Signs a voluntary exit with DOMAIN_VOLUNTARY_EXIT.
+    #[tracing::instrument(name = "rvc.sign.voluntary_exit", skip_all, fields(rvc.operation = "voluntary_exit"))]
     pub async fn sign_voluntary_exit(
         &self,
         voluntary_exit: &VoluntaryExit,
@@ -296,6 +353,7 @@ impl SignerService {
     /// Signs a builder registration with DOMAIN_APPLICATION_BUILDER.
     ///
     /// No slashing check is needed — builder registrations are not slashable.
+    #[tracing::instrument(name = "rvc.sign.builder_registration", skip_all, fields(rvc.operation = "builder_registration"))]
     pub async fn sign_builder_registration(
         &self,
         registration: &ValidatorRegistrationV1,
@@ -312,6 +370,7 @@ impl SignerService {
     }
 
     /// Signs a sync committee selection proof for the given slot and subcommittee.
+    #[tracing::instrument(name = "rvc.sign.sync_committee_selection_proof", skip_all, fields(rvc.operation = "sync_committee_selection_proof"))]
     pub async fn sign_sync_committee_selection_proof(
         &self,
         slot: Slot,
@@ -336,6 +395,7 @@ impl SignerService {
     }
 
     /// Signs a ContributionAndProof with DOMAIN_CONTRIBUTION_AND_PROOF.
+    #[tracing::instrument(name = "rvc.sign.contribution_and_proof", skip_all, fields(rvc.operation = "contribution_and_proof"))]
     pub async fn sign_contribution_and_proof(
         &self,
         contribution_and_proof: &ContributionAndProof,
@@ -484,6 +544,24 @@ impl ValidatorSigner for SignerService {
         genesis_validators_root: &Root,
     ) -> Result<Vec<u8>, SignerError> {
         let signature = SignerService::sign_aggregate_and_proof(
+            self,
+            aggregate_and_proof,
+            pubkey,
+            fork_schedule,
+            genesis_validators_root,
+        )
+        .await?;
+        Ok(signature.to_bytes().to_vec())
+    }
+
+    async fn sign_electra_aggregate_and_proof(
+        &self,
+        aggregate_and_proof: &ElectraAggregateAndProof,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Vec<u8>, SignerError> {
+        let signature = SignerService::sign_electra_aggregate_and_proof(
             self,
             aggregate_and_proof,
             pubkey,
@@ -1143,6 +1221,54 @@ mod tests {
     fn test_is_aggregator_reexported() {
         assert!(is_aggregator(0, &[0xaa; 96]));
         assert!(is_aggregator(1, &[0xaa; 96]));
+    }
+
+    fn create_test_electra_aggregate_and_proof(slot: Slot) -> eth_types::ElectraAggregateAndProof {
+        eth_types::ElectraAggregateAndProof {
+            aggregator_index: 42,
+            aggregate: eth_types::ElectraAttestation {
+                aggregation_bits: vec![0xff; 4],
+                data: AttestationData {
+                    slot,
+                    index: 0,
+                    beacon_block_root: [1u8; 32],
+                    source: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [2u8; 32] },
+                    target: Checkpoint { epoch: slot / SLOTS_PER_EPOCH + 1, root: [3u8; 32] },
+                },
+                signature: vec![0xaa; 96],
+                committee_bits: vec![0x01, 0, 0, 0, 0, 0, 0, 0],
+            },
+            selection_proof: vec![0xbb; 96],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sign_electra_aggregate_and_proof_success() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(signer, slashing_db);
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let slot = schedule.electra_fork_epoch * SLOTS_PER_EPOCH;
+        let agg_and_proof = create_test_electra_aggregate_and_proof(slot);
+
+        let result = service
+            .sign_electra_aggregate_and_proof(&agg_and_proof, &pubkey, &schedule, &genesis_root)
+            .await;
+        assert!(result.is_ok());
+
+        let signature = result.unwrap();
+
+        let fork_name = eth_types::ForkName::from_epoch(slot / SLOTS_PER_EPOCH, &schedule);
+        let fork_version = fork_name.fork_version(&schedule);
+        let domain =
+            compute_domain(eth_types::DOMAIN_AGGREGATE_AND_PROOF, fork_version, genesis_root);
+        let signing_root = compute_signing_root(&agg_and_proof, domain);
+        assert!(signature.verify(&pubkey, &signing_root).is_ok());
     }
 
     // --- Voluntary exit signing tests ---

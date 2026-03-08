@@ -425,10 +425,15 @@ impl KeyManager {
     }
 
     /// Inserts a secret key into the key manager.
-    /// This is only available for testing purposes.
-    #[cfg(any(test, feature = "test-utils"))]
+    ///
+    /// Used to add keys loaded from external sources (e.g., cloud secret managers)
+    /// at runtime. If a key with the same public key already exists, it is overwritten
+    /// and a warning is logged.
     pub fn insert(&mut self, secret_key: SecretKey) {
         let pubkey = secret_key.public_key();
+        if self.keys.contains_key(&pubkey.to_bytes()) {
+            warn!(pubkey = %hex::encode(pubkey.to_bytes()), "Inserting key with duplicate public key, overwriting");
+        }
         self.keys.insert(pubkey.to_bytes(), secret_key);
     }
 }
@@ -953,6 +958,26 @@ mod tests {
         let secret = test_password_secret();
         let debug_output = format!("{:?}", secret);
         assert!(!debug_output.contains(&test_password_string()));
+    }
+
+    #[test]
+    fn test_insert_duplicate_pubkey_overwrites() {
+        let mut manager = KeyManager::new();
+
+        let sk = SecretKey::generate();
+        let pubkey = sk.public_key();
+        let sk_bytes = sk.to_bytes();
+
+        manager.insert(sk);
+        assert_eq!(manager.len(), 1);
+
+        // Recreate the same key from raw bytes (same pubkey)
+        let sk_clone = SecretKey::from_bytes(&sk_bytes).unwrap();
+        manager.insert(sk_clone);
+
+        // Should still be 1 (overwrite, not append)
+        assert_eq!(manager.len(), 1);
+        assert!(manager.get_secret_key(&pubkey).is_some());
     }
 
     // ── Parallel decryption tests ─────────────────────────────────────────
