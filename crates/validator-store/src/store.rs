@@ -95,16 +95,13 @@ impl ValidatorStore {
     }
 
     pub fn get_config(&self, pubkey: &[u8; 48]) -> Option<ValidatorConfig> {
-        self.validators.read().unwrap().get(pubkey).cloned()
+        self.validators.read().expect("validators lock poisoned").get(pubkey).cloned()
     }
 
     pub fn effective_fee_recipient(&self, pubkey: &[u8; 48]) -> [u8; 20] {
-        self.validators
-            .read()
-            .unwrap()
-            .get(pubkey)
-            .and_then(|c| c.fee_recipient)
-            .unwrap_or(*self.default_fee_recipient.read().unwrap())
+        self.validators.read().unwrap().get(pubkey).and_then(|c| c.fee_recipient).unwrap_or(
+            *self.default_fee_recipient.read().expect("default_fee_recipient lock poisoned"),
+        )
     }
 
     pub fn effective_gas_limit(&self, pubkey: &[u8; 48]) -> u64 {
@@ -113,7 +110,7 @@ impl ValidatorStore {
             .unwrap()
             .get(pubkey)
             .and_then(|c| c.gas_limit)
-            .unwrap_or(*self.default_gas_limit.read().unwrap())
+            .unwrap_or(*self.default_gas_limit.read().expect("default_gas_limit lock poisoned"))
     }
 
     pub fn effective_graffiti(&self, pubkey: &[u8; 48]) -> Option<[u8; 32]> {
@@ -122,38 +119,58 @@ impl ValidatorStore {
             .unwrap()
             .get(pubkey)
             .and_then(|c| c.graffiti)
-            .or(*self.default_graffiti.read().unwrap())
+            .or(*self.default_graffiti.read().expect("default_graffiti lock poisoned"))
     }
 
     pub fn is_builder_enabled(&self, pubkey: &[u8; 48]) -> bool {
-        self.validators.read().unwrap().get(pubkey).map(|c| c.builder_proposals).unwrap_or(false)
+        self.validators
+            .read()
+            .expect("validators lock poisoned")
+            .get(pubkey)
+            .map(|c| c.builder_proposals)
+            .unwrap_or(false)
     }
 
     pub fn builder_boost_factor(&self, pubkey: &[u8; 48]) -> u64 {
-        self.validators.read().unwrap().get(pubkey).map(|c| c.builder_boost_factor).unwrap_or(100)
+        self.validators
+            .read()
+            .expect("validators lock poisoned")
+            .get(pubkey)
+            .map(|c| c.builder_boost_factor)
+            .unwrap_or(100)
     }
 
     #[tracing::instrument(name = "rvc.validator_store.list_enabled_pubkeys", skip_all)]
     pub fn list_enabled_pubkeys(&self) -> Vec<[u8; 48]> {
-        self.validators.read().unwrap().values().filter(|c| c.enabled).map(|c| c.pubkey).collect()
+        self.validators
+            .read()
+            .expect("validators lock poisoned")
+            .values()
+            .filter(|c| c.enabled)
+            .map(|c| c.pubkey)
+            .collect()
     }
 
     pub fn add_validator(&self, config: ValidatorConfig) {
-        self.validators.write().unwrap().insert(config.pubkey, config);
+        self.validators.write().expect("validators lock poisoned").insert(config.pubkey, config);
     }
 
     pub fn remove_validator(&self, pubkey: &[u8; 48]) -> Option<ValidatorConfig> {
-        self.validators.write().unwrap().remove(pubkey)
+        self.validators.write().expect("validators lock poisoned").remove(pubkey)
     }
 
     pub fn set_enabled(&self, pubkey: &[u8; 48], enabled: bool) {
-        if let Some(config) = self.validators.write().unwrap().get_mut(pubkey) {
+        if let Some(config) =
+            self.validators.write().expect("validators lock poisoned").get_mut(pubkey)
+        {
             config.enabled = enabled;
         }
     }
 
     pub fn update_config(&self, pubkey: &[u8; 48], update: ValidatorConfigUpdate) {
-        if let Some(config) = self.validators.write().unwrap().get_mut(pubkey) {
+        if let Some(config) =
+            self.validators.write().expect("validators lock poisoned").get_mut(pubkey)
+        {
             if let Some(fr) = update.fee_recipient {
                 config.fee_recipient = fr;
             }
@@ -204,11 +221,12 @@ impl ValidatorStore {
         }
 
         // Apply-second: all parsing succeeded, now mutate atomically.
-        *self.default_fee_recipient.write().unwrap() = new_fee_recipient;
-        *self.default_gas_limit.write().unwrap() = new_gas_limit;
-        *self.default_graffiti.write().unwrap() = new_graffiti;
+        *self.default_fee_recipient.write().expect("default_fee_recipient lock poisoned") =
+            new_fee_recipient;
+        *self.default_gas_limit.write().expect("default_gas_limit lock poisoned") = new_gas_limit;
+        *self.default_graffiti.write().expect("default_graffiti lock poisoned") = new_graffiti;
 
-        let mut validators = self.validators.write().unwrap();
+        let mut validators = self.validators.write().expect("validators lock poisoned");
         for config in parsed_validators {
             validators.insert(config.pubkey, config);
         }

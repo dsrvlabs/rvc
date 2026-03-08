@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use tree_hash::{Hash256, MerkleHasher, TreeHash, TreeHashType};
 
 use crate::hex_fixed::bytes_32_hex;
+use crate::tree_hash_utils::vec_u8_tree_hash_root;
 use crate::{Root, Signature, Slot};
 
 pub type BeaconBlockBody = Vec<u8>;
@@ -43,11 +44,42 @@ pub struct BlobSidecar {
     pub blob: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum BlockContents {
     BlockAndBlobs { block: BeaconBlock, blob_sidecars: Vec<BlobSidecar> },
     Block(BeaconBlock),
+}
+
+impl<'de> serde::Deserialize<'de> for BlockContents {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        // Try BlockAndBlobs first (has both "block" and "blob_sidecars" keys)
+        if value.get("blob_sidecars").is_some() {
+            #[derive(Deserialize)]
+            struct BlockAndBlobsHelper {
+                block: BeaconBlock,
+                blob_sidecars: Vec<BlobSidecar>,
+            }
+            return serde_json::from_value::<BlockAndBlobsHelper>(value.clone())
+                .map(|h| BlockContents::BlockAndBlobs {
+                    block: h.block,
+                    blob_sidecars: h.blob_sidecars,
+                })
+                .map_err(|e| {
+                    serde::de::Error::custom(format!("invalid BlockAndBlobs variant: {e}"))
+                });
+        }
+
+        // Fall back to Block (bare BeaconBlock)
+        serde_json::from_value::<BeaconBlock>(value)
+            .map(BlockContents::Block)
+            .map_err(|e| serde::de::Error::custom(format!("invalid Block variant: {e}")))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,14 +92,14 @@ pub enum ProducedBlock {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedBeaconBlock {
     pub message: BeaconBlock,
-    #[serde(with = "serde_utils::hex_vec")]
+    #[serde(with = "crate::serde_signature")]
     pub signature: Signature,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedBlindedBeaconBlock {
     pub message: BlindedBeaconBlock,
-    #[serde(with = "serde_utils::hex_vec")]
+    #[serde(with = "crate::serde_signature")]
     pub signature: Signature,
 }
 
@@ -78,13 +110,6 @@ impl BlockContents {
             Self::BlockAndBlobs { block, .. } => block,
         }
     }
-}
-
-fn vec_u8_tree_hash_root(bytes: &[u8]) -> Hash256 {
-    let num_leaves = bytes.len().div_ceil(32);
-    let mut hasher = MerkleHasher::with_leaves(num_leaves.max(1));
-    hasher.write(bytes).expect("valid bytes");
-    hasher.finish().expect("valid root")
 }
 
 impl TreeHash for BeaconBlock {
@@ -325,6 +350,28 @@ mod tests {
         let mut block2 = sample_blinded_block();
         block2.slot = 200;
         assert_ne!(block1.tree_hash_root(), block2.tree_hash_root());
+    }
+
+    #[test]
+    fn test_block_contents_invalid_json_error_has_context() {
+        let json = r#"{"blob_sidecars": "not-an-array"}"#;
+        let err = serde_json::from_str::<BlockContents>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("BlockAndBlobs"),
+            "expected error to mention BlockAndBlobs variant, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_block_contents_completely_invalid_json_error() {
+        let json = r#"{"random_field": 42}"#;
+        let err = serde_json::from_str::<BlockContents>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("Block variant"),
+            "expected error to mention Block variant, got: {}",
+            err
+        );
     }
 
     #[test]

@@ -78,10 +78,18 @@ pub fn generate_from_seed(
 
     let kdf = if pbkdf2 { EncryptionKdf::Pbkdf2 } else { EncryptionKdf::Scrypt };
 
+    let end_index = start_index.checked_add(num_validators).ok_or_else(|| {
+        anyhow::anyhow!(
+            "start_index ({}) + num_validators ({}) overflows u32",
+            start_index,
+            num_validators
+        )
+    })?;
+
     let mut deposits = Vec::with_capacity(num_validators as usize);
     let mut summaries = Vec::with_capacity(num_validators as usize);
 
-    for i in start_index..start_index + num_validators {
+    for i in start_index..end_index {
         let signing_path = format!("m/12381/3600/{}/0/0", i);
         let signing_key = crypto::eip2333::derive_key_from_path(seed, &signing_path)
             .with_context(|| format!("Failed to derive signing key at {}", signing_path))?;
@@ -171,20 +179,22 @@ fn write_with_permissions(path: &Path, data: &[u8]) -> Result<()> {
         use std::fs::OpenOptions;
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("Failed to create file: {}", path.display()))?;
+        let mut file =
+            OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).with_context(
+                || format!("Failed to create file (already exists?): {}", path.display()),
+            )?;
         file.write_all(data)?;
     }
 
     #[cfg(not(unix))]
     {
-        std::fs::write(path, data)
-            .with_context(|| format!("Failed to write file: {}", path.display()))?;
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        let mut file =
+            OpenOptions::new().write(true).create_new(true).open(path).with_context(|| {
+                format!("Failed to create file (already exists?): {}", path.display())
+            })?;
+        file.write_all(data)?;
     }
 
     Ok(())
@@ -637,5 +647,41 @@ mod tests {
             true,
         );
         assert!(result.is_ok());
+    }
+
+    // LOW-22: Integer overflow guard
+    #[test]
+    fn test_generate_overflow_start_index_plus_num_validators() {
+        let dir = tempfile::tempdir().unwrap();
+        let password = Zeroizing::new("testpassword123".to_string());
+
+        let mnemonic = crypto::mnemonic::generate_mnemonic();
+        let seed = crypto::mnemonic::mnemonic_to_seed(&mnemonic, "");
+
+        let net = network::from_name("mainnet").unwrap();
+        let result = generate_from_seed(
+            seed.as_ref(),
+            net,
+            dir.path(),
+            u32::MAX,
+            1,
+            Some(&[0xAB; 20]),
+            true,
+            &password,
+            true,
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("overflows"));
+    }
+
+    // LOW-24: Atomic file creation rejects existing file
+    #[test]
+    fn test_write_with_permissions_rejects_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.json");
+        std::fs::write(&path, "existing content").unwrap();
+
+        let result = write_with_permissions(&path, b"new content");
+        assert!(result.is_err());
     }
 }
