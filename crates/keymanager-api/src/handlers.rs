@@ -15,6 +15,7 @@ use crate::types::{
     ImportRemoteKeyStatus, ImportRemoteKeysRequest, ImportRemoteKeysResponse, ImportStatus,
     KeystoreInfo, ListKeystoresResponse, ListRemoteKeysResponse, RemoteKeyEntry,
 };
+use crate::url_validator;
 
 pub struct AppState {
     pub keystore_manager: Arc<dyn KeystoreManager>,
@@ -22,6 +23,7 @@ pub struct AppState {
     pub validator_manager: Arc<dyn ValidatorManager>,
     pub doppelganger_monitor: Arc<dyn DoppelgangerMonitor>,
     pub remote_key_manager: Arc<dyn RemoteKeyManager>,
+    pub allow_insecure_remote_signer: bool,
 }
 
 pub async fn list_keystores(State(state): State<Arc<AppState>>) -> Json<ListKeystoresResponse> {
@@ -199,6 +201,16 @@ pub async fn import_remote_keys(
     for key_import in &request.remote_keys {
         match parse_pubkey(&key_import.pubkey) {
             Ok(pubkey) => {
+                if let Err(e) = url_validator::validate_remote_signer_url(
+                    &key_import.url,
+                    state.allow_insecure_remote_signer,
+                ) {
+                    results.push(ImportRemoteKeyResult {
+                        status: ImportRemoteKeyStatus::Error,
+                        message: e,
+                    });
+                    continue;
+                }
                 match state.remote_key_manager.import_remote_key(pubkey, key_import.url.clone()) {
                     Ok(()) => {
                         results.push(ImportRemoteKeyResult {
@@ -598,6 +610,7 @@ mod tests {
                 validator_manager: self.validator_manager.clone(),
                 doppelganger_monitor: self.doppelganger_monitor.clone(),
                 remote_key_manager: self.remote_key_manager.clone(),
+                allow_insecure_remote_signer: true,
             });
             Router::new()
                 .route(
@@ -1714,5 +1727,327 @@ mod tests {
             json.get("message").is_none(),
             "success result should not have 'message' key, got: {json}"
         );
+    }
+
+    // --- SEC-07: Body size limit tests ---
+
+    #[tokio::test]
+    async fn test_body_limit_rejects_oversized_payload() {
+        use crate::server::KeymanagerServer;
+
+        let app = TestApp::new();
+        let server = KeymanagerServer::new(
+            app.keystore_manager.clone(),
+            app.slashing_protection.clone(),
+            app.validator_manager.clone(),
+            app.doppelganger_monitor.clone(),
+            app.remote_key_manager.clone(),
+            "test_token".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            vec![],
+            1024, // 1 KB limit
+            true,
+        );
+
+        let big_body = "x".repeat(2048); // 2 KB > 1 KB limit
+        let response = server
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/eth/v1/keystores")
+                    .header("Authorization", "Bearer test_token")
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(big_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn test_body_limit_allows_normal_payload() {
+        use crate::server::KeymanagerServer;
+
+        let app = TestApp::new();
+        let server = KeymanagerServer::new(
+            app.keystore_manager.clone(),
+            app.slashing_protection.clone(),
+            app.validator_manager.clone(),
+            app.doppelganger_monitor.clone(),
+            app.remote_key_manager.clone(),
+            "test_token".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            vec![],
+            10 * 1024 * 1024, // 10 MB
+            true,
+        );
+
+        let body = serde_json::json!({
+            "keystores": [],
+            "passwords": []
+        })
+        .to_string();
+
+        let response = server
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/eth/v1/keystores")
+                    .header("Authorization", "Bearer test_token")
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
+
+    // --- SEC-06: CORS tests ---
+
+    #[tokio::test]
+    async fn test_cors_no_origins_no_header() {
+        use crate::server::KeymanagerServer;
+
+        let app = TestApp::new();
+        let server = KeymanagerServer::new(
+            app.keystore_manager.clone(),
+            app.slashing_protection.clone(),
+            app.validator_manager.clone(),
+            app.doppelganger_monitor.clone(),
+            app.remote_key_manager.clone(),
+            "test_token".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            vec![],
+            10 * 1024 * 1024,
+            true,
+        );
+
+        let response = server
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/eth/v1/keystores")
+                    .header("Authorization", "Bearer test_token")
+                    .header("Origin", "http://evil.com")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            response.headers().get("access-control-allow-origin").is_none(),
+            "No CORS headers should be set when no origins configured"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cors_with_allowed_origin() {
+        use crate::server::KeymanagerServer;
+
+        let app = TestApp::new();
+        let server = KeymanagerServer::new(
+            app.keystore_manager.clone(),
+            app.slashing_protection.clone(),
+            app.validator_manager.clone(),
+            app.doppelganger_monitor.clone(),
+            app.remote_key_manager.clone(),
+            "test_token".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            vec!["http://localhost:3000".to_string()],
+            10 * 1024 * 1024,
+            true,
+        );
+
+        let response = server
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/eth/v1/keystores")
+                    .header("Authorization", "Bearer test_token")
+                    .header("Origin", "http://localhost:3000")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.headers().get("access-control-allow-origin").map(|v| v.to_str().unwrap()),
+            Some("http://localhost:3000"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cors_preflight_options() {
+        use crate::server::KeymanagerServer;
+
+        let app = TestApp::new();
+        let server = KeymanagerServer::new(
+            app.keystore_manager.clone(),
+            app.slashing_protection.clone(),
+            app.validator_manager.clone(),
+            app.doppelganger_monitor.clone(),
+            app.remote_key_manager.clone(),
+            "test_token".to_string(),
+            "127.0.0.1:0".parse().unwrap(),
+            vec!["http://localhost:3000".to_string()],
+            10 * 1024 * 1024,
+            true,
+        );
+
+        let response = server
+            .router()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/eth/v1/keystores")
+                    .header("Origin", "http://localhost:3000")
+                    .header("Access-Control-Request-Method", "POST")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(response.headers().get("access-control-allow-origin").is_some());
+    }
+
+    // --- SEC-05: URL validation in import_remote_keys ---
+
+    #[tokio::test]
+    async fn test_import_remote_key_rejects_http_without_flag() {
+        let app = TestApp::new();
+        let state = Arc::new(AppState {
+            keystore_manager: app.keystore_manager.clone(),
+            slashing_protection: app.slashing_protection.clone(),
+            validator_manager: app.validator_manager.clone(),
+            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            remote_key_manager: app.remote_key_manager.clone(),
+            allow_insecure_remote_signer: false,
+        });
+
+        let router = Router::new()
+            .route("/eth/v1/remotekeys", axum::routing::post(import_remote_keys))
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "remote_keys": [{
+                "pubkey": format!("0x{}", test_pubkey_hex(1)),
+                "url": "http://signer.example.com:9000"
+            }]
+        })
+        .to_string();
+
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/eth/v1/remotekeys")
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body_bytes =
+            http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let resp: ImportRemoteKeysResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(resp.data[0].status, ImportRemoteKeyStatus::Error);
+        assert!(resp.data[0].message.contains("HTTP not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_import_remote_key_rejects_file_scheme() {
+        let app = TestApp::new();
+        let state = Arc::new(AppState {
+            keystore_manager: app.keystore_manager.clone(),
+            slashing_protection: app.slashing_protection.clone(),
+            validator_manager: app.validator_manager.clone(),
+            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            remote_key_manager: app.remote_key_manager.clone(),
+            allow_insecure_remote_signer: false,
+        });
+
+        let router = Router::new()
+            .route("/eth/v1/remotekeys", axum::routing::post(import_remote_keys))
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "remote_keys": [{
+                "pubkey": format!("0x{}", test_pubkey_hex(1)),
+                "url": "file:///etc/passwd"
+            }]
+        })
+        .to_string();
+
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/eth/v1/remotekeys")
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body_bytes =
+            http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let resp: ImportRemoteKeysResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(resp.data[0].status, ImportRemoteKeyStatus::Error);
+        assert!(resp.data[0].message.contains("Unsupported URL scheme"));
+    }
+
+    #[tokio::test]
+    async fn test_import_remote_key_rejects_private_ip() {
+        let app = TestApp::new();
+        let state = Arc::new(AppState {
+            keystore_manager: app.keystore_manager.clone(),
+            slashing_protection: app.slashing_protection.clone(),
+            validator_manager: app.validator_manager.clone(),
+            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            remote_key_manager: app.remote_key_manager.clone(),
+            allow_insecure_remote_signer: false,
+        });
+
+        let router = Router::new()
+            .route("/eth/v1/remotekeys", axum::routing::post(import_remote_keys))
+            .with_state(state);
+
+        let body = serde_json::json!({
+            "remote_keys": [{
+                "pubkey": format!("0x{}", test_pubkey_hex(1)),
+                "url": "https://127.0.0.1:9000"
+            }]
+        })
+        .to_string();
+
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/eth/v1/remotekeys")
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body_bytes =
+            http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let resp: ImportRemoteKeysResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(resp.data[0].status, ImportRemoteKeyStatus::Error);
+        assert!(resp.data[0].message.contains("Private/reserved IP"));
     }
 }
