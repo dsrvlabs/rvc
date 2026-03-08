@@ -838,6 +838,13 @@ async fn run_validator(
         }
     };
 
+    match startup::check_fork_compatibility(beacon.as_ref(), &fork_schedule).await {
+        Ok(()) => {}
+        Err(e) => {
+            warn!("Fork compatibility check failed: {}", e);
+        }
+    }
+
     let orchestrator_config = builder
         .build_orchestrator_config(genesis_validators_root, fork_schedule)
         .with_timeouts(timeouts);
