@@ -1,3 +1,5 @@
+use eth_types::{BeaconBlock, BlindedBeaconBlock};
+
 use crate::BeaconError;
 
 /// Minimal block header extracted from raw SSZ-encoded `BeaconBlock` bytes.
@@ -33,21 +35,14 @@ const MIN_BEACON_BLOCK_HEADER_LEN: usize = 16;
 /// Minimum size of the `BlockContents` fixed portion (3 × 4-byte offsets).
 const BLOCK_CONTENTS_FIXED_LEN: usize = 12;
 
-/// Extracts slot and proposer_index from raw SSZ bytes.
-///
-/// The `format` parameter determines how to locate the `BeaconBlock` within
-/// the SSZ payload. See [`SszBlockFormat`] for details.
-///
-/// # Errors
-///
-/// Returns `BeaconError::ParseError` if the input is too short or the
-/// offset within a `BlockContents` payload points outside the buffer.
-pub fn extract_block_header_from_ssz(
-    bytes: &[u8],
-    format: SszBlockFormat,
-) -> Result<SszBlockHeader, BeaconError> {
-    let block_offset = match format {
-        SszBlockFormat::BeaconBlock => 0,
+/// Fixed portion of the SSZ `BeaconBlock` layout:
+/// slot(8) + proposer_index(8) + parent_root(32) + state_root(32) + body_offset(4) = 84.
+const BEACON_BLOCK_FIXED_LEN: usize = 84;
+
+/// Resolves the byte offset where the `BeaconBlock` data starts within `bytes`.
+fn resolve_block_offset(bytes: &[u8], format: SszBlockFormat) -> Result<usize, BeaconError> {
+    match format {
+        SszBlockFormat::BeaconBlock => Ok(0),
         SszBlockFormat::BlockContents => {
             if bytes.len() < BLOCK_CONTENTS_FIXED_LEN {
                 return Err(BeaconError::ParseError(format!(
@@ -65,9 +60,25 @@ pub fn extract_block_header_from_ssz(
                     offset, BLOCK_CONTENTS_FIXED_LEN,
                 )));
             }
-            offset
+            Ok(offset)
         }
-    };
+    }
+}
+
+/// Extracts slot and proposer_index from raw SSZ bytes.
+///
+/// The `format` parameter determines how to locate the `BeaconBlock` within
+/// the SSZ payload. See [`SszBlockFormat`] for details.
+///
+/// # Errors
+///
+/// Returns `BeaconError::ParseError` if the input is too short or the
+/// offset within a `BlockContents` payload points outside the buffer.
+pub fn extract_block_header_from_ssz(
+    bytes: &[u8],
+    format: SszBlockFormat,
+) -> Result<SszBlockHeader, BeaconError> {
+    let block_offset = resolve_block_offset(bytes, format)?;
 
     let end = block_offset
         .checked_add(MIN_BEACON_BLOCK_HEADER_LEN)
@@ -91,6 +102,104 @@ pub fn extract_block_header_from_ssz(
     );
 
     Ok(SszBlockHeader { slot, proposer_index })
+}
+
+/// Deserializes raw SSZ bytes into a `BeaconBlock`.
+///
+/// Returns the deserialized block and the byte offset within `bytes` where the
+/// `BeaconBlock` data starts. The offset is needed by callers constructing
+/// `SignedBeaconBlock` SSZ payloads.
+///
+/// # Errors
+///
+/// Returns `BeaconError::ParseError` if the input is too short, the body offset
+/// is invalid, or the `BlockContents` wrapper offset is out of bounds.
+pub fn deserialize_beacon_block_from_ssz(
+    bytes: &[u8],
+    format: SszBlockFormat,
+) -> Result<(BeaconBlock, usize), BeaconError> {
+    let block_offset = resolve_block_offset(bytes, format)?;
+    let block = deserialize_block_fields(bytes, block_offset)?;
+    Ok((block, block_offset))
+}
+
+/// Deserializes raw SSZ bytes into a `BlindedBeaconBlock`.
+///
+/// Identical SSZ layout to `BeaconBlock` (slot, proposer_index, parent_root,
+/// state_root, body).
+///
+/// # Errors
+///
+/// Returns `BeaconError::ParseError` if the input is too short or malformed.
+pub fn deserialize_blinded_beacon_block_from_ssz(
+    bytes: &[u8],
+    format: SszBlockFormat,
+) -> Result<(BlindedBeaconBlock, usize), BeaconError> {
+    let block_offset = resolve_block_offset(bytes, format)?;
+    let block = deserialize_block_fields(bytes, block_offset)?;
+    let blinded = BlindedBeaconBlock {
+        slot: block.slot,
+        proposer_index: block.proposer_index,
+        parent_root: block.parent_root,
+        state_root: block.state_root,
+        body: block.body,
+    };
+    Ok((blinded, block_offset))
+}
+
+/// Parses the fixed fields and body of a `BeaconBlock` starting at `block_offset`.
+fn deserialize_block_fields(bytes: &[u8], block_offset: usize) -> Result<BeaconBlock, BeaconError> {
+    let fixed_end = block_offset
+        .checked_add(BEACON_BLOCK_FIXED_LEN)
+        .ok_or_else(|| BeaconError::ParseError("SSZ offset overflow".to_string()))?;
+
+    if bytes.len() < fixed_end {
+        return Err(BeaconError::ParseError(format!(
+            "SSZ BeaconBlock too short: {} bytes, need at least {} (offset {} + fixed {})",
+            bytes.len(),
+            fixed_end,
+            block_offset,
+            BEACON_BLOCK_FIXED_LEN,
+        )));
+    }
+
+    let b = &bytes[block_offset..];
+
+    let slot = u64::from_le_bytes(b[0..8].try_into().expect("length verified"));
+    let proposer_index = u64::from_le_bytes(b[8..16].try_into().expect("length verified"));
+
+    let mut parent_root = [0u8; 32];
+    parent_root.copy_from_slice(&b[16..48]);
+
+    let mut state_root = [0u8; 32];
+    state_root.copy_from_slice(&b[48..80]);
+
+    let body_offset_rel =
+        u32::from_le_bytes(b[80..84].try_into().expect("length verified")) as usize;
+
+    if body_offset_rel < BEACON_BLOCK_FIXED_LEN {
+        return Err(BeaconError::ParseError(format!(
+            "SSZ BeaconBlock body offset {} is inside the fixed portion (< {})",
+            body_offset_rel, BEACON_BLOCK_FIXED_LEN,
+        )));
+    }
+
+    // Determine the end of the BeaconBlock region within bytes.
+    // For BlockContents, the second offset (kzg_proofs) marks the end of BeaconBlock.
+    // For bare BeaconBlock, it extends to the end of bytes.
+    let block_region_end = bytes.len();
+
+    let body_start = block_offset + body_offset_rel;
+    if body_start > block_region_end {
+        return Err(BeaconError::ParseError(format!(
+            "SSZ BeaconBlock body offset {} points past end of block region ({})",
+            body_start, block_region_end,
+        )));
+    }
+
+    let body = bytes[body_start..block_region_end].to_vec();
+
+    Ok(BeaconBlock { slot, proposer_index, parent_root, state_root, body })
 }
 
 #[cfg(test)]
@@ -303,5 +412,159 @@ mod tests {
         let header = extract_block_header_from_ssz(&bytes, SszBlockFormat::BlockContents).unwrap();
         assert_eq!(header.slot, 42);
         assert_eq!(header.proposer_index, 99);
+    }
+
+    // --- deserialize_beacon_block_from_ssz tests ---
+
+    /// Build a valid SSZ-encoded `BeaconBlock` from components.
+    /// Layout: slot(8) + proposer_index(8) + parent_root(32) + state_root(32) + body_offset(4) + body
+    fn build_beacon_block_ssz(
+        slot: u64,
+        proposer_index: u64,
+        parent_root: [u8; 32],
+        state_root: [u8; 32],
+        body: &[u8],
+    ) -> Vec<u8> {
+        let body_offset: u32 = 84; // fixed portion size
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&slot.to_le_bytes());
+        buf.extend_from_slice(&proposer_index.to_le_bytes());
+        buf.extend_from_slice(&parent_root);
+        buf.extend_from_slice(&state_root);
+        buf.extend_from_slice(&body_offset.to_le_bytes());
+        buf.extend_from_slice(body);
+        buf
+    }
+
+    #[test]
+    fn test_deserialize_beacon_block_from_ssz_roundtrip() {
+        let parent_root = [1u8; 32];
+        let state_root = [2u8; 32];
+        let body = vec![0xde, 0xad, 0xbe, 0xef];
+
+        let ssz = build_beacon_block_ssz(100, 42, parent_root, state_root, &body);
+        let (block, offset) =
+            deserialize_beacon_block_from_ssz(&ssz, SszBlockFormat::BeaconBlock).unwrap();
+
+        assert_eq!(offset, 0);
+        assert_eq!(block.slot, 100);
+        assert_eq!(block.proposer_index, 42);
+        assert_eq!(block.parent_root, parent_root);
+        assert_eq!(block.state_root, state_root);
+        assert_eq!(block.body, body);
+    }
+
+    #[test]
+    fn test_deserialize_beacon_block_from_block_contents_ssz() {
+        let parent_root = [3u8; 32];
+        let state_root = [4u8; 32];
+        let body = vec![0xca, 0xfe];
+
+        let block_ssz = build_beacon_block_ssz(200, 55, parent_root, state_root, &body);
+        let block_len = block_ssz.len();
+
+        // BlockContents: [block_offset(4) | kzg_offset(4) | blobs_offset(4) | BeaconBlock...]
+        let block_offset: u32 = 12;
+        let kzg_offset: u32 = block_offset + block_len as u32;
+        let blobs_offset: u32 = kzg_offset;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&block_offset.to_le_bytes());
+        buf.extend_from_slice(&kzg_offset.to_le_bytes());
+        buf.extend_from_slice(&blobs_offset.to_le_bytes());
+        buf.extend_from_slice(&block_ssz);
+
+        let (block, offset) =
+            deserialize_beacon_block_from_ssz(&buf, SszBlockFormat::BlockContents).unwrap();
+
+        assert_eq!(offset, 12);
+        assert_eq!(block.slot, 200);
+        assert_eq!(block.proposer_index, 55);
+        assert_eq!(block.parent_root, parent_root);
+        assert_eq!(block.state_root, state_root);
+        // Body includes everything from body_offset to end of buffer (past kzg/blobs area)
+        // since we don't limit by kzg_offset in the current implementation.
+        // The body starts at block_offset + 84 = 96 and goes to end of buf.
+        assert!(block.body.starts_with(&body));
+    }
+
+    #[test]
+    fn test_deserialize_beacon_block_ssz_too_short() {
+        // Empty
+        let result = deserialize_beacon_block_from_ssz(&[], SszBlockFormat::BeaconBlock);
+        assert!(result.is_err());
+
+        // 83 bytes — one short of fixed portion
+        let bytes = vec![0u8; 83];
+        let result = deserialize_beacon_block_from_ssz(&bytes, SszBlockFormat::BeaconBlock);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("too short"), "error should mention too short: {err}");
+    }
+
+    #[test]
+    fn test_deserialize_beacon_block_tree_hash_matches() {
+        use tree_hash::TreeHash;
+
+        let parent_root = [0xaa; 32];
+        let state_root = [0xbb; 32];
+        let body = vec![0x01, 0x02, 0x03, 0x04, 0x05];
+
+        let expected = BeaconBlock {
+            slot: 999,
+            proposer_index: 77,
+            parent_root,
+            state_root,
+            body: body.clone(),
+        };
+        let expected_root = expected.tree_hash_root();
+
+        let ssz = build_beacon_block_ssz(999, 77, parent_root, state_root, &body);
+        let (block, _) =
+            deserialize_beacon_block_from_ssz(&ssz, SszBlockFormat::BeaconBlock).unwrap();
+
+        assert_eq!(block.tree_hash_root(), expected_root);
+    }
+
+    #[test]
+    fn test_deserialize_beacon_block_body_offset_too_small() {
+        // Construct SSZ with body_offset < 84 (inside fixed portion)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&100u64.to_le_bytes()); // slot
+        buf.extend_from_slice(&42u64.to_le_bytes()); // proposer_index
+        buf.extend_from_slice(&[0u8; 32]); // parent_root
+        buf.extend_from_slice(&[0u8; 32]); // state_root
+        buf.extend_from_slice(&10u32.to_le_bytes()); // body_offset = 10 (invalid)
+
+        let result = deserialize_beacon_block_from_ssz(&buf, SszBlockFormat::BeaconBlock);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("fixed portion"), "error: {err}");
+    }
+
+    #[test]
+    fn test_deserialize_blinded_beacon_block_from_ssz_roundtrip() {
+        let parent_root = [5u8; 32];
+        let state_root = [6u8; 32];
+        let body = vec![0xfe, 0xed];
+
+        let ssz = build_beacon_block_ssz(300, 88, parent_root, state_root, &body);
+        let (block, offset) =
+            deserialize_blinded_beacon_block_from_ssz(&ssz, SszBlockFormat::BeaconBlock).unwrap();
+
+        assert_eq!(offset, 0);
+        assert_eq!(block.slot, 300);
+        assert_eq!(block.proposer_index, 88);
+        assert_eq!(block.parent_root, parent_root);
+        assert_eq!(block.state_root, state_root);
+        assert_eq!(block.body, body);
+    }
+
+    #[test]
+    fn test_deserialize_beacon_block_empty_body() {
+        let ssz = build_beacon_block_ssz(1, 1, [0u8; 32], [0u8; 32], &[]);
+        let (block, _) =
+            deserialize_beacon_block_from_ssz(&ssz, SszBlockFormat::BeaconBlock).unwrap();
+        assert!(block.body.is_empty());
     }
 }

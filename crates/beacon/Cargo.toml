@@ -22,4 +22,5 @@ tokio = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+tree_hash = { workspace = true }
 wiremock = { workspace = true }
