@@ -286,7 +286,8 @@ impl BeaconClient {
     ) -> Result<ProduceBlockResponse, BeaconError> {
         let mut query = format!("randao_reveal={}", randao_reveal);
         if let Some(g) = graffiti {
-            query.push_str(&format!("&graffiti={}", g));
+            let encoded: String = url::form_urlencoded::byte_serialize(g.as_bytes()).collect();
+            query.push_str(&format!("&graffiti={}", encoded));
         }
         if let Some(factor) = builder_boost_factor {
             query.push_str(&format!("&builder_boost_factor={}", factor));
@@ -504,36 +505,33 @@ impl BeaconClient {
             if is_blinded { "/eth/v1/beacon/blinded_blocks" } else { "/eth/v2/beacon/blocks" };
         let url = format!("{}{}", self.config.endpoint, path);
 
-        let span = tracing::info_span!(
-            "rvc.beacon.publish_block_ssz",
-            http.method = "POST",
-            http.url = %redact_url(&url),
-            http.status_code = tracing::field::Empty,
-        );
+        let mut trace_headers = reqwest::header::HeaderMap::new();
+        telemetry::inject_trace_context(&mut trace_headers);
+        let hdrs = trace_headers.clone();
+        let cv = consensus_version.to_string();
+        let body = ssz_bytes.to_vec();
 
-        let mut headers = reqwest::header::HeaderMap::new();
-        telemetry::inject_trace_context(&mut headers);
+        self.execute_with_retry_raw("POST", &url, || {
+            let hdrs = hdrs.clone();
+            let cv = cv.clone();
+            let body = body.clone();
+            let url = url.clone();
+            async move {
+                let mut req = self
+                    .client
+                    .post(&url)
+                    .header("Content-Type", "application/octet-stream")
+                    .header("Eth-Consensus-Version", &cv)
+                    .body(body);
+                for (name, value) in &hdrs {
+                    req = req.header(name.clone(), value.clone());
+                }
+                req.send().await
+            }
+        })
+        .await?;
 
-        let mut request = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/octet-stream")
-            .header("Eth-Consensus-Version", consensus_version)
-            .body(ssz_bytes.to_vec());
-        for (name, value) in &headers {
-            request = request.header(name.clone(), value.clone());
-        }
-
-        let response = request.send().await.map_err(|e| BeaconError::HttpError(e.to_string()))?;
-
-        let status = response.status();
-        span.record("http.status_code", status.as_u16());
-        if status.is_success() {
-            Ok(())
-        } else {
-            let body = response.text().await.unwrap_or_default();
-            Err(BeaconError::ApiError { status: status.as_u16(), message: body })
-        }
+        Ok(())
     }
 
     /// Fetches sync committee duties for the given epoch and validator indices.
@@ -4642,5 +4640,183 @@ mod tests {
 
         let result = client.submit_aggregate_and_proofs(&proofs).await;
         assert!(result.is_ok());
+    }
+
+    // FIX-07: URL-encode graffiti tests
+
+    #[tokio::test]
+    async fn test_produce_block_v3_encodes_graffiti_special_chars() {
+        let mock_server = MockServer::start().await;
+
+        let block_body = serde_json::json!({
+            "version": "deneb",
+            "data": {}
+        });
+
+        // The encoded graffiti "hello&world=bad" should arrive as a single parameter
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/100"))
+            .and(wiremock::matchers::query_param("randao_reveal", "0xrandao"))
+            .and(wiremock::matchers::query_param("graffiti", "hello&world=bad"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&block_body)
+                    .insert_header("Eth-Execution-Payload-Blinded", "false")
+                    .insert_header("Eth-Consensus-Version", "deneb"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.produce_block_v3(100, "0xrandao", Some("hello&world=bad"), None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_produce_block_v3_encodes_graffiti_spaces_and_unicode() {
+        let mock_server = MockServer::start().await;
+
+        let block_body = serde_json::json!({
+            "version": "deneb",
+            "data": {}
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/101"))
+            .and(wiremock::matchers::query_param("randao_reveal", "0xrandao"))
+            .and(wiremock::matchers::query_param("graffiti", "hello world 🚀"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&block_body)
+                    .insert_header("Eth-Execution-Payload-Blinded", "false")
+                    .insert_header("Eth-Consensus-Version", "deneb"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.produce_block_v3(101, "0xrandao", Some("hello world 🚀"), None).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_produce_block_v3_no_graffiti_no_param() {
+        let mock_server = MockServer::start().await;
+
+        let block_body = serde_json::json!({
+            "version": "deneb",
+            "data": {}
+        });
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/102"))
+            .and(wiremock::matchers::query_param("randao_reveal", "0xrandao"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&block_body)
+                    .insert_header("Eth-Execution-Payload-Blinded", "false")
+                    .insert_header("Eth-Consensus-Version", "deneb"),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let result = client.produce_block_v3(102, "0xrandao", None, None).await;
+        assert!(result.is_ok());
+    }
+
+    // FIX-08: publish_block_ssz retry tests
+
+    #[tokio::test]
+    async fn test_publish_block_ssz_retries_on_503() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(2)
+            .up_to_n_times(2)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1));
+        let client = BeaconClient::new(config).unwrap();
+
+        let ssz_bytes = vec![0x01, 0x02, 0x03];
+        let result = client.publish_block_ssz(&ssz_bytes, "deneb", false).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_publish_block_ssz_fails_on_400_no_retry() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("Invalid block"))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1));
+        let client = BeaconClient::new(config).unwrap();
+
+        let ssz_bytes = vec![0x01, 0x02, 0x03];
+        let result = client.publish_block_ssz(&ssz_bytes, "deneb", false).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, .. }) => {
+                assert_eq!(status, 400);
+            }
+            _ => panic!("Expected ApiError with status 400"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_publish_block_ssz_exhausts_retries() {
+        let mock_server = MockServer::start().await;
+
+        // 1 initial + 3 retries = 4 total requests
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("Service Unavailable"))
+            .expect(4)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1));
+        let client = BeaconClient::new(config).unwrap();
+
+        let ssz_bytes = vec![0x01, 0x02, 0x03];
+        let result = client.publish_block_ssz(&ssz_bytes, "deneb", false).await;
+
+        match result {
+            Err(BeaconError::ApiError { status, .. }) => {
+                assert_eq!(status, 503);
+            }
+            _ => panic!("Expected ApiError with status 503"),
+        }
     }
 }
