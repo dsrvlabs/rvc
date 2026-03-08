@@ -4891,20 +4891,20 @@ mod tests {
             }
             _ => panic!("Expected ApiError with status 503"),
         }
-    // --- COR-08: 429 Retry-After tests ---
+        // --- COR-08: 429 Retry-After tests ---
 
-    #[tokio::test]
-    async fn test_429_retried_with_retry_after_header() {
-        let server = MockServer::start().await;
+        #[tokio::test]
+        async fn test_429_retried_with_retry_after_header() {
+            let server = MockServer::start().await;
 
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/beacon/genesis"))
-            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
+            Mock::given(method("GET"))
+                .and(path("/eth/v1/beacon/genesis"))
+                .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
 
-        Mock::given(method("GET"))
+            Mock::given(method("GET"))
             .and(path("/eth/v1/beacon/genesis"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"{"data":{"genesis_time":"1606824023","genesis_validators_root":"0x0000000000000000000000000000000000000000000000000000000000000000","genesis_fork_version":"0x00000000"}}"#
@@ -4912,81 +4912,81 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = BeaconClientConfig::new(&server.uri())
-            .with_max_retries(2)
-            .with_initial_backoff(Duration::from_millis(10));
-        let client = BeaconClient::new(config).unwrap();
+            let config = BeaconClientConfig::new(&server.uri())
+                .with_max_retries(2)
+                .with_initial_backoff(Duration::from_millis(10));
+            let client = BeaconClient::new(config).unwrap();
 
-        let result = client.get_genesis().await;
-        assert!(result.is_ok(), "Should succeed after 429 retry: {:?}", result);
-    }
-
-    #[tokio::test]
-    async fn test_429_exhausts_retries() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/beacon/genesis"))
-            .respond_with(ResponseTemplate::new(429))
-            .mount(&server)
-            .await;
-
-        let config = BeaconClientConfig::new(&server.uri())
-            .with_max_retries(1)
-            .with_initial_backoff(Duration::from_millis(10));
-        let client = BeaconClient::new(config).unwrap();
-
-        let result = client.get_genesis().await;
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            BeaconError::ApiError { status, .. } => assert_eq!(status, 429),
-            e => panic!("expected ApiError(429), got: {e:?}"),
+            let result = client.get_genesis().await;
+            assert!(result.is_ok(), "Should succeed after 429 retry: {:?}", result);
         }
-    }
 
-    #[tokio::test]
-    async fn test_429_post_retried() {
-        let server = MockServer::start().await;
+        #[tokio::test]
+        async fn test_429_exhausts_retries() {
+            let server = MockServer::start().await;
 
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
-            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
+            Mock::given(method("GET"))
+                .and(path("/eth/v1/beacon/genesis"))
+                .respond_with(ResponseTemplate::new(429))
+                .mount(&server)
+                .await;
 
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
-            .await;
+            let config = BeaconClientConfig::new(&server.uri())
+                .with_max_retries(1)
+                .with_initial_backoff(Duration::from_millis(10));
+            let client = BeaconClient::new(config).unwrap();
 
-        let config = BeaconClientConfig::new(&server.uri())
-            .with_max_retries(2)
-            .with_initial_backoff(Duration::from_millis(10));
-        let client = BeaconClient::new(config).unwrap();
+            let result = client.get_genesis().await;
+            assert!(result.is_err());
+            match result.unwrap_err() {
+                BeaconError::ApiError { status, .. } => assert_eq!(status, 429),
+                e => panic!("expected ApiError(429), got: {e:?}"),
+            }
+        }
 
-        let preparations = vec![ProposerPreparation {
-            validator_index: "1".to_string(),
-            fee_recipient: "0x0000000000000000000000000000000000000001".to_string(),
-        }];
-        let result = client.prepare_beacon_proposer(&preparations).await;
-        assert!(result.is_ok(), "POST should succeed after 429 retry: {:?}", result);
-    }
+        #[tokio::test]
+        async fn test_429_post_retried() {
+            let server = MockServer::start().await;
 
-    #[tokio::test]
-    async fn test_429_with_retry_after_header_respected() {
-        let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+                .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
 
-        // Return 429 with Retry-After: 1 once, then succeed
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/beacon/genesis"))
-            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
+            Mock::given(method("POST"))
+                .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
 
-        Mock::given(method("GET"))
+            let config = BeaconClientConfig::new(&server.uri())
+                .with_max_retries(2)
+                .with_initial_backoff(Duration::from_millis(10));
+            let client = BeaconClient::new(config).unwrap();
+
+            let preparations = vec![ProposerPreparation {
+                validator_index: "1".to_string(),
+                fee_recipient: "0x0000000000000000000000000000000000000001".to_string(),
+            }];
+            let result = client.prepare_beacon_proposer(&preparations).await;
+            assert!(result.is_ok(), "POST should succeed after 429 retry: {:?}", result);
+        }
+
+        #[tokio::test]
+        async fn test_429_with_retry_after_header_respected() {
+            let server = MockServer::start().await;
+
+            // Return 429 with Retry-After: 1 once, then succeed
+            Mock::given(method("GET"))
+                .and(path("/eth/v1/beacon/genesis"))
+                .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("GET"))
             .and(path("/eth/v1/beacon/genesis"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"{"data":{"genesis_time":"1606824023","genesis_validators_root":"0x0000000000000000000000000000000000000000000000000000000000000000","genesis_fork_version":"0x00000000"}}"#
@@ -4994,114 +4994,120 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = BeaconClientConfig::new(&server.uri())
-            .with_max_retries(2)
-            .with_initial_backoff(Duration::from_millis(10));
-        let client = BeaconClient::new(config).unwrap();
+            let config = BeaconClientConfig::new(&server.uri())
+                .with_max_retries(2)
+                .with_initial_backoff(Duration::from_millis(10));
+            let client = BeaconClient::new(config).unwrap();
 
-        let start = tokio::time::Instant::now();
-        let result = client.get_genesis().await;
-        let elapsed = start.elapsed();
+            let start = tokio::time::Instant::now();
+            let result = client.get_genesis().await;
+            let elapsed = start.elapsed();
 
-        assert!(result.is_ok());
-        // Retry-After: 1 means at least 1 second delay
-        assert!(
-            elapsed >= Duration::from_millis(900),
-            "Should wait for Retry-After period: {elapsed:?}"
-        );
-    }
+            assert!(result.is_ok());
+            // Retry-After: 1 means at least 1 second delay
+            assert!(
+                elapsed >= Duration::from_millis(900),
+                "Should wait for Retry-After period: {elapsed:?}"
+            );
+        }
 
-    // --- COR-09: POST for large validator sets ---
+        // --- COR-09: POST for large validator sets ---
 
-    fn make_validators_response(count: usize) -> String {
-        let validators: Vec<serde_json::Value> = (0..count)
-            .map(|i| {
-                json!({
-                    "index": i.to_string(),
-                    "status": "active_ongoing",
-                    "validator": {
-                        "pubkey": format!("0x{:096x}", i)
-                    }
+        fn make_validators_response(count: usize) -> String {
+            let validators: Vec<serde_json::Value> = (0..count)
+                .map(|i| {
+                    json!({
+                        "index": i.to_string(),
+                        "status": "active_ongoing",
+                        "validator": {
+                            "pubkey": format!("0x{:096x}", i)
+                        }
+                    })
                 })
-            })
-            .collect();
-        json!({ "data": validators }).to_string()
-    }
+                .collect();
+            json!({ "data": validators }).to_string()
+        }
 
-    #[tokio::test]
-    async fn test_get_validators_small_set_uses_get() {
-        let server = MockServer::start().await;
+        #[tokio::test]
+        async fn test_get_validators_small_set_uses_get() {
+            let server = MockServer::start().await;
 
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/beacon/states/head/validators"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(make_validators_response(3)))
-            .expect(1)
-            .mount(&server)
-            .await;
+            Mock::given(method("GET"))
+                .and(path("/eth/v1/beacon/states/head/validators"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(make_validators_response(3)),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
 
-        let config = BeaconClientConfig::new(&server.uri()).with_max_retries(0);
-        let client = BeaconClient::new(config).unwrap();
+            let config = BeaconClientConfig::new(&server.uri()).with_max_retries(0);
+            let client = BeaconClient::new(config).unwrap();
 
-        let pubkeys: Vec<String> = (0..3).map(|i| format!("0x{:096x}", i)).collect();
-        let result = client.get_validators(&pubkeys).await;
-        assert!(result.is_ok(), "Small set should use GET: {:?}", result);
-        assert_eq!(result.unwrap().data.len(), 3);
-    }
+            let pubkeys: Vec<String> = (0..3).map(|i| format!("0x{:096x}", i)).collect();
+            let result = client.get_validators(&pubkeys).await;
+            assert!(result.is_ok(), "Small set should use GET: {:?}", result);
+            assert_eq!(result.unwrap().data.len(), 3);
+        }
 
-    #[tokio::test]
-    async fn test_get_validators_large_set_uses_post() {
-        let server = MockServer::start().await;
+        #[tokio::test]
+        async fn test_get_validators_large_set_uses_post() {
+            let server = MockServer::start().await;
 
-        // Only mount POST — GET should NOT be called
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/beacon/states/head/validators"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(make_validators_response(51)))
-            .expect(1)
-            .mount(&server)
-            .await;
+            // Only mount POST — GET should NOT be called
+            Mock::given(method("POST"))
+                .and(path("/eth/v1/beacon/states/head/validators"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(make_validators_response(51)),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
 
-        let config = BeaconClientConfig::new(&server.uri()).with_max_retries(0);
-        let client = BeaconClient::new(config).unwrap();
+            let config = BeaconClientConfig::new(&server.uri()).with_max_retries(0);
+            let client = BeaconClient::new(config).unwrap();
 
-        let pubkeys: Vec<String> = (0..51).map(|i| format!("0x{:096x}", i)).collect();
-        let result = client.get_validators(&pubkeys).await;
-        assert!(result.is_ok(), "Large set should use POST: {:?}", result);
-        assert_eq!(result.unwrap().data.len(), 51);
-    }
+            let pubkeys: Vec<String> = (0..51).map(|i| format!("0x{:096x}", i)).collect();
+            let result = client.get_validators(&pubkeys).await;
+            assert!(result.is_ok(), "Large set should use POST: {:?}", result);
+            assert_eq!(result.unwrap().data.len(), 51);
+        }
 
-    #[tokio::test]
-    async fn test_get_validators_threshold_boundary_uses_get() {
-        let server = MockServer::start().await;
+        #[tokio::test]
+        async fn test_get_validators_threshold_boundary_uses_get() {
+            let server = MockServer::start().await;
 
-        // Exactly 50 should use GET
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/beacon/states/head/validators"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(make_validators_response(50)))
-            .expect(1)
-            .mount(&server)
-            .await;
+            // Exactly 50 should use GET
+            Mock::given(method("GET"))
+                .and(path("/eth/v1/beacon/states/head/validators"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_string(make_validators_response(50)),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
 
-        let config = BeaconClientConfig::new(&server.uri()).with_max_retries(0);
-        let client = BeaconClient::new(config).unwrap();
+            let config = BeaconClientConfig::new(&server.uri()).with_max_retries(0);
+            let client = BeaconClient::new(config).unwrap();
 
-        let pubkeys: Vec<String> = (0..50).map(|i| format!("0x{:096x}", i)).collect();
-        let result = client.get_validators(&pubkeys).await;
-        assert!(result.is_ok(), "50 pubkeys should use GET: {:?}", result);
-    }
+            let pubkeys: Vec<String> = (0..50).map(|i| format!("0x{:096x}", i)).collect();
+            let result = client.get_validators(&pubkeys).await;
+            assert!(result.is_ok(), "50 pubkeys should use GET: {:?}", result);
+        }
 
-    #[tokio::test]
-    async fn test_429_without_retry_after_uses_exponential_backoff() {
-        let server = MockServer::start().await;
+        #[tokio::test]
+        async fn test_429_without_retry_after_uses_exponential_backoff() {
+            let server = MockServer::start().await;
 
-        // Return 429 without Retry-After, then succeed
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/beacon/genesis"))
-            .respond_with(ResponseTemplate::new(429))
-            .up_to_n_times(1)
-            .mount(&server)
-            .await;
+            // Return 429 without Retry-After, then succeed
+            Mock::given(method("GET"))
+                .and(path("/eth/v1/beacon/genesis"))
+                .respond_with(ResponseTemplate::new(429))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
 
-        Mock::given(method("GET"))
+            Mock::given(method("GET"))
             .and(path("/eth/v1/beacon/genesis"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 r#"{"data":{"genesis_time":"1606824023","genesis_validators_root":"0x0000000000000000000000000000000000000000000000000000000000000000","genesis_fork_version":"0x00000000"}}"#
@@ -5109,12 +5115,13 @@ mod tests {
             .mount(&server)
             .await;
 
-        let config = BeaconClientConfig::new(&server.uri())
-            .with_max_retries(2)
-            .with_initial_backoff(Duration::from_millis(50));
-        let client = BeaconClient::new(config).unwrap();
+            let config = BeaconClientConfig::new(&server.uri())
+                .with_max_retries(2)
+                .with_initial_backoff(Duration::from_millis(50));
+            let client = BeaconClient::new(config).unwrap();
 
-        let result = client.get_genesis().await;
-        assert!(result.is_ok(), "Should succeed after 429 retry with fallback backoff");
+            let result = client.get_genesis().await;
+            assert!(result.is_ok(), "Should succeed after 429 retry with fallback backoff");
+        }
     }
 }
