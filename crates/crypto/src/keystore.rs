@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
+use zeroize::Zeroizing;
+
 use super::bls::SecretKey;
 use super::error::KeystoreError;
 
@@ -153,10 +155,10 @@ impl Keystore {
     }
 
     pub fn decrypt(&self, password: &[u8]) -> Result<SecretKey, KeystoreError> {
-        let derived_key = self.derive_key(password)?;
+        let derived_key = Zeroizing::new(self.derive_key(password)?);
         let ciphertext = hex::decode(&self.crypto.cipher.message)?;
         self.verify_checksum(&derived_key, &ciphertext)?;
-        let plaintext = self.decrypt_ciphertext(&derived_key, &ciphertext)?;
+        let plaintext = Zeroizing::new(self.decrypt_ciphertext(&derived_key, &ciphertext)?);
         SecretKey::from_bytes(&plaintext).map_err(KeystoreError::from)
     }
 
@@ -366,9 +368,9 @@ impl Keystore {
             version: KEYSTORE_VERSION,
         };
 
-        let derived_key = keystore.derive_key(password)?;
+        let derived_key = Zeroizing::new(keystore.derive_key(password)?);
 
-        let plaintext = secret_key.to_bytes();
+        let plaintext = Zeroizing::new(secret_key.to_bytes());
         let aes_key = &derived_key[..AES_KEY_LEN];
         let mut cipher = Aes128Ctr::new(aes_key.into(), iv.as_slice().into());
         let mut ciphertext = plaintext.to_vec();

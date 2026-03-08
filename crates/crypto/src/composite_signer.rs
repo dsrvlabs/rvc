@@ -241,10 +241,9 @@ mod tests {
         let pk_bytes = sk.public_key().to_bytes();
         let signing_root: Root = [0xab; 32];
 
-        // Generate a different "remote" signature
-        let remote_sk = SecretKey::generate();
-        let remote_sig = remote_sk.sign(&signing_root);
-        let sig_hex = format!("0x{}", hex::encode(remote_sig.to_bytes()));
+        // Use the same key so the remote signature is valid for this pubkey
+        let expected_sig = sk.sign(&signing_root);
+        let sig_hex = format!("0x{}", hex::encode(expected_sig.to_bytes()));
 
         let mock_server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -252,7 +251,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({"signature": sig_hex})),
             )
-            .expect(1)
+            .expect(1) // Verifies the remote signer was called (not local)
             .mount(&mock_server)
             .await;
 
@@ -264,8 +263,8 @@ mod tests {
         composite.add_remote_key(pk_bytes, remote_signer);
 
         let sig = composite.sign(&signing_root, &pk_bytes).await.unwrap();
-        // Should get the remote signature, not local
-        assert_eq!(sig.to_bytes(), remote_sig.to_bytes());
+        // Mock expectation (expect(1)) verifies remote path was used
+        assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
     }
 
     #[tokio::test]

@@ -84,6 +84,9 @@ pub enum KeyManagerError {
         source: KeystoreError,
     },
 
+    #[error("path traversal detected: {path} resolves outside base directory {base}")]
+    PathTraversal { path: PathBuf, base: PathBuf },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
