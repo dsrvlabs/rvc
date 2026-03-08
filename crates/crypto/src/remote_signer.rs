@@ -55,6 +55,13 @@ impl RemoteSigner {
     ) -> Result<Self, SigningError> {
         let url = config.url.trim_end_matches('/').to_string();
 
+        if url.starts_with("http://") {
+            tracing::warn!(
+                url = %redact_url(&url),
+                "Remote signer URL uses plaintext HTTP — consider using HTTPS"
+            );
+        }
+
         let client = Client::builder()
             .timeout(config.timeout)
             .build()
@@ -609,6 +616,23 @@ mod tests {
         let url = "not-a-url";
         let redacted = redact_url(url);
         assert_eq!(redacted, "not-a-url");
+    }
+
+    #[test]
+    fn test_remote_signer_warns_on_http_url() {
+        let pk = [0xaa; PUBLIC_KEY_BYTES_LEN];
+        let config = RemoteSignerConfig::new("http://signer.example.com:9000");
+        // Should not error — just warn
+        let signer = RemoteSigner::new(config, vec![pk]);
+        assert!(signer.is_ok());
+    }
+
+    #[test]
+    fn test_remote_signer_no_warn_on_https_url() {
+        let pk = [0xaa; PUBLIC_KEY_BYTES_LEN];
+        let config = RemoteSignerConfig::new("https://signer.example.com:9000");
+        let signer = RemoteSigner::new(config, vec![pk]);
+        assert!(signer.is_ok());
     }
 
     #[tokio::test]

@@ -7,6 +7,7 @@ use axum::http::Method;
 use axum::routing::get;
 use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
+use zeroize::Zeroizing;
 
 use crate::auth;
 use crate::handlers::{self, AppState};
@@ -21,7 +22,7 @@ pub const DEFAULT_BODY_LIMIT: usize = 10 * 1024 * 1024; // 10 MB
 
 pub struct KeymanagerServer {
     state: Arc<AppState>,
-    token: Arc<String>,
+    token: Arc<Zeroizing<String>>,
     addr: SocketAddr,
     cors_origins: Vec<String>,
     body_limit: usize,
@@ -50,7 +51,7 @@ impl KeymanagerServer {
                 remote_key_manager,
                 allow_insecure_remote_signer,
             }),
-            token: Arc::new(token),
+            token: Arc::new(Zeroizing::new(token)),
             addr,
             cors_origins,
             body_limit,

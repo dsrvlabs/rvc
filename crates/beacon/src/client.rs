@@ -1193,7 +1193,16 @@ impl BeaconClient {
         // which when multiplied by a 100ms initial backoff gives ~27 hours max.
         let capped_attempt = attempt.min(20);
         let multiplier = 2u32.saturating_pow(capped_attempt);
-        self.config.initial_backoff.saturating_mul(multiplier)
+        let base = self.config.initial_backoff.saturating_mul(multiplier);
+        // Add +/-25% jitter to avoid thundering herd
+        let base_ms = base.as_millis() as u64;
+        let jitter_range = base_ms / 4; // 25%
+        if jitter_range == 0 {
+            return base;
+        }
+        let jitter = rand::Rng::gen_range(&mut rand::thread_rng(), 0..=jitter_range * 2);
+        let jittered_ms = base_ms.saturating_sub(jitter_range).saturating_add(jitter);
+        Duration::from_millis(jittered_ms)
     }
 }
 
@@ -1292,10 +1301,18 @@ mod tests {
             .with_initial_backoff(Duration::from_millis(100));
         let client = BeaconClient::new(config).unwrap();
 
-        assert_eq!(client.calculate_backoff(0), Duration::from_millis(100));
-        assert_eq!(client.calculate_backoff(1), Duration::from_millis(200));
-        assert_eq!(client.calculate_backoff(2), Duration::from_millis(400));
-        assert_eq!(client.calculate_backoff(3), Duration::from_millis(800));
+        // With +/-25% jitter, check ranges instead of exact values
+        let b0 = client.calculate_backoff(0).as_millis() as u64;
+        assert!(b0 >= 75 && b0 <= 125, "attempt 0: {b0}ms not in [75,125]");
+
+        let b1 = client.calculate_backoff(1).as_millis() as u64;
+        assert!(b1 >= 150 && b1 <= 250, "attempt 1: {b1}ms not in [150,250]");
+
+        let b2 = client.calculate_backoff(2).as_millis() as u64;
+        assert!(b2 >= 300 && b2 <= 500, "attempt 2: {b2}ms not in [300,500]");
+
+        let b3 = client.calculate_backoff(3).as_millis() as u64;
+        assert!(b3 >= 600 && b3 <= 1000, "attempt 3: {b3}ms not in [600,1000]");
     }
 
     #[test]
@@ -1317,34 +1334,36 @@ mod tests {
             .with_initial_backoff(Duration::from_millis(100));
         let client = BeaconClient::new(config).unwrap();
 
-        // Max backoff at attempt 20: 100ms * 2^20 = 104,857,600ms (~29 hours)
-        let max_backoff = Duration::from_millis(100 * (1 << 20));
+        // Max base backoff at attempt 20: 100ms * 2^20 = 104,857,600ms (~29 hours)
+        let max_base_ms: u64 = 100 * (1 << 20);
+        let max_low = max_base_ms * 3 / 4; // -25%
+        let max_high = max_base_ms * 5 / 4; // +25%
 
-        // All attempts >= 20 should return the same maximum backoff
-        assert_eq!(client.calculate_backoff(20), max_backoff);
-        assert_eq!(client.calculate_backoff(31), max_backoff);
-        assert_eq!(client.calculate_backoff(32), max_backoff);
-        assert_eq!(client.calculate_backoff(100), max_backoff);
+        // All attempts >= 20 should return backoff within +/-25% of the same max base
+        for attempt in [20u32, 31, 32, 100] {
+            let ms = client.calculate_backoff(attempt).as_millis() as u64;
+            assert!(
+                ms >= max_low && ms <= max_high,
+                "attempt {attempt}: {ms}ms not in [{max_low},{max_high}]"
+            );
+        }
     }
 
     #[test]
-    fn test_calculate_backoff_monotonically_increasing() {
+    fn test_calculate_backoff_within_jitter_range() {
         let config = BeaconClientConfig::new("http://localhost:5052")
             .with_initial_backoff(Duration::from_millis(100));
         let client = BeaconClient::new(config).unwrap();
 
-        // Backoff should be monotonically increasing up to the cap
-        let mut prev_backoff = Duration::ZERO;
-        for attempt in 0..=25 {
-            let backoff = client.calculate_backoff(attempt);
-            assert!(
-                backoff >= prev_backoff,
-                "Backoff should be monotonically increasing: attempt {} gave {:?}, previous was {:?}",
-                attempt,
-                backoff,
-                prev_backoff
-            );
-            prev_backoff = backoff;
+        // Verify each attempt's backoff is within +/-25% of the expected base
+        for _ in 0..100 {
+            let b0 = client.calculate_backoff(0).as_millis() as u64;
+            assert!(b0 >= 75 && b0 <= 125, "attempt 0: {b0}ms not in [75,125]");
+        }
+
+        for _ in 0..100 {
+            let b1 = client.calculate_backoff(1).as_millis() as u64;
+            assert!(b1 >= 150 && b1 <= 250, "attempt 1: {b1}ms not in [150,250]");
         }
     }
 

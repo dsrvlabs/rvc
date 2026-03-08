@@ -47,11 +47,11 @@ pub async fn import_keystores(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ImportKeystoresRequest>,
 ) -> Result<Json<ImportKeystoresResponse>, ApiError> {
-    let _span = tracing::info_span!(
+    let span = tracing::info_span!(
         "rvc.keymanager.import_keystores",
         rvc.keymanager.count = request.keystores.len(),
-    )
-    .entered();
+    );
+    let _guard = span.enter();
 
     if request.keystores.len() != request.passwords.len() {
         return Err(ApiError::BadRequest(
@@ -101,11 +101,11 @@ pub async fn delete_keystores(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DeleteKeystoresRequest>,
 ) -> Result<Json<DeleteKeystoresResponse>, ApiError> {
-    let _span = tracing::info_span!(
+    let span = tracing::info_span!(
         "rvc.keymanager.delete_keystores",
         rvc.keymanager.count = request.pubkeys.len(),
-    )
-    .entered();
+    );
+    let _guard = span.enter();
 
     // Parse all pubkeys and identify which ones exist for slashing export
     let parsed: Vec<Result<Pubkey, String>> =
@@ -183,11 +183,11 @@ pub async fn import_remote_keys(
     State(state): State<Arc<AppState>>,
     Json(request): Json<ImportRemoteKeysRequest>,
 ) -> Json<ImportRemoteKeysResponse> {
-    let _span = tracing::info_span!(
+    let span = tracing::info_span!(
         "rvc.keymanager.import_remote_keys",
         rvc.keymanager.count = request.remote_keys.len(),
-    )
-    .entered();
+    );
+    let _guard = span.enter();
 
     let mut results = Vec::with_capacity(request.remote_keys.len());
 
@@ -241,11 +241,11 @@ pub async fn delete_remote_keys(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DeleteRemoteKeysRequest>,
 ) -> Json<DeleteRemoteKeysResponse> {
-    let _span = tracing::info_span!(
+    let span = tracing::info_span!(
         "rvc.keymanager.delete_remote_keys",
         rvc.keymanager.count = request.pubkeys.len(),
-    )
-    .entered();
+    );
+    let _guard = span.enter();
 
     let mut results = Vec::with_capacity(request.pubkeys.len());
 
@@ -321,6 +321,7 @@ mod tests {
     use http_body_util::BodyExt;
     use std::sync::Mutex;
     use tower::ServiceExt;
+    use zeroize::Zeroizing;
 
     // --- Mock implementations ---
 
@@ -618,7 +619,7 @@ mod tests {
         }
 
         fn authed_router(&self, token: &str) -> Router {
-            auth::with_auth(self.router(), Arc::new(token.to_string()))
+            auth::with_auth(self.router(), Arc::new(Zeroizing::new(token.to_string())))
         }
     }
 

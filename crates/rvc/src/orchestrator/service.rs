@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tracing::{debug, error, info, info_span, warn};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use beacon::{
     AttesterDuty, BeaconCommitteeSubscription, LegacyAttestation, ProposerPreparation,
@@ -63,9 +63,17 @@ const SYNC_COMMITTEE_SUBNET_COUNT: u64 = 4;
 
 /// Constructs a hex-encoded SSZ bitlist where only the validator's position
 /// in the committee is set (pre-Electra aggregation_bits format).
-fn make_aggregation_bits(duty: &AttesterDuty) -> String {
+fn make_aggregation_bits(duty: &AttesterDuty) -> Option<String> {
     let committee_length: usize = duty.committee_length.parse().unwrap_or(0);
     let validator_committee_index: usize = duty.validator_committee_index.parse().unwrap_or(0);
+
+    if committee_length == 0 {
+        warn!(
+            validator_index = %duty.validator_index,
+            "committee_length is 0, cannot produce aggregation bits"
+        );
+        return None;
+    }
 
     // SSZ bitlist: ceil((committee_length + 1) / 8) bytes
     // The "+1" is for the length bit at position committee_length
@@ -80,7 +88,7 @@ fn make_aggregation_bits(duty: &AttesterDuty) -> String {
     // Set the length bit (sentinel) at position committee_length
     bits[committee_length / 8] |= 1 << (committee_length % 8);
 
-    format!("0x{}", hex::encode(bits))
+    Some(format!("0x{}", hex::encode(bits)))
 }
 
 /// Configuration for the duty orchestrator.
@@ -266,9 +274,8 @@ where
 
             let current_epoch = current_slot / SLOTS_PER_EPOCH;
 
-            let _slot_span =
-                info_span!("rvc.slot.process", rvc.slot = current_slot, rvc.epoch = current_epoch,)
-                    .entered();
+            let slot_span =
+                info_span!("rvc.slot.process", rvc.slot = current_slot, rvc.epoch = current_epoch,);
 
             // Check if keys changed (dynamic key import/delete via keymanager API)
             if self.key_gen_rx.has_changed().unwrap_or(false) {
@@ -277,23 +284,27 @@ where
             }
 
             // === Epoch boundary: fetch all duty types ===
-            self.fetch_epoch_duties(current_epoch).await;
-            self.fetch_epoch_duties(current_epoch + 1).await;
+            self.fetch_epoch_duties(current_epoch).instrument(slot_span.clone()).await;
+            self.fetch_epoch_duties(current_epoch + 1).instrument(slot_span.clone()).await;
 
             // Proposer preparation and committee subscriptions (non-fatal)
             if current_slot % SLOTS_PER_EPOCH == 0 {
-                let _epoch_span =
-                    info_span!("rvc.epoch.boundary", rvc.epoch = current_epoch).entered();
-                self.check_reorg_at_epoch_boundary(current_epoch).await;
-                self.prepare_proposers().await;
-                self.submit_committee_subscriptions(current_epoch).await;
-                self.submit_committee_subscriptions(current_epoch + 1).await;
+                let epoch_span =
+                    info_span!(parent: &slot_span, "rvc.epoch.boundary", rvc.epoch = current_epoch);
+                async {
+                    self.check_reorg_at_epoch_boundary(current_epoch).await;
+                    self.prepare_proposers().await;
+                    self.submit_committee_subscriptions(current_epoch).await;
+                    self.submit_committee_subscriptions(current_epoch + 1).await;
+                }
+                .instrument(epoch_span)
+                .await;
             }
 
             // === Phase 1: t=0 — Block proposal ===
             {
-                let _phase = info_span!("rvc.slot.phase.block").entered();
-                self.maybe_propose_block(current_slot, current_epoch).await;
+                let phase_span = info_span!(parent: &slot_span, "rvc.slot.phase.block");
+                self.maybe_propose_block(current_slot, current_epoch).instrument(phase_span).await;
             }
 
             if self.check_shutdown() {
@@ -302,18 +313,20 @@ where
 
             // === Phase 2: t=slot/3 — Attestations + sync committee messages ===
             {
-                let _phase = info_span!("rvc.slot.phase.attestation").entered();
+                let att_phase_span = info_span!(parent: &slot_span, "rvc.slot.phase.attestation");
 
                 let time_until_attestation = self.clock.time_until_attestation(current_slot)?;
                 if !time_until_attestation.is_zero() {
+                    let _guard = att_phase_span.enter();
                     debug!(
                         slot = current_slot,
                         wait_ms = time_until_attestation.as_millis(),
                         "Waiting for attestation time"
                     );
+                    drop(_guard);
 
                     tokio::select! {
-                        _ = tokio::time::sleep(time_until_attestation) => {}
+                        _ = tokio::time::sleep(time_until_attestation).instrument(att_phase_span.clone()) => {}
                         _ = self.shutdown_rx.changed() => {
                             if self.check_shutdown() {
                                 return Ok(());
@@ -326,7 +339,10 @@ where
                     return Ok(());
                 }
 
-                if let Err(e) = self.process_slot(current_slot).await {
+                if let Err(e) =
+                    self.process_slot(current_slot).instrument(att_phase_span.clone()).await
+                {
+                    let _guard = att_phase_span.enter();
                     match &e {
                         OrchestratorError::SlotMissed { slot, current_slot } => {
                             warn!(slot = slot, current_slot = current_slot, "Missed slot");
@@ -343,7 +359,9 @@ where
                     }
                 }
 
-                self.maybe_produce_sync_messages(current_slot, current_epoch).await;
+                self.maybe_produce_sync_messages(current_slot, current_epoch)
+                    .instrument(att_phase_span)
+                    .await;
             }
 
             if self.check_shutdown() {
@@ -352,7 +370,7 @@ where
 
             // === Phase 3: t=2*slot/3 — Aggregation + sync committee contributions ===
             {
-                let _phase = info_span!("rvc.slot.phase.aggregation").entered();
+                let agg_phase_span = info_span!(parent: &slot_span, "rvc.slot.phase.aggregation");
 
                 let slot_duration = self.clock.slot_duration();
                 let two_thirds_offset = slot_duration.as_secs() * 2 / 3;
@@ -361,14 +379,17 @@ where
 
                 if now < two_thirds_time {
                     let wait_duration = Duration::from_secs(two_thirds_time - now);
-                    debug!(
-                        slot = current_slot,
-                        wait_ms = wait_duration.as_millis(),
-                        "Waiting for 2/3 slot time"
-                    );
+                    {
+                        let _guard = agg_phase_span.enter();
+                        debug!(
+                            slot = current_slot,
+                            wait_ms = wait_duration.as_millis(),
+                            "Waiting for 2/3 slot time"
+                        );
+                    }
 
                     tokio::select! {
-                        _ = tokio::time::sleep(wait_duration) => {}
+                        _ = tokio::time::sleep(wait_duration).instrument(agg_phase_span.clone()) => {}
                         _ = self.shutdown_rx.changed() => {
                             if self.check_shutdown() {
                                 return Ok(());
@@ -381,8 +402,12 @@ where
                     return Ok(());
                 }
 
-                self.maybe_produce_sync_contributions(current_slot, current_epoch).await;
-                self.maybe_produce_aggregations(current_slot, current_epoch).await;
+                self.maybe_produce_sync_contributions(current_slot, current_epoch)
+                    .instrument(agg_phase_span.clone())
+                    .await;
+                self.maybe_produce_aggregations(current_slot, current_epoch)
+                    .instrument(agg_phase_span)
+                    .await;
             }
 
             // === Post-duty: builder registration (epoch boundary only) ===
@@ -1034,14 +1059,13 @@ where
         };
 
         for duty in &duties {
-            let _agg_span = info_span!(
+            let agg_span = info_span!(
                 "rvc.aggregation.produce",
                 rvc.slot = slot,
                 rvc.validator_index = %duty.validator_index,
                 rvc.pubkey = %truncate_pubkey(&duty.pubkey),
                 rvc.aggregation.fork = fork_label,
-            )
-            .entered();
+            );
 
             let committee_length: u64 = match duty.committee_length.parse() {
                 Ok(c) => c,
@@ -1061,6 +1085,7 @@ where
                     &self.config.fork_schedule,
                     &self.config.genesis_validators_root,
                 )
+                .instrument(agg_span.clone())
                 .await
             {
                 Ok(sig) => sig,
@@ -1101,6 +1126,7 @@ where
                 self.config.timeouts.aggregate_fetch,
                 self.beacon.get_attestation_data(slot, committee_index),
             )
+            .instrument(agg_span.clone())
             .await
             {
                 Ok(Ok(resp)) => resp,
@@ -1156,6 +1182,7 @@ where
                     electra_committee_index,
                 ),
             )
+            .instrument(agg_span.clone())
             .await
             {
                 Ok(Ok(resp)) => resp,
@@ -1217,6 +1244,7 @@ where
                         &self.config.fork_schedule,
                         &self.config.genesis_validators_root,
                     )
+                    .instrument(agg_span.clone())
                     .await
                 {
                     Ok(sig) => sig,
@@ -1265,6 +1293,7 @@ where
                         &self.config.fork_schedule,
                         &self.config.genesis_validators_root,
                     )
+                    .instrument(agg_span.clone())
                     .await
                 {
                     Ok(sig) => sig,
@@ -1292,19 +1321,19 @@ where
             let count = pre_electra_aggregates.len();
             let source_validators_str = source_validators.join(",");
 
-            let _submit_span = info_span!(
+            let submit_span = info_span!(
                 "rvc.aggregation.submit",
                 rvc.slot = slot,
                 rvc.aggregation.count = count,
                 rvc.aggregation.source_validators = %source_validators_str,
-            )
-            .entered();
+            );
 
             let versioned = VersionedSignedAggregateAndProof::PreElectra(pre_electra_aggregates);
             match tokio::time::timeout(
                 self.config.timeouts.aggregate_submit,
                 self.beacon.submit_aggregate_and_proofs(&versioned),
             )
+            .instrument(submit_span)
             .await
             {
                 Ok(Ok(_)) => {
@@ -1336,13 +1365,12 @@ where
             let count = electra_aggregates.len();
             let source_validators_str = source_validators.join(",");
 
-            let _submit_span = info_span!(
+            let submit_span = info_span!(
                 "rvc.aggregation.submit",
                 rvc.slot = slot,
                 rvc.aggregation.count = count,
                 rvc.aggregation.source_validators = %source_validators_str,
-            )
-            .entered();
+            );
 
             let versioned = if fork_name >= ForkName::Fulu {
                 VersionedSignedAggregateAndProof::Fulu(electra_aggregates)
@@ -1353,6 +1381,7 @@ where
                 self.config.timeouts.aggregate_submit,
                 self.beacon.submit_aggregate_and_proofs(&versioned),
             )
+            .instrument(submit_span)
             .await
             {
                 Ok(Ok(_)) => {
@@ -1580,20 +1609,22 @@ where
             }
         };
 
-        let _att_span = info_span!(
+        let att_span = info_span!(
             "rvc.attestation.produce",
             rvc.slot = slot,
             rvc.validator_index = %validator_index,
             rvc.pubkey = %truncate_pubkey(&duty.pubkey),
-        )
-        .entered();
-
-        debug!(
-            validator = %validator_index,
-            slot = slot,
-            committee_index = committee_index,
-            "Processing attestation duty"
         );
+
+        {
+            let _guard = att_span.enter();
+            debug!(
+                validator = %validator_index,
+                slot = slot,
+                committee_index = committee_index,
+                "Processing attestation duty"
+            );
+        }
 
         let pubkey = match self.find_pubkey(&duty.pubkey) {
             Some(pk) => pk,
@@ -1608,14 +1639,12 @@ where
         };
 
         // Apply timeout to beacon client call to prevent blocking
-        let attestation_data_result = {
-            let _fetch_span = info_span!("rvc.beacon.get_attestation_data").entered();
-            tokio::time::timeout(
-                self.config.timeouts.attestation_fetch,
-                self.beacon.get_attestation_data(slot, committee_index),
-            )
-            .await
-        };
+        let attestation_data_result = tokio::time::timeout(
+            self.config.timeouts.attestation_fetch,
+            self.beacon.get_attestation_data(slot, committee_index),
+        )
+        .instrument(info_span!(parent: &att_span, "rvc.beacon.get_attestation_data"))
+        .await;
 
         let attestation_data_response = match attestation_data_result {
             Ok(Ok(response)) => response,
@@ -1675,7 +1704,6 @@ where
             "Converted attestation data"
         );
 
-        let fork = self.derive_fork_for_epoch(target_epoch);
         let fork_name = ForkName::from_epoch(target_epoch, &self.config.fork_schedule);
         let is_electra = fork_name >= ForkName::Electra;
 
@@ -1683,9 +1711,6 @@ where
             validator = %validator_index,
             fork_name = ?fork_name,
             is_electra = is_electra,
-            previous_version = %format!("0x{}", hex::encode(fork.previous_version)),
-            current_version = %format!("0x{}", hex::encode(fork.current_version)),
-            fork_epoch = fork.epoch,
             target_epoch = target_epoch,
             "Fork derived for attestation"
         );
@@ -1708,9 +1733,10 @@ where
             .sign_attestation(
                 &crypto_attestation_data,
                 &pubkey,
-                &fork,
-                self.config.genesis_validators_root,
+                &self.config.fork_schedule,
+                &self.config.genesis_validators_root,
             )
+            .instrument(att_span.clone())
             .await
         {
             Ok(sig) => {
@@ -1767,8 +1793,26 @@ where
                 signature: sig_hex,
             }])
         } else {
+            let aggregation_bits = match make_aggregation_bits(&duty) {
+                Some(bits) => bits,
+                None => {
+                    warn!(
+                        validator = %validator_index,
+                        slot,
+                        "Skipping attestation: could not produce aggregation bits"
+                    );
+                    return AttestationResult {
+                        validator_index,
+                        slot,
+                        success: false,
+                        error: Some(
+                            "committee_length is 0, cannot produce aggregation bits".to_string(),
+                        ),
+                    };
+                }
+            };
             VersionedAttestation::PreElectra(vec![LegacyAttestation {
-                aggregation_bits: make_aggregation_bits(&duty),
+                aggregation_bits,
                 data: beacon_attestation_data,
                 signature: sig_hex,
             }])
@@ -1785,14 +1829,12 @@ where
             "Propagating attestation"
         );
 
-        let submit_result = {
-            let _submit_span = info_span!("rvc.beacon.submit_attestation").entered();
-            tokio::time::timeout(
-                self.config.timeouts.attestation_submit,
-                self.propagator.propagate(&versioned),
-            )
-            .await
-        };
+        let submit_result = tokio::time::timeout(
+            self.config.timeouts.attestation_submit,
+            self.propagator.propagate(&versioned),
+        )
+        .instrument(info_span!(parent: &att_span, "rvc.beacon.submit_attestation"))
+        .await;
 
         match submit_result {
             Ok(Ok(_)) => AttestationResult { validator_index, slot, success: true, error: None },
@@ -1817,17 +1859,6 @@ where
                     )),
                 }
             }
-        }
-    }
-
-    fn derive_fork_for_epoch(&self, epoch: u64) -> eth_types::Fork {
-        let schedule = &self.config.fork_schedule;
-        let current = ForkName::from_epoch(epoch, schedule);
-        let previous = current.previous_fork(schedule);
-        eth_types::Fork {
-            previous_version: previous.fork_version(schedule),
-            current_version: current.fork_version(schedule),
-            epoch: current.activation_epoch(schedule),
         }
     }
 
@@ -3674,7 +3705,7 @@ mod tests {
             validator_committee_index: "0".to_string(),
             slot: "100".to_string(),
         };
-        let bits = make_aggregation_bits(&duty);
+        let bits = make_aggregation_bits(&duty).unwrap();
         // committee_length=4, validator_committee_index=0
         // Byte 0: bit 0 set (validator) = 0x01
         // Length bit at position 4 → byte 0, bit 4 = 0x10
@@ -3693,7 +3724,7 @@ mod tests {
             validator_committee_index: "3".to_string(),
             slot: "100".to_string(),
         };
-        let bits = make_aggregation_bits(&duty);
+        let bits = make_aggregation_bits(&duty).unwrap();
         // committee_length=8, validator_committee_index=3
         // Byte 0: bit 3 set = 0x08
         // Length bit at position 8 → byte 1, bit 0 = 0x01
@@ -3712,11 +3743,25 @@ mod tests {
             validator_committee_index: "3".to_string(),
             slot: "100".to_string(),
         };
-        let bits = make_aggregation_bits(&duty);
+        let bits = make_aggregation_bits(&duty).unwrap();
         // committee_length=4, validator_committee_index=3
         // Byte 0: bit 3 set = 0x08, length bit at position 4 = 0x10
         // Combined: 0x18
         assert_eq!(bits, "0x18");
+    }
+
+    #[test]
+    fn test_make_aggregation_bits_zero_committee_length() {
+        let duty = AttesterDuty {
+            pubkey: "0xaabb".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: "0".to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: "0".to_string(),
+            slot: "100".to_string(),
+        };
+        assert!(make_aggregation_bits(&duty).is_none());
     }
 
     #[test]
@@ -5088,7 +5133,7 @@ mod tests {
     #[tokio::test]
     async fn test_signer_span_created_on_sign_attestation() {
         use crypto::SecretKey;
-        use eth_types::{AttestationData, Checkpoint, Fork};
+        use eth_types::{AttestationData, Checkpoint};
 
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
@@ -5106,15 +5151,17 @@ mod tests {
             source: Checkpoint { epoch: 100, root: [0x22; 32] },
             target: Checkpoint { epoch: 101, root: [0x33; 32] },
         };
-        let fork =
-            Fork { previous_version: [0, 0, 0, 1], current_version: [0, 0, 0, 2], epoch: 50 };
+        let fork_schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
 
         let captured = Arc::new(Mutex::new(Vec::new()));
         let layer = SpanCapture { names: captured.clone() };
         let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let result = signer.sign_attestation(&attestation_data, &pubkey, &fork, [0xaa; 32]).await;
+        let result = signer
+            .sign_attestation(&attestation_data, &pubkey, &fork_schedule, &genesis_root)
+            .await;
         assert!(result.is_ok());
 
         let span_names = captured.lock().unwrap();

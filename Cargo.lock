@@ -597,6 +597,7 @@ name = "beacon"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "rand 0.8.5",
  "reqwest 0.12.28",
  "rvc-eth-types",
  "rvc-telemetry",
