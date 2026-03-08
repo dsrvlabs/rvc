@@ -17,6 +17,7 @@ const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64 = 256;
 pub struct DutyCacheKey {
     pub slot: u64,
     pub committee_index: u64,
+    pub validator_index: u64,
 }
 
 #[derive(Debug)]
@@ -125,8 +126,15 @@ impl DutyTracker {
                     continue;
                 }
             };
+            let validator_index: u64 = match duty.validator_index.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    warn!(raw_validator_index = %duty.validator_index, "Skipping duty with unparseable validator_index");
+                    continue;
+                }
+            };
 
-            let key = DutyCacheKey { slot, committee_index };
+            let key = DutyCacheKey { slot, committee_index, validator_index };
             epoch_cache.insert(key, duty.clone());
         }
 
@@ -146,11 +154,12 @@ impl DutyTracker {
         &self,
         slot: u64,
         committee_index: u64,
+        validator_index: u64,
     ) -> Result<AttesterDuty, DutyTrackerError> {
         let epoch = slot / SLOTS_PER_EPOCH;
         let cache = self.cache.read().await;
 
-        let key = DutyCacheKey { slot, committee_index };
+        let key = DutyCacheKey { slot, committee_index, validator_index };
 
         if let Some(epoch_cache) = cache.get(&epoch) {
             if let Some(duty) = epoch_cache.get(&key) {
@@ -158,7 +167,7 @@ impl DutyTracker {
             }
         }
 
-        Err(DutyTrackerError::DutyNotFound { slot, committee_index })
+        Err(DutyTrackerError::DutyNotFound { slot, committee_index, validator_index })
     }
 
     #[tracing::instrument(name = "rvc.duty_tracker.check_attester_reorg", skip_all, fields(rvc.epoch = epoch))]
@@ -208,7 +217,14 @@ impl DutyTracker {
                         continue;
                     }
                 };
-                let key = DutyCacheKey { slot, committee_index };
+                let validator_index: u64 = match duty.validator_index.parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        warn!(raw_validator_index = %duty.validator_index, "Skipping duty with unparseable validator_index");
+                        continue;
+                    }
+                };
+                let key = DutyCacheKey { slot, committee_index, validator_index };
                 epoch_cache.insert(key, duty.clone());
             }
 
@@ -535,7 +551,7 @@ mod tests {
         let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_duties_for_epoch(10).await.unwrap();
 
-        let duty = tracker.get_duty(320, 1).await.unwrap();
+        let duty = tracker.get_duty(320, 1, 1234).await.unwrap();
         assert_eq!(duty.slot, "320");
         assert_eq!(duty.committee_index, "1");
         assert_eq!(duty.validator_index, "1234");
@@ -558,7 +574,7 @@ mod tests {
         let tracker = DutyTracker::new(beacon, validator_indices);
         tracker.fetch_duties_for_epoch(10).await.unwrap();
 
-        let result = tracker.get_duty(320, 99).await;
+        let result = tracker.get_duty(320, 99, 1234).await;
         assert!(matches!(result, Err(DutyTrackerError::DutyNotFound { .. })));
     }
 
@@ -569,7 +585,7 @@ mod tests {
 
         let tracker = DutyTracker::new(beacon, validator_indices);
 
-        let result = tracker.get_duty(320, 1).await;
+        let result = tracker.get_duty(320, 1, 1234).await;
         assert!(matches!(result, Err(DutyTrackerError::DutyNotFound { .. })));
     }
 
@@ -698,10 +714,10 @@ mod tests {
 
         assert_eq!(duties.len(), 2);
 
-        let duty1 = tracker.get_duty(320, 1).await.unwrap();
+        let duty1 = tracker.get_duty(320, 1, 1234).await.unwrap();
         assert_eq!(duty1.validator_index, "1234");
 
-        let duty2 = tracker.get_duty(321, 2).await.unwrap();
+        let duty2 = tracker.get_duty(321, 2, 5678).await.unwrap();
         assert_eq!(duty2.validator_index, "5678");
     }
 
@@ -753,19 +769,19 @@ mod tests {
         assert!(tracker.is_epoch_cached(10).await);
         assert!(tracker.is_epoch_cached(11).await);
 
-        let duty10 = tracker.get_duty(320, 1).await.unwrap();
+        let duty10 = tracker.get_duty(320, 1, 1234).await.unwrap();
         assert_eq!(duty10.slot, "320");
 
-        let duty11 = tracker.get_duty(352, 2).await.unwrap();
+        let duty11 = tracker.get_duty(352, 2, 1234).await.unwrap();
         assert_eq!(duty11.slot, "352");
     }
 
     #[tokio::test]
     async fn test_duty_cache_key_hash_eq() {
-        let key1 = DutyCacheKey { slot: 100, committee_index: 1 };
-        let key2 = DutyCacheKey { slot: 100, committee_index: 1 };
-        let key3 = DutyCacheKey { slot: 100, committee_index: 2 };
-        let key4 = DutyCacheKey { slot: 101, committee_index: 1 };
+        let key1 = DutyCacheKey { slot: 100, committee_index: 1, validator_index: 42 };
+        let key2 = DutyCacheKey { slot: 100, committee_index: 1, validator_index: 42 };
+        let key3 = DutyCacheKey { slot: 100, committee_index: 2, validator_index: 42 };
+        let key4 = DutyCacheKey { slot: 101, committee_index: 1, validator_index: 42 };
 
         assert_eq!(key1, key2);
         assert_ne!(key1, key3);
@@ -1282,11 +1298,64 @@ mod tests {
         assert_eq!(duties.len(), 2);
 
         // But only the valid one is cached
-        let duty = tracker.get_duty(320, 1).await;
+        let duty = tracker.get_duty(320, 1, 1234).await;
         assert!(duty.is_ok());
 
         // The invalid slot should not be cached at slot 0 as before
         let duties_at_zero = tracker.get_duties_for_slot(0).await;
         assert!(duties_at_zero.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_same_slot_committee_different_validators_both_stored() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["100".to_string(), "200".to_string()];
+
+        // Two validators in the same (slot=320, committee_index=1)
+        let response =
+            create_mock_duty_response(10, vec![(320, 1, "100"), (320, 1, "200")], "0xdeproot");
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        tracker.fetch_duties_for_epoch(10).await.unwrap();
+
+        let duties = tracker.get_duties_for_slot(320).await;
+        assert_eq!(duties.len(), 2, "Both validators should be stored, got {}", duties.len());
+    }
+
+    #[tokio::test]
+    async fn test_get_duty_with_validator_index() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["100".to_string(), "200".to_string()];
+
+        let response =
+            create_mock_duty_response(10, vec![(320, 1, "100"), (320, 1, "200")], "0xdeproot");
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        tracker.fetch_duties_for_epoch(10).await.unwrap();
+
+        // Found with correct validator_index
+        let duty = tracker.get_duty(320, 1, 100).await.unwrap();
+        assert_eq!(duty.validator_index, "100");
+
+        let duty = tracker.get_duty(320, 1, 200).await.unwrap();
+        assert_eq!(duty.validator_index, "200");
+
+        // Not found with wrong validator_index
+        let result = tracker.get_duty(320, 1, 999).await;
+        assert!(matches!(result, Err(DutyTrackerError::DutyNotFound { .. })));
     }
 }
