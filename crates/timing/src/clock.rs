@@ -11,6 +11,7 @@ pub trait SlotClock: Send + Sync {
     fn genesis_time(&self) -> u64;
     fn slot_duration(&self) -> Duration;
     fn current_slot(&self) -> Result<Slot, TimingError>;
+    fn current_time_secs(&self) -> u64;
     fn slot_start_time(&self, slot: Slot) -> u64;
     fn slot_end_time(&self, slot: Slot) -> u64;
     fn attestation_time(&self, slot: Slot) -> u64;
@@ -27,11 +28,18 @@ pub struct SystemSlotClock {
 }
 
 impl SystemSlotClock {
-    pub fn new(genesis_time: u64, slot_duration: Duration, slots_per_epoch: u64) -> Self {
-        Self { genesis_time, slot_duration, slots_per_epoch }
+    pub fn new(
+        genesis_time: u64,
+        slot_duration: Duration,
+        slots_per_epoch: u64,
+    ) -> Result<Self, TimingError> {
+        if slot_duration.as_secs() < 1 {
+            return Err(TimingError::InvalidSlotDuration);
+        }
+        Ok(Self { genesis_time, slot_duration, slots_per_epoch })
     }
 
-    pub fn new_mainnet(genesis_time: u64) -> Self {
+    pub fn new_mainnet(genesis_time: u64) -> Result<Self, TimingError> {
         Self::new(genesis_time, Duration::from_secs(SECONDS_PER_SLOT), SLOTS_PER_EPOCH)
     }
 
@@ -93,6 +101,10 @@ impl SlotClock for SystemSlotClock {
         }
 
         Ok(Duration::from_secs(attestation_time - current_time))
+    }
+
+    fn current_time_secs(&self) -> u64 {
+        self.current_unix_time()
     }
 
     fn slot_to_epoch(&self, slot: Slot) -> u64 {
@@ -192,6 +204,10 @@ impl SlotClock for MockSlotClock {
         }
 
         Ok(Duration::from_secs(attestation_time - current_time))
+    }
+
+    fn current_time_secs(&self) -> u64 {
+        self.get_current_time()
     }
 
     fn slot_to_epoch(&self, slot: Slot) -> u64 {
@@ -354,9 +370,34 @@ mod tests {
 
     #[test]
     fn test_system_slot_clock_new_mainnet() {
-        let clock = SystemSlotClock::new_mainnet(TEST_GENESIS_TIME);
+        let clock = SystemSlotClock::new_mainnet(TEST_GENESIS_TIME).unwrap();
         assert_eq!(clock.genesis_time(), TEST_GENESIS_TIME);
         assert_eq!(clock.slot_duration(), Duration::from_secs(12));
         assert_eq!(clock.slots_per_epoch, 32);
+    }
+
+    #[test]
+    fn test_system_slot_clock_zero_duration_returns_error() {
+        let result = SystemSlotClock::new(TEST_GENESIS_TIME, Duration::ZERO, 32);
+        assert!(matches!(result, Err(TimingError::InvalidSlotDuration)));
+    }
+
+    #[test]
+    fn test_system_slot_clock_valid_duration_succeeds() {
+        let result = SystemSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_current_time_secs_returns_mock_time() {
+        let clock = create_mock_clock();
+        clock.set_current_time(TEST_GENESIS_TIME + 42);
+        assert_eq!(clock.current_time_secs(), TEST_GENESIS_TIME + 42);
+    }
+
+    #[test]
+    fn test_system_slot_clock_sub_second_duration_returns_error() {
+        let result = SystemSlotClock::new(TEST_GENESIS_TIME, Duration::from_millis(500), 32);
+        assert!(matches!(result, Err(TimingError::InvalidSlotDuration)));
     }
 }

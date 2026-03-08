@@ -166,57 +166,51 @@ impl DutyTracker {
         &self,
         epoch: u64,
     ) -> Result<bool, DutyTrackerError> {
-        let cached_root = {
-            let cache = self.cache.read().await;
-            cache.get(&epoch).map(|c| c.dependent_root.clone())
-        };
-
-        if cached_root.is_none() {
-            self.fetch_duties_for_epoch(epoch).await?;
-            return Ok(true);
-        }
-
+        // Fetch from BN first (no lock held) to avoid TOCTOU race
         let response = self
             .beacon
             .get_attester_duties(epoch, &self.validator_indices)
             .await
             .map_err(DutyTrackerError::BeaconError)?;
 
-        if cached_root.as_ref() != Some(&response.dependent_root) {
-            info!(
-                epoch = epoch,
-                old_root = ?cached_root,
-                new_root = %response.dependent_root,
-                "Dependent root changed, refetching duties"
-            );
+        // Acquire write lock and compare-and-swap atomically
+        let mut cache = self.cache.write().await;
+        let cached_root = cache.get(&epoch).map(|c| c.dependent_root.clone());
 
-            let mut cache = self.cache.write().await;
-            let mut epoch_cache = EpochDutyCache::new(response.dependent_root.clone());
-
-            for duty in &response.data {
-                let slot: u64 = match duty.slot.parse() {
-                    Ok(s) => s,
-                    Err(_) => {
-                        warn!(raw_slot = %duty.slot, "Skipping duty with unparseable slot");
-                        continue;
-                    }
-                };
-                let committee_index: u64 = match duty.committee_index.parse() {
-                    Ok(c) => c,
-                    Err(_) => {
-                        warn!(raw_committee_index = %duty.committee_index, "Skipping duty with unparseable committee_index");
-                        continue;
-                    }
-                };
-                let key = DutyCacheKey { slot, committee_index };
-                epoch_cache.insert(key, duty.clone());
-            }
-
-            cache.insert(epoch, epoch_cache);
-            return Ok(true);
+        if cached_root.as_ref() == Some(&response.dependent_root) {
+            return Ok(false);
         }
 
-        Ok(false)
+        info!(
+            epoch = epoch,
+            old_root = ?cached_root,
+            new_root = %response.dependent_root,
+            "Dependent root changed, refetching duties"
+        );
+
+        let mut epoch_cache = EpochDutyCache::new(response.dependent_root.clone());
+
+        for duty in &response.data {
+            let slot: u64 = match duty.slot.parse() {
+                Ok(s) => s,
+                Err(_) => {
+                    warn!(raw_slot = %duty.slot, "Skipping duty with unparseable slot");
+                    continue;
+                }
+            };
+            let committee_index: u64 = match duty.committee_index.parse() {
+                Ok(c) => c,
+                Err(_) => {
+                    warn!(raw_committee_index = %duty.committee_index, "Skipping duty with unparseable committee_index");
+                    continue;
+                }
+            };
+            let key = DutyCacheKey { slot, committee_index };
+            epoch_cache.insert(key, duty.clone());
+        }
+
+        cache.insert(epoch, epoch_cache);
+        Ok(true)
     }
 
     #[tracing::instrument(name = "rvc.duty_tracker.evict_old_caches", skip_all, fields(rvc.epoch = current_epoch))]
@@ -271,6 +265,12 @@ impl DutyTracker {
         let mut cache = self.cache.write().await;
         cache.remove(&epoch);
         debug!(epoch = epoch, "Cleared cache for epoch");
+    }
+
+    pub async fn clear_cache(&self) {
+        self.cache.write().await.clear();
+        self.proposer_cache.write().await.clear();
+        debug!("Cleared all duty caches");
     }
 
     pub async fn is_epoch_cached(&self, epoch: u64) -> bool {
@@ -1288,5 +1288,67 @@ mod tests {
         // The invalid slot should not be cached at slot 0 as before
         let duties_at_zero = tracker.get_duties_for_slot(0).await;
         assert!(duties_at_zero.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_check_and_refetch_atomic_compare_and_swap() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["100".to_string()];
+
+        // First fetch: initial root
+        let initial_response = create_mock_duty_response(0, vec![(0, 0, "100")], "0xroot_a");
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&initial_response))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        let changed = tracker.check_and_refetch_if_root_changed(0).await.unwrap();
+        assert!(changed, "first fetch should report changed");
+
+        // Second check: same root — no change
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&initial_response))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        let changed = tracker.check_and_refetch_if_root_changed(0).await.unwrap();
+        assert!(!changed, "same root should not report changed");
+
+        // Third check: different root — changed
+        let changed_response = create_mock_duty_response(0, vec![(0, 0, "100")], "0xroot_b");
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&changed_response))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        let changed = tracker.check_and_refetch_if_root_changed(0).await.unwrap();
+        assert!(changed, "different root should report changed");
+    }
+
+    #[tokio::test]
+    async fn test_clear_cache_empties_all_caches() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["100".to_string()];
+
+        let response = create_mock_duty_response(0, vec![(0, 0, "100")], "0xroot_a");
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        tracker.fetch_duties_for_epoch(0).await.unwrap();
+        assert!(tracker.is_epoch_cached(0).await);
+
+        tracker.clear_cache().await;
+        assert!(!tracker.is_epoch_cached(0).await);
     }
 }
