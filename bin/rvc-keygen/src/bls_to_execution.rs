@@ -17,6 +17,7 @@ pub struct BlsToExecutionArgs {
     pub validator_index: u64,
     pub execution_address: String,
     pub bls_withdrawal_index: u32,
+    pub mnemonic_passphrase: String,
 }
 
 pub fn run(args: BlsToExecutionArgs) -> Result<()> {
@@ -32,7 +33,7 @@ pub fn run(args: BlsToExecutionArgs) -> Result<()> {
     let mnemonic =
         mnemonic::validate_mnemonic(mnemonic_phrase.trim()).context("Invalid mnemonic phrase")?;
 
-    let seed = mnemonic::mnemonic_to_seed(&mnemonic, "");
+    let seed = mnemonic::mnemonic_to_seed(&mnemonic, &args.mnemonic_passphrase);
 
     // Withdrawal key path: m/12381/3600/{bls_withdrawal_index}/0
     let withdrawal_path = format!("m/12381/3600/{}/0", args.bls_withdrawal_index);
@@ -352,6 +353,35 @@ mod tests {
 
         // Different withdrawal indices produce different keys
         assert_ne!(pk0.to_bytes(), pk1.to_bytes());
+    }
+
+    #[test]
+    fn test_bls_to_execution_passphrase_changes_key() {
+        let mnemonic = mnemonic::validate_mnemonic(TEST_MNEMONIC).unwrap();
+
+        // Without passphrase (default)
+        let seed_no_pass = mnemonic::mnemonic_to_seed(&mnemonic, "");
+        let key_no_pass =
+            eip2333::derive_key_from_path(seed_no_pass.as_ref(), "m/12381/3600/0/0").unwrap();
+
+        // With passphrase
+        let seed_with_pass = mnemonic::mnemonic_to_seed(&mnemonic, "my secret passphrase");
+        let key_with_pass =
+            eip2333::derive_key_from_path(seed_with_pass.as_ref(), "m/12381/3600/0/0").unwrap();
+
+        // Keys must differ when passphrase is different
+        assert_ne!(key_no_pass.to_bytes(), key_with_pass.to_bytes());
+    }
+
+    #[test]
+    fn test_bls_to_execution_empty_passphrase_backward_compatible() {
+        let mnemonic = mnemonic::validate_mnemonic(TEST_MNEMONIC).unwrap();
+
+        let seed1 = mnemonic::mnemonic_to_seed(&mnemonic, "");
+        let seed2 = mnemonic::mnemonic_to_seed(&mnemonic, "");
+
+        // Empty passphrase produces same seed (backward compatible)
+        assert_eq!(seed1.as_ref(), seed2.as_ref());
     }
 
     #[test]

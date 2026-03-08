@@ -8,4 +8,7 @@ pub enum BlockServiceError {
 
     #[error("parse error: {0}")]
     Parse(String),
+
+    #[error("slot mismatch: requested {requested}, got {got}")]
+    SlotMismatch { requested: u64, got: u64 },
 }

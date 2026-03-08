@@ -34,8 +34,6 @@ fn redact_url(url: &str) -> String {
 
 use crate::health::{new_shared_health_trackers, SharedHealthTrackers};
 use crate::sse::{self, SseConfig, SseEvent};
-#[cfg(test)]
-use crate::sync_status::BnSyncStatus;
 use crate::sync_status::{
     check_all_sync_statuses, new_shared_sync_statuses, start_sync_monitor, SharedSyncStatuses,
 };
@@ -137,18 +135,25 @@ impl BnManager {
     /// Returns current health scores for all BNs.
     #[tracing::instrument(name = "rvc.bn_manager.health_scores", skip_all)]
     pub async fn health_scores(&self) -> Vec<BnHealthScore> {
-        let guard = self.health_trackers.read().await;
-        guard
+        use crate::sync_status::BnSyncStatus;
+
+        let health_guard = self.health_trackers.read().await;
+        let sync_guard = self.sync_statuses.read().await;
+        health_guard
             .iter()
-            .map(|t| BnHealthScore {
-                endpoint: t.endpoint().to_string(),
-                is_reachable: true,
-                is_synced: true,
-                head_slot: None,
-                latency: t.latency_ema_ms().map(|ms| Duration::from_secs_f64(ms / 1000.0)),
-                latency_ms: t.latency_ema_ms().unwrap_or(0.0),
-                error_rate: t.error_rate(),
-                score: t.score(),
+            .enumerate()
+            .map(|(i, t)| {
+                let sync_status = sync_guard.get(i).copied().unwrap_or(BnSyncStatus::Unknown);
+                BnHealthScore {
+                    endpoint: t.endpoint().to_string(),
+                    is_reachable: !matches!(sync_status, BnSyncStatus::Unreachable),
+                    is_synced: matches!(sync_status, BnSyncStatus::Synced),
+                    head_slot: None,
+                    latency: t.latency_ema_ms().map(|ms| Duration::from_secs_f64(ms / 1000.0)),
+                    latency_ms: t.latency_ema_ms().unwrap_or(0.0),
+                    error_rate: t.error_rate(),
+                    score: t.score(),
+                }
             })
             .collect()
     }
@@ -1130,6 +1135,8 @@ mod tests {
     use serde_json::json;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::sync_status::BnSyncStatus;
 
     use super::*;
 
@@ -2988,5 +2995,94 @@ mod tests {
 
         let result = manager.get_genesis().await;
         assert!(result.is_ok(), "Should succeed without overall deadline");
+    }
+
+    #[tokio::test]
+    async fn test_health_scores_reflect_sync_status_synced() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let manager = make_manager(&server.uri());
+
+        // Set sync status to Synced
+        {
+            let mut statuses = manager.sync_statuses().write().await;
+            statuses[0] = BnSyncStatus::Synced;
+        }
+
+        let scores = manager.health_scores().await;
+        assert_eq!(scores.len(), 1);
+        assert!(scores[0].is_reachable);
+        assert!(scores[0].is_synced);
+    }
+
+    #[tokio::test]
+    async fn test_health_scores_reflect_sync_status_syncing() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let manager = make_manager(&server.uri());
+
+        // Set sync status to Syncing
+        {
+            let mut statuses = manager.sync_statuses().write().await;
+            statuses[0] = BnSyncStatus::Syncing;
+        }
+
+        let scores = manager.health_scores().await;
+        assert!(scores[0].is_reachable);
+        assert!(!scores[0].is_synced);
+    }
+
+    #[tokio::test]
+    async fn test_health_scores_reflect_sync_status_unreachable() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let manager = make_manager(&server.uri());
+
+        // Set sync status to Unreachable
+        {
+            let mut statuses = manager.sync_statuses().write().await;
+            statuses[0] = BnSyncStatus::Unreachable;
+        }
+
+        let scores = manager.health_scores().await;
+        assert!(!scores[0].is_reachable);
+        assert!(!scores[0].is_synced);
+    }
+
+    #[tokio::test]
+    async fn test_health_scores_reflect_sync_status_unknown() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let manager = make_manager(&server.uri());
+        // Default is Unknown — don't set anything
+
+        let scores = manager.health_scores().await;
+        // Unknown is not unreachable (we don't know), but not synced either
+        assert!(scores[0].is_reachable);
+        assert!(!scores[0].is_synced);
     }
 }

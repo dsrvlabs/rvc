@@ -119,6 +119,10 @@ enum Commands {
         /// BLS withdrawal key index for derivation path m/12381/3600/{index}/0
         #[arg(long, default_value_t = 0)]
         bls_withdrawal_index: u32,
+
+        /// Passphrase for mnemonic seed derivation
+        #[arg(long, default_value = "")]
+        mnemonic_passphrase: String,
     },
 
     /// Generate a signed voluntary exit message
@@ -207,12 +211,14 @@ fn main() -> anyhow::Result<()> {
             validator_index,
             execution_address,
             bls_withdrawal_index,
+            mnemonic_passphrase,
         } => bls_to_execution::run(bls_to_execution::BlsToExecutionArgs {
             network,
             output_dir,
             validator_index,
             execution_address,
             bls_withdrawal_index,
+            mnemonic_passphrase,
         }),
         Commands::Exit { network, output_dir, validator_index, epoch, keystore, password_file } => {
             exit::run(exit::ExitArgs {

@@ -14,8 +14,9 @@ hex.workspace = true
 metrics.workspace = true
 slashing.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 
 [dev-dependencies]
 crypto = { workspace = true, features = ["test-utils"] }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }

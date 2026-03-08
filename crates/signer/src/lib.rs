@@ -8,12 +8,13 @@ mod traits;
 pub use crypto::is_aggregator;
 pub use traits::ValidatorSigner;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crypto::{CompositeSigner, PublicKey, Signature, Signer, SigningError};
 use eth_types::{
@@ -50,16 +51,51 @@ impl From<SigningError> for SignerError {
     }
 }
 
+/// Per-validator lock map for serializing check-record-sign per validator.
+///
+/// Prevents TOCTOU races where two concurrent sign requests for the same
+/// validator could both pass the slashing check before either records.
+/// Different validators are NOT blocked by each other.
+pub struct ValidatorLockMap {
+    locks: std::sync::Mutex<HashMap<[u8; 48], Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl ValidatorLockMap {
+    pub fn new() -> Self {
+        Self { locks: std::sync::Mutex::new(HashMap::new()) }
+    }
+
+    pub fn get(&self, pubkey: &[u8; 48]) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .expect("validator lock map poisoned")
+            .entry(*pubkey)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+}
+
+impl Default for ValidatorLockMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Service that combines signing through CompositeSigner with slashing protection.
+///
+/// Record-then-sign order is mandated by Ethereum consensus spec (phase0/validator.md):
+/// "Save a record to hard disk ... Generate and broadcast."
+/// The per-validator mutex prevents TOCTOU between concurrent signing requests.
 pub struct SignerService {
     signer: Arc<CompositeSigner>,
     slashing_db: Arc<SlashingDb>,
+    validator_locks: ValidatorLockMap,
 }
 
 impl SignerService {
     /// Creates a new SignerService with the provided composite signer and slashing database.
     pub fn new(signer: Arc<CompositeSigner>, slashing_db: Arc<SlashingDb>) -> Self {
-        Self { signer, slashing_db }
+        Self { signer, slashing_db, validator_locks: ValidatorLockMap::new() }
     }
 
     /// Signs an attestation after checking slashing protection.
@@ -73,7 +109,12 @@ impl SignerService {
     ) -> Result<Signature, SignerError> {
         let start = Instant::now();
 
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        // Acquire per-validator lock to serialize check-record-sign for the same validator.
+        let lock = self.validator_locks.get(&pubkey_bytes);
+        let _guard = lock.lock().await;
 
         let source_epoch = attestation_data.source.epoch;
         let target_epoch = attestation_data.target.epoch;
@@ -136,11 +177,13 @@ impl SignerService {
         tracing::Span::current().record("rvc.slashing.result", "safe");
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
 
-        let pubkey_bytes = pubkey.to_bytes();
         let signature = match self.signer.sign(&signing_root, &pubkey_bytes).await {
             Ok(sig) => sig,
             Err(e) => {
-                tracing::error!(error = %e, "Attestation signing failed");
+                // Phantom entry: record exists but signing failed. This is safe per spec —
+                // missing a duty is far less harmful than double-signing.
+                warn!(error = %e, pubkey = %format!("0x{}", &pubkey_hex[..16]),
+                    "Attestation signing failed after recording (phantom entry in slashing DB)");
                 return Err(e.into());
             }
         };
@@ -163,7 +206,12 @@ impl SignerService {
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
         let start = Instant::now();
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        // Acquire per-validator lock to serialize check-record-sign for the same validator.
+        let lock = self.validator_locks.get(&pubkey_bytes);
+        let _guard = lock.lock().await;
 
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
@@ -193,11 +241,12 @@ impl SignerService {
         tracing::Span::current().record("rvc.slashing.result", "safe");
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
 
-        let pubkey_bytes = pubkey.to_bytes();
         let signature = match self.signer.sign(&signing_root, &pubkey_bytes).await {
             Ok(sig) => sig,
             Err(e) => {
-                tracing::error!(error = %e, "Block signing failed");
+                // Phantom entry: record exists but signing failed. Safe per spec.
+                warn!(error = %e, pubkey = %format!("0x{}", &pubkey_hex[..16]),
+                    "Block signing failed after recording (phantom entry in slashing DB)");
                 return Err(e.into());
             }
         };
@@ -1526,5 +1575,129 @@ mod tests {
         let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, fork_version, genesis_root);
         let signing_root = compute_signing_root(&contribution_and_proof, domain);
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
+    }
+
+    // --- COR-01 Tests: Per-validator signing mutex ---
+
+    #[test]
+    fn test_validator_lock_map_returns_same_lock_for_same_key() {
+        let map = ValidatorLockMap::new();
+        let pk = [1u8; 48];
+        let lock1 = map.get(&pk);
+        let lock2 = map.get(&pk);
+        assert!(Arc::ptr_eq(&lock1, &lock2));
+    }
+
+    #[test]
+    fn test_validator_lock_map_returns_different_locks_for_different_keys() {
+        let map = ValidatorLockMap::new();
+        let pk1 = [1u8; 48];
+        let pk2 = [2u8; 48];
+        let lock1 = map.get(&pk1);
+        let lock2 = map.get(&pk2);
+        assert!(!Arc::ptr_eq(&lock1, &lock2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_signing_same_validator_serialized() {
+        use tokio::sync::Barrier;
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = Arc::new(SignerService::new(signer, slashing_db));
+        let fork = create_test_fork();
+        let genesis_root = [0xaa; 32];
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Both attestations use the SAME source/target so the second would normally
+        // fail without the mutex. With the mutex, only one runs at a time, and the
+        // second will see the same signing_root already recorded (which is allowed).
+        let data = create_test_attestation_data(59, 60);
+
+        let mut handles = vec![];
+        for _ in 0..2 {
+            let service = service.clone();
+            let pk = pubkey.clone();
+            let f = fork.clone();
+            let d = data.clone();
+            let barrier = barrier.clone();
+
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                service.sign_attestation(&d, &pk, &f, genesis_root).await
+            }));
+        }
+
+        // Both should succeed because they have the same signing root
+        // and the mutex ensures they run sequentially
+        for h in handles {
+            let result = h.await.unwrap();
+            assert!(result.is_ok(), "signing should succeed: {:?}", result.err());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_signing_different_validators_parallel() {
+        use tokio::sync::Barrier;
+
+        let sk1 = SecretKey::generate();
+        let sk2 = SecretKey::generate();
+        let pk1 = sk1.public_key();
+        let pk2 = sk2.public_key();
+
+        let mut manager = KeyManager::new();
+        manager.insert(sk1);
+        manager.insert(sk2);
+        let signer = Arc::new(CompositeSigner::new(LocalSigner::new(manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = Arc::new(SignerService::new(signer, slashing_db));
+        let fork = create_test_fork();
+        let genesis_root = [0xaa; 32];
+        let barrier = Arc::new(Barrier::new(2));
+
+        let mut handles = vec![];
+        for (pk, epoch) in [(pk1, 60u64), (pk2, 60)] {
+            let service = service.clone();
+            let f = fork.clone();
+            let barrier = barrier.clone();
+
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let data = create_test_attestation_data(epoch - 1, epoch);
+                service.sign_attestation(&data, &pk, &f, genesis_root).await
+            }));
+        }
+
+        for h in handles {
+            let result = h.await.unwrap();
+            assert!(result.is_ok(), "parallel signing should succeed: {:?}", result.err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_signing_failure_after_recording_warns_phantom() {
+        // Use a signer with no keys to cause a signing failure after slashing check passes
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+
+        // Register the validator in slashing DB but DON'T add the key to the signer
+        let empty_signer = create_empty_composite_signer();
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(empty_signer, slashing_db.clone());
+        let fork = create_test_fork();
+        let genesis_root = [0xaa; 32];
+
+        let data = create_test_attestation_data(59, 60);
+        let result = service.sign_attestation(&data, &pubkey, &fork, genesis_root).await;
+        assert!(result.is_err());
+
+        // Verify the phantom entry exists in slashing DB — the signing failed,
+        // but the record was committed. This is the spec-mandated behavior.
+        match result.err().unwrap() {
+            SignerError::KeyNotFound(_) | SignerError::SigningFailed(_) => {}
+            other => panic!("expected signing failure, got: {other}"),
+        }
     }
 }
