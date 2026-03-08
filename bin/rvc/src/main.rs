@@ -9,7 +9,6 @@ use std::path::PathBuf;
 
 use bn_manager::BeaconNodeClient;
 use clap::{Parser, Subcommand};
-use crypto::PublicKey;
 use metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
 use rvc::config::{redact_url, CliOverrides, Config, Network, ServiceBuilder};
 use rvc::duty_tracker::DutyTrackerService;
@@ -701,9 +700,11 @@ async fn run_validator(
         if secret_providers.is_empty() {
             key_manager
         } else {
-            let mut km = std::sync::Arc::try_unwrap(key_manager).unwrap_or_else(|_| {
-                panic!("single reference to key_manager before cloud key loading")
-            });
+            let mut km = std::sync::Arc::try_unwrap(key_manager).map_err(|_| {
+                anyhow::anyhow!(
+                    "cannot take ownership of key_manager: outstanding Arc references exist"
+                )
+            })?;
             let ksm = secret_provider::KeySourceManager::from_arc(secret_providers.clone());
             let summary = ksm.load_all(&mut km).await?;
             let mut total_loaded = 0usize;
@@ -734,8 +735,9 @@ async fn run_validator(
     let pubkey_map = builder.build_pubkey_map(&key_manager);
 
     // Create shared CompositeSigner from loaded keys
-    let key_manager_owned = std::sync::Arc::try_unwrap(key_manager)
-        .unwrap_or_else(|_| panic!("single reference to key_manager after pubkey_map build"));
+    let key_manager_owned = std::sync::Arc::try_unwrap(key_manager).map_err(|_| {
+        anyhow::anyhow!("cannot take ownership of key_manager: outstanding Arc references exist")
+    })?;
     let known_pubkeys: std::collections::HashSet<[u8; 48]> =
         key_manager_owned.list_public_keys().iter().map(|pk| pk.to_bytes()).collect();
     let local_signer = crypto::LocalSigner::new(key_manager_owned);
@@ -766,12 +768,12 @@ async fn run_validator(
     let validator_index_map = resolve_validator_indices(beacon_for_resolve, &pubkey_map).await;
 
     // Step 6: Doppelganger detection (if enabled)
-    if doppelganger_enabled && !pubkey_map.is_empty() {
+    if doppelganger_enabled && !pubkey_map.read().expect("pubkey_map lock poisoned").is_empty() {
         let validator_index_map = match validator_index_map {
             Ok(ref map) if !map.is_empty() => map.clone(),
             Ok(_) => {
                 warn!(
-                    total = pubkey_map.len(),
+                    total = pubkey_map.read().expect("pubkey_map lock poisoned").len(),
                     "No validator indices resolved; validators may be pending activation. \
                      Skipping doppelganger detection"
                 );
@@ -789,7 +791,8 @@ async fn run_validator(
             let doppelganger_service =
                 builder.build_doppelganger_service(beacon_client.clone(), slashing_db.clone());
 
-            let pubkeys: Vec<String> = pubkey_map.keys().cloned().collect();
+            let pubkeys: Vec<String> =
+                pubkey_map.read().expect("pubkey_map lock poisoned").keys().cloned().collect();
 
             let slot_clock = match builder.build_slot_clock() {
                 Ok(clock) => clock,
@@ -1049,13 +1052,15 @@ async fn run_validator(
 
 async fn resolve_validator_indices(
     beacon_client: &dyn BeaconNodeClient,
-    pubkey_map: &std::collections::HashMap<String, PublicKey>,
+    pubkey_map: &rvc::orchestrator::PubkeyMap,
 ) -> Result<std::collections::HashMap<String, String>, anyhow::Error> {
-    if pubkey_map.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-
-    let pubkeys: Vec<String> = pubkey_map.keys().cloned().collect();
+    let pubkeys: Vec<String> = {
+        let map = pubkey_map.read().expect("pubkey_map lock poisoned");
+        if map.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        map.keys().cloned().collect()
+    };
     let response = beacon_client.get_validators(&pubkeys).await?;
 
     let index_map: std::collections::HashMap<String, String> =

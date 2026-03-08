@@ -138,6 +138,7 @@ pub async fn subscribe_events<F>(
     let url = format!("{}/eth/v1/events?topics={}", config.endpoint.trim_end_matches('/'), topics);
 
     let mut consecutive_failures: u32 = 0;
+    let mut events_since_reconnect: u64;
 
     loop {
         if *shutdown.borrow() {
@@ -156,6 +157,7 @@ pub async fn subscribe_events<F>(
                     return;
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_secs(12)) => {
+                    // Don't reset counter here — require actual events to confirm BN recovery
                     consecutive_failures = 0;
                     continue;
                 }
@@ -165,6 +167,7 @@ pub async fn subscribe_events<F>(
         debug!(url = %url, "connecting to SSE stream");
 
         let mut es = EventSource::get(&url);
+        events_since_reconnect = 0;
 
         loop {
             tokio::select! {
@@ -177,11 +180,20 @@ pub async fn subscribe_events<F>(
                     match event {
                         Some(Ok(Event::Open)) => {
                             info!("SSE connection established");
-                            consecutive_failures = 0;
+                            // Don't reset consecutive_failures on Open alone;
+                            // wait for at least one valid event to confirm BN health
                         }
                         Some(Ok(Event::Message(msg))) => {
                             match parse_sse_event(&msg.event, &msg.data) {
                                 Ok(sse_event) => {
+                                    events_since_reconnect += 1;
+                                    if events_since_reconnect == 1 && consecutive_failures > 0 {
+                                        debug!(
+                                            previous_failures = consecutive_failures,
+                                            "BN recovered, resetting failure counter"
+                                        );
+                                        consecutive_failures = 0;
+                                    }
                                     debug!(event_type = %msg.event, "SSE event received");
                                     callback(sse_event);
                                 }

@@ -281,6 +281,7 @@ impl BnManager {
         let indices = self.synced_indices().await;
         let mut last_err = None;
         let mut tried: usize = 0;
+        let mut failed_indices: Vec<usize> = Vec::new();
 
         for i in indices {
             let client = &self.clients[i];
@@ -293,7 +294,14 @@ impl BnManager {
             match op(client).instrument(attempt_span).await {
                 Ok(result) => {
                     let elapsed = start.elapsed();
-                    self.health_trackers.write().await[i].record_success(elapsed);
+                    // Batch update: record success + all prior errors in one lock acquisition
+                    {
+                        let mut trackers = self.health_trackers.write().await;
+                        for fi in &failed_indices {
+                            trackers[*fi].record_error();
+                        }
+                        trackers[i].record_success(elapsed);
+                    }
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -305,7 +313,7 @@ impl BnManager {
                     return Ok(result);
                 }
                 Err(e) => {
-                    self.health_trackers.write().await[i].record_error();
+                    failed_indices.push(i);
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -315,6 +323,14 @@ impl BnManager {
                     );
                     last_err = Some(e);
                 }
+            }
+        }
+
+        // All failed — batch record errors
+        if !failed_indices.is_empty() {
+            let mut trackers = self.health_trackers.write().await;
+            for fi in &failed_indices {
+                trackers[*fi].record_error();
             }
         }
 
@@ -502,17 +518,22 @@ impl BnManager {
 
         for i in unsynced {
             let client = &self.clients[i];
+            let start = tokio::time::Instant::now();
             match op(client).await {
                 Ok(result) => {
+                    let elapsed = start.elapsed();
+                    self.health_trackers.write().await[i].record_success(elapsed);
                     warn!(
                         op = op_name,
                         bn_index = i,
                         endpoint = client.endpoint(),
+                        latency_ms = elapsed.as_millis() as u64,
                         "query succeeded on unsynced BN (degraded)"
                     );
                     return Some(result);
                 }
                 Err(e) => {
+                    self.health_trackers.write().await[i].record_error();
                     warn!(
                         op = op_name,
                         bn_index = i,

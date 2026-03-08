@@ -12,6 +12,9 @@ pub enum TimingError {
 
     #[error("timer cancelled")]
     Cancelled,
+
+    #[error("slot duration must be at least 1 second")]
+    InvalidSlotDuration,
 }
 
 #[cfg(test)]
@@ -34,5 +37,11 @@ mod tests {
     fn test_cancelled_display() {
         let err = TimingError::Cancelled;
         assert_eq!(err.to_string(), "timer cancelled");
+    }
+
+    #[test]
+    fn test_invalid_slot_duration_display() {
+        let err = TimingError::InvalidSlotDuration;
+        assert_eq!(err.to_string(), "slot duration must be at least 1 second");
     }
 }
