@@ -318,7 +318,7 @@ impl KeyManager {
     /// - Block attempts when rate limit is exceeded
     pub fn load_from_directory_with_tracker<P: AsRef<Path>>(
         path: P,
-        passwords: &HashMap<String, String>,
+        passwords: &HashMap<String, SecretString>,
         tracker: &mut DecryptionAttemptTracker,
     ) -> Result<Self, KeyManagerError> {
         let dir_path = path.as_ref();
@@ -395,7 +395,7 @@ impl KeyManager {
                 }
             };
 
-            let secret_key = match keystore.decrypt(password.as_bytes()) {
+            let secret_key = match keystore.decrypt(password.expose_secret().as_bytes()) {
                 Ok(sk) => sk,
                 Err(e) => {
                     tracker.record_failure(&pubkey_hex);
@@ -720,7 +720,7 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), test_password_string());
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), SecretString::from(test_password_string()));
 
         let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
 
@@ -740,7 +740,8 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), "wrong_password".to_string());
+        passwords
+            .insert(TEST_PUBKEY_HEX.to_string(), SecretString::from("wrong_password".to_string()));
 
         let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
 
@@ -761,7 +762,8 @@ mod tests {
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
         let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), "wrong_password".to_string());
+        passwords
+            .insert(TEST_PUBKEY_HEX.to_string(), SecretString::from("wrong_password".to_string()));
 
         // Only allow 2 attempts
         let mut tracker = DecryptionAttemptTracker::new(2, Duration::from_secs(60));

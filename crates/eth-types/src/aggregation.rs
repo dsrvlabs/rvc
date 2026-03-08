@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tree_hash::{Hash256, MerkleHasher, TreeHash, TreeHashType};
 
+use crate::tree_hash_utils::vec_u8_tree_hash_root;
 use crate::{AttestationData, Signature};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -8,7 +9,7 @@ pub struct Attestation {
     #[serde(with = "serde_utils::hex_vec")]
     pub aggregation_bits: Vec<u8>,
     pub data: AttestationData,
-    #[serde(with = "serde_utils::hex_vec")]
+    #[serde(with = "crate::serde_signature")]
     pub signature: Signature,
 }
 
@@ -39,7 +40,7 @@ pub struct AggregateAndProof {
     #[serde(with = "serde_utils::quoted_u64")]
     pub aggregator_index: u64,
     pub aggregate: Attestation,
-    #[serde(with = "serde_utils::hex_vec")]
+    #[serde(with = "crate::serde_signature")]
     pub selection_proof: Signature,
 }
 
@@ -68,7 +69,7 @@ impl TreeHash for AggregateAndProof {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedAggregateAndProof {
     pub message: AggregateAndProof,
-    #[serde(with = "serde_utils::hex_vec")]
+    #[serde(with = "crate::serde_signature")]
     pub signature: Signature,
 }
 
@@ -77,7 +78,7 @@ pub struct ElectraAttestation {
     #[serde(with = "serde_utils::hex_vec")]
     pub aggregation_bits: Vec<u8>,
     pub data: AttestationData,
-    #[serde(with = "serde_utils::hex_vec")]
+    #[serde(with = "crate::serde_signature")]
     pub signature: Signature,
     #[serde(with = "serde_utils::hex_vec")]
     pub committee_bits: Vec<u8>,
@@ -112,7 +113,7 @@ pub struct ElectraAggregateAndProof {
     #[serde(with = "serde_utils::quoted_u64")]
     pub aggregator_index: u64,
     pub aggregate: ElectraAttestation,
-    #[serde(with = "serde_utils::hex_vec")]
+    #[serde(with = "crate::serde_signature")]
     pub selection_proof: Signature,
 }
 
@@ -141,15 +142,8 @@ impl TreeHash for ElectraAggregateAndProof {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedElectraAggregateAndProof {
     pub message: ElectraAggregateAndProof,
-    #[serde(with = "serde_utils::hex_vec")]
+    #[serde(with = "crate::serde_signature")]
     pub signature: Signature,
-}
-
-pub(crate) fn vec_u8_tree_hash_root(bytes: &[u8]) -> Hash256 {
-    let num_leaves = bytes.len().div_ceil(32);
-    let mut hasher = MerkleHasher::with_leaves(num_leaves.max(1));
-    hasher.write(bytes).expect("valid bytes");
-    hasher.finish().expect("valid root")
 }
 
 #[cfg(test)]

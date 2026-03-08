@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tree_hash::{Hash256, MerkleHasher, TreeHash, TreeHashType};
 
-use crate::aggregation::vec_u8_tree_hash_root;
+use crate::tree_hash_utils::vec_u8_tree_hash_root;
 use crate::{AttestationData, Signature};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,7 +11,7 @@ pub struct SingleAttestation {
     #[serde(with = "serde_utils::quoted_u64")]
     pub attester_index: u64,
     pub data: AttestationData,
-    #[serde(with = "serde_utils::hex_vec")]
+    #[serde(with = "crate::serde_signature")]
     pub signature: Signature,
 }
 

@@ -6,7 +6,8 @@ use crate::{Epoch, Signature, Slot};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposerDuty {
-    pub pubkey: String,
+    #[serde(with = "crate::hex_fixed::bytes_48_hex")]
+    pub pubkey: [u8; 48],
     #[serde(with = "serde_utils::quoted_u64")]
     pub validator_index: u64,
     #[serde(with = "serde_utils::quoted_u64")]
@@ -24,7 +25,7 @@ pub struct VoluntaryExit {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedVoluntaryExit {
     pub message: VoluntaryExit,
-    #[serde(with = "serde_utils::hex_vec")]
+    #[serde(with = "crate::serde_signature")]
     pub signature: Signature,
 }
 
@@ -33,7 +34,7 @@ mod tests {
     use super::*;
 
     fn sample_proposer_duty() -> ProposerDuty {
-        ProposerDuty { pubkey: "0xabcdef1234567890".to_string(), validator_index: 42, slot: 1000 }
+        ProposerDuty { pubkey: [0xab; 48], validator_index: 42, slot: 1000 }
     }
 
     fn sample_voluntary_exit() -> VoluntaryExit {
@@ -58,11 +59,12 @@ mod tests {
     }
 
     #[test]
-    fn test_proposer_duty_pubkey_is_string() {
+    fn test_proposer_duty_pubkey_is_hex() {
         let duty = sample_proposer_duty();
         let json = serde_json::to_string(&duty).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["pubkey"], serde_json::Value::String("0xabcdef1234567890".to_string()));
+        let expected = format!("0x{}", "ab".repeat(48));
+        assert_eq!(parsed["pubkey"], serde_json::Value::String(expected));
     }
 
     #[test]
@@ -108,10 +110,9 @@ mod tests {
     }
 
     #[test]
-    fn test_signed_voluntary_exit_empty_signature() {
-        let signed = SignedVoluntaryExit { message: sample_voluntary_exit(), signature: vec![] };
-        let json = serde_json::to_string(&signed).unwrap();
-        let deserialized: SignedVoluntaryExit = serde_json::from_str(&json).unwrap();
-        assert_eq!(signed, deserialized);
+    fn test_signed_voluntary_exit_rejects_empty_signature() {
+        let json =
+            format!(r#"{{"message":{{"epoch":"100","validator_index":"42"}},"signature":"0x"}}"#);
+        assert!(serde_json::from_str::<SignedVoluntaryExit>(&json).is_err());
     }
 }
