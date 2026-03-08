@@ -35,6 +35,25 @@ enum DecryptionOutcome {
     },
 }
 
+/// Validate that `candidate` resolves inside `base` after canonicalization.
+///
+/// Rejects symlinks or path traversal (`../`) that resolve outside the base directory.
+pub fn validate_key_path(base: &Path, candidate: &Path) -> Result<PathBuf, KeyManagerError> {
+    let canonical_base = base.canonicalize().map_err(KeyManagerError::Io)?;
+    let canonical_path = candidate.canonicalize().map_err(KeyManagerError::Io)?;
+    if !canonical_path.starts_with(&canonical_base) {
+        warn!(
+            "Rejecting file outside keystore directory (possible path traversal): {:?}",
+            candidate
+        );
+        return Err(KeyManagerError::PathTraversal {
+            path: candidate.to_path_buf(),
+            base: canonical_base,
+        });
+    }
+    Ok(canonical_path)
+}
+
 pub struct KeyManager {
     keys: HashMap<[u8; PUBLIC_KEY_BYTES_LEN], SecretKey>,
 }
@@ -108,21 +127,14 @@ impl KeyManager {
 
             let file_path = entry.path();
 
-            let canonical_file = match file_path.canonicalize() {
+            let canonical_file = match validate_key_path(&canonical_dir, &file_path) {
                 Ok(p) => p,
+                Err(KeyManagerError::PathTraversal { .. }) => continue,
                 Err(e) => {
-                    warn!("Failed to canonicalize {:?}: {}", file_path, e);
+                    warn!("Failed to validate path {:?}: {}", file_path, e);
                     continue;
                 }
             };
-
-            if !canonical_file.starts_with(&canonical_dir) {
-                warn!(
-                    "Skipping file outside keystore directory (possible symlink attack): {:?}",
-                    file_path
-                );
-                continue;
-            }
 
             if !canonical_file.is_file() {
                 continue;
@@ -1205,5 +1217,49 @@ mod tests {
                 "Symlink pointing outside directory should be skipped in parallel load"
             );
         }
+    }
+
+    #[test]
+    fn test_validate_key_path_accepts_file_inside_dir() {
+        let dir = TempDir::new().unwrap();
+        let file_path = dir.path().join("keystore.json");
+        File::create(&file_path).unwrap();
+
+        let result = validate_key_path(dir.path(), &file_path);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_key_path_rejects_path_outside_dir() {
+        let base_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        let outside_file = outside_dir.path().join("evil.json");
+        File::create(&outside_file).unwrap();
+
+        let result = validate_key_path(base_dir.path(), &outside_file);
+        assert!(
+            matches!(result, Err(KeyManagerError::PathTraversal { .. })),
+            "Expected PathTraversal error, got: {:?}",
+            result
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_validate_key_path_rejects_symlink_outside_dir() {
+        let base_dir = TempDir::new().unwrap();
+        let outside_dir = TempDir::new().unwrap();
+        let outside_file = outside_dir.path().join("evil.json");
+        File::create(&outside_file).unwrap();
+
+        let symlink_path = base_dir.path().join("link.json");
+        std::os::unix::fs::symlink(&outside_file, &symlink_path).unwrap();
+
+        let result = validate_key_path(base_dir.path(), &symlink_path);
+        assert!(
+            matches!(result, Err(KeyManagerError::PathTraversal { .. })),
+            "Expected PathTraversal error for symlink outside dir, got: {:?}",
+            result
+        );
     }
 }

@@ -46,6 +46,9 @@ impl From<SigningError> for SignerError {
         match e {
             SigningError::KeyNotFound(pk) => SignerError::KeyNotFound(pk),
             SigningError::RemoteSignerError(msg) => SignerError::SigningFailed(msg),
+            SigningError::InvalidRemoteSignature => {
+                SignerError::SigningFailed("remote signer returned invalid signature".to_string())
+            }
         }
     }
 }

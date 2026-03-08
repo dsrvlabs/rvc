@@ -7,7 +7,7 @@ use tracing::Instrument;
 
 use url::Url;
 
-use super::bls::{Signature, PUBLIC_KEY_BYTES_LEN};
+use super::bls::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
 use super::signer_trait::{Signer, SigningError};
 use eth_types::Root;
 
@@ -129,8 +129,21 @@ impl Signer for RemoteSigner {
                 SigningError::RemoteSignerError(format!("invalid signature hex: {e}"))
             })?;
 
-            Signature::from_bytes(&sig_bytes)
-                .map_err(|e| SigningError::RemoteSignerError(format!("invalid BLS signature: {e}")))
+            let signature = Signature::from_bytes(&sig_bytes).map_err(|e| {
+                SigningError::RemoteSignerError(format!("invalid BLS signature: {e}"))
+            })?;
+
+            let pk = PublicKey::from_bytes(pubkey)
+                .map_err(|e| SigningError::RemoteSignerError(format!("invalid public key: {e}")))?;
+            if signature.verify(&pk, signing_root).is_err() {
+                tracing::error!(
+                    pubkey = %hex::encode(pubkey),
+                    "Remote signer returned invalid signature"
+                );
+                return Err(SigningError::InvalidRemoteSignature);
+            }
+
+            Ok(signature)
         }
         .instrument(span)
         .await
@@ -624,5 +637,88 @@ mod tests {
 
         let result = signer.sign(&signing_root, &pk_bytes).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_remote_signer_rejects_wrong_key_signature() {
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+        let signing_root: Root = [0xab; 32];
+
+        // Sign with a different key
+        let wrong_sk = SecretKey::generate();
+        let wrong_sig = wrong_sk.sign(&signing_root);
+        let sig_hex = format!("0x{}", hex::encode(wrong_sig.to_bytes()));
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/api/v1/eth2/sign/.*"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"signature": sig_hex})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = RemoteSignerConfig::new(mock_server.uri());
+        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+
+        let result = signer.sign(&signing_root, &pk_bytes).await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SigningError::InvalidRemoteSignature => {}
+            other => panic!("expected InvalidRemoteSignature, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_remote_signer_accepts_correct_signature() {
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+        let signing_root: Root = [0xab; 32];
+
+        let correct_sig = sk.sign(&signing_root);
+        let sig_hex = format!("0x{}", hex::encode(correct_sig.to_bytes()));
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/api/v1/eth2/sign/.*"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"signature": sig_hex})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = RemoteSignerConfig::new(mock_server.uri());
+        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+
+        let result = signer.sign(&signing_root, &pk_bytes).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().to_bytes(), correct_sig.to_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_remote_signer_rejects_garbage_signature_bytes() {
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+        let signing_root: Root = [0xab; 32];
+
+        // Return valid-length but garbage signature bytes
+        let garbage_bytes = [0xffu8; 96];
+        let sig_hex = format!("0x{}", hex::encode(garbage_bytes));
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/api/v1/eth2/sign/.*"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"signature": sig_hex})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = RemoteSignerConfig::new(mock_server.uri());
+        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+
+        let result = signer.sign(&signing_root, &pk_bytes).await;
+        assert!(result.is_err());
     }
 }

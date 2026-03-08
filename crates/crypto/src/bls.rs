@@ -7,7 +7,7 @@ use blst::min_pk::{
 };
 use blst::BLST_ERROR;
 use rand::RngCore;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use super::error::BlsError;
 
@@ -50,9 +50,13 @@ impl Hash for PublicKey {
     }
 }
 
+/// BLS secret key wrapper.
+///
+/// The inner `blst::SecretKey` implements `Zeroize + ZeroizeOnDrop` via
+/// `#[zeroize(drop)]` (blst >= 0.3.11, current: 0.3.16). Key material
+/// is automatically zeroized when this struct is dropped.
 pub struct SecretKey {
     inner: BlstSecretKey,
-    raw_bytes: [u8; SECRET_KEY_BYTES_LEN],
 }
 
 impl SecretKey {
@@ -62,31 +66,26 @@ impl SecretKey {
 
         let inner = BlstSecretKey::key_gen(ikm.as_ref(), &[])
             .expect("key generation should not fail with valid IKM");
-        let raw_bytes = inner.to_bytes();
-
-        Self { inner, raw_bytes }
+        Self { inner }
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BlsError> {
         let inner = BlstSecretKey::from_bytes(bytes)
             .map_err(|_| BlsError::InvalidSecretKey("invalid secret key bytes".to_string()))?;
 
-        let mut raw_bytes = [0u8; SECRET_KEY_BYTES_LEN];
-        if bytes.len() == SECRET_KEY_BYTES_LEN {
-            raw_bytes.copy_from_slice(bytes);
-        } else {
-            raw_bytes = inner.to_bytes();
-        }
-
-        Ok(Self { inner, raw_bytes })
+        Ok(Self { inner })
     }
 
     pub fn to_bytes(&self) -> [u8; SECRET_KEY_BYTES_LEN] {
         self.inner.to_bytes()
     }
 
-    pub fn raw_bytes(&self) -> &[u8; SECRET_KEY_BYTES_LEN] {
-        &self.raw_bytes
+    /// Returns the raw secret key bytes.
+    ///
+    /// Each call produces a stack-allocated copy that is short-lived.
+    /// The caller should wrap the result in `Zeroizing` if it needs to persist.
+    pub fn raw_bytes(&self) -> [u8; SECRET_KEY_BYTES_LEN] {
+        self.inner.to_bytes()
     }
 
     pub fn public_key(&self) -> PublicKey {
@@ -95,12 +94,6 @@ impl SecretKey {
 
     pub fn sign(&self, message: &[u8]) -> Signature {
         Signature(self.inner.sign(message, DST, &[]))
-    }
-}
-
-impl Drop for SecretKey {
-    fn drop(&mut self) {
-        self.raw_bytes.zeroize();
     }
 }
 
@@ -315,39 +308,19 @@ mod tests {
     }
 
     #[test]
-    fn test_secret_key_has_raw_bytes() {
+    fn test_secret_key_raw_bytes_matches_to_bytes() {
         let sk = SecretKey::generate();
         let raw = sk.raw_bytes();
         let expected = sk.to_bytes();
-        assert_eq!(raw, &expected);
+        assert_eq!(raw, expected);
     }
 
     #[test]
-    fn test_secret_key_zeroized_on_drop() {
-        use std::ptr;
-
-        let raw_ptr: *const [u8; SECRET_KEY_BYTES_LEN];
-        {
-            let sk = SecretKey::generate();
-            raw_ptr = sk.raw_bytes() as *const [u8; SECRET_KEY_BYTES_LEN];
-            let bytes_before_drop = sk.to_bytes();
-            assert_ne!(bytes_before_drop, [0u8; SECRET_KEY_BYTES_LEN]);
-        }
-        // After drop, the memory at raw_ptr should be zeroed
-        // Note: This is a best-effort test - memory may be reused
-        // The actual zeroization happens via the Zeroize trait
-        unsafe {
-            let zeroed = ptr::read_volatile(raw_ptr);
-            assert_eq!(zeroed, [0u8; SECRET_KEY_BYTES_LEN]);
-        }
-    }
-
-    #[test]
-    fn test_secret_key_from_bytes_stores_raw() {
+    fn test_secret_key_from_bytes_raw_bytes_roundtrip() {
         let original = SecretKey::generate();
         let bytes = original.to_bytes();
         let restored = SecretKey::from_bytes(&bytes).expect("valid bytes");
-        assert_eq!(restored.raw_bytes(), &bytes);
+        assert_eq!(restored.raw_bytes(), bytes);
     }
 
     #[test]
