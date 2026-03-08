@@ -138,8 +138,8 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         })?;
 
         let format = ssz_block_format(response.is_blinded, &response.consensus_version);
-        let block_root: Root = if response.is_blinded {
-            let (block, _offset) =
+        let (block_root, block_data_offset): (Root, usize) = if response.is_blinded {
+            let (block, offset) =
                 beacon::ssz_deser::deserialize_blinded_beacon_block_from_ssz(ssz_bytes, format)
                     .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
             if block.slot != slot {
@@ -148,9 +148,9 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     block.slot, slot,
                 )));
             }
-            compute_blinded_block_root(&block)
+            (compute_blinded_block_root(&block), offset)
         } else {
-            let (block, _offset) =
+            let (block, offset) =
                 beacon::ssz_deser::deserialize_beacon_block_from_ssz(ssz_bytes, format)
                     .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
             if block.slot != slot {
@@ -159,10 +159,10 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     block.slot, slot,
                 )));
             }
-            compute_block_root(&block)
+            (compute_block_root(&block), offset)
         };
 
-        let _sig = self
+        let sig = self
             .signer
             .sign_block(
                 &block_root,
@@ -175,8 +175,17 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
 
+        // Construct SignedBeaconBlock SSZ:
+        // [message_offset: 4 bytes LE] [signature: 96 bytes] [BeaconBlock SSZ bytes]
+        let block_ssz = &ssz_bytes[block_data_offset..];
+        let message_offset: u32 = 100; // 4 (offset) + 96 (signature)
+        let mut signed_ssz = Vec::with_capacity(100 + block_ssz.len());
+        signed_ssz.extend_from_slice(&message_offset.to_le_bytes());
+        signed_ssz.extend_from_slice(&sig);
+        signed_ssz.extend_from_slice(block_ssz);
+
         self.beacon
-            .publish_block_ssz(ssz_bytes, &response.consensus_version, response.is_blinded)
+            .publish_block_ssz(&signed_ssz, &response.consensus_version, response.is_blinded)
             .instrument(tracing::info_span!("rvc.beacon.publish_block"))
             .await?;
 
@@ -1364,5 +1373,109 @@ mod tests {
         let calls = signer_arc.randao_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], 10); // epoch = 320/32
+    }
+
+    #[tokio::test]
+    async fn test_ssz_published_payload_contains_signature() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = MockBeaconClient::ssz(slot, 42, false);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
+        assert_eq!(ssz_calls.len(), 1);
+        let published = &ssz_calls[0].0;
+
+        // First 4 bytes: message_offset = 100 (4 + 96)
+        let message_offset = u32::from_le_bytes(published[0..4].try_into().unwrap());
+        assert_eq!(message_offset, 100);
+
+        // Bytes 4..100: 96-byte signature (MockSigner returns 0xbb * 96)
+        let sig = &published[4..100];
+        assert_eq!(sig.len(), 96);
+        assert!(sig.iter().all(|&b| b == 0xbb), "signature should be mock 0xbb bytes");
+
+        // Bytes 100..: BeaconBlock SSZ data
+        assert!(
+            published.len() > 100,
+            "published payload should contain block data after signature"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ssz_published_payload_is_signed_beacon_block() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = MockBeaconClient::ssz(slot, 42, false);
+        let original_ssz = beacon.produce_response.as_ref().unwrap().ssz_bytes.clone().unwrap();
+
+        // For BlockContents (deneb), block starts at offset 12
+        let block_ssz_len = original_ssz.len() - 12; // block data starts at offset 12
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
+        let published = &ssz_calls[0].0;
+
+        // Published length = 100 (4 offset + 96 sig) + block_ssz_len
+        assert_eq!(published.len(), 100 + block_ssz_len);
+    }
+
+    #[tokio::test]
+    async fn test_ssz_blinded_block_also_includes_signature() {
+        let pubkey = test_pubkey();
+        let slot = 200;
+        let beacon = MockBeaconClient::ssz(slot, 42, true);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
+        assert_eq!(ssz_calls.len(), 1);
+        let published = &ssz_calls[0].0;
+
+        // First 4 bytes: message_offset = 100
+        let message_offset = u32::from_le_bytes(published[0..4].try_into().unwrap());
+        assert_eq!(message_offset, 100);
+
+        // Signature present
+        let sig = &published[4..100];
+        assert!(sig.iter().all(|&b| b == 0xbb));
+
+        // Blinded flag should be true
+        assert!(ssz_calls[0].2);
     }
 }
