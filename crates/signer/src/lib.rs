@@ -1681,7 +1681,7 @@ mod tests {
         let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
         let service = Arc::new(SignerService::new(signer, slashing_db));
-        let fork = create_test_fork();
+        let fork_schedule = create_test_fork_schedule_for_attestation();
         let genesis_root = [0xaa; 32];
         let barrier = Arc::new(Barrier::new(2));
 
@@ -1694,13 +1694,13 @@ mod tests {
         for _ in 0..2 {
             let service = service.clone();
             let pk = pubkey.clone();
-            let f = fork.clone();
+            let f = fork_schedule.clone();
             let d = data.clone();
             let barrier = barrier.clone();
 
             handles.push(tokio::spawn(async move {
                 barrier.wait().await;
-                service.sign_attestation(&d, &pk, &f, genesis_root).await
+                service.sign_attestation(&d, &pk, &f, &genesis_root).await
             }));
         }
 
@@ -1727,20 +1727,20 @@ mod tests {
         let signer = Arc::new(CompositeSigner::new(LocalSigner::new(manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
         let service = Arc::new(SignerService::new(signer, slashing_db));
-        let fork = create_test_fork();
+        let fork_schedule = create_test_fork_schedule_for_attestation();
         let genesis_root = [0xaa; 32];
         let barrier = Arc::new(Barrier::new(2));
 
         let mut handles = vec![];
         for (pk, epoch) in [(pk1, 60u64), (pk2, 60)] {
             let service = service.clone();
-            let f = fork.clone();
+            let f = fork_schedule.clone();
             let barrier = barrier.clone();
 
             handles.push(tokio::spawn(async move {
                 barrier.wait().await;
                 let data = create_test_attestation_data(epoch - 1, epoch);
-                service.sign_attestation(&data, &pk, &f, genesis_root).await
+                service.sign_attestation(&data, &pk, &f, &genesis_root).await
             }));
         }
 
@@ -1760,11 +1760,11 @@ mod tests {
         let empty_signer = create_empty_composite_signer();
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
         let service = SignerService::new(empty_signer, slashing_db.clone());
-        let fork = create_test_fork();
+        let fork_schedule = create_test_fork_schedule_for_attestation();
         let genesis_root = [0xaa; 32];
 
         let data = create_test_attestation_data(59, 60);
-        let result = service.sign_attestation(&data, &pubkey, &fork, genesis_root).await;
+        let result = service.sign_attestation(&data, &pubkey, &fork_schedule, &genesis_root).await;
         assert!(result.is_err());
 
         // Verify the phantom entry exists in slashing DB — the signing failed,
