@@ -100,8 +100,9 @@ impl TreeHash for ElectraAttestation {
         let mut hasher = MerkleHasher::with_leaves(4);
         hasher.write(vec_u8_tree_hash_root(&self.aggregation_bits).as_slice()).expect("valid leaf");
         hasher.write(self.data.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
+        // EIP-7549 spec order: field 2 = committee_bits, field 3 = signature
         hasher.write(vec_u8_tree_hash_root(&self.committee_bits).as_slice()).expect("valid leaf");
+        hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
         hasher.finish().expect("valid root")
     }
 }
@@ -391,5 +392,40 @@ mod tests {
         let json = serde_json::to_string(&signed).unwrap();
         let deserialized: SignedElectraAggregateAndProof = serde_json::from_str(&json).unwrap();
         assert_eq!(signed, deserialized);
+    }
+
+    #[test]
+    fn test_electra_attestation_tree_hash_spec_field_order() {
+        let att = sample_electra_attestation();
+
+        // Manually compute expected root using EIP-7549 spec field order:
+        // aggregation_bits (0), data (1), committee_bits (2), signature (3)
+        let mut hasher = MerkleHasher::with_leaves(4);
+        hasher.write(vec_u8_tree_hash_root(&att.aggregation_bits).as_slice()).expect("leaf");
+        hasher.write(att.data.tree_hash_root().as_slice()).expect("leaf");
+        hasher.write(vec_u8_tree_hash_root(&att.committee_bits).as_slice()).expect("leaf");
+        hasher.write(vec_u8_tree_hash_root(&att.signature).as_slice()).expect("leaf");
+        let expected = hasher.finish().expect("root");
+
+        assert_eq!(att.tree_hash_root(), expected, "tree_hash_root must match spec field order");
+    }
+
+    #[test]
+    fn test_electra_attestation_wrong_field_order_differs() {
+        let att = sample_electra_attestation();
+
+        // Compute root with WRONG order (signature before committee_bits)
+        let mut hasher = MerkleHasher::with_leaves(4);
+        hasher.write(vec_u8_tree_hash_root(&att.aggregation_bits).as_slice()).expect("leaf");
+        hasher.write(att.data.tree_hash_root().as_slice()).expect("leaf");
+        hasher.write(vec_u8_tree_hash_root(&att.signature).as_slice()).expect("leaf");
+        hasher.write(vec_u8_tree_hash_root(&att.committee_bits).as_slice()).expect("leaf");
+        let wrong_root = hasher.finish().expect("root");
+
+        assert_ne!(
+            att.tree_hash_root(),
+            wrong_root,
+            "tree_hash_root must differ from wrong field order"
+        );
     }
 }
