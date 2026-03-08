@@ -200,6 +200,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
     ) -> Result<(Root, bool), BlockServiceError> {
         let block_contents = response.parse_full_block()?;
         let block = block_contents.block().clone();
+
+        if block.slot != slot {
+            return Err(BlockServiceError::SlotMismatch { requested: slot, got: block.slot });
+        }
+
         let block_root = compute_block_root(&block);
 
         let sig = self
@@ -231,6 +236,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         pubkey: &PublicKey,
     ) -> Result<(Root, bool), BlockServiceError> {
         let block = response.parse_blinded_block()?;
+
+        if block.slot != slot {
+            return Err(BlockServiceError::SlotMismatch { requested: slot, got: block.slot });
+        }
+
         let block_root = compute_blinded_block_root(&block);
 
         let sig = self
@@ -1347,6 +1357,44 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BlockServiceError::Signer(_)));
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_unblinded_slot_mismatch_returns_error() {
+        let pubkey = test_pubkey();
+        let requested_slot = 100;
+        let block = test_block(200); // block has slot 200, we request 100
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(requested_slot, &pubkey).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, BlockServiceError::SlotMismatch { requested: 100, got: 200 }),
+            "expected SlotMismatch, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_blinded_slot_mismatch_returns_error() {
+        let pubkey = test_pubkey();
+        let requested_slot = 100;
+        let block = test_blinded_block(300); // block has slot 300, we request 100
+        let beacon = MockBeaconClient::blinded(block);
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(requested_slot, &pubkey).await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, BlockServiceError::SlotMismatch { requested: 100, got: 300 }),
+            "expected SlotMismatch, got: {err:?}"
+        );
     }
 
     #[tokio::test]

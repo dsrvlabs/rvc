@@ -27,10 +27,11 @@ pub struct AppState {
 }
 
 pub async fn list_keystores(State(state): State<Arc<AppState>>) -> Json<ListKeystoresResponse> {
+    // Per Keymanager API spec, GET /eth/v1/keystores returns only local keys.
+    // Remote keys are returned by GET /eth/v1/remotekeys.
     let local_keys = state.keystore_manager.list_keys();
-    let remote_keys = state.remote_key_manager.list_remote_keys();
 
-    let mut data: Vec<KeystoreInfo> = local_keys
+    let data: Vec<KeystoreInfo> = local_keys
         .into_iter()
         .map(|pk| KeystoreInfo {
             validating_pubkey: format!("0x{}", hex::encode(pk)),
@@ -38,14 +39,6 @@ pub async fn list_keystores(State(state): State<Arc<AppState>>) -> Json<ListKeys
             readonly: false,
         })
         .collect();
-
-    for (pk, _url) in &remote_keys {
-        data.push(KeystoreInfo {
-            validating_pubkey: format!("0x{}", hex::encode(pk)),
-            derivation_path: None,
-            readonly: true,
-        });
-    }
 
     Json(ListKeystoresResponse { data })
 }
@@ -1611,13 +1604,11 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::OK);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let resp: ListKeystoresResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(resp.data.len(), 2);
-        // Local key: not readonly
+        // COR-05: list_keystores now returns only local keys
+        assert_eq!(resp.data.len(), 1);
+        // Only local key present
         assert_eq!(resp.data[0].validating_pubkey, format!("0x{}", test_pubkey_hex(1)));
         assert!(!resp.data[0].readonly);
-        // Remote key: readonly
-        assert_eq!(resp.data[1].validating_pubkey, format!("0x{}", test_pubkey_hex(2)));
-        assert!(resp.data[1].readonly);
     }
 
     // --- Auth tests for remote key endpoints ---
