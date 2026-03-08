@@ -13,12 +13,47 @@ pub struct ListKeystoresResponse {
     pub data: Vec<KeystoreInfo>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct ImportKeystoresRequest {
     pub keystores: Vec<String>,
     pub passwords: Vec<String>,
     #[serde(default)]
     pub slashing_protection: Option<String>,
+}
+
+impl std::fmt::Debug for ImportKeystoresRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportKeystoresRequest")
+            .field("keystores", &self.keystores)
+            .field("passwords", &format_args!("[REDACTED; {}]", self.passwords.len()))
+            .field("slashing_protection", &self.slashing_protection)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_import_keystores_request_debug_redacts_passwords() {
+        let req = ImportKeystoresRequest {
+            keystores: vec!["ks1".into()],
+            passwords: vec!["super_secret_password".into(), "another_secret".into()],
+            slashing_protection: None,
+        };
+        let debug_output = format!("{:?}", req);
+        assert!(debug_output.contains("REDACTED"), "Debug output should contain REDACTED");
+        assert!(debug_output.contains("[REDACTED; 2]"), "Debug output should show password count");
+        assert!(
+            !debug_output.contains("super_secret_password"),
+            "Debug output must NOT contain actual passwords"
+        );
+        assert!(
+            !debug_output.contains("another_secret"),
+            "Debug output must NOT contain actual passwords"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

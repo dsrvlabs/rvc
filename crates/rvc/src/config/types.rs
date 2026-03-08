@@ -84,6 +84,15 @@ pub struct Config {
 
     #[serde(default)]
     pub secret_provider: SecretProviderConfig,
+
+    #[serde(default)]
+    pub allow_insecure_remote_signer: bool,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keymanager_cors_origins: Vec<String>,
+
+    #[serde(default = "default_keymanager_body_limit")]
+    pub keymanager_body_limit: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -117,6 +126,10 @@ impl Default for GcpSecretConfig {
 
 fn default_gcp_secret_prefix() -> String {
     "validator-key-".to_string()
+}
+
+fn default_keymanager_body_limit() -> usize {
+    10 * 1024 * 1024 // 10 MB
 }
 
 fn default_tracing_exporter() -> String {
@@ -157,6 +170,9 @@ impl Default for Config {
             tracing_max_queue_size: None,
             tracing_max_export_batch_size: None,
             secret_provider: SecretProviderConfig::default(),
+            allow_insecure_remote_signer: false,
+            keymanager_cors_origins: Vec::new(),
+            keymanager_body_limit: default_keymanager_body_limit(),
         }
     }
 }
@@ -436,6 +452,18 @@ impl Config {
         if let Some(interval) = cli.secret_refresh_interval {
             self.secret_provider.refresh_interval = Some(interval);
         }
+
+        if let Some(allow) = cli.allow_insecure_remote_signer {
+            self.allow_insecure_remote_signer = allow;
+        }
+
+        if let Some(ref origins) = cli.keymanager_cors_origins {
+            self.keymanager_cors_origins = origins.clone();
+        }
+
+        if let Some(limit) = cli.keymanager_body_limit {
+            self.keymanager_body_limit = limit;
+        }
     }
 }
 
@@ -488,6 +516,9 @@ pub struct CliOverrides {
     pub gcp_project_id: Option<String>,
     pub gcp_secret_prefix: Option<String>,
     pub secret_refresh_interval: Option<u64>,
+    pub allow_insecure_remote_signer: Option<bool>,
+    pub keymanager_cors_origins: Option<Vec<String>>,
+    pub keymanager_body_limit: Option<usize>,
 }
 
 #[cfg(test)]

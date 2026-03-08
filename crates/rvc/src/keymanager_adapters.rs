@@ -558,6 +558,9 @@ mod tests {
             remote_key_mgr,
             token,
             addr,
+            vec![],
+            keymanager_api::DEFAULT_BODY_LIMIT,
+            true,
         )
     }
 
@@ -665,6 +668,9 @@ mod tests {
             remote_key_mgr,
             token.clone(),
             addr,
+            vec![],
+            keymanager_api::DEFAULT_BODY_LIMIT,
+            true,
         );
 
         // 1. Import a remote key

@@ -193,6 +193,19 @@ enum Commands {
         /// Interval in seconds to refresh keys from secret providers (0 = disabled)
         #[arg(long)]
         secret_refresh_interval: Option<u64>,
+
+        // --- Keymanager API hardening flags (SEC-05, SEC-06, SEC-07) ---
+        /// Allow HTTP (non-TLS) URLs for remote signer imports
+        #[arg(long)]
+        allow_insecure_remote_signer: bool,
+
+        /// Comma-separated list of allowed CORS origins for the Keymanager API
+        #[arg(long, value_delimiter = ',')]
+        keymanager_cors_origins: Option<Vec<String>>,
+
+        /// Maximum request body size in bytes for the Keymanager API (default: 10 MB)
+        #[arg(long, default_value_t = keymanager_api::DEFAULT_BODY_LIMIT)]
+        keymanager_body_limit: usize,
     },
 
     /// Submit a voluntary exit for a validator
@@ -289,6 +302,9 @@ async fn main() -> anyhow::Result<()> {
             gcp_project_id,
             gcp_secret_prefix,
             secret_refresh_interval,
+            allow_insecure_remote_signer,
+            keymanager_cors_origins,
+            keymanager_body_limit,
         } => {
             let mut timeouts = bn_manager::OperationTimeouts::default();
             if let Some(secs) = block_production_timeout {
@@ -360,6 +376,13 @@ async fn main() -> anyhow::Result<()> {
                 gcp_project_id,
                 gcp_secret_prefix,
                 secret_refresh_interval,
+                allow_insecure_remote_signer: if allow_insecure_remote_signer {
+                    Some(true)
+                } else {
+                    None
+                },
+                keymanager_cors_origins,
+                keymanager_body_limit: Some(keymanager_body_limit),
             };
 
             let mut cfg = load_config(config)?;
@@ -928,6 +951,9 @@ async fn run_validator(
             remote_key_mgr,
             token.to_string(),
             km_addr,
+            config.keymanager_cors_origins.clone(),
+            config.keymanager_body_limit,
+            config.allow_insecure_remote_signer,
         );
 
         info!(addr = %km_addr, token_path = %token_path.display(), "Keymanager API enabled");
