@@ -2,23 +2,18 @@ use async_trait::async_trait;
 use google_cloud_gax::error::rpc::Code;
 use google_cloud_secretmanager_v1::client::SecretManagerService;
 use tracing::{debug, warn};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{KeyMaterial, SecretKeyEntry, SecretProvider, SecretProviderError};
 
 pub struct GcpSecretProviderConfig {
     pub project_id: String,
     pub prefix: String,
-    pub concurrency_limit: usize,
 }
 
 impl Default for GcpSecretProviderConfig {
     fn default() -> Self {
-        Self {
-            project_id: String::new(),
-            prefix: "validator-key-".to_string(),
-            concurrency_limit: 10,
-        }
+        Self { project_id: String::new(), prefix: "validator-key-".to_string() }
     }
 }
 
@@ -72,12 +67,21 @@ impl GcpSecretProvider {
     ) -> Result<Zeroizing<String>, SecretProviderError> {
         let password_id = format!("{secret_id}-password");
         let data = self.access_secret_payload(&password_id).await?;
-        let password = String::from_utf8(data.to_vec()).map_err(|_| {
-            SecretProviderError::InvalidKeyMaterial(format!(
-                "password secret {password_id} is not valid UTF-8"
-            ))
-        })?;
-        Ok(Zeroizing::new(password.trim().to_string()))
+        let raw_bytes = data.to_vec();
+        let password = match String::from_utf8(raw_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                let mut bytes = e.into_bytes();
+                bytes.zeroize();
+                return Err(SecretProviderError::InvalidKeyMaterial(format!(
+                    "password secret {password_id} is not valid UTF-8"
+                )));
+            }
+        };
+        let result = Zeroizing::new(password.trim().to_string());
+        let mut password = password;
+        password.zeroize();
+        Ok(result)
     }
 }
 
@@ -343,20 +347,15 @@ mod tests {
     fn test_config_defaults() {
         let config = GcpSecretProviderConfig::default();
         assert_eq!(config.prefix, "validator-key-");
-        assert_eq!(config.concurrency_limit, 10);
         assert!(config.project_id.is_empty());
     }
 
     #[test]
     fn test_config_custom() {
-        let config = GcpSecretProviderConfig {
-            project_id: "my-project".into(),
-            prefix: "bls-key-".into(),
-            concurrency_limit: 5,
-        };
+        let config =
+            GcpSecretProviderConfig { project_id: "my-project".into(), prefix: "bls-key-".into() };
         assert_eq!(config.project_id, "my-project");
         assert_eq!(config.prefix, "bls-key-");
-        assert_eq!(config.concurrency_limit, 5);
     }
 
     #[test]

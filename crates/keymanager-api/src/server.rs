@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use axum::routing::get;
 use axum::Router;
+use zeroize::Zeroizing;
 
 use crate::auth;
 use crate::handlers::{self, AppState};
@@ -15,7 +16,7 @@ pub const DEFAULT_ADDR: SocketAddr =
 
 pub struct KeymanagerServer {
     state: Arc<AppState>,
-    token: Arc<String>,
+    token: Arc<Zeroizing<String>>,
     addr: SocketAddr,
 }
 
@@ -37,7 +38,7 @@ impl KeymanagerServer {
                 doppelganger_monitor,
                 remote_key_manager,
             }),
-            token: Arc::new(token),
+            token: Arc::new(Zeroizing::new(token)),
             addr,
         }
     }

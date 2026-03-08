@@ -122,10 +122,12 @@ pub enum SseConnectionState {
 /// Subscribes to beacon node SSE events. Calls `callback` for each parsed event.
 ///
 /// - Auto-reconnects on connection drop.
-/// - Falls back to polling after `MAX_CONSECUTIVE_FAILURES` consecutive connection failures.
+/// - Supports failover to secondary endpoints when multiple configs are provided.
+/// - Falls back to polling after `MAX_CONSECUTIVE_FAILURES` consecutive connection failures
+///   on the current endpoint before switching to the next one.
 /// - Stops when `shutdown` resolves.
 pub async fn subscribe_events<F>(
-    config: SseConfig,
+    configs: Vec<SseConfig>,
     callback: F,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) where
@@ -134,9 +136,12 @@ pub async fn subscribe_events<F>(
     use reqwest_eventsource::{Event, EventSource};
     use tracing::{debug, info, warn};
 
-    let topics = config.topics.join(",");
-    let url = format!("{}/eth/v1/events?topics={}", config.endpoint.trim_end_matches('/'), topics);
+    if configs.is_empty() {
+        warn!("No SSE endpoints configured");
+        return;
+    }
 
+    let mut current_idx = 0;
     let mut consecutive_failures: u32 = 0;
 
     loop {
@@ -146,6 +151,20 @@ pub async fn subscribe_events<F>(
         }
 
         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+            // Try failover to next endpoint if available
+            if configs.len() > 1 {
+                let next_idx = (current_idx + 1) % configs.len();
+                warn!(
+                    from = %configs[current_idx].endpoint,
+                    to = %configs[next_idx].endpoint,
+                    "SSE failover to secondary endpoint"
+                );
+                current_idx = next_idx;
+                consecutive_failures = 0;
+                continue;
+            }
+
+            // Only one endpoint, fall back to polling
             warn!(
                 failures = consecutive_failures,
                 "SSE max failures reached, falling back to polling"
@@ -161,6 +180,11 @@ pub async fn subscribe_events<F>(
                 }
             }
         }
+
+        let config = &configs[current_idx];
+        let topics = config.topics.join(",");
+        let url =
+            format!("{}/eth/v1/events?topics={}", config.endpoint.trim_end_matches('/'), topics);
 
         debug!(url = %url, "connecting to SSE stream");
 
@@ -501,7 +525,7 @@ mod tests {
         let config = SseConfig::new("http://localhost:1".to_string());
         let callback = |_event: SseEvent| {};
 
-        subscribe_events(config, callback, rx).await;
+        subscribe_events(vec![config], callback, rx).await;
         drop(tx);
     }
 
@@ -568,7 +592,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             subscribe_events(
-                config,
+                vec![config],
                 move |event| {
                     events_clone.lock().unwrap().push(event);
                 },
@@ -623,7 +647,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             subscribe_events(
-                config,
+                vec![config],
                 move |event| {
                     events_clone.lock().unwrap().push(event);
                 },
@@ -671,7 +695,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             subscribe_events(
-                config,
+                vec![config],
                 move |event| {
                     events_clone.lock().unwrap().push(event);
                 },
@@ -749,7 +773,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             subscribe_events(
-                config,
+                vec![config],
                 move |event| {
                     events_clone.lock().unwrap().push(event);
                 },
@@ -779,5 +803,68 @@ mod tests {
 
         let total_connects = *connect_count.lock().unwrap();
         assert!(total_connects >= 2, "expected at least 2 connections, got {}", total_connects);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_events_empty_configs() {
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let callback = |_event: SseEvent| {};
+        // Should return immediately without panic
+        subscribe_events(vec![], callback, rx).await;
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_events_failover_to_secondary() {
+        use std::sync::{Arc, Mutex};
+
+        // Primary endpoint: always refuses connections (port with no listener)
+        // Secondary endpoint: serves events
+        let sse_body = "event: head\ndata: {\"slot\":\"42\",\"block\":\"0xa\",\"state\":\"0xb\",\"epoch_transition\":false,\"previous_duty_dependent_root\":\"0xc\",\"current_duty_dependent_root\":\"0xd\",\"execution_optimistic\":false}\n\n";
+
+        let (secondary_port, server_handle) = start_sse_server(sse_body).await;
+
+        let events: Arc<Mutex<Vec<SseEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        // Primary: unreachable port, secondary: our server
+        let configs = vec![
+            SseConfig::new("http://127.0.0.1:1".to_string()),
+            SseConfig::new(format!("http://127.0.0.1:{secondary_port}")),
+        ];
+
+        let handle = tokio::spawn(async move {
+            subscribe_events(
+                configs,
+                move |event| {
+                    events_clone.lock().unwrap().push(event);
+                },
+                rx,
+            )
+            .await;
+        });
+
+        // Wait for failover and event reception
+        for _ in 0..60 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !events.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+
+        tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+        server_handle.abort();
+
+        let received = events.lock().unwrap();
+        assert!(
+            !received.is_empty(),
+            "should have received events from secondary endpoint after failover"
+        );
+        match &received[0] {
+            SseEvent::Head(h) => assert_eq!(h.slot, "42"),
+            other => panic!("expected Head event, got: {:?}", other),
+        }
     }
 }

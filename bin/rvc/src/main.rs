@@ -333,7 +333,10 @@ async fn main() -> anyhow::Result<()> {
                 metrics_port: Some(metrics_port),
                 grpc_port: Some(grpc_port),
                 grpc_address: Some(grpc_address),
-                network: network.and_then(|n| n.parse::<Network>().ok()),
+                network: network
+                    .map(|n| n.parse::<Network>())
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
                 genesis_time,
                 genesis_validators_root,
                 graffiti,

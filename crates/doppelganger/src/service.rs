@@ -128,10 +128,8 @@ impl DoppelgangerService {
             let liveness_data = self
                 .liveness_checker
                 .check_liveness(check_epoch, &indices)
-                .instrument(epoch_span.clone())
+                .instrument(epoch_span)
                 .await?;
-
-            let _epoch_guard = epoch_span.enter();
 
             // Build index -> pubkey reverse map for this check
             let index_to_pubkey: HashMap<&str, &str> = pubkeys_to_monitor

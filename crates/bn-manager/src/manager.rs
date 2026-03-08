@@ -189,9 +189,10 @@ impl BnManager {
     where
         F: Fn(SseEvent) + Send + Sync + 'static,
     {
-        let config = SseConfig::new(self.clients[0].endpoint().to_string());
+        let configs: Vec<SseConfig> =
+            self.clients.iter().map(|c| SseConfig::new(c.endpoint().to_string())).collect();
         tokio::spawn(async move {
-            sse::subscribe_events(config, callback, shutdown).await;
+            sse::subscribe_events(configs, callback, shutdown).await;
         })
     }
 

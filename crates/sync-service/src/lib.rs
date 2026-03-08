@@ -130,7 +130,7 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
 
         let mut messages = Vec::new();
         for (duty, pubkey) in duties.iter().zip(pubkeys.iter()) {
-            let sig = self
+            let sig = match self
                 .signer
                 .sign_sync_committee_message(
                     head_root,
@@ -139,7 +139,18 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
                     &self.fork_schedule,
                     &self.genesis_validators_root,
                 )
-                .await?;
+                .await
+            {
+                Ok(sig) => sig,
+                Err(e) => {
+                    tracing::warn!(
+                        validator_index = duty.validator_index,
+                        error = %e,
+                        "Failed to sign sync committee message, skipping validator"
+                    );
+                    continue;
+                }
+            };
 
             messages.push(SyncCommitteeMessage {
                 slot,
@@ -147,6 +158,11 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
                 validator_index: duty.validator_index,
                 signature: sig,
             });
+        }
+
+        if messages.is_empty() {
+            debug!(slot, "No sync committee messages to submit after signing failures");
+            return Ok(SyncMessagesResult { count: 0 });
         }
 
         debug!(count = messages.len(), slot, "Submitting sync committee messages");
@@ -577,8 +593,9 @@ mod tests {
 
         let result = service.produce_sync_messages(100, &duties, &head_root, &pubkeys).await;
 
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SyncServiceError::Signer(_)));
+        // Signing failure is now gracefully handled: returns Ok with count=0
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().count, 0);
         assert_eq!(service.beacon.submit_messages_call_count.load(Ordering::SeqCst), 0);
     }
 
@@ -784,5 +801,83 @@ mod tests {
         let result = result.unwrap();
         assert_eq!(result.count, 0);
         assert_eq!(service.beacon.submit_proofs_call_count.load(Ordering::SeqCst), 0);
+    }
+
+    /// A mock signer that fails on specific call indices (0-based).
+    struct PerCallMockSigner {
+        call_count: AtomicUsize,
+        fail_on_calls: Vec<usize>,
+    }
+
+    impl PerCallMockSigner {
+        fn new(fail_on_calls: Vec<usize>) -> Self {
+            Self { call_count: AtomicUsize::new(0), fail_on_calls }
+        }
+    }
+
+    #[async_trait]
+    impl SyncSigner for PerCallMockSigner {
+        async fn sign_sync_committee_message(
+            &self,
+            _beacon_block_root: &Root,
+            _slot: Slot,
+            _pubkey: &PublicKey,
+            _fork_schedule: &ForkSchedule,
+            _genesis_validators_root: &Root,
+        ) -> Result<Signature, SyncServiceError> {
+            let idx = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if self.fail_on_calls.contains(&idx) {
+                Err(SyncServiceError::Signer(format!("mock failure on call {}", idx)))
+            } else {
+                Ok(vec![0xaa; 96])
+            }
+        }
+
+        async fn sign_selection_proof(
+            &self,
+            _slot: Slot,
+            _subcommittee_index: u64,
+            _pubkey: &PublicKey,
+            _fork_schedule: &ForkSchedule,
+            _genesis_validators_root: &Root,
+        ) -> Result<Signature, SyncServiceError> {
+            Ok(vec![0xbb; 96])
+        }
+
+        async fn sign_contribution_and_proof(
+            &self,
+            _contribution_and_proof: &ContributionAndProof,
+            _pubkey: &PublicKey,
+            _fork_schedule: &ForkSchedule,
+            _genesis_validators_root: &Root,
+        ) -> Result<Signature, SyncServiceError> {
+            Ok(vec![0xcc; 96])
+        }
+    }
+
+    #[tokio::test]
+    async fn test_produce_sync_messages_partial_failure() {
+        // 3 validators, the 2nd one (index 1) fails signing
+        let signer = PerCallMockSigner::new(vec![1]);
+        let beacon = MockBeacon::new();
+        let service = SyncService::new(
+            Arc::new(signer),
+            Arc::new(beacon),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let duties = sample_duties(3);
+        let pubkeys = sample_pubkeys(3);
+        let head_root = [0x11; 32];
+
+        let result = service.produce_sync_messages(100, &duties, &head_root, &pubkeys).await;
+
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        // 2 out of 3 should succeed
+        assert_eq!(result.count, 2);
+        // Submit should still be called once with the 2 successful messages
+        assert_eq!(service.beacon.submit_messages_call_count.load(Ordering::SeqCst), 1);
     }
 }
