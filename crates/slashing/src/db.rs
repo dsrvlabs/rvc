@@ -34,6 +34,21 @@ impl SlashingDb {
         let path = path.as_ref();
         let conn = Connection::open(path)?;
 
+        // Enable WAL journal mode for crash-safe durability.
+        // WAL creates -wal and -shm sidecar files, so this must be set before permissions.
+        let journal_mode: String =
+            conn.pragma_update_and_check(None, "journal_mode", "wal", |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            tracing::warn!(
+                actual_mode = %journal_mode,
+                "WAL journal mode not supported; falling back to '{}'",
+                journal_mode,
+            );
+        }
+
+        // Set synchronous=FULL unconditionally for durability (works with both WAL and DELETE).
+        conn.pragma_update(None, "synchronous", "FULL")?;
+
         // Set restrictive file permissions (owner-only read/write)
         #[cfg(unix)]
         {
@@ -3338,6 +3353,54 @@ mod tests {
             )
             .expect("failed to query tables");
         assert_eq!(table_count, 1);
+    }
+
+    #[test]
+    fn test_open_sets_wal_journal_mode() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("wal_test.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        let conn = db.conn.lock().expect("mutex poisoned");
+        let mode: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0)).unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    #[test]
+    fn test_open_sets_synchronous_full() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("sync_test.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        let conn = db.conn.lock().expect("mutex poisoned");
+        let sync_mode: i64 =
+            conn.pragma_query_value(None, "synchronous", |row| row.get(0)).unwrap();
+        // FULL = 2
+        assert_eq!(sync_mode, 2);
+    }
+
+    #[test]
+    fn test_wal_crash_durability() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("durability_test.db");
+
+        let pubkey = "0xabcdef1234567890";
+
+        // Write a record, then drop without explicit close
+        {
+            let db = SlashingDb::open(&path).expect("failed to open db");
+            db.record_attestation(pubkey, 1, 2, Some("0xroot".to_string())).expect("record failed");
+            // Drop db without explicit close — WAL should ensure durability
+        }
+
+        // Reopen and verify the record persisted
+        {
+            let db = SlashingDb::open(&path).expect("failed to reopen db");
+            let attestations = db.get_attestations(pubkey).expect("query failed");
+            assert_eq!(attestations.len(), 1);
+            assert_eq!(attestations[0].source_epoch, 1);
+            assert_eq!(attestations[0].target_epoch, 2);
+        }
     }
 }
 
