@@ -425,7 +425,12 @@ impl SlashingDb {
             });
         }
 
+        let mut conn = self.conn.lock().expect("mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
         for validator in &interchange.data {
+            let pubkey = normalize_pubkey(&validator.pubkey);
+
             for attestation in &validator.signed_attestations {
                 let source_epoch: Epoch = attestation.source_epoch.parse().map_err(|_| {
                     SlashingError::InvalidInterchangeFormat(format!(
@@ -441,11 +446,9 @@ impl SlashingDb {
                     ))
                 })?;
 
-                self.record_attestation(
-                    &validator.pubkey,
-                    source_epoch,
-                    target_epoch,
-                    attestation.signing_root.clone(),
+                tx.execute(
+                    "INSERT OR IGNORE INTO attestations (pubkey, source_epoch, target_epoch, signing_root) VALUES (?1, ?2, ?3, ?4)",
+                    (&pubkey, source_epoch as i64, target_epoch as i64, &attestation.signing_root),
                 )?;
             }
 
@@ -454,10 +457,14 @@ impl SlashingDb {
                     SlashingError::InvalidInterchangeFormat(format!("invalid slot: {}", block.slot))
                 })?;
 
-                self.record_block(&validator.pubkey, slot, block.signing_root.clone())?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO blocks (pubkey, slot, signing_root) VALUES (?1, ?2, ?3)",
+                    (&pubkey, slot as i64, &block.signing_root),
+                )?;
             }
         }
 
+        tx.commit()?;
         Ok(())
     }
 
@@ -3401,6 +3408,156 @@ mod tests {
             assert_eq!(attestations[0].source_epoch, 1);
             assert_eq!(attestations[0].target_epoch, 2);
         }
+    }
+
+    #[test]
+    fn test_import_atomic_success() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data: vec![
+                ValidatorRecord {
+                    pubkey: "0xaaa".to_string(),
+                    signed_blocks: vec![InterchangeBlock {
+                        slot: "10".to_string(),
+                        signing_root: None,
+                    }],
+                    signed_attestations: vec![InterchangeAttestation {
+                        source_epoch: "1".to_string(),
+                        target_epoch: "2".to_string(),
+                        signing_root: None,
+                    }],
+                },
+                ValidatorRecord {
+                    pubkey: "0xbbb".to_string(),
+                    signed_blocks: vec![InterchangeBlock {
+                        slot: "20".to_string(),
+                        signing_root: Some("0xroot".to_string()),
+                    }],
+                    signed_attestations: vec![InterchangeAttestation {
+                        source_epoch: "3".to_string(),
+                        target_epoch: "4".to_string(),
+                        signing_root: Some("0xroot2".to_string()),
+                    }],
+                },
+            ],
+        };
+
+        db.import(&interchange, genesis_root).expect("import should succeed");
+
+        let att_a = db.get_attestations("0xaaa").expect("query failed");
+        assert_eq!(att_a.len(), 1);
+        assert_eq!(att_a[0].source_epoch, 1);
+
+        let blocks_b = db.get_blocks("0xbbb").expect("query failed");
+        assert_eq!(blocks_b.len(), 1);
+        assert_eq!(blocks_b[0].slot, 20);
+    }
+
+    #[test]
+    fn test_import_atomic_rollback_on_error() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        // Validators 1-5 are valid, validator 6 has invalid epoch
+        let mut data = Vec::new();
+        for i in 0..5 {
+            data.push(ValidatorRecord {
+                pubkey: format!("0x{:04x}", i),
+                signed_blocks: vec![InterchangeBlock {
+                    slot: format!("{}", i * 100),
+                    signing_root: None,
+                }],
+                signed_attestations: vec![InterchangeAttestation {
+                    source_epoch: format!("{}", i),
+                    target_epoch: format!("{}", i + 1),
+                    signing_root: None,
+                }],
+            });
+        }
+        // Validator 6 with invalid epoch
+        data.push(ValidatorRecord {
+            pubkey: "0xbad".to_string(),
+            signed_blocks: vec![],
+            signed_attestations: vec![InterchangeAttestation {
+                source_epoch: "not_a_number".to_string(),
+                target_epoch: "10".to_string(),
+                signing_root: None,
+            }],
+        });
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data,
+        };
+
+        let result = db.import(&interchange, genesis_root);
+        assert!(result.is_err());
+
+        // All 5 valid validators should have zero records due to rollback
+        for i in 0..5 {
+            let pubkey = format!("0x{:04x}", i);
+            let attestations = db.get_attestations(&pubkey).expect("query failed");
+            assert_eq!(
+                attestations.len(),
+                0,
+                "validator {} should have no attestations after rollback",
+                i
+            );
+            let blocks = db.get_blocks(&pubkey).expect("query failed");
+            assert_eq!(blocks.len(), 0, "validator {} should have no blocks after rollback", i);
+        }
+    }
+
+    #[test]
+    fn test_import_atomic_large_batch() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        let mut data = Vec::new();
+        for i in 0..1000 {
+            data.push(ValidatorRecord {
+                pubkey: format!("0x{:06x}", i),
+                signed_blocks: vec![InterchangeBlock {
+                    slot: format!("{}", i * 10),
+                    signing_root: None,
+                }],
+                signed_attestations: vec![InterchangeAttestation {
+                    source_epoch: format!("{}", i),
+                    target_epoch: format!("{}", i + 1),
+                    signing_root: None,
+                }],
+            });
+        }
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data,
+        };
+
+        db.import(&interchange, genesis_root).expect("large import should succeed");
+
+        // Spot-check a few validators
+        let att_0 = db.get_attestations("0x000000").expect("query failed");
+        assert_eq!(att_0.len(), 1);
+        let att_999 = db.get_attestations("0x0003e7").expect("query failed");
+        assert_eq!(att_999.len(), 1);
+        assert_eq!(att_999[0].source_epoch, 999);
+
+        let blocks_500 = db.get_blocks("0x0001f4").expect("query failed");
+        assert_eq!(blocks_500.len(), 1);
+        assert_eq!(blocks_500[0].slot, 5000);
     }
 }
 
