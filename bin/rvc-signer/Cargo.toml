@@ -39,6 +39,7 @@ rcgen = "0.13"
 tempfile.workspace = true
 proptest.workspace = true
 rand.workspace = true
+tokio-stream.workspace = true
 
 # DVT test dependencies (always available in tests when dvt feature is on)
 vsss-rs.workspace = true

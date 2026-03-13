@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use tonic::transport::server::ServerTlsConfig;
-use tonic::transport::{Certificate, Identity};
+use tonic::transport::{Certificate, ClientTlsConfig, Identity};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
@@ -28,6 +28,27 @@ pub struct TlsConfig {
 impl TlsConfig {
     pub fn new(cert_path: PathBuf, key_path: PathBuf, ca_cert_path: PathBuf) -> Self {
         Self { cert_path, key_path, ca_cert_path }
+    }
+
+    /// Build a tonic `ServerTlsConfig` with mTLS enabled.
+    ///
+    /// Client certificates are required (not optional). Connections
+    /// without a valid client certificate signed by the CA are rejected.
+    /// Build a tonic `ClientTlsConfig` for mTLS peer connections.
+    ///
+    /// Uses the same cert/key/CA as the server: the client presents its
+    /// identity and verifies the peer's certificate against the shared CA.
+    pub fn to_client_tls_config(&self) -> Result<ClientTlsConfig, TlsError> {
+        let cert = read_file(&self.cert_path)
+            .map_err(|source| TlsError::ReadCert { path: self.cert_path.clone(), source })?;
+        let key = read_file(&self.key_path)
+            .map_err(|source| TlsError::ReadKey { path: self.key_path.clone(), source })?;
+        let ca_cert = read_file(&self.ca_cert_path)
+            .map_err(|source| TlsError::ReadCaCert { path: self.ca_cert_path.clone(), source })?;
+
+        Ok(ClientTlsConfig::new()
+            .identity(Identity::from_pem(&cert, &key))
+            .ca_certificate(Certificate::from_pem(&ca_cert)))
     }
 
     /// Build a tonic `ServerTlsConfig` with mTLS enabled.

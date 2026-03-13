@@ -18,6 +18,8 @@ pub mod proto {
     }
 }
 
+#[cfg(feature = "dvt")]
+pub use proto::signer::peer_signer_service_client::PeerSignerServiceClient;
 pub use proto::signer::peer_signer_service_server::{PeerSignerService, PeerSignerServiceServer};
 pub use proto::signer::signer_service_server::{SignerService, SignerServiceServer};
 pub use proto::signer::{
@@ -78,6 +80,26 @@ struct Cli {
     /// Signing backend to use
     #[arg(long, value_enum, default_value_t = Backend::Basic)]
     backend: Backend,
+
+    /// Comma-separated list of DVT peer addresses (host:port)
+    #[cfg(feature = "dvt")]
+    #[arg(long, value_delimiter = ',')]
+    dvt_peers: Vec<String>,
+
+    /// DVT threshold for signature reconstruction
+    #[cfg(feature = "dvt")]
+    #[arg(long)]
+    dvt_threshold: Option<u64>,
+
+    /// This node's DVT share index
+    #[cfg(feature = "dvt")]
+    #[arg(long)]
+    dvt_index: Option<u64>,
+
+    /// DVT per-peer RPC timeout in milliseconds
+    #[cfg(feature = "dvt")]
+    #[arg(long, default_value = "2000")]
+    dvt_timeout: u64,
 }
 
 #[tokio::main]
@@ -310,5 +332,84 @@ mod tests {
         let resp = PartialSignResponse { partial_signature: vec![0u8; 96], share_index: 3 };
         assert_eq!(resp.partial_signature.len(), 96);
         assert_eq!(resp.share_index, 3);
+    }
+
+    #[cfg(feature = "dvt")]
+    mod dvt_cli {
+        use super::*;
+
+        #[test]
+        fn test_dvt_peers_flag() {
+            let cli = Cli::parse_from([
+                "rvc-signer",
+                "--keystore-dir",
+                "/tmp/ks",
+                "--dvt-peers",
+                "127.0.0.1:50053,127.0.0.1:50054",
+            ]);
+            assert_eq!(cli.dvt_peers, vec!["127.0.0.1:50053", "127.0.0.1:50054"]);
+        }
+
+        #[test]
+        fn test_dvt_threshold_and_index() {
+            let cli = Cli::parse_from([
+                "rvc-signer",
+                "--keystore-dir",
+                "/tmp/ks",
+                "--dvt-threshold",
+                "2",
+                "--dvt-index",
+                "1",
+            ]);
+            assert_eq!(cli.dvt_threshold, Some(2));
+            assert_eq!(cli.dvt_index, Some(1));
+        }
+
+        #[test]
+        fn test_dvt_timeout_default() {
+            let cli = Cli::parse_from(["rvc-signer", "--keystore-dir", "/tmp/ks"]);
+            assert_eq!(cli.dvt_timeout, 2000);
+        }
+
+        #[test]
+        fn test_dvt_timeout_custom() {
+            let cli = Cli::parse_from([
+                "rvc-signer",
+                "--keystore-dir",
+                "/tmp/ks",
+                "--dvt-timeout",
+                "5000",
+            ]);
+            assert_eq!(cli.dvt_timeout, 5000);
+        }
+
+        #[test]
+        fn test_dvt_peers_empty_by_default() {
+            let cli = Cli::parse_from(["rvc-signer", "--keystore-dir", "/tmp/ks"]);
+            assert!(cli.dvt_peers.is_empty());
+        }
+
+        #[test]
+        fn test_dvt_all_flags_together() {
+            let cli = Cli::parse_from([
+                "rvc-signer",
+                "--keystore-dir",
+                "/tmp/ks",
+                "--dvt-peers",
+                "peer1:50053,peer2:50054,peer3:50055",
+                "--dvt-threshold",
+                "3",
+                "--dvt-index",
+                "0",
+                "--dvt-timeout",
+                "1500",
+                "--password-file",
+                "/tmp/pw.txt",
+            ]);
+            assert_eq!(cli.dvt_peers.len(), 3);
+            assert_eq!(cli.dvt_threshold, Some(3));
+            assert_eq!(cli.dvt_index, Some(0));
+            assert_eq!(cli.dvt_timeout, 1500);
+        }
     }
 }
