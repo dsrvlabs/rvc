@@ -244,17 +244,6 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         (Arc::new(signer), None)
     };
 
-<<<<<<< HEAD
-    // Set up Prometheus metrics
-    let signer_metrics = Arc::new(metrics::SignerMetrics::new());
-    let key_count = signing_backend.public_keys().len() as f64;
-    signer_metrics.keys_loaded.with_label_values(&[&resolved.backend]).set(key_count);
-
-    let metrics_addr: std::net::SocketAddr = args.metrics_address.parse()?;
-    let (_metrics_handle, metrics_bound_addr) =
-        metrics::serve_metrics(metrics_addr, Arc::clone(&signer_metrics)).await?;
-    info!(address = %metrics_bound_addr, "Prometheus metrics server listening");
-=======
     // Validate TLS certificates if provided
     if let Some(ref tls) = tls_config {
         tls.to_server_tls_config()?;
@@ -281,7 +270,16 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
->>>>>>> e5010e3 (feat(rvc-signer): add dry-run mode for configuration validation (RS-21))
+
+    // Set up Prometheus metrics
+    let signer_metrics = Arc::new(metrics::SignerMetrics::new());
+    let key_count = signing_backend.public_keys().len() as f64;
+    signer_metrics.keys_loaded.with_label_values(&[&resolved.backend]).set(key_count);
+
+    let metrics_addr: std::net::SocketAddr = args.metrics_address.parse()?;
+    let (_metrics_handle, metrics_bound_addr) =
+        metrics::serve_metrics(metrics_addr, Arc::clone(&signer_metrics)).await?;
+    info!(address = %metrics_bound_addr, "Prometheus metrics server listening");
 
     let signer_service =
         service::SignerServiceImpl::new(Arc::clone(&signing_backend), resolved.backend.clone())
@@ -610,6 +608,7 @@ mod tests {
             tls_ca_cert: None,
             dry_run: true,
             backend: Backend::Basic,
+            metrics_address: "127.0.0.1:0".to_string(),
             #[cfg(feature = "dvt")]
             dvt_peers: vec![],
             #[cfg(feature = "dvt")]
@@ -641,6 +640,7 @@ mod tests {
             tls_ca_cert: None,
             dry_run: true,
             backend: Backend::Basic,
+            metrics_address: "127.0.0.1:0".to_string(),
             #[cfg(feature = "dvt")]
             dvt_peers: vec![],
             #[cfg(feature = "dvt")]
@@ -700,6 +700,7 @@ mod tests {
             tls_ca_cert: Some(ca_cert_path),
             dry_run: true,
             backend: Backend::Basic,
+            metrics_address: "127.0.0.1:0".to_string(),
             #[cfg(feature = "dvt")]
             dvt_peers: vec![],
             #[cfg(feature = "dvt")]
@@ -738,6 +739,7 @@ mod tests {
             tls_ca_cert: Some(PathBuf::from("/nonexistent/ca.pem")),
             dry_run: true,
             backend: Backend::Basic,
+            metrics_address: "127.0.0.1:0".to_string(),
             #[cfg(feature = "dvt")]
             dvt_peers: vec![],
             #[cfg(feature = "dvt")]
