@@ -10,6 +10,7 @@ use eth_types::Root;
 
 pub struct CompositeSigner {
     local: LocalSigner,
+    grpc_remote: RwLock<HashMap<[u8; PUBLIC_KEY_BYTES_LEN], Arc<dyn Signer + Send + Sync>>>,
     remote: RwLock<HashMap<[u8; PUBLIC_KEY_BYTES_LEN], Arc<RemoteSigner>>>,
     dynamic_local: RwLock<HashMap<[u8; PUBLIC_KEY_BYTES_LEN], SecretKey>>,
 }
@@ -18,9 +19,25 @@ impl CompositeSigner {
     pub fn new(local: LocalSigner) -> Self {
         Self {
             local,
+            grpc_remote: RwLock::new(HashMap::new()),
             remote: RwLock::new(HashMap::new()),
             dynamic_local: RwLock::new(HashMap::new()),
         }
+    }
+
+    pub fn add_grpc_remote_signer(
+        &self,
+        pubkeys: Vec<[u8; PUBLIC_KEY_BYTES_LEN]>,
+        signer: Arc<dyn Signer + Send + Sync>,
+    ) {
+        let mut grpc = self.grpc_remote.write().expect("grpc_remote lock poisoned");
+        for pubkey in pubkeys {
+            grpc.insert(pubkey, Arc::clone(&signer));
+        }
+    }
+
+    pub fn remove_grpc_remote_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
+        self.grpc_remote.write().expect("grpc_remote lock poisoned").remove(pubkey).is_some()
     }
 
     pub fn add_remote_key(&self, pubkey: [u8; PUBLIC_KEY_BYTES_LEN], signer: RemoteSigner) {
@@ -48,7 +65,16 @@ impl Signer for CompositeSigner {
         signing_root: &Root,
         pubkey: &[u8; PUBLIC_KEY_BYTES_LEN],
     ) -> Result<Signature, SigningError> {
-        // Check remote signers first — clone Arc to release the lock before await
+        // Check gRPC remote signers first (highest priority)
+        let grpc_signer = {
+            let grpc = self.grpc_remote.read().expect("grpc_remote lock poisoned");
+            grpc.get(pubkey).cloned()
+        };
+        if let Some(signer) = grpc_signer {
+            return signer.sign(signing_root, pubkey).await;
+        }
+
+        // Check HTTP remote signers — clone Arc to release the lock before await
         let remote_signer = {
             let remote = self.remote.read().expect("remote lock poisoned");
             remote.get(pubkey).cloned()
@@ -79,6 +105,9 @@ impl Signer for CompositeSigner {
         for signer in remote.values() {
             keys.extend(signer.public_keys());
         }
+
+        let grpc = self.grpc_remote.read().expect("grpc_remote lock poisoned");
+        keys.extend(grpc.keys());
 
         keys.sort();
         keys.dedup();
@@ -279,5 +308,158 @@ mod tests {
         let sig = signer.sign(&signing_root, &pk_bytes).await.unwrap();
         assert_eq!(sig.to_bytes().len(), 96);
         assert_eq!(signer.public_keys().len(), 1);
+    }
+
+    // --- gRPC remote signer tests ---
+
+    struct MockGrpcSigner {
+        keys: Vec<[u8; PUBLIC_KEY_BYTES_LEN]>,
+        sk_bytes: [u8; 32],
+    }
+
+    impl MockGrpcSigner {
+        fn new(sk: &SecretKey, keys: Vec<[u8; PUBLIC_KEY_BYTES_LEN]>) -> Self {
+            Self { keys, sk_bytes: sk.to_bytes() }
+        }
+    }
+
+    #[async_trait]
+    impl Signer for MockGrpcSigner {
+        async fn sign(
+            &self,
+            signing_root: &Root,
+            pubkey: &[u8; PUBLIC_KEY_BYTES_LEN],
+        ) -> Result<Signature, SigningError> {
+            if self.keys.contains(pubkey) {
+                let sk = SecretKey::from_bytes(&self.sk_bytes).unwrap();
+                Ok(sk.sign(signing_root))
+            } else {
+                Err(SigningError::KeyNotFound(hex::encode(pubkey)))
+            }
+        }
+
+        fn public_keys(&self) -> Vec<[u8; PUBLIC_KEY_BYTES_LEN]> {
+            self.keys.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_composite_signer_grpc_remote_sign() {
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+        let signing_root: Root = [0xab; 32];
+        let expected_sig = sk.sign(&signing_root);
+
+        let mock_grpc = Arc::new(MockGrpcSigner::new(&sk, vec![pk_bytes]));
+
+        let composite = CompositeSigner::new(create_empty_local_signer());
+        composite.add_grpc_remote_signer(vec![pk_bytes], mock_grpc);
+
+        let sig = composite.sign(&signing_root, &pk_bytes).await.unwrap();
+        assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_composite_signer_grpc_remote_takes_priority_over_http_remote() {
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+        let signing_root: Root = [0xab; 32];
+        let expected_sig = sk.sign(&signing_root);
+
+        let mock_grpc = Arc::new(MockGrpcSigner::new(&sk, vec![pk_bytes]));
+
+        // Set up HTTP remote mock that should NOT be called
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/api/v1/eth2/sign/.*"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0) // Must not be called — gRPC has priority
+            .mount(&mock_server)
+            .await;
+
+        let config = RemoteSignerConfig::new(mock_server.uri());
+        let remote_signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+
+        let composite = CompositeSigner::new(create_empty_local_signer());
+        composite.add_grpc_remote_signer(vec![pk_bytes], mock_grpc);
+        composite.add_remote_key(pk_bytes, remote_signer);
+
+        let sig = composite.sign(&signing_root, &pk_bytes).await.unwrap();
+        assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_composite_signer_grpc_remote_takes_priority_over_local() {
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+        let signing_root: Root = [0xab; 32];
+        let expected_sig = sk.sign(&signing_root);
+
+        let mock_grpc = Arc::new(MockGrpcSigner::new(&sk, vec![pk_bytes]));
+
+        // Same key in both gRPC remote and local — gRPC should win
+        let composite = CompositeSigner::new(create_local_signer_with_key(sk));
+        composite.add_grpc_remote_signer(vec![pk_bytes], mock_grpc);
+
+        let sig = composite.sign(&signing_root, &pk_bytes).await.unwrap();
+        assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
+    }
+
+    #[tokio::test]
+    async fn test_composite_signer_public_keys_includes_grpc_remote() {
+        let sk1 = SecretKey::generate();
+        let pk1 = sk1.public_key().to_bytes();
+
+        let sk2 = SecretKey::generate();
+        let pk2 = sk2.public_key().to_bytes();
+
+        let mock_grpc = Arc::new(MockGrpcSigner::new(&sk2, vec![pk2]));
+
+        let composite = CompositeSigner::new(create_local_signer_with_key(sk1));
+        composite.add_grpc_remote_signer(vec![pk2], mock_grpc);
+
+        let keys = composite.public_keys();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&pk1));
+        assert!(keys.contains(&pk2));
+    }
+
+    #[tokio::test]
+    async fn test_composite_signer_remove_grpc_remote_key() {
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+
+        let mock_grpc = Arc::new(MockGrpcSigner::new(&sk, vec![pk_bytes]));
+
+        let composite = CompositeSigner::new(create_empty_local_signer());
+        composite.add_grpc_remote_signer(vec![pk_bytes], mock_grpc);
+        assert_eq!(composite.public_keys().len(), 1);
+
+        let removed = composite.remove_grpc_remote_key(&pk_bytes);
+        assert!(removed);
+        assert!(composite.public_keys().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_composite_signer_remove_grpc_remote_nonexistent() {
+        let composite = CompositeSigner::new(create_empty_local_signer());
+        let pk = [0xbb; PUBLIC_KEY_BYTES_LEN];
+        assert!(!composite.remove_grpc_remote_key(&pk));
+    }
+
+    #[tokio::test]
+    async fn test_composite_signer_public_keys_deduplicates_grpc_and_local() {
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+
+        let mock_grpc = Arc::new(MockGrpcSigner::new(&sk, vec![pk_bytes]));
+
+        // Same key in both local and gRPC remote
+        let composite = CompositeSigner::new(create_local_signer_with_key(sk));
+        composite.add_grpc_remote_signer(vec![pk_bytes], mock_grpc);
+
+        let keys = composite.public_keys();
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&pk_bytes));
     }
 }
