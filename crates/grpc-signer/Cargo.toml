@@ -18,6 +18,7 @@ tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+rcgen = "0.13"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream.workspace = true
 tracing-subscriber.workspace = true
