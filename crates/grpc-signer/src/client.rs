@@ -559,6 +559,117 @@ mod tests {
         assert!(config.tls_ca_cert.is_some());
     }
 
+    enum BadSignMode {
+        WrongKey,
+        GarbageBytes,
+    }
+
+    struct BadSignerService {
+        legit_keys: Vec<SecretKey>,
+        mode: BadSignMode,
+    }
+
+    #[tonic::async_trait]
+    impl SignerService for BadSignerService {
+        async fn sign(
+            &self,
+            request: Request<ProtoSignRequest>,
+        ) -> Result<Response<ProtoSignResponse>, Status> {
+            let req = request.into_inner();
+            let signing_root: [u8; 32] = req
+                .signing_root
+                .try_into()
+                .map_err(|_| Status::invalid_argument("invalid signing root length"))?;
+
+            let signature_bytes = match &self.mode {
+                BadSignMode::WrongKey => {
+                    let wrong_sk = SecretKey::generate();
+                    wrong_sk.sign(&signing_root).to_bytes().to_vec()
+                }
+                BadSignMode::GarbageBytes => vec![0xffu8; 96],
+            };
+
+            Ok(Response::new(ProtoSignResponse { signature: signature_bytes }))
+        }
+
+        async fn list_public_keys(
+            &self,
+            _request: Request<ListPublicKeysRequest>,
+        ) -> Result<Response<ListPublicKeysResponse>, Status> {
+            let pubkeys: Vec<Vec<u8>> =
+                self.legit_keys.iter().map(|sk| sk.public_key().to_bytes().to_vec()).collect();
+            Ok(Response::new(ListPublicKeysResponse { pubkeys }))
+        }
+
+        async fn get_status(
+            &self,
+            _request: Request<GetStatusRequest>,
+        ) -> Result<Response<GetStatusResponse>, Status> {
+            Ok(Response::new(GetStatusResponse {
+                ready: true,
+                backend: "bad_mock".to_string(),
+                key_count: self.legit_keys.len() as u32,
+            }))
+        }
+    }
+
+    async fn start_bad_server(
+        service: BadSignerService,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(SignerServiceServer::new(service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn test_sign_wrong_key_signature_rejected() {
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+
+        let (addr, _handle) = start_bad_server(BadSignerService {
+            legit_keys: vec![sk],
+            mode: BadSignMode::WrongKey,
+        })
+        .await;
+
+        let config = GrpcRemoteSignerConfig::new(format!("http://{addr}"));
+        let signer = GrpcRemoteSigner::connect(config).await.unwrap();
+
+        let result = signer.sign(&[0xab; 32], &pk_bytes).await;
+        match result.unwrap_err() {
+            SigningError::InvalidRemoteSignature => {}
+            other => panic!("expected InvalidRemoteSignature, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_sign_garbage_bytes_rejected() {
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+
+        let (addr, _handle) = start_bad_server(BadSignerService {
+            legit_keys: vec![sk],
+            mode: BadSignMode::GarbageBytes,
+        })
+        .await;
+
+        let config = GrpcRemoteSignerConfig::new(format!("http://{addr}"));
+        let signer = GrpcRemoteSigner::connect(config).await.unwrap();
+
+        let result = signer.sign(&[0xab; 32], &pk_bytes).await;
+        assert!(result.is_err(), "garbage signature bytes should be rejected");
+    }
+
     #[test]
     fn test_redact_url_hides_credentials() {
         let url = "http://user:pass@example.com:50051";
