@@ -242,7 +242,8 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         Option<Arc<backend::basic::BasicSigner>>,
     ) = match parse_backend(&resolved.backend)? {
         Backend::Basic => {
-            let signer = Arc::new(backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)?);
+            let signer =
+                Arc::new(backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)?);
             (Arc::clone(&signer) as Arc<dyn backend::SigningBackend>, None, Some(signer))
         }
         Backend::Dvt => {
@@ -263,7 +264,8 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         Option<()>,
         Option<Arc<backend::basic::BasicSigner>>,
     ) = {
-        let signer = Arc::new(backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)?);
+        let signer =
+            Arc::new(backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)?);
         (Arc::clone(&signer) as Arc<dyn backend::SigningBackend>, None, Some(signer))
     };
 
@@ -310,10 +312,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 reloader.run(cancel_clone).await;
             });
 
-            info!(
-                interval_secs = resolved.reload_interval_secs,
-                "Keystore hot-reload enabled"
-            );
+            info!(interval_secs = resolved.reload_interval_secs, "Keystore hot-reload enabled");
         }
     }
 
