@@ -36,12 +36,17 @@ const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:50052";
 pub enum Backend {
     /// Local keystore-based signing
     Basic,
+    /// Distributed Validator Technology (DVT) signing
+    #[cfg(feature = "dvt")]
+    Dvt,
 }
 
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Basic => write!(f, "basic"),
+            #[cfg(feature = "dvt")]
+            Self::Dvt => write!(f, "dvt"),
         }
     }
 }
@@ -193,34 +198,138 @@ async fn main() {
 async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let password = load_serve_password(&args)?;
 
-    let signer = backend::basic::BasicSigner::load(&args.keystore_dir, &password)?;
-    let backend: Arc<dyn backend::SigningBackend> = Arc::new(signer);
+    let tls_config = match (args.tls_cert.as_ref(), args.tls_key.as_ref(), args.tls_ca_cert.as_ref()) {
+        (Some(cert), Some(key), Some(ca)) => {
+            Some(tls::TlsConfig::new(cert.clone(), key.clone(), ca.clone()))
+        }
+        _ => None,
+    };
+
+    // Build the signing backend and optional peer signer service
+    #[cfg(feature = "dvt")]
+    let (signing_backend, peer_signer_service): (
+        Arc<dyn backend::SigningBackend>,
+        Option<dvt::peer_service::PeerSignerServiceImpl>,
+    ) = match args.backend {
+        Backend::Basic => {
+            let signer = backend::basic::BasicSigner::load(&args.keystore_dir, &password)?;
+            (Arc::new(signer), None)
+        }
+        Backend::Dvt => build_dvt_backend(&args, &password, tls_config.as_ref()).await?,
+    };
+
+    #[cfg(not(feature = "dvt"))]
+    let (signing_backend, peer_signer_service): (Arc<dyn backend::SigningBackend>, Option<()>) = {
+        let signer = backend::basic::BasicSigner::load(&args.keystore_dir, &password)?;
+        (Arc::new(signer), None)
+    };
 
     let signer_service =
-        service::SignerServiceImpl::new(Arc::clone(&backend), args.backend.to_string());
+        service::SignerServiceImpl::new(Arc::clone(&signing_backend), args.backend.to_string());
 
     let addr = args.listen_address.parse()?;
 
     let mut builder = tonic::transport::Server::builder();
 
-    if let (Some(cert), Some(key), Some(ca)) =
-        (args.tls_cert.as_ref(), args.tls_key.as_ref(), args.tls_ca_cert.as_ref())
-    {
-        let tls_config =
-            tls::TlsConfig::new(cert.clone(), key.clone(), ca.clone()).to_server_tls_config()?;
-        builder = builder.tls_config(tls_config)?;
+    if let Some(ref tls) = tls_config {
+        let server_tls = tls.to_server_tls_config()?;
+        builder = builder.tls_config(server_tls)?;
         info!("mTLS enabled");
     } else {
         info!("TLS disabled (no --tls-cert/--tls-key/--tls-ca-cert provided)");
     }
 
     info!(address = %addr, "gRPC server listening");
-    builder
-        .add_service(SignerServiceServer::new(signer_service))
-        .serve_with_shutdown(addr, shutdown_signal())
-        .await?;
+
+    let router = builder.add_service(SignerServiceServer::new(signer_service));
+
+    #[cfg(feature = "dvt")]
+    let router = if let Some(peer_svc) = peer_signer_service {
+        info!("PeerSignerService registered for DVT");
+        router.add_service(PeerSignerServiceServer::new(peer_svc))
+    } else {
+        router
+    };
+
+    #[cfg(not(feature = "dvt"))]
+    let _ = peer_signer_service;
+
+    router.serve_with_shutdown(addr, shutdown_signal()).await?;
 
     Ok(())
+}
+
+#[cfg(feature = "dvt")]
+async fn build_dvt_backend(
+    args: &ServeArgs,
+    password: &Zeroizing<String>,
+    tls_config: Option<&tls::TlsConfig>,
+) -> Result<
+    (Arc<dyn backend::SigningBackend>, Option<dvt::peer_service::PeerSignerServiceImpl>),
+    Box<dyn std::error::Error>,
+> {
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    let dvt_index = args.dvt_index.ok_or("--dvt-index is required when using --backend dvt")?;
+
+    let timeout = Duration::from_millis(args.dvt_timeout);
+
+    // Load Shamir shares from keystore directory
+    let shares = dvt::types::load_shares(&args.keystore_dir, password)
+        .map_err(|e| format!("failed to load DVT shares: {}", e))?;
+
+    if shares.is_empty() {
+        return Err("no DVT shares found in keystore directory".into());
+    }
+
+    info!(
+        share_count = shares.len(),
+        dvt_index,
+        peer_count = args.dvt_peers.len(),
+        "Loaded DVT shares"
+    );
+
+    // Build shared share map for PeerSignerServiceImpl
+    let share_map: HashMap<[u8; 48], dvt::types::ShareInfo> =
+        shares.iter().map(|s| (s.aggregate_pubkey, clone_share_info(s))).collect();
+
+    let peer_signer_service = dvt::peer_service::PeerSignerServiceImpl::new(Arc::new(share_map));
+
+    // Connect to peers
+    let peer_requester = if !args.dvt_peers.is_empty() {
+        let requester =
+            dvt::peer_client::GrpcPeerRequester::connect(&args.dvt_peers, tls_config, timeout)
+                .await
+                .map_err(|e| format!("failed to connect to DVT peers: {}", e))?;
+
+        info!(peers = ?requester.peer_addrs(), "Connected to DVT peers");
+        Some(Arc::new(requester) as Arc<dyn backend::dvt::PeerRequester>)
+    } else {
+        info!("No DVT peers configured; running in standalone mode");
+        None
+    };
+
+    let dvt_signer = backend::dvt::DvtSigner::new(
+        shares,
+        dvt_index,
+        args.dvt_peers.clone(),
+        peer_requester,
+        timeout,
+    );
+
+    Ok((Arc::new(dvt_signer), Some(peer_signer_service)))
+}
+
+#[cfg(feature = "dvt")]
+fn clone_share_info(s: &dvt::types::ShareInfo) -> dvt::types::ShareInfo {
+    dvt::types::ShareInfo {
+        index: s.index,
+        threshold: s.threshold,
+        total: s.total,
+        scalar_bytes: s.scalar_bytes.clone(),
+        aggregate_pubkey: s.aggregate_pubkey,
+    }
 }
 
 fn load_serve_password(args: &ServeArgs) -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
@@ -673,6 +782,382 @@ mod tests {
         #[test]
         fn test_load_password_from_args_neither() {
             let result = load_password_from_args(None, None);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_backend_dvt_display() {
+            assert_eq!(Backend::Dvt.to_string(), "dvt");
+        }
+
+        #[test]
+        fn test_cli_parse_backend_dvt() {
+            let cli = Cli::parse_from([
+                "rvc-signer",
+                "serve",
+                "--keystore-dir",
+                "/tmp/ks",
+                "--backend",
+                "dvt",
+                "--dvt-index",
+                "1",
+            ]);
+            match cli.command {
+                Command::Serve(args) => {
+                    assert!(matches!(args.backend, Backend::Dvt));
+                }
+                _ => panic!("expected Serve command"),
+            }
+        }
+
+        fn parse_serve_args(args: &[&str]) -> ServeArgs {
+            let cli = Cli::parse_from(args);
+            match cli.command {
+                Command::Serve(args) => args,
+                _ => panic!("expected Serve command"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_build_dvt_backend_missing_index_fails() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pw_file = dir.path().join("pw.txt");
+            std::fs::write(&pw_file, "test-password").unwrap();
+
+            let args = parse_serve_args(&[
+                "rvc-signer",
+                "serve",
+                "--keystore-dir",
+                dir.path().to_str().unwrap(),
+                "--backend",
+                "dvt",
+                "--password-file",
+                pw_file.to_str().unwrap(),
+            ]);
+            let password = load_serve_password(&args).unwrap();
+            let result = build_dvt_backend(&args, &password, None).await;
+            let err = result.err().expect("should fail without --dvt-index");
+            assert!(err.to_string().contains("--dvt-index"));
+        }
+
+        #[tokio::test]
+        async fn test_build_dvt_backend_no_shares_fails() {
+            let dir = tempfile::TempDir::new().unwrap();
+            let pw_file = dir.path().join("pw.txt");
+            std::fs::write(&pw_file, "test-password").unwrap();
+
+            let args = parse_serve_args(&[
+                "rvc-signer",
+                "serve",
+                "--keystore-dir",
+                dir.path().to_str().unwrap(),
+                "--backend",
+                "dvt",
+                "--dvt-index",
+                "1",
+                "--password-file",
+                pw_file.to_str().unwrap(),
+            ]);
+            let password = load_serve_password(&args).unwrap();
+            let result = build_dvt_backend(&args, &password, None).await;
+            let err = result.err().expect("should fail with no shares");
+            assert!(err.to_string().contains("no DVT shares"));
+        }
+
+        #[tokio::test]
+        async fn test_build_dvt_backend_with_shares_succeeds() {
+            use crypto::{EncryptionKdf, Keystore, SecretKey};
+
+            let dir = tempfile::TempDir::new().unwrap();
+            let pw = "test-password";
+            let pw_file = dir.path().join("pw.txt");
+            std::fs::write(&pw_file, pw).unwrap();
+
+            // Create a share keystore
+            let sk = SecretKey::generate();
+            let mut ks = Keystore::encrypt(&sk, pw.as_bytes(), "", EncryptionKdf::Pbkdf2).unwrap();
+            ks.description = Some("shamir-share".to_string());
+            ks.pubkey = Some(hex::encode(sk.public_key().to_bytes()));
+            std::fs::write(dir.path().join("share-1.json"), ks.to_json().unwrap()).unwrap();
+
+            let meta = serde_json::json!({"threshold": 1, "total": 1, "index": 1});
+            std::fs::write(dir.path().join("share-meta.json"), meta.to_string()).unwrap();
+
+            let args = parse_serve_args(&[
+                "rvc-signer",
+                "serve",
+                "--keystore-dir",
+                dir.path().to_str().unwrap(),
+                "--backend",
+                "dvt",
+                "--dvt-index",
+                "1",
+                "--password-file",
+                pw_file.to_str().unwrap(),
+            ]);
+            let password = load_serve_password(&args).unwrap();
+            let (backend, peer_svc) = build_dvt_backend(&args, &password, None).await.unwrap();
+
+            assert_eq!(backend.public_keys().len(), 1);
+            assert_eq!(backend.public_keys()[0], sk.public_key().to_bytes());
+            assert!(peer_svc.is_some());
+        }
+    }
+
+    #[cfg(feature = "dvt")]
+    mod dvt_integration {
+        use super::*;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use backend::dvt::{DvtSigner, PeerRequester};
+        use backend::SigningBackend;
+        use dvt::peer_client::GrpcPeerRequester;
+        use dvt::peer_service::PeerSignerServiceImpl;
+        use dvt::types::ShareInfo;
+        use zeroize::Zeroizing;
+
+        use bls12_381_plus::Scalar;
+        use rand::rngs::OsRng;
+        use vsss_rs::{shamir, DefaultShare, IdentifierPrimeField};
+
+        use dvt::bridge::blst_sk_to_scalar;
+
+        type BlsShare = DefaultShare<IdentifierPrimeField<Scalar>, IdentifierPrimeField<Scalar>>;
+
+        fn split_key(
+            sk: &crypto::SecretKey,
+            threshold: usize,
+            total: usize,
+        ) -> Vec<(u64, [u8; 32], [u8; 48])> {
+            let pk = sk.public_key().to_bytes();
+            let blst_sk = blst::min_pk::SecretKey::from_bytes(&sk.to_bytes()).unwrap();
+            let secret = blst_sk_to_scalar(&blst_sk).unwrap();
+
+            let shares: Vec<BlsShare> = shamir::split_secret::<BlsShare>(
+                threshold,
+                total,
+                &IdentifierPrimeField(secret),
+                OsRng,
+            )
+            .unwrap();
+
+            shares
+                .iter()
+                .map(|share| {
+                    use vsss_rs::Share;
+                    let idx_field: &IdentifierPrimeField<Scalar> = share.identifier();
+                    let val_field: &IdentifierPrimeField<Scalar> = share.value();
+                    let idx_bytes = idx_field.0.to_be_bytes();
+                    let idx = u64::from_be_bytes(idx_bytes[24..32].try_into().unwrap());
+                    let val_bytes = val_field.0.to_be_bytes();
+                    (idx, val_bytes, pk)
+                })
+                .collect()
+        }
+
+        fn make_share_info(
+            idx: u64,
+            scalar: [u8; 32],
+            aggregate_pubkey: [u8; 48],
+            threshold: u64,
+            total: u64,
+        ) -> ShareInfo {
+            ShareInfo {
+                index: idx,
+                threshold,
+                total,
+                scalar_bytes: Zeroizing::new(scalar),
+                aggregate_pubkey,
+            }
+        }
+
+        /// End-to-end 2-of-3 DVT signing via gRPC peer servers.
+        ///
+        /// Sets up 2 PeerSignerService gRPC servers (peers), then creates
+        /// a DvtSigner with a GrpcPeerRequester connected to both peers.
+        /// Verifies the combined signature matches direct signing.
+        #[tokio::test]
+        async fn test_dvt_end_to_end_2_of_3_via_grpc() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let shares = split_key(&sk, 2, 3);
+
+            // Node 0 = us, Nodes 1+2 = peer gRPC servers
+            let own_idx = shares[0].0;
+
+            // Start peer gRPC servers for nodes 1 and 2
+            let mut peer_addrs = Vec::new();
+            for i in 1..=2usize {
+                let share = make_share_info(shares[i].0, shares[i].1, pk, 2, 3);
+                let mut map = HashMap::new();
+                map.insert(pk, share);
+                let svc = PeerSignerServiceImpl::new(Arc::new(map));
+
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                peer_addrs.push(addr.to_string());
+
+                tokio::spawn(async move {
+                    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                    tonic::transport::Server::builder()
+                        .add_service(PeerSignerServiceServer::new(svc))
+                        .serve_with_incoming(incoming)
+                        .await
+                        .unwrap();
+                });
+            }
+
+            // Give servers time to start
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // Connect GrpcPeerRequester to both peers
+            let timeout = Duration::from_secs(5);
+            let requester = GrpcPeerRequester::connect(&peer_addrs, None, timeout).await.unwrap();
+
+            assert_eq!(requester.peer_addrs().len(), 2);
+
+            // Create DvtSigner with the GrpcPeerRequester
+            let own_share = make_share_info(own_idx, shares[0].1, pk, 2, 3);
+            let signer = DvtSigner::new(
+                vec![own_share],
+                own_idx,
+                peer_addrs.clone(),
+                Some(Arc::new(requester) as Arc<dyn PeerRequester>),
+                timeout,
+            );
+
+            let signing_root = [0xAB; 32];
+            let sig = signer.sign(&signing_root, &pk).await.unwrap();
+
+            // Verify combined signature matches direct signing
+            let direct_sig = sk.sign(&signing_root);
+            assert_eq!(sig, direct_sig.to_bytes());
+        }
+
+        /// Test that DvtSigner succeeds when one peer fails (2-of-3, one peer down).
+        #[tokio::test]
+        async fn test_dvt_grpc_partial_peer_failure_still_succeeds() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let shares = split_key(&sk, 2, 3);
+
+            let own_idx = shares[0].0;
+
+            // Only start peer 1 (peer 2 address is unreachable)
+            let share1 = make_share_info(shares[1].0, shares[1].1, pk, 2, 3);
+            let mut map = HashMap::new();
+            map.insert(pk, share1);
+            let svc = PeerSignerServiceImpl::new(Arc::new(map));
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let live_addr = listener.local_addr().unwrap().to_string();
+
+            tokio::spawn(async move {
+                let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                tonic::transport::Server::builder()
+                    .add_service(PeerSignerServiceServer::new(svc))
+                    .serve_with_incoming(incoming)
+                    .await
+                    .unwrap();
+            });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // Connect only to the live peer
+            let timeout = Duration::from_secs(5);
+            let peer_addrs = vec![live_addr.clone()];
+            let requester = GrpcPeerRequester::connect(&peer_addrs, None, timeout).await.unwrap();
+
+            // DvtSigner knows about 2 peers but requester only connected to 1
+            // The DvtSigner iterates over peer_addrs it was given
+            let own_share = make_share_info(own_idx, shares[0].1, pk, 2, 3);
+            let signer = DvtSigner::new(
+                vec![own_share],
+                own_idx,
+                peer_addrs,
+                Some(Arc::new(requester) as Arc<dyn PeerRequester>),
+                timeout,
+            );
+
+            let signing_root = [0xCC; 32];
+            let sig = signer.sign(&signing_root, &pk).await.unwrap();
+
+            let direct_sig = sk.sign(&signing_root);
+            assert_eq!(sig, direct_sig.to_bytes());
+        }
+
+        /// Test GrpcPeerRequester implements PeerRequester trait from backend::dvt.
+        #[tokio::test]
+        async fn test_grpc_peer_requester_implements_backend_trait() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let scalar = sk.to_bytes();
+
+            let share = make_share_info(1, scalar, pk, 2, 3);
+            let mut map = HashMap::new();
+            map.insert(pk, share);
+            let svc = PeerSignerServiceImpl::new(Arc::new(map));
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+
+            tokio::spawn(async move {
+                let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                tonic::transport::Server::builder()
+                    .add_service(PeerSignerServiceServer::new(svc))
+                    .serve_with_incoming(incoming)
+                    .await
+                    .unwrap();
+            });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let timeout = Duration::from_secs(5);
+            let requester =
+                GrpcPeerRequester::connect(&[addr.clone()], None, timeout).await.unwrap();
+
+            // Use as dyn PeerRequester (backend::dvt trait)
+            let requester: Arc<dyn PeerRequester> = Arc::new(requester);
+            let signing_root = [0xDD; 32];
+            let (share_index, partial_sig) =
+                requester.request_partial(&addr, &signing_root, &pk).await.unwrap();
+
+            assert_eq!(share_index, 1);
+            assert_eq!(partial_sig.len(), 96);
+
+            // Verify partial sig is correct
+            let blst_sk = blst::min_pk::SecretKey::from_bytes(&scalar).unwrap();
+            let expected =
+                blst_sk.sign(&signing_root, b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_", &[]);
+            assert_eq!(partial_sig, expected.to_bytes());
+        }
+
+        /// Test that PeerRequester returns error for unknown peer address.
+        #[tokio::test]
+        async fn test_grpc_peer_requester_unknown_addr_fails() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+
+            // Start empty peer service
+            let svc = PeerSignerServiceImpl::new(Arc::new(HashMap::new()));
+            tokio::spawn(async move {
+                let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                tonic::transport::Server::builder()
+                    .add_service(PeerSignerServiceServer::new(svc))
+                    .serve_with_incoming(incoming)
+                    .await
+                    .unwrap();
+            });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let requester =
+                GrpcPeerRequester::connect(&[addr], None, Duration::from_secs(5)).await.unwrap();
+
+            let requester: Arc<dyn PeerRequester> = Arc::new(requester);
+            let result = requester.request_partial("unknown:1234", &[0u8; 32], &[0u8; 48]).await;
             assert!(result.is_err());
         }
     }

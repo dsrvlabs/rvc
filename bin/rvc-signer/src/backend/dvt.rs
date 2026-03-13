@@ -109,7 +109,7 @@ impl SigningBackend for DvtSigner {
     #[tracing::instrument(
         name = "rvc.signer.dvt.coordinate",
         skip_all,
-        fields(threshold, peers_contacted, partials_received,)
+        fields(threshold, peers_contacted, partials_received, peers_responded, peers_failed,)
     )]
     async fn sign(
         &self,
@@ -147,22 +147,36 @@ impl SigningBackend for DvtSigner {
                 });
             }
 
+            let mut peers_responded: u64 = 0;
+            let mut peers_failed: u64 = 0;
+
             while let Some(result) = join_set.join_next().await {
                 match result {
-                    Ok(Ok(Ok(partial))) => partials.push(partial),
+                    Ok(Ok(Ok(partial))) => {
+                        partials.push(partial);
+                        peers_responded += 1;
+                    }
                     Ok(Ok(Err(e))) => {
+                        peers_failed += 1;
                         tracing::warn!(error = %e, "Peer partial request failed");
                     }
                     Ok(Err(_)) => {
+                        peers_failed += 1;
                         tracing::warn!("Peer partial request timed out");
                     }
                     Err(e) => {
+                        peers_failed += 1;
                         tracing::warn!(error = %e, "Peer partial task panicked");
                     }
                 }
             }
+
+            span.record("peers_responded", peers_responded);
+            span.record("peers_failed", peers_failed);
         } else {
             span.record("peers_contacted", 0u64);
+            span.record("peers_responded", 0u64);
+            span.record("peers_failed", 0u64);
         }
 
         span.record("partials_received", partials.len() as u64);

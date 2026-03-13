@@ -8,6 +8,7 @@ use crate::dvt::types::ShareInfo;
 use crate::proto::signer::peer_signer_service_server::PeerSignerService;
 use crate::proto::signer::{PartialSignRequest, PartialSignResponse};
 
+#[derive(Debug)]
 pub struct PeerSignerServiceImpl {
     shares: Arc<HashMap<[u8; 48], ShareInfo>>,
 }

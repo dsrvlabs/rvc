@@ -5,6 +5,7 @@ use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
 use tracing::warn;
 
+use crate::backend::dvt::{PeerRequestError, PeerRequester};
 use crate::proto::signer::peer_signer_service_client::PeerSignerServiceClient;
 use crate::proto::signer::PartialSignRequest;
 use crate::tls::TlsConfig;
@@ -25,17 +26,6 @@ pub enum PeerClientError {
 
     #[error("peer not found: {0}")]
     PeerNotFound(String),
-}
-
-/// Trait for requesting partial signatures from DVT peers.
-#[async_trait]
-pub trait PeerRequester: Send + Sync {
-    async fn request_partial(
-        &self,
-        peer_addr: &str,
-        signing_root: &[u8; 32],
-        pubkey: &[u8; 48],
-    ) -> Result<(u64, [u8; 96]), PeerClientError>;
 }
 
 /// gRPC-based peer requester that connects to DVT peers.
@@ -165,12 +155,11 @@ impl PeerRequester for GrpcPeerRequester {
         peer_addr: &str,
         signing_root: &[u8; 32],
         pubkey: &[u8; 48],
-    ) -> Result<(u64, [u8; 96]), PeerClientError> {
-        let (_, client) = self
-            .peers
-            .iter()
-            .find(|(addr, _)| addr == peer_addr)
-            .ok_or_else(|| PeerClientError::PeerNotFound(peer_addr.to_string()))?;
+    ) -> Result<(u64, [u8; 96]), PeerRequestError> {
+        let (_, client) =
+            self.peers.iter().find(|(addr, _)| addr == peer_addr).ok_or_else(|| {
+                PeerRequestError::RequestFailed(format!("peer not found: {}", peer_addr))
+            })?;
 
         let mut client = client.clone();
         let req = PartialSignRequest {
@@ -181,18 +170,13 @@ impl PeerRequester for GrpcPeerRequester {
 
         let result = tokio::time::timeout(self.timeout, client.partial_sign(req))
             .await
-            .map_err(|_| PeerClientError::Timeout {
-                addr: peer_addr.to_string(),
-                timeout: self.timeout,
-            })?
-            .map_err(|e| PeerClientError::Rpc { addr: peer_addr.to_string(), source: e })?;
+            .map_err(|_| PeerRequestError::Timeout)?
+            .map_err(|e| PeerRequestError::RequestFailed(format!("RPC failed: {}", e)))?;
 
         let inner = result.into_inner();
-        let sig: [u8; 96] =
-            inner.partial_signature.try_into().map_err(|_| PeerClientError::Rpc {
-                addr: peer_addr.to_string(),
-                source: tonic::Status::internal("invalid signature length"),
-            })?;
+        let sig: [u8; 96] = inner.partial_signature.try_into().map_err(|_| {
+            PeerRequestError::RequestFailed("invalid signature length from peer".to_string())
+        })?;
 
         Ok((inner.share_index, sig))
     }
