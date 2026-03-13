@@ -1,4 +1,6 @@
 pub mod basic;
+#[cfg(feature = "dvt")]
+pub mod dvt;
 
 use async_trait::async_trait;
 use thiserror::Error;
