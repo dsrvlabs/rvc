@@ -14,6 +14,7 @@ pub struct SignerSection {
     pub password_dir: Option<PathBuf>,
     pub password_file: Option<PathBuf>,
     pub backend: Option<String>,
+    pub dry_run: Option<bool>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub tls_ca_cert: Option<PathBuf>,
@@ -35,6 +36,7 @@ pub struct ResolvedConfig {
     pub password_dir: Option<PathBuf>,
     pub password_file: Option<PathBuf>,
     pub backend: String,
+    pub dry_run: bool,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub tls_ca_cert: Option<PathBuf>,
@@ -52,6 +54,7 @@ pub struct CliOverrides<'a> {
     pub password_file: Option<&'a Path>,
     pub backend: &'a str,
     pub backend_is_default: bool,
+    pub dry_run: bool,
     pub tls_cert: Option<&'a Path>,
     pub tls_key: Option<&'a Path>,
     pub tls_ca_cert: Option<&'a Path>,
@@ -96,6 +99,8 @@ pub fn merge_with_cli(
         section.backend.unwrap_or_else(|| cli.backend.to_string())
     };
 
+    let dry_run = cli.dry_run || section.dry_run.unwrap_or(false);
+
     let tls_cert = cli.tls_cert.map(PathBuf::from).or(section.tls_cert);
     let tls_key = cli.tls_key.map(PathBuf::from).or(section.tls_key);
     let tls_ca_cert = cli.tls_ca_cert.map(PathBuf::from).or(section.tls_ca_cert);
@@ -121,6 +126,7 @@ pub fn merge_with_cli(
         password_dir,
         password_file,
         backend,
+        dry_run,
         tls_cert,
         tls_key,
         tls_ca_cert,
@@ -152,6 +158,7 @@ mod tests {
             password_file: None,
             backend: "basic",
             backend_is_default: true,
+            dry_run: false,
             tls_cert: None,
             tls_key: None,
             tls_ca_cert: None,
@@ -356,6 +363,57 @@ index = 1
         assert_eq!(resolved.dvt_threshold.unwrap(), 3);
         assert_eq!(resolved.dvt_index.unwrap(), 0);
         assert_eq!(resolved.dvt_timeout_ms, 5000);
+    }
+
+    #[test]
+    fn test_load_config_dry_run() {
+        let f = write_toml(
+            r#"
+[signer]
+keystore_dir = "/ks"
+dry_run = true
+"#,
+        );
+
+        let cfg = load_config(f.path()).unwrap();
+        let s = cfg.signer.unwrap();
+        assert_eq!(s.dry_run, Some(true));
+    }
+
+    #[test]
+    fn test_merge_dry_run_from_config() {
+        let config = SignerConfig {
+            signer: Some(SignerSection {
+                keystore_dir: Some(PathBuf::from("/ks")),
+                dry_run: Some(true),
+                ..Default::default()
+            }),
+        };
+
+        let resolved = merge_with_cli(config, &default_cli_overrides()).unwrap();
+        assert!(resolved.dry_run);
+    }
+
+    #[test]
+    fn test_merge_dry_run_cli_overrides_config() {
+        let config = SignerConfig {
+            signer: Some(SignerSection {
+                keystore_dir: Some(PathBuf::from("/ks")),
+                dry_run: Some(false),
+                ..Default::default()
+            }),
+        };
+
+        let cli = CliOverrides { dry_run: true, ..default_cli_overrides() };
+        let resolved = merge_with_cli(config, &cli).unwrap();
+        assert!(resolved.dry_run);
+    }
+
+    #[test]
+    fn test_merge_dry_run_defaults_false() {
+        let cli = CliOverrides { keystore_dir: Some(Path::new("/ks")), ..default_cli_overrides() };
+        let resolved = merge_with_cli(SignerConfig::default(), &cli).unwrap();
+        assert!(!resolved.dry_run);
     }
 
     #[test]

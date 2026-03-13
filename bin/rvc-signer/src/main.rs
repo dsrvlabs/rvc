@@ -106,6 +106,10 @@ struct ServeArgs {
     #[arg(long)]
     tls_ca_cert: Option<PathBuf>,
 
+    /// Validate configuration and exit without starting the server
+    #[arg(long)]
+    dry_run: bool,
+
     /// Signing backend to use
     #[arg(long, value_enum, default_value_t = Backend::Basic)]
     backend: Backend,
@@ -240,6 +244,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         (Arc::new(signer), None)
     };
 
+<<<<<<< HEAD
     // Set up Prometheus metrics
     let signer_metrics = Arc::new(metrics::SignerMetrics::new());
     let key_count = signing_backend.public_keys().len() as f64;
@@ -249,6 +254,34 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let (_metrics_handle, metrics_bound_addr) =
         metrics::serve_metrics(metrics_addr, Arc::clone(&signer_metrics)).await?;
     info!(address = %metrics_bound_addr, "Prometheus metrics server listening");
+=======
+    // Validate TLS certificates if provided
+    if let Some(ref tls) = tls_config {
+        tls.to_server_tls_config()?;
+    }
+
+    if resolved.dry_run {
+        println!("Configuration valid:");
+        println!("  Backend: {}", resolved.backend);
+        println!("  Keys loaded: {}", signing_backend.public_keys().len());
+        if tls_config.is_some() {
+            println!("  TLS: certificates valid");
+        } else {
+            println!("  TLS: disabled");
+        }
+        #[cfg(feature = "dvt")]
+        if resolved.backend == "dvt" {
+            println!("  DVT peers: {}", resolved.dvt_peers.len());
+            if let Some(threshold) = resolved.dvt_threshold {
+                println!("  DVT threshold: {}", threshold);
+            }
+            if let Some(index) = resolved.dvt_index {
+                println!("  DVT index: {}", index);
+            }
+        }
+        return Ok(());
+    }
+>>>>>>> e5010e3 (feat(rvc-signer): add dry-run mode for configuration validation (RS-21))
 
     let signer_service =
         service::SignerServiceImpl::new(Arc::clone(&signing_backend), resolved.backend.clone())
@@ -396,6 +429,7 @@ fn resolve_config(args: &ServeArgs) -> Result<config::ResolvedConfig, Box<dyn st
         password_file: args.password_file.as_deref(),
         backend: &args.backend.to_string(),
         backend_is_default,
+        dry_run: args.dry_run,
         tls_cert: args.tls_cert.as_deref(),
         tls_key: args.tls_key.as_deref(),
         tls_ca_cert: args.tls_ca_cert.as_deref(),
@@ -515,10 +549,207 @@ mod tests {
                 assert!(args.tls_key.is_none());
                 assert!(args.tls_ca_cert.is_none());
                 assert!(matches!(args.backend, Backend::Basic));
+                assert!(!args.dry_run);
             }
             #[cfg(feature = "dvt")]
             _ => panic!("expected Serve command"),
         }
+    }
+
+    #[test]
+    fn test_cli_parse_dry_run_flag() {
+        let cli = Cli::parse_from([
+            "rvc-signer",
+            "serve",
+            "--keystore-dir",
+            "/tmp/keystores",
+            "--dry-run",
+        ]);
+        match cli.command {
+            Command::Serve(args) => {
+                assert!(args.dry_run);
+            }
+            #[cfg(feature = "dvt")]
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_dry_run_defaults_false() {
+        let cli = Cli::parse_from(["rvc-signer", "serve", "--keystore-dir", "/tmp/ks"]);
+        match cli.command {
+            Command::Serve(args) => {
+                assert!(!args.dry_run);
+            }
+            #[cfg(feature = "dvt")]
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_valid_config_exits_ok() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pw_file = dir.path().join("pw.txt");
+        std::fs::write(&pw_file, "test-password").unwrap();
+
+        // Create a valid keystore
+        let sk = crypto::SecretKey::generate();
+        let ks =
+            crypto::Keystore::encrypt(&sk, b"test-password", "", crypto::EncryptionKdf::Pbkdf2)
+                .unwrap();
+        std::fs::write(dir.path().join("key.json"), ks.to_json().unwrap()).unwrap();
+
+        let args = ServeArgs {
+            config: None,
+            listen_address: DEFAULT_LISTEN_ADDRESS.to_string(),
+            keystore_dir: Some(dir.path().to_path_buf()),
+            password_dir: None,
+            password_file: Some(pw_file),
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            dry_run: true,
+            backend: Backend::Basic,
+            #[cfg(feature = "dvt")]
+            dvt_peers: vec![],
+            #[cfg(feature = "dvt")]
+            dvt_threshold: None,
+            #[cfg(feature = "dvt")]
+            dvt_index: None,
+            #[cfg(feature = "dvt")]
+            dvt_timeout: 2000,
+        };
+
+        let result = run_serve(args).await;
+        assert!(result.is_ok(), "dry-run with valid config should succeed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_invalid_keystore_dir_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pw_file = dir.path().join("pw.txt");
+        std::fs::write(&pw_file, "test-password").unwrap();
+
+        let args = ServeArgs {
+            config: None,
+            listen_address: DEFAULT_LISTEN_ADDRESS.to_string(),
+            keystore_dir: Some(PathBuf::from("/nonexistent/keystores")),
+            password_dir: None,
+            password_file: Some(pw_file),
+            tls_cert: None,
+            tls_key: None,
+            tls_ca_cert: None,
+            dry_run: true,
+            backend: Backend::Basic,
+            #[cfg(feature = "dvt")]
+            dvt_peers: vec![],
+            #[cfg(feature = "dvt")]
+            dvt_threshold: None,
+            #[cfg(feature = "dvt")]
+            dvt_index: None,
+            #[cfg(feature = "dvt")]
+            dvt_timeout: 2000,
+        };
+
+        let result = run_serve(args).await;
+        assert!(result.is_err(), "dry-run with invalid keystore dir should fail");
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_with_tls_certs() {
+        use std::io::Write;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let pw_file = dir.path().join("pw.txt");
+        std::fs::write(&pw_file, "test-password").unwrap();
+
+        // Create a valid keystore
+        let sk = crypto::SecretKey::generate();
+        let ks =
+            crypto::Keystore::encrypt(&sk, b"test-password", "", crypto::EncryptionKdf::Pbkdf2)
+                .unwrap();
+        std::fs::write(dir.path().join("key.json"), ks.to_json().unwrap()).unwrap();
+
+        // Generate test TLS certs
+        let ca_params = rcgen::CertificateParams::new(vec!["rvc-signer-ca".to_string()]).unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let server_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let server_key = rcgen::KeyPair::generate().unwrap();
+        let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
+
+        let cert_path = dir.path().join("server.pem");
+        let key_path = dir.path().join("server.key");
+        let ca_cert_path = dir.path().join("ca.pem");
+
+        let mut f = std::fs::File::create(&cert_path).unwrap();
+        f.write_all(server_cert.pem().as_bytes()).unwrap();
+        let mut f = std::fs::File::create(&key_path).unwrap();
+        f.write_all(server_key.serialize_pem().as_bytes()).unwrap();
+        let mut f = std::fs::File::create(&ca_cert_path).unwrap();
+        f.write_all(ca_cert.pem().as_bytes()).unwrap();
+
+        let args = ServeArgs {
+            config: None,
+            listen_address: DEFAULT_LISTEN_ADDRESS.to_string(),
+            keystore_dir: Some(dir.path().to_path_buf()),
+            password_dir: None,
+            password_file: Some(pw_file),
+            tls_cert: Some(cert_path),
+            tls_key: Some(key_path),
+            tls_ca_cert: Some(ca_cert_path),
+            dry_run: true,
+            backend: Backend::Basic,
+            #[cfg(feature = "dvt")]
+            dvt_peers: vec![],
+            #[cfg(feature = "dvt")]
+            dvt_threshold: None,
+            #[cfg(feature = "dvt")]
+            dvt_index: None,
+            #[cfg(feature = "dvt")]
+            dvt_timeout: 2000,
+        };
+
+        let result = run_serve(args).await;
+        assert!(result.is_ok(), "dry-run with valid TLS certs should succeed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_invalid_tls_cert_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pw_file = dir.path().join("pw.txt");
+        std::fs::write(&pw_file, "test-password").unwrap();
+
+        // Create a valid keystore
+        let sk = crypto::SecretKey::generate();
+        let ks =
+            crypto::Keystore::encrypt(&sk, b"test-password", "", crypto::EncryptionKdf::Pbkdf2)
+                .unwrap();
+        std::fs::write(dir.path().join("key.json"), ks.to_json().unwrap()).unwrap();
+
+        let args = ServeArgs {
+            config: None,
+            listen_address: DEFAULT_LISTEN_ADDRESS.to_string(),
+            keystore_dir: Some(dir.path().to_path_buf()),
+            password_dir: None,
+            password_file: Some(pw_file),
+            tls_cert: Some(PathBuf::from("/nonexistent/cert.pem")),
+            tls_key: Some(PathBuf::from("/nonexistent/key.pem")),
+            tls_ca_cert: Some(PathBuf::from("/nonexistent/ca.pem")),
+            dry_run: true,
+            backend: Backend::Basic,
+            #[cfg(feature = "dvt")]
+            dvt_peers: vec![],
+            #[cfg(feature = "dvt")]
+            dvt_threshold: None,
+            #[cfg(feature = "dvt")]
+            dvt_index: None,
+            #[cfg(feature = "dvt")]
+            dvt_timeout: 2000,
+        };
+
+        let result = run_serve(args).await;
+        assert!(result.is_err(), "dry-run with invalid TLS certs should fail");
     }
 
     #[test]
