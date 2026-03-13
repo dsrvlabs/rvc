@@ -90,6 +90,7 @@ rpassword = "5"
 tiny-keccak = { version = "2", features = ["keccak"] }
 rayon = "1"
 tokio-util = "0.7"
+tokio-stream = "0.1"
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }

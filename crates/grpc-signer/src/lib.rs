@@ -1,10 +1,13 @@
+pub mod client;
 pub mod proto {
     pub mod signer {
         tonic::include_proto!("signer");
     }
 }
 
+pub use client::{GrpcRemoteSigner, GrpcRemoteSignerConfig};
 pub use proto::signer::signer_service_client::SignerServiceClient;
+pub use proto::signer::signer_service_server::{SignerService, SignerServiceServer};
 pub use proto::signer::{
     GetStatusRequest, GetStatusResponse, ListPublicKeysRequest, ListPublicKeysResponse,
     SignRequest, SignResponse,
@@ -24,7 +27,6 @@ mod tests {
     #[test]
     fn test_list_public_keys_request_default() {
         let req = ListPublicKeysRequest {};
-        // Verify default construction works
         let _ = req;
     }
 

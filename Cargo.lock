@@ -3924,9 +3924,19 @@ dependencies = [
 name = "rvc-grpc-signer"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "hex",
  "prost 0.13.5",
+ "rvc-crypto",
+ "rvc-eth-types",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
  "tonic 0.12.3",
  "tonic-build",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

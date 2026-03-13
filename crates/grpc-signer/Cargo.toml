@@ -7,8 +7,20 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+crypto.workspace = true
+eth-types.workspace = true
+hex.workspace = true
 prost.workspace = true
-tonic.workspace = true
+thiserror.workspace = true
+tonic = { workspace = true, features = ["transport", "tls"] }
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-stream.workspace = true
+tracing-subscriber.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true
