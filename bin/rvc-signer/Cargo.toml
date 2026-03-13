@@ -1,0 +1,19 @@
+[package]
+name = "rvc-signer-bin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "rvc-signer"
+path = "src/main.rs"
+
+[dependencies]
+prost.workspace = true
+tonic.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true
