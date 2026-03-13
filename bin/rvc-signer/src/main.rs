@@ -1,6 +1,7 @@
 pub mod backend;
 #[cfg(feature = "dvt")]
 pub mod commands;
+pub mod config;
 #[cfg(feature = "dvt")]
 pub mod dvt;
 pub mod service;
@@ -72,13 +73,17 @@ enum Command {
 
 #[derive(Parser)]
 struct ServeArgs {
+    /// Path to config.toml file
+    #[arg(long)]
+    config: Option<PathBuf>,
+
     /// gRPC listen address (host:port)
     #[arg(long, default_value = DEFAULT_LISTEN_ADDRESS)]
     listen_address: String,
 
     /// Path to the keystore directory
     #[arg(long)]
-    keystore_dir: PathBuf,
+    keystore_dir: Option<PathBuf>,
 
     /// Path to the directory containing per-keystore password files
     #[arg(long, group = "password_source")]
@@ -171,13 +176,6 @@ async fn main() {
 
     match cli.command {
         Command::Serve(args) => {
-            info!(
-                listen_address = %args.listen_address,
-                keystore_dir = %args.keystore_dir.display(),
-                backend = %args.backend,
-                "Starting rvc-signer"
-            );
-
             if let Err(e) = run_serve(args).await {
                 error!(error = %e, "rvc-signer failed");
                 std::process::exit(1);
@@ -196,39 +194,51 @@ async fn main() {
 }
 
 async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let password = load_serve_password(&args)?;
+    let resolved = resolve_config(&args)?;
 
-    let tls_config =
-        match (args.tls_cert.as_ref(), args.tls_key.as_ref(), args.tls_ca_cert.as_ref()) {
-            (Some(cert), Some(key), Some(ca)) => {
-                Some(tls::TlsConfig::new(cert.clone(), key.clone(), ca.clone()))
-            }
-            _ => None,
-        };
+    info!(
+        listen_address = %resolved.listen_address,
+        keystore_dir = %resolved.keystore_dir.display(),
+        backend = %resolved.backend,
+        "Starting rvc-signer"
+    );
+
+    let password = load_serve_password(&resolved)?;
+
+    let tls_config = match (
+        resolved.tls_cert.as_ref(),
+        resolved.tls_key.as_ref(),
+        resolved.tls_ca_cert.as_ref(),
+    ) {
+        (Some(cert), Some(key), Some(ca)) => {
+            Some(tls::TlsConfig::new(cert.clone(), key.clone(), ca.clone()))
+        }
+        _ => None,
+    };
 
     // Build the signing backend and optional peer signer service
     #[cfg(feature = "dvt")]
     let (signing_backend, peer_signer_service): (
         Arc<dyn backend::SigningBackend>,
         Option<dvt::peer_service::PeerSignerServiceImpl>,
-    ) = match args.backend {
+    ) = match parse_backend(&resolved.backend)? {
         Backend::Basic => {
-            let signer = backend::basic::BasicSigner::load(&args.keystore_dir, &password)?;
+            let signer = backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)?;
             (Arc::new(signer), None)
         }
-        Backend::Dvt => build_dvt_backend(&args, &password, tls_config.as_ref()).await?,
+        Backend::Dvt => build_dvt_backend(&resolved, &password, tls_config.as_ref()).await?,
     };
 
     #[cfg(not(feature = "dvt"))]
     let (signing_backend, peer_signer_service): (Arc<dyn backend::SigningBackend>, Option<()>) = {
-        let signer = backend::basic::BasicSigner::load(&args.keystore_dir, &password)?;
+        let signer = backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)?;
         (Arc::new(signer), None)
     };
 
     let signer_service =
-        service::SignerServiceImpl::new(Arc::clone(&signing_backend), args.backend.to_string());
+        service::SignerServiceImpl::new(Arc::clone(&signing_backend), resolved.backend.clone());
 
-    let addr = args.listen_address.parse()?;
+    let addr = resolved.listen_address.parse()?;
 
     let mut builder = tonic::transport::Server::builder();
 
@@ -262,7 +272,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(feature = "dvt")]
 async fn build_dvt_backend(
-    args: &ServeArgs,
+    resolved: &config::ResolvedConfig,
     password: &Zeroizing<String>,
     tls_config: Option<&tls::TlsConfig>,
 ) -> Result<
@@ -272,12 +282,12 @@ async fn build_dvt_backend(
     use std::collections::HashMap;
     use std::time::Duration;
 
-    let dvt_index = args.dvt_index.ok_or("--dvt-index is required when using --backend dvt")?;
+    let dvt_index = resolved.dvt_index.ok_or("dvt_index is required when using backend dvt")?;
 
-    let timeout = Duration::from_millis(args.dvt_timeout);
+    let timeout = Duration::from_millis(resolved.dvt_timeout_ms);
 
     // Load Shamir shares from keystore directory
-    let shares = dvt::types::load_shares(&args.keystore_dir, password)
+    let shares = dvt::types::load_shares(&resolved.keystore_dir, password)
         .map_err(|e| format!("failed to load DVT shares: {}", e))?;
 
     if shares.is_empty() {
@@ -287,7 +297,7 @@ async fn build_dvt_backend(
     info!(
         share_count = shares.len(),
         dvt_index,
-        peer_count = args.dvt_peers.len(),
+        peer_count = resolved.dvt_peers.len(),
         "Loaded DVT shares"
     );
 
@@ -298,9 +308,9 @@ async fn build_dvt_backend(
     let peer_signer_service = dvt::peer_service::PeerSignerServiceImpl::new(Arc::new(share_map));
 
     // Connect to peers
-    let peer_requester = if !args.dvt_peers.is_empty() {
+    let peer_requester = if !resolved.dvt_peers.is_empty() {
         let requester =
-            dvt::peer_client::GrpcPeerRequester::connect(&args.dvt_peers, tls_config, timeout)
+            dvt::peer_client::GrpcPeerRequester::connect(&resolved.dvt_peers, tls_config, timeout)
                 .await
                 .map_err(|e| format!("failed to connect to DVT peers: {}", e))?;
 
@@ -314,7 +324,7 @@ async fn build_dvt_backend(
     let dvt_signer = backend::dvt::DvtSigner::new(
         shares,
         dvt_index,
-        args.dvt_peers.clone(),
+        resolved.dvt_peers.clone(),
         peer_requester,
         timeout,
     );
@@ -333,12 +343,74 @@ fn clone_share_info(s: &dvt::types::ShareInfo) -> dvt::types::ShareInfo {
     }
 }
 
-fn load_serve_password(args: &ServeArgs) -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
-    if let Some(ref path) = args.password_file {
+fn resolve_config(args: &ServeArgs) -> Result<config::ResolvedConfig, Box<dyn std::error::Error>> {
+    let file_config = if let Some(ref path) = args.config {
+        config::load_config(path)?
+    } else {
+        config::SignerConfig::default()
+    };
+
+    // When a config file is used, treat clap default_values as unset so config
+    // file values can take precedence.
+    let has_config = args.config.is_some();
+    let listen_address_is_default = has_config && args.listen_address == DEFAULT_LISTEN_ADDRESS;
+    let backend_is_default = has_config && matches!(args.backend, Backend::Basic);
+
+    #[cfg(feature = "dvt")]
+    let dvt_timeout_is_default = has_config && args.dvt_timeout == 2000;
+    #[cfg(not(feature = "dvt"))]
+    let dvt_timeout_is_default = true;
+
+    #[cfg(feature = "dvt")]
+    let (dvt_peers, dvt_threshold, dvt_index, dvt_timeout) =
+        (&args.dvt_peers[..], args.dvt_threshold, args.dvt_index, args.dvt_timeout);
+    #[cfg(not(feature = "dvt"))]
+    let (dvt_peers, dvt_threshold, dvt_index, dvt_timeout): (
+        &[String],
+        Option<u64>,
+        Option<u64>,
+        u64,
+    ) = (&[], None, None, 2000);
+
+    let cli = config::CliOverrides {
+        listen_address: &args.listen_address,
+        listen_address_is_default,
+        keystore_dir: args.keystore_dir.as_deref(),
+        password_dir: args.password_dir.as_deref(),
+        password_file: args.password_file.as_deref(),
+        backend: &args.backend.to_string(),
+        backend_is_default,
+        tls_cert: args.tls_cert.as_deref(),
+        tls_key: args.tls_key.as_deref(),
+        tls_ca_cert: args.tls_ca_cert.as_deref(),
+        dvt_peers,
+        dvt_threshold,
+        dvt_index,
+        dvt_timeout,
+        dvt_timeout_is_default,
+    };
+
+    config::merge_with_cli(file_config, &cli)
+}
+
+#[cfg(feature = "dvt")]
+fn parse_backend(s: &str) -> Result<Backend, Box<dyn std::error::Error>> {
+    match s {
+        "basic" => Ok(Backend::Basic),
+        #[cfg(feature = "dvt")]
+        "dvt" => Ok(Backend::Dvt),
+        other => Err(format!("unknown backend: {}", other).into()),
+    }
+}
+
+fn load_serve_password(
+    resolved: &config::ResolvedConfig,
+) -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
+    if let Some(ref path) = resolved.password_file {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read password file {}: {}", path.display(), e))?;
         Ok(Zeroizing::new(content.trim_end().to_string()))
-    } else if let Some(ref dir) = args.password_dir {
+    } else if let Some(ref dir) = resolved.password_dir {
         let _ = dir;
         Err("--password-dir is not yet supported; use --password-file".into())
     } else {
@@ -419,9 +491,10 @@ mod tests {
         match cli.command {
             Command::Serve(args) => {
                 assert_eq!(args.listen_address, DEFAULT_LISTEN_ADDRESS);
-                assert_eq!(args.keystore_dir, PathBuf::from("/tmp/keystores"));
+                assert_eq!(args.keystore_dir, Some(PathBuf::from("/tmp/keystores")));
                 assert!(args.password_dir.is_none());
                 assert!(args.password_file.is_none());
+                assert!(args.config.is_none());
                 assert!(args.tls_cert.is_none());
                 assert!(args.tls_key.is_none());
                 assert!(args.tls_ca_cert.is_none());
@@ -455,7 +528,7 @@ mod tests {
         match cli.command {
             Command::Serve(args) => {
                 assert_eq!(args.listen_address, "0.0.0.0:9000");
-                assert_eq!(args.keystore_dir, PathBuf::from("/tmp/keystores"));
+                assert_eq!(args.keystore_dir, Some(PathBuf::from("/tmp/keystores")));
                 assert_eq!(args.password_dir, Some(PathBuf::from("/tmp/passwords")));
                 assert_eq!(args.tls_cert, Some(PathBuf::from("/tmp/cert.pem")));
                 assert_eq!(args.tls_key, Some(PathBuf::from("/tmp/key.pem")));
