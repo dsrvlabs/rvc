@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [features]
 default = []
-dvt = ["vsss-rs", "bls12_381_plus"]
+dvt = ["vsss-rs", "bls12_381_plus", "rand"]
 
 [dependencies]
 async-trait.workspace = true
@@ -33,6 +33,7 @@ zeroize.workspace = true
 # DVT (optional)
 vsss-rs = { workspace = true, optional = true }
 bls12_381_plus = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
 
 [dev-dependencies]
 rcgen = "0.13"

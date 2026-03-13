@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
@@ -32,7 +32,7 @@ pub enum ShareError {
 }
 
 /// Metadata sidecar for a Shamir share keystore.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShareMetadata {
     pub threshold: u64,
     pub total: u64,

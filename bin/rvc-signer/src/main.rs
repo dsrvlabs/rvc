@@ -1,12 +1,14 @@
 pub mod backend;
 #[cfg(feature = "dvt")]
+pub mod commands;
+#[cfg(feature = "dvt")]
 pub mod dvt;
 pub mod service;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::{error, info};
 use zeroize::Zeroizing;
 
@@ -49,6 +51,22 @@ impl std::fmt::Display for Backend {
 #[command(version)]
 #[command(about = "Remote BLS signer for rvc validator client", long_about = None)]
 struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Start the gRPC signing server
+    Serve(ServeArgs),
+
+    /// Split a BLS secret key into Shamir shares stored as EIP-2335 keystores
+    #[cfg(feature = "dvt")]
+    SplitKey(SplitKeyCliArgs),
+}
+
+#[derive(Parser)]
+struct ServeArgs {
     /// gRPC listen address (host:port)
     #[arg(long, default_value = DEFAULT_LISTEN_ADDRESS)]
     listen_address: String,
@@ -102,6 +120,42 @@ struct Cli {
     dvt_timeout: u64,
 }
 
+#[cfg(feature = "dvt")]
+#[derive(Parser)]
+struct SplitKeyCliArgs {
+    /// Path to the source EIP-2335 keystore
+    #[arg(long)]
+    keystore: PathBuf,
+
+    /// Password for the source keystore
+    #[arg(long, group = "src_password")]
+    password: Option<String>,
+
+    /// Path to a file containing the source keystore password
+    #[arg(long, group = "src_password")]
+    password_file: Option<PathBuf>,
+
+    /// Threshold (t) for Shamir secret sharing
+    #[arg(long)]
+    threshold: u64,
+
+    /// Total number of shares (n) to generate
+    #[arg(long)]
+    shares: u64,
+
+    /// Output directory for share keystores
+    #[arg(long)]
+    output_dir: PathBuf,
+
+    /// Password for the output share keystores
+    #[arg(long, group = "out_password")]
+    output_password: Option<String>,
+
+    /// Path to a file containing the password for output share keystores
+    #[arg(long, group = "out_password")]
+    output_password_file: Option<PathBuf>,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -110,36 +164,47 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    info!(
-        listen_address = %cli.listen_address,
-        keystore_dir = %cli.keystore_dir.display(),
-        backend = %cli.backend,
-        "Starting rvc-signer"
-    );
+    match cli.command {
+        Command::Serve(args) => {
+            info!(
+                listen_address = %args.listen_address,
+                keystore_dir = %args.keystore_dir.display(),
+                backend = %args.backend,
+                "Starting rvc-signer"
+            );
 
-    if let Err(e) = run(cli).await {
-        error!(error = %e, "rvc-signer failed");
-        std::process::exit(1);
+            if let Err(e) = run_serve(args).await {
+                error!(error = %e, "rvc-signer failed");
+                std::process::exit(1);
+            }
+
+            info!("Shutting down rvc-signer");
+        }
+        #[cfg(feature = "dvt")]
+        Command::SplitKey(args) => {
+            if let Err(e) = run_split_key(args) {
+                error!(error = %e, "split-key failed");
+                std::process::exit(1);
+            }
+        }
     }
-
-    info!("Shutting down rvc-signer");
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    let password = load_password(&cli)?;
+async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let password = load_serve_password(&args)?;
 
-    let signer = backend::basic::BasicSigner::load(&cli.keystore_dir, &password)?;
+    let signer = backend::basic::BasicSigner::load(&args.keystore_dir, &password)?;
     let backend: Arc<dyn backend::SigningBackend> = Arc::new(signer);
 
     let signer_service =
-        service::SignerServiceImpl::new(Arc::clone(&backend), cli.backend.to_string());
+        service::SignerServiceImpl::new(Arc::clone(&backend), args.backend.to_string());
 
-    let addr = cli.listen_address.parse()?;
+    let addr = args.listen_address.parse()?;
 
     let mut builder = tonic::transport::Server::builder();
 
     if let (Some(cert), Some(key), Some(ca)) =
-        (cli.tls_cert.as_ref(), cli.tls_key.as_ref(), cli.tls_ca_cert.as_ref())
+        (args.tls_cert.as_ref(), args.tls_key.as_ref(), args.tls_ca_cert.as_ref())
     {
         let tls_config =
             tls::TlsConfig::new(cert.clone(), key.clone(), ca.clone()).to_server_tls_config()?;
@@ -158,19 +223,53 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn load_password(cli: &Cli) -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
-    if let Some(ref path) = cli.password_file {
+fn load_serve_password(args: &ServeArgs) -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
+    if let Some(ref path) = args.password_file {
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("failed to read password file {}: {}", path.display(), e))?;
         Ok(Zeroizing::new(content.trim_end().to_string()))
-    } else if let Some(ref dir) = cli.password_dir {
-        // For password-dir, we read the first file found as the shared password.
-        // Individual per-keystore password files are handled in BasicSigner::load
-        // when that feature is implemented. For now, use the directory path.
+    } else if let Some(ref dir) = args.password_dir {
         let _ = dir;
         Err("--password-dir is not yet supported; use --password-file".into())
     } else {
         Err("one of --password-file or --password-dir is required".into())
+    }
+}
+
+#[cfg(feature = "dvt")]
+fn run_split_key(args: SplitKeyCliArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let password =
+        load_password_from_args(args.password.as_deref(), args.password_file.as_deref())?;
+    let output_password = load_password_from_args(
+        args.output_password.as_deref(),
+        args.output_password_file.as_deref(),
+    )?;
+
+    commands::split_key::execute(commands::split_key::SplitKeyArgs {
+        keystore: args.keystore,
+        password,
+        threshold: args.threshold,
+        shares: args.shares,
+        output_dir: args.output_dir,
+        output_password,
+    })?;
+
+    Ok(())
+}
+
+#[cfg(feature = "dvt")]
+fn load_password_from_args(
+    inline: Option<&str>,
+    file: Option<&std::path::Path>,
+) -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
+    if let Some(pw) = inline {
+        Ok(Zeroizing::new(pw.to_string()))
+    } else if let Some(path) = file {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read password file {}: {}", path.display(), e))?;
+        Ok(Zeroizing::new(content.trim_end().to_string()))
+    } else {
+        Err("one of --password or --password-file is required".into())
     }
 }
 
@@ -205,22 +304,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cli_parse_minimal() {
-        let cli = Cli::parse_from(["rvc-signer", "--keystore-dir", "/tmp/keystores"]);
-        assert_eq!(cli.listen_address, DEFAULT_LISTEN_ADDRESS);
-        assert_eq!(cli.keystore_dir, PathBuf::from("/tmp/keystores"));
-        assert!(cli.password_dir.is_none());
-        assert!(cli.password_file.is_none());
-        assert!(cli.tls_cert.is_none());
-        assert!(cli.tls_key.is_none());
-        assert!(cli.tls_ca_cert.is_none());
-        assert!(matches!(cli.backend, Backend::Basic));
+    fn test_cli_parse_serve_minimal() {
+        let cli = Cli::parse_from(["rvc-signer", "serve", "--keystore-dir", "/tmp/keystores"]);
+        match cli.command {
+            Command::Serve(args) => {
+                assert_eq!(args.listen_address, DEFAULT_LISTEN_ADDRESS);
+                assert_eq!(args.keystore_dir, PathBuf::from("/tmp/keystores"));
+                assert!(args.password_dir.is_none());
+                assert!(args.password_file.is_none());
+                assert!(args.tls_cert.is_none());
+                assert!(args.tls_key.is_none());
+                assert!(args.tls_ca_cert.is_none());
+                assert!(matches!(args.backend, Backend::Basic));
+            }
+            #[cfg(feature = "dvt")]
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]
-    fn test_cli_parse_all_flags() {
+    fn test_cli_parse_serve_all_flags() {
         let cli = Cli::parse_from([
             "rvc-signer",
+            "serve",
             "--keystore-dir",
             "/tmp/keystores",
             "--listen-address",
@@ -236,32 +342,46 @@ mod tests {
             "--backend",
             "basic",
         ]);
-        assert_eq!(cli.listen_address, "0.0.0.0:9000");
-        assert_eq!(cli.keystore_dir, PathBuf::from("/tmp/keystores"));
-        assert_eq!(cli.password_dir, Some(PathBuf::from("/tmp/passwords")));
-        assert_eq!(cli.tls_cert, Some(PathBuf::from("/tmp/cert.pem")));
-        assert_eq!(cli.tls_key, Some(PathBuf::from("/tmp/key.pem")));
-        assert_eq!(cli.tls_ca_cert, Some(PathBuf::from("/tmp/ca.pem")));
-        assert!(matches!(cli.backend, Backend::Basic));
+        match cli.command {
+            Command::Serve(args) => {
+                assert_eq!(args.listen_address, "0.0.0.0:9000");
+                assert_eq!(args.keystore_dir, PathBuf::from("/tmp/keystores"));
+                assert_eq!(args.password_dir, Some(PathBuf::from("/tmp/passwords")));
+                assert_eq!(args.tls_cert, Some(PathBuf::from("/tmp/cert.pem")));
+                assert_eq!(args.tls_key, Some(PathBuf::from("/tmp/key.pem")));
+                assert_eq!(args.tls_ca_cert, Some(PathBuf::from("/tmp/ca.pem")));
+                assert!(matches!(args.backend, Backend::Basic));
+            }
+            #[cfg(feature = "dvt")]
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]
-    fn test_cli_parse_password_file() {
+    fn test_cli_parse_serve_password_file() {
         let cli = Cli::parse_from([
             "rvc-signer",
+            "serve",
             "--keystore-dir",
             "/tmp/ks",
             "--password-file",
             "/tmp/pw.txt",
         ]);
-        assert_eq!(cli.password_file, Some(PathBuf::from("/tmp/pw.txt")));
-        assert!(cli.password_dir.is_none());
+        match cli.command {
+            Command::Serve(args) => {
+                assert_eq!(args.password_file, Some(PathBuf::from("/tmp/pw.txt")));
+                assert!(args.password_dir.is_none());
+            }
+            #[cfg(feature = "dvt")]
+            _ => panic!("expected Serve command"),
+        }
     }
 
     #[test]
-    fn test_cli_password_dir_and_file_mutually_exclusive() {
+    fn test_cli_serve_password_dir_and_file_mutually_exclusive() {
         let result = Cli::try_parse_from([
             "rvc-signer",
+            "serve",
             "--keystore-dir",
             "/tmp/ks",
             "--password-dir",
@@ -273,9 +393,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_missing_keystore_dir_fails() {
+    fn test_cli_missing_subcommand_fails() {
         let result = Cli::try_parse_from(["rvc-signer"]);
-        assert!(result.is_err(), "keystore-dir is required");
+        assert!(result.is_err(), "subcommand is required");
     }
 
     #[test]
@@ -342,18 +462,25 @@ mod tests {
         fn test_dvt_peers_flag() {
             let cli = Cli::parse_from([
                 "rvc-signer",
+                "serve",
                 "--keystore-dir",
                 "/tmp/ks",
                 "--dvt-peers",
                 "127.0.0.1:50053,127.0.0.1:50054",
             ]);
-            assert_eq!(cli.dvt_peers, vec!["127.0.0.1:50053", "127.0.0.1:50054"]);
+            match cli.command {
+                Command::Serve(args) => {
+                    assert_eq!(args.dvt_peers, vec!["127.0.0.1:50053", "127.0.0.1:50054"]);
+                }
+                _ => panic!("expected Serve command"),
+            }
         }
 
         #[test]
         fn test_dvt_threshold_and_index() {
             let cli = Cli::parse_from([
                 "rvc-signer",
+                "serve",
                 "--keystore-dir",
                 "/tmp/ks",
                 "--dvt-threshold",
@@ -361,38 +488,60 @@ mod tests {
                 "--dvt-index",
                 "1",
             ]);
-            assert_eq!(cli.dvt_threshold, Some(2));
-            assert_eq!(cli.dvt_index, Some(1));
+            match cli.command {
+                Command::Serve(args) => {
+                    assert_eq!(args.dvt_threshold, Some(2));
+                    assert_eq!(args.dvt_index, Some(1));
+                }
+                _ => panic!("expected Serve command"),
+            }
         }
 
         #[test]
         fn test_dvt_timeout_default() {
-            let cli = Cli::parse_from(["rvc-signer", "--keystore-dir", "/tmp/ks"]);
-            assert_eq!(cli.dvt_timeout, 2000);
+            let cli = Cli::parse_from(["rvc-signer", "serve", "--keystore-dir", "/tmp/ks"]);
+            match cli.command {
+                Command::Serve(args) => {
+                    assert_eq!(args.dvt_timeout, 2000);
+                }
+                _ => panic!("expected Serve command"),
+            }
         }
 
         #[test]
         fn test_dvt_timeout_custom() {
             let cli = Cli::parse_from([
                 "rvc-signer",
+                "serve",
                 "--keystore-dir",
                 "/tmp/ks",
                 "--dvt-timeout",
                 "5000",
             ]);
-            assert_eq!(cli.dvt_timeout, 5000);
+            match cli.command {
+                Command::Serve(args) => {
+                    assert_eq!(args.dvt_timeout, 5000);
+                }
+                _ => panic!("expected Serve command"),
+            }
         }
 
         #[test]
         fn test_dvt_peers_empty_by_default() {
-            let cli = Cli::parse_from(["rvc-signer", "--keystore-dir", "/tmp/ks"]);
-            assert!(cli.dvt_peers.is_empty());
+            let cli = Cli::parse_from(["rvc-signer", "serve", "--keystore-dir", "/tmp/ks"]);
+            match cli.command {
+                Command::Serve(args) => {
+                    assert!(args.dvt_peers.is_empty());
+                }
+                _ => panic!("expected Serve command"),
+            }
         }
 
         #[test]
         fn test_dvt_all_flags_together() {
             let cli = Cli::parse_from([
                 "rvc-signer",
+                "serve",
                 "--keystore-dir",
                 "/tmp/ks",
                 "--dvt-peers",
@@ -406,10 +555,125 @@ mod tests {
                 "--password-file",
                 "/tmp/pw.txt",
             ]);
-            assert_eq!(cli.dvt_peers.len(), 3);
-            assert_eq!(cli.dvt_threshold, Some(3));
-            assert_eq!(cli.dvt_index, Some(0));
-            assert_eq!(cli.dvt_timeout, 1500);
+            match cli.command {
+                Command::Serve(args) => {
+                    assert_eq!(args.dvt_peers.len(), 3);
+                    assert_eq!(args.dvt_threshold, Some(3));
+                    assert_eq!(args.dvt_index, Some(0));
+                    assert_eq!(args.dvt_timeout, 1500);
+                }
+                _ => panic!("expected Serve command"),
+            }
+        }
+
+        #[test]
+        fn test_cli_parse_split_key() {
+            let cli = Cli::parse_from([
+                "rvc-signer",
+                "split-key",
+                "--keystore",
+                "/tmp/key.json",
+                "--password",
+                "secret",
+                "--threshold",
+                "2",
+                "--shares",
+                "3",
+                "--output-dir",
+                "/tmp/shares",
+                "--output-password",
+                "share-secret",
+            ]);
+            match cli.command {
+                Command::SplitKey(args) => {
+                    assert_eq!(args.keystore, PathBuf::from("/tmp/key.json"));
+                    assert_eq!(args.password, Some("secret".to_string()));
+                    assert!(args.password_file.is_none());
+                    assert_eq!(args.threshold, 2);
+                    assert_eq!(args.shares, 3);
+                    assert_eq!(args.output_dir, PathBuf::from("/tmp/shares"));
+                    assert_eq!(args.output_password, Some("share-secret".to_string()));
+                    assert!(args.output_password_file.is_none());
+                }
+                _ => panic!("expected SplitKey command"),
+            }
+        }
+
+        #[test]
+        fn test_cli_parse_split_key_with_password_files() {
+            let cli = Cli::parse_from([
+                "rvc-signer",
+                "split-key",
+                "--keystore",
+                "/tmp/key.json",
+                "--password-file",
+                "/tmp/pw.txt",
+                "--threshold",
+                "3",
+                "--shares",
+                "5",
+                "--output-dir",
+                "/tmp/shares",
+                "--output-password-file",
+                "/tmp/share-pw.txt",
+            ]);
+            match cli.command {
+                Command::SplitKey(args) => {
+                    assert!(args.password.is_none());
+                    assert_eq!(args.password_file, Some(PathBuf::from("/tmp/pw.txt")));
+                    assert_eq!(args.threshold, 3);
+                    assert_eq!(args.shares, 5);
+                    assert!(args.output_password.is_none());
+                    assert_eq!(
+                        args.output_password_file,
+                        Some(PathBuf::from("/tmp/share-pw.txt"))
+                    );
+                }
+                _ => panic!("expected SplitKey command"),
+            }
+        }
+
+        #[test]
+        fn test_cli_split_key_password_and_file_mutually_exclusive() {
+            let result = Cli::try_parse_from([
+                "rvc-signer",
+                "split-key",
+                "--keystore",
+                "/tmp/key.json",
+                "--password",
+                "secret",
+                "--password-file",
+                "/tmp/pw.txt",
+                "--threshold",
+                "2",
+                "--shares",
+                "3",
+                "--output-dir",
+                "/tmp/shares",
+                "--output-password",
+                "pw",
+            ]);
+            assert!(result.is_err(), "password and password-file should be mutually exclusive");
+        }
+
+        #[test]
+        fn test_load_password_from_args_inline() {
+            let result = load_password_from_args(Some("my-password"), None).unwrap();
+            assert_eq!(*result, "my-password");
+        }
+
+        #[test]
+        fn test_load_password_from_args_file() {
+            let tmp = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(tmp.path(), "file-password\n").unwrap();
+            let result = load_password_from_args(None, Some(tmp.path())).unwrap();
+            assert_eq!(*result, "file-password");
+        }
+
+        #[test]
+        fn test_load_password_from_args_neither() {
+            let result = load_password_from_args(None, None);
+            assert!(result.is_err());
         }
     }
 }
