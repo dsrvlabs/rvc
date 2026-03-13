@@ -1,9 +1,12 @@
 pub mod backend;
+pub mod service;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::Parser;
-use tracing::info;
+use tracing::{error, info};
+use zeroize::Zeroizing;
 
 pub mod tls;
 
@@ -89,9 +92,61 @@ async fn main() {
         "Starting rvc-signer"
     );
 
-    // Wait for shutdown signal
-    shutdown_signal().await;
+    if let Err(e) = run(cli).await {
+        error!(error = %e, "rvc-signer failed");
+        std::process::exit(1);
+    }
+
     info!("Shutting down rvc-signer");
+}
+
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let password = load_password(&cli)?;
+
+    let signer = backend::basic::BasicSigner::load(&cli.keystore_dir, &password)?;
+    let backend: Arc<dyn backend::SigningBackend> = Arc::new(signer);
+
+    let signer_service =
+        service::SignerServiceImpl::new(Arc::clone(&backend), cli.backend.to_string());
+
+    let addr = cli.listen_address.parse()?;
+
+    let mut builder = tonic::transport::Server::builder();
+
+    if let (Some(cert), Some(key), Some(ca)) =
+        (cli.tls_cert.as_ref(), cli.tls_key.as_ref(), cli.tls_ca_cert.as_ref())
+    {
+        let tls_config =
+            tls::TlsConfig::new(cert.clone(), key.clone(), ca.clone()).to_server_tls_config()?;
+        builder = builder.tls_config(tls_config)?;
+        info!("mTLS enabled");
+    } else {
+        info!("TLS disabled (no --tls-cert/--tls-key/--tls-ca-cert provided)");
+    }
+
+    info!(address = %addr, "gRPC server listening");
+    builder
+        .add_service(SignerServiceServer::new(signer_service))
+        .serve_with_shutdown(addr, shutdown_signal())
+        .await?;
+
+    Ok(())
+}
+
+fn load_password(cli: &Cli) -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
+    if let Some(ref path) = cli.password_file {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| format!("failed to read password file {}: {}", path.display(), e))?;
+        Ok(Zeroizing::new(content.trim_end().to_string()))
+    } else if let Some(ref dir) = cli.password_dir {
+        // For password-dir, we read the first file found as the shared password.
+        // Individual per-keystore password files are handled in BasicSigner::load
+        // when that feature is implemented. For now, use the directory path.
+        let _ = dir;
+        Err("--password-dir is not yet supported; use --password-file".into())
+    } else {
+        Err("one of --password-file or --password-dir is required".into())
+    }
 }
 
 async fn shutdown_signal() {
