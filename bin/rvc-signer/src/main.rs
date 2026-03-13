@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod backend;
 #[cfg(feature = "dvt")]
 pub mod commands;

@@ -4,6 +4,7 @@ use std::time::Instant;
 use tonic::{Request, Response, Status};
 use tracing::Span;
 
+use crate::audit;
 use crate::backend::SigningBackend;
 use crate::metrics::SignerMetrics;
 use crate::proto::signer::signer_service_server::SignerService;
@@ -33,6 +34,7 @@ impl SignerServiceImpl {
 impl SignerService for SignerServiceImpl {
     #[tracing::instrument(name = "rvc.signer.sign", skip_all, fields(pubkey))]
     async fn sign(&self, request: Request<SignRequest>) -> Result<Response<SignResponse>, Status> {
+        let client_cn = audit::extract_client_cn(&request);
         let req = request.into_inner();
 
         if req.signing_root.len() != 32 {
@@ -49,7 +51,7 @@ impl SignerService for SignerServiceImpl {
             )));
         }
 
-        let pubkey_hex = hex::encode(&req.pubkey[..6]);
+        let pubkey_hex = format!("0x{}", hex::encode(&req.pubkey));
         Span::current().record("pubkey", pubkey_hex.as_str());
 
         let signing_root: [u8; 32] = req.signing_root.try_into().expect("length already validated");
@@ -57,18 +59,23 @@ impl SignerService for SignerServiceImpl {
 
         let start = Instant::now();
         let result = self.backend.sign(&signing_root, &pubkey).await;
-        let elapsed = start.elapsed().as_secs_f64();
+        let elapsed = start.elapsed();
 
         if let Some(ref m) = self.metrics {
-            m.sign_duration_seconds.with_label_values(&[&self.backend_name]).observe(elapsed);
+            m.sign_duration_seconds
+                .with_label_values(&[&self.backend_name])
+                .observe(elapsed.as_secs_f64());
         }
 
-        match result {
+        let (grpc_result, audit_result) = match result {
             Ok(signature) => {
                 if let Some(ref m) = self.metrics {
                     m.sign_total.with_label_values(&[self.backend_name.as_str(), "success"]).inc();
                 }
-                Ok(Response::new(SignResponse { signature: signature.to_vec() }))
+                (
+                    Ok(Response::new(SignResponse { signature: signature.to_vec() })),
+                    "success".to_string(),
+                )
             }
             Err(ref e) => {
                 if let Some(ref m) = self.metrics {
@@ -78,14 +85,26 @@ impl SignerService for SignerServiceImpl {
                         .with_label_values(&[self.backend_name.as_str(), error_type])
                         .inc();
                 }
-                match e {
+                let (status, audit_result) = match e {
                     crate::backend::SigningBackendError::KeyNotFound(_) => {
-                        Err(Status::not_found("unknown public key"))
+                        (Status::not_found("unknown public key"), "key_not_found".to_string())
                     }
-                    _ => Err(Status::internal(e.to_string())),
-                }
+                    _ => (Status::internal(e.to_string()), "error".to_string()),
+                };
+                (Err(status), audit_result)
             }
-        }
+        };
+
+        audit::log_audit(&audit::AuditEntry {
+            timestamp: audit::now_rfc3339(),
+            pubkey_hex,
+            client_cn,
+            backend: self.backend_name.clone(),
+            result: audit_result,
+            duration_ms: elapsed.as_millis() as u64,
+        });
+
+        grpc_result
     }
 
     async fn list_public_keys(
