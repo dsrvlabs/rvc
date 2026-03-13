@@ -1,3 +1,5 @@
+pub mod backend;
+
 use std::path::PathBuf;
 
 use clap::Parser;

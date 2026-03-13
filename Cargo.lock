@@ -4045,9 +4045,12 @@ dependencies = [
 name = "rvc-signer-bin"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
+ "hex",
  "prost 0.13.5",
  "rcgen",
+ "rvc-crypto",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -4055,6 +4058,7 @@ dependencies = [
  "tonic-build",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]
