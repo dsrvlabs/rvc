@@ -4,19 +4,21 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use crypto::{Keystore, SecretKey};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 use zeroize::Zeroizing;
 
 use super::{SigningBackend, SigningBackendError};
 
 pub struct BasicSigner {
-    keys: HashMap<[u8; 48], (SecretKey, Mutex<()>)>,
+    #[allow(clippy::type_complexity)]
+    keys: RwLock<HashMap<[u8; 48], (SecretKey, Mutex<()>)>>,
 }
 
 impl fmt::Debug for BasicSigner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BasicSigner").field("key_count", &self.keys.len()).finish()
+        let key_count = self.keys.try_read().map(|k| k.len()).unwrap_or(0);
+        f.debug_struct("BasicSigner").field("key_count", &key_count).finish()
     }
 }
 
@@ -74,7 +76,22 @@ impl BasicSigner {
         }
 
         info!(key_count = keys.len(), "BasicSigner loaded");
-        Ok(Self { keys })
+        Ok(Self { keys: RwLock::new(keys) })
+    }
+
+    pub async fn add_key(&self, pubkey: [u8; 48], secret_key: SecretKey) {
+        let mut keys = self.keys.write().await;
+        keys.insert(pubkey, (secret_key, Mutex::new(())));
+    }
+
+    pub async fn remove_key(&self, pubkey: &[u8; 48]) -> bool {
+        let mut keys = self.keys.write().await;
+        keys.remove(pubkey).is_some()
+    }
+
+    pub async fn loaded_pubkeys(&self) -> Vec<[u8; 48]> {
+        let keys = self.keys.read().await;
+        keys.keys().copied().collect()
     }
 }
 
@@ -85,8 +102,9 @@ impl SigningBackend for BasicSigner {
         signing_root: &[u8; 32],
         pubkey: &[u8; 48],
     ) -> Result<[u8; 96], SigningBackendError> {
+        let keys = self.keys.read().await;
         let (secret_key, mutex): &(SecretKey, Mutex<()>) =
-            self.keys.get(pubkey).ok_or(SigningBackendError::KeyNotFound(*pubkey))?;
+            keys.get(pubkey).ok_or(SigningBackendError::KeyNotFound(*pubkey))?;
 
         let _guard = mutex.lock().await;
         let signature = secret_key.sign(signing_root);
@@ -94,7 +112,7 @@ impl SigningBackend for BasicSigner {
     }
 
     fn public_keys(&self) -> Vec<[u8; 48]> {
-        self.keys.keys().copied().collect()
+        self.keys.try_read().map(|k| k.keys().copied().collect()).unwrap_or_default()
     }
 }
 
@@ -121,6 +139,32 @@ fn check_file_permissions(path: &Path) {
 
 #[cfg(not(unix))]
 fn check_file_permissions(_path: &Path) {}
+
+pub fn load_keystore_from_file(
+    path: &Path,
+    password: &Zeroizing<String>,
+) -> Result<(SecretKey, [u8; 48]), SigningBackendError> {
+    check_file_permissions(path);
+
+    let keystore = Keystore::from_file(path).map_err(|e| {
+        SigningBackendError::KeystoreLoadFailed(format!(
+            "failed to load keystore {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let secret_key = keystore.decrypt(password.as_bytes()).map_err(|e| {
+        SigningBackendError::KeystoreLoadFailed(format!(
+            "failed to decrypt keystore {}: {}",
+            path.display(),
+            e
+        ))
+    })?;
+
+    let pubkey = secret_key.public_key().to_bytes();
+    Ok((secret_key, pubkey))
+}
 
 #[cfg(test)]
 mod tests {
@@ -318,5 +362,84 @@ mod tests {
         for i in 1..results.len() {
             assert_ne!(results[0], results[i]);
         }
+    }
+
+    #[tokio::test]
+    async fn test_add_key_makes_key_available() {
+        let dir = TempDir::new().unwrap();
+        let password = Zeroizing::new("test-password".to_string());
+        let signer = BasicSigner::load(dir.path(), &password).unwrap();
+
+        assert!(signer.public_keys().is_empty());
+
+        let sk = SecretKey::generate();
+        let pubkey = sk.public_key().to_bytes();
+        signer.add_key(pubkey, sk).await;
+
+        let keys = signer.public_keys();
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&pubkey));
+
+        // Should be signable
+        let signing_root = [42u8; 32];
+        let result = signer.sign(&signing_root, &pubkey).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_remove_key_makes_key_unavailable() {
+        let dir = TempDir::new().unwrap();
+        let password = Zeroizing::new("test-password".to_string());
+        let pubkey = create_test_keystore(dir.path(), &password);
+
+        let signer = BasicSigner::load(dir.path(), &password).unwrap();
+        assert_eq!(signer.public_keys().len(), 1);
+
+        let removed = signer.remove_key(&pubkey).await;
+        assert!(removed);
+        assert!(signer.public_keys().is_empty());
+
+        // Should no longer be signable
+        let signing_root = [42u8; 32];
+        let result = signer.sign(&signing_root, &pubkey).await;
+        assert!(matches!(result.unwrap_err(), SigningBackendError::KeyNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent_key_returns_false() {
+        let dir = TempDir::new().unwrap();
+        let password = Zeroizing::new("test-password".to_string());
+        let signer = BasicSigner::load(dir.path(), &password).unwrap();
+
+        let removed = signer.remove_key(&[0u8; 48]).await;
+        assert!(!removed);
+    }
+
+    #[tokio::test]
+    async fn test_load_keystore_from_file() {
+        let dir = TempDir::new().unwrap();
+        let password = Zeroizing::new("test-password".to_string());
+        let expected_pubkey = create_test_keystore(dir.path(), &password);
+
+        let filename = format!("{}.json", hex::encode(expected_pubkey));
+        let path = dir.path().join(&filename);
+
+        let (sk, pubkey) = load_keystore_from_file(&path, &password).unwrap();
+        assert_eq!(pubkey, expected_pubkey);
+        assert_eq!(sk.public_key().to_bytes(), expected_pubkey);
+    }
+
+    #[tokio::test]
+    async fn test_load_keystore_from_file_wrong_password() {
+        let dir = TempDir::new().unwrap();
+        let password = Zeroizing::new("correct".to_string());
+        let wrong = Zeroizing::new("wrong".to_string());
+        let pubkey = create_test_keystore(dir.path(), &password);
+
+        let filename = format!("{}.json", hex::encode(pubkey));
+        let path = dir.path().join(&filename);
+
+        let result = load_keystore_from_file(&path, &wrong);
+        assert!(matches!(result.unwrap_err(), SigningBackendError::KeystoreLoadFailed(_)));
     }
 }

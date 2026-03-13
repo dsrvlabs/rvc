@@ -18,6 +18,7 @@ pub struct SignerSection {
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub tls_ca_cert: Option<PathBuf>,
+    pub reload_interval_secs: Option<u64>,
     pub dvt: Option<DvtConfig>,
 }
 
@@ -40,6 +41,7 @@ pub struct ResolvedConfig {
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
     pub tls_ca_cert: Option<PathBuf>,
+    pub reload_interval_secs: u64,
     pub dvt_peers: Vec<String>,
     pub dvt_threshold: Option<u64>,
     pub dvt_index: Option<u64>,
@@ -58,6 +60,8 @@ pub struct CliOverrides<'a> {
     pub tls_cert: Option<&'a Path>,
     pub tls_key: Option<&'a Path>,
     pub tls_ca_cert: Option<&'a Path>,
+    pub reload_interval: u64,
+    pub reload_interval_is_default: bool,
     pub dvt_peers: &'a [String],
     pub dvt_threshold: Option<u64>,
     pub dvt_index: Option<u64>,
@@ -105,6 +109,12 @@ pub fn merge_with_cli(
     let tls_key = cli.tls_key.map(PathBuf::from).or(section.tls_key);
     let tls_ca_cert = cli.tls_ca_cert.map(PathBuf::from).or(section.tls_ca_cert);
 
+    let reload_interval_secs = if !cli.reload_interval_is_default {
+        cli.reload_interval
+    } else {
+        section.reload_interval_secs.unwrap_or(cli.reload_interval)
+    };
+
     let dvt_peers = if !cli.dvt_peers.is_empty() {
         cli.dvt_peers.to_vec()
     } else {
@@ -130,6 +140,7 @@ pub fn merge_with_cli(
         tls_cert,
         tls_key,
         tls_ca_cert,
+        reload_interval_secs,
         dvt_peers,
         dvt_threshold,
         dvt_index,
@@ -162,6 +173,8 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             tls_ca_cert: None,
+            reload_interval: 30,
+            reload_interval_is_default: true,
             dvt_peers: &[],
             dvt_threshold: None,
             dvt_index: None,

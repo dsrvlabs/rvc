@@ -6,6 +6,7 @@ pub mod config;
 #[cfg(feature = "dvt")]
 pub mod dvt;
 pub mod metrics;
+pub mod reload;
 pub mod service;
 
 use std::path::PathBuf;
@@ -119,6 +120,10 @@ struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:9101")]
     metrics_address: String,
 
+    /// Keystore reload interval in seconds (0 to disable)
+    #[arg(long, default_value = "30")]
+    reload_interval: u64,
+
     /// Comma-separated list of DVT peer addresses (host:port)
     #[cfg(feature = "dvt")]
     #[arg(long, value_delimiter = ',')]
@@ -231,29 +236,35 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the signing backend and optional peer signer service
     #[cfg(feature = "dvt")]
-    let (signing_backend, peer_signer_service): (
+    let (signing_backend, peer_signer_service, basic_signer_ref): (
         Arc<dyn backend::SigningBackend>,
         Option<dvt::peer_service::PeerSignerServiceImpl>,
+        Option<Arc<backend::basic::BasicSigner>>,
     ) = match parse_backend(&resolved.backend)? {
         Backend::Basic => {
-            let signer = backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)?;
-            (Arc::new(signer), None)
+            let signer = Arc::new(backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)?);
+            (Arc::clone(&signer) as Arc<dyn backend::SigningBackend>, None, Some(signer))
         }
         Backend::Dvt => {
-            build_dvt_backend(
+            let (backend, peer_svc) = build_dvt_backend(
                 &resolved,
                 &password,
                 tls_config.as_ref(),
                 Arc::new(signer_metrics.dvt.clone()),
             )
-            .await?
+            .await?;
+            (backend, peer_svc, None)
         }
     };
 
     #[cfg(not(feature = "dvt"))]
-    let (signing_backend, peer_signer_service): (Arc<dyn backend::SigningBackend>, Option<()>) = {
-        let signer = backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)?;
-        (Arc::new(signer), None)
+    let (signing_backend, peer_signer_service, basic_signer_ref): (
+        Arc<dyn backend::SigningBackend>,
+        Option<()>,
+        Option<Arc<backend::basic::BasicSigner>>,
+    ) = {
+        let signer = Arc::new(backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)?);
+        (Arc::clone(&signer) as Arc<dyn backend::SigningBackend>, None, Some(signer))
     };
 
     // Validate TLS certificates if provided
@@ -281,6 +292,29 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         return Ok(());
+    }
+
+    // Start keystore hot-reload if using basic backend and interval > 0
+    if let Some(ref basic_signer) = basic_signer_ref {
+        if resolved.reload_interval_secs > 0 {
+            let reloader = reload::KeystoreReloader::new(
+                resolved.keystore_dir.clone(),
+                password.clone(),
+                std::time::Duration::from_secs(resolved.reload_interval_secs),
+                Arc::clone(basic_signer),
+            );
+
+            let cancel = tokio_util::sync::CancellationToken::new();
+            let cancel_clone = cancel.clone();
+            tokio::spawn(async move {
+                reloader.run(cancel_clone).await;
+            });
+
+            info!(
+                interval_secs = resolved.reload_interval_secs,
+                "Keystore hot-reload enabled"
+            );
+        }
     }
 
     // Set up Prometheus metrics server
@@ -416,6 +450,8 @@ fn resolve_config(args: &ServeArgs) -> Result<config::ResolvedConfig, Box<dyn st
     let listen_address_is_default = has_config && args.listen_address == DEFAULT_LISTEN_ADDRESS;
     let backend_is_default = has_config && matches!(args.backend, Backend::Basic);
 
+    let reload_interval_is_default = has_config && args.reload_interval == 30;
+
     #[cfg(feature = "dvt")]
     let dvt_timeout_is_default = has_config && args.dvt_timeout == 2000;
     #[cfg(not(feature = "dvt"))]
@@ -444,6 +480,8 @@ fn resolve_config(args: &ServeArgs) -> Result<config::ResolvedConfig, Box<dyn st
         tls_cert: args.tls_cert.as_deref(),
         tls_key: args.tls_key.as_deref(),
         tls_ca_cert: args.tls_ca_cert.as_deref(),
+        reload_interval: args.reload_interval,
+        reload_interval_is_default,
         dvt_peers,
         dvt_threshold,
         dvt_index,
@@ -622,6 +660,7 @@ mod tests {
             dry_run: true,
             backend: Backend::Basic,
             metrics_address: "127.0.0.1:0".to_string(),
+            reload_interval: 0,
             #[cfg(feature = "dvt")]
             dvt_peers: vec![],
             #[cfg(feature = "dvt")]
@@ -654,6 +693,7 @@ mod tests {
             dry_run: true,
             backend: Backend::Basic,
             metrics_address: "127.0.0.1:0".to_string(),
+            reload_interval: 0,
             #[cfg(feature = "dvt")]
             dvt_peers: vec![],
             #[cfg(feature = "dvt")]
@@ -714,6 +754,7 @@ mod tests {
             dry_run: true,
             backend: Backend::Basic,
             metrics_address: "127.0.0.1:0".to_string(),
+            reload_interval: 0,
             #[cfg(feature = "dvt")]
             dvt_peers: vec![],
             #[cfg(feature = "dvt")]
@@ -753,6 +794,7 @@ mod tests {
             dry_run: true,
             backend: Backend::Basic,
             metrics_address: "127.0.0.1:0".to_string(),
+            reload_interval: 0,
             #[cfg(feature = "dvt")]
             dvt_peers: vec![],
             #[cfg(feature = "dvt")]
