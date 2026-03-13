@@ -16,10 +16,11 @@ pub mod proto {
     }
 }
 
+pub use proto::signer::peer_signer_service_server::{PeerSignerService, PeerSignerServiceServer};
 pub use proto::signer::signer_service_server::{SignerService, SignerServiceServer};
 pub use proto::signer::{
     GetStatusRequest, GetStatusResponse, ListPublicKeysRequest, ListPublicKeysResponse,
-    SignRequest, SignResponse,
+    PartialSignRequest, PartialSignResponse, SignRequest, SignResponse,
 };
 
 const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:50052";
@@ -288,5 +289,24 @@ mod tests {
     #[test]
     fn test_default_listen_address() {
         assert_eq!(DEFAULT_LISTEN_ADDRESS, "127.0.0.1:50052");
+    }
+
+    #[test]
+    fn test_partial_sign_request_fields() {
+        let req = PartialSignRequest {
+            signing_root: vec![0u8; 32],
+            pubkey: vec![0u8; 48],
+            requester_index: 7,
+        };
+        assert_eq!(req.signing_root.len(), 32);
+        assert_eq!(req.pubkey.len(), 48);
+        assert_eq!(req.requester_index, 7);
+    }
+
+    #[test]
+    fn test_partial_sign_response_fields() {
+        let resp = PartialSignResponse { partial_signature: vec![0u8; 96], share_index: 3 };
+        assert_eq!(resp.partial_signature.len(), 96);
+        assert_eq!(resp.share_index, 3);
     }
 }

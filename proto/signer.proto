@@ -52,3 +52,30 @@ message GetStatusResponse {
   // key_count is the number of keys loaded in the signer.
   uint32 key_count = 3;
 }
+
+// PeerSignerService provides DVT peer-to-peer partial signature requests.
+service PeerSignerService {
+  // PartialSign produces a partial BLS signature share for DVT threshold signing.
+  rpc PartialSign(PartialSignRequest) returns (PartialSignResponse);
+}
+
+// PartialSignRequest is the request message for the PartialSign RPC.
+message PartialSignRequest {
+  // signing_root is the 32-byte hash to sign.
+  bytes signing_root = 1;
+
+  // pubkey is the 48-byte BLS public key identifying which key to sign with.
+  bytes pubkey = 2;
+
+  // requester_index is the index of the peer requesting the partial signature.
+  uint64 requester_index = 3;
+}
+
+// PartialSignResponse is the response message for the PartialSign RPC.
+message PartialSignResponse {
+  // partial_signature is the 96-byte BLS partial signature share.
+  bytes partial_signature = 1;
+
+  // share_index is the index of the share that produced the partial signature.
+  uint64 share_index = 2;
+}
