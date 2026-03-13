@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use tracing::info;
 
+pub mod tls;
+
 pub mod proto {
     pub mod signer {
         tonic::include_proto!("signer");
