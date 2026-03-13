@@ -6,12 +6,23 @@ use prometheus::{
 use tokio::task::JoinHandle;
 use tracing::info;
 
+#[cfg(feature = "dvt")]
+#[derive(Clone)]
+pub struct DvtMetrics {
+    pub coordination_duration_seconds: HistogramVec,
+    pub peers_responded: HistogramVec,
+    pub threshold_failures_total: IntCounterVec,
+    pub partial_sign_duration_seconds: HistogramVec,
+}
+
 pub struct SignerMetrics {
     pub registry: Registry,
     pub sign_total: IntCounterVec,
     pub sign_duration_seconds: HistogramVec,
     pub sign_errors_total: IntCounterVec,
     pub keys_loaded: GaugeVec,
+    #[cfg(feature = "dvt")]
+    pub dvt: DvtMetrics,
 }
 
 impl Default for SignerMetrics {
@@ -64,7 +75,76 @@ impl SignerMetrics {
             .register(Box::new(keys_loaded.clone()))
             .expect("failed to register rvc_signer_keys_loaded");
 
-        Self { registry, sign_total, sign_duration_seconds, sign_errors_total, keys_loaded }
+        #[cfg(feature = "dvt")]
+        let dvt = {
+            let coordination_duration_seconds = HistogramVec::new(
+                HistogramOpts::new(
+                    "rvc_signer_dvt_coordination_duration_seconds",
+                    "Total time for DVT peer coordination in seconds",
+                )
+                .buckets(vec![0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]),
+                &[],
+            )
+            .expect("failed to create rvc_signer_dvt_coordination_duration_seconds");
+            registry
+                .register(Box::new(coordination_duration_seconds.clone()))
+                .expect("failed to register rvc_signer_dvt_coordination_duration_seconds");
+
+            let peers_responded = HistogramVec::new(
+                HistogramOpts::new(
+                    "rvc_signer_dvt_peers_responded",
+                    "Number of peers that responded per DVT sign operation",
+                )
+                .buckets(vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 10.0, 20.0]),
+                &[],
+            )
+            .expect("failed to create rvc_signer_dvt_peers_responded");
+            registry
+                .register(Box::new(peers_responded.clone()))
+                .expect("failed to register rvc_signer_dvt_peers_responded");
+
+            let threshold_failures_total = IntCounterVec::new(
+                Opts::new(
+                    "rvc_signer_dvt_threshold_failures_total",
+                    "Total times DVT threshold was not met",
+                ),
+                &[],
+            )
+            .expect("failed to create rvc_signer_dvt_threshold_failures_total");
+            registry
+                .register(Box::new(threshold_failures_total.clone()))
+                .expect("failed to register rvc_signer_dvt_threshold_failures_total");
+
+            let partial_sign_duration_seconds = HistogramVec::new(
+                HistogramOpts::new(
+                    "rvc_signer_dvt_partial_sign_duration_seconds",
+                    "Per-peer partial signature latency in seconds",
+                )
+                .buckets(vec![0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5]),
+                &["peer"],
+            )
+            .expect("failed to create rvc_signer_dvt_partial_sign_duration_seconds");
+            registry
+                .register(Box::new(partial_sign_duration_seconds.clone()))
+                .expect("failed to register rvc_signer_dvt_partial_sign_duration_seconds");
+
+            DvtMetrics {
+                coordination_duration_seconds,
+                peers_responded,
+                threshold_failures_total,
+                partial_sign_duration_seconds,
+            }
+        };
+
+        Self {
+            registry,
+            sign_total,
+            sign_duration_seconds,
+            sign_errors_total,
+            keys_loaded,
+            #[cfg(feature = "dvt")]
+            dvt,
+        }
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, prometheus::Error> {
@@ -245,5 +325,95 @@ mod tests {
         assert!(response.contains("rvc_signer_sign_total"), "response: {response}");
 
         handle.abort();
+    }
+
+    #[cfg(feature = "dvt")]
+    mod dvt_metrics_tests {
+        use super::*;
+
+        #[test]
+        fn test_dvt_metrics_registered_in_signer_metrics() {
+            let m = SignerMetrics::new();
+            m.dvt.coordination_duration_seconds.with_label_values(&[] as &[&str]).observe(0.1);
+            m.dvt.peers_responded.with_label_values(&[] as &[&str]).observe(2.0);
+            m.dvt.threshold_failures_total.with_label_values(&[] as &[&str]).inc();
+            m.dvt.partial_sign_duration_seconds.with_label_values(&["peer1:5000"]).observe(0.05);
+
+            let gathered = m.registry.gather();
+            let names: Vec<&str> = gathered.iter().map(|mf| mf.name()).collect();
+            assert!(names.contains(&"rvc_signer_dvt_coordination_duration_seconds"));
+            assert!(names.contains(&"rvc_signer_dvt_peers_responded"));
+            assert!(names.contains(&"rvc_signer_dvt_threshold_failures_total"));
+            assert!(names.contains(&"rvc_signer_dvt_partial_sign_duration_seconds"));
+        }
+
+        #[test]
+        fn test_dvt_coordination_duration_records() {
+            let m = SignerMetrics::new();
+            m.dvt.coordination_duration_seconds.with_label_values(&[] as &[&str]).observe(0.25);
+            assert_eq!(
+                m.dvt
+                    .coordination_duration_seconds
+                    .with_label_values(&[] as &[&str])
+                    .get_sample_count(),
+                1
+            );
+        }
+
+        #[test]
+        fn test_dvt_peers_responded_records() {
+            let m = SignerMetrics::new();
+            m.dvt.peers_responded.with_label_values(&[] as &[&str]).observe(3.0);
+            assert_eq!(
+                m.dvt.peers_responded.with_label_values(&[] as &[&str]).get_sample_count(),
+                1
+            );
+            assert!(
+                (m.dvt.peers_responded.with_label_values(&[] as &[&str]).get_sample_sum() - 3.0)
+                    .abs()
+                    < 1e-9
+            );
+        }
+
+        #[test]
+        fn test_dvt_threshold_failures_increments() {
+            let m = SignerMetrics::new();
+            m.dvt.threshold_failures_total.with_label_values(&[] as &[&str]).inc();
+            m.dvt.threshold_failures_total.with_label_values(&[] as &[&str]).inc();
+            assert_eq!(m.dvt.threshold_failures_total.with_label_values(&[] as &[&str]).get(), 2);
+        }
+
+        #[test]
+        fn test_dvt_partial_sign_duration_per_peer() {
+            let m = SignerMetrics::new();
+            m.dvt.partial_sign_duration_seconds.with_label_values(&["peer1:5000"]).observe(0.05);
+            m.dvt.partial_sign_duration_seconds.with_label_values(&["peer2:5000"]).observe(0.10);
+            assert_eq!(
+                m.dvt
+                    .partial_sign_duration_seconds
+                    .with_label_values(&["peer1:5000"])
+                    .get_sample_count(),
+                1
+            );
+            assert_eq!(
+                m.dvt
+                    .partial_sign_duration_seconds
+                    .with_label_values(&["peer2:5000"])
+                    .get_sample_count(),
+                1
+            );
+        }
+
+        #[test]
+        fn test_dvt_metrics_in_encode_output() {
+            let m = SignerMetrics::new();
+            m.dvt.coordination_duration_seconds.with_label_values(&[] as &[&str]).observe(0.1);
+            m.dvt.threshold_failures_total.with_label_values(&[] as &[&str]).inc();
+
+            let output = m.encode().unwrap();
+            let text = String::from_utf8(output).unwrap();
+            assert!(text.contains("rvc_signer_dvt_coordination_duration_seconds"));
+            assert!(text.contains("rvc_signer_dvt_threshold_failures_total"));
+        }
     }
 }

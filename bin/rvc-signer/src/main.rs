@@ -226,6 +226,9 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         _ => None,
     };
 
+    // Set up Prometheus metrics early so DVT backend can use them
+    let signer_metrics = Arc::new(metrics::SignerMetrics::new());
+
     // Build the signing backend and optional peer signer service
     #[cfg(feature = "dvt")]
     let (signing_backend, peer_signer_service): (
@@ -236,7 +239,15 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             let signer = backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)?;
             (Arc::new(signer), None)
         }
-        Backend::Dvt => build_dvt_backend(&resolved, &password, tls_config.as_ref()).await?,
+        Backend::Dvt => {
+            build_dvt_backend(
+                &resolved,
+                &password,
+                tls_config.as_ref(),
+                Arc::new(signer_metrics.dvt.clone()),
+            )
+            .await?
+        }
     };
 
     #[cfg(not(feature = "dvt"))]
@@ -272,8 +283,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Set up Prometheus metrics
-    let signer_metrics = Arc::new(metrics::SignerMetrics::new());
+    // Set up Prometheus metrics server
     let key_count = signing_backend.public_keys().len() as f64;
     signer_metrics.keys_loaded.with_label_values(&[&resolved.backend]).set(key_count);
 
@@ -323,6 +333,7 @@ async fn build_dvt_backend(
     resolved: &config::ResolvedConfig,
     password: &Zeroizing<String>,
     tls_config: Option<&tls::TlsConfig>,
+    dvt_metrics: Arc<metrics::DvtMetrics>,
 ) -> Result<
     (Arc<dyn backend::SigningBackend>, Option<dvt::peer_service::PeerSignerServiceImpl>),
     Box<dyn std::error::Error>,
@@ -375,7 +386,8 @@ async fn build_dvt_backend(
         resolved.dvt_peers.clone(),
         peer_requester,
         timeout,
-    );
+    )
+    .with_metrics(dvt_metrics);
 
     Ok((Arc::new(dvt_signer), Some(peer_signer_service)))
 }
@@ -1155,10 +1167,12 @@ mod tests {
                 "--password-file",
                 pw_file.to_str().unwrap(),
             ]);
-            let password = load_serve_password(&args).unwrap();
-            let result = build_dvt_backend(&args, &password, None).await;
+            let resolved = resolve_config(&args).unwrap();
+            let password = load_serve_password(&resolved).unwrap();
+            let dvt_metrics = Arc::new(metrics::SignerMetrics::new().dvt.clone());
+            let result = build_dvt_backend(&resolved, &password, None, dvt_metrics).await;
             let err = result.err().expect("should fail without --dvt-index");
-            assert!(err.to_string().contains("--dvt-index"));
+            assert!(err.to_string().contains("dvt_index"));
         }
 
         #[tokio::test]
@@ -1179,8 +1193,10 @@ mod tests {
                 "--password-file",
                 pw_file.to_str().unwrap(),
             ]);
-            let password = load_serve_password(&args).unwrap();
-            let result = build_dvt_backend(&args, &password, None).await;
+            let resolved = resolve_config(&args).unwrap();
+            let password = load_serve_password(&resolved).unwrap();
+            let dvt_metrics = Arc::new(metrics::SignerMetrics::new().dvt.clone());
+            let result = build_dvt_backend(&resolved, &password, None, dvt_metrics).await;
             let err = result.err().expect("should fail with no shares");
             assert!(err.to_string().contains("no DVT shares"));
         }
@@ -1216,8 +1232,11 @@ mod tests {
                 "--password-file",
                 pw_file.to_str().unwrap(),
             ]);
-            let password = load_serve_password(&args).unwrap();
-            let (backend, peer_svc) = build_dvt_backend(&args, &password, None).await.unwrap();
+            let resolved = resolve_config(&args).unwrap();
+            let password = load_serve_password(&resolved).unwrap();
+            let dvt_metrics = Arc::new(metrics::SignerMetrics::new().dvt.clone());
+            let (backend, peer_svc) =
+                build_dvt_backend(&resolved, &password, None, dvt_metrics).await.unwrap();
 
             assert_eq!(backend.public_keys().len(), 1);
             assert_eq!(backend.public_keys()[0], sk.public_key().to_bytes());

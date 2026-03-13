@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tracing::info;
@@ -9,6 +9,7 @@ use tracing::info;
 use super::{SigningBackend, SigningBackendError};
 use crate::dvt::lagrange::{combine_partial_signatures, verify_combined_signature};
 use crate::dvt::types::ShareInfo;
+use crate::metrics::DvtMetrics;
 
 const BLS_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
@@ -46,6 +47,7 @@ pub struct DvtSigner {
     own_index: u64,
     peer_requester: Option<Arc<dyn PeerRequester>>,
     timeout: Duration,
+    metrics: Option<Arc<DvtMetrics>>,
 }
 
 impl fmt::Debug for DvtSigner {
@@ -86,7 +88,12 @@ impl DvtSigner {
             "DvtSigner initialized"
         );
 
-        Self { keys, own_index, peer_requester, timeout }
+        Self { keys, own_index, peer_requester, timeout, metrics: None }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<DvtMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Produce this node's own partial signature for the given signing root.
@@ -128,6 +135,8 @@ impl SigningBackend for DvtSigner {
         let mut partials = vec![own_partial];
 
         // 2. Request partials from peers (concurrent)
+        let coordination_start = Instant::now();
+
         if let Some(ref requester) = self.peer_requester {
             let peers_contacted = key_info.peer_addrs.len();
             span.record("peers_contacted", peers_contacted as u64);
@@ -142,8 +151,12 @@ impl SigningBackend for DvtSigner {
                 let timeout = self.timeout;
 
                 join_set.spawn(async move {
-                    tokio::time::timeout(timeout, requester.request_partial(&addr, &root, &pk))
-                        .await
+                    let peer_start = Instant::now();
+                    let result =
+                        tokio::time::timeout(timeout, requester.request_partial(&addr, &root, &pk))
+                            .await;
+                    let peer_elapsed = peer_start.elapsed();
+                    (addr, result, peer_elapsed)
                 });
             }
 
@@ -152,16 +165,31 @@ impl SigningBackend for DvtSigner {
 
             while let Some(result) = join_set.join_next().await {
                 match result {
-                    Ok(Ok(Ok(partial))) => {
+                    Ok((addr, Ok(Ok(partial)), elapsed)) => {
                         partials.push(partial);
                         peers_responded += 1;
+                        if let Some(ref m) = self.metrics {
+                            m.partial_sign_duration_seconds
+                                .with_label_values(&[&addr])
+                                .observe(elapsed.as_secs_f64());
+                        }
                     }
-                    Ok(Ok(Err(e))) => {
+                    Ok((addr, Ok(Err(e)), elapsed)) => {
                         peers_failed += 1;
+                        if let Some(ref m) = self.metrics {
+                            m.partial_sign_duration_seconds
+                                .with_label_values(&[&addr])
+                                .observe(elapsed.as_secs_f64());
+                        }
                         tracing::warn!(error = %e, "Peer partial request failed");
                     }
-                    Ok(Err(_)) => {
+                    Ok((addr, Err(_), elapsed)) => {
                         peers_failed += 1;
+                        if let Some(ref m) = self.metrics {
+                            m.partial_sign_duration_seconds
+                                .with_label_values(&[&addr])
+                                .observe(elapsed.as_secs_f64());
+                        }
                         tracing::warn!("Peer partial request timed out");
                     }
                     Err(e) => {
@@ -173,6 +201,13 @@ impl SigningBackend for DvtSigner {
 
             span.record("peers_responded", peers_responded);
             span.record("peers_failed", peers_failed);
+
+            if let Some(ref m) = self.metrics {
+                m.coordination_duration_seconds
+                    .with_label_values(&[] as &[&str])
+                    .observe(coordination_start.elapsed().as_secs_f64());
+                m.peers_responded.with_label_values(&[] as &[&str]).observe(peers_responded as f64);
+            }
         } else {
             span.record("peers_contacted", 0u64);
             span.record("peers_responded", 0u64);
@@ -183,6 +218,9 @@ impl SigningBackend for DvtSigner {
 
         // 3. Check threshold
         if (partials.len() as u64) < threshold {
+            if let Some(ref m) = self.metrics {
+                m.threshold_failures_total.with_label_values(&[] as &[&str]).inc();
+            }
             return Err(SigningBackendError::SigningFailed(format!(
                 "insufficient partials: got {}, need {}",
                 partials.len(),
@@ -564,6 +602,105 @@ mod tests {
             assert!(debug.contains("DvtSigner"));
             assert!(debug.contains("key_count: 0"));
             assert!(debug.contains("own_index: 42"));
+        }
+
+        #[tokio::test]
+        async fn test_sign_updates_dvt_metrics_on_success() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let signing_root = [99u8; 32];
+
+            let shares = split_key(&sk, 2, 3);
+            let own_idx = shares[0].0;
+            let peer_idx = shares[1].0;
+            let peer_partial = partial_sign(&shares[1].1, &signing_root);
+
+            let mut peer_partials = HashMap::new();
+            peer_partials.insert("peer1:5000".to_string(), (peer_idx, peer_partial));
+            let requester = Arc::new(MockPeerRequester { partials: peer_partials });
+
+            let metrics = Arc::new(crate::metrics::SignerMetrics::new());
+            let dvt_metrics = Arc::new(metrics.dvt.clone());
+
+            let share_info = make_share_info(own_idx, shares[0].1, pk, 2, 3);
+            let signer = DvtSigner::new(
+                vec![share_info],
+                own_idx,
+                vec!["peer1:5000".to_string()],
+                Some(requester),
+                Duration::from_secs(5),
+            )
+            .with_metrics(dvt_metrics.clone());
+
+            signer.sign(&signing_root, &pk).await.unwrap();
+
+            assert_eq!(
+                dvt_metrics
+                    .coordination_duration_seconds
+                    .with_label_values(&[] as &[&str])
+                    .get_sample_count(),
+                1
+            );
+            assert_eq!(
+                dvt_metrics.peers_responded.with_label_values(&[] as &[&str]).get_sample_count(),
+                1
+            );
+            assert!(
+                (dvt_metrics.peers_responded.with_label_values(&[] as &[&str]).get_sample_sum()
+                    - 1.0)
+                    .abs()
+                    < 1e-9
+            );
+            assert_eq!(
+                dvt_metrics
+                    .partial_sign_duration_seconds
+                    .with_label_values(&["peer1:5000"])
+                    .get_sample_count(),
+                1
+            );
+            assert_eq!(
+                dvt_metrics.threshold_failures_total.with_label_values(&[] as &[&str]).get(),
+                0
+            );
+        }
+
+        #[tokio::test]
+        async fn test_sign_updates_dvt_metrics_on_threshold_failure() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let shares = split_key(&sk, 3, 5);
+            let own_idx = shares[0].0;
+
+            let requester = Arc::new(FailingPeerRequester);
+            let peer_addrs: Vec<String> = (1..=4).map(|i| format!("peer{}:5000", i)).collect();
+
+            let metrics = Arc::new(crate::metrics::SignerMetrics::new());
+            let dvt_metrics = Arc::new(metrics.dvt.clone());
+
+            let share_info = make_share_info(own_idx, shares[0].1, pk, 3, 5);
+            let signer = DvtSigner::new(
+                vec![share_info],
+                own_idx,
+                peer_addrs,
+                Some(requester),
+                Duration::from_secs(5),
+            )
+            .with_metrics(dvt_metrics.clone());
+
+            let result = signer.sign(&[11u8; 32], &pk).await;
+            assert!(result.is_err());
+
+            assert_eq!(
+                dvt_metrics.threshold_failures_total.with_label_values(&[] as &[&str]).get(),
+                1
+            );
+            assert_eq!(
+                dvt_metrics
+                    .coordination_duration_seconds
+                    .with_label_values(&[] as &[&str])
+                    .get_sample_count(),
+                1
+            );
         }
 
         #[tokio::test]
