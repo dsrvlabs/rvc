@@ -1,4 +1,6 @@
 pub mod backend;
+#[cfg(feature = "dvt")]
+pub mod dvt;
 pub mod service;
 
 use std::path::PathBuf;
