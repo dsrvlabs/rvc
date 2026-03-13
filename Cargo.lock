@@ -4214,6 +4214,7 @@ dependencies = [
  "blst",
  "clap",
  "hex",
+ "prometheus",
  "proptest",
  "prost 0.13.5",
  "rand 0.8.5",

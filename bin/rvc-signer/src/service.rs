@@ -1,9 +1,11 @@
 use std::sync::Arc;
+use std::time::Instant;
 
 use tonic::{Request, Response, Status};
 use tracing::Span;
 
 use crate::backend::SigningBackend;
+use crate::metrics::SignerMetrics;
 use crate::proto::signer::signer_service_server::SignerService;
 use crate::proto::signer::{
     GetStatusRequest, GetStatusResponse, ListPublicKeysRequest, ListPublicKeysResponse,
@@ -13,11 +15,17 @@ use crate::proto::signer::{
 pub struct SignerServiceImpl {
     backend: Arc<dyn SigningBackend>,
     backend_name: String,
+    metrics: Option<Arc<SignerMetrics>>,
 }
 
 impl SignerServiceImpl {
     pub fn new(backend: Arc<dyn SigningBackend>, backend_name: String) -> Self {
-        Self { backend, backend_name }
+        Self { backend, backend_name, metrics: None }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<SignerMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 }
 
@@ -47,12 +55,36 @@ impl SignerService for SignerServiceImpl {
         let signing_root: [u8; 32] = req.signing_root.try_into().expect("length already validated");
         let pubkey: [u8; 48] = req.pubkey.try_into().expect("length already validated");
 
-        match self.backend.sign(&signing_root, &pubkey).await {
-            Ok(signature) => Ok(Response::new(SignResponse { signature: signature.to_vec() })),
-            Err(crate::backend::SigningBackendError::KeyNotFound(_)) => {
-                Err(Status::not_found("unknown public key"))
+        let start = Instant::now();
+        let result = self.backend.sign(&signing_root, &pubkey).await;
+        let elapsed = start.elapsed().as_secs_f64();
+
+        if let Some(ref m) = self.metrics {
+            m.sign_duration_seconds.with_label_values(&[&self.backend_name]).observe(elapsed);
+        }
+
+        match result {
+            Ok(signature) => {
+                if let Some(ref m) = self.metrics {
+                    m.sign_total.with_label_values(&[self.backend_name.as_str(), "success"]).inc();
+                }
+                Ok(Response::new(SignResponse { signature: signature.to_vec() }))
             }
-            Err(e) => Err(Status::internal(e.to_string())),
+            Err(ref e) => {
+                if let Some(ref m) = self.metrics {
+                    m.sign_total.with_label_values(&[self.backend_name.as_str(), "error"]).inc();
+                    let error_type = crate::metrics::classify_error(e);
+                    m.sign_errors_total
+                        .with_label_values(&[self.backend_name.as_str(), error_type])
+                        .inc();
+                }
+                match e {
+                    crate::backend::SigningBackendError::KeyNotFound(_) => {
+                        Err(Status::not_found("unknown public key"))
+                    }
+                    _ => Err(Status::internal(e.to_string())),
+                }
+            }
         }
     }
 
@@ -253,5 +285,78 @@ mod tests {
         let req = Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: vec![1u8; 48] });
         let err = svc.sign(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Internal);
+    }
+
+    // --- Metrics tests ---
+
+    fn make_service_with_metrics(backend: MockBackend) -> (SignerServiceImpl, Arc<SignerMetrics>) {
+        let metrics = Arc::new(SignerMetrics::new());
+        let svc = SignerServiceImpl::new(Arc::new(backend), "basic".to_string())
+            .with_metrics(Arc::clone(&metrics));
+        (svc, metrics)
+    }
+
+    #[tokio::test]
+    async fn test_sign_success_increments_counter() {
+        let pubkey = [1u8; 48];
+        let (svc, metrics) = make_service_with_metrics(MockBackend::new(vec![pubkey]));
+
+        let req =
+            Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: pubkey.to_vec() });
+        svc.sign(req).await.unwrap();
+
+        assert_eq!(metrics.sign_total.with_label_values(&["basic", "success"]).get(), 1);
+        assert_eq!(metrics.sign_total.with_label_values(&["basic", "error"]).get(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sign_success_records_duration() {
+        let pubkey = [1u8; 48];
+        let (svc, metrics) = make_service_with_metrics(MockBackend::new(vec![pubkey]));
+
+        let req =
+            Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: pubkey.to_vec() });
+        svc.sign(req).await.unwrap();
+
+        assert_eq!(
+            metrics.sign_duration_seconds.with_label_values(&["basic"]).get_sample_count(),
+            1
+        );
+        assert!(
+            metrics.sign_duration_seconds.with_label_values(&["basic"]).get_sample_sum() >= 0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sign_error_increments_error_counter() {
+        let (svc, metrics) = make_service_with_metrics(MockBackend::new(vec![[1u8; 48]]));
+
+        let req = Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: vec![2u8; 48] });
+        let _ = svc.sign(req).await;
+
+        assert_eq!(metrics.sign_total.with_label_values(&["basic", "error"]).get(), 1);
+        assert_eq!(
+            metrics.sign_errors_total.with_label_values(&["basic", "key_not_found"]).get(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sign_internal_error_increments_internal_error_counter() {
+        let metrics = Arc::new(SignerMetrics::new());
+        let svc = SignerServiceImpl::new(Arc::new(FailingBackend), "basic".to_string())
+            .with_metrics(Arc::clone(&metrics));
+
+        let req = Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: vec![1u8; 48] });
+        let _ = svc.sign(req).await;
+
+        assert_eq!(metrics.sign_errors_total.with_label_values(&["basic", "internal"]).get(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_sign_without_metrics_does_not_panic() {
+        let svc = make_service(MockBackend::new(vec![[1u8; 48]]));
+        let req = Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: vec![1u8; 48] });
+        svc.sign(req).await.unwrap();
     }
 }
