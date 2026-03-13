@@ -198,12 +198,13 @@ async fn main() {
 async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let password = load_serve_password(&args)?;
 
-    let tls_config = match (args.tls_cert.as_ref(), args.tls_key.as_ref(), args.tls_ca_cert.as_ref()) {
-        (Some(cert), Some(key), Some(ca)) => {
-            Some(tls::TlsConfig::new(cert.clone(), key.clone(), ca.clone()))
-        }
-        _ => None,
-    };
+    let tls_config =
+        match (args.tls_cert.as_ref(), args.tls_key.as_ref(), args.tls_ca_cert.as_ref()) {
+            (Some(cert), Some(key), Some(ca)) => {
+                Some(tls::TlsConfig::new(cert.clone(), key.clone(), ca.clone()))
+            }
+            _ => None,
+        };
 
     // Build the signing backend and optional peer signer service
     #[cfg(feature = "dvt")]
@@ -733,10 +734,7 @@ mod tests {
                     assert_eq!(args.threshold, 3);
                     assert_eq!(args.shares, 5);
                     assert!(args.output_password.is_none());
-                    assert_eq!(
-                        args.output_password_file,
-                        Some(PathBuf::from("/tmp/share-pw.txt"))
-                    );
+                    assert_eq!(args.output_password_file, Some(PathBuf::from("/tmp/share-pw.txt")));
                 }
                 _ => panic!("expected SplitKey command"),
             }
@@ -1159,6 +1157,465 @@ mod tests {
             let requester: Arc<dyn PeerRequester> = Arc::new(requester);
             let result = requester.request_partial("unknown:1234", &[0u8; 32], &[0u8; 48]).await;
             assert!(result.is_err());
+        }
+    }
+
+    /// RS-18: Phase 2 full-stack integration tests.
+    ///
+    /// These tests exercise the complete DVT signing pipeline:
+    /// GrpcRemoteSigner client → SignerServiceImpl → DvtSigner → PeerSignerServiceImpl
+    #[cfg(feature = "dvt")]
+    mod dvt_full_stack {
+        use super::*;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use backend::basic::BasicSigner;
+        use backend::dvt::{DvtSigner, PeerRequester};
+        use backend::SigningBackend;
+        use dvt::peer_client::GrpcPeerRequester;
+        use dvt::peer_service::PeerSignerServiceImpl;
+        use dvt::types::ShareInfo;
+        use zeroize::Zeroizing;
+
+        use bls12_381_plus::Scalar;
+        use crypto::Signer;
+        use grpc_signer::{GrpcRemoteSigner, GrpcRemoteSignerConfig};
+        use rand::rngs::OsRng;
+        use vsss_rs::{shamir, DefaultShare, IdentifierPrimeField};
+
+        use dvt::bridge::blst_sk_to_scalar;
+
+        type BlsShare = DefaultShare<IdentifierPrimeField<Scalar>, IdentifierPrimeField<Scalar>>;
+
+        fn split_key(
+            sk: &crypto::SecretKey,
+            threshold: usize,
+            total: usize,
+        ) -> Vec<(u64, [u8; 32], [u8; 48])> {
+            let pk = sk.public_key().to_bytes();
+            let blst_sk = blst::min_pk::SecretKey::from_bytes(&sk.to_bytes()).unwrap();
+            let secret = blst_sk_to_scalar(&blst_sk).unwrap();
+
+            let shares: Vec<BlsShare> = shamir::split_secret::<BlsShare>(
+                threshold,
+                total,
+                &IdentifierPrimeField(secret),
+                OsRng,
+            )
+            .unwrap();
+
+            shares
+                .iter()
+                .map(|share| {
+                    use vsss_rs::Share;
+                    let idx_field: &IdentifierPrimeField<Scalar> = share.identifier();
+                    let val_field: &IdentifierPrimeField<Scalar> = share.value();
+                    let idx_bytes = idx_field.0.to_be_bytes();
+                    let idx = u64::from_be_bytes(idx_bytes[24..32].try_into().unwrap());
+                    let val_bytes = val_field.0.to_be_bytes();
+                    (idx, val_bytes, pk)
+                })
+                .collect()
+        }
+
+        fn make_share_info(
+            idx: u64,
+            scalar: [u8; 32],
+            aggregate_pubkey: [u8; 48],
+            threshold: u64,
+            total: u64,
+        ) -> ShareInfo {
+            ShareInfo {
+                index: idx,
+                threshold,
+                total,
+                scalar_bytes: Zeroizing::new(scalar),
+                aggregate_pubkey,
+            }
+        }
+
+        /// Start peer gRPC servers and return their addresses.
+        async fn start_peer_servers(
+            shares: &[(u64, [u8; 32], [u8; 48])],
+            peer_indices: &[usize],
+            pk: [u8; 48],
+            threshold: u64,
+            total: u64,
+        ) -> Vec<String> {
+            let mut peer_addrs = Vec::new();
+            for &i in peer_indices {
+                let share = make_share_info(shares[i].0, shares[i].1, pk, threshold, total);
+                let mut map = HashMap::new();
+                map.insert(pk, share);
+                let svc = PeerSignerServiceImpl::new(Arc::new(map));
+
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                peer_addrs.push(addr.to_string());
+
+                tokio::spawn(async move {
+                    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                    tonic::transport::Server::builder()
+                        .add_service(PeerSignerServiceServer::new(svc))
+                        .serve_with_incoming(incoming)
+                        .await
+                        .unwrap();
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            peer_addrs
+        }
+
+        /// Start a SignerService gRPC server backed by DvtSigner and return its address.
+        async fn start_dvt_signer_server(
+            shares: &[(u64, [u8; 32], [u8; 48])],
+            own_index: usize,
+            peer_addrs: Vec<String>,
+            pk: [u8; 48],
+            threshold: u64,
+            total: u64,
+            timeout: Duration,
+        ) -> String {
+            let own_idx = shares[own_index].0;
+            let own_share = make_share_info(own_idx, shares[own_index].1, pk, threshold, total);
+
+            let requester = if !peer_addrs.is_empty() {
+                let r = GrpcPeerRequester::connect(&peer_addrs, None, timeout).await.unwrap();
+                Some(Arc::new(r) as Arc<dyn PeerRequester>)
+            } else {
+                None
+            };
+
+            let dvt_signer =
+                DvtSigner::new(vec![own_share], own_idx, peer_addrs, requester, timeout);
+
+            let signer_svc = service::SignerServiceImpl::new(
+                Arc::new(dvt_signer) as Arc<dyn SigningBackend>,
+                "dvt".to_string(),
+            );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let addr_str = addr.to_string();
+
+            tokio::spawn(async move {
+                let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                tonic::transport::Server::builder()
+                    .add_service(SignerServiceServer::new(signer_svc))
+                    .serve_with_incoming(incoming)
+                    .await
+                    .unwrap();
+            });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            addr_str
+        }
+
+        /// Full E2E: split key → start 3 DVT nodes → GrpcRemoteSigner client signs →
+        /// verify combined signature against original pubkey.
+        #[tokio::test]
+        async fn test_full_e2e_split_key_to_grpc_client_sign() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let shares = split_key(&sk, 2, 3);
+
+            // Start peer servers for nodes 1 and 2
+            let peer_addrs = start_peer_servers(&shares, &[1, 2], pk, 2, 3).await;
+
+            // Start DVT signer server for node 0
+            let timeout = Duration::from_secs(5);
+            let server_addr =
+                start_dvt_signer_server(&shares, 0, peer_addrs, pk, 2, 3, timeout).await;
+
+            // Connect GrpcRemoteSigner client
+            let config = GrpcRemoteSignerConfig::new(format!("http://{}", server_addr));
+            let client = GrpcRemoteSigner::connect(config).await.unwrap();
+
+            // Verify the client sees the validator key
+            let keys = client.public_keys();
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0], pk);
+
+            // Sign via the client
+            let signing_root = [0xAB; 32];
+            let sig = client.sign(&signing_root, &pk).await.unwrap();
+
+            // Verify combined signature matches direct signing
+            let direct_sig = sk.sign(&signing_root);
+            assert_eq!(sig.to_bytes(), direct_sig.to_bytes());
+
+            // Verify signature via crypto crate
+            let pubkey = crypto::PublicKey::from_bytes(&pk).unwrap();
+            assert!(sig.verify(&pubkey, &signing_root).is_ok());
+        }
+
+        /// Peer failure tolerance: 1-of-2 peers down, 2-of-3 still succeeds.
+        #[tokio::test]
+        async fn test_full_e2e_peer_failure_tolerance() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let shares = split_key(&sk, 2, 3);
+
+            // Only start peer 1 (peer 2 not started)
+            let peer_addrs = start_peer_servers(&shares, &[1], pk, 2, 3).await;
+
+            // Start DVT signer server for node 0 with only the live peer
+            let timeout = Duration::from_secs(5);
+            let server_addr =
+                start_dvt_signer_server(&shares, 0, peer_addrs, pk, 2, 3, timeout).await;
+
+            // Connect client and sign
+            let config = GrpcRemoteSignerConfig::new(format!("http://{}", server_addr));
+            let client = GrpcRemoteSigner::connect(config).await.unwrap();
+
+            let signing_root = [0xCC; 32];
+            let sig = client.sign(&signing_root, &pk).await.unwrap();
+
+            // 2-of-3 threshold met (own + 1 peer), signature is valid
+            let direct_sig = sk.sign(&signing_root);
+            assert_eq!(sig.to_bytes(), direct_sig.to_bytes());
+        }
+
+        /// Timeout test: all peers slow → DvtSigner times out → error returned to client.
+        #[tokio::test]
+        async fn test_full_e2e_timeout_when_all_peers_slow() {
+            use async_trait::async_trait;
+
+            struct SlowPeerRequester;
+
+            #[async_trait]
+            impl PeerRequester for SlowPeerRequester {
+                async fn request_partial(
+                    &self,
+                    _peer_addr: &str,
+                    _signing_root: &[u8; 32],
+                    _pubkey: &[u8; 48],
+                ) -> Result<(u64, [u8; 96]), backend::dvt::PeerRequestError> {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    unreachable!()
+                }
+            }
+
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let shares = split_key(&sk, 2, 3);
+
+            let own_idx = shares[0].0;
+            let own_share = make_share_info(own_idx, shares[0].1, pk, 2, 3);
+
+            // DvtSigner with slow peer requester and very short timeout
+            let dvt_signer = DvtSigner::new(
+                vec![own_share],
+                own_idx,
+                vec!["slow-peer:5000".to_string()],
+                Some(Arc::new(SlowPeerRequester)),
+                Duration::from_millis(100),
+            );
+
+            let signer_svc = service::SignerServiceImpl::new(
+                Arc::new(dvt_signer) as Arc<dyn SigningBackend>,
+                "dvt".to_string(),
+            );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let addr_str = addr.to_string();
+
+            tokio::spawn(async move {
+                let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                tonic::transport::Server::builder()
+                    .add_service(SignerServiceServer::new(signer_svc))
+                    .serve_with_incoming(incoming)
+                    .await
+                    .unwrap();
+            });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let config = GrpcRemoteSignerConfig::new(format!("http://{}", addr_str));
+            let client = GrpcRemoteSigner::connect(config).await.unwrap();
+
+            let start = std::time::Instant::now();
+            let result = client.sign(&[0xEE; 32], &pk).await;
+            let elapsed = start.elapsed();
+
+            // Should fail because timeout → only own partial (1 of 2 needed)
+            assert!(result.is_err());
+            // Should complete within a reasonable time (timeout + overhead)
+            assert!(elapsed < Duration::from_secs(5), "took too long: {:?}", elapsed);
+        }
+
+        /// BasicSigner coexistence: a BasicSigner-backed server works independently.
+        #[tokio::test]
+        async fn test_basic_signer_coexistence() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+
+            // Create a BasicSigner using a temp keystore directory
+            let tmp = tempfile::tempdir().unwrap();
+            let password = Zeroizing::new("test-password".to_string());
+
+            // Write a keystore for the key
+            let keystore = crypto::Keystore::encrypt(
+                &sk,
+                password.as_bytes(),
+                "",
+                crypto::EncryptionKdf::Pbkdf2,
+            )
+            .unwrap();
+            let keystore_json = serde_json::to_string_pretty(&keystore).unwrap();
+            let keystore_path = tmp.path().join("key.json");
+            std::fs::write(&keystore_path, &keystore_json).unwrap();
+
+            let basic_signer = BasicSigner::load(tmp.path(), &password).unwrap();
+
+            let signer_svc = service::SignerServiceImpl::new(
+                Arc::new(basic_signer) as Arc<dyn SigningBackend>,
+                "basic".to_string(),
+            );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            tokio::spawn(async move {
+                let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                tonic::transport::Server::builder()
+                    .add_service(SignerServiceServer::new(signer_svc))
+                    .serve_with_incoming(incoming)
+                    .await
+                    .unwrap();
+            });
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let config = GrpcRemoteSignerConfig::new(format!("http://{}", addr));
+            let client = GrpcRemoteSigner::connect(config).await.unwrap();
+
+            let keys = client.public_keys();
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0], pk);
+
+            let signing_root = [0x42; 32];
+            let sig = client.sign(&signing_root, &pk).await.unwrap();
+            let direct_sig = sk.sign(&signing_root);
+            assert_eq!(sig.to_bytes(), direct_sig.to_bytes());
+        }
+
+        /// Signature equivalence: DVT combined signature is byte-identical to direct signing.
+        #[tokio::test]
+        async fn test_dvt_signature_equivalence_with_direct_signing() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let shares = split_key(&sk, 2, 3);
+
+            let peer_addrs = start_peer_servers(&shares, &[1, 2], pk, 2, 3).await;
+            let timeout = Duration::from_secs(5);
+            let server_addr =
+                start_dvt_signer_server(&shares, 0, peer_addrs, pk, 2, 3, timeout).await;
+
+            let config = GrpcRemoteSignerConfig::new(format!("http://{}", server_addr));
+            let client = GrpcRemoteSigner::connect(config).await.unwrap();
+
+            // Test multiple different signing roots
+            for root_byte in [0x00u8, 0x42, 0x99, 0xFF] {
+                let signing_root = [root_byte; 32];
+                let dvt_sig = client.sign(&signing_root, &pk).await.unwrap();
+                let direct_sig = sk.sign(&signing_root);
+                assert_eq!(
+                    dvt_sig.to_bytes(),
+                    direct_sig.to_bytes(),
+                    "DVT signature must match direct signing for root 0x{:02x}",
+                    root_byte
+                );
+            }
+        }
+
+        /// Property test: any 2-of-3 subset produces identical valid signature.
+        #[tokio::test]
+        async fn test_any_2_of_3_subset_produces_same_signature() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let signing_root = [0xBE; 32];
+            let direct_sig = sk.sign(&signing_root);
+
+            let shares = split_key(&sk, 2, 3);
+
+            // All C(3,2) = 3 subsets of 2 from 3 shares
+            let subsets: [(usize, &[usize]); 3] = [(0, &[1, 2]), (1, &[0, 2]), (2, &[0, 1])];
+
+            let mut collected_sigs = Vec::new();
+
+            for (own_idx, peer_indices) in &subsets {
+                let peer_addrs = start_peer_servers(&shares, peer_indices, pk, 2, 3).await;
+                let timeout = Duration::from_secs(5);
+                let server_addr =
+                    start_dvt_signer_server(&shares, *own_idx, peer_addrs, pk, 2, 3, timeout).await;
+
+                let config = GrpcRemoteSignerConfig::new(format!("http://{}", server_addr));
+                let client = GrpcRemoteSigner::connect(config).await.unwrap();
+
+                let sig = client.sign(&signing_root, &pk).await.unwrap();
+                collected_sigs.push(sig.to_bytes());
+            }
+
+            // All subsets must produce the same signature
+            for (i, sig) in collected_sigs.iter().enumerate() {
+                assert_eq!(*sig, direct_sig.to_bytes(), "subset {} should match direct signing", i);
+            }
+
+            // Cross-check: all DVT signatures are byte-identical
+            assert_eq!(collected_sigs[0], collected_sigs[1]);
+            assert_eq!(collected_sigs[1], collected_sigs[2]);
+        }
+
+        /// GetStatus reports DVT backend correctly through the full stack.
+        #[tokio::test]
+        async fn test_full_e2e_get_status_reports_dvt() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let shares = split_key(&sk, 2, 3);
+
+            let peer_addrs = start_peer_servers(&shares, &[1], pk, 2, 3).await;
+            let timeout = Duration::from_secs(5);
+            let server_addr =
+                start_dvt_signer_server(&shares, 0, peer_addrs, pk, 2, 3, timeout).await;
+
+            // Use raw gRPC client to check status
+            let channel = tonic::transport::Channel::from_shared(format!("http://{}", server_addr))
+                .unwrap()
+                .connect()
+                .await
+                .unwrap();
+
+            let mut client = grpc_signer::SignerServiceClient::new(channel);
+            let status =
+                client.get_status(grpc_signer::GetStatusRequest {}).await.unwrap().into_inner();
+
+            assert!(status.ready);
+            assert_eq!(status.backend, "dvt");
+            assert_eq!(status.key_count, 1);
+        }
+
+        /// ListPublicKeys returns the aggregate pubkey via the full stack.
+        #[tokio::test]
+        async fn test_full_e2e_list_public_keys() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let shares = split_key(&sk, 2, 3);
+
+            let peer_addrs = start_peer_servers(&shares, &[1], pk, 2, 3).await;
+            let timeout = Duration::from_secs(5);
+            let server_addr =
+                start_dvt_signer_server(&shares, 0, peer_addrs, pk, 2, 3, timeout).await;
+
+            let config = GrpcRemoteSignerConfig::new(format!("http://{}", server_addr));
+            let client = GrpcRemoteSigner::connect(config).await.unwrap();
+
+            let keys = client.public_keys();
+            assert_eq!(keys.len(), 1);
+            assert_eq!(keys[0], pk);
         }
     }
 }

@@ -4219,6 +4219,7 @@ dependencies = [
  "rand 0.8.5",
  "rcgen",
  "rvc-crypto",
+ "rvc-grpc-signer",
  "serde",
  "serde_json",
  "tempfile",
