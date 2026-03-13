@@ -93,6 +93,18 @@ pub struct Config {
 
     #[serde(default = "default_keymanager_body_limit")]
     pub keymanager_body_limit: usize,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grpc_signer_url: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grpc_signer_tls_cert: Option<PathBuf>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grpc_signer_tls_key: Option<PathBuf>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grpc_signer_tls_ca_cert: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -173,6 +185,10 @@ impl Default for Config {
             allow_insecure_remote_signer: false,
             keymanager_cors_origins: Vec::new(),
             keymanager_body_limit: default_keymanager_body_limit(),
+            grpc_signer_url: None,
+            grpc_signer_tls_cert: None,
+            grpc_signer_tls_key: None,
+            grpc_signer_tls_ca_cert: None,
         }
     }
 }
@@ -464,6 +480,22 @@ impl Config {
         if let Some(limit) = cli.keymanager_body_limit {
             self.keymanager_body_limit = limit;
         }
+
+        if let Some(ref url) = cli.grpc_signer_url {
+            self.grpc_signer_url = Some(url.clone());
+        }
+
+        if let Some(ref path) = cli.grpc_signer_tls_cert {
+            self.grpc_signer_tls_cert = Some(path.clone());
+        }
+
+        if let Some(ref path) = cli.grpc_signer_tls_key {
+            self.grpc_signer_tls_key = Some(path.clone());
+        }
+
+        if let Some(ref path) = cli.grpc_signer_tls_ca_cert {
+            self.grpc_signer_tls_ca_cert = Some(path.clone());
+        }
     }
 }
 
@@ -519,6 +551,10 @@ pub struct CliOverrides {
     pub allow_insecure_remote_signer: Option<bool>,
     pub keymanager_cors_origins: Option<Vec<String>>,
     pub keymanager_body_limit: Option<usize>,
+    pub grpc_signer_url: Option<String>,
+    pub grpc_signer_tls_cert: Option<PathBuf>,
+    pub grpc_signer_tls_key: Option<PathBuf>,
+    pub grpc_signer_tls_ca_cert: Option<PathBuf>,
 }
 
 #[cfg(test)]

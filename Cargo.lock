@@ -3771,6 +3771,7 @@ dependencies = [
  "rvc-builder",
  "rvc-crypto",
  "rvc-eth-types",
+ "rvc-grpc-signer",
  "rvc-keymanager-api",
  "rvc-metrics",
  "rvc-secret-provider",

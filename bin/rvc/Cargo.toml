@@ -20,6 +20,7 @@ beacon.workspace = true
 bn-manager.workspace = true
 builder.workspace = true
 crypto.workspace = true
+grpc-signer.workspace = true
 eth-types.workspace = true
 hex.workspace = true
 keymanager-api.workspace = true
