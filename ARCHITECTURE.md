@@ -1,6 +1,6 @@
 # Architecture
 
-RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 21 crates (2 binaries + 19 libraries). It handles the full validator lifecycle: block proposals, attestations, sync committee participation, aggregation duties, slashing protection, multi-BN failover, doppelganger detection, MEV/builder integration, runtime key management via the Keymanager API, key generation, and distributed tracing via OpenTelemetry.
+RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 23 crates (3 binaries + 20 libraries). It handles the full validator lifecycle: block proposals, attestations, sync committee participation, aggregation duties, slashing protection, multi-BN failover, doppelganger detection, MEV/builder integration, runtime key management via the Keymanager API, key generation, distributed tracing via OpenTelemetry, and remote/distributed signing via gRPC.
 
 ## System Overview
 
@@ -14,6 +14,10 @@ graph TB
         DB[(SQLite<br/>Slashing DB)]
         PROM[Prometheus]
         OTEL[OTel Collector]
+    end
+
+    subgraph RVCSIGNER["RVC Signer (standalone)"]
+        SIGBIN[bin/rvc-signer<br/>gRPC Signing Server]
     end
 
     subgraph RVC["RVC Validator Client"]
@@ -32,8 +36,11 @@ graph TB
     BNM <-->|HTTP API| BN
     KS -->|load keys| BIN
     KS -->|load keys| KEYGEN
+    KS -->|load keys| SIGBIN
     GCP -->|fetch keys| RVC
     W3S <-->|HTTP signing| RVC
+    RVC <-->|gRPC mTLS| SIGBIN
+    SIGBIN <-->|gRPC mTLS<br/>DVT peers| SIGBIN
     DB <-->|read/write| ORCH
     KMA <-->|key mgmt| RVC
     MS -->|expose| PROM
@@ -46,10 +53,12 @@ graph TB
 graph TD
     BIN["bin/rvc<br/><i>CLI entry point</i>"]
     KEYGEN["bin/rvc-keygen<br/><i>key generation</i>"]
+    SIGBIN["bin/rvc-signer<br/><i>gRPC signing server</i>"]
     RVC["rvc<br/><i>orchestrator</i>"]
     BEACON["beacon<br/><i>HTTP client</i>"]
     BNM["bn-manager<br/><i>multi-BN</i>"]
     CRYPTO["crypto<br/><i>BLS, signing, Web3Signer</i>"]
+    GRPCSIGNER["grpc-signer<br/><i>gRPC signer client</i>"]
     SIGNER["signer<br/><i>safe signing</i>"]
     SLASHING["slashing<br/><i>EIP-3076</i>"]
     DUTY["duty-tracker<br/><i>duty cache</i>"]
@@ -69,11 +78,14 @@ graph TD
     BIN --> RVC
     BIN --> BNM
     BIN --> CRYPTO
+    BIN --> GRPCSIGNER
     BIN --> METRICS
     BIN --> KMA
     BIN --> SLASHING
     BIN --> TEL
     BIN --> SP
+
+    SIGBIN --> CRYPTO
 
     KEYGEN --> CRYPTO
     KEYGEN --> ETH
@@ -129,11 +141,14 @@ graph TD
     SLASHING --> ETH
     SLASHING --> METRICS
 
+    GRPCSIGNER --> CRYPTO
+
     SP --> CRYPTO
     SP --> METRICS
 
     style BIN fill:#4a9eff,color:#fff
     style KEYGEN fill:#4a9eff,color:#fff
+    style SIGBIN fill:#4a9eff,color:#fff
     style RVC fill:#ff6b6b,color:#fff
     style ETH fill:#51cf66,color:#fff
     style METRICS fill:#51cf66,color:#fff
@@ -153,6 +168,7 @@ graph TD
     style DOPP fill:#ffd43b,color:#333
     style BUILD fill:#ffd43b,color:#333
     style SP fill:#51cf66,color:#fff
+    style GRPCSIGNER fill:#51cf66,color:#fff
 ```
 
 **Layer colors:**
@@ -170,6 +186,7 @@ block-beta
     block:binary:8
         BIN["bin/rvc"]
         KEYGEN["bin/rvc-keygen"]
+        SIGBIN["bin/rvc-signer"]
     end
 
     space:8
@@ -203,10 +220,13 @@ block-beta
         KMA["keymanager-api"]
         TEL["telemetry"]
         SP["secret-provider"]
+        GRPCSIGNER["grpc-signer"]
     end
 
     BIN --> RVC
+    BIN --> GRPCSIGNER
     KEYGEN --> CRYPTO
+    SIGBIN --> CRYPTO
     RVC --> SIGNER
     RVC --> DUTY
     RVC --> PROP
@@ -307,11 +327,13 @@ flowchart TD
     E --> G
     F --> G
 
-    G -->|Remote key| H[Web3Signer<br/>POST /api/v1/eth2/sign]
+    G -->|Remote HTTP key| H[Web3Signer<br/>POST /api/v1/eth2/sign]
+    G -->|Remote gRPC key| H2[rvc-signer<br/>gRPC mTLS]
     G -->|Local key| I[BLS sign<br/>blst library]
     G -->|Not found| X4[REJECT: KeyNotFound]
 
     H --> J[Return Signature]
+    H2 --> J
     I --> J
 
     style X1 fill:#ff6b6b,color:#fff
@@ -335,7 +357,8 @@ flowchart TD
     E -->|Match| F[Check beacon node sync status]
     F --> F1[Load cloud keys<br/>→ KeySourceManager]
     F1 --> G[Load validator keys<br/>→ CompositeSigner]
-    G --> H{Doppelganger<br/>enabled?}
+    G --> G1[Connect gRPC signer<br/>→ GrpcRemoteSigner mTLS]
+    G1 --> H{Doppelganger<br/>enabled?}
     H -->|Yes| I[Run 2-epoch monitoring]
     I -->|Detected| X3[Exit code 2]
     I -->|Safe| J[Build services]
@@ -356,13 +379,15 @@ flowchart LR
     CONFIG[Config / CLI Args] --> BIN[bin/rvc]
 
     BIN --> BNM[BnManager<br/>multi-BN failover]
-    BIN --> CS[CompositeSigner<br/>local + remote keys]
+    BIN --> CS[CompositeSigner<br/>local + remote + gRPC keys]
     BIN --> SDB[SlashingDb]
     BIN --> SC[SystemSlotClock]
     BIN --> VS[ValidatorStore]
     BIN --> KSM[KeySourceManager<br/>secret providers]
 
     KSM -->|load keys| CS
+    BIN --> GRS[GrpcRemoteSigner<br/>mTLS client]
+    GRS -->|add remote signer| CS
 
     BNM --> DT[DutyTracker]
     BNM --> PROP[Propagator]
@@ -406,6 +431,27 @@ Binary crate for offline key generation and signing operations. Subcommands:
 - **`exit`** — Generates `SignedVoluntaryExit` messages with EIP-7044 fork version cap at Capella.
 
 Supports `--dry-run`, `--password-file`, `--pbkdf2`, `--withdrawal-address`. Networks: mainnet, hoodi, custom.
+
+### `bin/rvc-signer` — Remote BLS Signing Server
+
+Standalone gRPC signing server for key isolation and Distributed Validator Technology (DVT). Subcommands:
+
+- **`serve`** — Starts the gRPC signing server with mTLS. Supports two backends:
+  - **`BasicSigner`** — Loads EIP-2335 keystores and performs direct BLS signing.
+  - **`DvtSigner`** (feature-gated: `dvt`) — Holds Shamir Secret Sharing (SSS) key shares and coordinates threshold signing with peers.
+- **`split-key`** (feature-gated: `dvt`) — Splits a BLS secret key into Shamir shares stored as EIP-2335 keystores.
+
+Features:
+- **mTLS-first** — All gRPC channels require mutual TLS certificate verification.
+- **Keystore hot-reload** — Periodic directory scanning for new/removed keystores (configurable interval, default 30s).
+- **Audit logging** — Structured logs for all sign requests.
+- **Prometheus metrics** — Per-backend signing counters and latency histograms (default `:9101`).
+- **DVT coordination** — `PeerSignerService` gRPC for partial signature exchange. Lagrange interpolation for share combination.
+- **Dry-run mode** — Validates configuration without starting the server.
+
+Defined via `proto/signer.proto`:
+- `SignerService` — `Sign`, `ListPublicKeys`, `GetStatus` RPCs.
+- `PeerSignerService` — `PartialSign` RPC for DVT peer-to-peer coordination.
 
 ### `crates/rvc` — Core Orchestrator
 
@@ -559,6 +605,15 @@ Pluggable secret provider abstraction for loading validator keys from cloud key 
 - **Observability** — `rvc.secret_provider.*` OTel spans, Prometheus metrics (`keys_loaded`, `errors_total`, `load_duration`).
 - **Security** — `Zeroizing<T>` for all key material, `KeyMaterial` intentionally excludes `Debug`.
 
+### `crates/grpc-signer` — gRPC Remote Signer Client
+
+Client library for connecting `bin/rvc` to `bin/rvc-signer` via gRPC with mTLS:
+
+- **`GrpcRemoteSigner`** — Implements the `Signer` trait from `crates/crypto`. Lazily connects to the remote signing server.
+- **`GrpcRemoteSignerConfig`** — mTLS configuration (client cert, key, CA cert).
+- **Proto stubs** — Re-exports `SignerServiceClient` and `PeerSignerServiceClient` generated from `proto/signer.proto`.
+- **Integration** — Added to `CompositeSigner` via `add_remote_signer()` during startup.
+
 ### `crates/telemetry` — OpenTelemetry Distributed Tracing
 
 Provides distributed tracing infrastructure using OpenTelemetry:
@@ -582,6 +637,8 @@ Provides distributed tracing infrastructure using OpenTelemetry:
 - **Graceful shutdown** — `tokio::watch` channel signals completion of current slot before exiting.
 - **Distributed tracing** — OpenTelemetry spans across slot lifecycle, block proposals, attestations, signing, and beacon HTTP requests with W3C trace context propagation.
 - **Pluggable secret providers** — `SecretProvider` trait enables cloud key management (GCP Secret Manager) with periodic refresh and `Zeroizing` key material.
+- **Remote signing isolation** — `rvc-signer` runs as a standalone process with mTLS; keys never leave the signer. Slashing protection remains in `rvc`.
+- **DVT threshold signing** — Optional Shamir Secret Sharing backend with peer-to-peer partial signature coordination and Lagrange interpolation.
 
 ## Consensus Protocol Parameters
 
@@ -620,3 +677,4 @@ The validator client is configured via a TOML file (`config.toml`) or CLI flags:
 - Strict file permissions checking (`--strict-permissions`)
 - Secret provider (`--secret-provider gcp`, `--gcp-project-id`, `--secret-refresh-interval`)
 - OpenTelemetry tracing endpoint, exporter (`otlp` or `gcp`), sample rate, batch processor tuning
+- gRPC remote signer (`--grpc-signer-url`, `--grpc-signer-tls-cert`, `--grpc-signer-tls-key`, `--grpc-signer-tls-ca-cert`)

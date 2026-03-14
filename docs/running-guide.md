@@ -16,9 +16,15 @@ cargo build
 cargo build --release
 ```
 
-Binary location:
-- Debug: `target/debug/rvc`
-- Release: `target/release/rvc`
+Binary locations:
+- Debug: `target/debug/rvc`, `target/debug/rvc-signer`
+- Release: `target/release/rvc`, `target/release/rvc-signer`
+
+To build with DVT support for `rvc-signer`:
+
+```bash
+cargo build --release -p rvc-signer --features dvt
+```
 
 ## Quick Start
 
@@ -81,6 +87,17 @@ rvc start [OPTIONS]
 | `--keymanager-address <ADDR>` | `127.0.0.1:5062` | Keymanager API listen address |
 | `--keymanager-token-file <PATH>` | `./keymanager-api-token.txt` | Bearer token file |
 | `--remote-signer-url <URL>` | none | Web3Signer URL for remote signing |
+
+#### gRPC Remote Signer Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--grpc-signer-url <URL>` | none | gRPC remote signer URL (e.g., `https://signer.example.com:50052`) |
+| `--grpc-signer-tls-cert <PATH>` | none | Client TLS certificate for mTLS (required if URL set) |
+| `--grpc-signer-tls-key <PATH>` | none | Client TLS private key for mTLS (required if URL set) |
+| `--grpc-signer-tls-ca-cert <PATH>` | none | CA certificate for mTLS verification (required if URL set) |
+
+All three TLS flags are required when `--grpc-signer-url` is set.
 
 #### Security Options
 
@@ -187,6 +204,12 @@ log_level = "info"
 # gcp_project_id = "my-project"
 # gcp_secret_prefix = "validator-key-"
 # refresh_interval = 3600
+
+# gRPC remote signer (rvc-signer)
+# grpc_signer_url = "https://signer.example.com:50052"
+# grpc_signer_tls_cert = "./certs/client.pem"
+# grpc_signer_tls_key = "./certs/client-key.pem"
+# grpc_signer_tls_ca_cert = "./certs/ca.pem"
 ```
 
 CLI flags override config file values.
@@ -255,11 +278,12 @@ Requires bearer token authentication.
 11. Load validator keys from keystores
 12. Load keys from secret providers (if `--secret-provider` configured)
 13. Start periodic key refresh (if `--secret-refresh-interval` > 0)
-14. Run doppelganger detection (if enabled, ~2 epochs)
-15. Build services (signer, propagator, duty tracker, builder)
-16. Start Keymanager API server (if enabled)
-17. Start duty orchestrator (slot-by-slot validation)
-18. Start gRPC and metrics servers
+14. Connect gRPC remote signer (if `--grpc-signer-url` configured, lazy, non-fatal)
+15. Run doppelganger detection (if enabled, ~2 epochs)
+16. Build services (signer, propagator, duty tracker, builder)
+17. Start Keymanager API server (if enabled)
+18. Start duty orchestrator (slot-by-slot validation)
+19. Start gRPC and metrics servers
 
 ## Environment Variables
 
@@ -337,3 +361,121 @@ rvc start -c config.toml \
   --tracing-exporter gcp \
   --tracing-sample-rate 0.01
 ```
+
+### With gRPC Remote Signer (rvc-signer)
+
+```bash
+# Start rvc-signer first
+rvc-signer serve \
+  --keystore-dir ./signer-keystores \
+  --password-dir ./signer-passwords \
+  --tls-cert ./certs/server.pem \
+  --tls-key ./certs/server-key.pem \
+  --tls-ca-cert ./certs/ca.pem \
+  --listen-address 0.0.0.0:50052
+
+# Then start rvc pointing to the signer
+rvc start -c config.toml \
+  --grpc-signer-url https://signer.example.com:50052 \
+  --grpc-signer-tls-cert ./certs/client.pem \
+  --grpc-signer-tls-key ./certs/client-key.pem \
+  --grpc-signer-tls-ca-cert ./certs/ca.pem
+```
+
+---
+
+## `rvc-signer` — Remote BLS Signing Server
+
+Standalone gRPC signing server for key isolation. Keeps validator keys on a dedicated machine while `rvc` handles duty orchestration and slashing protection.
+
+### `rvc-signer serve` — Start the Signing Server
+
+```
+rvc-signer serve [OPTIONS]
+```
+
+#### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--config <PATH>` | none | TOML configuration file |
+| `--listen-address <ADDR>` | `127.0.0.1:50052` | gRPC listen address |
+| `--keystore-dir <PATH>` | none | Directory containing EIP-2335 keystore files |
+| `--password-dir <PATH>` | none | Directory with per-keystore password files |
+| `--password-file <PATH>` | none | Single password file for all keystores |
+| `--tls-cert <PATH>` | none | Server TLS certificate (PEM) |
+| `--tls-key <PATH>` | none | Server TLS private key (PEM) |
+| `--tls-ca-cert <PATH>` | none | CA certificate for client authentication (PEM) |
+| `--backend <TYPE>` | `basic` | Signing backend: `basic` or `dvt` (requires `dvt` feature) |
+| `--metrics-address <ADDR>` | `127.0.0.1:9101` | Prometheus metrics listen address |
+| `--reload-interval <SECS>` | `30` | Keystore hot-reload interval (0 to disable) |
+| `--dry-run` | false | Validate configuration and exit |
+
+#### DVT Options (requires `--features dvt`)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dvt-peers <ADDR,ADDR,...>` | none | Comma-separated DVT peer addresses |
+| `--dvt-threshold <N>` | none | Threshold for signature reconstruction |
+| `--dvt-index <N>` | none | This node's share index |
+| `--dvt-timeout <MS>` | `2000` | Per-peer RPC timeout in milliseconds |
+
+### `rvc-signer split-key` — Split Key into Shares (requires `--features dvt`)
+
+Splits a BLS secret key into Shamir shares stored as EIP-2335 keystores.
+
+```
+rvc-signer split-key [OPTIONS]
+```
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--keystore <PATH>` | yes | Source EIP-2335 keystore |
+| `--password <STRING>` | no | Source keystore password |
+| `--password-file <PATH>` | no | Source keystore password file |
+| `--threshold <N>` | yes | Threshold (t) for Shamir secret sharing |
+| `--shares <N>` | yes | Total number of shares (n) to generate |
+| `--output-dir <PATH>` | yes | Output directory for share keystores |
+| `--output-password <STRING>` | no | Password for output share keystores |
+| `--output-password-file <PATH>` | no | Password file for output share keystores |
+
+Example:
+
+```bash
+# Split a key into 3 shares with threshold of 2
+rvc-signer split-key \
+  --keystore ./validator.json \
+  --password-file ./password.txt \
+  --threshold 2 \
+  --shares 3 \
+  --output-dir ./shares \
+  --output-password-file ./share-password.txt
+```
+
+### DVT Multi-Node Setup
+
+```bash
+# Node 1
+rvc-signer serve \
+  --backend dvt \
+  --keystore-dir ./shares/node1 \
+  --password-dir ./passwords \
+  --tls-cert ./certs/node1.pem \
+  --tls-key ./certs/node1-key.pem \
+  --tls-ca-cert ./certs/ca.pem \
+  --listen-address 0.0.0.0:50052 \
+  --dvt-peers node2:50052,node3:50052 \
+  --dvt-threshold 2 \
+  --dvt-index 0
+
+# Node 2 and Node 3 similar with their own shares and index
+```
+
+### gRPC Services
+
+| Service | RPC | Description |
+|---------|-----|-------------|
+| `SignerService` | `Sign` | Produce BLS signature over a 32-byte signing root |
+| `SignerService` | `ListPublicKeys` | List all available public keys |
+| `SignerService` | `GetStatus` | Check readiness, backend type, key count |
+| `PeerSignerService` | `PartialSign` | DVT partial signature for threshold signing |
