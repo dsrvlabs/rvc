@@ -19,7 +19,7 @@ pub struct ValidatorRegistrationV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedValidatorRegistration {
     pub message: ValidatorRegistrationV1,
-    #[serde(with = "serde_utils::hex_vec")]
+    #[serde(with = "crate::serde_signature")]
     pub signature: Signature,
 }
 

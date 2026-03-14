@@ -20,6 +20,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
+tree_hash = { workspace = true }
 wiremock = { workspace = true }

@@ -2,23 +2,18 @@ use async_trait::async_trait;
 use google_cloud_gax::error::rpc::Code;
 use google_cloud_secretmanager_v1::client::SecretManagerService;
 use tracing::{debug, warn};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{KeyMaterial, SecretKeyEntry, SecretProvider, SecretProviderError};
 
 pub struct GcpSecretProviderConfig {
     pub project_id: String,
     pub prefix: String,
-    pub concurrency_limit: usize,
 }
 
 impl Default for GcpSecretProviderConfig {
     fn default() -> Self {
-        Self {
-            project_id: String::new(),
-            prefix: "validator-key-".to_string(),
-            concurrency_limit: 10,
-        }
+        Self { project_id: String::new(), prefix: "validator-key-".to_string() }
     }
 }
 
@@ -72,12 +67,21 @@ impl GcpSecretProvider {
     ) -> Result<Zeroizing<String>, SecretProviderError> {
         let password_id = format!("{secret_id}-password");
         let data = self.access_secret_payload(&password_id).await?;
-        let password = String::from_utf8(data.to_vec()).map_err(|_| {
-            SecretProviderError::InvalidKeyMaterial(format!(
-                "password secret {password_id} is not valid UTF-8"
-            ))
-        })?;
-        Ok(Zeroizing::new(password.trim().to_string()))
+        let raw_bytes = data.to_vec();
+        let password = match String::from_utf8(raw_bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                let mut bytes = e.into_bytes();
+                bytes.zeroize();
+                return Err(SecretProviderError::InvalidKeyMaterial(format!(
+                    "password secret {password_id} is not valid UTF-8"
+                )));
+            }
+        };
+        let result = Zeroizing::new(password.trim().to_string());
+        let mut password = password;
+        password.zeroize();
+        Ok(result)
     }
 }
 
@@ -87,45 +91,6 @@ fn extract_secret_id(full_name: &str) -> &str {
 
 fn extract_pubkey_from_name(secret_id: &str, prefix: &str) -> Option<String> {
     secret_id.strip_prefix(prefix).map(|s| s.to_string())
-}
-
-fn detect_format(data: &[u8]) -> KeyMaterialFormat {
-    let trimmed = match std::str::from_utf8(data) {
-        Ok(s) => s.trim(),
-        Err(_) => return KeyMaterialFormat::Unknown,
-    };
-
-    if trimmed.starts_with('{') && serde_json::from_str::<serde_json::Value>(trimmed).is_ok() {
-        return KeyMaterialFormat::KeystoreJson;
-    }
-
-    KeyMaterialFormat::RawHex
-}
-
-#[derive(Debug, PartialEq)]
-enum KeyMaterialFormat {
-    RawHex,
-    KeystoreJson,
-    Unknown,
-}
-
-fn parse_raw_hex(data: &[u8]) -> Result<Zeroizing<[u8; 32]>, SecretProviderError> {
-    let s = std::str::from_utf8(data)
-        .map_err(|_| SecretProviderError::InvalidKeyMaterial("not valid UTF-8".into()))?;
-    let hex_str = s.trim().strip_prefix("0x").unwrap_or(s.trim());
-    let decoded = Zeroizing::new(
-        hex::decode(hex_str)
-            .map_err(|e| SecretProviderError::InvalidKeyMaterial(format!("invalid hex: {e}")))?,
-    );
-    if decoded.len() != 32 {
-        return Err(SecretProviderError::InvalidKeyMaterial(format!(
-            "expected 32 bytes, got {}",
-            decoded.len()
-        )));
-    }
-    let mut key = Zeroizing::new([0u8; 32]);
-    key.copy_from_slice(&decoded);
-    Ok(key)
 }
 
 fn map_sdk_error(err: google_cloud_secretmanager_v1::Error, context: &str) -> SecretProviderError {
@@ -199,26 +164,15 @@ impl SecretProvider for GcpSecretProvider {
     async fn fetch_key(&self, id: &str) -> Result<KeyMaterial, SecretProviderError> {
         let data = self.access_secret_payload(id).await?;
 
-        match detect_format(&data) {
-            KeyMaterialFormat::KeystoreJson => {
-                let json = String::from_utf8(data.to_vec()).map_err(|_| {
-                    SecretProviderError::InvalidKeyMaterial(
-                        "keystore JSON is not valid UTF-8".into(),
-                    )
-                })?;
+        match crate::format::parse_secret_data(&data)? {
+            crate::format::SecretDataFormat::KeystoreJson(json) => {
                 let password = self.fetch_companion_password(id).await.map_err(|e| {
                     warn!(secret_id = id, error = %e, "failed to fetch companion password");
                     e
                 })?;
                 Ok(KeyMaterial::Keystore { keystore_json: json, password })
             }
-            KeyMaterialFormat::RawHex => {
-                let key = parse_raw_hex(&data)?;
-                Ok(KeyMaterial::RawKey(key))
-            }
-            KeyMaterialFormat::Unknown => Err(SecretProviderError::InvalidKeyMaterial(format!(
-                "secret {id}: not valid JSON or hex"
-            ))),
+            crate::format::SecretDataFormat::RawHex(key) => Ok(KeyMaterial::RawKey(key)),
         }
     }
 }
@@ -253,110 +207,35 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_format_json() {
+    fn test_format_detection_delegates_to_format_module() {
+        use crate::format::{parse_secret_data, SecretDataFormat};
+
+        // JSON detection
         let data = br#"{"version":4,"crypto":{}}"#;
-        assert_eq!(detect_format(data), KeyMaterialFormat::KeystoreJson);
-    }
+        assert!(matches!(parse_secret_data(data), Ok(SecretDataFormat::KeystoreJson(_))));
 
-    #[test]
-    fn test_detect_format_hex() {
+        // Hex detection
         let hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        assert_eq!(detect_format(hex.as_bytes()), KeyMaterialFormat::RawHex);
-    }
+        assert!(matches!(parse_secret_data(hex.as_bytes()), Ok(SecretDataFormat::RawHex(_))));
 
-    #[test]
-    fn test_detect_format_hex_with_0x_prefix() {
-        let hex = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        assert_eq!(detect_format(hex.as_bytes()), KeyMaterialFormat::RawHex);
-    }
-
-    #[test]
-    fn test_detect_format_non_utf8() {
+        // Non-UTF-8 returns error
         let data = [0xFF, 0xFE, 0x00, 0x01];
-        assert_eq!(detect_format(&data), KeyMaterialFormat::Unknown);
-    }
-
-    #[test]
-    fn test_parse_raw_hex_valid() {
-        let hex = "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        let result = parse_raw_hex(hex.as_bytes());
-        assert!(result.is_ok());
-        let key = result.unwrap();
-        assert_eq!(key[0], 0xab);
-        assert_eq!(key[1], 0xcd);
-    }
-
-    #[test]
-    fn test_parse_raw_hex_with_0x() {
-        let hex = "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890";
-        let result = parse_raw_hex(hex.as_bytes());
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_parse_raw_hex_with_whitespace() {
-        let hex = "  abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890  \n";
-        let result = parse_raw_hex(hex.as_bytes());
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_parse_raw_hex_wrong_length() {
-        let hex = "abcdef1234";
-        let result = parse_raw_hex(hex.as_bytes());
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SecretProviderError::InvalidKeyMaterial(msg) => {
-                assert!(msg.contains("expected 32 bytes"));
-            }
-            _ => panic!("expected InvalidKeyMaterial"),
-        }
-    }
-
-    #[test]
-    fn test_parse_raw_hex_invalid_hex() {
-        let hex = "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
-        let result = parse_raw_hex(hex.as_bytes());
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SecretProviderError::InvalidKeyMaterial(msg) => {
-                assert!(msg.contains("invalid hex"));
-            }
-            _ => panic!("expected InvalidKeyMaterial"),
-        }
-    }
-
-    #[test]
-    fn test_parse_raw_hex_non_utf8() {
-        let data = [0xFF, 0xFE, 0x00, 0x01];
-        let result = parse_raw_hex(&data);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            SecretProviderError::InvalidKeyMaterial(msg) => {
-                assert!(msg.contains("UTF-8"));
-            }
-            _ => panic!("expected InvalidKeyMaterial"),
-        }
+        assert!(parse_secret_data(&data).is_err());
     }
 
     #[test]
     fn test_config_defaults() {
         let config = GcpSecretProviderConfig::default();
         assert_eq!(config.prefix, "validator-key-");
-        assert_eq!(config.concurrency_limit, 10);
         assert!(config.project_id.is_empty());
     }
 
     #[test]
     fn test_config_custom() {
-        let config = GcpSecretProviderConfig {
-            project_id: "my-project".into(),
-            prefix: "bls-key-".into(),
-            concurrency_limit: 5,
-        };
+        let config =
+            GcpSecretProviderConfig { project_id: "my-project".into(), prefix: "bls-key-".into() };
         assert_eq!(config.project_id, "my-project");
         assert_eq!(config.prefix, "bls-key-");
-        assert_eq!(config.concurrency_limit, 5);
     }
 
     #[test]
@@ -387,37 +266,5 @@ mod tests {
     fn test_non_password_secret_not_skipped() {
         let id = "validator-key-abc";
         assert!(!id.ends_with("-password"));
-    }
-
-    #[test]
-    fn test_detect_format_json_keystore() {
-        let keystore = r#"{
-            "crypto": {
-                "kdf": {"function": "scrypt"},
-                "checksum": {"function": "sha256"},
-                "cipher": {"function": "aes-128-ctr"}
-            },
-            "version": 4,
-            "uuid": "abc-123"
-        }"#;
-        assert_eq!(detect_format(keystore.as_bytes()), KeyMaterialFormat::KeystoreJson);
-    }
-
-    #[test]
-    fn test_detect_format_empty() {
-        assert_eq!(detect_format(b""), KeyMaterialFormat::RawHex);
-    }
-
-    #[test]
-    fn test_parse_raw_hex_empty_string() {
-        let result = parse_raw_hex(b"");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_raw_hex_uppercase() {
-        let hex = "ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890ABCDEF1234567890";
-        let result = parse_raw_hex(hex.as_bytes());
-        assert!(result.is_ok());
     }
 }

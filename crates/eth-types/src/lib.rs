@@ -11,7 +11,9 @@ mod domains;
 mod duties;
 mod fork;
 pub(crate) mod hex_fixed;
+pub(crate) mod serde_signature;
 mod sync_committee;
+pub(crate) mod tree_hash_utils;
 pub use aggregation::{
     AggregateAndProof, Attestation, ElectraAggregateAndProof, ElectraAttestation,
     SignedAggregateAndProof, SignedElectraAggregateAndProof,
@@ -44,6 +46,9 @@ pub type Root = [u8; 32];
 pub type Domain = [u8; 32];
 pub type DomainType = [u8; 4];
 pub type Signature = Vec<u8>;
+
+/// Expected length of a BLS signature in bytes.
+pub const SIGNATURE_BYTES_LEN: usize = 96;
 
 pub const SLOTS_PER_EPOCH: u64 = 32;
 pub const SECONDS_PER_SLOT: u64 = 12;

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tracing::{debug, error, info, info_span, warn};
+use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use beacon::{
     AttesterDuty, BeaconCommitteeSubscription, LegacyAttestation, ProposerPreparation,
@@ -36,6 +36,12 @@ use tree_hash::TreeHash;
 
 use super::error::OrchestratorError;
 
+/// Shared, dynamically-updatable public key map.
+///
+/// Wrapped in `Arc<RwLock>` so the keymanager API can insert/remove keys at
+/// runtime while the orchestrator reads them each slot.
+pub type PubkeyMap = Arc<std::sync::RwLock<HashMap<String, PublicKey>>>;
+
 /// Truncates a hex-encoded public key for display in tracing spans.
 ///
 /// Returns `0x` + first 10 hex chars + `...` + last 8 hex chars for keys
@@ -57,9 +63,17 @@ const SYNC_COMMITTEE_SUBNET_COUNT: u64 = 4;
 
 /// Constructs a hex-encoded SSZ bitlist where only the validator's position
 /// in the committee is set (pre-Electra aggregation_bits format).
-fn make_aggregation_bits(duty: &AttesterDuty) -> String {
+fn make_aggregation_bits(duty: &AttesterDuty) -> Option<String> {
     let committee_length: usize = duty.committee_length.parse().unwrap_or(0);
     let validator_committee_index: usize = duty.validator_committee_index.parse().unwrap_or(0);
+
+    if committee_length == 0 {
+        warn!(
+            validator_index = %duty.validator_index,
+            "committee_length is 0, cannot produce aggregation bits"
+        );
+        return None;
+    }
 
     // SSZ bitlist: ceil((committee_length + 1) / 8) bytes
     // The "+1" is for the length bit at position committee_length
@@ -74,7 +88,7 @@ fn make_aggregation_bits(duty: &AttesterDuty) -> String {
     // Set the length bit (sentinel) at position committee_length
     bits[committee_length / 8] |= 1 << (committee_length % 8);
 
-    format!("0x{}", hex::encode(bits))
+    Some(format!("0x{}", hex::encode(bits)))
 }
 
 /// Configuration for the duty orchestrator.
@@ -151,7 +165,8 @@ where
     builder_service: Option<Arc<BuilderService>>,
     validator_store: Arc<validator_store::ValidatorStore>,
     config: OrchestratorConfig,
-    pubkey_map: HashMap<String, PublicKey>,
+    pubkey_map: PubkeyMap,
+    key_gen_rx: watch::Receiver<u64>,
     shutdown_rx: watch::Receiver<bool>,
 }
 
@@ -173,7 +188,37 @@ where
         builder_service: Option<Arc<BuilderService>>,
         validator_store: Arc<validator_store::ValidatorStore>,
         config: OrchestratorConfig,
-        pubkey_map: HashMap<String, PublicKey>,
+        pubkey_map: PubkeyMap,
+    ) -> (Self, OrchestratorHandle) {
+        let (_key_gen_tx, key_gen_rx) = watch::channel(0u64);
+        Self::new_with_key_gen(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            block_beacon,
+            builder_service,
+            validator_store,
+            config,
+            pubkey_map,
+            key_gen_rx,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_key_gen(
+        clock: Arc<C>,
+        duty_tracker: Arc<DutyTracker>,
+        signer: Arc<SignerService>,
+        propagator: Arc<Propagator<S>>,
+        beacon: Arc<dyn BeaconNodeClient>,
+        block_beacon: Arc<B>,
+        builder_service: Option<Arc<BuilderService>>,
+        validator_store: Arc<validator_store::ValidatorStore>,
+        config: OrchestratorConfig,
+        pubkey_map: PubkeyMap,
+        key_gen_rx: watch::Receiver<u64>,
     ) -> (Self, OrchestratorHandle) {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -196,6 +241,7 @@ where
             validator_store,
             config,
             pubkey_map,
+            key_gen_rx,
             shutdown_rx,
         };
 
@@ -228,28 +274,37 @@ where
 
             let current_epoch = current_slot / SLOTS_PER_EPOCH;
 
-            let _slot_span =
-                info_span!("rvc.slot.process", rvc.slot = current_slot, rvc.epoch = current_epoch,)
-                    .entered();
+            let slot_span =
+                info_span!("rvc.slot.process", rvc.slot = current_slot, rvc.epoch = current_epoch,);
+
+            // Check if keys changed (dynamic key import/delete via keymanager API)
+            if self.key_gen_rx.has_changed().unwrap_or(false) {
+                info!("Key set changed, clearing duty cache to trigger refetch");
+                self.duty_tracker.clear_cache().await;
+            }
 
             // === Epoch boundary: fetch all duty types ===
-            self.fetch_epoch_duties(current_epoch).await;
-            self.fetch_epoch_duties(current_epoch + 1).await;
+            self.fetch_epoch_duties(current_epoch).instrument(slot_span.clone()).await;
+            self.fetch_epoch_duties(current_epoch + 1).instrument(slot_span.clone()).await;
 
             // Proposer preparation and committee subscriptions (non-fatal)
             if current_slot % SLOTS_PER_EPOCH == 0 {
-                let _epoch_span =
-                    info_span!("rvc.epoch.boundary", rvc.epoch = current_epoch).entered();
-                self.check_reorg_at_epoch_boundary(current_epoch).await;
-                self.prepare_proposers().await;
-                self.submit_committee_subscriptions(current_epoch).await;
-                self.submit_committee_subscriptions(current_epoch + 1).await;
+                let epoch_span =
+                    info_span!(parent: &slot_span, "rvc.epoch.boundary", rvc.epoch = current_epoch);
+                async {
+                    self.check_reorg_at_epoch_boundary(current_epoch).await;
+                    self.prepare_proposers().await;
+                    self.submit_committee_subscriptions(current_epoch).await;
+                    self.submit_committee_subscriptions(current_epoch + 1).await;
+                }
+                .instrument(epoch_span)
+                .await;
             }
 
             // === Phase 1: t=0 — Block proposal ===
             {
-                let _phase = info_span!("rvc.slot.phase.block").entered();
-                self.maybe_propose_block(current_slot, current_epoch).await;
+                let phase_span = info_span!(parent: &slot_span, "rvc.slot.phase.block");
+                self.maybe_propose_block(current_slot, current_epoch).instrument(phase_span).await;
             }
 
             if self.check_shutdown() {
@@ -258,18 +313,20 @@ where
 
             // === Phase 2: t=slot/3 — Attestations + sync committee messages ===
             {
-                let _phase = info_span!("rvc.slot.phase.attestation").entered();
+                let att_phase_span = info_span!(parent: &slot_span, "rvc.slot.phase.attestation");
 
                 let time_until_attestation = self.clock.time_until_attestation(current_slot)?;
                 if !time_until_attestation.is_zero() {
+                    let _guard = att_phase_span.enter();
                     debug!(
                         slot = current_slot,
                         wait_ms = time_until_attestation.as_millis(),
                         "Waiting for attestation time"
                     );
+                    drop(_guard);
 
                     tokio::select! {
-                        _ = tokio::time::sleep(time_until_attestation) => {}
+                        _ = tokio::time::sleep(time_until_attestation).instrument(att_phase_span.clone()) => {}
                         _ = self.shutdown_rx.changed() => {
                             if self.check_shutdown() {
                                 return Ok(());
@@ -282,7 +339,10 @@ where
                     return Ok(());
                 }
 
-                if let Err(e) = self.process_slot(current_slot).await {
+                if let Err(e) =
+                    self.process_slot(current_slot).instrument(att_phase_span.clone()).await
+                {
+                    let _guard = att_phase_span.enter();
                     match &e {
                         OrchestratorError::SlotMissed { slot, current_slot } => {
                             warn!(slot = slot, current_slot = current_slot, "Missed slot");
@@ -299,7 +359,9 @@ where
                     }
                 }
 
-                self.maybe_produce_sync_messages(current_slot, current_epoch).await;
+                self.maybe_produce_sync_messages(current_slot, current_epoch)
+                    .instrument(att_phase_span)
+                    .await;
             }
 
             if self.check_shutdown() {
@@ -308,26 +370,26 @@ where
 
             // === Phase 3: t=2*slot/3 — Aggregation + sync committee contributions ===
             {
-                let _phase = info_span!("rvc.slot.phase.aggregation").entered();
+                let agg_phase_span = info_span!(parent: &slot_span, "rvc.slot.phase.aggregation");
 
                 let slot_duration = self.clock.slot_duration();
                 let two_thirds_offset = slot_duration.as_secs() * 2 / 3;
                 let two_thirds_time = self.clock.slot_start_time(current_slot) + two_thirds_offset;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("time went backwards")
-                    .as_secs();
+                let now = self.clock.current_time_secs();
 
                 if now < two_thirds_time {
                     let wait_duration = Duration::from_secs(two_thirds_time - now);
-                    debug!(
-                        slot = current_slot,
-                        wait_ms = wait_duration.as_millis(),
-                        "Waiting for 2/3 slot time"
-                    );
+                    {
+                        let _guard = agg_phase_span.enter();
+                        debug!(
+                            slot = current_slot,
+                            wait_ms = wait_duration.as_millis(),
+                            "Waiting for 2/3 slot time"
+                        );
+                    }
 
                     tokio::select! {
-                        _ = tokio::time::sleep(wait_duration) => {}
+                        _ = tokio::time::sleep(wait_duration).instrument(agg_phase_span.clone()) => {}
                         _ = self.shutdown_rx.changed() => {
                             if self.check_shutdown() {
                                 return Ok(());
@@ -340,22 +402,62 @@ where
                     return Ok(());
                 }
 
-                self.maybe_produce_sync_contributions(current_slot, current_epoch).await;
-                self.maybe_produce_aggregations(current_slot, current_epoch).await;
+                self.maybe_produce_sync_contributions(current_slot, current_epoch)
+                    .instrument(agg_phase_span.clone())
+                    .await;
+                self.maybe_produce_aggregations(current_slot, current_epoch)
+                    .instrument(agg_phase_span)
+                    .await;
             }
 
             // === Post-duty: builder registration (epoch boundary only) ===
-            // Runs after all time-sensitive phases to avoid blocking block proposal.
-            // Builder registration includes jitter + API call that can take up to 40s.
-            if current_slot % SLOTS_PER_EPOCH == 0 {
-                self.register_builders().await;
-            }
-
-            // === Wait for next slot ===
+            // Runs concurrently with the next-slot wait via select! so it
+            // doesn't block slot processing. If the next slot arrives before
+            // registration completes, registration is abandoned (non-critical).
             let next_slot = current_slot + 1;
             let time_until_next_slot = self.clock.time_until_slot(next_slot)?;
+            let should_register = current_slot % SLOTS_PER_EPOCH == 0;
 
-            if !time_until_next_slot.is_zero() {
+            if should_register && !time_until_next_slot.is_zero() {
+                // Clone builder_service before borrowing self for shutdown_rx
+                let builder_service = self.builder_service.clone();
+                let builder_fut = async {
+                    if let Some(bs) = builder_service {
+                        let jitter = Duration::from_secs(BuilderService::jitter_seconds());
+                        debug!(
+                            jitter_secs = jitter.as_secs(),
+                            "Delaying builder registration with jitter"
+                        );
+                        tokio::time::sleep(jitter).await;
+                        match tokio::time::timeout(
+                            BUILDER_REGISTRATION_TIMEOUT,
+                            bs.register_validators(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_)) => info!("Builder registration completed"),
+                            Ok(Err(e)) => {
+                                warn!(error = %e, "Builder registration failed (non-fatal)")
+                            }
+                            Err(_) => warn!(
+                                "Builder registration timed out after {}s (non-fatal)",
+                                BUILDER_REGISTRATION_TIMEOUT.as_secs()
+                            ),
+                        }
+                    }
+                };
+                tokio::pin!(builder_fut);
+
+                tokio::select! {
+                    _ = tokio::time::sleep(time_until_next_slot) => {}
+                    _ = &mut builder_fut => {}
+                    _ = self.shutdown_rx.changed() => {
+                        if self.check_shutdown() {
+                            return Ok(());
+                        }
+                    }
+                }
+            } else if !time_until_next_slot.is_zero() {
                 tokio::select! {
                     _ = tokio::time::sleep(time_until_next_slot) => {}
                     _ = self.shutdown_rx.changed() => {
@@ -503,7 +605,8 @@ where
     async fn prepare_proposers(&self) {
         let mut preparations = Vec::new();
 
-        for (pubkey_hex, pubkey) in &self.pubkey_map {
+        let pubkey_snapshot = self.pubkey_map.read().expect("pubkey_map lock poisoned").clone();
+        for (pubkey_hex, pubkey) in &pubkey_snapshot {
             let fee_recipient = self.validator_store.effective_fee_recipient(&pubkey.to_bytes());
             let fee_recipient_hex = format!("0x{}", hex::encode(fee_recipient));
 
@@ -569,6 +672,7 @@ where
     #[tracing::instrument(name = "rvc.orchestrator.submit_committee_subscriptions", skip_all, fields(rvc.epoch = epoch))]
     async fn submit_committee_subscriptions(&self, epoch: u64) {
         let mut subscriptions = Vec::new();
+        let pubkey_snapshot = self.pubkey_map.read().expect("pubkey_map lock poisoned").clone();
 
         for slot_offset in 0..SLOTS_PER_EPOCH {
             let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
@@ -578,7 +682,7 @@ where
                 // Only subscribe for our own validators
                 let normalized = Self::normalize_pubkey(&duty.pubkey);
                 let pubkey =
-                    self.pubkey_map.iter().find(|(k, _)| Self::normalize_pubkey(k) == normalized);
+                    pubkey_snapshot.iter().find(|(k, _)| Self::normalize_pubkey(k) == normalized);
 
                 let pubkey = match pubkey {
                     Some((_, pk)) => pk.clone(),
@@ -649,32 +753,6 @@ where
                 epoch,
                 "Committee subscription timed out after {}s",
                 self.config.timeouts.preparation.as_secs()
-            ),
-        }
-    }
-
-    #[tracing::instrument(name = "rvc.orchestrator.register_builders", skip_all)]
-    async fn register_builders(&self) {
-        let builder_service = match &self.builder_service {
-            Some(bs) => bs.clone(),
-            None => return,
-        };
-
-        let jitter = Duration::from_secs(BuilderService::jitter_seconds());
-        debug!(jitter_secs = jitter.as_secs(), "Delaying builder registration with jitter");
-        tokio::time::sleep(jitter).await;
-
-        match tokio::time::timeout(
-            BUILDER_REGISTRATION_TIMEOUT,
-            builder_service.register_validators(),
-        )
-        .await
-        {
-            Ok(Ok(_)) => info!("Builder registration completed"),
-            Ok(Err(e)) => warn!(error = %e, "Builder registration failed (non-fatal)"),
-            Err(_) => warn!(
-                "Builder registration timed out after {}s (non-fatal)",
-                BUILDER_REGISTRATION_TIMEOUT.as_secs()
             ),
         }
     }
@@ -981,14 +1059,13 @@ where
         };
 
         for duty in &duties {
-            let _agg_span = info_span!(
+            let agg_span = info_span!(
                 "rvc.aggregation.produce",
                 rvc.slot = slot,
                 rvc.validator_index = %duty.validator_index,
                 rvc.pubkey = %truncate_pubkey(&duty.pubkey),
                 rvc.aggregation.fork = fork_label,
-            )
-            .entered();
+            );
 
             let committee_length: u64 = match duty.committee_length.parse() {
                 Ok(c) => c,
@@ -1008,6 +1085,7 @@ where
                     &self.config.fork_schedule,
                     &self.config.genesis_validators_root,
                 )
+                .instrument(agg_span.clone())
                 .await
             {
                 Ok(sig) => sig,
@@ -1048,6 +1126,7 @@ where
                 self.config.timeouts.aggregate_fetch,
                 self.beacon.get_attestation_data(slot, committee_index),
             )
+            .instrument(agg_span.clone())
             .await
             {
                 Ok(Ok(resp)) => resp,
@@ -1103,6 +1182,7 @@ where
                     electra_committee_index,
                 ),
             )
+            .instrument(agg_span.clone())
             .await
             {
                 Ok(Ok(resp)) => resp,
@@ -1148,9 +1228,6 @@ where
                         continue;
                     }
                 };
-                // NOTE: FU-36 — vec_u8_tree_hash_root does not apply mix_in_length for
-                // Bitlist fields (aggregation_bits). This affects signing root correctness
-                // for both pre-Electra and Electra aggregates. Tracked as a separate fix.
                 let aggregate_and_proof = ElectraAggregateAndProof {
                     aggregator_index,
                     aggregate: electra_agg,
@@ -1164,6 +1241,7 @@ where
                         &self.config.fork_schedule,
                         &self.config.genesis_validators_root,
                     )
+                    .instrument(agg_span.clone())
                     .await
                 {
                     Ok(sig) => sig,
@@ -1212,6 +1290,7 @@ where
                         &self.config.fork_schedule,
                         &self.config.genesis_validators_root,
                     )
+                    .instrument(agg_span.clone())
                     .await
                 {
                     Ok(sig) => sig,
@@ -1239,19 +1318,19 @@ where
             let count = pre_electra_aggregates.len();
             let source_validators_str = source_validators.join(",");
 
-            let _submit_span = info_span!(
+            let submit_span = info_span!(
                 "rvc.aggregation.submit",
                 rvc.slot = slot,
                 rvc.aggregation.count = count,
                 rvc.aggregation.source_validators = %source_validators_str,
-            )
-            .entered();
+            );
 
             let versioned = VersionedSignedAggregateAndProof::PreElectra(pre_electra_aggregates);
             match tokio::time::timeout(
                 self.config.timeouts.aggregate_submit,
                 self.beacon.submit_aggregate_and_proofs(&versioned),
             )
+            .instrument(submit_span)
             .await
             {
                 Ok(Ok(_)) => {
@@ -1283,13 +1362,12 @@ where
             let count = electra_aggregates.len();
             let source_validators_str = source_validators.join(",");
 
-            let _submit_span = info_span!(
+            let submit_span = info_span!(
                 "rvc.aggregation.submit",
                 rvc.slot = slot,
                 rvc.aggregation.count = count,
                 rvc.aggregation.source_validators = %source_validators_str,
-            )
-            .entered();
+            );
 
             let versioned = if fork_name >= ForkName::Fulu {
                 VersionedSignedAggregateAndProof::Fulu(electra_aggregates)
@@ -1300,6 +1378,7 @@ where
                 self.config.timeouts.aggregate_submit,
                 self.beacon.submit_aggregate_and_proofs(&versioned),
             )
+            .instrument(submit_span)
             .await
             {
                 Ok(Ok(_)) => {
@@ -1464,7 +1543,8 @@ where
         &self,
         slot: Slot,
     ) -> Result<Vec<AttesterDuty>, OrchestratorError> {
-        if self.pubkey_map.is_empty() {
+        let pubkey_snapshot = self.pubkey_map.read().expect("pubkey_map lock poisoned").clone();
+        if pubkey_snapshot.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -1475,7 +1555,7 @@ where
         }
 
         let normalized_pubkeys: std::collections::HashSet<String> =
-            self.pubkey_map.keys().map(|k| Self::normalize_pubkey(k)).collect();
+            pubkey_snapshot.keys().map(|k| Self::normalize_pubkey(k)).collect();
 
         let all_duties = self.duty_tracker.get_duties_for_slot(slot).await;
         let duties: Vec<AttesterDuty> = all_duties
@@ -1526,20 +1606,22 @@ where
             }
         };
 
-        let _att_span = info_span!(
+        let att_span = info_span!(
             "rvc.attestation.produce",
             rvc.slot = slot,
             rvc.validator_index = %validator_index,
             rvc.pubkey = %truncate_pubkey(&duty.pubkey),
-        )
-        .entered();
-
-        debug!(
-            validator = %validator_index,
-            slot = slot,
-            committee_index = committee_index,
-            "Processing attestation duty"
         );
+
+        {
+            let _guard = att_span.enter();
+            debug!(
+                validator = %validator_index,
+                slot = slot,
+                committee_index = committee_index,
+                "Processing attestation duty"
+            );
+        }
 
         let pubkey = match self.find_pubkey(&duty.pubkey) {
             Some(pk) => pk,
@@ -1554,14 +1636,12 @@ where
         };
 
         // Apply timeout to beacon client call to prevent blocking
-        let attestation_data_result = {
-            let _fetch_span = info_span!("rvc.beacon.get_attestation_data").entered();
-            tokio::time::timeout(
-                self.config.timeouts.attestation_fetch,
-                self.beacon.get_attestation_data(slot, committee_index),
-            )
-            .await
-        };
+        let attestation_data_result = tokio::time::timeout(
+            self.config.timeouts.attestation_fetch,
+            self.beacon.get_attestation_data(slot, committee_index),
+        )
+        .instrument(info_span!(parent: &att_span, "rvc.beacon.get_attestation_data"))
+        .await;
 
         let attestation_data_response = match attestation_data_result {
             Ok(Ok(response)) => response,
@@ -1621,7 +1701,6 @@ where
             "Converted attestation data"
         );
 
-        let fork = self.derive_fork_for_epoch(target_epoch);
         let fork_name = ForkName::from_epoch(target_epoch, &self.config.fork_schedule);
         let is_electra = fork_name >= ForkName::Electra;
 
@@ -1629,9 +1708,6 @@ where
             validator = %validator_index,
             fork_name = ?fork_name,
             is_electra = is_electra,
-            previous_version = %format!("0x{}", hex::encode(fork.previous_version)),
-            current_version = %format!("0x{}", hex::encode(fork.current_version)),
-            fork_epoch = fork.epoch,
             target_epoch = target_epoch,
             "Fork derived for attestation"
         );
@@ -1654,9 +1730,10 @@ where
             .sign_attestation(
                 &crypto_attestation_data,
                 &pubkey,
-                &fork,
-                self.config.genesis_validators_root,
+                &self.config.fork_schedule,
+                &self.config.genesis_validators_root,
             )
+            .instrument(att_span.clone())
             .await
         {
             Ok(sig) => {
@@ -1713,8 +1790,26 @@ where
                 signature: sig_hex,
             }])
         } else {
+            let aggregation_bits = match make_aggregation_bits(&duty) {
+                Some(bits) => bits,
+                None => {
+                    warn!(
+                        validator = %validator_index,
+                        slot,
+                        "Skipping attestation: could not produce aggregation bits"
+                    );
+                    return AttestationResult {
+                        validator_index,
+                        slot,
+                        success: false,
+                        error: Some(
+                            "committee_length is 0, cannot produce aggregation bits".to_string(),
+                        ),
+                    };
+                }
+            };
             VersionedAttestation::PreElectra(vec![LegacyAttestation {
-                aggregation_bits: make_aggregation_bits(&duty),
+                aggregation_bits,
                 data: beacon_attestation_data,
                 signature: sig_hex,
             }])
@@ -1731,14 +1826,12 @@ where
             "Propagating attestation"
         );
 
-        let submit_result = {
-            let _submit_span = info_span!("rvc.beacon.submit_attestation").entered();
-            tokio::time::timeout(
-                self.config.timeouts.attestation_submit,
-                self.propagator.propagate(&versioned),
-            )
-            .await
-        };
+        let submit_result = tokio::time::timeout(
+            self.config.timeouts.attestation_submit,
+            self.propagator.propagate(&versioned),
+        )
+        .instrument(info_span!(parent: &att_span, "rvc.beacon.submit_attestation"))
+        .await;
 
         match submit_result {
             Ok(Ok(_)) => AttestationResult { validator_index, slot, success: true, error: None },
@@ -1766,23 +1859,14 @@ where
         }
     }
 
-    fn derive_fork_for_epoch(&self, epoch: u64) -> eth_types::Fork {
-        let schedule = &self.config.fork_schedule;
-        let current = ForkName::from_epoch(epoch, schedule);
-        let previous = current.previous_fork(schedule);
-        eth_types::Fork {
-            previous_version: previous.fork_version(schedule),
-            current_version: current.fork_version(schedule),
-            epoch: current.activation_epoch(schedule),
-        }
-    }
-
     /// Finds a public key by matching against duty pubkey.
     ///
     /// Pubkeys are matched case-insensitively and with/without "0x" prefix.
     fn find_pubkey(&self, duty_pubkey: &str) -> Option<PublicKey> {
+        let pubkey_map = self.pubkey_map.read().expect("pubkey_map lock poisoned");
+
         // Try exact match first
-        if let Some(pk) = self.pubkey_map.get(duty_pubkey) {
+        if let Some(pk) = pubkey_map.get(duty_pubkey) {
             return Some(pk.clone());
         }
 
@@ -1793,14 +1877,14 @@ where
             format!("0x{}", duty_pubkey)
         };
 
-        if let Some(pk) = self.pubkey_map.get(&normalized_pubkey) {
+        if let Some(pk) = pubkey_map.get(&normalized_pubkey) {
             return Some(pk.clone());
         }
 
         // Normalize for case-insensitive matching
         let duty_normalized = Self::normalize_pubkey(duty_pubkey);
 
-        for (key, pk) in &self.pubkey_map {
+        for (key, pk) in pubkey_map.iter() {
             if Self::normalize_pubkey(key) == duty_normalized {
                 return Some(pk.clone());
             }
@@ -2158,7 +2242,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = HashMap::new();
+        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         let (mut orchestrator, handle) = DutyOrchestrator::new(
             clock,
@@ -2198,7 +2282,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = HashMap::new();
+        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2236,7 +2320,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = HashMap::new();
+        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2305,8 +2389,9 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let mut pubkey_map = HashMap::new();
-        pubkey_map.insert(pubkey_hex, pubkey);
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey_hex, pubkey);
+        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
 
         let (_orchestrator, handle) = DutyOrchestrator::new(
             clock,
@@ -2345,8 +2430,9 @@ mod tests {
         let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
 
         let config = create_test_config();
-        let mut pubkey_map = HashMap::new();
-        pubkey_map.insert(pubkey_hex.clone(), pubkey.clone());
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey_hex.clone(), pubkey.clone());
+        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2385,8 +2471,9 @@ mod tests {
         let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
 
         let config = create_test_config();
-        let mut pubkey_map = HashMap::new();
-        pubkey_map.insert(pubkey_hex.to_uppercase(), pubkey.clone());
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey_hex.to_uppercase(), pubkey.clone());
+        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2420,7 +2507,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = HashMap::new();
+        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2628,8 +2715,9 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let mut pubkey_map = HashMap::new();
-        pubkey_map.insert(pubkey_hex.clone(), pubkey.clone());
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey_hex.clone(), pubkey.clone());
+        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, handle) = DutyOrchestrator::new(
             clock,
@@ -2958,11 +3046,12 @@ mod tests {
         let config = create_test_config();
 
         // Map our pubkey to match the duty's pubkey
-        let mut pubkey_map = HashMap::new();
-        pubkey_map.insert(
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             pubkey,
         );
+        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
 
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
 
@@ -3013,7 +3102,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = HashMap::new();
+        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3086,11 +3175,12 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let mut pubkey_map = HashMap::new();
-        pubkey_map.insert(
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(
             "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
             pubkey,
         );
+        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
 
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
 
@@ -3170,11 +3260,12 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let mut pubkey_map = HashMap::new();
-        pubkey_map.insert(
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(
             "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
             pubkey,
         );
+        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3223,7 +3314,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = HashMap::new();
+        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3294,11 +3385,12 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let mut pubkey_map = HashMap::new();
-        pubkey_map.insert(
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(
             "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
             pubkey,
         );
+        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3330,250 +3422,11 @@ mod tests {
         assert!(BUILDER_REGISTRATION_TIMEOUT.as_secs() <= 15);
     }
 
-    #[tokio::test]
-    async fn test_builder_registration_called_at_epoch_boundary() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock_server = MockServer::start().await;
-
-        // Mock register_validators endpoint
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/register_validator"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
-
-        let beacon_config = BeaconClientConfig::new(mock_server.uri());
-        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
-
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let pubkey_bytes = pubkey.to_bytes();
-
-        let mut key_manager = KeyManager::new();
-        key_manager.insert(secret_key);
-        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
-
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
-
-        // Set up validator store with a builder-enabled validator
-        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
-        let mut config = validator_store::ValidatorConfig::new(pubkey_bytes);
-        config.builder_proposals = true;
-        validator_store.add_validator(config);
-
-        let builder_service = builder::BuilderService::new(
-            signer.clone(),
-            beacon.clone() as Arc<dyn BeaconNodeClient>,
-            validator_store.clone(),
-            [0x00, 0x00, 0x00, 0x00],
-        );
-
-        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
-        clock.set_slot(100);
-
-        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
-
-        let submitter = Arc::new(MockSubmitter::new());
-        let propagator = Arc::new(Propagator::new(submitter));
-
-        let orch_config = create_test_config();
-        let pubkey_map = HashMap::new();
-
-        let (orchestrator, _handle) = DutyOrchestrator::new(
-            clock,
-            duty_tracker,
-            signer,
-            propagator,
-            beacon,
-            create_mock_block_beacon(),
-            Some(Arc::new(builder_service)),
-            validator_store,
-            orch_config,
-            pubkey_map,
-        );
-
-        orchestrator.register_builders().await;
-        // wiremock will verify expect(1) on drop
-    }
-
-    #[tokio::test]
-    async fn test_builder_registration_nonfatal_on_failure() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock_server = MockServer::start().await;
-
-        // Mock register_validators endpoint with a 500 error
-        // Beacon client may retry, so expect at least 1 call
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/register_validator"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("server error"))
-            .expect(1..)
-            .mount(&mock_server)
-            .await;
-
-        let beacon_config = BeaconClientConfig::new(mock_server.uri());
-        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
-
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let pubkey_bytes = pubkey.to_bytes();
-
-        let mut key_manager = KeyManager::new();
-        key_manager.insert(secret_key);
-        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
-
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
-
-        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
-        let mut config = validator_store::ValidatorConfig::new(pubkey_bytes);
-        config.builder_proposals = true;
-        validator_store.add_validator(config);
-
-        let builder_service = builder::BuilderService::new(
-            signer.clone(),
-            beacon.clone() as Arc<dyn BeaconNodeClient>,
-            validator_store.clone(),
-            [0x00, 0x00, 0x00, 0x00],
-        );
-
-        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
-        clock.set_slot(100);
-
-        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
-
-        let submitter = Arc::new(MockSubmitter::new());
-        let propagator = Arc::new(Propagator::new(submitter));
-
-        let orch_config = create_test_config();
-        let pubkey_map = HashMap::new();
-
-        let (orchestrator, _handle) = DutyOrchestrator::new(
-            clock,
-            duty_tracker,
-            signer,
-            propagator,
-            beacon,
-            create_mock_block_beacon(),
-            Some(Arc::new(builder_service)),
-            validator_store,
-            orch_config,
-            pubkey_map,
-        );
-
-        // Should NOT panic or return error - registration failure is non-fatal
-        orchestrator.register_builders().await;
-    }
-
-    #[tokio::test]
-    async fn test_builder_registration_skipped_when_no_builder_service() {
-        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
-        clock.set_slot(100);
-
-        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
-        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
-
-        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
-
-        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
-
-        let submitter = Arc::new(MockSubmitter::new());
-        let propagator = Arc::new(Propagator::new(submitter));
-
-        let config = create_test_config();
-        let pubkey_map = HashMap::new();
-
-        let (orchestrator, _handle) = DutyOrchestrator::new(
-            clock,
-            duty_tracker,
-            signer,
-            propagator,
-            beacon,
-            create_mock_block_beacon(),
-            None,
-            create_mock_validator_store(),
-            config,
-            pubkey_map,
-        );
-
-        // Should return immediately with no errors when builder_service is None
-        orchestrator.register_builders().await;
-    }
-
-    #[tokio::test]
-    async fn test_builder_registration_skips_non_builder_validators() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let mock_server = MockServer::start().await;
-
-        // No registration calls expected since builder is not enabled
-        Mock::given(method("POST"))
-            .and(path("/eth/v1/validator/register_validator"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&mock_server)
-            .await;
-
-        let beacon_config = BeaconClientConfig::new(mock_server.uri());
-        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
-
-        let secret_key = SecretKey::generate();
-        let pubkey_bytes = secret_key.public_key().to_bytes();
-
-        let mut key_manager = KeyManager::new();
-        key_manager.insert(secret_key);
-        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
-
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
-
-        // Validator with builder_proposals = false (default)
-        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
-        let config = validator_store::ValidatorConfig::new(pubkey_bytes);
-        validator_store.add_validator(config);
-
-        let builder_service = builder::BuilderService::new(
-            signer.clone(),
-            beacon.clone() as Arc<dyn BeaconNodeClient>,
-            validator_store.clone(),
-            [0x00, 0x00, 0x00, 0x00],
-        );
-
-        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
-        clock.set_slot(100);
-
-        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
-
-        let submitter = Arc::new(MockSubmitter::new());
-        let propagator = Arc::new(Propagator::new(submitter));
-
-        let orch_config = create_test_config();
-        let pubkey_map = HashMap::new();
-
-        let (orchestrator, _handle) = DutyOrchestrator::new(
-            clock,
-            duty_tracker,
-            signer,
-            propagator,
-            beacon,
-            create_mock_block_beacon(),
-            Some(Arc::new(builder_service)),
-            validator_store,
-            orch_config,
-            pubkey_map,
-        );
-
-        orchestrator.register_builders().await;
-        // wiremock expect(0) verifies no registration call was made
-    }
+    // NOTE: Tests for builder registration behavior (called_at_epoch_boundary,
+    // nonfatal_on_failure, skipped_when_no_builder_service,
+    // skips_non_builder_validators) were removed after CON-01 refactored
+    // register_builders() into the main loop via tokio::select!.
+    // Builder registration is now tested implicitly through the main loop tests.
 
     #[tokio::test]
     async fn test_check_reorg_at_epoch_boundary_no_change() {
@@ -3627,7 +3480,7 @@ mod tests {
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config();
-        let pubkey_map = HashMap::new();
+        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3692,7 +3545,7 @@ mod tests {
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config();
-        let pubkey_map = HashMap::new();
+        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3769,7 +3622,7 @@ mod tests {
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config();
-        let pubkey_map = HashMap::new();
+        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3817,7 +3670,7 @@ mod tests {
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config();
-        let pubkey_map = HashMap::new();
+        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3849,7 +3702,7 @@ mod tests {
             validator_committee_index: "0".to_string(),
             slot: "100".to_string(),
         };
-        let bits = make_aggregation_bits(&duty);
+        let bits = make_aggregation_bits(&duty).unwrap();
         // committee_length=4, validator_committee_index=0
         // Byte 0: bit 0 set (validator) = 0x01
         // Length bit at position 4 → byte 0, bit 4 = 0x10
@@ -3868,7 +3721,7 @@ mod tests {
             validator_committee_index: "3".to_string(),
             slot: "100".to_string(),
         };
-        let bits = make_aggregation_bits(&duty);
+        let bits = make_aggregation_bits(&duty).unwrap();
         // committee_length=8, validator_committee_index=3
         // Byte 0: bit 3 set = 0x08
         // Length bit at position 8 → byte 1, bit 0 = 0x01
@@ -3887,11 +3740,25 @@ mod tests {
             validator_committee_index: "3".to_string(),
             slot: "100".to_string(),
         };
-        let bits = make_aggregation_bits(&duty);
+        let bits = make_aggregation_bits(&duty).unwrap();
         // committee_length=4, validator_committee_index=3
         // Byte 0: bit 3 set = 0x08, length bit at position 4 = 0x10
         // Combined: 0x18
         assert_eq!(bits, "0x18");
+    }
+
+    #[test]
+    fn test_make_aggregation_bits_zero_committee_length() {
+        let duty = AttesterDuty {
+            pubkey: "0xaabb".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: "0".to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: "0".to_string(),
+            slot: "100".to_string(),
+        };
+        assert!(make_aggregation_bits(&duty).is_none());
     }
 
     #[test]
@@ -3978,8 +3845,9 @@ mod tests {
         let propagator = Arc::new(Propagator::new(capturing_submitter.clone()));
 
         let config = create_test_config();
-        let mut pubkey_map = HashMap::new();
-        pubkey_map.insert(pubkey_hex.clone(), pubkey);
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
+        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, handle) = DutyOrchestrator::new(
             clock,
@@ -4835,7 +4703,7 @@ mod tests {
             None,
             create_mock_validator_store(),
             config,
-            HashMap::new(),
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
         );
 
         // Capture spans via thread-local subscriber
@@ -4905,7 +4773,7 @@ mod tests {
             None,
             create_mock_validator_store(),
             config,
-            HashMap::new(),
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
         );
 
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -5166,7 +5034,7 @@ mod tests {
             None,
             create_mock_validator_store(),
             config,
-            HashMap::new(),
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
         );
 
         let (layer, spans) = HierarchyCapture::new();
@@ -5235,7 +5103,7 @@ mod tests {
             None,
             create_mock_validator_store(),
             config,
-            HashMap::new(),
+            Arc::new(std::sync::RwLock::new(HashMap::new())),
         );
 
         let (layer, spans) = HierarchyCapture::new();
@@ -5262,7 +5130,7 @@ mod tests {
     #[tokio::test]
     async fn test_signer_span_created_on_sign_attestation() {
         use crypto::SecretKey;
-        use eth_types::{AttestationData, Checkpoint, Fork};
+        use eth_types::{AttestationData, Checkpoint};
 
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
@@ -5280,15 +5148,17 @@ mod tests {
             source: Checkpoint { epoch: 100, root: [0x22; 32] },
             target: Checkpoint { epoch: 101, root: [0x33; 32] },
         };
-        let fork =
-            Fork { previous_version: [0, 0, 0, 1], current_version: [0, 0, 0, 2], epoch: 50 };
+        let fork_schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
 
         let captured = Arc::new(Mutex::new(Vec::new()));
         let layer = SpanCapture { names: captured.clone() };
         let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        let result = signer.sign_attestation(&attestation_data, &pubkey, &fork, [0xaa; 32]).await;
+        let result = signer
+            .sign_attestation(&attestation_data, &pubkey, &fork_schedule, &genesis_root)
+            .await;
         assert!(result.is_ok());
 
         let span_names = captured.lock().unwrap();

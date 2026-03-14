@@ -12,6 +12,9 @@ pub enum SigningError {
 
     #[error("remote signer error: {0}")]
     RemoteSignerError(String),
+
+    #[error("remote signer returned invalid signature")]
+    InvalidRemoteSignature,
 }
 
 #[async_trait]

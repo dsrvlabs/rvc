@@ -28,22 +28,30 @@ pub fn generate_token() -> Zeroizing<String> {
 pub fn write_token_file(path: &std::path::Path, token: &str) -> Result<(), AuthError> {
     use std::io::Write;
 
+    // Write to a temp file in the same directory, then atomically rename.
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    let tmp_path = parent.join(format!(".api-token.{}.tmp", std::process::id()));
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o400)
-            .open(path)?;
+        let mut file =
+            std::fs::OpenOptions::new().write(true).create_new(true).mode(0o400).open(&tmp_path)?;
         file.write_all(token.as_bytes())?;
+        file.sync_all()?;
     }
 
     #[cfg(not(unix))]
     {
-        std::fs::write(path, token)?;
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp_path)?;
+        file.write_all(token.as_bytes())?;
+        file.sync_all()?;
     }
+
+    std::fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        AuthError::Io(e)
+    })?;
 
     Ok(())
 }
@@ -116,7 +124,7 @@ pub fn warn_if_insecure_permissions(path: &std::path::Path) -> bool {
 }
 
 async fn bearer_auth(
-    axum::extract::State(expected_token): axum::extract::State<Arc<String>>,
+    axum::extract::State(expected_token): axum::extract::State<Arc<Zeroizing<String>>>,
     request: Request,
     next: Next,
 ) -> Response {
@@ -135,7 +143,7 @@ async fn bearer_auth(
     }
 }
 
-pub fn with_auth(router: axum::Router, token: Arc<String>) -> axum::Router {
+pub fn with_auth(router: axum::Router, token: Arc<Zeroizing<String>>) -> axum::Router {
     router.layer(middleware::from_fn_with_state(token, bearer_auth))
 }
 
@@ -372,7 +380,7 @@ mod tests {
 
         let token = "abc123".to_string();
         let router = Router::new().route("/test", get(|| async { "ok" }));
-        let app = with_auth(router, Arc::new(token.clone()));
+        let app = with_auth(router, Arc::new(Zeroizing::new(token.clone())));
 
         let request = axum::http::Request::builder()
             .uri("/test")
@@ -395,7 +403,7 @@ mod tests {
 
         let token = "abc123".to_string();
         let router = Router::new().route("/test", get(|| async { "ok" }));
-        let app = with_auth(router, Arc::new(token));
+        let app = with_auth(router, Arc::new(Zeroizing::new(token)));
 
         let request = axum::http::Request::builder()
             .uri("/test")
@@ -415,7 +423,7 @@ mod tests {
 
         let token = "abc123".to_string();
         let router = Router::new().route("/test", get(|| async { "ok" }));
-        let app = with_auth(router, Arc::new(token));
+        let app = with_auth(router, Arc::new(Zeroizing::new(token)));
 
         let request =
             axum::http::Request::builder().uri("/test").body(axum::body::Body::empty()).unwrap();
@@ -432,7 +440,7 @@ mod tests {
 
         let token = "abc123".to_string();
         let router = Router::new().route("/test", get(|| async { "ok" }));
-        let app = with_auth(router, Arc::new(token));
+        let app = with_auth(router, Arc::new(Zeroizing::new(token)));
 
         let request = axum::http::Request::builder()
             .uri("/test")

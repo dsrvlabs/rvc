@@ -14,6 +14,12 @@ use crate::types::{
 use eth_types::{Epoch, Slot};
 use metrics::definitions as metrics;
 
+/// Normalize a pubkey to lowercase with 0x prefix for consistent DB storage/lookup.
+fn normalize_pubkey(pubkey: &str) -> String {
+    let stripped = pubkey.strip_prefix("0x").unwrap_or(pubkey);
+    format!("0x{}", stripped.to_lowercase())
+}
+
 /// SQLite-backed database for storing slashing protection data.
 pub struct SlashingDb {
     conn: Mutex<Connection>,
@@ -27,6 +33,35 @@ impl SlashingDb {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SlashingError> {
         let path = path.as_ref();
         let conn = Connection::open(path)?;
+
+        // Enable WAL journal mode for crash-safe durability.
+        // WAL creates -wal and -shm sidecar files, so this must be set before permissions.
+        let journal_mode: String =
+            conn.pragma_update_and_check(None, "journal_mode", "wal", |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            tracing::warn!(
+                actual_mode = %journal_mode,
+                "WAL journal mode not supported; falling back to '{}'",
+                journal_mode,
+            );
+        }
+
+        // Set synchronous=FULL unconditionally for durability (works with both WAL and DELETE).
+        conn.pragma_update(None, "synchronous", "FULL")?;
+
+        // Set restrictive file permissions (owner-only read/write)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            std::fs::set_permissions(path, perms).map_err(|e| {
+                SlashingError::UnsafePermissions {
+                    path: path.display().to_string(),
+                    mode: format!("failed to set permissions: {}", e),
+                }
+            })?;
+        }
+
         let db = Self {
             conn: Mutex::new(conn),
             path: Some(path.to_path_buf()),
@@ -92,13 +127,18 @@ impl SlashingDb {
     }
 
     /// Insert a signed attestation record.
-    pub fn insert_attestation(&self, attestation: &SignedAttestation) -> Result<(), SlashingError> {
+    #[cfg(test)]
+    pub(crate) fn insert_attestation(
+        &self,
+        attestation: &SignedAttestation,
+    ) -> Result<(), SlashingError> {
+        let pubkey = normalize_pubkey(&attestation.pubkey);
         let conn = self.conn.lock().expect("mutex poisoned");
         conn.execute(
             "INSERT INTO attestations (pubkey, source_epoch, target_epoch, signing_root)
              VALUES (?1, ?2, ?3, ?4)",
             (
-                &attestation.pubkey,
+                &pubkey,
                 attestation.source_epoch as i64,
                 attestation.target_epoch as i64,
                 &attestation.signing_root,
@@ -119,17 +159,19 @@ impl SlashingDb {
         target_epoch: Epoch,
         signing_root: Option<String>,
     ) -> Result<(), SlashingError> {
+        let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock().expect("mutex poisoned");
         conn.execute(
             "INSERT OR IGNORE INTO attestations (pubkey, source_epoch, target_epoch, signing_root)
              VALUES (?1, ?2, ?3, ?4)",
-            (pubkey, source_epoch as i64, target_epoch as i64, &signing_root),
+            (&pubkey, source_epoch as i64, target_epoch as i64, &signing_root),
         )?;
         Ok(())
     }
 
     /// Get all attestations for a given public key.
     pub fn get_attestations(&self, pubkey: &str) -> Result<Vec<SignedAttestation>, SlashingError> {
+        let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock().expect("mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT pubkey, source_epoch, target_epoch, signing_root
@@ -138,7 +180,7 @@ impl SlashingDb {
              ORDER BY target_epoch ASC",
         )?;
 
-        let rows = stmt.query_map([pubkey], |row| {
+        let rows = stmt.query_map([&pubkey], |row| {
             Ok(SignedAttestation {
                 pubkey: row.get(0)?,
                 source_epoch: row.get::<_, i64>(1)? as Epoch,
@@ -155,18 +197,21 @@ impl SlashingDb {
     }
 
     /// Insert a signed block record.
-    pub fn insert_block(&self, block: &SignedBlock) -> Result<(), SlashingError> {
+    #[cfg(test)]
+    pub(crate) fn insert_block(&self, block: &SignedBlock) -> Result<(), SlashingError> {
+        let pubkey = normalize_pubkey(&block.pubkey);
         let conn = self.conn.lock().expect("mutex poisoned");
         conn.execute(
             "INSERT INTO blocks (pubkey, slot, signing_root)
              VALUES (?1, ?2, ?3)",
-            (&block.pubkey, block.slot as i64, &block.signing_root),
+            (&pubkey, block.slot as i64, &block.signing_root),
         )?;
         Ok(())
     }
 
     /// Get all blocks for a given public key.
     pub fn get_blocks(&self, pubkey: &str) -> Result<Vec<SignedBlock>, SlashingError> {
+        let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock().expect("mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT pubkey, slot, signing_root
@@ -175,7 +220,7 @@ impl SlashingDb {
              ORDER BY slot ASC",
         )?;
 
-        let rows = stmt.query_map([pubkey], |row| {
+        let rows = stmt.query_map([&pubkey], |row| {
             Ok(SignedBlock {
                 pubkey: row.get(0)?,
                 slot: row.get::<_, i64>(1)? as u64,
@@ -205,13 +250,14 @@ impl SlashingDb {
         source_epoch: Epoch,
         target_epoch: Epoch,
     ) -> Result<(), SlashingError> {
+        let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock().expect("mutex poisoned");
 
         // Check attestation watermarks (both source and target)
         let wm_source: Option<i64> = conn
             .query_row(
                 "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
-                [pubkey],
+                [&pubkey],
                 |row| row.get(0),
             )
             .optional()?;
@@ -227,7 +273,7 @@ impl SlashingDb {
         let wm_target: Option<i64> = conn
             .query_row(
                 "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
-                [pubkey],
+                [&pubkey],
                 |row| row.get(0),
             )
             .optional()?;
@@ -246,7 +292,7 @@ impl SlashingDb {
              WHERE pubkey = ?1",
         )?;
 
-        let rows = stmt.query_map([pubkey], |row| {
+        let rows = stmt.query_map([&pubkey], |row| {
             Ok((row.get::<_, i64>(0)? as Epoch, row.get::<_, i64>(1)? as Epoch))
         })?;
 
@@ -365,6 +411,13 @@ impl SlashingDb {
         interchange: &InterchangeFormat,
         expected_genesis_validators_root: &str,
     ) -> Result<(), SlashingError> {
+        if interchange.metadata.interchange_format_version != "5" {
+            return Err(SlashingError::InvalidInterchangeFormat(format!(
+                "unsupported interchange_format_version: expected \"5\", got \"{}\"",
+                interchange.metadata.interchange_format_version
+            )));
+        }
+
         if interchange.metadata.genesis_validators_root != expected_genesis_validators_root {
             return Err(SlashingError::GenesisValidatorsRootMismatch {
                 expected: expected_genesis_validators_root.to_string(),
@@ -372,7 +425,12 @@ impl SlashingDb {
             });
         }
 
+        let mut conn = self.conn.lock().expect("mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
         for validator in &interchange.data {
+            let pubkey = normalize_pubkey(&validator.pubkey);
+
             for attestation in &validator.signed_attestations {
                 let source_epoch: Epoch = attestation.source_epoch.parse().map_err(|_| {
                     SlashingError::InvalidInterchangeFormat(format!(
@@ -388,11 +446,9 @@ impl SlashingDb {
                     ))
                 })?;
 
-                self.record_attestation(
-                    &validator.pubkey,
-                    source_epoch,
-                    target_epoch,
-                    attestation.signing_root.clone(),
+                tx.execute(
+                    "INSERT OR IGNORE INTO attestations (pubkey, source_epoch, target_epoch, signing_root) VALUES (?1, ?2, ?3, ?4)",
+                    (&pubkey, source_epoch as i64, target_epoch as i64, &attestation.signing_root),
                 )?;
             }
 
@@ -401,10 +457,14 @@ impl SlashingDb {
                     SlashingError::InvalidInterchangeFormat(format!("invalid slot: {}", block.slot))
                 })?;
 
-                self.record_block(&validator.pubkey, slot, block.signing_root.clone())?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO blocks (pubkey, slot, signing_root) VALUES (?1, ?2, ?3)",
+                    (&pubkey, slot as i64, &block.signing_root),
+                )?;
             }
         }
 
+        tx.commit()?;
         Ok(())
     }
 
@@ -418,11 +478,12 @@ impl SlashingDb {
         slot: Slot,
         signing_root: Option<String>,
     ) -> Result<(), SlashingError> {
+        let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock().expect("mutex poisoned");
         conn.execute(
             "INSERT OR IGNORE INTO blocks (pubkey, slot, signing_root)
              VALUES (?1, ?2, ?3)",
-            (pubkey, slot as i64, &signing_root),
+            (&pubkey, slot as i64, &signing_root),
         )?;
         Ok(())
     }
@@ -442,13 +503,14 @@ impl SlashingDb {
         slot: Slot,
         signing_root: Option<String>,
     ) -> Result<(), SlashingError> {
+        let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock().expect("mutex poisoned");
 
         // Check block watermark
         let watermark: Option<i64> = conn
             .query_row(
                 "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
-                [pubkey],
+                [&pubkey],
                 |row| row.get(0),
             )
             .optional()?;
@@ -464,7 +526,7 @@ impl SlashingDb {
         let existing: Option<Option<String>> = conn
             .query_row(
                 "SELECT signing_root FROM blocks WHERE pubkey = ?1 AND slot = ?2",
-                (pubkey, slot as i64),
+                (&pubkey, slot as i64),
                 |row| row.get(0),
             )
             .optional()?;
@@ -476,7 +538,7 @@ impl SlashingDb {
         } else {
             // No block at this slot — check that slot is not below the minimum
             let min_slot: Option<i64> = conn
-                .query_row("SELECT MIN(slot) FROM blocks WHERE pubkey = ?1", [pubkey], |row| {
+                .query_row("SELECT MIN(slot) FROM blocks WHERE pubkey = ?1", [&pubkey], |row| {
                     row.get(0)
                 })
                 .optional()?
@@ -507,6 +569,7 @@ impl SlashingDb {
         slot: Slot,
         signing_root: Option<String>,
     ) -> Result<(), SlashingError> {
+        let pubkey = normalize_pubkey(pubkey);
         let mut conn = self.conn.lock().expect("mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -514,7 +577,7 @@ impl SlashingDb {
         let watermark: Option<i64> = tx
             .query_row(
                 "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
-                [pubkey],
+                [&pubkey],
                 |row| row.get(0),
             )
             .optional()?;
@@ -531,7 +594,7 @@ impl SlashingDb {
         let existing: Option<Option<String>> = tx
             .query_row(
                 "SELECT signing_root FROM blocks WHERE pubkey = ?1 AND slot = ?2",
-                (pubkey, slot as i64),
+                (&pubkey, slot as i64),
                 |row| row.get(0),
             )
             .optional()?;
@@ -554,7 +617,9 @@ impl SlashingDb {
 
         // No block at this slot — check that slot is not below the minimum
         let min_slot: Option<i64> = tx
-            .query_row("SELECT MIN(slot) FROM blocks WHERE pubkey = ?1", [pubkey], |row| row.get(0))
+            .query_row("SELECT MIN(slot) FROM blocks WHERE pubkey = ?1", [&pubkey], |row| {
+                row.get(0)
+            })
             .optional()?
             .flatten();
 
@@ -571,7 +636,7 @@ impl SlashingDb {
 
         tx.execute(
             "INSERT INTO blocks (pubkey, slot, signing_root) VALUES (?1, ?2, ?3)",
-            (pubkey, slot as i64, &signing_root),
+            (&pubkey, slot as i64, &signing_root),
         )?;
 
         tx.commit()?;
@@ -610,6 +675,7 @@ impl SlashingDb {
         target_epoch: Epoch,
         signing_root: Option<String>,
     ) -> Result<(), SlashingError> {
+        let pubkey = normalize_pubkey(pubkey);
         let mut conn = self.conn.lock().expect("mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -617,7 +683,7 @@ impl SlashingDb {
         let wm_source: Option<i64> = tx
             .query_row(
                 "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
-                [pubkey],
+                [&pubkey],
                 |row| row.get(0),
             )
             .optional()?;
@@ -634,7 +700,7 @@ impl SlashingDb {
         let wm_target: Option<i64> = tx
             .query_row(
                 "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
-                [pubkey],
+                [&pubkey],
                 |row| row.get(0),
             )
             .optional()?;
@@ -655,7 +721,7 @@ impl SlashingDb {
                  WHERE pubkey = ?1",
             )?;
             let result = stmt
-                .query_map([pubkey], |row| {
+                .query_map([&pubkey], |row| {
                     Ok((
                         row.get::<_, i64>(0)? as Epoch,
                         row.get::<_, i64>(1)? as Epoch,
@@ -741,7 +807,7 @@ impl SlashingDb {
             tx.execute(
                 "INSERT INTO attestations (pubkey, source_epoch, target_epoch, signing_root)
                  VALUES (?1, ?2, ?3, ?4)",
-                (pubkey, source_epoch as i64, target_epoch as i64, &signing_root),
+                (&pubkey, source_epoch as i64, target_epoch as i64, &signing_root),
             )?;
         }
 
@@ -757,11 +823,12 @@ impl SlashingDb {
         &self,
         pubkey: &str,
     ) -> Result<Option<Epoch>, SlashingError> {
+        let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock().expect("mutex poisoned");
         let result: Option<i64> = conn
             .query_row(
                 "SELECT MAX(target_epoch) FROM attestations WHERE pubkey = ?1",
-                [pubkey],
+                [&pubkey],
                 |row| row.get(0),
             )
             .map_err(SlashingError::from)?;
@@ -773,9 +840,12 @@ impl SlashingDb {
     ///
     /// Returns `None` if no blocks have been signed for this validator.
     pub fn last_signed_block_slot(&self, pubkey: &str) -> Result<Option<Slot>, SlashingError> {
+        let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock().expect("mutex poisoned");
         let result: Option<i64> = conn
-            .query_row("SELECT MAX(slot) FROM blocks WHERE pubkey = ?1", [pubkey], |row| row.get(0))
+            .query_row("SELECT MAX(slot) FROM blocks WHERE pubkey = ?1", [&pubkey], |row| {
+                row.get(0)
+            })
             .map_err(SlashingError::from)?;
 
         Ok(result.map(|s| s as Slot))
@@ -837,11 +907,13 @@ impl SlashingDb {
     ///
     /// Watermarks can only be raised, never lowered. Setting the same value is idempotent.
     pub fn set_block_watermark(&self, pubkey: &str, slot: Slot) -> Result<(), SlashingError> {
-        let conn = self.conn.lock().expect("mutex poisoned");
-        let existing: Option<i64> = conn
+        let pubkey = normalize_pubkey(pubkey);
+        let mut conn = self.conn.lock().expect("mutex poisoned");
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<i64> = tx
             .query_row(
                 "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
-                [pubkey],
+                [&pubkey],
                 |row| row.get(0),
             )
             .optional()?;
@@ -853,26 +925,28 @@ impl SlashingDb {
                     watermark_type: "block".to_string(),
                 });
             }
-            conn.execute(
+            tx.execute(
                 "UPDATE watermarks SET value = ?1 WHERE pubkey = ?2 AND watermark_type = 'block'",
-                (slot as i64, pubkey),
+                (slot as i64, &pubkey),
             )?;
         } else {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, 'block', ?2)",
-                (pubkey, slot as i64),
+                (&pubkey, slot as i64),
             )?;
         }
+        tx.commit()?;
         Ok(())
     }
 
     /// Get the block watermark for a validator.
     pub fn get_block_watermark(&self, pubkey: &str) -> Result<Option<Slot>, SlashingError> {
+        let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock().expect("mutex poisoned");
         let result: Option<i64> = conn
             .query_row(
                 "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
-                [pubkey],
+                [&pubkey],
                 |row| row.get(0),
             )
             .optional()?;
@@ -888,13 +962,14 @@ impl SlashingDb {
         source_epoch: Epoch,
         target_epoch: Epoch,
     ) -> Result<(), SlashingError> {
+        let pubkey = normalize_pubkey(pubkey);
         let mut conn = self.conn.lock().expect("mutex poisoned");
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let existing_source: Option<i64> = tx
             .query_row(
                 "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
-                [pubkey],
+                [&pubkey],
                 |row| row.get(0),
             )
             .optional()?;
@@ -902,7 +977,7 @@ impl SlashingDb {
         let existing_target: Option<i64> = tx
             .query_row(
                 "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
-                [pubkey],
+                [&pubkey],
                 |row| row.get(0),
             )
             .optional()?;
@@ -910,7 +985,7 @@ impl SlashingDb {
         if let Some(current_source) = existing_source {
             if (source_epoch as i64) < current_source {
                 return Err(SlashingError::WatermarkLowered {
-                    pubkey: pubkey.to_string(),
+                    pubkey: pubkey.clone(),
                     watermark_type: "att_source".to_string(),
                 });
             }
@@ -918,7 +993,7 @@ impl SlashingDb {
         if let Some(current_target) = existing_target {
             if (target_epoch as i64) < current_target {
                 return Err(SlashingError::WatermarkLowered {
-                    pubkey: pubkey.to_string(),
+                    pubkey: pubkey.clone(),
                     watermark_type: "att_target".to_string(),
                 });
             }
@@ -927,12 +1002,12 @@ impl SlashingDb {
         tx.execute(
             "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, 'att_source', ?2)
              ON CONFLICT(pubkey, watermark_type) DO UPDATE SET value = ?2",
-            (pubkey, source_epoch as i64),
+            (&pubkey, source_epoch as i64),
         )?;
         tx.execute(
             "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, 'att_target', ?2)
              ON CONFLICT(pubkey, watermark_type) DO UPDATE SET value = ?2",
-            (pubkey, target_epoch as i64),
+            (&pubkey, target_epoch as i64),
         )?;
 
         tx.commit()?;
@@ -946,12 +1021,13 @@ impl SlashingDb {
         &self,
         pubkey: &str,
     ) -> Result<Option<(Epoch, Epoch)>, SlashingError> {
+        let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock().expect("mutex poisoned");
 
         let source: Option<i64> = conn
             .query_row(
                 "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
-                [pubkey],
+                [&pubkey],
                 |row| row.get(0),
             )
             .optional()?;
@@ -959,7 +1035,7 @@ impl SlashingDb {
         let target: Option<i64> = conn
             .query_row(
                 "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
-                [pubkey],
+                [&pubkey],
                 |row| row.get(0),
             )
             .optional()?;
@@ -3285,6 +3361,204 @@ mod tests {
             .expect("failed to query tables");
         assert_eq!(table_count, 1);
     }
+
+    #[test]
+    fn test_open_sets_wal_journal_mode() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("wal_test.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        let conn = db.conn.lock().expect("mutex poisoned");
+        let mode: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0)).unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    #[test]
+    fn test_open_sets_synchronous_full() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("sync_test.db");
+        let db = SlashingDb::open(&path).expect("failed to open db");
+
+        let conn = db.conn.lock().expect("mutex poisoned");
+        let sync_mode: i64 =
+            conn.pragma_query_value(None, "synchronous", |row| row.get(0)).unwrap();
+        // FULL = 2
+        assert_eq!(sync_mode, 2);
+    }
+
+    #[test]
+    fn test_wal_crash_durability() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("durability_test.db");
+
+        let pubkey = "0xabcdef1234567890";
+
+        // Write a record, then drop without explicit close
+        {
+            let db = SlashingDb::open(&path).expect("failed to open db");
+            db.record_attestation(pubkey, 1, 2, Some("0xroot".to_string())).expect("record failed");
+            // Drop db without explicit close — WAL should ensure durability
+        }
+
+        // Reopen and verify the record persisted
+        {
+            let db = SlashingDb::open(&path).expect("failed to reopen db");
+            let attestations = db.get_attestations(pubkey).expect("query failed");
+            assert_eq!(attestations.len(), 1);
+            assert_eq!(attestations[0].source_epoch, 1);
+            assert_eq!(attestations[0].target_epoch, 2);
+        }
+    }
+
+    #[test]
+    fn test_import_atomic_success() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data: vec![
+                ValidatorRecord {
+                    pubkey: "0xaaa".to_string(),
+                    signed_blocks: vec![InterchangeBlock {
+                        slot: "10".to_string(),
+                        signing_root: None,
+                    }],
+                    signed_attestations: vec![InterchangeAttestation {
+                        source_epoch: "1".to_string(),
+                        target_epoch: "2".to_string(),
+                        signing_root: None,
+                    }],
+                },
+                ValidatorRecord {
+                    pubkey: "0xbbb".to_string(),
+                    signed_blocks: vec![InterchangeBlock {
+                        slot: "20".to_string(),
+                        signing_root: Some("0xroot".to_string()),
+                    }],
+                    signed_attestations: vec![InterchangeAttestation {
+                        source_epoch: "3".to_string(),
+                        target_epoch: "4".to_string(),
+                        signing_root: Some("0xroot2".to_string()),
+                    }],
+                },
+            ],
+        };
+
+        db.import(&interchange, genesis_root).expect("import should succeed");
+
+        let att_a = db.get_attestations("0xaaa").expect("query failed");
+        assert_eq!(att_a.len(), 1);
+        assert_eq!(att_a[0].source_epoch, 1);
+
+        let blocks_b = db.get_blocks("0xbbb").expect("query failed");
+        assert_eq!(blocks_b.len(), 1);
+        assert_eq!(blocks_b[0].slot, 20);
+    }
+
+    #[test]
+    fn test_import_atomic_rollback_on_error() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        // Validators 1-5 are valid, validator 6 has invalid epoch
+        let mut data = Vec::new();
+        for i in 0..5 {
+            data.push(ValidatorRecord {
+                pubkey: format!("0x{:04x}", i),
+                signed_blocks: vec![InterchangeBlock {
+                    slot: format!("{}", i * 100),
+                    signing_root: None,
+                }],
+                signed_attestations: vec![InterchangeAttestation {
+                    source_epoch: format!("{}", i),
+                    target_epoch: format!("{}", i + 1),
+                    signing_root: None,
+                }],
+            });
+        }
+        // Validator 6 with invalid epoch
+        data.push(ValidatorRecord {
+            pubkey: "0xbad".to_string(),
+            signed_blocks: vec![],
+            signed_attestations: vec![InterchangeAttestation {
+                source_epoch: "not_a_number".to_string(),
+                target_epoch: "10".to_string(),
+                signing_root: None,
+            }],
+        });
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data,
+        };
+
+        let result = db.import(&interchange, genesis_root);
+        assert!(result.is_err());
+
+        // All 5 valid validators should have zero records due to rollback
+        for i in 0..5 {
+            let pubkey = format!("0x{:04x}", i);
+            let attestations = db.get_attestations(&pubkey).expect("query failed");
+            assert_eq!(
+                attestations.len(),
+                0,
+                "validator {} should have no attestations after rollback",
+                i
+            );
+            let blocks = db.get_blocks(&pubkey).expect("query failed");
+            assert_eq!(blocks.len(), 0, "validator {} should have no blocks after rollback", i);
+        }
+    }
+
+    #[test]
+    fn test_import_atomic_large_batch() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        let mut data = Vec::new();
+        for i in 0..1000 {
+            data.push(ValidatorRecord {
+                pubkey: format!("0x{:06x}", i),
+                signed_blocks: vec![InterchangeBlock {
+                    slot: format!("{}", i * 10),
+                    signing_root: None,
+                }],
+                signed_attestations: vec![InterchangeAttestation {
+                    source_epoch: format!("{}", i),
+                    target_epoch: format!("{}", i + 1),
+                    signing_root: None,
+                }],
+            });
+        }
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data,
+        };
+
+        db.import(&interchange, genesis_root).expect("large import should succeed");
+
+        // Spot-check a few validators
+        let att_0 = db.get_attestations("0x000000").expect("query failed");
+        assert_eq!(att_0.len(), 1);
+        let att_999 = db.get_attestations("0x0003e7").expect("query failed");
+        assert_eq!(att_999.len(), 1);
+        assert_eq!(att_999[0].source_epoch, 999);
+
+        let blocks_500 = db.get_blocks("0x0001f4").expect("query failed");
+        assert_eq!(blocks_500.len(), 1);
+        assert_eq!(blocks_500[0].slot, 5000);
+    }
 }
 
 /// Living documentation tests for EIP-3076 edge case decisions.
@@ -3463,6 +3737,87 @@ mod edge_case_tests {
         assert!(
             result.is_err(),
             "strict mode: None==None block must be rejected as potential double proposal"
+        );
+    }
+
+    // LOW-13: Validate interchange_format_version on import
+    #[test]
+    fn test_import_rejects_wrong_interchange_version() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "4".to_string(),
+                genesis_validators_root: "0xroot".to_string(),
+            },
+            data: vec![],
+        };
+        let err = db.import(&interchange, "0xroot").unwrap_err();
+        assert!(err.to_string().contains("unsupported interchange_format_version"));
+        assert!(err.to_string().contains("\"4\""));
+    }
+
+    #[test]
+    fn test_import_accepts_version_5() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: "0xroot".to_string(),
+            },
+            data: vec![],
+        };
+        assert!(db.import(&interchange, "0xroot").is_ok());
+    }
+
+    // LOW-14: Normalize pubkeys
+    #[test]
+    fn test_pubkey_normalization_case_insensitive() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.record_attestation("0xABCD", 1, 2, None).expect("insert");
+        let results = db.get_attestations("0xabcd").expect("get");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_pubkey_normalization_adds_prefix() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.record_block("ABCD", 100, None).expect("insert");
+        let results = db.get_blocks("0xabcd").expect("get");
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_pubkey_normalization_already_normalized() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.record_block("0xabcd", 100, None).expect("insert");
+        let results = db.get_blocks("0xabcd").expect("get");
+        assert_eq!(results.len(), 1);
+    }
+
+    // LOW-15: Transactional set_block_watermark
+    #[test]
+    fn test_set_block_watermark_is_transactional() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_block_watermark("0xval", 100).expect("set");
+        assert_eq!(db.get_block_watermark("0xval").expect("get"), Some(100));
+        db.set_block_watermark("0xval", 200).expect("raise");
+        assert_eq!(db.get_block_watermark("0xval").expect("get"), Some(200));
+    }
+
+    // LOW-17: File permissions on DB creation
+    #[cfg(unix)]
+    #[test]
+    fn test_open_sets_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test_perms.db");
+        let _db = SlashingDb::open(&path).expect("open");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "DB file should have 0o600 permissions, got {:o}",
+            mode & 0o777
         );
     }
 }

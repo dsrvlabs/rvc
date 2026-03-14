@@ -37,7 +37,7 @@ pub struct BLSToExecutionChange {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedBLSToExecutionChange {
     pub message: BLSToExecutionChange,
-    #[serde(with = "serde_utils::hex_vec")]
+    #[serde(with = "crate::serde_signature")]
     pub signature: Vec<u8>,
 }
 

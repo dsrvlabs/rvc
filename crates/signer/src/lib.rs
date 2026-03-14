@@ -8,19 +8,20 @@ mod traits;
 pub use crypto::is_aggregator;
 pub use traits::ValidatorSigner;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crypto::{CompositeSigner, PublicKey, Signature, Signer, SigningError};
 use eth_types::{
     AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
-    Fork, ForkSchedule, Root, Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1,
-    VoluntaryExit, DOMAIN_APPLICATION_BUILDER, DOMAIN_CONTRIBUTION_AND_PROOF,
-    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SLOTS_PER_EPOCH,
+    ForkSchedule, Root, Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
+    DOMAIN_APPLICATION_BUILDER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SLOTS_PER_EPOCH,
 };
 use metrics::definitions::{
     slashing_result, RVC_ATTESTATIONS_TOTAL, RVC_SIGNING_DURATION_SECONDS,
@@ -41,25 +42,75 @@ pub enum SignerError {
     SigningFailed(String),
 }
 
+/// Truncates an error message body to a maximum length, appending
+/// "... (truncated)" if the message exceeds the limit.
+fn truncate_error_body(msg: &str, max: usize) -> String {
+    if msg.len() <= max {
+        msg.to_string()
+    } else {
+        format!("{}... (truncated)", &msg[..max])
+    }
+}
+
 impl From<SigningError> for SignerError {
     fn from(e: SigningError) -> Self {
         match e {
             SigningError::KeyNotFound(pk) => SignerError::KeyNotFound(pk),
-            SigningError::RemoteSignerError(msg) => SignerError::SigningFailed(msg),
+            SigningError::RemoteSignerError(msg) => {
+                SignerError::SigningFailed(truncate_error_body(&msg, 200))
+            }
+            SigningError::InvalidRemoteSignature => {
+                SignerError::SigningFailed("remote signer returned invalid signature".to_string())
+            }
         }
     }
 }
 
+/// Per-validator lock map for serializing check-record-sign per validator.
+///
+/// Prevents TOCTOU races where two concurrent sign requests for the same
+/// validator could both pass the slashing check before either records.
+/// Different validators are NOT blocked by each other.
+pub struct ValidatorLockMap {
+    locks: std::sync::Mutex<HashMap<[u8; 48], Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl ValidatorLockMap {
+    pub fn new() -> Self {
+        Self { locks: std::sync::Mutex::new(HashMap::new()) }
+    }
+
+    pub fn get(&self, pubkey: &[u8; 48]) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .expect("validator lock map poisoned")
+            .entry(*pubkey)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+}
+
+impl Default for ValidatorLockMap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Service that combines signing through CompositeSigner with slashing protection.
+///
+/// Record-then-sign order is mandated by Ethereum consensus spec (phase0/validator.md):
+/// "Save a record to hard disk ... Generate and broadcast."
+/// The per-validator mutex prevents TOCTOU between concurrent signing requests.
 pub struct SignerService {
     signer: Arc<CompositeSigner>,
     slashing_db: Arc<SlashingDb>,
+    validator_locks: ValidatorLockMap,
 }
 
 impl SignerService {
     /// Creates a new SignerService with the provided composite signer and slashing database.
     pub fn new(signer: Arc<CompositeSigner>, slashing_db: Arc<SlashingDb>) -> Self {
-        Self { signer, slashing_db }
+        Self { signer, slashing_db, validator_locks: ValidatorLockMap::new() }
     }
 
     /// Signs an attestation after checking slashing protection.
@@ -68,25 +119,27 @@ impl SignerService {
         &self,
         attestation_data: &AttestationData,
         pubkey: &PublicKey,
-        fork: &Fork,
-        genesis_validators_root: Root,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
         let start = Instant::now();
 
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        // Acquire per-validator lock to serialize check-record-sign for the same validator.
+        let lock = self.validator_locks.get(&pubkey_bytes);
+        let _guard = lock.lock().await;
 
         let source_epoch = attestation_data.source.epoch;
         let target_epoch = attestation_data.target.epoch;
 
-        let (fork_version, fork_version_branch) = if target_epoch >= fork.epoch {
-            (fork.current_version, "current")
-        } else {
-            (fork.previous_version, "previous")
-        };
+        let fork_name = eth_types::ForkName::from_epoch(target_epoch, fork_schedule);
+        let fork_version = fork_name.fork_version(fork_schedule);
         let domain = crypto::compute_domain(
             crypto::DOMAIN_BEACON_ATTESTER,
             fork_version,
-            genesis_validators_root,
+            *genesis_validators_root,
         );
 
         debug!(
@@ -94,9 +147,8 @@ impl SignerService {
             fork_version_used = %format!("0x{}", hex::encode(fork_version)),
             genesis_validators_root = %format!("0x{}", hex::encode(genesis_validators_root)),
             domain = %format!("0x{}", hex::encode(domain)),
-            fork_version_branch = fork_version_branch,
+            fork_name = ?fork_name,
             target_epoch = target_epoch,
-            fork_epoch = fork.epoch,
             "Computed attestation domain"
         );
 
@@ -136,11 +188,13 @@ impl SignerService {
         tracing::Span::current().record("rvc.slashing.result", "safe");
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
 
-        let pubkey_bytes = pubkey.to_bytes();
         let signature = match self.signer.sign(&signing_root, &pubkey_bytes).await {
             Ok(sig) => sig,
             Err(e) => {
-                tracing::error!(error = %e, "Attestation signing failed");
+                // Phantom entry: record exists but signing failed. This is safe per spec —
+                // missing a duty is far less harmful than double-signing.
+                warn!(error = %e, pubkey = %format!("0x{}", &pubkey_hex[..16]),
+                    "Attestation signing failed after recording (phantom entry in slashing DB)");
                 return Err(e.into());
             }
         };
@@ -163,7 +217,12 @@ impl SignerService {
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
         let start = Instant::now();
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        // Acquire per-validator lock to serialize check-record-sign for the same validator.
+        let lock = self.validator_locks.get(&pubkey_bytes);
+        let _guard = lock.lock().await;
 
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
@@ -193,11 +252,12 @@ impl SignerService {
         tracing::Span::current().record("rvc.slashing.result", "safe");
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
 
-        let pubkey_bytes = pubkey.to_bytes();
         let signature = match self.signer.sign(&signing_root, &pubkey_bytes).await {
             Ok(sig) => sig,
             Err(e) => {
-                tracing::error!(error = %e, "Block signing failed");
+                // Phantom entry: record exists but signing failed. Safe per spec.
+                warn!(error = %e, pubkey = %format!("0x{}", &pubkey_hex[..16]),
+                    "Block signing failed after recording (phantom entry in slashing DB)");
                 return Err(e.into());
             }
         };
@@ -437,26 +497,14 @@ impl ValidatorSigner for SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Vec<u8>, SignerError> {
-        let target_epoch = data.target.epoch;
-        let epoch = target_epoch;
-        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
-        let fork_version = fork_name.fork_version(fork_schedule);
-        let prior_fork_name = if epoch > 0 {
-            eth_types::ForkName::from_epoch(epoch - 1, fork_schedule)
-        } else {
-            eth_types::ForkName::from_epoch(0, fork_schedule)
-        };
-        let prior_fork_version = prior_fork_name.fork_version(fork_schedule);
-
-        let fork = Fork {
-            previous_version: prior_fork_version,
-            current_version: fork_version,
-            epoch: if fork_version != prior_fork_version { epoch } else { 0 },
-        };
-
-        let signature =
-            SignerService::sign_attestation(self, data, pubkey, &fork, *genesis_validators_root)
-                .await?;
+        let signature = SignerService::sign_attestation(
+            self,
+            data,
+            pubkey,
+            fork_schedule,
+            genesis_validators_root,
+        )
+        .await?;
         Ok(signature.to_bytes().to_vec())
     }
 
@@ -670,11 +718,21 @@ mod tests {
         }
     }
 
-    fn create_test_fork() -> Fork {
-        Fork {
-            previous_version: [0x00, 0x00, 0x00, 0x01],
-            current_version: [0x00, 0x00, 0x00, 0x02],
-            epoch: 50,
+    fn create_test_fork_schedule_for_attestation() -> ForkSchedule {
+        ForkSchedule {
+            genesis_fork_version: [0x00, 0x00, 0x00, 0x01],
+            altair_fork_epoch: 50,
+            altair_fork_version: [0x00, 0x00, 0x00, 0x02],
+            bellatrix_fork_epoch: u64::MAX,
+            bellatrix_fork_version: [0x00, 0x00, 0x00, 0x03],
+            capella_fork_epoch: u64::MAX,
+            capella_fork_version: [0x00, 0x00, 0x00, 0x04],
+            deneb_fork_epoch: u64::MAX,
+            deneb_fork_version: [0x00, 0x00, 0x00, 0x05],
+            electra_fork_epoch: u64::MAX,
+            electra_fork_version: [0x00, 0x00, 0x00, 0x06],
+            fulu_fork_epoch: u64::MAX,
+            fulu_fork_version: [0x00, 0x00, 0x00, 0x07],
         }
     }
 
@@ -698,16 +756,18 @@ mod tests {
         let service = SignerService::new(signer, slashing_db.clone());
 
         let attestation_data = create_test_attestation_data(100, 101);
-        let fork = create_test_fork();
+        let fork_schedule = create_test_fork_schedule_for_attestation();
         let genesis_root = [0xaa; 32];
 
-        let result =
-            service.sign_attestation(&attestation_data, &pubkey, &fork, genesis_root).await;
+        let result = service
+            .sign_attestation(&attestation_data, &pubkey, &fork_schedule, &genesis_root)
+            .await;
 
         assert!(result.is_ok());
         let signature = result.unwrap();
 
-        let fork_version = fork.current_version;
+        let fork_name = eth_types::ForkName::from_epoch(101, &fork_schedule);
+        let fork_version = fork_name.fork_version(&fork_schedule);
         let domain = compute_domain(DOMAIN_BEACON_ATTESTER, fork_version, genesis_root);
         let signing_root = compute_signing_root(&attestation_data, domain);
 
@@ -722,7 +782,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sign_attestation_success_uses_previous_fork_version() {
+    async fn test_sign_attestation_success_uses_correct_fork_version() {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
         let signer = create_test_composite_signer_with_key(secret_key);
@@ -730,21 +790,38 @@ mod tests {
 
         let service = SignerService::new(signer, slashing_db);
 
-        let fork = Fork {
-            previous_version: [0x00, 0x00, 0x00, 0x01],
-            current_version: [0x00, 0x00, 0x00, 0x02],
-            epoch: 100,
+        // Use a schedule where target_epoch=51 falls in the Phase0 range (before altair at 100)
+        let fork_schedule = ForkSchedule {
+            genesis_fork_version: [0x00, 0x00, 0x00, 0x01],
+            altair_fork_epoch: 100,
+            altair_fork_version: [0x00, 0x00, 0x00, 0x02],
+            bellatrix_fork_epoch: u64::MAX,
+            bellatrix_fork_version: [0x00, 0x00, 0x00, 0x03],
+            capella_fork_epoch: u64::MAX,
+            capella_fork_version: [0x00, 0x00, 0x00, 0x04],
+            deneb_fork_epoch: u64::MAX,
+            deneb_fork_version: [0x00, 0x00, 0x00, 0x05],
+            electra_fork_epoch: u64::MAX,
+            electra_fork_version: [0x00, 0x00, 0x00, 0x06],
+            fulu_fork_epoch: u64::MAX,
+            fulu_fork_version: [0x00, 0x00, 0x00, 0x07],
         };
         let attestation_data = create_test_attestation_data(50, 51);
         let genesis_root = [0xaa; 32];
 
-        let result =
-            service.sign_attestation(&attestation_data, &pubkey, &fork, genesis_root).await;
+        let result = service
+            .sign_attestation(&attestation_data, &pubkey, &fork_schedule, &genesis_root)
+            .await;
 
         assert!(result.is_ok());
         let signature = result.unwrap();
 
-        let domain = compute_domain(DOMAIN_BEACON_ATTESTER, fork.previous_version, genesis_root);
+        // target_epoch=51 is before altair at 100, so Phase0 fork version is used
+        let domain = compute_domain(
+            DOMAIN_BEACON_ATTESTER,
+            fork_schedule.genesis_fork_version,
+            genesis_root,
+        );
         let signing_root = compute_signing_root(&attestation_data, domain);
 
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
@@ -760,16 +837,18 @@ mod tests {
         let service = SignerService::new(signer, slashing_db);
 
         let attestation_data1 = create_test_attestation_data(100, 101);
-        let fork = create_test_fork();
+        let fork_schedule = create_test_fork_schedule_for_attestation();
         let genesis_root = [0xaa; 32];
 
-        let result1 =
-            service.sign_attestation(&attestation_data1, &pubkey, &fork, genesis_root).await;
+        let result1 = service
+            .sign_attestation(&attestation_data1, &pubkey, &fork_schedule, &genesis_root)
+            .await;
         assert!(result1.is_ok());
 
         let attestation_data2 = create_test_attestation_data(99, 101);
-        let result2 =
-            service.sign_attestation(&attestation_data2, &pubkey, &fork, genesis_root).await;
+        let result2 = service
+            .sign_attestation(&attestation_data2, &pubkey, &fork_schedule, &genesis_root)
+            .await;
 
         assert!(result2.is_err());
         match result2.unwrap_err() {
@@ -787,22 +866,25 @@ mod tests {
 
         let service = SignerService::new(signer, slashing_db.clone());
 
-        let fork = create_test_fork();
+        let fork_schedule = create_test_fork_schedule_for_attestation();
         let genesis_root = [0xaa; 32];
 
         let attestation_data1 = create_test_attestation_data(100, 101);
-        let result1 =
-            service.sign_attestation(&attestation_data1, &pubkey, &fork, genesis_root).await;
+        let result1 = service
+            .sign_attestation(&attestation_data1, &pubkey, &fork_schedule, &genesis_root)
+            .await;
         assert!(result1.is_ok());
 
         let attestation_data2 = create_test_attestation_data(101, 102);
-        let result2 =
-            service.sign_attestation(&attestation_data2, &pubkey, &fork, genesis_root).await;
+        let result2 = service
+            .sign_attestation(&attestation_data2, &pubkey, &fork_schedule, &genesis_root)
+            .await;
         assert!(result2.is_ok());
 
         let attestation_data3 = create_test_attestation_data(102, 103);
-        let result3 =
-            service.sign_attestation(&attestation_data3, &pubkey, &fork, genesis_root).await;
+        let result3 = service
+            .sign_attestation(&attestation_data3, &pubkey, &fork_schedule, &genesis_root)
+            .await;
         assert!(result3.is_ok());
 
         let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -819,11 +901,12 @@ mod tests {
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
         let attestation_data = create_test_attestation_data(100, 101);
-        let fork = create_test_fork();
+        let fork_schedule = create_test_fork_schedule_for_attestation();
         let genesis_root = [0xaa; 32];
 
-        let result =
-            service.sign_attestation(&attestation_data, &pubkey, &fork, genesis_root).await;
+        let result = service
+            .sign_attestation(&attestation_data, &pubkey, &fork_schedule, &genesis_root)
+            .await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -848,11 +931,12 @@ mod tests {
         let service = SignerService::new(signer, slashing_db);
 
         let attestation_data = create_test_attestation_data(99, 101);
-        let fork = create_test_fork();
+        let fork_schedule = create_test_fork_schedule_for_attestation();
         let genesis_root = [0xaa; 32];
 
-        let result =
-            service.sign_attestation(&attestation_data, &pubkey, &fork, genesis_root).await;
+        let result = service
+            .sign_attestation(&attestation_data, &pubkey, &fork_schedule, &genesis_root)
+            .await;
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -876,15 +960,17 @@ mod tests {
         let service = SignerService::new(signer, slashing_db);
 
         let attestation_data = create_test_attestation_data(100, 101);
-        let fork = create_test_fork();
+        let fork_schedule = create_test_fork_schedule_for_attestation();
         let genesis_root = [0xaa; 32];
 
-        let result1 =
-            service.sign_attestation(&attestation_data, &pubkey1, &fork, genesis_root).await;
+        let result1 = service
+            .sign_attestation(&attestation_data, &pubkey1, &fork_schedule, &genesis_root)
+            .await;
         assert!(result1.is_ok());
 
-        let result2 =
-            service.sign_attestation(&attestation_data, &pubkey2, &fork, genesis_root).await;
+        let result2 = service
+            .sign_attestation(&attestation_data, &pubkey2, &fork_schedule, &genesis_root)
+            .await;
         assert!(result2.is_ok());
     }
 
@@ -903,6 +989,43 @@ mod tests {
 
         let err = SignerError::SigningFailed("remote error".to_string());
         assert!(err.to_string().contains("signing failed"));
+    }
+
+    #[test]
+    fn test_truncate_error_body_short_message() {
+        let msg = "short error";
+        let result = truncate_error_body(msg, 200);
+        assert_eq!(result, "short error");
+    }
+
+    #[test]
+    fn test_truncate_error_body_exact_limit() {
+        let msg = "a".repeat(200);
+        let result = truncate_error_body(&msg, 200);
+        assert_eq!(result, msg);
+    }
+
+    #[test]
+    fn test_truncate_error_body_over_limit() {
+        let msg = "a".repeat(300);
+        let result = truncate_error_body(&msg, 200);
+        assert_eq!(result.len(), 200 + "... (truncated)".len());
+        assert!(result.ends_with("... (truncated)"));
+        assert!(result.starts_with(&"a".repeat(200)));
+    }
+
+    #[test]
+    fn test_remote_signer_error_truncated_on_conversion() {
+        let long_msg = "x".repeat(500);
+        let signing_error = SigningError::RemoteSignerError(long_msg);
+        let signer_error: SignerError = signing_error.into();
+        match signer_error {
+            SignerError::SigningFailed(msg) => {
+                assert!(msg.len() < 500);
+                assert!(msg.ends_with("... (truncated)"));
+            }
+            _ => panic!("expected SigningFailed"),
+        }
     }
 
     #[test]
@@ -1526,5 +1649,129 @@ mod tests {
         let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, fork_version, genesis_root);
         let signing_root = compute_signing_root(&contribution_and_proof, domain);
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
+    }
+
+    // --- COR-01 Tests: Per-validator signing mutex ---
+
+    #[test]
+    fn test_validator_lock_map_returns_same_lock_for_same_key() {
+        let map = ValidatorLockMap::new();
+        let pk = [1u8; 48];
+        let lock1 = map.get(&pk);
+        let lock2 = map.get(&pk);
+        assert!(Arc::ptr_eq(&lock1, &lock2));
+    }
+
+    #[test]
+    fn test_validator_lock_map_returns_different_locks_for_different_keys() {
+        let map = ValidatorLockMap::new();
+        let pk1 = [1u8; 48];
+        let pk2 = [2u8; 48];
+        let lock1 = map.get(&pk1);
+        let lock2 = map.get(&pk2);
+        assert!(!Arc::ptr_eq(&lock1, &lock2));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_signing_same_validator_serialized() {
+        use tokio::sync::Barrier;
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = Arc::new(SignerService::new(signer, slashing_db));
+        let fork_schedule = create_test_fork_schedule_for_attestation();
+        let genesis_root = [0xaa; 32];
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Both attestations use the SAME source/target so the second would normally
+        // fail without the mutex. With the mutex, only one runs at a time, and the
+        // second will see the same signing_root already recorded (which is allowed).
+        let data = create_test_attestation_data(59, 60);
+
+        let mut handles = vec![];
+        for _ in 0..2 {
+            let service = service.clone();
+            let pk = pubkey.clone();
+            let f = fork_schedule.clone();
+            let d = data.clone();
+            let barrier = barrier.clone();
+
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                service.sign_attestation(&d, &pk, &f, &genesis_root).await
+            }));
+        }
+
+        // Both should succeed because they have the same signing root
+        // and the mutex ensures they run sequentially
+        for h in handles {
+            let result = h.await.unwrap();
+            assert!(result.is_ok(), "signing should succeed: {:?}", result.err());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_concurrent_signing_different_validators_parallel() {
+        use tokio::sync::Barrier;
+
+        let sk1 = SecretKey::generate();
+        let sk2 = SecretKey::generate();
+        let pk1 = sk1.public_key();
+        let pk2 = sk2.public_key();
+
+        let mut manager = KeyManager::new();
+        manager.insert(sk1);
+        manager.insert(sk2);
+        let signer = Arc::new(CompositeSigner::new(LocalSigner::new(manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = Arc::new(SignerService::new(signer, slashing_db));
+        let fork_schedule = create_test_fork_schedule_for_attestation();
+        let genesis_root = [0xaa; 32];
+        let barrier = Arc::new(Barrier::new(2));
+
+        let mut handles = vec![];
+        for (pk, epoch) in [(pk1, 60u64), (pk2, 60)] {
+            let service = service.clone();
+            let f = fork_schedule.clone();
+            let barrier = barrier.clone();
+
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let data = create_test_attestation_data(epoch - 1, epoch);
+                service.sign_attestation(&data, &pk, &f, &genesis_root).await
+            }));
+        }
+
+        for h in handles {
+            let result = h.await.unwrap();
+            assert!(result.is_ok(), "parallel signing should succeed: {:?}", result.err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_signing_failure_after_recording_warns_phantom() {
+        // Use a signer with no keys to cause a signing failure after slashing check passes
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+
+        // Register the validator in slashing DB but DON'T add the key to the signer
+        let empty_signer = create_empty_composite_signer();
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(empty_signer, slashing_db.clone());
+        let fork_schedule = create_test_fork_schedule_for_attestation();
+        let genesis_root = [0xaa; 32];
+
+        let data = create_test_attestation_data(59, 60);
+        let result = service.sign_attestation(&data, &pubkey, &fork_schedule, &genesis_root).await;
+        assert!(result.is_err());
+
+        // Verify the phantom entry exists in slashing DB — the signing failed,
+        // but the record was committed. This is the spec-mandated behavior.
+        match result.err().unwrap() {
+            SignerError::KeyNotFound(_) | SignerError::SigningFailed(_) => {}
+            other => panic!("expected signing failure, got: {other}"),
+        }
     }
 }

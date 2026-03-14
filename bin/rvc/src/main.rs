@@ -9,7 +9,6 @@ use std::path::PathBuf;
 
 use bn_manager::BeaconNodeClient;
 use clap::{Parser, Subcommand};
-use crypto::PublicKey;
 use metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
 use rvc::config::{redact_url, CliOverrides, Config, Network, ServiceBuilder};
 use rvc::duty_tracker::DutyTrackerService;
@@ -193,6 +192,36 @@ enum Commands {
         /// Interval in seconds to refresh keys from secret providers (0 = disabled)
         #[arg(long)]
         secret_refresh_interval: Option<u64>,
+
+        // --- Keymanager API hardening flags (SEC-05, SEC-06, SEC-07) ---
+        /// Allow HTTP (non-TLS) URLs for remote signer imports
+        #[arg(long)]
+        allow_insecure_remote_signer: bool,
+
+        /// Comma-separated list of allowed CORS origins for the Keymanager API
+        #[arg(long, value_delimiter = ',')]
+        keymanager_cors_origins: Option<Vec<String>>,
+
+        /// Maximum request body size in bytes for the Keymanager API (default: 10 MB)
+        #[arg(long, default_value_t = keymanager_api::DEFAULT_BODY_LIMIT)]
+        keymanager_body_limit: usize,
+
+        // --- gRPC remote signer flags ---
+        /// gRPC remote signer URL (e.g., https://signer.example.com:50051)
+        #[arg(long)]
+        grpc_signer_url: Option<String>,
+
+        /// Path to the client TLS certificate for gRPC signer mTLS
+        #[arg(long)]
+        grpc_signer_tls_cert: Option<PathBuf>,
+
+        /// Path to the client TLS private key for gRPC signer mTLS
+        #[arg(long)]
+        grpc_signer_tls_key: Option<PathBuf>,
+
+        /// Path to the CA certificate for gRPC signer mTLS
+        #[arg(long)]
+        grpc_signer_tls_ca_cert: Option<PathBuf>,
     },
 
     /// Submit a voluntary exit for a validator
@@ -289,7 +318,26 @@ async fn main() -> anyhow::Result<()> {
             gcp_project_id,
             gcp_secret_prefix,
             secret_refresh_interval,
+            allow_insecure_remote_signer,
+            keymanager_cors_origins,
+            keymanager_body_limit,
+            grpc_signer_url,
+            grpc_signer_tls_cert,
+            grpc_signer_tls_key,
+            grpc_signer_tls_ca_cert,
         } => {
+            // Validate gRPC signer flags: if URL is set, all TLS flags are required
+            if grpc_signer_url.is_some()
+                && (grpc_signer_tls_cert.is_none()
+                    || grpc_signer_tls_key.is_none()
+                    || grpc_signer_tls_ca_cert.is_none())
+            {
+                anyhow::bail!(
+                    "--grpc-signer-url requires --grpc-signer-tls-cert, \
+                     --grpc-signer-tls-key, and --grpc-signer-tls-ca-cert"
+                );
+            }
+
             let mut timeouts = bn_manager::OperationTimeouts::default();
             if let Some(secs) = block_production_timeout {
                 if secs == 0 {
@@ -333,7 +381,10 @@ async fn main() -> anyhow::Result<()> {
                 metrics_port: Some(metrics_port),
                 grpc_port: Some(grpc_port),
                 grpc_address: Some(grpc_address),
-                network: network.and_then(|n| n.parse::<Network>().ok()),
+                network: network
+                    .map(|n| n.parse::<Network>())
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
                 genesis_time,
                 genesis_validators_root,
                 graffiti,
@@ -360,6 +411,17 @@ async fn main() -> anyhow::Result<()> {
                 gcp_project_id,
                 gcp_secret_prefix,
                 secret_refresh_interval,
+                allow_insecure_remote_signer: if allow_insecure_remote_signer {
+                    Some(true)
+                } else {
+                    None
+                },
+                keymanager_cors_origins,
+                keymanager_body_limit: Some(keymanager_body_limit),
+                grpc_signer_url,
+                grpc_signer_tls_cert,
+                grpc_signer_tls_key,
+                grpc_signer_tls_ca_cert,
             };
 
             let mut cfg = load_config(config)?;
@@ -678,9 +740,11 @@ async fn run_validator(
         if secret_providers.is_empty() {
             key_manager
         } else {
-            let mut km = std::sync::Arc::try_unwrap(key_manager).unwrap_or_else(|_| {
-                panic!("single reference to key_manager before cloud key loading")
-            });
+            let mut km = std::sync::Arc::try_unwrap(key_manager).map_err(|_| {
+                anyhow::anyhow!(
+                    "cannot take ownership of key_manager: outstanding Arc references exist"
+                )
+            })?;
             let ksm = secret_provider::KeySourceManager::from_arc(secret_providers.clone());
             let summary = ksm.load_all(&mut km).await?;
             let mut total_loaded = 0usize;
@@ -711,12 +775,56 @@ async fn run_validator(
     let pubkey_map = builder.build_pubkey_map(&key_manager);
 
     // Create shared CompositeSigner from loaded keys
-    let key_manager_owned = std::sync::Arc::try_unwrap(key_manager)
-        .unwrap_or_else(|_| panic!("single reference to key_manager after pubkey_map build"));
+    let key_manager_owned = std::sync::Arc::try_unwrap(key_manager).map_err(|_| {
+        anyhow::anyhow!("cannot take ownership of key_manager: outstanding Arc references exist")
+    })?;
     let known_pubkeys: std::collections::HashSet<[u8; 48]> =
         key_manager_owned.list_public_keys().iter().map(|pk| pk.to_bytes()).collect();
     let local_signer = crypto::LocalSigner::new(key_manager_owned);
     let composite_signer = std::sync::Arc::new(crypto::CompositeSigner::new(local_signer));
+
+    // Connect gRPC remote signer if configured (non-fatal: lazy connection)
+    let _grpc_remote_signer = if let Some(ref grpc_url) = config.grpc_signer_url {
+        info!(url = %redact_url(grpc_url), "Configuring gRPC remote signer");
+
+        let mut grpc_config = grpc_signer::GrpcRemoteSignerConfig::new(grpc_url.clone());
+
+        if let (Some(ref cert_path), Some(ref key_path), Some(ref ca_path)) = (
+            &config.grpc_signer_tls_cert,
+            &config.grpc_signer_tls_key,
+            &config.grpc_signer_tls_ca_cert,
+        ) {
+            let cert = std::fs::read(cert_path)
+                .map_err(|e| anyhow::anyhow!("failed to read gRPC signer TLS cert: {e}"))?;
+            let key = std::fs::read(key_path)
+                .map_err(|e| anyhow::anyhow!("failed to read gRPC signer TLS key: {e}"))?;
+            let ca_cert = std::fs::read(ca_path)
+                .map_err(|e| anyhow::anyhow!("failed to read gRPC signer TLS CA cert: {e}"))?;
+            grpc_config = grpc_config.with_tls(cert, key, ca_cert);
+        }
+
+        match grpc_signer::GrpcRemoteSigner::connect(grpc_config).await {
+            Ok(signer) => {
+                let key_count = crypto::Signer::public_keys(&signer).len();
+                info!(
+                    url = %redact_url(grpc_url),
+                    key_count,
+                    "gRPC remote signer connected"
+                );
+                Some(signer)
+            }
+            Err(e) => {
+                warn!(
+                    url = %redact_url(grpc_url),
+                    error = %e,
+                    "Failed to connect to gRPC remote signer; will retry on demand"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Spawn secret provider refresh task (if configured)
     let refresh_interval = config.secret_provider.refresh_interval.unwrap_or(0);
@@ -743,12 +851,12 @@ async fn run_validator(
     let validator_index_map = resolve_validator_indices(beacon_for_resolve, &pubkey_map).await;
 
     // Step 6: Doppelganger detection (if enabled)
-    if doppelganger_enabled && !pubkey_map.is_empty() {
+    if doppelganger_enabled && !pubkey_map.read().expect("pubkey_map lock poisoned").is_empty() {
         let validator_index_map = match validator_index_map {
             Ok(ref map) if !map.is_empty() => map.clone(),
             Ok(_) => {
                 warn!(
-                    total = pubkey_map.len(),
+                    total = pubkey_map.read().expect("pubkey_map lock poisoned").len(),
                     "No validator indices resolved; validators may be pending activation. \
                      Skipping doppelganger detection"
                 );
@@ -766,7 +874,8 @@ async fn run_validator(
             let doppelganger_service =
                 builder.build_doppelganger_service(beacon_client.clone(), slashing_db.clone());
 
-            let pubkeys: Vec<String> = pubkey_map.keys().cloned().collect();
+            let pubkeys: Vec<String> =
+                pubkey_map.read().expect("pubkey_map lock poisoned").keys().cloned().collect();
 
             let slot_clock = match builder.build_slot_clock() {
                 Ok(clock) => clock,
@@ -837,6 +946,13 @@ async fn run_validator(
             return Err(e.into());
         }
     };
+
+    match startup::check_fork_compatibility(beacon.as_ref(), &fork_schedule).await {
+        Ok(()) => {}
+        Err(e) => {
+            warn!("Fork compatibility check failed: {}", e);
+        }
+    }
 
     let orchestrator_config = builder
         .build_orchestrator_config(genesis_validators_root, fork_schedule)
@@ -921,6 +1037,9 @@ async fn run_validator(
             remote_key_mgr,
             token.to_string(),
             km_addr,
+            config.keymanager_cors_origins.clone(),
+            config.keymanager_body_limit,
+            config.allow_insecure_remote_signer,
         );
 
         info!(addr = %km_addr, token_path = %token_path.display(), "Keymanager API enabled");
@@ -1016,13 +1135,15 @@ async fn run_validator(
 
 async fn resolve_validator_indices(
     beacon_client: &dyn BeaconNodeClient,
-    pubkey_map: &std::collections::HashMap<String, PublicKey>,
+    pubkey_map: &rvc::orchestrator::PubkeyMap,
 ) -> Result<std::collections::HashMap<String, String>, anyhow::Error> {
-    if pubkey_map.is_empty() {
-        return Ok(std::collections::HashMap::new());
-    }
-
-    let pubkeys: Vec<String> = pubkey_map.keys().cloned().collect();
+    let pubkeys: Vec<String> = {
+        let map = pubkey_map.read().expect("pubkey_map lock poisoned");
+        if map.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        map.keys().cloned().collect()
+    };
     let response = beacon_client.get_validators(&pubkeys).await?;
 
     let index_map: std::collections::HashMap<String, String> =
@@ -1331,5 +1452,100 @@ mod tests {
         };
         let result = telemetry::init_tracing(&tc);
         assert!(result.is_err(), "init_tracing should fail with invalid endpoint scheme");
+    }
+
+    #[test]
+    fn test_grpc_signer_cli_flags_parse_all() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "rvc",
+            "start",
+            "--grpc-signer-url",
+            "https://signer.example.com:50051",
+            "--grpc-signer-tls-cert",
+            "/tmp/cert.pem",
+            "--grpc-signer-tls-key",
+            "/tmp/key.pem",
+            "--grpc-signer-tls-ca-cert",
+            "/tmp/ca.pem",
+        ])
+        .expect("should parse");
+
+        match cli.command {
+            Commands::Start {
+                grpc_signer_url,
+                grpc_signer_tls_cert,
+                grpc_signer_tls_key,
+                grpc_signer_tls_ca_cert,
+                ..
+            } => {
+                assert_eq!(grpc_signer_url.as_deref(), Some("https://signer.example.com:50051"));
+                assert_eq!(grpc_signer_tls_cert, Some(PathBuf::from("/tmp/cert.pem")));
+                assert_eq!(grpc_signer_tls_key, Some(PathBuf::from("/tmp/key.pem")));
+                assert_eq!(grpc_signer_tls_ca_cert, Some(PathBuf::from("/tmp/ca.pem")));
+            }
+            _ => panic!("expected Start command"),
+        }
+    }
+
+    #[test]
+    fn test_grpc_signer_cli_flags_optional() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["rvc", "start"]).expect("should parse without grpc flags");
+
+        match cli.command {
+            Commands::Start {
+                grpc_signer_url,
+                grpc_signer_tls_cert,
+                grpc_signer_tls_key,
+                grpc_signer_tls_ca_cert,
+                ..
+            } => {
+                assert!(grpc_signer_url.is_none());
+                assert!(grpc_signer_tls_cert.is_none());
+                assert!(grpc_signer_tls_key.is_none());
+                assert!(grpc_signer_tls_ca_cert.is_none());
+            }
+            _ => panic!("expected Start command"),
+        }
+    }
+
+    #[test]
+    fn test_grpc_signer_config_defaults_none() {
+        let config = Config::default();
+        assert!(config.grpc_signer_url.is_none());
+        assert!(config.grpc_signer_tls_cert.is_none());
+        assert!(config.grpc_signer_tls_key.is_none());
+        assert!(config.grpc_signer_tls_ca_cert.is_none());
+    }
+
+    #[test]
+    fn test_grpc_signer_config_merge_with_cli() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            grpc_signer_url: Some("https://signer:50051".to_string()),
+            grpc_signer_tls_cert: Some(PathBuf::from("/cert.pem")),
+            grpc_signer_tls_key: Some(PathBuf::from("/key.pem")),
+            grpc_signer_tls_ca_cert: Some(PathBuf::from("/ca.pem")),
+            ..Default::default()
+        };
+
+        config.merge_with_cli(&cli);
+
+        assert_eq!(config.grpc_signer_url.as_deref(), Some("https://signer:50051"));
+        assert_eq!(config.grpc_signer_tls_cert, Some(PathBuf::from("/cert.pem")));
+        assert_eq!(config.grpc_signer_tls_key, Some(PathBuf::from("/key.pem")));
+        assert_eq!(config.grpc_signer_tls_ca_cert, Some(PathBuf::from("/ca.pem")));
+    }
+
+    #[test]
+    fn test_grpc_signer_config_merge_preserves_none() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+
+        config.merge_with_cli(&cli);
+
+        assert!(config.grpc_signer_url.is_none());
+        assert!(config.grpc_signer_tls_cert.is_none());
     }
 }

@@ -59,14 +59,27 @@ impl RefreshService {
                     }
                 }
 
-                let material = match provider.fetch_key(&entry.id).await {
-                    Ok(m) => m,
-                    Err(e) => {
+                let material = match tokio::time::timeout(
+                    Duration::from_secs(30),
+                    provider.fetch_key(&entry.id),
+                )
+                .await
+                {
+                    Ok(Ok(m)) => m,
+                    Ok(Err(e)) => {
                         warn!(
                             provider = %provider_name,
                             key_id = %entry.id,
                             error = %e,
                             "Failed to fetch key during refresh"
+                        );
+                        continue;
+                    }
+                    Err(_elapsed) => {
+                        warn!(
+                            provider = %provider_name,
+                            key_id = %entry.id,
+                            "Timed out fetching key during refresh (30s)"
                         );
                         continue;
                     }
@@ -135,6 +148,7 @@ impl RefreshService {
 mod tests {
     use std::sync::Mutex;
 
+    use async_trait::async_trait;
     use zeroize::Zeroizing;
 
     use super::*;
@@ -382,6 +396,60 @@ mod tests {
             RefreshService::new(vec![Arc::new(provider)], known, Duration::from_secs(60), cancel);
 
         let new_keys = service.refresh().await;
+        assert_eq!(new_keys.len(), 0);
+    }
+
+    /// A mock provider whose `fetch_key` sleeps for a configurable duration,
+    /// used to test timeout behavior.
+    struct SlowSecretProvider {
+        name: String,
+        entry_ids: Vec<String>,
+        fetch_delay: Duration,
+    }
+
+    #[async_trait]
+    impl SecretProvider for SlowSecretProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn list_keys(&self) -> Result<Vec<SecretKeyEntry>, SecretProviderError> {
+            Ok(self
+                .entry_ids
+                .iter()
+                .map(|id| SecretKeyEntry { id: id.clone(), pubkey_hex: None })
+                .collect())
+        }
+
+        async fn fetch_key(&self, _id: &str) -> Result<KeyMaterial, SecretProviderError> {
+            tokio::time::sleep(self.fetch_delay).await;
+            // Return a dummy key (won't be reached if timeout fires)
+            let sk = crypto::SecretKey::generate();
+            let bytes: [u8; 32] = sk.to_bytes();
+            Ok(KeyMaterial::RawKey(Zeroizing::new(bytes)))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_refresh_fetch_timeout() {
+        tokio::time::pause();
+
+        let slow_provider = SlowSecretProvider {
+            name: "slow".to_string(),
+            entry_ids: vec!["slow-key-1".to_string()],
+            fetch_delay: Duration::from_secs(60), // well over 30s timeout
+        };
+
+        let cancel = CancellationToken::new();
+        let mut service = RefreshService::new(
+            vec![Arc::new(slow_provider)],
+            HashSet::new(),
+            Duration::from_secs(300),
+            cancel,
+        );
+
+        let new_keys = service.refresh().await;
+        // The fetch should have timed out, so no keys are returned
         assert_eq!(new_keys.len(), 0);
     }
 }

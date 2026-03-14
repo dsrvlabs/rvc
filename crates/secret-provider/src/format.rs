@@ -1,6 +1,6 @@
 use std::fmt;
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::SecretProviderError;
 
@@ -46,20 +46,26 @@ pub fn parse_secret_data(data: &[u8]) -> Result<SecretDataFormat, SecretProvider
     let trimmed = text.trim();
     let hex_str = trimmed.strip_prefix("0x").unwrap_or(trimmed);
 
-    let decoded = hex::decode(hex_str).map_err(|e| {
+    let mut raw = hex::decode(hex_str).map_err(|e| {
         SecretProviderError::InvalidKeyMaterial(format!(
             "data is neither valid JSON nor valid hex: {e}"
         ))
     })?;
 
-    let bytes: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
-        SecretProviderError::InvalidKeyMaterial(format!(
+    if raw.len() != 32 {
+        let len = raw.len();
+        raw.zeroize();
+        return Err(SecretProviderError::InvalidKeyMaterial(format!(
             "hex decodes to {} bytes, expected 32",
-            v.len()
-        ))
-    })?;
+            len
+        )));
+    }
 
-    Ok(SecretDataFormat::RawHex(Zeroizing::new(bytes)))
+    let mut bytes = Zeroizing::new([0u8; 32]);
+    bytes.copy_from_slice(&raw);
+    raw.zeroize();
+
+    Ok(SecretDataFormat::RawHex(bytes))
 }
 
 #[cfg(test)]

@@ -43,9 +43,12 @@ fn hkdf_mod_r(ikm: &[u8], key_info: &[u8]) -> Result<Zeroizing<[u8; 32]>, Eip233
 
         let sk_int = BigUint::from_bytes_be(okm.as_ref()) % &r;
         if sk_int != BigUint::ZERO {
-            let bytes = sk_int.to_bytes_be();
+            let mut bytes = Zeroizing::new(sk_int.to_bytes_be());
             let mut buf = Zeroizing::new([0u8; 32]);
             buf[32 - bytes.len()..].copy_from_slice(&bytes);
+            // Best-effort zeroize: BigUint does not implement Zeroize (upstream limitation),
+            // but we zeroize its exported byte representation immediately after use.
+            bytes.iter_mut().for_each(|b| *b = 0);
             return Ok(buf);
         }
 

@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/rvc", "bin/rvc-keygen", "crates/rvc", "crates/beacon", "crates/bn-manager", "crates/builder", "crates/doppelganger", "crates/eth-types", "crates/keymanager-api", "crates/metrics", "crates/secret-provider", "crates/slashing", "crates/telemetry", "crates/timing", "crates/crypto", "crates/duty-tracker", "crates/propagator", "crates/signer", "crates/validator-store", "crates/block-service", "crates/sync-service"]
+members = ["bin/rvc", "bin/rvc-keygen", "bin/rvc-signer", "crates/rvc", "crates/beacon", "crates/bn-manager", "crates/builder", "crates/doppelganger", "crates/eth-types", "crates/grpc-signer", "crates/keymanager-api", "crates/metrics", "crates/secret-provider", "crates/slashing", "crates/telemetry", "crates/timing", "crates/crypto", "crates/duty-tracker", "crates/propagator", "crates/signer", "crates/validator-store", "crates/block-service", "crates/sync-service"]
 default-members = ["bin/rvc"]
 resolver = "2"
 
@@ -31,12 +31,14 @@ doppelganger = { path = "crates/doppelganger", package = "rvc-doppelganger" }
 keymanager-api = { path = "crates/keymanager-api", package = "rvc-keymanager-api" }
 telemetry = { path = "crates/telemetry", package = "rvc-telemetry" }
 secret-provider = { path = "crates/secret-provider", package = "rvc-secret-provider" }
+grpc-signer = { path = "crates/grpc-signer", package = "rvc-grpc-signer" }
 
 # External
 async-trait = "0.1"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
@@ -85,8 +87,14 @@ hkdf = "0.12"
 num-bigint = "0.4"
 bip39 = { version = "2.2", features = ["zeroize", "rand"] }
 rpassword = "5"
+tiny-keccak = { version = "2", features = ["keccak"] }
 rayon = "1"
 tokio-util = "0.7"
+tokio-stream = "0.1"
+
+# DVT (Distributed Validator Technology)
+vsss-rs = { version = "5.3", default-features = false, features = ["std"] }
+bls12_381_plus = "0.8"
 
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }

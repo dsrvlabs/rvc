@@ -7,4 +7,4 @@ mod error;
 mod service;
 
 pub use error::OrchestratorError;
-pub use service::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle};
+pub use service::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle, PubkeyMap};

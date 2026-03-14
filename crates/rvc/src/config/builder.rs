@@ -11,11 +11,11 @@ use tracing::info;
 
 use crate::beacon_adapter::BeaconBlockAdapter;
 use crate::doppelganger_adapter::{BeaconLivenessAdapter, SlashingDbReaderAdapter};
-use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle};
+use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle, PubkeyMap};
 use beacon::{BeaconClient, BeaconClientConfig};
 use bn_manager::{BeaconNodeClient, BnManager, BnManagerConfig};
 use builder::BuilderService;
-use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey};
+use crypto::{CompositeSigner, KeyManager, LocalSigner};
 use doppelganger::DoppelgangerService;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkSchedule, Root};
@@ -49,7 +49,7 @@ where
     pub duty_tracker: Arc<DutyTracker>,
     pub slot_clock: Arc<C>,
     pub validator_store: Arc<ValidatorStore>,
-    pub pubkey_map: HashMap<String, PublicKey>,
+    pub pubkey_map: PubkeyMap,
     pub genesis_validators_root: Root,
     pub fork_schedule: Arc<ForkSchedule>,
     pub doppelganger_service: Option<DoppelgangerService>,
@@ -166,7 +166,8 @@ impl ServiceBuilder {
         let slot_duration = Duration::from_secs(self.config.network.seconds_per_slot());
         let slots_per_epoch = self.config.network.slots_per_epoch();
 
-        let clock = SystemSlotClock::new(genesis_time, slot_duration, slots_per_epoch);
+        let clock = SystemSlotClock::new(genesis_time, slot_duration, slots_per_epoch)
+            .map_err(|e| ConfigError::MissingField(format!("invalid slot clock: {e}")))?;
         info!(
             genesis_time = genesis_time,
             slot_duration_secs = slot_duration.as_secs(),
@@ -176,14 +177,14 @@ impl ServiceBuilder {
         Ok(Arc::new(clock))
     }
 
-    pub fn build_pubkey_map(&self, key_manager: &KeyManager) -> HashMap<String, PublicKey> {
-        let mut pubkey_map = HashMap::new();
+    pub fn build_pubkey_map(&self, key_manager: &KeyManager) -> PubkeyMap {
+        let mut map = HashMap::new();
         for pubkey in key_manager.list_public_keys() {
             let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
-            pubkey_map.insert(pubkey_hex, pubkey);
+            map.insert(pubkey_hex, pubkey);
         }
-        info!(count = pubkey_map.len(), "Built public key map");
-        pubkey_map
+        info!(count = map.len(), "Built public key map");
+        Arc::new(std::sync::RwLock::new(map))
     }
 
     pub fn parse_genesis_validators_root(&self) -> Result<Root, ConfigError> {
@@ -348,8 +349,11 @@ impl ServiceBuilder {
         let key_manager = self.build_key_manager()?;
         let slashing_db = self.build_slashing_db()?;
         let pubkey_map = self.build_pubkey_map(&key_manager);
-        let key_manager_owned = Arc::try_unwrap(key_manager)
-            .unwrap_or_else(|_| panic!("single reference to key_manager after pubkey_map build"));
+        let key_manager_owned = Arc::try_unwrap(key_manager).map_err(|_| {
+            ConfigError::MissingField(
+                "cannot take ownership of key_manager: outstanding Arc references".to_string(),
+            )
+        })?;
         let composite_signer = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager_owned)));
         let signer = self.build_signer(composite_signer.clone(), slashing_db.clone());
         let propagator = self.build_propagator(beacon_client.clone());
@@ -536,7 +540,7 @@ mod tests {
         let key_manager = KeyManager::new();
         let pubkey_map = builder.build_pubkey_map(&key_manager);
 
-        assert!(pubkey_map.is_empty());
+        assert!(pubkey_map.read().unwrap().is_empty());
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub struct BuilderService {
     bn: Arc<dyn BeaconNodeClient>,
     validator_store: Arc<ValidatorStore>,
     genesis_fork_version: [u8; 4],
-    cache: std::sync::RwLock<HashMap<[u8; 48], CachedRegistration>>,
+    cache: tokio::sync::RwLock<HashMap<[u8; 48], CachedRegistration>>,
 }
 
 impl BuilderService {
@@ -48,7 +48,7 @@ impl BuilderService {
             bn,
             validator_store,
             genesis_fork_version,
-            cache: std::sync::RwLock::new(HashMap::new()),
+            cache: tokio::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -74,7 +74,7 @@ impl BuilderService {
         // the cache under a read lock, then release the lock before
         // performing any async signing.
         let candidates: Vec<([u8; 48], [u8; 20], u64)> = {
-            let cache = self.cache.read().expect("builder cache lock poisoned");
+            let cache = self.cache.read().await;
             builder_pubkeys
                 .iter()
                 .filter_map(|pubkey| {
@@ -138,7 +138,7 @@ impl BuilderService {
 
         // Update cache after successful submission
         {
-            let mut cache = self.cache.write().expect("builder cache lock poisoned");
+            let mut cache = self.cache.write().await;
             for reg in &registrations {
                 cache.insert(
                     reg.message.pubkey,
