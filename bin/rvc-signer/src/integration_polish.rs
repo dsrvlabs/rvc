@@ -406,6 +406,7 @@ keystore_dir = "{}"
     }
 
     #[test]
+    #[ignore] // Requires pre-built binary; fails under cargo llvm-cov
     fn test_dry_run_binary_exit_code_valid() {
         let dir = TempDir::new().unwrap();
         let ks_dir = dir.path().join("keystores");
@@ -439,6 +440,7 @@ keystore_dir = "{}"
     }
 
     #[test]
+    #[ignore] // Requires pre-built binary; fails under cargo llvm-cov
     fn test_dry_run_binary_exit_code_invalid_tls() {
         let dir = TempDir::new().unwrap();
         let ks_dir = dir.path().join("keystores");
@@ -681,6 +683,7 @@ reload_interval_secs = 5
     // --- Dry-run with config.toml ---
 
     #[test]
+    #[ignore] // Requires pre-built binary; fails under cargo llvm-cov
     fn test_dry_run_binary_with_config_toml() {
         let dir = TempDir::new().unwrap();
         let ks_dir = dir.path().join("keystores");

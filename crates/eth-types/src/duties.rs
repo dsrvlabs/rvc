@@ -112,7 +112,7 @@ mod tests {
     #[test]
     fn test_signed_voluntary_exit_rejects_empty_signature() {
         let json =
-            format!(r#"{{"message":{{"epoch":"100","validator_index":"42"}},"signature":"0x"}}"#);
+            r#"{"message":{"epoch":"100","validator_index":"42"},"signature":"0x"}"#.to_string();
         assert!(serde_json::from_str::<SignedVoluntaryExit>(&json).is_err());
     }
 }
