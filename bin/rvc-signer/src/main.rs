@@ -5,6 +5,7 @@ pub mod commands;
 pub mod config;
 #[cfg(feature = "dvt")]
 pub mod dvt;
+mod integration_polish;
 pub mod metrics;
 pub mod reload;
 pub mod service;

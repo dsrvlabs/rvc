@@ -68,7 +68,7 @@ pub fn extract_client_cn<T>(request: &tonic::Request<T>) -> String {
 ///
 /// Searches for the CN OID (2.5.4.3 = `[0x55, 0x04, 0x03]`) and reads
 /// the following UTF8String or PrintableString value.
-fn extract_cn_from_der(der: &[u8]) -> Option<String> {
+pub(crate) fn extract_cn_from_der(der: &[u8]) -> Option<String> {
     // CN OID: 2.5.4.3 encoded as 0x06 0x03 0x55 0x04 0x03
     let cn_oid: &[u8] = &[0x06, 0x03, 0x55, 0x04, 0x03];
 
