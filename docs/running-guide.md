@@ -410,6 +410,9 @@ rvc-signer serve [OPTIONS]
 | `--metrics-address <ADDR>` | `127.0.0.1:9101` | Prometheus metrics listen address |
 | `--reload-interval <SECS>` | `30` | Keystore hot-reload interval (0 to disable) |
 | `--dry-run` | false | Validate configuration and exit |
+| `--insecure` | false | Allow starting without TLS (NOT recommended for production) |
+
+TLS is required by default. The server refuses to start without `--tls-cert`, `--tls-key`, and `--tls-ca-cert` unless `--insecure` is explicitly set.
 
 #### DVT Options (requires `--features dvt`)
 

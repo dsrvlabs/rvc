@@ -16,6 +16,7 @@ thiserror.workspace = true
 tonic = { workspace = true, features = ["transport", "tls"] }
 tracing.workspace = true
 url.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 rcgen = "0.13"

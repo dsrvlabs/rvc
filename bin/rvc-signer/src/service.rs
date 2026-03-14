@@ -89,7 +89,10 @@ impl SignerService for SignerServiceImpl {
                     crate::backend::SigningBackendError::KeyNotFound(_) => {
                         (Status::not_found("unknown public key"), "key_not_found".to_string())
                     }
-                    _ => (Status::internal(e.to_string()), "error".to_string()),
+                    _ => {
+                        tracing::error!(error = %e, "signing backend error");
+                        (Status::internal("internal signing error"), "error".to_string())
+                    }
                 };
                 (Err(status), audit_result)
             }

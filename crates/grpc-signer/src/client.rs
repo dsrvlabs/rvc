@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use tonic::transport::Channel;
 use tracing::Instrument;
 use url::Url;
+use zeroize::Zeroizing;
 
 use crypto::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
 use crypto::{Signer, SigningError};
@@ -25,7 +26,7 @@ fn redact_url(url: &str) -> String {
 pub struct GrpcRemoteSignerConfig {
     pub url: String,
     pub tls_cert: Option<Vec<u8>>,
-    pub tls_key: Option<Vec<u8>>,
+    pub tls_key: Option<Zeroizing<Vec<u8>>>,
     pub tls_ca_cert: Option<Vec<u8>>,
 }
 
@@ -36,7 +37,7 @@ impl GrpcRemoteSignerConfig {
 
     pub fn with_tls(mut self, cert: Vec<u8>, key: Vec<u8>, ca_cert: Vec<u8>) -> Self {
         self.tls_cert = Some(cert);
-        self.tls_key = Some(key);
+        self.tls_key = Some(Zeroizing::new(key));
         self.tls_ca_cert = Some(ca_cert);
         self
     }
@@ -56,7 +57,7 @@ impl GrpcRemoteSigner {
             (config.tls_cert, config.tls_key, config.tls_ca_cert)
         {
             let tls = tonic::transport::ClientTlsConfig::new()
-                .identity(tonic::transport::Identity::from_pem(cert, key))
+                .identity(tonic::transport::Identity::from_pem(cert, &*key))
                 .ca_certificate(tonic::transport::Certificate::from_pem(ca_cert));
 
             Channel::from_shared(url.clone())

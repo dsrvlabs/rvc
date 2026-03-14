@@ -85,8 +85,11 @@ pub fn execute(args: SplitKeyArgs) -> Result<(), SplitKeyError> {
     fs::create_dir_all(&args.output_dir)
         .map_err(|e| SplitKeyError::WriteOutput(format!("{}: {}", args.output_dir.display(), e)))?;
 
-    for (i, share) in share_scalars.iter().enumerate() {
-        let share_index = (i + 1) as u64;
+    for share in &share_scalars {
+        let id: &IdentifierPrimeField<Scalar> = share.identifier();
+        let id_bytes = id.0.to_be_bytes();
+        // vsss_rs identifiers fit in the low 8 bytes of the 32-byte scalar
+        let share_index = u64::from_be_bytes(id_bytes[24..32].try_into().unwrap());
         let share_scalar: &IdentifierPrimeField<Scalar> = share.value();
         let scalar_val = share_scalar.0;
 

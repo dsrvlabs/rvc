@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 use tracing::Span;
 
+use crate::audit;
 use crate::dvt::types::ShareInfo;
 use crate::proto::signer::peer_signer_service_server::PeerSignerService;
 use crate::proto::signer::{PartialSignRequest, PartialSignResponse};
@@ -24,12 +25,15 @@ impl PeerSignerService for PeerSignerServiceImpl {
     #[tracing::instrument(
         name = "rvc.signer.dvt.partial_sign",
         skip_all,
-        fields(pubkey, share_index)
+        fields(pubkey, share_index, peer_cn)
     )]
     async fn partial_sign(
         &self,
         request: Request<PartialSignRequest>,
     ) -> Result<Response<PartialSignResponse>, Status> {
+        let client_cn = audit::extract_client_cn(&request);
+        Span::current().record("peer_cn", client_cn.as_str());
+
         let req = request.into_inner();
 
         if req.signing_root.len() != 32 {

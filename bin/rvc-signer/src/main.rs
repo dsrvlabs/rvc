@@ -114,6 +114,10 @@ struct ServeArgs {
     #[arg(long)]
     dry_run: bool,
 
+    /// Allow starting without TLS (NOT recommended for production)
+    #[arg(long)]
+    insecure: bool,
+
     /// Signing backend to use
     #[arg(long, value_enum, default_value_t = Backend::Basic)]
     backend: Backend,
@@ -339,8 +343,12 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let server_tls = tls.to_server_tls_config()?;
         builder = builder.tls_config(server_tls)?;
         info!("mTLS enabled");
+    } else if args.insecure {
+        tracing::warn!("TLS disabled via --insecure flag. Do NOT use in production!");
     } else {
-        info!("TLS disabled (no --tls-cert/--tls-key/--tls-ca-cert provided)");
+        return Err("TLS is required. Provide --tls-cert, --tls-key, and --tls-ca-cert, \
+             or use --insecure to disable (NOT recommended for production)."
+            .into());
     }
 
     info!(address = %addr, "gRPC server listening");
@@ -659,6 +667,7 @@ mod tests {
             tls_key: None,
             tls_ca_cert: None,
             dry_run: true,
+            insecure: true,
             backend: Backend::Basic,
             metrics_address: "127.0.0.1:0".to_string(),
             reload_interval: 0,
@@ -692,6 +701,7 @@ mod tests {
             tls_key: None,
             tls_ca_cert: None,
             dry_run: true,
+            insecure: true,
             backend: Backend::Basic,
             metrics_address: "127.0.0.1:0".to_string(),
             reload_interval: 0,
@@ -753,6 +763,7 @@ mod tests {
             tls_key: Some(key_path),
             tls_ca_cert: Some(ca_cert_path),
             dry_run: true,
+            insecure: true,
             backend: Backend::Basic,
             metrics_address: "127.0.0.1:0".to_string(),
             reload_interval: 0,
@@ -793,6 +804,7 @@ mod tests {
             tls_key: Some(PathBuf::from("/nonexistent/key.pem")),
             tls_ca_cert: Some(PathBuf::from("/nonexistent/ca.pem")),
             dry_run: true,
+            insecure: true,
             backend: Backend::Basic,
             metrics_address: "127.0.0.1:0".to_string(),
             reload_interval: 0,

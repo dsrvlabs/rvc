@@ -53,7 +53,8 @@ impl GrpcPeerRequester {
         let mut connected = Vec::with_capacity(peers.len());
 
         for addr in peers {
-            let uri = format!("http://{}", addr);
+            let scheme = if client_tls.is_some() { "https" } else { "http" };
+            let uri = format!("{}://{}", scheme, addr);
             let mut endpoint = Endpoint::from_shared(uri)
                 .map_err(|e| PeerClientError::Connect { addr: addr.clone(), source: e })?
                 .timeout(timeout);
