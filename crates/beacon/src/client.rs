@@ -5055,9 +5055,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/eth/v1/beacon/states/head/validators"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(make_validators_response(3)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(make_validators_response(3)))
             .expect(1)
             .mount(&server)
             .await;
@@ -5078,9 +5076,7 @@ mod tests {
         // Only mount POST — GET should NOT be called
         Mock::given(method("POST"))
             .and(path("/eth/v1/beacon/states/head/validators"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(make_validators_response(51)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(make_validators_response(51)))
             .expect(1)
             .mount(&server)
             .await;
@@ -5101,9 +5097,7 @@ mod tests {
         // Exactly 50 should use GET
         Mock::given(method("GET"))
             .and(path("/eth/v1/beacon/states/head/validators"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(make_validators_response(50)),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(make_validators_response(50)))
             .expect(1)
             .mount(&server)
             .await;
