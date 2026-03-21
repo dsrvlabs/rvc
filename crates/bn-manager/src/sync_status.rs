@@ -15,14 +15,21 @@ pub enum BnSyncStatus {
     Synced,
     /// Node is still syncing (head behind chain tip).
     Syncing,
+    /// Beacon is synced but EL is offline; usable for non-EL queries only.
+    ElOffline,
     /// Node is unreachable (network error, timeout, etc.).
     Unreachable,
 }
 
 impl BnSyncStatus {
-    /// Returns `true` if the BN is usable for validator duties.
+    /// Returns `true` if the BN is fully synced (including EL).
     pub fn is_usable(&self) -> bool {
         matches!(self, Self::Synced)
+    }
+
+    /// Returns `true` if the BN is usable for non-EL-dependent operations.
+    pub fn is_usable_for_non_el(&self) -> bool {
+        matches!(self, Self::Synced | Self::ElOffline)
     }
 }
 
@@ -60,6 +67,13 @@ pub async fn check_all_sync_statuses(clients: &[BeaconClient], statuses: &Shared
                     "BN is still syncing, will be skipped for duties"
                 );
             }
+            BnSyncStatus::ElOffline => {
+                warn!(
+                    bn_index = i,
+                    endpoint = endpoint,
+                    "BN execution layer is offline, usable for non-EL queries only"
+                );
+            }
             BnSyncStatus::Unreachable => {
                 warn!(bn_index = i, endpoint = endpoint, "BN is unreachable");
             }
@@ -74,13 +88,16 @@ pub async fn check_all_sync_statuses(clients: &[BeaconClient], statuses: &Shared
 
 /// Checks the sync status of a single beacon node.
 ///
-/// Marks as `Syncing` if `is_syncing`, `is_optimistic`, or `el_offline` is true.
+/// Returns `ElOffline` when the beacon layer is synced but `el_offline` is true,
+/// allowing the BN to still serve non-EL-dependent queries.
 async fn check_single_sync_status(client: &BeaconClient) -> BnSyncStatus {
     match client.get_node_syncing().await {
         Ok(response) => {
             let data = &response.data;
-            if data.is_syncing || data.is_optimistic || data.el_offline {
+            if data.is_syncing || data.is_optimistic {
                 BnSyncStatus::Syncing
+            } else if data.el_offline {
+                BnSyncStatus::ElOffline
             } else {
                 BnSyncStatus::Synced
             }
@@ -373,7 +390,7 @@ mod tests {
     // -- el_offline and is_optimistic tests --
 
     #[tokio::test]
-    async fn test_check_single_el_offline_marks_syncing() {
+    async fn test_check_single_el_offline_marks_el_offline() {
         let server = MockServer::start().await;
 
         Mock::given(method("GET"))
@@ -388,7 +405,7 @@ mod tests {
         check_all_sync_statuses(&clients, &statuses).await;
 
         let guard = statuses.read().await;
-        assert_eq!(guard[0], BnSyncStatus::Syncing);
+        assert_eq!(guard[0], BnSyncStatus::ElOffline);
     }
 
     #[tokio::test]
@@ -453,6 +470,53 @@ mod tests {
         let guard = statuses.read().await;
         assert_eq!(guard[0], BnSyncStatus::Synced);
         assert_eq!(guard[1], BnSyncStatus::Synced);
+    }
+
+    #[test]
+    fn test_sync_status_el_offline_not_usable() {
+        assert!(!BnSyncStatus::ElOffline.is_usable());
+    }
+
+    #[test]
+    fn test_sync_status_el_offline_is_usable_for_non_el() {
+        assert!(BnSyncStatus::ElOffline.is_usable_for_non_el());
+    }
+
+    #[test]
+    fn test_sync_status_synced_is_usable_for_non_el() {
+        assert!(BnSyncStatus::Synced.is_usable_for_non_el());
+    }
+
+    #[test]
+    fn test_sync_status_syncing_not_usable_for_non_el() {
+        assert!(!BnSyncStatus::Syncing.is_usable_for_non_el());
+    }
+
+    #[test]
+    fn test_sync_status_unreachable_not_usable_for_non_el() {
+        assert!(!BnSyncStatus::Unreachable.is_usable_for_non_el());
+    }
+
+    #[tokio::test]
+    async fn test_syncing_and_el_offline_returns_syncing() {
+        let server = MockServer::start().await;
+
+        // Both is_syncing=true and el_offline=true → should be Syncing, not ElOffline
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"head_slot":"500","sync_distance":"500","is_syncing":true,"is_optimistic":false,"el_offline":true}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let clients = vec![make_client(&server.uri())];
+        let statuses = new_shared_sync_statuses(1);
+
+        check_all_sync_statuses(&clients, &statuses).await;
+
+        let guard = statuses.read().await;
+        assert_eq!(guard[0], BnSyncStatus::Syncing);
     }
 
     #[tokio::test]

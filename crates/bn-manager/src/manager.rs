@@ -224,13 +224,26 @@ impl BnManager {
 
     /// Returns indices of synced+healthy BNs, ordered by health score (highest first).
     /// Falls back to all BNs if none are synced (single-BN mode logs a warning).
+    ///
+    /// When `allow_el_offline` is true, BNs with `ElOffline` status are included
+    /// alongside fully synced BNs (for non-EL-dependent operations).
     #[tracing::instrument(name = "rvc.bn_manager.synced_indices", skip_all)]
-    async fn synced_indices(&self) -> Vec<usize> {
+    async fn synced_indices(&self, allow_el_offline: bool) -> Vec<usize> {
         let sync_guard = self.sync_statuses.read().await;
         let health_guard = self.health_trackers.read().await;
 
-        let mut synced: Vec<usize> =
-            sync_guard.iter().enumerate().filter(|(_, s)| s.is_usable()).map(|(i, _)| i).collect();
+        let mut synced: Vec<usize> = sync_guard
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| {
+                if allow_el_offline {
+                    s.is_usable_for_non_el()
+                } else {
+                    s.is_usable()
+                }
+            })
+            .map(|(i, _)| i)
+            .collect();
 
         if synced.is_empty() {
             if self.clients.len() == 1 {
@@ -267,7 +280,12 @@ impl BnManager {
     }
 
     /// Query using the `First` strategy: try synced BNs in order, fail over on error.
-    async fn query_first<'s, T, F>(&'s self, op_name: &str, op: F) -> Result<T, BeaconError>
+    async fn query_first<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        allow_el_offline: bool,
+        op: F,
+    ) -> Result<T, BeaconError>
     where
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
@@ -277,15 +295,22 @@ impl BnManager {
             rvc.bn.strategy = "first",
             rvc.bn.tried = tracing::field::Empty,
         );
-        self.query_first_inner(op_name, &op).instrument(strategy_span).await
+        self.query_first_inner(op_name, allow_el_offline, &op)
+            .instrument(strategy_span)
+            .await
     }
 
-    async fn query_first_inner<'s, T, F>(&'s self, op_name: &str, op: &F) -> Result<T, BeaconError>
+    async fn query_first_inner<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        allow_el_offline: bool,
+        op: &F,
+    ) -> Result<T, BeaconError>
     where
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        let indices = self.synced_indices().await;
+        let indices = self.synced_indices(allow_el_offline).await;
         let mut last_err = None;
         let mut tried: usize = 0;
         let mut failed_indices: Vec<usize> = Vec::new();
@@ -353,6 +378,7 @@ impl BnManager {
     async fn query_best<'s, T, F>(
         &'s self,
         op_name: &str,
+        allow_el_offline: bool,
         op: F,
         pick_best: fn(&T, &T) -> bool,
     ) -> Result<T, BeaconError>
@@ -365,12 +391,15 @@ impl BnManager {
             rvc.bn.strategy = "best",
             rvc.bn.tried = tracing::field::Empty,
         );
-        self.query_best_inner(op_name, &op, pick_best).instrument(strategy_span).await
+        self.query_best_inner(op_name, allow_el_offline, &op, pick_best)
+            .instrument(strategy_span)
+            .await
     }
 
     async fn query_best_inner<'s, T, F>(
         &'s self,
         op_name: &str,
+        allow_el_offline: bool,
         op: &F,
         pick_best: fn(&T, &T) -> bool,
     ) -> Result<T, BeaconError>
@@ -378,7 +407,7 @@ impl BnManager {
         T: Send + 'static,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        let indices = self.synced_indices().await;
+        let indices = self.synced_indices(allow_el_offline).await;
         tracing::Span::current().record("rvc.bn.tried", indices.len());
 
         if indices.len() == 1 {
@@ -727,23 +756,23 @@ impl BeaconNodeClient for BnManager {
     // -- State / Config: query(First) --
 
     async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-        self.query_first("get_genesis", |c| Box::pin(c.get_genesis())).await
+        self.query_first("get_genesis", true, |c| Box::pin(c.get_genesis())).await
     }
 
     async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-        self.query_first("get_config_spec", |c| Box::pin(c.get_config_spec())).await
+        self.query_first("get_config_spec", true, |c| Box::pin(c.get_config_spec())).await
     }
 
     async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-        self.query_first("get_fork_schedule", |c| Box::pin(c.get_fork_schedule())).await
+        self.query_first("get_fork_schedule", true, |c| Box::pin(c.get_fork_schedule())).await
     }
 
     async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError> {
-        self.query_first("get_fork", |c| Box::pin(c.get_fork(state_id))).await
+        self.query_first("get_fork", true, |c| Box::pin(c.get_fork(state_id))).await
     }
 
     async fn get_validators(&self, pubkeys: &[String]) -> Result<ValidatorsResponse, BeaconError> {
-        self.query_first("get_validators", |c| Box::pin(c.get_validators(pubkeys))).await
+        self.query_first("get_validators", true, |c| Box::pin(c.get_validators(pubkeys))).await
     }
 
     // -- Duties: query(First) + duty_fetch timeout --
@@ -756,7 +785,7 @@ impl BeaconNodeClient for BnManager {
         self.with_op_timeout(
             "get_attester_duties",
             self.op_timeout(|t| t.duty_fetch),
-            self.query_first("get_attester_duties", |c| {
+            self.query_first("get_attester_duties", true, |c| {
                 Box::pin(c.get_attester_duties(epoch, validator_indices))
             }),
         )
@@ -767,7 +796,7 @@ impl BeaconNodeClient for BnManager {
         self.with_op_timeout(
             "get_proposer_duties",
             self.op_timeout(|t| t.duty_fetch),
-            self.query_first("get_proposer_duties", |c| Box::pin(c.get_proposer_duties(epoch))),
+            self.query_first("get_proposer_duties", true, |c| Box::pin(c.get_proposer_duties(epoch))),
         )
         .await
     }
@@ -780,7 +809,7 @@ impl BeaconNodeClient for BnManager {
         self.with_op_timeout(
             "post_sync_committee_duties",
             self.op_timeout(|t| t.duty_fetch),
-            self.query_first("post_sync_committee_duties", |c| {
+            self.query_first("post_sync_committee_duties", true, |c| {
                 Box::pin(c.post_sync_committee_duties(epoch, validator_indices))
             }),
         )
@@ -801,6 +830,7 @@ impl BeaconNodeClient for BnManager {
             self.op_timeout(|t| t.block_production),
             self.query_best(
                 "produce_block_v3",
+                false,
                 |c| {
                     Box::pin(c.produce_block_v3(
                         slot,
@@ -857,7 +887,7 @@ impl BeaconNodeClient for BnManager {
         self.with_op_timeout(
             "get_attestation_data",
             self.op_timeout(|t| t.attestation_fetch),
-            self.query_first("get_attestation_data", |c| {
+            self.query_first("get_attestation_data", true, |c| {
                 Box::pin(c.get_attestation_data(slot, committee_index))
             }),
         )
@@ -891,7 +921,7 @@ impl BeaconNodeClient for BnManager {
         self.with_op_timeout(
             "get_aggregate_attestation",
             self.op_timeout(|t| t.aggregate_fetch),
-            self.query_first("get_aggregate_attestation", |c| {
+            self.query_first("get_aggregate_attestation", true, |c| {
                 Box::pin(c.get_aggregate_attestation(slot, attestation_data_root, committee_index))
             }),
         )
@@ -937,7 +967,7 @@ impl BeaconNodeClient for BnManager {
         self.with_op_timeout(
             "get_sync_committee_contribution",
             self.op_timeout(|t| t.sync_contribution),
-            self.query_first("get_sync_committee_contribution", |c| {
+            self.query_first("get_sync_committee_contribution", true, |c| {
                 Box::pin(c.get_sync_committee_contribution(
                     slot,
                     subcommittee_index,
@@ -965,7 +995,7 @@ impl BeaconNodeClient for BnManager {
     // -- Blocks --
 
     async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-        self.query_first("get_block_root", |c| Box::pin(c.get_block_root(block_id))).await
+        self.query_first("get_block_root", true, |c| Box::pin(c.get_block_root(block_id))).await
     }
 
     // -- Proposer preparation: broadcast + preparation timeout --
@@ -1019,11 +1049,11 @@ impl BeaconNodeClient for BnManager {
     // -- Node status: query(First) --
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-        self.query_first("get_node_syncing", |c| Box::pin(c.get_node_syncing())).await
+        self.query_first("get_node_syncing", true, |c| Box::pin(c.get_node_syncing())).await
     }
 
     async fn get_node_version(&self) -> Result<String, BeaconError> {
-        self.query_first("get_node_version", |c| Box::pin(c.get_node_version())).await
+        self.query_first("get_node_version", true, |c| Box::pin(c.get_node_version())).await
     }
 }
 
@@ -2193,6 +2223,7 @@ mod tests {
 
     const SYNCED_RESPONSE: &str = r#"{"data":{"head_slot":"1000","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}"#;
     const SYNCING_SYNCING_RESPONSE: &str = r#"{"data":{"head_slot":"500","sync_distance":"500","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#;
+    const EL_OFFLINE_RESPONSE: &str = r#"{"data":{"head_slot":"1000","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":true}}"#;
 
     #[tokio::test]
     async fn test_sync_check_sync_status_marks_synced() {
@@ -3177,5 +3208,143 @@ mod tests {
         assert!(
             matches!(result.unwrap_err(), BeaconError::OperationTimeout { operation, .. } if operation == "get_proposer_duties"),
         );
+    }
+
+    // ===================================================================
+    // EL-offline sync status integration tests
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_el_offline_bn_marks_el_offline_status() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(EL_OFFLINE_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let manager = make_manager(&server.uri());
+        manager.check_sync_status().await;
+
+        let guard = manager.sync_statuses().read().await;
+        assert_eq!(guard[0], BnSyncStatus::ElOffline);
+    }
+
+    #[tokio::test]
+    async fn test_el_offline_bn_used_for_non_el_operations() {
+        let el_offline_bn = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(EL_OFFLINE_RESPONSE))
+            .mount(&el_offline_bn)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(1)
+            .mount(&el_offline_bn)
+            .await;
+
+        let manager = make_manager(&el_offline_bn.uri());
+        manager.check_sync_status().await;
+
+        // get_genesis is non-EL, so ElOffline BN should be used
+        let result = manager.get_genesis().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().data.genesis_time, "1606824023");
+    }
+
+    #[tokio::test]
+    async fn test_el_offline_bn_skipped_for_block_production() {
+        let el_offline_bn = MockServer::start().await;
+        let synced_bn = MockServer::start().await;
+
+        // BN1: EL offline
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(EL_OFFLINE_RESPONSE))
+            .mount(&el_offline_bn)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Execution-Payload-Value", "9999")
+                .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+            .expect(0) // Should NOT be called — EL offline
+            .mount(&el_offline_bn)
+            .await;
+
+        // BN2: synced
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&synced_bn)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Execution-Payload-Value", "5000")
+                .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+            .expect(1)
+            .mount(&synced_bn)
+            .await;
+
+        let manager = make_multi_manager(&[&el_offline_bn.uri(), &synced_bn.uri()]);
+        manager.check_sync_status().await;
+
+        // produce_block_v3 is EL-dependent, so ElOffline BN should be skipped
+        let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().execution_payload_value, Some("5000".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_el_offline_bn_preferred_over_syncing_for_duties() {
+        let el_offline_bn = MockServer::start().await;
+        let syncing_bn = MockServer::start().await;
+
+        // BN1: EL offline (CL is synced)
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(EL_OFFLINE_RESPONSE))
+            .mount(&el_offline_bn)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(1)
+            .mount(&el_offline_bn)
+            .await;
+
+        // BN2: syncing
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
+            .mount(&syncing_bn)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(0) // Should NOT be called — syncing BN is less preferred
+            .mount(&syncing_bn)
+            .await;
+
+        let manager = make_multi_manager(&[&el_offline_bn.uri(), &syncing_bn.uri()]);
+        manager.check_sync_status().await;
+
+        // get_genesis is non-EL: ElOffline BN should be used, Syncing BN should be skipped
+        let result = manager.get_genesis().await;
+        assert!(result.is_ok());
     }
 }
