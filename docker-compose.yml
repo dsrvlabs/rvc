@@ -1,0 +1,68 @@
+# Docker Compose for rvc validator client + remote signer
+#
+# Usage:
+#   docker compose up        # Start services (build from source)
+#   docker compose build     # Build images only
+#   docker compose down      # Stop and remove containers
+#
+# For production, replace 'build' with 'image' directives:
+#   image: ghcr.io/rootwarp/rvc/rvc:latest
+
+services:
+  rvc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: rvc
+    # image: ghcr.io/rootwarp/rvc/rvc:latest
+    ports:
+      - "8080:8080"   # Metrics and health
+      - "5062:5062"   # Keymanager API (optional)
+    volumes:
+      - ./config:/config:ro
+      - rvc-data:/data
+    # environment:
+    #   - RUST_LOG=info
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - rvc-net
+    depends_on:
+      rvc-signer:
+        condition: service_healthy
+
+  rvc-signer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: rvc-signer
+    # image: ghcr.io/rootwarp/rvc/rvc-signer:latest
+    ports:
+      - "50051:50051" # gRPC signer endpoint
+      - "9101:9101"   # Metrics
+    volumes:
+      - ./config:/config:ro
+      - ./certs:/certs:ro
+      - signer-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9101/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - rvc-net
+
+volumes:
+  rvc-data:
+  signer-data:
+
+networks:
+  rvc-net:
+    driver: bridge
