@@ -184,7 +184,7 @@ impl ServiceBuilder {
             map.insert(pubkey_hex, pubkey);
         }
         info!(count = map.len(), "Built public key map");
-        Arc::new(std::sync::RwLock::new(map))
+        Arc::new(parking_lot::RwLock::new(map))
     }
 
     pub fn parse_genesis_validators_root(&self) -> Result<Root, ConfigError> {
@@ -540,7 +540,7 @@ mod tests {
         let key_manager = KeyManager::new();
         let pubkey_map = builder.build_pubkey_map(&key_manager);
 
-        assert!(pubkey_map.read().unwrap().is_empty());
+        assert!(pubkey_map.read().is_empty());
     }
 
     #[test]

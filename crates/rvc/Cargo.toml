@@ -23,6 +23,7 @@ duty-tracker.workspace = true
 hex.workspace = true
 keymanager-api.workspace = true
 metrics.workspace = true
+parking_lot.workspace = true
 propagator.workspace = true
 prost.workspace = true
 secrecy.workspace = true

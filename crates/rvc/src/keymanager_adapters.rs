@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use crypto::{CompositeSigner, Keystore, PublicKey, RemoteSigner, RemoteSignerConfig};
 use keymanager_api::traits::{
@@ -53,11 +55,11 @@ impl KeystoreManagerAdapter {
 
 impl KeystoreManager for KeystoreManagerAdapter {
     fn list_keys(&self) -> Vec<Pubkey> {
-        self.tracked_keys.lock().expect("tracked_keys lock poisoned").clone()
+        self.tracked_keys.lock().clone()
     }
 
     fn has_key(&self, pubkey: &Pubkey) -> bool {
-        self.tracked_keys.lock().expect("tracked_keys lock poisoned").contains(pubkey)
+        self.tracked_keys.lock().contains(pubkey)
     }
 
     fn import_keystore(
@@ -75,7 +77,7 @@ impl KeystoreManager for KeystoreManagerAdapter {
         let pubkey_bytes = secret_key.public_key().to_bytes();
 
         // Hold lock for the entire check-and-insert to prevent TOCTOU race
-        let mut keys = self.tracked_keys.lock().expect("tracked_keys lock poisoned");
+        let mut keys = self.tracked_keys.lock();
         if keys.contains(&pubkey_bytes) {
             return Err(ImportKeystoreError::Duplicate);
         }
@@ -117,7 +119,7 @@ impl KeystoreManager for KeystoreManagerAdapter {
         // Update shared pubkey_map
         if let Some(ref map) = self.pubkey_map {
             let pubkey_hex = format!("0x{}", hex::encode(pubkey_bytes));
-            map.write().expect("pubkey_map lock poisoned").insert(pubkey_hex, public_key);
+            map.write().insert(pubkey_hex, public_key);
             self.notify_key_change();
         }
 
@@ -126,7 +128,7 @@ impl KeystoreManager for KeystoreManagerAdapter {
     }
 
     fn delete_keystore(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError> {
-        let mut keys = self.tracked_keys.lock().expect("tracked_keys lock poisoned");
+        let mut keys = self.tracked_keys.lock();
         if let Some(pos) = keys.iter().position(|k| k == pubkey) {
             // Delete file FIRST — if IO fails, memory state remains consistent
             let filename = format!("0x{}.json", hex::encode(pubkey));
@@ -151,7 +153,7 @@ impl KeystoreManager for KeystoreManagerAdapter {
             // Remove from shared pubkey_map
             if let Some(ref map) = self.pubkey_map {
                 let pubkey_hex = format!("0x{}", hex::encode(pubkey));
-                map.write().expect("pubkey_map lock poisoned").remove(&pubkey_hex);
+                map.write().remove(&pubkey_hex);
                 self.notify_key_change();
             }
 
@@ -294,15 +296,11 @@ impl RemoteKeyManagerAdapter {
 
 impl RemoteKeyManager for RemoteKeyManagerAdapter {
     fn list_remote_keys(&self) -> Vec<(Pubkey, String)> {
-        self.tracked_keys.lock().expect("tracked_keys lock poisoned").clone()
+        self.tracked_keys.lock().clone()
     }
 
     fn has_remote_key(&self, pubkey: &Pubkey) -> bool {
-        self.tracked_keys
-            .lock()
-            .expect("tracked_keys lock poisoned")
-            .iter()
-            .any(|(pk, _)| pk == pubkey)
+        self.tracked_keys.lock().iter().any(|(pk, _)| pk == pubkey)
     }
 
     fn import_remote_key(&self, pubkey: Pubkey, url: String) -> Result<(), ImportRemoteKeyError> {
@@ -333,7 +331,7 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
             );
         }
 
-        let mut keys = self.tracked_keys.lock().expect("tracked_keys lock poisoned");
+        let mut keys = self.tracked_keys.lock();
         if keys.iter().any(|(pk, _)| *pk == pubkey) {
             return Err(ImportRemoteKeyError::Duplicate);
         }
@@ -349,7 +347,7 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
         if let Some(ref map) = self.pubkey_map {
             if let Ok(pk) = PublicKey::from_bytes(&pubkey) {
                 let pubkey_hex = format!("0x{}", hex::encode(pubkey));
-                map.write().expect("pubkey_map lock poisoned").insert(pubkey_hex, pk);
+                map.write().insert(pubkey_hex, pk);
             }
             self.notify_key_change();
         }
@@ -359,7 +357,7 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
     }
 
     fn delete_remote_key(&self, pubkey: &Pubkey) -> Result<bool, DeleteRemoteKeyError> {
-        let mut keys = self.tracked_keys.lock().expect("tracked_keys lock poisoned");
+        let mut keys = self.tracked_keys.lock();
         if let Some(pos) = keys.iter().position(|(pk, _)| pk == pubkey) {
             keys.remove(pos);
             drop(keys);
@@ -369,7 +367,7 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
             // Remove from shared pubkey_map
             if let Some(ref map) = self.pubkey_map {
                 let pubkey_hex = format!("0x{}", hex::encode(pubkey));
-                map.write().expect("pubkey_map lock poisoned").remove(&pubkey_hex);
+                map.write().remove(&pubkey_hex);
                 self.notify_key_change();
             }
 
@@ -602,7 +600,7 @@ mod tests {
 
         // Manually add key (simulating what would happen with a real keystore)
         composite.add_local_key(sk);
-        adapter.tracked_keys.lock().unwrap().push(pk_bytes);
+        adapter.tracked_keys.lock().push(pk_bytes);
 
         assert!(adapter.has_key(&pk_bytes));
         assert!(composite.public_keys().contains(&pk_bytes));
@@ -909,7 +907,7 @@ mod tests {
     // --- CON-03: Dynamic pubkey_map + generation counter tests ---
 
     fn create_pubkey_map() -> PubkeyMap {
-        Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()))
+        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()))
     }
 
     #[test]
@@ -926,14 +924,14 @@ mod tests {
 
         // Manually add (real keystore import needs a proper keystore JSON)
         composite.add_local_key(sk);
-        adapter.tracked_keys.lock().unwrap().push(pk_bytes);
+        adapter.tracked_keys.lock().push(pk_bytes);
 
         // Simulate pubkey_map update as import_keystore would
         let pubkey_hex = format!("0x{}", hex::encode(pk_bytes));
         let pk = crypto::PublicKey::from_bytes(&pk_bytes).unwrap();
-        pubkey_map.write().unwrap().insert(pubkey_hex.clone(), pk);
+        pubkey_map.write().insert(pubkey_hex.clone(), pk);
 
-        assert!(pubkey_map.read().unwrap().contains_key(&pubkey_hex));
+        assert!(pubkey_map.read().contains_key(&pubkey_hex));
     }
 
     #[test]
@@ -951,13 +949,13 @@ mod tests {
         let pk = crypto::PublicKey::from_bytes(&pk_bytes).unwrap();
 
         composite.add_local_key(sk);
-        adapter.tracked_keys.lock().unwrap().push(pk_bytes);
-        pubkey_map.write().unwrap().insert(pubkey_hex.clone(), pk);
+        adapter.tracked_keys.lock().push(pk_bytes);
+        pubkey_map.write().insert(pubkey_hex.clone(), pk);
 
         // Delete the keystore
         let deleted = adapter.delete_keystore(&pk_bytes).unwrap();
         assert!(deleted);
-        assert!(!pubkey_map.read().unwrap().contains_key(&pubkey_hex));
+        assert!(!pubkey_map.read().contains_key(&pubkey_hex));
     }
 
     #[test]
@@ -1004,7 +1002,7 @@ mod tests {
         let sk = SecretKey::generate();
         let pk_bytes = sk.public_key().to_bytes();
         composite.add_local_key(sk);
-        adapter.tracked_keys.lock().unwrap().push(pk_bytes);
+        adapter.tracked_keys.lock().push(pk_bytes);
 
         assert_eq!(*rx.borrow(), 0);
 
@@ -1056,7 +1054,7 @@ mod tests {
 
         // Register in tracked_keys and composite signer
         composite.add_local_key(sk);
-        adapter.tracked_keys.lock().unwrap().push(pk_bytes);
+        adapter.tracked_keys.lock().push(pk_bytes);
 
         (adapter, pk_bytes, composite)
     }
@@ -1097,7 +1095,7 @@ mod tests {
             let filename = format!("0x{}.json", hex::encode(pk_bytes));
             std::fs::write(dir.path().join(&filename), "{}").unwrap();
             composite.add_local_key(sk);
-            adapter.tracked_keys.lock().unwrap().push(pk_bytes);
+            adapter.tracked_keys.lock().push(pk_bytes);
             keys.push(pk_bytes);
         }
 

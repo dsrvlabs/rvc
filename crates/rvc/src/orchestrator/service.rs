@@ -40,7 +40,7 @@ use super::error::OrchestratorError;
 ///
 /// Wrapped in `Arc<RwLock>` so the keymanager API can insert/remove keys at
 /// runtime while the orchestrator reads them each slot.
-pub type PubkeyMap = Arc<std::sync::RwLock<HashMap<String, PublicKey>>>;
+pub type PubkeyMap = Arc<parking_lot::RwLock<HashMap<String, PublicKey>>>;
 
 /// Truncates a hex-encoded public key for display in tracing spans.
 ///
@@ -605,7 +605,7 @@ where
     async fn prepare_proposers(&self) {
         let mut preparations = Vec::new();
 
-        let pubkey_snapshot = self.pubkey_map.read().expect("pubkey_map lock poisoned").clone();
+        let pubkey_snapshot = self.pubkey_map.read().clone();
         for (pubkey_hex, pubkey) in &pubkey_snapshot {
             let fee_recipient = self.validator_store.effective_fee_recipient(&pubkey.to_bytes());
             let fee_recipient_hex = format!("0x{}", hex::encode(fee_recipient));
@@ -672,7 +672,7 @@ where
     #[tracing::instrument(name = "rvc.orchestrator.submit_committee_subscriptions", skip_all, fields(rvc.epoch = epoch))]
     async fn submit_committee_subscriptions(&self, epoch: u64) {
         let mut subscriptions = Vec::new();
-        let pubkey_snapshot = self.pubkey_map.read().expect("pubkey_map lock poisoned").clone();
+        let pubkey_snapshot = self.pubkey_map.read().clone();
 
         for slot_offset in 0..SLOTS_PER_EPOCH {
             let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
@@ -1563,7 +1563,7 @@ where
         &self,
         slot: Slot,
     ) -> Result<Vec<AttesterDuty>, OrchestratorError> {
-        let pubkey_snapshot = self.pubkey_map.read().expect("pubkey_map lock poisoned").clone();
+        let pubkey_snapshot = self.pubkey_map.read().clone();
         if pubkey_snapshot.is_empty() {
             return Ok(Vec::new());
         }
@@ -1883,7 +1883,7 @@ where
     ///
     /// Pubkeys are matched case-insensitively and with/without "0x" prefix.
     fn find_pubkey(&self, duty_pubkey: &str) -> Option<PublicKey> {
-        let pubkey_map = self.pubkey_map.read().expect("pubkey_map lock poisoned");
+        let pubkey_map = self.pubkey_map.read();
 
         // Try exact match first
         if let Some(pk) = pubkey_map.get(duty_pubkey) {
@@ -2262,7 +2262,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (mut orchestrator, handle) = DutyOrchestrator::new(
             clock,
@@ -2302,7 +2302,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2340,7 +2340,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2411,7 +2411,7 @@ mod tests {
         let config = create_test_config();
         let mut pubkey_map_inner = HashMap::new();
         pubkey_map_inner.insert(pubkey_hex, pubkey);
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let (_orchestrator, handle) = DutyOrchestrator::new(
             clock,
@@ -2452,7 +2452,7 @@ mod tests {
         let config = create_test_config();
         let mut pubkey_map_inner = HashMap::new();
         pubkey_map_inner.insert(pubkey_hex.clone(), pubkey.clone());
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2493,7 +2493,7 @@ mod tests {
         let config = create_test_config();
         let mut pubkey_map_inner = HashMap::new();
         pubkey_map_inner.insert(pubkey_hex.to_uppercase(), pubkey.clone());
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2527,7 +2527,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2737,7 +2737,7 @@ mod tests {
         let config = create_test_config();
         let mut pubkey_map_inner = HashMap::new();
         pubkey_map_inner.insert(pubkey_hex.clone(), pubkey.clone());
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, handle) = DutyOrchestrator::new(
             clock,
@@ -3071,7 +3071,7 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             pubkey,
         );
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
 
@@ -3122,7 +3122,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3200,7 +3200,7 @@ mod tests {
             "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
             pubkey,
         );
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
 
@@ -3285,7 +3285,7 @@ mod tests {
             "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
             pubkey,
         );
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3334,7 +3334,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3410,7 +3410,7 @@ mod tests {
             "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
             pubkey,
         );
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3500,7 +3500,7 @@ mod tests {
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3565,7 +3565,7 @@ mod tests {
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3642,7 +3642,7 @@ mod tests {
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3690,7 +3690,7 @@ mod tests {
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3803,16 +3803,16 @@ mod tests {
 
     /// A submitter that captures the submitted VersionedAttestation for assertion.
     struct CapturingSubmitter {
-        captured: std::sync::Mutex<Vec<VersionedAttestation>>,
+        captured: parking_lot::Mutex<Vec<VersionedAttestation>>,
     }
 
     impl CapturingSubmitter {
         fn new() -> Self {
-            Self { captured: std::sync::Mutex::new(Vec::new()) }
+            Self { captured: parking_lot::Mutex::new(Vec::new()) }
         }
 
         fn captured(&self) -> Vec<VersionedAttestation> {
-            self.captured.lock().unwrap().clone()
+            self.captured.lock().clone()
         }
     }
 
@@ -3827,7 +3827,7 @@ mod tests {
                     + 'a,
             >,
         > {
-            self.captured.lock().unwrap().push(attestations.clone());
+            self.captured.lock().push(attestations.clone());
             Box::pin(async move { Ok(beacon::SubmitAttestationResult::Success) })
         }
     }
@@ -3867,7 +3867,7 @@ mod tests {
         let config = create_test_config();
         let mut pubkey_map_inner = HashMap::new();
         pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, handle) = DutyOrchestrator::new(
             clock,
@@ -4620,8 +4620,8 @@ mod tests {
 
     // --- H-08: Orchestrator slot lifecycle span tests ---
 
+    use parking_lot::Mutex;
     use std::collections::HashMap as SpanMap;
-    use std::sync::Mutex;
     use tracing::span::Id;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -4637,7 +4637,7 @@ mod tests {
             _id: &tracing::span::Id,
             _ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            self.names.lock().unwrap().push(attrs.metadata().name().to_string());
+            self.names.lock().push(attrs.metadata().name().to_string());
         }
     }
 
@@ -4664,7 +4664,7 @@ mod tests {
             ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
             let parent_id = attrs.parent().cloned().or_else(|| ctx.current_span().id().cloned());
-            self.spans.lock().unwrap().insert(
+            self.spans.lock().insert(
                 id.into_u64(),
                 SpanEntry { name: attrs.metadata().name().to_string(), parent_id },
             );
@@ -4723,7 +4723,7 @@ mod tests {
             None,
             create_mock_validator_store(),
             config,
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
         );
 
         // Capture spans via thread-local subscriber
@@ -4740,7 +4740,7 @@ mod tests {
 
         let _ = orchestrator.run().await;
 
-        let span_names = captured.lock().unwrap();
+        let span_names = captured.lock();
         assert!(
             span_names.contains(&"rvc.slot.process".to_string()),
             "Expected rvc.slot.process span, got: {:?}",
@@ -4793,7 +4793,7 @@ mod tests {
             None,
             create_mock_validator_store(),
             config,
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
         );
 
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -4808,7 +4808,7 @@ mod tests {
 
         let _ = orchestrator.run().await;
 
-        let span_names = captured.lock().unwrap();
+        let span_names = captured.lock();
         assert!(
             span_names.contains(&"rvc.epoch.boundary".to_string()),
             "Expected rvc.epoch.boundary span at epoch boundary slot, got: {:?}",
@@ -4948,7 +4948,7 @@ mod tests {
 
         orchestrator.maybe_produce_aggregations(slot, epoch).await;
 
-        let span_names = captured.lock().unwrap();
+        let span_names = captured.lock();
         assert!(
             span_names.contains(&"rvc.orchestrator.produce_aggregations".to_string()),
             "Expected rvc.orchestrator.produce_aggregations span, got: {:?}",
@@ -5007,7 +5007,7 @@ mod tests {
 
         orchestrator.maybe_produce_aggregations(slot, epoch).await;
 
-        let span_names = captured.lock().unwrap();
+        let span_names = captured.lock();
         // produce span should still be created (it wraps the entire per-validator loop body)
         assert!(
             span_names.contains(&"rvc.orchestrator.produce_aggregations".to_string()),
@@ -5054,7 +5054,7 @@ mod tests {
             None,
             create_mock_validator_store(),
             config,
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
         );
 
         let (layer, spans) = HierarchyCapture::new();
@@ -5068,7 +5068,7 @@ mod tests {
 
         let _ = orchestrator.run().await;
 
-        let span_map = spans.lock().unwrap();
+        let span_map = spans.lock();
 
         // Verify phase spans are children of rvc.slot.process
         let block_parent = find_parent_name(&span_map, "rvc.slot.phase.block");
@@ -5123,7 +5123,7 @@ mod tests {
             None,
             create_mock_validator_store(),
             config,
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
         );
 
         let (layer, spans) = HierarchyCapture::new();
@@ -5137,7 +5137,7 @@ mod tests {
 
         let _ = orchestrator.run().await;
 
-        let span_map = spans.lock().unwrap();
+        let span_map = spans.lock();
 
         let epoch_parent = find_parent_name(&span_map, "rvc.epoch.boundary");
         assert_eq!(
@@ -5181,7 +5181,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let span_names = captured.lock().unwrap();
+        let span_names = captured.lock();
         assert!(
             span_names.contains(&"rvc.sign.attestation".to_string()),
             "Expected rvc.sign.attestation span, got: {:?}",
@@ -5613,7 +5613,7 @@ mod tests {
 
         let _ = beacon.get_node_version().await;
 
-        let span_names = captured.lock().unwrap();
+        let span_names = captured.lock();
         assert!(
             span_names.contains(&"rvc.beacon.http".to_string()),
             "Expected rvc.beacon.http span, got: {:?}",

@@ -25,6 +25,7 @@ eth-types.workspace = true
 hex.workspace = true
 keymanager-api.workspace = true
 metrics.workspace = true
+parking_lot.workspace = true
 rvc.workspace = true
 secret-provider.workspace = true
 signer.workspace = true

@@ -851,12 +851,12 @@ async fn run_validator(
     let validator_index_map = resolve_validator_indices(beacon_for_resolve, &pubkey_map).await;
 
     // Step 6: Doppelganger detection (if enabled)
-    if doppelganger_enabled && !pubkey_map.read().expect("pubkey_map lock poisoned").is_empty() {
+    if doppelganger_enabled && !pubkey_map.read().is_empty() {
         let validator_index_map = match validator_index_map {
             Ok(ref map) if !map.is_empty() => map.clone(),
             Ok(_) => {
                 warn!(
-                    total = pubkey_map.read().expect("pubkey_map lock poisoned").len(),
+                    total = pubkey_map.read().len(),
                     "No validator indices resolved; validators may be pending activation. \
                      Skipping doppelganger detection"
                 );
@@ -874,8 +874,7 @@ async fn run_validator(
             let doppelganger_service =
                 builder.build_doppelganger_service(beacon_client.clone(), slashing_db.clone());
 
-            let pubkeys: Vec<String> =
-                pubkey_map.read().expect("pubkey_map lock poisoned").keys().cloned().collect();
+            let pubkeys: Vec<String> = pubkey_map.read().keys().cloned().collect();
 
             let slot_clock = match builder.build_slot_clock() {
                 Ok(clock) => clock,
@@ -1138,7 +1137,7 @@ async fn resolve_validator_indices(
     pubkey_map: &rvc::orchestrator::PubkeyMap,
 ) -> Result<std::collections::HashMap<String, String>, anyhow::Error> {
     let pubkeys: Vec<String> = {
-        let map = pubkey_map.read().expect("pubkey_map lock poisoned");
+        let map = pubkey_map.read();
         if map.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
