@@ -19,6 +19,8 @@ use tracing::Instrument;
 use tracing::{debug, warn};
 use url::Url;
 
+use crate::sync_status::BnSyncStatus;
+
 /// Redact credentials from a URL for safe inclusion in tracing spans.
 fn redact_url(url: &str) -> String {
     if let Ok(mut parsed) = Url::parse(url) {
@@ -156,8 +158,6 @@ impl BnManager {
     /// Returns current health scores for all BNs.
     #[tracing::instrument(name = "rvc.bn_manager.health_scores", skip_all)]
     pub async fn health_scores(&self) -> Vec<BnHealthScore> {
-        use crate::sync_status::BnSyncStatus;
-
         let health_guard = self.health_trackers.read().await;
         let sync_guard = self.sync_statuses.read().await;
         health_guard
@@ -169,6 +169,7 @@ impl BnManager {
                     endpoint: t.endpoint().to_string(),
                     is_reachable: !matches!(sync_status, BnSyncStatus::Unreachable),
                     is_synced: matches!(sync_status, BnSyncStatus::Synced),
+                    is_el_offline: matches!(sync_status, BnSyncStatus::ElOffline),
                     head_slot: None,
                     latency: t.latency_ema_ms().map(|ms| Duration::from_secs_f64(ms / 1000.0)),
                     latency_ms: t.latency_ema_ms().unwrap_or(0.0),
@@ -235,13 +236,15 @@ impl BnManager {
         let mut synced: Vec<usize> = sync_guard
             .iter()
             .enumerate()
-            .filter(|(_, s)| {
-                if allow_el_offline {
-                    s.is_usable_for_non_el()
-                } else {
-                    s.is_usable()
-                }
-            })
+            .filter(
+                |(_, s)| {
+                    if allow_el_offline {
+                        s.is_usable_for_non_el()
+                    } else {
+                        s.is_usable()
+                    }
+                },
+            )
             .map(|(i, _)| i)
             .collect();
 
@@ -254,7 +257,18 @@ impl BnManager {
             } else {
                 warn!("no synced BNs available, falling back to all BNs");
             }
-            synced = (0..self.clients.len()).collect();
+            // When EL-offline BNs are excluded (block production), don't include them in fallback
+            synced = if allow_el_offline {
+                (0..self.clients.len()).collect()
+            } else {
+                (0..self.clients.len())
+                    .filter(|&i| !matches!(sync_guard[i], BnSyncStatus::ElOffline))
+                    .collect()
+            };
+            // If still empty after filtering, fall back to truly all BNs as last resort
+            if synced.is_empty() {
+                synced = (0..self.clients.len()).collect();
+            }
         }
 
         // Filter out unhealthy BNs (unless it would leave none)
@@ -295,9 +309,7 @@ impl BnManager {
             rvc.bn.strategy = "first",
             rvc.bn.tried = tracing::field::Empty,
         );
-        self.query_first_inner(op_name, allow_el_offline, &op)
-            .instrument(strategy_span)
-            .await
+        self.query_first_inner(op_name, allow_el_offline, &op).instrument(strategy_span).await
     }
 
     async fn query_first_inner<'s, T, F>(
@@ -438,7 +450,10 @@ impl BnManager {
                         error = %e,
                         "BN query failed, trying unsynced BNs"
                     );
-                    return self.fallback_unsynced(op_name, &op, &indices).await.ok_or(e);
+                    return self
+                        .fallback_unsynced(op_name, &op, &indices, allow_el_offline)
+                        .await
+                        .ok_or(e);
                 }
             }
         }
@@ -508,7 +523,9 @@ impl BnManager {
                 Ok(value)
             }
             None => {
-                if let Some(result) = self.fallback_unsynced(op_name, &op, &indices).await {
+                if let Some(result) =
+                    self.fallback_unsynced(op_name, &op, &indices, allow_el_offline).await
+                {
                     return Ok(result);
                 }
                 Err(BeaconError::HttpError(format!("{op_name}: all BNs failed in best-selection")))
@@ -522,13 +539,26 @@ impl BnManager {
         op_name: &str,
         op: &F,
         tried_indices: &[usize],
+        allow_el_offline: bool,
     ) -> Option<T>
     where
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        let unsynced: Vec<usize> =
-            (0..self.clients.len()).filter(|i| !tried_indices.contains(i)).collect();
+        let sync_statuses = self.sync_statuses.read().await;
+        let unsynced: Vec<usize> = (0..self.clients.len())
+            .filter(|i| !tried_indices.contains(i))
+            .filter(|&i| {
+                // When EL-offline BNs are excluded (e.g., block production),
+                // don't fall back to them
+                allow_el_offline
+                    || !matches!(
+                        sync_statuses.get(i).copied().unwrap_or(BnSyncStatus::Unknown),
+                        BnSyncStatus::ElOffline
+                    )
+            })
+            .collect();
+        drop(sync_statuses);
 
         if unsynced.is_empty() {
             return None;
@@ -796,7 +826,9 @@ impl BeaconNodeClient for BnManager {
         self.with_op_timeout(
             "get_proposer_duties",
             self.op_timeout(|t| t.duty_fetch),
-            self.query_first("get_proposer_duties", true, |c| Box::pin(c.get_proposer_duties(epoch))),
+            self.query_first("get_proposer_duties", true, |c| {
+                Box::pin(c.get_proposer_duties(epoch))
+            }),
         )
         .await
     }

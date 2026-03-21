@@ -520,6 +520,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_optimistic_and_el_offline_returns_syncing() {
+        let server = MockServer::start().await;
+
+        // is_optimistic=true takes precedence over el_offline=true → Syncing
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"head_slot":"1000","sync_distance":"0","is_syncing":false,"is_optimistic":true,"el_offline":true}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let clients = vec![make_client(&server.uri())];
+        let statuses = new_shared_sync_statuses(1);
+
+        check_all_sync_statuses(&clients, &statuses).await;
+
+        let guard = statuses.read().await;
+        assert_eq!(guard[0], BnSyncStatus::Syncing);
+    }
+
+    #[tokio::test]
     async fn test_unknown_status_not_usable_in_filter() {
         let statuses = Arc::new(RwLock::new(vec![
             BnSyncStatus::Unknown,

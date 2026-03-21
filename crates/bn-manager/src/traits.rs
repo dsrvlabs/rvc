@@ -219,6 +219,8 @@ pub struct BnHealthScore {
     pub is_reachable: bool,
     /// Whether the node is fully synced.
     pub is_synced: bool,
+    /// Whether the node's execution layer is offline.
+    pub is_el_offline: bool,
     /// Latest observed head slot from the node.
     pub head_slot: Option<u64>,
     /// Response latency for the most recent health check.
@@ -337,6 +339,7 @@ mod tests {
             endpoint: "http://localhost:5052".to_string(),
             is_reachable: true,
             is_synced: true,
+            is_el_offline: false,
             head_slot: Some(1000),
             latency: Some(Duration::from_millis(50)),
             latency_ms: 50.0,
@@ -355,6 +358,7 @@ mod tests {
             endpoint: "http://dead-node:5052".to_string(),
             is_reachable: false,
             is_synced: false,
+            is_el_offline: false,
             head_slot: None,
             latency: None,
             latency_ms: 0.0,
@@ -374,6 +378,7 @@ mod tests {
             endpoint: "http://syncing:5052".to_string(),
             is_reachable: true,
             is_synced: false,
+            is_el_offline: false,
             head_slot: Some(500),
             latency: Some(Duration::from_millis(200)),
             latency_ms: 200.0,
@@ -391,6 +396,7 @@ mod tests {
             endpoint: "http://localhost:5052".to_string(),
             is_reachable: true,
             is_synced: true,
+            is_el_offline: false,
             head_slot: Some(1000),
             latency: Some(Duration::from_millis(50)),
             latency_ms: 50.0,
@@ -407,6 +413,7 @@ mod tests {
             endpoint: "http://localhost:5052".to_string(),
             is_reachable: true,
             is_synced: true,
+            is_el_offline: false,
             head_slot: Some(1000),
             latency: Some(Duration::from_millis(50)),
             latency_ms: 50.0,
