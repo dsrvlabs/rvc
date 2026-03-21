@@ -6,6 +6,12 @@ use eth_types::{
     SLOTS_PER_EPOCH,
 };
 
+#[tracing::instrument(
+    name = "rvc.crypto.sign_sync_message",
+    level = "debug",
+    skip_all,
+    fields(rvc.signing_type = "sync_committee_message"),
+)]
 pub fn sign_sync_committee_message(
     beacon_block_root: &Root,
     slot: Slot,
@@ -21,6 +27,12 @@ pub fn sign_sync_committee_message(
     secret_key.sign(&signing_root)
 }
 
+#[tracing::instrument(
+    name = "rvc.crypto.sign_contribution_and_proof",
+    level = "debug",
+    skip_all,
+    fields(rvc.signing_type = "contribution_and_proof"),
+)]
 pub fn sign_contribution_and_proof(
     contribution_and_proof: &ContributionAndProof,
     secret_key: &SecretKey,
@@ -36,6 +48,12 @@ pub fn sign_contribution_and_proof(
     secret_key.sign(&signing_root)
 }
 
+#[tracing::instrument(
+    name = "rvc.crypto.sign_sync_selection_proof",
+    level = "debug",
+    skip_all,
+    fields(rvc.signing_type = "sync_selection_proof"),
+)]
 pub fn sign_sync_committee_selection_proof(
     slot: Slot,
     subcommittee_index: u64,

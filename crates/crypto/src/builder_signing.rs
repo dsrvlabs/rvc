@@ -2,6 +2,12 @@ use super::bls::{SecretKey, Signature};
 use super::signing::{compute_domain, compute_signing_root};
 use eth_types::{ValidatorRegistrationV1, DOMAIN_APPLICATION_BUILDER};
 
+#[tracing::instrument(
+    name = "rvc.crypto.sign_builder_registration",
+    level = "debug",
+    skip_all,
+    fields(rvc.signing_type = "builder_registration"),
+)]
 pub fn sign_builder_registration(
     registration: &ValidatorRegistrationV1,
     secret_key: &SecretKey,

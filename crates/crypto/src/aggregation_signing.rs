@@ -8,6 +8,12 @@ use eth_types::{
     TARGET_AGGREGATORS_PER_COMMITTEE,
 };
 
+#[tracing::instrument(
+    name = "rvc.crypto.sign_selection_proof",
+    level = "debug",
+    skip_all,
+    fields(rvc.signing_type = "selection_proof"),
+)]
 /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof
 /// for attestation aggregation.
 pub fn sign_selection_proof(
@@ -24,6 +30,12 @@ pub fn sign_selection_proof(
     secret_key.sign(&signing_root)
 }
 
+#[tracing::instrument(
+    name = "rvc.crypto.sign_aggregate_and_proof",
+    level = "debug",
+    skip_all,
+    fields(rvc.signing_type = "aggregate_and_proof"),
+)]
 /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
 pub fn sign_aggregate_and_proof(
     aggregate_and_proof: &AggregateAndProof,
@@ -39,6 +51,12 @@ pub fn sign_aggregate_and_proof(
     secret_key.sign(&signing_root)
 }
 
+#[tracing::instrument(
+    name = "rvc.crypto.sign_electra_aggregate_and_proof",
+    level = "debug",
+    skip_all,
+    fields(rvc.signing_type = "electra_aggregate_and_proof"),
+)]
 /// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
 pub fn sign_electra_aggregate_and_proof(
     aggregate_and_proof: &ElectraAggregateAndProof,

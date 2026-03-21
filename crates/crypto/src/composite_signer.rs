@@ -2,10 +2,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use tracing::{debug, info, warn};
 
 use async_trait::async_trait;
 
 use super::bls::{SecretKey, Signature, PUBLIC_KEY_BYTES_LEN};
+use super::logging::TruncatedPubkey;
 use super::remote_signer::RemoteSigner;
 use super::signer_trait::{LocalSigner, Signer, SigningError};
 use eth_types::Root;
@@ -33,30 +35,53 @@ impl CompositeSigner {
         signer: Arc<dyn Signer + Send + Sync>,
     ) {
         let mut grpc = self.grpc_remote.write();
+        for pubkey in &pubkeys {
+            let pubkey_hex = hex::encode(pubkey);
+            info!(pubkey = %TruncatedPubkey::new(&pubkey_hex), "Added gRPC remote signer key");
+        }
         for pubkey in pubkeys {
             grpc.insert(pubkey, Arc::clone(&signer));
         }
     }
 
     pub fn remove_grpc_remote_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
-        self.grpc_remote.write().remove(pubkey).is_some()
+        let removed = self.grpc_remote.write().remove(pubkey).is_some();
+        if removed {
+            let pubkey_hex = hex::encode(pubkey);
+            warn!(pubkey = %TruncatedPubkey::new(&pubkey_hex), "Removed gRPC remote signer key");
+        }
+        removed
     }
 
     pub fn add_remote_key(&self, pubkey: [u8; PUBLIC_KEY_BYTES_LEN], signer: RemoteSigner) {
+        let pubkey_hex = hex::encode(pubkey);
+        info!(pubkey = %TruncatedPubkey::new(&pubkey_hex), "Added remote signer key");
         self.remote.write().insert(pubkey, Arc::new(signer));
     }
 
     pub fn remove_remote_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
-        self.remote.write().remove(pubkey).is_some()
+        let removed = self.remote.write().remove(pubkey).is_some();
+        if removed {
+            let pubkey_hex = hex::encode(pubkey);
+            warn!(pubkey = %TruncatedPubkey::new(&pubkey_hex), "Removed remote signer key");
+        }
+        removed
     }
 
     pub fn add_local_key(&self, secret_key: SecretKey) {
         let pubkey = secret_key.public_key().to_bytes();
+        let pubkey_hex = hex::encode(pubkey);
+        info!(pubkey = %TruncatedPubkey::new(&pubkey_hex), "Added local signer key");
         self.dynamic_local.write().insert(pubkey, secret_key);
     }
 
     pub fn remove_local_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
-        self.dynamic_local.write().remove(pubkey).is_some()
+        let removed = self.dynamic_local.write().remove(pubkey).is_some();
+        if removed {
+            let pubkey_hex = hex::encode(pubkey);
+            warn!(pubkey = %TruncatedPubkey::new(&pubkey_hex), "Removed local signer key");
+        }
+        removed
     }
 }
 
@@ -73,7 +98,12 @@ impl Signer for CompositeSigner {
             grpc.get(pubkey).cloned()
         };
         if let Some(signer) = grpc_signer {
-            return signer.sign(signing_root, pubkey).await;
+            let result = signer.sign(signing_root, pubkey).await;
+            match &result {
+                Ok(_) => debug!(backend = "grpc", "Signing succeeded"),
+                Err(e) => debug!(backend = "grpc", error = %e, "Signing failed"),
+            }
+            return result;
         }
 
         // Check HTTP remote signers — clone Arc to release the lock before await
@@ -82,19 +112,30 @@ impl Signer for CompositeSigner {
             remote.get(pubkey).cloned()
         };
         if let Some(signer) = remote_signer {
-            return signer.sign(signing_root, pubkey).await;
+            let result = signer.sign(signing_root, pubkey).await;
+            match &result {
+                Ok(_) => debug!(backend = "remote", "Signing succeeded"),
+                Err(e) => debug!(backend = "remote", error = %e, "Signing failed"),
+            }
+            return result;
         }
 
         // Check dynamically-added local keys
         {
             let dynamic = self.dynamic_local.read();
             if let Some(sk) = dynamic.get(pubkey) {
+                debug!(backend = "local", "Signing succeeded");
                 return Ok(sk.sign(signing_root));
             }
         }
 
         // Fall through to the base local signer
-        self.local.sign(signing_root, pubkey).await
+        let result = self.local.sign(signing_root, pubkey).await;
+        match &result {
+            Ok(_) => debug!(backend = "local", "Signing succeeded"),
+            Err(e) => debug!(backend = "local", error = %e, "Signing failed"),
+        }
+        result
     }
 
     fn public_keys(&self) -> Vec<[u8; PUBLIC_KEY_BYTES_LEN]> {

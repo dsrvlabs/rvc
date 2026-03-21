@@ -1,3 +1,4 @@
+use tracing::trace;
 use tree_hash::TreeHash;
 
 use super::bls::{SecretKey, Signature};
@@ -29,9 +30,17 @@ pub fn compute_domain(
 pub fn compute_signing_root<T: TreeHash>(ssz_object: &T, domain: Domain) -> Root {
     let object_root = hash_tree_root(ssz_object);
     let signing_data = SigningData { object_root, domain };
-    hash_tree_root(&signing_data)
+    let signing_root = hash_tree_root(&signing_data);
+    trace!(domain = ?domain, root = ?signing_root, "Computed signing root");
+    signing_root
 }
 
+#[tracing::instrument(
+    name = "rvc.crypto.sign_attestation",
+    level = "debug",
+    skip_all,
+    fields(rvc.signing_type = "attestation"),
+)]
 pub fn sign_attestation(
     attestation_data: &AttestationData,
     secret_key: &SecretKey,
