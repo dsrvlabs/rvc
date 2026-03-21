@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
-use tracing::{info, Instrument};
+use tracing::{debug, error, info, Instrument};
 use tree_hash::TreeHash;
 
+use crypto::logging::TruncatedPubkey;
 use crypto::PublicKey;
 use eth_types::{ForkSchedule, Root, Slot, SLOTS_PER_EPOCH};
 use signer::ValidatorSigner;
@@ -56,9 +57,15 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         slot: Slot,
         pubkey: &PublicKey,
     ) -> Result<BlockProposalResult, BlockServiceError> {
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let proposal_start = std::time::Instant::now();
+
+        info!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), "Block proposal started");
+
         let epoch = slot / SLOTS_PER_EPOCH;
 
         // 1. Sign RANDAO reveal
+        let randao_start = std::time::Instant::now();
         let randao_bytes = self
             .signer
             .sign_randao_reveal(epoch, pubkey, &self.fork_schedule, &self.genesis_validators_root)
@@ -66,9 +73,10 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .await
             .map_err(|e| {
                 let err = BlockServiceError::Signer(e.to_string());
-                tracing::error!(error = %err, "RANDAO signing failed");
+                error!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), error = %err, "RANDAO signing failed");
                 err
             })?;
+        debug!(slot = slot, duration_ms = randao_start.elapsed().as_millis() as u64, "RANDAO reveal signed");
         let randao_hex = format!("0x{}", hex::encode(&randao_bytes));
 
         // 2. Get validator preferences
@@ -84,9 +92,16 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .instrument(tracing::info_span!("rvc.beacon.produce_block_v3"))
             .await
             .map_err(|e| {
-                tracing::error!(error = %e, "Block production failed");
+                error!(slot = slot, error = %e, "Block production failed");
                 e
             })?;
+
+        info!(
+            slot = slot,
+            is_blinded = response.is_blinded,
+            execution_payload_value = response.execution_payload_value.as_deref().unwrap_or("none"),
+            "Block production response received"
+        );
 
         // Record dynamic attributes after block production
         let span = tracing::Span::current();
@@ -97,6 +112,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         }
 
         // 4. Sign and publish based on block type
+        debug!(slot = slot, is_blinded = response.is_blinded, "Blinded/unblinded path chosen");
         let (block_root, is_blinded) = if response.is_ssz {
             self.sign_and_publish_ssz(&response, slot, pubkey).await
         } else if response.is_blinded {
@@ -105,17 +121,17 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             self.sign_and_publish_full(&response, slot, pubkey).await
         }
         .map_err(|e| {
-            tracing::error!(error = %e, "Block sign/publish failed");
+            error!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), error = %e, "Block publication failed");
             e
         })?;
 
-        let block_type = if is_blinded { "blinded" } else { "unblinded" };
         info!(
-            slot,
-            block_type,
-            consensus_version = %response.consensus_version,
-            value_wei = response.execution_payload_value.as_deref().unwrap_or("unknown"),
-            "block proposed"
+            slot = slot,
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            block_root = %format!("0x{}", hex::encode(block_root)),
+            is_blinded = is_blinded,
+            duration_ms = proposal_start.elapsed().as_millis() as u64,
+            "Block publication success"
         );
 
         Ok(BlockProposalResult {
@@ -162,6 +178,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             (compute_block_root(&block), offset)
         };
 
+        let sign_start = std::time::Instant::now();
         let sig = self
             .signer
             .sign_block(
@@ -174,6 +191,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .instrument(tracing::info_span!("rvc.sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+        debug!(slot = slot, duration_ms = sign_start.elapsed().as_millis() as u64, "Block signing duration");
 
         // Construct SignedBeaconBlock SSZ:
         // [message_offset: 4 bytes LE] [signature: 96 bytes] [BeaconBlock SSZ bytes]
@@ -207,6 +225,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
 
         let block_root = compute_block_root(&block);
 
+        let sign_start = std::time::Instant::now();
         let sig = self
             .signer
             .sign_block(
@@ -219,6 +238,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .instrument(tracing::info_span!("rvc.sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+        debug!(slot = slot, duration_ms = sign_start.elapsed().as_millis() as u64, "Block signing duration");
 
         let signed = eth_types::SignedBeaconBlock { message: block, signature: sig };
         self.beacon
@@ -243,6 +263,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
 
         let block_root = compute_blinded_block_root(&block);
 
+        let sign_start = std::time::Instant::now();
         let sig = self
             .signer
             .sign_block(
@@ -255,6 +276,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .instrument(tracing::info_span!("rvc.sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+        debug!(slot = slot, duration_ms = sign_start.elapsed().as_millis() as u64, "Block signing duration");
 
         let signed = eth_types::SignedBlindedBeaconBlock { message: block, signature: sig };
         self.beacon
