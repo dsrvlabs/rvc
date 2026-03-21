@@ -19,44 +19,41 @@ lazy_static! {
     pub static ref REGISTRY: Registry = Registry::new();
 }
 
-/// Register a counter metric with the global registry.
-///
-/// # Arguments
-/// * `name` - The metric name
-/// * `help` - Help text describing the metric
-///
-/// # Returns
-/// A registered `Counter` or an error if registration fails.
-pub fn register_counter(name: &str, help: &str) -> prometheus::Result<Counter> {
+/// Register a counter metric with a specific registry.
+pub fn register_counter_with(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+) -> prometheus::Result<Counter> {
     let counter = Counter::with_opts(Opts::new(name, help))?;
-    REGISTRY.register(Box::new(counter.clone()))?;
+    registry.register(Box::new(counter.clone()))?;
     Ok(counter)
 }
 
-/// Register a gauge metric with the global registry.
-///
-/// # Arguments
-/// * `name` - The metric name
-/// * `help` - Help text describing the metric
-///
-/// # Returns
-/// A registered `Gauge` or an error if registration fails.
-pub fn register_gauge(name: &str, help: &str) -> prometheus::Result<Gauge> {
+/// Register a counter metric with the global registry.
+pub fn register_counter(name: &str, help: &str) -> prometheus::Result<Counter> {
+    register_counter_with(&REGISTRY, name, help)
+}
+
+/// Register a gauge metric with a specific registry.
+pub fn register_gauge_with(
+    registry: &Registry,
+    name: &str,
+    help: &str,
+) -> prometheus::Result<Gauge> {
     let gauge = Gauge::with_opts(Opts::new(name, help))?;
-    REGISTRY.register(Box::new(gauge.clone()))?;
+    registry.register(Box::new(gauge.clone()))?;
     Ok(gauge)
 }
 
-/// Register a histogram metric with the global registry.
-///
-/// # Arguments
-/// * `name` - The metric name
-/// * `help` - Help text describing the metric
-/// * `buckets` - Optional custom bucket boundaries
-///
-/// # Returns
-/// A registered `Histogram` or an error if registration fails.
-pub fn register_histogram(
+/// Register a gauge metric with the global registry.
+pub fn register_gauge(name: &str, help: &str) -> prometheus::Result<Gauge> {
+    register_gauge_with(&REGISTRY, name, help)
+}
+
+/// Register a histogram metric with a specific registry.
+pub fn register_histogram_with(
+    registry: &Registry,
     name: &str,
     help: &str,
     buckets: Option<Vec<f64>>,
@@ -66,8 +63,17 @@ pub fn register_histogram(
         opts = opts.buckets(b);
     }
     let histogram = Histogram::with_opts(opts)?;
-    REGISTRY.register(Box::new(histogram.clone()))?;
+    registry.register(Box::new(histogram.clone()))?;
     Ok(histogram)
+}
+
+/// Register a histogram metric with the global registry.
+pub fn register_histogram(
+    name: &str,
+    help: &str,
+    buckets: Option<Vec<f64>>,
+) -> prometheus::Result<Histogram> {
+    register_histogram_with(&REGISTRY, name, help, buckets)
 }
 
 /// Macro for conveniently registering a counter metric.
@@ -79,6 +85,9 @@ pub fn register_histogram(
 /// ```
 #[macro_export]
 macro_rules! register_counter {
+    ($registry:expr, $name:expr, $help:expr) => {
+        $crate::register_counter_with($registry, $name, $help)
+    };
     ($name:expr, $help:expr) => {
         $crate::register_counter($name, $help)
     };
@@ -93,6 +102,9 @@ macro_rules! register_counter {
 /// ```
 #[macro_export]
 macro_rules! register_gauge {
+    ($registry:expr, $name:expr, $help:expr) => {
+        $crate::register_gauge_with($registry, $name, $help)
+    };
     ($name:expr, $help:expr) => {
         $crate::register_gauge($name, $help)
     };
@@ -107,6 +119,12 @@ macro_rules! register_gauge {
 /// ```
 #[macro_export]
 macro_rules! register_histogram {
+    ($registry:expr, $name:expr, $help:expr) => {
+        $crate::register_histogram_with($registry, $name, $help, None)
+    };
+    ($registry:expr, $name:expr, $help:expr, $buckets:expr) => {
+        $crate::register_histogram_with($registry, $name, $help, Some($buckets))
+    };
     ($name:expr, $help:expr) => {
         $crate::register_histogram($name, $help, None)
     };
@@ -212,6 +230,78 @@ mod tests {
         // Attempting to register with the same name should fail
         let result = register_counter("duplicate_test_counter", "Second registration");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_register_counter_with_custom_registry() {
+        let registry = Registry::new();
+        let counter = register_counter_with(&registry, "custom_reg_counter", "A counter").unwrap();
+        counter.inc();
+        assert_eq!(counter.get(), 1.0);
+
+        let gathered = registry.gather();
+        assert!(gathered.iter().any(|m| m.name() == "custom_reg_counter"));
+
+        // Should NOT appear in the global registry
+        let global = REGISTRY.gather();
+        assert!(!global.iter().any(|m| m.name() == "custom_reg_counter"));
+    }
+
+    #[test]
+    fn test_register_gauge_with_custom_registry() {
+        let registry = Registry::new();
+        let gauge = register_gauge_with(&registry, "custom_reg_gauge", "A gauge").unwrap();
+        gauge.set(7.0);
+        assert_eq!(gauge.get(), 7.0);
+
+        let gathered = registry.gather();
+        assert!(gathered.iter().any(|m| m.name() == "custom_reg_gauge"));
+    }
+
+    #[test]
+    fn test_register_histogram_with_custom_registry() {
+        let registry = Registry::new();
+        let histogram =
+            register_histogram_with(&registry, "custom_reg_histogram", "A histogram", None)
+                .unwrap();
+        histogram.observe(1.5);
+        assert_eq!(histogram.get_sample_count(), 1);
+
+        let gathered = registry.gather();
+        assert!(gathered.iter().any(|m| m.name() == "custom_reg_histogram"));
+    }
+
+    #[test]
+    fn test_register_histogram_with_custom_registry_and_buckets() {
+        let registry = Registry::new();
+        let buckets = vec![0.1, 1.0, 10.0];
+        let histogram = register_histogram_with(
+            &registry,
+            "custom_reg_histogram_buckets",
+            "A histogram with buckets",
+            Some(buckets),
+        )
+        .unwrap();
+        histogram.observe(0.5);
+        assert_eq!(histogram.get_sample_count(), 1);
+    }
+
+    #[test]
+    fn test_duplicate_registration_with_custom_registry_fails() {
+        let registry = Registry::new();
+        let _ = register_counter_with(&registry, "dup_custom", "First").unwrap();
+        let result = register_counter_with(&registry, "dup_custom", "Second");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_global_functions_delegate_to_with() {
+        // Verify the global register_counter still works (uses REGISTRY internally)
+        let counter = register_counter("delegation_test_counter", "test").unwrap();
+        counter.inc();
+        assert_eq!(counter.get(), 1.0);
+        let gathered = REGISTRY.gather();
+        assert!(gathered.iter().any(|m| m.name() == "delegation_test_counter"));
     }
 
     #[test]
