@@ -136,6 +136,8 @@ async fn bearer_auth(
         .map(|token| token.as_bytes().ct_eq(expected_token.as_bytes()).unwrap_u8() == 1)
         .unwrap_or(false);
 
+    tracing::debug!(valid = authorized, "Auth token validation");
+
     if authorized {
         next.run(request).await
     } else {

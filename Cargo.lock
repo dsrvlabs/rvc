@@ -4141,6 +4141,7 @@ dependencies = [
  "hyper",
  "parking_lot",
  "rand 0.8.5",
+ "rvc-crypto",
  "serde",
  "serde_json",
  "subtle",

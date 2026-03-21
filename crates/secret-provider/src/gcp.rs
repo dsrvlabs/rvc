@@ -164,7 +164,7 @@ impl SecretProvider for GcpSecretProvider {
     async fn fetch_key(&self, id: &str) -> Result<KeyMaterial, SecretProviderError> {
         let data = self.access_secret_payload(id).await?;
 
-        match crate::format::parse_secret_data(&data)? {
+        let result = match crate::format::parse_secret_data(&data)? {
             crate::format::SecretDataFormat::KeystoreJson(json) => {
                 let password = self.fetch_companion_password(id).await.map_err(|e| {
                     warn!(secret_id = id, error = %e, "failed to fetch companion password");
@@ -173,7 +173,13 @@ impl SecretProvider for GcpSecretProvider {
                 Ok(KeyMaterial::Keystore { keystore_json: json, password })
             }
             crate::format::SecretDataFormat::RawHex(key) => Ok(KeyMaterial::RawKey(key)),
+        };
+
+        if result.is_ok() {
+            debug!(key_id = id, "GCP fetch completed");
         }
+
+        result
     }
 }
 

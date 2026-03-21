@@ -2,6 +2,8 @@ use std::sync::Arc;
 
 use axum::extract::State;
 use axum::Json;
+use crypto::logging::{RedactedUrl, TruncatedPubkey};
+use tracing::{info, warn};
 
 use crate::error::ApiError;
 use crate::traits::{
@@ -40,6 +42,8 @@ pub async fn list_keystores(State(state): State<Arc<AppState>>) -> Json<ListKeys
         })
         .collect();
 
+    info!(count = data.len(), "Listed local keystores");
+
     Json(ListKeystoresResponse { data })
 }
 
@@ -52,6 +56,8 @@ pub async fn import_keystores(
         rvc.keymanager.count = request.keystores.len(),
     );
     let _guard = span.enter();
+
+    info!(count = request.keystores.len(), "Importing keystores");
 
     if request.keystores.len() != request.passwords.len() {
         return Err(ApiError::BadRequest(
@@ -72,6 +78,12 @@ pub async fn import_keystores(
     for (keystore_json, password) in request.keystores.iter().zip(request.passwords.iter()) {
         match state.keystore_manager.import_keystore(keystore_json, password) {
             Ok(pubkey) => {
+                let pubkey_hex = format!("0x{}", hex::encode(pubkey));
+                info!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    status = "imported",
+                    "Keystore import result"
+                );
                 state.validator_manager.add_validator(pubkey, false);
                 state.doppelganger_monitor.start_monitoring(pubkey);
                 results.push(ImportKeystoreResult {
@@ -80,12 +92,14 @@ pub async fn import_keystores(
                 });
             }
             Err(ImportKeystoreError::Duplicate) => {
+                info!(status = "duplicate", "Keystore import result");
                 results.push(ImportKeystoreResult {
                     status: ImportStatus::Duplicate,
                     message: "key already exists".into(),
                 });
             }
             Err(e) => {
+                warn!(status = "error", error = %e, "Keystore import result");
                 results.push(ImportKeystoreResult {
                     status: ImportStatus::Error,
                     message: e.to_string(),
@@ -106,6 +120,8 @@ pub async fn delete_keystores(
         rvc.keymanager.count = request.pubkeys.len(),
     );
     let _guard = span.enter();
+
+    warn!(count = request.pubkeys.len(), "Deleting keystores");
 
     // Parse all pubkeys and identify which ones exist for slashing export
     let parsed: Vec<Result<Pubkey, String>> =
@@ -130,10 +146,16 @@ pub async fn delete_keystores(
 
     // Now process deletions
     let mut results = Vec::with_capacity(request.pubkeys.len());
-    for parse_result in &parsed {
+    for (i, parse_result) in parsed.iter().enumerate() {
+        let pubkey_hex = &request.pubkeys[i];
         match parse_result {
             Ok(pubkey) => match state.keystore_manager.delete_keystore(pubkey) {
                 Ok(true) => {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(pubkey_hex),
+                        status = "deleted",
+                        "Keystore delete result"
+                    );
                     state.validator_manager.remove_validator(pubkey);
                     state.doppelganger_monitor.stop_monitoring(pubkey);
                     results.push(DeleteKeystoreResult {
@@ -142,12 +164,23 @@ pub async fn delete_keystores(
                     });
                 }
                 Ok(false) => {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(pubkey_hex),
+                        status = "not_found",
+                        "Keystore delete result"
+                    );
                     results.push(DeleteKeystoreResult {
                         status: DeleteStatus::NotFound,
                         message: String::new(),
                     });
                 }
                 Err(e) => {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(pubkey_hex),
+                        status = "error",
+                        error = %e,
+                        "Keystore delete result"
+                    );
                     results.push(DeleteKeystoreResult {
                         status: DeleteStatus::Error,
                         message: e.to_string(),
@@ -155,6 +188,12 @@ pub async fn delete_keystores(
                 }
             },
             Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(pubkey_hex),
+                    status = "error",
+                    error = %e,
+                    "Keystore delete result"
+                );
                 results
                     .push(DeleteKeystoreResult { status: DeleteStatus::Error, message: e.clone() });
             }
@@ -168,7 +207,7 @@ pub async fn delete_keystores(
 
 pub async fn list_remote_keys(State(state): State<Arc<AppState>>) -> Json<ListRemoteKeysResponse> {
     let keys = state.remote_key_manager.list_remote_keys();
-    let data = keys
+    let data: Vec<RemoteKeyEntry> = keys
         .into_iter()
         .map(|(pk, url)| RemoteKeyEntry {
             pubkey: format!("0x{}", hex::encode(pk)),
@@ -176,6 +215,9 @@ pub async fn list_remote_keys(State(state): State<Arc<AppState>>) -> Json<ListRe
             readonly: false,
         })
         .collect();
+
+    info!(count = data.len(), "Listed remote keys");
+
     Json(ListRemoteKeysResponse { data })
 }
 
@@ -189,6 +231,8 @@ pub async fn import_remote_keys(
     );
     let _guard = span.enter();
 
+    info!(count = request.remote_keys.len(), "Importing remote keys");
+
     let mut results = Vec::with_capacity(request.remote_keys.len());
 
     for key_import in &request.remote_keys {
@@ -198,6 +242,12 @@ pub async fn import_remote_keys(
                     &key_import.url,
                     state.allow_insecure_remote_signer,
                 ) {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(&key_import.pubkey),
+                        status = "error",
+                        error = %e,
+                        "Remote key import result"
+                    );
                     results.push(ImportRemoteKeyResult {
                         status: ImportRemoteKeyStatus::Error,
                         message: e,
@@ -206,18 +256,35 @@ pub async fn import_remote_keys(
                 }
                 match state.remote_key_manager.import_remote_key(pubkey, key_import.url.clone()) {
                     Ok(()) => {
+                        info!(
+                            pubkey = %TruncatedPubkey::new(&key_import.pubkey),
+                            url = %RedactedUrl(&key_import.url),
+                            status = "imported",
+                            "Remote key import result"
+                        );
                         results.push(ImportRemoteKeyResult {
                             status: ImportRemoteKeyStatus::Imported,
                             message: String::new(),
                         });
                     }
                     Err(ImportRemoteKeyError::Duplicate) => {
+                        info!(
+                            pubkey = %TruncatedPubkey::new(&key_import.pubkey),
+                            status = "duplicate",
+                            "Remote key import result"
+                        );
                         results.push(ImportRemoteKeyResult {
                             status: ImportRemoteKeyStatus::Duplicate,
                             message: "key already exists".into(),
                         });
                     }
                     Err(e) => {
+                        warn!(
+                            pubkey = %TruncatedPubkey::new(&key_import.pubkey),
+                            status = "error",
+                            error = %e,
+                            "Remote key import result"
+                        );
                         results.push(ImportRemoteKeyResult {
                             status: ImportRemoteKeyStatus::Error,
                             message: e.to_string(),
@@ -226,6 +293,12 @@ pub async fn import_remote_keys(
                 }
             }
             Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&key_import.pubkey),
+                    status = "error",
+                    error = %e,
+                    "Remote key import result"
+                );
                 results.push(ImportRemoteKeyResult {
                     status: ImportRemoteKeyStatus::Error,
                     message: e,
@@ -247,24 +320,42 @@ pub async fn delete_remote_keys(
     );
     let _guard = span.enter();
 
+    warn!(count = request.pubkeys.len(), "Deleting remote keys");
+
     let mut results = Vec::with_capacity(request.pubkeys.len());
 
     for pubkey_str in &request.pubkeys {
         match parse_pubkey(pubkey_str) {
             Ok(pubkey) => match state.remote_key_manager.delete_remote_key(&pubkey) {
                 Ok(true) => {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(pubkey_str),
+                        status = "deleted",
+                        "Remote key delete result"
+                    );
                     results.push(DeleteRemoteKeyResult {
                         status: DeleteRemoteKeyStatus::Deleted,
                         message: String::new(),
                     });
                 }
                 Ok(false) => {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(pubkey_str),
+                        status = "not_found",
+                        "Remote key delete result"
+                    );
                     results.push(DeleteRemoteKeyResult {
                         status: DeleteRemoteKeyStatus::NotFound,
                         message: String::new(),
                     });
                 }
                 Err(e) => {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(pubkey_str),
+                        status = "error",
+                        error = %e,
+                        "Remote key delete result"
+                    );
                     results.push(DeleteRemoteKeyResult {
                         status: DeleteRemoteKeyStatus::Error,
                         message: e.to_string(),
@@ -272,6 +363,12 @@ pub async fn delete_remote_keys(
                 }
             },
             Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(pubkey_str),
+                    status = "error",
+                    error = %e,
+                    "Remote key delete result"
+                );
                 results.push(DeleteRemoteKeyResult {
                     status: DeleteRemoteKeyStatus::Error,
                     message: e,

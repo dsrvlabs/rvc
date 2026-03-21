@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crypto::logging::TruncatedPubkey;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -27,9 +28,15 @@ impl RefreshService {
     }
 
     pub async fn refresh(&mut self) -> Vec<SecretKey> {
+        let start = Instant::now();
         let mut new_keys = Vec::new();
 
         for provider in &self.providers {
+            info!(
+                source = %provider.name(),
+                interval_secs = self.interval.as_secs(),
+                "Refresh cycle start"
+            );
             let provider_name = provider.name().to_string();
 
             let entries = match provider.list_keys().await {
@@ -104,9 +111,9 @@ impl RefreshService {
                 }
 
                 let pubkey_hex = format!("0x{}", hex::encode(pubkey));
-                warn!(
-                    provider = %provider_name,
-                    pubkey = %pubkey_hex,
+                info!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    source = %provider_name,
                     "Discovered new key during refresh"
                 );
 
@@ -117,10 +124,12 @@ impl RefreshService {
 
         let total = self.known_pubkeys.len();
         let new_count = new_keys.len();
+        let duration_ms = start.elapsed().as_millis();
         info!(
-            new_count = new_count,
+            keys_refreshed_count = new_count,
             total = total,
-            "Secret provider refresh: {new_count} new keys, {total} total"
+            duration_ms = duration_ms,
+            "Refresh cycle completed"
         );
 
         new_keys

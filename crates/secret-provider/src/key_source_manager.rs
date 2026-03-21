@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use crypto::logging::TruncatedPubkey;
 use crypto::{KeyManager, Keystore, SecretKey};
-use tracing::{info_span, warn, Instrument};
+use tracing::{info, info_span, warn, Instrument};
 
 use crate::metrics::{
     classify_error, RVC_SECRET_PROVIDER_ERRORS_TOTAL, RVC_SECRET_PROVIDER_KEYS_LOADED,
@@ -104,15 +105,22 @@ impl KeySourceManager {
                 match result {
                     Ok(material) => match convert_key_material(&entry_id, material) {
                         Ok(secret_key) => {
+                            let pubkey_hex =
+                                format!("0x{}", hex::encode(secret_key.public_key().to_bytes()));
+                            info!(
+                                pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                                source = %provider_name,
+                                "New key discovered"
+                            );
                             key_manager.insert(secret_key);
                             provider_summary.loaded += 1;
                         }
                         Err(e) => {
                             warn!(
-                                provider = %provider_name,
                                 key_id = %entry_id,
+                                source = %provider_name,
                                 error = %e,
-                                "Failed to convert key material, skipping"
+                                "Key fetch failure"
                             );
                             RVC_SECRET_PROVIDER_ERRORS_TOTAL
                                 .with_label_values(&[provider_name.as_str(), classify_error(&e)])
