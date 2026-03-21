@@ -39,11 +39,16 @@ fn parse_hex_bytes<const N: usize>(s: &str) -> Result<[u8; N], ValidatorStoreErr
     bytes.try_into().map_err(|_| ValidatorStoreError::Config(format!("expected {N} bytes")))
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ValidatorDefaults {
+    pub fee_recipient: [u8; 20],
+    pub gas_limit: u64,
+    pub graffiti: Option<[u8; 32]>,
+}
+
 pub struct ValidatorStore {
     validators: RwLock<HashMap<[u8; 48], ValidatorConfig>>,
-    default_fee_recipient: RwLock<[u8; 20]>,
-    default_gas_limit: RwLock<u64>,
-    default_graffiti: RwLock<Option<[u8; 32]>>,
+    defaults: RwLock<ValidatorDefaults>,
     config_path: Option<PathBuf>,
 }
 
@@ -51,9 +56,11 @@ impl ValidatorStore {
     pub fn new(default_fee_recipient: [u8; 20], default_gas_limit: u64) -> Self {
         Self {
             validators: RwLock::new(HashMap::new()),
-            default_fee_recipient: RwLock::new(default_fee_recipient),
-            default_gas_limit: RwLock::new(default_gas_limit),
-            default_graffiti: RwLock::new(None),
+            defaults: RwLock::new(ValidatorDefaults {
+                fee_recipient: default_fee_recipient,
+                gas_limit: default_gas_limit,
+                graffiti: None,
+            }),
             config_path: None,
         }
     }
@@ -87,9 +94,11 @@ impl ValidatorStore {
 
         Ok(Self {
             validators: RwLock::new(validators),
-            default_fee_recipient: RwLock::new(default_fee_recipient),
-            default_gas_limit: RwLock::new(default_gas_limit),
-            default_graffiti: RwLock::new(default_graffiti),
+            defaults: RwLock::new(ValidatorDefaults {
+                fee_recipient: default_fee_recipient,
+                gas_limit: default_gas_limit,
+                graffiti: default_graffiti,
+            }),
             config_path: Some(path.to_path_buf()),
         })
     }
@@ -98,28 +107,29 @@ impl ValidatorStore {
         self.validators.read().get(pubkey).cloned()
     }
 
+    pub fn effective_config(&self, pubkey: &[u8; 48]) -> ValidatorDefaults {
+        let validators = self.validators.read();
+        let defaults = self.defaults.read();
+        let validator = validators.get(pubkey);
+        ValidatorDefaults {
+            fee_recipient: validator
+                .and_then(|c| c.fee_recipient)
+                .unwrap_or(defaults.fee_recipient),
+            gas_limit: validator.and_then(|c| c.gas_limit).unwrap_or(defaults.gas_limit),
+            graffiti: validator.and_then(|c| c.graffiti).or(defaults.graffiti),
+        }
+    }
+
     pub fn effective_fee_recipient(&self, pubkey: &[u8; 48]) -> [u8; 20] {
-        self.validators
-            .read()
-            .get(pubkey)
-            .and_then(|c| c.fee_recipient)
-            .unwrap_or(*self.default_fee_recipient.read())
+        self.effective_config(pubkey).fee_recipient
     }
 
     pub fn effective_gas_limit(&self, pubkey: &[u8; 48]) -> u64 {
-        self.validators
-            .read()
-            .get(pubkey)
-            .and_then(|c| c.gas_limit)
-            .unwrap_or(*self.default_gas_limit.read())
+        self.effective_config(pubkey).gas_limit
     }
 
     pub fn effective_graffiti(&self, pubkey: &[u8; 48]) -> Option<[u8; 32]> {
-        self.validators
-            .read()
-            .get(pubkey)
-            .and_then(|c| c.graffiti)
-            .or(*self.default_graffiti.read())
+        self.effective_config(pubkey).graffiti
     }
 
     pub fn is_builder_enabled(&self, pubkey: &[u8; 48]) -> bool {
@@ -201,9 +211,11 @@ impl ValidatorStore {
         }
 
         // Apply-second: all parsing succeeded, now mutate atomically.
-        *self.default_fee_recipient.write() = new_fee_recipient;
-        *self.default_gas_limit.write() = new_gas_limit;
-        *self.default_graffiti.write() = new_graffiti;
+        *self.defaults.write() = ValidatorDefaults {
+            fee_recipient: new_fee_recipient,
+            gas_limit: new_gas_limit,
+            graffiti: new_graffiti,
+        };
 
         let mut validators = self.validators.write();
         for config in parsed_validators {
@@ -261,9 +273,9 @@ mod tests {
         let store = ValidatorStore::new(fr, 30_000_000);
 
         assert!(store.list_enabled_pubkeys().is_empty());
-        assert_eq!(*store.default_fee_recipient.read(), fr);
-        assert_eq!(*store.default_gas_limit.read(), 30_000_000);
-        assert!(store.default_graffiti.read().is_none());
+        assert_eq!(store.defaults.read().fee_recipient, fr);
+        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
+        assert!(store.defaults.read().graffiti.is_none());
     }
 
     #[test]
@@ -378,7 +390,7 @@ mod tests {
         default_graffiti[..4].copy_from_slice(b"test");
 
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
-        *store.default_graffiti.write() = Some(default_graffiti);
+        store.defaults.write().graffiti = Some(default_graffiti);
 
         let pk = test_pubkey(1);
         store.add_validator(ValidatorConfig::new(pk));
@@ -586,8 +598,8 @@ graffiti = "my graffiti"
         assert!(config.graffiti.is_some());
         assert!(config.enabled);
 
-        assert_eq!(*store.default_fee_recipient.read(), [0xaau8; 20]);
-        assert_eq!(*store.default_gas_limit.read(), 30_000_000);
+        assert_eq!(store.defaults.read().fee_recipient, [0xaau8; 20]);
+        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
     }
 
     #[test]
@@ -642,9 +654,9 @@ pubkey = "{}"
         file.write_all(toml_content.as_bytes()).unwrap();
 
         let store = ValidatorStore::load_from_config(&config_path).unwrap();
-        assert_eq!(*store.default_fee_recipient.read(), [0u8; 20]);
-        assert_eq!(*store.default_gas_limit.read(), 30_000_000);
-        assert!(store.default_graffiti.read().is_none());
+        assert_eq!(store.defaults.read().fee_recipient, [0u8; 20]);
+        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
+        assert!(store.defaults.read().graffiti.is_none());
     }
 
     #[test]
@@ -994,8 +1006,8 @@ pubkey = "invalid-hex-not-48-bytes"
 
         // CRITICAL: Store must be completely unchanged after failed reload
         // Defaults must not have changed
-        assert_eq!(*store.default_fee_recipient.read(), [0xaau8; 20]);
-        assert_eq!(*store.default_gas_limit.read(), 30_000_000);
+        assert_eq!(store.defaults.read().fee_recipient, [0xaau8; 20]);
+        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
 
         // No new validators added
         assert!(store.get_config(&[2u8; 48]).is_none());
@@ -1027,9 +1039,9 @@ pubkey = "{}"
         std::fs::write(&config_path, &toml_v1).unwrap();
 
         let store = ValidatorStore::load_from_config(&config_path).unwrap();
-        assert_eq!(*store.default_fee_recipient.read(), [0xaau8; 20]);
-        assert_eq!(*store.default_gas_limit.read(), 50_000_000);
-        assert!(store.default_graffiti.read().is_some());
+        assert_eq!(store.defaults.read().fee_recipient, [0xaau8; 20]);
+        assert_eq!(store.defaults.read().gas_limit, 50_000_000);
+        assert!(store.defaults.read().graffiti.is_some());
 
         // Remove [defaults] section entirely
         let toml_v2 = format!(
@@ -1044,9 +1056,9 @@ pubkey = "{}"
         store.reload_config().unwrap();
 
         // Defaults should reset to hardcoded fallbacks
-        assert_eq!(*store.default_fee_recipient.read(), [0u8; 20]);
-        assert_eq!(*store.default_gas_limit.read(), 30_000_000);
-        assert!(store.default_graffiti.read().is_none());
+        assert_eq!(store.defaults.read().fee_recipient, [0u8; 20]);
+        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
+        assert!(store.defaults.read().graffiti.is_none());
     }
 
     #[test]
@@ -1089,8 +1101,83 @@ pubkey = "{}"
         store.reload_config().unwrap();
 
         // fee_recipient and graffiti should reset to hardcoded fallbacks
-        assert_eq!(*store.default_fee_recipient.read(), [0u8; 20]);
-        assert_eq!(*store.default_gas_limit.read(), 40_000_000);
-        assert!(store.default_graffiti.read().is_none());
+        assert_eq!(store.defaults.read().fee_recipient, [0u8; 20]);
+        assert_eq!(store.defaults.read().gas_limit, 40_000_000);
+        assert!(store.defaults.read().graffiti.is_none());
+    }
+
+    #[test]
+    fn test_effective_config_returns_consistent_snapshot() {
+        let default_fr = [0xaau8; 20];
+        let store = ValidatorStore::new(default_fr, 30_000_000);
+
+        let pk = test_pubkey(1);
+        store.validators.write().insert(
+            pk,
+            ValidatorConfig {
+                pubkey: pk,
+                fee_recipient: Some([0xbbu8; 20]),
+                gas_limit: Some(40_000_000),
+                graffiti: None,
+                builder_proposals: false,
+                builder_boost_factor: 100,
+                enabled: true,
+            },
+        );
+
+        let config = store.effective_config(&pk);
+        assert_eq!(config.fee_recipient, [0xbbu8; 20]);
+        assert_eq!(config.gas_limit, 40_000_000);
+        assert!(config.graffiti.is_none());
+    }
+
+    #[test]
+    fn test_effective_config_falls_back_to_defaults() {
+        let default_fr = [0xaau8; 20];
+        let store = ValidatorStore::new(default_fr, 30_000_000);
+        let pk = test_pubkey(1);
+
+        let config = store.effective_config(&pk);
+        assert_eq!(config.fee_recipient, default_fr);
+        assert_eq!(config.gas_limit, 30_000_000);
+        assert!(config.graffiti.is_none());
+    }
+
+    #[test]
+    fn test_effective_config_concurrent_reads_consistent() {
+        use std::sync::Arc;
+
+        let default_fr = [0xaau8; 20];
+        let store = Arc::new(ValidatorStore::new(default_fr, 30_000_000));
+
+        let pk = test_pubkey(1);
+        store.validators.write().insert(
+            pk,
+            ValidatorConfig {
+                pubkey: pk,
+                fee_recipient: Some([0xbbu8; 20]),
+                gas_limit: Some(40_000_000),
+                graffiti: None,
+                builder_proposals: false,
+                builder_boost_factor: 100,
+                enabled: true,
+            },
+        );
+
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let config = store.effective_config(&pk);
+                    // All values must come from the same snapshot
+                    assert_eq!(config.fee_recipient, [0xbbu8; 20]);
+                    assert_eq!(config.gas_limit, 40_000_000);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }
