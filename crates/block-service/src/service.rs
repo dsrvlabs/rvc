@@ -76,7 +76,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 error!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), error = %err, "RANDAO signing failed");
                 err
             })?;
-        debug!(slot = slot, duration_ms = randao_start.elapsed().as_millis() as u64, "RANDAO reveal signed");
+        debug!(
+            slot = slot,
+            duration_ms = randao_start.elapsed().as_millis() as u64,
+            "RANDAO reveal signed"
+        );
         let randao_hex = format!("0x{}", hex::encode(&randao_bytes));
 
         // 2. Get validator preferences
@@ -191,7 +195,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .instrument(tracing::info_span!("rvc.sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
-        debug!(slot = slot, duration_ms = sign_start.elapsed().as_millis() as u64, "Block signing duration");
+        debug!(
+            slot = slot,
+            duration_ms = sign_start.elapsed().as_millis() as u64,
+            "Block signing duration"
+        );
 
         // Construct SignedBeaconBlock SSZ:
         // [message_offset: 4 bytes LE] [signature: 96 bytes] [BeaconBlock SSZ bytes]
@@ -238,7 +246,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .instrument(tracing::info_span!("rvc.sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
-        debug!(slot = slot, duration_ms = sign_start.elapsed().as_millis() as u64, "Block signing duration");
+        debug!(
+            slot = slot,
+            duration_ms = sign_start.elapsed().as_millis() as u64,
+            "Block signing duration"
+        );
 
         let signed = eth_types::SignedBeaconBlock { message: block, signature: sig };
         self.beacon
@@ -276,7 +288,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .instrument(tracing::info_span!("rvc.sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
-        debug!(slot = slot, duration_ms = sign_start.elapsed().as_millis() as u64, "Block signing duration");
+        debug!(
+            slot = slot,
+            duration_ms = sign_start.elapsed().as_millis() as u64,
+            "Block signing duration"
+        );
 
         let signed = eth_types::SignedBlindedBeaconBlock { message: block, signature: sig };
         self.beacon
