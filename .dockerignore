@@ -34,6 +34,9 @@ docker-compose*.yml
 *.pem
 *.key
 *.crt
+.env
+.env.*
+*.env
 keystores/
 secrets/
 
