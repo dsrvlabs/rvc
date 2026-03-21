@@ -288,7 +288,18 @@ impl Config {
         self.effective_genesis_time()?;
         self.effective_genesis_validators_root()?;
 
+        if self.allow_insecure_remote_signer {
+            self.validate_insecure_env_var()?;
+        }
+
         Ok(())
+    }
+
+    fn validate_insecure_env_var(&self) -> Result<(), ConfigError> {
+        match std::env::var("RVC_ALLOW_INSECURE") {
+            Ok(val) if val == "true" => Ok(()),
+            _ => Err(ConfigError::InsecureFlagRequiresEnvVar),
+        }
     }
 
     pub fn load_passwords(&self) -> Result<HashMap<String, SecretString>, ConfigError> {
@@ -1572,5 +1583,39 @@ log_level = "info"
         let cli = CliOverrides::default();
         config.merge_with_cli(&cli);
         assert_eq!(config.secret_provider.refresh_interval, Some(300));
+    }
+
+    #[test]
+    fn test_insecure_flag_env_var_validation() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // Case 1: insecure flag false skips env check
+        std::env::remove_var("RVC_ALLOW_INSECURE");
+        let config = Config::default();
+        assert!(!config.allow_insecure_remote_signer);
+        assert!(config.validate().is_ok(), "Should pass when insecure flag is false");
+
+        // Case 2: insecure flag true without env var fails
+        let config = Config { allow_insecure_remote_signer: true, ..Config::default() };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("RVC_ALLOW_INSECURE"),
+            "Error should mention RVC_ALLOW_INSECURE, got: {}",
+            err
+        );
+
+        // Case 3: insecure flag true with wrong env var value fails
+        std::env::set_var("RVC_ALLOW_INSECURE", "yes");
+        let config = Config { allow_insecure_remote_signer: true, ..Config::default() };
+        assert!(config.validate().is_err(), "Should fail with RVC_ALLOW_INSECURE=yes (not 'true')");
+
+        // Case 4: insecure flag true with correct env var passes
+        std::env::set_var("RVC_ALLOW_INSECURE", "true");
+        let config = Config { allow_insecure_remote_signer: true, ..Config::default() };
+        assert!(config.validate().is_ok(), "Should pass with RVC_ALLOW_INSECURE=true");
+
+        std::env::remove_var("RVC_ALLOW_INSECURE");
     }
 }

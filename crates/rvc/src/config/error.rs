@@ -56,4 +56,9 @@ pub enum ConfigError {
 
     #[error("secret provider error: {0}")]
     SecretProviderError(String),
+
+    #[error(
+        "--allow-insecure-remote-signer requires RVC_ALLOW_INSECURE=true environment variable"
+    )]
+    InsecureFlagRequiresEnvVar,
 }
