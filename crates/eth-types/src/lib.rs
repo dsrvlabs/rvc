@@ -37,6 +37,7 @@ pub use sync_committee::{
     ContributionAndProof, SignedContributionAndProof, SyncAggregatorSelectionData,
     SyncCommitteeContribution, SyncCommitteeDuty, SyncCommitteeMessage,
 };
+pub use tree_hash_utils::TreeHashError;
 
 pub type Slot = u64;
 pub type Epoch = u64;

@@ -1233,6 +1233,16 @@ where
                     aggregate: electra_agg,
                     selection_proof: selection_proof.to_bytes().to_vec(),
                 };
+                if let Err(e) = aggregate_and_proof.try_tree_hash_root() {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        error = %e,
+                        "Skipping aggregate with invalid aggregation bits"
+                    );
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    continue;
+                }
                 let signature = match self
                     .signer
                     .sign_electra_aggregate_and_proof(
@@ -1282,6 +1292,16 @@ where
                     aggregate: pre_electra_agg,
                     selection_proof: selection_proof.to_bytes().to_vec(),
                 };
+                if let Err(e) = aggregate_and_proof.try_tree_hash_root() {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        error = %e,
+                        "Skipping aggregate with invalid aggregation bits"
+                    );
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    continue;
+                }
                 let signature = match self
                     .signer
                     .sign_aggregate_and_proof(
