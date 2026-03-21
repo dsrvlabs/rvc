@@ -79,9 +79,11 @@ impl ServiceBuilder {
     pub fn build_bn_manager(&self) -> Result<Arc<BnManager>, ConfigError> {
         let endpoints = self.config.effective_beacon_nodes();
         let config = BnManagerConfig::new(endpoints.clone());
-        let manager = BnManager::new(config).map_err(|e| {
-            ConfigError::InvalidBeaconUrl(format!("failed to create BnManager: {}", e))
-        })?;
+        let manager = BnManager::new(config)
+            .map_err(|e| {
+                ConfigError::InvalidBeaconUrl(format!("failed to create BnManager: {}", e))
+            })?
+            .with_operation_timeouts(bn_manager::OperationTimeouts::default());
         info!(endpoints = ?endpoints, "Created BnManager with {} beacon nodes", endpoints.len());
         Ok(Arc::new(manager))
     }

@@ -37,7 +37,7 @@ use crate::sse::{self, SseConfig, SseEvent};
 use crate::sync_status::{
     check_all_sync_statuses, new_shared_sync_statuses, start_sync_monitor, SharedSyncStatuses,
 };
-use crate::traits::{BeaconNodeClient, BnHealthScore, BnManagerConfig};
+use crate::traits::{BeaconNodeClient, BnHealthScore, BnManagerConfig, OperationTimeouts};
 use crate::BnManagerError;
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, BeaconError>> + Send + 'a>>;
@@ -61,6 +61,7 @@ pub struct BnManager {
     sync_statuses: SharedSyncStatuses,
     health_trackers: SharedHealthTrackers,
     overall_timeout: Option<Duration>,
+    operation_timeouts: Option<OperationTimeouts>,
 }
 
 impl BnManager {
@@ -109,7 +110,13 @@ impl BnManager {
         let sync_statuses = new_shared_sync_statuses(clients.len());
         let endpoints: Vec<String> = clients.iter().map(|c| c.endpoint().to_string()).collect();
         let health_trackers = new_shared_health_trackers(&endpoints);
-        Ok(Self { clients, sync_statuses, health_trackers, overall_timeout: None })
+        Ok(Self {
+            clients,
+            sync_statuses,
+            health_trackers,
+            overall_timeout: None,
+            operation_timeouts: None,
+        })
     }
 
     /// Returns the shared sync status tracker.
@@ -130,6 +137,37 @@ impl BnManager {
     pub fn with_overall_timeout(mut self, timeout: Duration) -> Self {
         self.overall_timeout = Some(timeout);
         self
+    }
+
+    /// Sets per-operation timeouts for BN API calls.
+    ///
+    /// When set, each BN operation is wrapped in `tokio::time::timeout` using the
+    /// corresponding field from `OperationTimeouts`. If an operation exceeds its
+    /// timeout, `BeaconError::OperationTimeout` is returned.
+    pub fn with_operation_timeouts(mut self, timeouts: OperationTimeouts) -> Self {
+        self.operation_timeouts = Some(timeouts);
+        self
+    }
+
+    /// Wraps a future with an optional per-operation timeout.
+    async fn with_op_timeout<T>(
+        &self,
+        op_name: &str,
+        timeout: Option<Duration>,
+        fut: impl Future<Output = Result<T, BeaconError>>,
+    ) -> Result<T, BeaconError> {
+        match timeout {
+            Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| {
+                warn!(op = op_name, timeout_ms = d.as_millis() as u64, "operation timed out");
+                BeaconError::OperationTimeout { operation: op_name.to_string(), timeout: d }
+            })?,
+            None => fut.await,
+        }
+    }
+
+    /// Returns the per-operation timeout for a given field selector.
+    fn op_timeout(&self, f: impl FnOnce(&OperationTimeouts) -> Duration) -> Option<Duration> {
+        self.operation_timeouts.as_ref().map(f)
     }
 
     /// Returns current health scores for all BNs.
@@ -788,21 +826,30 @@ impl BeaconNodeClient for BnManager {
         self.query_first("get_validators", |c| Box::pin(c.get_validators(pubkeys))).await
     }
 
-    // -- Duties: query(First) --
+    // -- Duties: query(First) + duty_fetch timeout --
 
     async fn get_attester_duties(
         &self,
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<AttesterDutiesResponse, BeaconError> {
-        self.query_first("get_attester_duties", |c| {
-            Box::pin(c.get_attester_duties(epoch, validator_indices))
-        })
+        self.with_op_timeout(
+            "get_attester_duties",
+            self.op_timeout(|t| t.duty_fetch),
+            self.query_first("get_attester_duties", |c| {
+                Box::pin(c.get_attester_duties(epoch, validator_indices))
+            }),
+        )
         .await
     }
 
     async fn get_proposer_duties(&self, epoch: u64) -> Result<ProposerDutiesResponse, BeaconError> {
-        self.query_first("get_proposer_duties", |c| Box::pin(c.get_proposer_duties(epoch))).await
+        self.with_op_timeout(
+            "get_proposer_duties",
+            self.op_timeout(|t| t.duty_fetch),
+            self.query_first("get_proposer_duties", |c| Box::pin(c.get_proposer_duties(epoch))),
+        )
+        .await
     }
 
     async fn post_sync_committee_duties(
@@ -810,13 +857,17 @@ impl BeaconNodeClient for BnManager {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-        self.query_first("post_sync_committee_duties", |c| {
-            Box::pin(c.post_sync_committee_duties(epoch, validator_indices))
-        })
+        self.with_op_timeout(
+            "post_sync_committee_duties",
+            self.op_timeout(|t| t.duty_fetch),
+            self.query_first("post_sync_committee_duties", |c| {
+                Box::pin(c.post_sync_committee_duties(epoch, validator_indices))
+            }),
+        )
         .await
     }
 
-    // -- Block production: query(Best) --
+    // -- Block production: query(Best) + block_production timeout --
 
     async fn produce_block_v3(
         &self,
@@ -825,24 +876,39 @@ impl BeaconNodeClient for BnManager {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, BeaconError> {
-        self.query_best(
+        self.with_op_timeout(
             "produce_block_v3",
-            |c| Box::pin(c.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor)),
-            is_better_block,
+            self.op_timeout(|t| t.block_production),
+            self.query_best(
+                "produce_block_v3",
+                |c| {
+                    Box::pin(c.produce_block_v3(
+                        slot,
+                        randao_reveal,
+                        graffiti,
+                        builder_boost_factor,
+                    ))
+                },
+                is_better_block,
+            ),
         )
         .await
     }
 
-    // -- Submissions: broadcast --
+    // -- Submissions: broadcast + block_publication timeout --
 
     async fn publish_block(
         &self,
         signed_block: &SignedBeaconBlock,
         consensus_version: &str,
     ) -> Result<(), BeaconError> {
-        self.broadcast("publish_block", |c| {
-            Box::pin(c.publish_block(signed_block, consensus_version))
-        })
+        self.with_op_timeout(
+            "publish_block",
+            self.op_timeout(|t| t.block_publication),
+            self.broadcast("publish_block", |c| {
+                Box::pin(c.publish_block(signed_block, consensus_version))
+            }),
+        )
         .await
     }
 
@@ -851,38 +917,50 @@ impl BeaconNodeClient for BnManager {
         signed_blinded_block: &SignedBlindedBeaconBlock,
         consensus_version: &str,
     ) -> Result<(), BeaconError> {
-        self.broadcast("publish_blinded_block", |c| {
-            Box::pin(c.publish_blinded_block(signed_blinded_block, consensus_version))
-        })
+        self.with_op_timeout(
+            "publish_blinded_block",
+            self.op_timeout(|t| t.block_publication),
+            self.broadcast("publish_blinded_block", |c| {
+                Box::pin(c.publish_blinded_block(signed_blinded_block, consensus_version))
+            }),
+        )
         .await
     }
 
-    // -- Attestation data: query(First) --
+    // -- Attestation data: query(First) + attestation_fetch timeout --
 
     async fn get_attestation_data(
         &self,
         slot: u64,
         committee_index: u64,
     ) -> Result<AttestationDataResponse, BeaconError> {
-        self.query_first("get_attestation_data", |c| {
-            Box::pin(c.get_attestation_data(slot, committee_index))
-        })
+        self.with_op_timeout(
+            "get_attestation_data",
+            self.op_timeout(|t| t.attestation_fetch),
+            self.query_first("get_attestation_data", |c| {
+                Box::pin(c.get_attestation_data(slot, committee_index))
+            }),
+        )
         .await
     }
 
-    // -- Attestation submission: broadcast --
+    // -- Attestation submission: broadcast + attestation_submit timeout --
 
     async fn submit_attestation(
         &self,
         attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError> {
-        self.broadcast_with_result("submit_attestation", |c| {
-            Box::pin(c.submit_attestation(attestations))
-        })
+        self.with_op_timeout(
+            "submit_attestation",
+            self.op_timeout(|t| t.attestation_submit),
+            self.broadcast_with_result("submit_attestation", |c| {
+                Box::pin(c.submit_attestation(attestations))
+            }),
+        )
         .await
     }
 
-    // -- Aggregation: query(First) for fetching, broadcast for submitting --
+    // -- Aggregation: query(First) + aggregate_fetch timeout for fetching, broadcast + aggregate_submit timeout for submitting --
 
     async fn get_aggregate_attestation(
         &self,
@@ -890,9 +968,13 @@ impl BeaconNodeClient for BnManager {
         attestation_data_root: &str,
         committee_index: Option<u64>,
     ) -> Result<VersionedAggregateAttestation, BeaconError> {
-        self.query_first("get_aggregate_attestation", |c| {
-            Box::pin(c.get_aggregate_attestation(slot, attestation_data_root, committee_index))
-        })
+        self.with_op_timeout(
+            "get_aggregate_attestation",
+            self.op_timeout(|t| t.aggregate_fetch),
+            self.query_first("get_aggregate_attestation", |c| {
+                Box::pin(c.get_aggregate_attestation(slot, attestation_data_root, committee_index))
+            }),
+        )
         .await
     }
 
@@ -900,21 +982,29 @@ impl BeaconNodeClient for BnManager {
         &self,
         proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError> {
-        self.broadcast("submit_aggregate_and_proofs", |c| {
-            Box::pin(c.submit_aggregate_and_proofs(proofs))
-        })
+        self.with_op_timeout(
+            "submit_aggregate_and_proofs",
+            self.op_timeout(|t| t.aggregate_submit),
+            self.broadcast("submit_aggregate_and_proofs", |c| {
+                Box::pin(c.submit_aggregate_and_proofs(proofs))
+            }),
+        )
         .await
     }
 
-    // -- Sync committee: broadcast for submissions, query(First) for fetching --
+    // -- Sync committee: broadcast + sync_message/sync_contribution timeout --
 
     async fn submit_sync_committee_messages(
         &self,
         messages: &[SyncCommitteeMessage],
     ) -> Result<(), BeaconError> {
-        self.broadcast("submit_sync_committee_messages", |c| {
-            Box::pin(c.submit_sync_committee_messages(messages))
-        })
+        self.with_op_timeout(
+            "submit_sync_committee_messages",
+            self.op_timeout(|t| t.sync_message),
+            self.broadcast("submit_sync_committee_messages", |c| {
+                Box::pin(c.submit_sync_committee_messages(messages))
+            }),
+        )
         .await
     }
 
@@ -924,9 +1014,17 @@ impl BeaconNodeClient for BnManager {
         subcommittee_index: u64,
         beacon_block_root: &str,
     ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-        self.query_first("get_sync_committee_contribution", |c| {
-            Box::pin(c.get_sync_committee_contribution(slot, subcommittee_index, beacon_block_root))
-        })
+        self.with_op_timeout(
+            "get_sync_committee_contribution",
+            self.op_timeout(|t| t.sync_contribution),
+            self.query_first("get_sync_committee_contribution", |c| {
+                Box::pin(c.get_sync_committee_contribution(
+                    slot,
+                    subcommittee_index,
+                    beacon_block_root,
+                ))
+            }),
+        )
         .await
     }
 
@@ -934,9 +1032,13 @@ impl BeaconNodeClient for BnManager {
         &self,
         proofs: &[SignedContributionAndProof],
     ) -> Result<(), BeaconError> {
-        self.broadcast("submit_contribution_and_proofs", |c| {
-            Box::pin(c.submit_contribution_and_proofs(proofs))
-        })
+        self.with_op_timeout(
+            "submit_contribution_and_proofs",
+            self.op_timeout(|t| t.sync_message),
+            self.broadcast("submit_contribution_and_proofs", |c| {
+                Box::pin(c.submit_contribution_and_proofs(proofs))
+            }),
+        )
         .await
     }
 
@@ -946,38 +1048,52 @@ impl BeaconNodeClient for BnManager {
         self.query_first("get_block_root", |c| Box::pin(c.get_block_root(block_id))).await
     }
 
-    // -- Proposer preparation: broadcast --
+    // -- Proposer preparation: broadcast + preparation timeout --
 
     async fn prepare_beacon_proposer(
         &self,
         preparations: &[ProposerPreparation],
     ) -> Result<(), BeaconError> {
-        self.broadcast("prepare_beacon_proposer", |c| {
-            Box::pin(c.prepare_beacon_proposer(preparations))
-        })
+        self.with_op_timeout(
+            "prepare_beacon_proposer",
+            self.op_timeout(|t| t.preparation),
+            self.broadcast("prepare_beacon_proposer", |c| {
+                Box::pin(c.prepare_beacon_proposer(preparations))
+            }),
+        )
         .await
     }
 
-    // -- Committee subscriptions: broadcast --
+    // -- Committee subscriptions: broadcast + preparation timeout --
 
     async fn submit_beacon_committee_subscriptions(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
-        self.broadcast("submit_beacon_committee_subscriptions", |c| {
-            Box::pin(c.submit_beacon_committee_subscriptions(subscriptions))
-        })
+        self.with_op_timeout(
+            "submit_beacon_committee_subscriptions",
+            self.op_timeout(|t| t.preparation),
+            self.broadcast("submit_beacon_committee_subscriptions", |c| {
+                Box::pin(c.submit_beacon_committee_subscriptions(subscriptions))
+            }),
+        )
         .await
     }
 
-    // -- Builder: broadcast --
+    // -- Builder: broadcast + preparation timeout --
 
     async fn register_validators(
         &self,
         registrations: &[SignedValidatorRegistration],
     ) -> Result<(), BeaconError> {
-        self.broadcast("register_validators", |c| Box::pin(c.register_validators(registrations)))
-            .await
+        self.with_op_timeout(
+            "register_validators",
+            self.op_timeout(|t| t.preparation),
+            self.broadcast("register_validators", |c| {
+                Box::pin(c.register_validators(registrations))
+            }),
+        )
+        .await
     }
 
     // -- Node status: query(First) --
@@ -3106,5 +3222,126 @@ mod tests {
         // Unknown is not unreachable (we don't know), but not synced either
         assert!(scores[0].is_reachable);
         assert!(!scores[0].is_synced);
+    }
+
+    // -- Per-operation timeout tests --
+
+    #[tokio::test]
+    async fn test_operation_timeout_fires_on_slow_bn() {
+        let server = MockServer::start().await;
+
+        // Simulate a slow BN: 10s delay on attestation data endpoint
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        r#"{"data":{"slot":"1","index":"0","beacon_block_root":"0x0000000000000000000000000000000000000000000000000000000000000000","source":{"epoch":"0","root":"0x0000000000000000000000000000000000000000000000000000000000000000"},"target":{"epoch":"0","root":"0x0000000000000000000000000000000000000000000000000000000000000000"}}}"#,
+                    )
+                    .set_delay(Duration::from_secs(10)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = BnManagerConfig::new(vec![server.uri()]);
+        let manager = BnManager::new(config).unwrap().with_operation_timeouts(OperationTimeouts {
+            attestation_fetch: Duration::from_millis(100),
+            ..OperationTimeouts::default()
+        });
+
+        let start = tokio::time::Instant::now();
+        let result = manager.get_attestation_data(1, 0).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, BeaconError::OperationTimeout { operation, timeout }
+                if operation == "get_attestation_data" && *timeout == Duration::from_millis(100)),
+            "expected OperationTimeout, got: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "should have timed out quickly, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_operation_timeout_completes_normally() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"data":{"slot":"1","index":"0","beacon_block_root":"0x0000000000000000000000000000000000000000000000000000000000000000","source":{"epoch":"0","root":"0x0000000000000000000000000000000000000000000000000000000000000000"},"target":{"epoch":"0","root":"0x0000000000000000000000000000000000000000000000000000000000000000"}}}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        // No operation_timeouts set
+        let manager = make_manager(&server.uri());
+
+        let result = manager.get_attestation_data(1, 0).await;
+        assert!(result.is_ok(), "should succeed without per-op timeout: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_operation_timeout_on_block_production() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        r#"{"version":"deneb","execution_payload_blinded":false,"execution_payload_value":"0","consensus_block_value":"0","data":{}}"#,
+                    )
+                    .set_delay(Duration::from_secs(10)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = BnManagerConfig::new(vec![server.uri()]);
+        let manager = BnManager::new(config).unwrap().with_operation_timeouts(OperationTimeouts {
+            block_production: Duration::from_millis(100),
+            ..OperationTimeouts::default()
+        });
+
+        let result = manager.produce_block_v3(1, "0xabc", None, None).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), BeaconError::OperationTimeout { operation, .. } if operation == "produce_block_v3"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_operation_timeout_on_duty_fetch() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/duties/proposer/1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        r#"{"dependent_root":"0x0000000000000000000000000000000000000000000000000000000000000000","execution_optimistic":false,"data":[]}"#,
+                    )
+                    .set_delay(Duration::from_secs(10)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = BnManagerConfig::new(vec![server.uri()]);
+        let manager = BnManager::new(config).unwrap().with_operation_timeouts(OperationTimeouts {
+            duty_fetch: Duration::from_millis(100),
+            ..OperationTimeouts::default()
+        });
+
+        let result = manager.get_proposer_duties(1).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), BeaconError::OperationTimeout { operation, .. } if operation == "get_proposer_duties"),
+        );
     }
 }
