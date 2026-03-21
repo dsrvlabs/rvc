@@ -71,24 +71,24 @@ pub async fn check_all_sync_statuses(clients: &[BeaconClient], statuses: &Shared
         }
         match status {
             BnSyncStatus::Synced => {
-                info!(bn_index = i, endpoint = endpoint, "BN is synced");
+                info!(bn_index = i, endpoint = %RedactedUrl(&endpoint), "BN is synced");
             }
             BnSyncStatus::Syncing => {
                 warn!(
                     bn_index = i,
-                    endpoint = endpoint,
+                    endpoint = %RedactedUrl(&endpoint),
                     "BN is still syncing, will be skipped for duties"
                 );
             }
             BnSyncStatus::ElOffline => {
                 warn!(
                     bn_index = i,
-                    endpoint = endpoint,
+                    endpoint = %RedactedUrl(&endpoint),
                     "BN execution layer is offline, usable for non-EL queries only"
                 );
             }
             BnSyncStatus::Unreachable => {
-                warn!(bn_index = i, endpoint = endpoint, "BN is unreachable");
+                warn!(bn_index = i, endpoint = %RedactedUrl(&endpoint), "BN is unreachable");
             }
             BnSyncStatus::Unknown => {}
         }

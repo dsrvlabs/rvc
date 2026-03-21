@@ -157,8 +157,8 @@ pub async fn subscribe_events<F>(
             if configs.len() > 1 {
                 let next_idx = (current_idx + 1) % configs.len();
                 warn!(
-                    from = %configs[current_idx].endpoint,
-                    to = %configs[next_idx].endpoint,
+                    from = %RedactedUrl(&configs[current_idx].endpoint),
+                    to = %RedactedUrl(&configs[next_idx].endpoint),
                     "SSE failover to secondary endpoint"
                 );
                 current_idx = next_idx;

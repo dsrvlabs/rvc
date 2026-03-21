@@ -244,7 +244,7 @@ impl BnManager {
         if synced.is_empty() {
             if self.clients.len() == 1 {
                 warn!(
-                    endpoint = self.clients[0].endpoint(),
+                    endpoint = %RedactedUrl(self.clients[0].endpoint()),
                     "single BN is not synced, continuing with degraded service"
                 );
             } else {
@@ -342,7 +342,7 @@ impl BnManager {
                     debug!(
                         op = op_name,
                         bn_index = i,
-                        endpoint = client.endpoint(),
+                        endpoint = %RedactedUrl(client.endpoint()),
                         latency_ms = elapsed.as_millis() as u64,
                         "query succeeded"
                     );
@@ -439,7 +439,7 @@ impl BnManager {
                     debug!(
                         op = op_name,
                         bn_index = i,
-                        endpoint = client.endpoint(),
+                        endpoint = %RedactedUrl(client.endpoint()),
                         "query succeeded (single synced BN)"
                     );
                     return Ok(result);
@@ -449,7 +449,7 @@ impl BnManager {
                     warn!(
                         op = op_name,
                         bn_index = i,
-                        endpoint = client.endpoint(),
+                        endpoint = %RedactedUrl(client.endpoint()),
                         error = %e,
                         "BN query failed, trying unsynced BNs"
                     );
@@ -507,7 +507,7 @@ impl BnManager {
                     warn!(
                         op = op_name,
                         bn_index = i,
-                        endpoint = endpoint,
+                        endpoint = %RedactedUrl(&endpoint),
                         error = %e,
                         "BN query failed in best-selection"
                     );
@@ -520,7 +520,7 @@ impl BnManager {
                 debug!(
                     op = op_name,
                     bn_index = i,
-                    endpoint = self.clients[i].endpoint(),
+                    endpoint = %RedactedUrl(self.clients[i].endpoint()),
                     "best-selection picked BN"
                 );
                 Ok(value)
@@ -579,7 +579,7 @@ impl BnManager {
                     warn!(
                         op = op_name,
                         bn_index = i,
-                        endpoint = client.endpoint(),
+                        endpoint = %RedactedUrl(client.endpoint()),
                         latency_ms = elapsed.as_millis() as u64,
                         "query succeeded on unsynced BN (degraded)"
                     );
@@ -590,7 +590,7 @@ impl BnManager {
                     warn!(
                         op = op_name,
                         bn_index = i,
-                        endpoint = client.endpoint(),
+                        endpoint = %RedactedUrl(client.endpoint()),
                         error = %e,
                         "unsynced BN fallback also failed"
                     );
@@ -658,7 +658,7 @@ impl BnManager {
                         debug!(
                             op = op_name,
                             bn_index = i,
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(&endpoint),
                             "broadcast succeeded on BN"
                         );
                     }
@@ -667,7 +667,7 @@ impl BnManager {
                         warn!(
                             op = op_name,
                             bn_index = i,
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(&endpoint),
                             error = %e,
                             "broadcast failed on BN"
                         );

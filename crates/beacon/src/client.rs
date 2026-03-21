@@ -133,13 +133,9 @@ impl BeaconClient {
         body: &B,
     ) -> Result<T, BeaconError> {
         let url = format!("{}{}", self.config.endpoint, path);
-        if let Ok(serialized) = serde_json::to_vec(body) {
-            trace!(
-                method = "POST",
-                endpoint = path,
-                body_bytes = serialized.len(),
-                "HTTP request body size"
-            );
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let body_size = serde_json::to_vec(body).map(|b| b.len()).unwrap_or(0);
+            trace!(method = "POST", endpoint = path, body_size_bytes = body_size, "HTTP request body");
         }
         let mut trace_headers = reqwest::header::HeaderMap::new();
         telemetry::inject_trace_context(&mut trace_headers);
