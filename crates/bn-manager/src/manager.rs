@@ -34,6 +34,7 @@ fn redact_url(url: &str) -> String {
     }
 }
 
+use crate::broadcast::{BnOutcome, BroadcastResult};
 use crate::health::{new_shared_health_trackers, SharedHealthTrackers};
 use crate::sse::{self, SseConfig, SseEvent};
 use crate::sync_status::{
@@ -599,7 +600,7 @@ impl BnManager {
     }
 
     /// Broadcast an operation to all BNs (regardless of sync status). Returns first success.
-    /// If all fail, returns the last error.
+    /// If all fail, returns the last error. Logs partial failures at warn level.
     async fn broadcast<'s, F>(&'s self, op_name: &str, op: F) -> Result<(), BeaconError>
     where
         F: Fn(&'s BeaconClient) -> BoxFut<'s, ()>,
@@ -609,102 +610,16 @@ impl BnManager {
             rvc.bn.strategy = "broadcast",
             rvc.bn.tried = self.clients.len(),
         );
-        self.broadcast_inner(op_name, &op).instrument(strategy_span).await
+        async {
+            let broadcast = self.broadcast_inner(op_name, &op).await;
+            Self::log_partial_failure(op_name, &broadcast);
+            broadcast.into_result()
+        }
+        .instrument(strategy_span)
+        .await
     }
 
-    async fn broadcast_inner<'s, F>(&'s self, op_name: &str, op: &F) -> Result<(), BeaconError>
-    where
-        F: Fn(&'s BeaconClient) -> BoxFut<'s, ()>,
-    {
-        let mut futs: Vec<IndexedTimedResultFut<'_, ()>> = Vec::with_capacity(self.clients.len());
-
-        for (i, client) in self.clients.iter().enumerate() {
-            let endpoint = client.endpoint().to_string();
-            let fut = op(client);
-            let attempt_span = tracing::info_span!(
-                "rvc.bn.attempt",
-                rvc.bn.url = %redact_url(client.endpoint()),
-            );
-            futs.push(Box::pin(
-                async move {
-                    let start = tokio::time::Instant::now();
-                    let result = fut.await;
-                    let elapsed = start.elapsed();
-                    (i, endpoint, result, elapsed)
-                }
-                .instrument(attempt_span),
-            ));
-        }
-
-        let results = join_all(futs).await;
-
-        // Record health for ALL BNs first, then determine the result.
-        let mut first_ok = false;
-        let mut last_err = None;
-        {
-            let mut guard = self.health_trackers.write().await;
-            for (i, endpoint, result, elapsed) in &results {
-                match result {
-                    Ok(()) => {
-                        guard[*i].record_success(*elapsed);
-                        debug!(
-                            op = op_name,
-                            bn_index = i,
-                            endpoint = endpoint,
-                            "broadcast succeeded on BN"
-                        );
-                        first_ok = true;
-                    }
-                    Err(e) => {
-                        guard[*i].record_error();
-                        warn!(
-                            op = op_name,
-                            bn_index = i,
-                            endpoint = endpoint,
-                            error = %e,
-                            "broadcast failed on BN"
-                        );
-                    }
-                }
-            }
-        }
-
-        if first_ok {
-            return Ok(());
-        }
-
-        for (_, _, result, _) in results {
-            if let Err(e) = result {
-                last_err = Some(e);
-            }
-        }
-        Err(last_err.expect("at least one client exists"))
-    }
-
-    /// Broadcast an operation that returns a non-unit result.
-    /// Returns first success. If all fail, returns the last error.
-    async fn broadcast_with_result<'s, T, F>(
-        &'s self,
-        op_name: &str,
-        op: F,
-    ) -> Result<T, BeaconError>
-    where
-        T: Send + 'static,
-        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
-    {
-        let strategy_span = tracing::info_span!(
-            "rvc.bn.strategy.broadcast",
-            rvc.bn.strategy = "broadcast",
-            rvc.bn.tried = self.clients.len(),
-        );
-        self.broadcast_with_result_inner(op_name, &op).instrument(strategy_span).await
-    }
-
-    async fn broadcast_with_result_inner<'s, T, F>(
-        &'s self,
-        op_name: &str,
-        op: &F,
-    ) -> Result<T, BeaconError>
+    async fn broadcast_inner<'s, T, F>(&'s self, op_name: &str, op: &F) -> BroadcastResult<T>
     where
         T: Send + 'static,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
@@ -731,13 +646,13 @@ impl BnManager {
 
         let results = join_all(futs).await;
 
-        // Record health for ALL BNs first.
+        let mut outcomes = Vec::with_capacity(results.len());
         {
             let mut guard = self.health_trackers.write().await;
-            for (i, endpoint, result, elapsed) in &results {
-                match result {
+            for (i, endpoint, result, elapsed) in results {
+                match &result {
                     Ok(_) => {
-                        guard[*i].record_success(*elapsed);
+                        guard[i].record_success(elapsed);
                         debug!(
                             op = op_name,
                             bn_index = i,
@@ -746,7 +661,7 @@ impl BnManager {
                         );
                     }
                     Err(e) => {
-                        guard[*i].record_error();
+                        guard[i].record_error();
                         warn!(
                             op = op_name,
                             bn_index = i,
@@ -756,18 +671,51 @@ impl BnManager {
                         );
                     }
                 }
+                outcomes.push(BnOutcome { endpoint, result, latency: elapsed });
             }
         }
 
-        // Return first success or last error.
-        let mut last_err = None;
-        for (_, _, result, _) in results {
-            match result {
-                Ok(v) => return Ok(v),
-                Err(e) => last_err = Some(e),
-            }
+        BroadcastResult { outcomes }
+    }
+
+    fn log_partial_failure<T>(op_name: &str, broadcast: &BroadcastResult<T>) {
+        if broadcast.any_success() && !broadcast.all_success() {
+            let (ok, fail) = broadcast.counts();
+            let failed_endpoints: Vec<&str> =
+                broadcast.failures().iter().map(|(e, _)| *e).collect();
+            warn!(
+                op = op_name,
+                successes = ok,
+                failures = fail,
+                failed_endpoints = ?failed_endpoints,
+                "partial broadcast failure"
+            );
         }
-        Err(last_err.expect("at least one client exists"))
+    }
+
+    /// Broadcast an operation that returns a non-unit result.
+    /// Returns first success. If all fail, returns the last error.
+    async fn broadcast_with_result<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        op: F,
+    ) -> Result<T, BeaconError>
+    where
+        T: Send + 'static,
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+    {
+        let strategy_span = tracing::info_span!(
+            "rvc.bn.strategy.broadcast",
+            rvc.bn.strategy = "broadcast",
+            rvc.bn.tried = self.clients.len(),
+        );
+        async {
+            let broadcast = self.broadcast_inner(op_name, &op).await;
+            Self::log_partial_failure(op_name, &broadcast);
+            broadcast.into_result()
+        }
+        .instrument(strategy_span)
+        .await
     }
 }
 
@@ -3378,5 +3326,91 @@ mod tests {
         // get_genesis is non-EL: ElOffline BN should be used, Syncing BN should be skipped
         let result = manager.get_genesis().await;
         assert!(result.is_ok());
+    }
+
+    // ===================================================================
+    // Broadcast partial failure tests
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_broadcast_partial_failure_still_succeeds() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // BN1: returns 400 for prepare_beacon_proposer
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .expect(1)
+            .mount(&bn1)
+            .await;
+
+        // BN2: returns 200
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+
+        // Overall result should be Ok despite BN1 failing
+        let result = manager.prepare_beacon_proposer(&[]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_all_fail_returns_error() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // Both BNs return 500
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(1)
+            .mount(&bn1)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(1)
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+
+        let result = manager.prepare_beacon_proposer(&[]).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_partial_failure_records_health() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // BN1: returns 400
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .mount(&bn1)
+            .await;
+
+        // BN2: returns 200
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+
+        let _ = manager.prepare_beacon_proposer(&[]).await;
+
+        // BN1 should have error recorded, BN2 should have success
+        let health = manager.health_trackers().read().await;
+        assert!(health[0].score() < health[1].score());
     }
 }
