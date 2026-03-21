@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crypto::logging::TruncatedPubkey;
 use crypto::{CompositeSigner, PublicKey, Signature, Signer, SigningError};
@@ -127,6 +127,15 @@ impl SignerService {
         let pubkey_bytes = pubkey.to_bytes();
         let pubkey_hex = hex::encode(pubkey_bytes);
 
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = attestation_data.slot,
+            source_epoch = attestation_data.source.epoch,
+            target_epoch = attestation_data.target.epoch,
+            signing_type = "attestation",
+            "Signing attestation"
+        );
+
         // Acquire per-validator lock to serialize check-record-sign for the same validator.
         let lock = self.validator_locks.get(&pubkey_bytes);
         let _guard = lock.lock().await;
@@ -177,7 +186,14 @@ impl SignerService {
 
         if let Err(e) = slashing_check_result {
             tracing::Span::current().record("rvc.slashing.result", "blocked");
-            tracing::error!(error = %e, "Attestation slashing protection blocked signing");
+            error!(
+                pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                slot = attestation_data.slot,
+                source_epoch = source_epoch,
+                target_epoch = target_epoch,
+                rejection_reason = %e,
+                "Slashing protection rejected attestation"
+            );
             RVC_SLASHING_PROTECTION_CHECKS_TOTAL
                 .with_label_values(&[slashing_result::BLOCKED])
                 .inc();
@@ -193,8 +209,12 @@ impl SignerService {
             Err(e) => {
                 // Phantom entry: record exists but signing failed. This is safe per spec —
                 // missing a duty is far less harmful than double-signing.
-                warn!(error = %e, pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    "Attestation signing failed after recording (phantom entry in slashing DB)");
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "attestation",
+                    "Signing failed"
+                );
                 return Err(e.into());
             }
         };
@@ -202,6 +222,12 @@ impl SignerService {
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
         RVC_ATTESTATIONS_TOTAL.with_label_values(&["success"]).inc();
+
+        debug!(
+            duration_ms = start.elapsed().as_millis() as u64,
+            signing_type = "attestation",
+            "Signing completed"
+        );
 
         Ok(signature)
     }
@@ -219,6 +245,13 @@ impl SignerService {
         let start = Instant::now();
         let pubkey_bytes = pubkey.to_bytes();
         let pubkey_hex = hex::encode(pubkey_bytes);
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "block",
+            "Signing block"
+        );
 
         // Acquire per-validator lock to serialize check-record-sign for the same validator.
         let lock = self.validator_locks.get(&pubkey_bytes);
@@ -242,7 +275,12 @@ impl SignerService {
 
         if let Err(e) = slashing_check_result {
             tracing::Span::current().record("rvc.slashing.result", "blocked");
-            tracing::error!(error = %e, "Block slashing protection blocked signing");
+            error!(
+                pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                slot = slot,
+                rejection_reason = %e,
+                "Slashing protection rejected block proposal"
+            );
             RVC_SLASHING_PROTECTION_CHECKS_TOTAL
                 .with_label_values(&[slashing_result::BLOCKED])
                 .inc();
@@ -256,14 +294,24 @@ impl SignerService {
             Ok(sig) => sig,
             Err(e) => {
                 // Phantom entry: record exists but signing failed. Safe per spec.
-                warn!(error = %e, pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    "Block signing failed after recording (phantom entry in slashing DB)");
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "block",
+                    "Signing failed"
+                );
                 return Err(e.into());
             }
         };
 
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
+
+        debug!(
+            duration_ms = start.elapsed().as_millis() as u64,
+            signing_type = "block",
+            "Signing completed"
+        );
 
         Ok(signature)
     }
@@ -277,6 +325,17 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            epoch = epoch,
+            signing_type = "randao",
+            "Signing RANDAO reveal"
+        );
+
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
         let domain = crypto::compute_domain(
@@ -286,8 +345,25 @@ impl SignerService {
         );
         let signing_root = crypto::compute_signing_root(&epoch, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "randao",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "randao",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs a sync committee message for the given beacon block root and slot.
@@ -300,6 +376,17 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "sync_committee_message",
+            "Signing sync committee message"
+        );
+
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
@@ -307,8 +394,25 @@ impl SignerService {
             crypto::compute_domain(DOMAIN_SYNC_COMMITTEE, fork_version, *genesis_validators_root);
         let signing_root = crypto::compute_signing_root(beacon_block_root, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "sync_committee_message",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "sync_committee_message",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
@@ -320,6 +424,17 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "selection_proof",
+            "Signing selection proof"
+        );
+
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
@@ -330,8 +445,25 @@ impl SignerService {
         );
         let signing_root = crypto::compute_signing_root(&slot, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "selection_proof",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "selection_proof",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
@@ -343,7 +475,18 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
         let slot = aggregate_and_proof.aggregate.data.slot;
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "aggregate_and_proof",
+            "Signing aggregate and proof"
+        );
+
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
@@ -354,8 +497,25 @@ impl SignerService {
         );
         let signing_root = crypto::compute_signing_root(aggregate_and_proof, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "aggregate_and_proof",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "aggregate_and_proof",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
@@ -367,7 +527,18 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
         let slot = aggregate_and_proof.aggregate.data.slot;
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "electra_aggregate_and_proof",
+            "Signing Electra aggregate and proof"
+        );
+
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
@@ -378,8 +549,25 @@ impl SignerService {
         );
         let signing_root = crypto::compute_signing_root(aggregate_and_proof, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "electra_aggregate_and_proof",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "electra_aggregate_and_proof",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs a voluntary exit with DOMAIN_VOLUNTARY_EXIT.
@@ -391,6 +579,17 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            epoch = voluntary_exit.epoch,
+            signing_type = "voluntary_exit",
+            "Signing voluntary exit"
+        );
+
         let fork_name = eth_types::ForkName::from_epoch(voluntary_exit.epoch, fork_schedule);
         // EIP-7044: cap fork version at Capella for voluntary exits
         let capped = if fork_name >= eth_types::ForkName::Capella {
@@ -406,8 +605,25 @@ impl SignerService {
         );
         let signing_root = crypto::compute_signing_root(voluntary_exit, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "voluntary_exit",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "voluntary_exit",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs a builder registration with DOMAIN_APPLICATION_BUILDER.
@@ -420,13 +636,40 @@ impl SignerService {
         pubkey: &PublicKey,
         fork_version: [u8; 4],
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            signing_type = "builder_registration",
+            "Signing builder registration"
+        );
+
         let zeroed_genesis_root = [0u8; 32];
         let domain =
             crypto::compute_domain(DOMAIN_APPLICATION_BUILDER, fork_version, zeroed_genesis_root);
         let signing_root = crypto::compute_signing_root(registration, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "builder_registration",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "builder_registration",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs a sync committee selection proof for the given slot and subcommittee.
@@ -439,6 +682,18 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            subcommittee_index = subcommittee_index,
+            signing_type = "sync_committee_selection_proof",
+            "Signing sync committee selection proof"
+        );
+
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
@@ -450,8 +705,25 @@ impl SignerService {
         let selection_data = SyncAggregatorSelectionData { slot, subcommittee_index };
         let signing_root = crypto::compute_signing_root(&selection_data, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "sync_committee_selection_proof",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "sync_committee_selection_proof",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs a ContributionAndProof with DOMAIN_CONTRIBUTION_AND_PROOF.
@@ -463,7 +735,19 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        let epoch = contribution_and_proof.contribution.slot / SLOTS_PER_EPOCH;
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+        let slot = contribution_and_proof.contribution.slot;
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "contribution_and_proof",
+            "Signing contribution and proof"
+        );
+
+        let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
         let domain = crypto::compute_domain(
@@ -473,8 +757,25 @@ impl SignerService {
         );
         let signing_root = crypto::compute_signing_root(contribution_and_proof, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "contribution_and_proof",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "contribution_and_proof",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Returns a reference to the underlying composite signer.
