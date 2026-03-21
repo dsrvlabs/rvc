@@ -26,22 +26,25 @@ ENV CARGO_PROFILE_RELEASE_STRIP=true
 ENV CARGO_PROFILE_RELEASE_LTO=true
 
 # Cook dependencies from recipe (cached until Cargo.toml/Cargo.lock change)
-ARG FEATURES=""
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json \
-    ${FEATURES:+--features "$FEATURES"}
+RUN cargo chef cook --release --recipe-path recipe.json
 
 # === Tier 2: Source Compilation ===
 
 # Stage 4: builder — compile all binaries
 FROM cook AS builder
 COPY . .
-ARG FEATURES=""
-RUN cargo build --release \
-    -p rvc-bin --bin rvc \
-    -p rvc-signer-bin --bin rvc-signer \
-    -p rvc-keygen --bin rvc-keygen \
-    ${FEATURES:+--features "$FEATURES"}
+# Features are package-specific:
+#   rvc-bin: gcp-trace, gcp-secret
+#   rvc-signer-bin: dvt
+#   rvc-keygen: (none)
+ARG RVC_FEATURES=""
+ARG SIGNER_FEATURES=""
+RUN cargo build --release -p rvc-bin --bin rvc \
+        ${RVC_FEATURES:+--features "$RVC_FEATURES"} && \
+    cargo build --release -p rvc-signer-bin --bin rvc-signer \
+        ${SIGNER_FEATURES:+--features "$SIGNER_FEATURES"} && \
+    cargo build --release -p rvc-keygen --bin rvc-keygen
 
 # === Tier 3: Runtime Images ===
 
