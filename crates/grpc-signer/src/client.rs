@@ -1,9 +1,12 @@
+use std::time::Instant;
+
 use async_trait::async_trait;
 use tonic::transport::Channel;
 use tracing::Instrument;
 use url::Url;
 use zeroize::Zeroizing;
 
+use crypto::logging::TruncatedPubkey;
 use crypto::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
 use crypto::{Signer, SigningError};
 use eth_types::Root;
@@ -50,8 +53,10 @@ pub struct GrpcRemoteSigner {
 }
 
 impl GrpcRemoteSigner {
+    #[tracing::instrument(name = "rvc.grpc_signer.connect", skip_all)]
     pub async fn connect(config: GrpcRemoteSignerConfig) -> Result<Self, SigningError> {
         let url = config.url.trim_end_matches('/').to_string();
+        let tls_enabled = config.tls_cert.is_some();
 
         let channel = if let (Some(cert), Some(key), Some(ca_cert)) =
             (config.tls_cert, config.tls_key, config.tls_ca_cert)
@@ -69,6 +74,11 @@ impl GrpcRemoteSigner {
                 .connect()
                 .await
                 .map_err(|e| {
+                    tracing::error!(
+                        endpoint = %redact_url(&url),
+                        error = %e,
+                        "gRPC signer connection failed"
+                    );
                     SigningError::RemoteSignerError(format!(
                         "failed to connect to {}: {e}",
                         redact_url(&url)
@@ -80,6 +90,11 @@ impl GrpcRemoteSigner {
                 .connect()
                 .await
                 .map_err(|e| {
+                    tracing::error!(
+                        endpoint = %redact_url(&url),
+                        error = %e,
+                        "gRPC signer connection failed"
+                    );
                     SigningError::RemoteSignerError(format!(
                         "failed to connect to {}: {e}",
                         redact_url(&url)
@@ -91,6 +106,11 @@ impl GrpcRemoteSigner {
 
         let response =
             client.list_public_keys(crate::ListPublicKeysRequest {}).await.map_err(|e| {
+                tracing::error!(
+                    endpoint = %redact_url(&url),
+                    error = %e,
+                    "gRPC signer connection failed during key listing"
+                );
                 SigningError::RemoteSignerError(format!("failed to list public keys: {e}"))
             })?;
 
@@ -102,9 +122,10 @@ impl GrpcRemoteSigner {
             .collect();
 
         tracing::info!(
-            url = %redact_url(&url),
+            endpoint = %redact_url(&url),
+            tls_enabled,
             key_count = pubkeys.len(),
-            "Connected to gRPC remote signer"
+            "gRPC signer connection established"
         );
 
         Ok(Self { client, pubkeys, url })
@@ -134,12 +155,28 @@ impl Signer for GrpcRemoteSigner {
         );
 
         async {
+            let pubkey_hex = hex::encode(pubkey);
+
+            tracing::debug!(
+                pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                signing_type = "grpc_remote",
+                "Sign request sent"
+            );
+
+            let start = Instant::now();
+
             let request =
                 crate::SignRequest { signing_root: signing_root.to_vec(), pubkey: pubkey.to_vec() };
 
             let mut client = self.client.clone();
             let response = client.sign(request).await.map_err(|status| {
                 tracing::Span::current().record("grpc.status_code", status.code() as i32);
+                tracing::warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error_code = %status.code(),
+                    message = %status.message(),
+                    "Sign error from gRPC signer"
+                );
                 SigningError::RemoteSignerError(format!(
                     "gRPC sign failed ({}): {}",
                     status.code(),
@@ -147,7 +184,14 @@ impl Signer for GrpcRemoteSigner {
                 ))
             })?;
 
+            let latency_ms = start.elapsed().as_millis() as u64;
             tracing::Span::current().record("grpc.status_code", 0i32);
+
+            tracing::debug!(
+                pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                latency_ms,
+                "Sign response received"
+            );
 
             let sig_bytes = response.into_inner().signature;
             let signature = Signature::from_bytes(&sig_bytes).map_err(|e| {
@@ -158,7 +202,7 @@ impl Signer for GrpcRemoteSigner {
                 .map_err(|e| SigningError::RemoteSignerError(format!("invalid public key: {e}")))?;
             if signature.verify(&pk, signing_root).is_err() {
                 tracing::error!(
-                    pubkey = %hex::encode(pubkey),
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     "gRPC remote signer returned invalid signature"
                 );
                 return Err(SigningError::InvalidRemoteSignature);
