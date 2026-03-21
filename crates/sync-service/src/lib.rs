@@ -4,10 +4,11 @@ mod error;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use eth_types::{
     ContributionAndProof, ForkSchedule, Root, SignedContributionAndProof, Slot,
@@ -128,6 +129,7 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
             return Ok(SyncMessagesResult { count: 0 });
         }
 
+        let signing_start = Instant::now();
         let mut messages = Vec::new();
         for (duty, pubkey) in duties.iter().zip(pubkeys.iter()) {
             let sig = match self
@@ -143,7 +145,7 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
             {
                 Ok(sig) => sig,
                 Err(e) => {
-                    tracing::warn!(
+                    warn!(
                         validator_index = duty.validator_index,
                         error = %e,
                         "Failed to sign sync committee message, skipping validator"
@@ -159,15 +161,29 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
                 signature: sig,
             });
         }
+        let signing_duration_ms = signing_start.elapsed().as_millis() as u64;
+        debug!(
+            slot,
+            count = messages.len(),
+            duration_ms = signing_duration_ms,
+            "Sync message signing batch complete"
+        );
 
         if messages.is_empty() {
             debug!(slot, "No sync committee messages to submit after signing failures");
             return Ok(SyncMessagesResult { count: 0 });
         }
 
-        debug!(count = messages.len(), slot, "Submitting sync committee messages");
-        self.beacon.submit_sync_committee_messages(&messages).await?;
-        info!(count = messages.len(), slot, "Submitted sync committee messages");
+        let count = messages.len();
+        match self.beacon.submit_sync_committee_messages(&messages).await {
+            Ok(()) => {
+                info!(slot, count, "Sync committee messages submitted successfully");
+            }
+            Err(e) => {
+                warn!(slot, count, error = %e, "Failed to submit sync committee messages");
+                return Err(e);
+            }
+        }
 
         Ok(SyncMessagesResult { count: messages.len() })
     }
@@ -246,11 +262,18 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
         }
 
         if !signed_proofs.is_empty() {
-            debug!(count = signed_proofs.len(), slot, "Submitting contribution and proofs");
-            self.beacon.submit_contribution_and_proofs(&signed_proofs).await?;
-            info!(count = signed_proofs.len(), slot, "Submitted contribution and proofs");
+            let count = signed_proofs.len();
+            match self.beacon.submit_contribution_and_proofs(&signed_proofs).await {
+                Ok(()) => {
+                    info!(slot, count, "Sync committee contributions submitted successfully");
+                }
+                Err(e) => {
+                    warn!(slot, count, error = %e, "Failed to submit sync committee contributions");
+                    return Err(e);
+                }
+            }
         } else {
-            debug!(slot, "No validators selected as sync committee aggregator");
+            debug!(slot, "Contribution production skipped, no aggregators selected");
         }
 
         Ok(ContributionsResult { count: signed_proofs.len() })

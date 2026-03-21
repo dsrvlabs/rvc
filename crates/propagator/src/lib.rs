@@ -9,7 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use bn_manager::{BeaconError, BeaconNodeClient, SubmitAttestationResult, VersionedAttestation};
 use metrics::definitions::{attestation_status, RVC_ATTESTATIONS_TOTAL};
@@ -86,6 +86,7 @@ impl<S: AttestationSubmitter> Propagator<S> {
     }
 
     /// Propagates attestations to the beacon node.
+    #[tracing::instrument(name = "rvc.propagator.propagate", skip_all, fields(rvc.count))]
     pub async fn propagate(
         &self,
         attestations: &VersionedAttestation,
@@ -95,18 +96,28 @@ impl<S: AttestationSubmitter> Propagator<S> {
             VersionedAttestation::Electra(a) | VersionedAttestation::Fulu(a) => a.len(),
         };
 
+        tracing::Span::current().record("rvc.count", total);
+
+        let (batch_slot, batch_target_epoch, _batch_committee_index) =
+            extract_attestation_context(attestations);
+
         if total == 0 {
             debug!("No attestations to propagate");
             return Ok(PropagationResult { total: 0, success_count: 0, failure_count: 0 });
         }
 
-        debug!(count = total, "Propagating attestations to beacon node");
+        debug!(count = total, slot = %batch_slot, "Propagating attestations to beacon node");
 
         let result = self.submitter.submit_attestation(attestations).await?;
 
         match result {
             SubmitAttestationResult::Success => {
-                info!(count = total, "Successfully propagated all attestations");
+                info!(
+                    slot = %batch_slot,
+                    count = total,
+                    target_epoch = %batch_target_epoch,
+                    "Attestation submission successful"
+                );
                 RVC_ATTESTATIONS_TOTAL
                     .with_label_values(&[attestation_status::SUCCESS])
                     .inc_by(total as u64);
@@ -118,24 +129,24 @@ impl<S: AttestationSubmitter> Propagator<S> {
                 let success_count = total.saturating_sub(failure_count);
 
                 if failure_count == 0 {
-                    info!(count = total, "Successfully propagated all attestations");
+                    info!(
+                        slot = %batch_slot,
+                        count = total,
+                        target_epoch = %batch_target_epoch,
+                        "Attestation submission successful"
+                    );
                     RVC_ATTESTATIONS_TOTAL
                         .with_label_values(&[attestation_status::SUCCESS])
                         .inc_by(total as u64);
                     return Ok(PropagationResult { total, success_count: total, failure_count: 0 });
                 }
 
-                let (batch_slot, batch_target_epoch, batch_committee_index) =
-                    extract_attestation_context(attestations);
-
                 for failure in &failures {
-                    warn!(
+                    debug!(
                         index = failure.index,
                         message = %failure.message,
                         slot = %batch_slot,
-                        target_epoch = %batch_target_epoch,
-                        committee_index = %batch_committee_index,
-                        "Attestation failed validation"
+                        "Individual attestation submission failed"
                     );
                 }
 
@@ -147,8 +158,21 @@ impl<S: AttestationSubmitter> Propagator<S> {
                     .inc_by(failure_count as u64);
 
                 if success_count == 0 {
+                    error!(
+                        slot = %batch_slot,
+                        failure_count,
+                        target_epoch = %batch_target_epoch,
+                        "Attestation submission complete failure"
+                    );
                     Err(PropagatorError::AllAttestationsFailed)
                 } else {
+                    warn!(
+                        slot = %batch_slot,
+                        success_count,
+                        failure_count,
+                        target_epoch = %batch_target_epoch,
+                        "Attestation submission partial failure"
+                    );
                     Err(PropagatorError::PartialFailure { success_count, failure_count })
                 }
             }
@@ -210,6 +234,7 @@ mod tests {
                         }
                         BeaconError::ParseError(msg) => BeaconError::ParseError(msg.clone()),
                         BeaconError::InvalidUrl(msg) => BeaconError::InvalidUrl(msg.clone()),
+                        other => panic!("Unexpected error variant in test mock: {:?}", other),
                     });
                 }
 
