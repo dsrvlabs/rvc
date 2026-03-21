@@ -67,10 +67,15 @@ impl<C: SlotClock> AttestationTimer<C> {
         let time_until_slot = self.clock.time_until_slot(slot)?;
 
         if time_until_slot.is_zero() {
+            tracing::trace!(phase = "slot_start", slot, drift_ms = 0, "timer wait completed");
             return Ok(());
         }
 
-        self.wait_with_cancellation(time_until_slot).await
+        let result = self.wait_with_cancellation(time_until_slot).await;
+        if result.is_ok() {
+            tracing::trace!(phase = "slot_start", slot, drift_ms = 0, "timer wait completed");
+        }
+        result
     }
 
     pub async fn wait_for_attestation_time(&mut self, slot: Slot) -> Result<(), TimingError> {
@@ -78,6 +83,7 @@ impl<C: SlotClock> AttestationTimer<C> {
 
         if time_until_attestation.is_zero() {
             self.record_attestation_delay(slot);
+            tracing::trace!(phase = "attestation", slot, drift_ms = 0, "timer wait completed");
             return Ok(());
         }
 
@@ -85,6 +91,7 @@ impl<C: SlotClock> AttestationTimer<C> {
 
         if result.is_ok() {
             self.record_attestation_delay(slot);
+            tracing::trace!(phase = "attestation", slot, drift_ms = 0, "timer wait completed");
         }
 
         result
@@ -104,6 +111,9 @@ impl<C: SlotClock> AttestationTimer<C> {
                 }
                 Err(e) => return Err(e),
             };
+
+            let epoch = self.clock.slot_to_epoch(current_slot);
+            tracing::trace!(slot = current_slot, epoch, "slot loop tick");
 
             self.update_slot_metrics(current_slot);
 

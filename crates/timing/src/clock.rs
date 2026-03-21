@@ -36,6 +36,12 @@ impl SystemSlotClock {
         if slot_duration.as_secs() < 1 {
             return Err(TimingError::InvalidSlotDuration);
         }
+        tracing::debug!(
+            genesis_time,
+            slot_duration_secs = slot_duration.as_secs(),
+            slots_per_epoch,
+            "clock created"
+        );
         Ok(Self { genesis_time, slot_duration, slots_per_epoch })
     }
 
@@ -66,7 +72,12 @@ impl SlotClock for SystemSlotClock {
             });
         }
         let seconds_since_genesis = current_time - self.genesis_time;
-        Ok(seconds_since_genesis / self.slot_duration.as_secs())
+        let slot_duration_secs = self.slot_duration.as_secs();
+        let slot = seconds_since_genesis / slot_duration_secs;
+        let epoch = slot / self.slots_per_epoch;
+        let time_into_slot_ms = (seconds_since_genesis % slot_duration_secs) * 1000;
+        tracing::trace!(slot, epoch, time_into_slot_ms, "slot transition");
+        Ok(slot)
     }
 
     fn slot_start_time(&self, slot: Slot) -> u64 {

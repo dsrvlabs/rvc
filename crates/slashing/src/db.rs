@@ -11,6 +11,7 @@ use crate::types::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata, PruneStats,
     SignedAttestation, SignedBlock, ValidatorRecord,
 };
+use crypto::logging::TruncatedPubkey;
 use eth_types::{Epoch, Slot};
 use metrics::definitions as metrics;
 
@@ -68,6 +69,7 @@ impl SlashingDb {
             strict_semantics: AtomicBool::new(false),
         };
         db.migrate()?;
+        tracing::info!(path = %path.display(), "slashing protection database opened");
         Ok(db)
     }
 
@@ -396,13 +398,20 @@ impl SlashingDb {
             data.push(ValidatorRecord { pubkey, signed_blocks, signed_attestations });
         }
 
-        Ok(InterchangeFormat {
+        let record_count = data.len();
+        let result = InterchangeFormat {
             metadata: InterchangeMetadata {
                 interchange_format_version: "5".to_string(),
                 genesis_validators_root: genesis_validators_root.to_string(),
             },
             data,
-        })
+        };
+        tracing::info!(
+            record_count,
+            path = self.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            "slashing DB export completed"
+        );
+        Ok(result)
     }
 
     #[tracing::instrument(name = "rvc.slashing.db.import", skip_all)]
@@ -465,6 +474,12 @@ impl SlashingDb {
         }
 
         tx.commit()?;
+        let record_count = interchange.data.len();
+        tracing::info!(
+            record_count,
+            path = self.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+            "slashing DB import completed"
+        );
         Ok(())
     }
 
@@ -584,6 +599,12 @@ impl SlashingDb {
         if let Some(wm) = watermark {
             if (slot as i64) < wm {
                 tracing::Span::current().record("rvc.slashing.result", "blocked");
+                tracing::error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey),
+                    slot,
+                    rejection_reason = "below_block_watermark",
+                    "block proposal rejected"
+                );
                 return Err(SlashingError::BelowBlockWatermark {
                     slot,
                     watermark_slot: wm as Slot,
@@ -607,11 +628,22 @@ impl SlashingDb {
             };
             if !is_resign {
                 tracing::Span::current().record("rvc.slashing.result", "blocked");
+                tracing::error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey),
+                    slot,
+                    rejection_reason = "double_block_proposal",
+                    "block proposal rejected"
+                );
                 return Err(BlockSlashingViolation::DoubleBlockProposal { slot }.into());
             }
             // Same signing root — idempotent re-sign, commit without inserting
             tx.commit()?;
             tracing::Span::current().record("rvc.slashing.result", "safe");
+            tracing::debug!(
+                pubkey = %TruncatedPubkey::new(&pubkey),
+                slot,
+                "block proposal safe"
+            );
             return Ok(());
         }
 
@@ -626,6 +658,12 @@ impl SlashingDb {
         if let Some(min) = min_slot {
             if (slot as i64) < min {
                 tracing::Span::current().record("rvc.slashing.result", "blocked");
+                tracing::error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey),
+                    slot,
+                    rejection_reason = "slot_below_minimum",
+                    "block proposal rejected"
+                );
                 return Err(BlockSlashingViolation::SlotBelowMinimum {
                     slot,
                     min_slot: min as Slot,
@@ -641,6 +679,11 @@ impl SlashingDb {
 
         tx.commit()?;
         tracing::Span::current().record("rvc.slashing.result", "safe");
+        tracing::debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey),
+            slot,
+            "block proposal safe"
+        );
         Ok(())
     }
 
@@ -690,6 +733,13 @@ impl SlashingDb {
         if let Some(ws) = wm_source {
             if (source_epoch as i64) < ws {
                 tracing::Span::current().record("rvc.slashing.result", "blocked");
+                tracing::error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey),
+                    source_epoch,
+                    target_epoch,
+                    rejection_reason = "below_attestation_source_watermark",
+                    "attestation rejected"
+                );
                 return Err(SlashingError::BelowAttestationSourceWatermark {
                     source_epoch,
                     watermark_source: ws as Epoch,
@@ -707,6 +757,13 @@ impl SlashingDb {
         if let Some(wt) = wm_target {
             if (target_epoch as i64) < wt {
                 tracing::Span::current().record("rvc.slashing.result", "blocked");
+                tracing::error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey),
+                    source_epoch,
+                    target_epoch,
+                    rejection_reason = "below_attestation_target_watermark",
+                    "attestation rejected"
+                );
                 return Err(SlashingError::BelowAttestationWatermark {
                     target_epoch,
                     watermark_target: wt as Epoch,
@@ -760,6 +817,13 @@ impl SlashingDb {
                     _ => {
                         // Different roots, or None involved in strict mode
                         tracing::Span::current().record("rvc.slashing.result", "blocked");
+                        tracing::error!(
+                            pubkey = %TruncatedPubkey::new(&pubkey),
+                            source_epoch,
+                            target_epoch,
+                            rejection_reason = "double_vote",
+                            "attestation rejected"
+                        );
                         return Err(
                             AttestationSlashingViolation::DoubleVote { target_epoch }.into()
                         );
@@ -769,6 +833,13 @@ impl SlashingDb {
 
             if source_epoch < *existing_source && target_epoch > *existing_target {
                 tracing::Span::current().record("rvc.slashing.result", "blocked");
+                tracing::error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey),
+                    source_epoch,
+                    target_epoch,
+                    rejection_reason = "surrounding_vote",
+                    "attestation rejected"
+                );
                 return Err(AttestationSlashingViolation::SurroundingVote {
                     new_source: source_epoch,
                     new_target: target_epoch,
@@ -780,6 +851,13 @@ impl SlashingDb {
 
             if *existing_source < source_epoch && *existing_target > target_epoch {
                 tracing::Span::current().record("rvc.slashing.result", "blocked");
+                tracing::error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey),
+                    source_epoch,
+                    target_epoch,
+                    rejection_reason = "surrounded_vote",
+                    "attestation rejected"
+                );
                 return Err(AttestationSlashingViolation::SurroundedVote {
                     new_source: source_epoch,
                     new_target: target_epoch,
@@ -796,6 +874,13 @@ impl SlashingDb {
             if let Some(min) = min_target {
                 if target_epoch < min {
                     tracing::Span::current().record("rvc.slashing.result", "blocked");
+                    tracing::error!(
+                        pubkey = %TruncatedPubkey::new(&pubkey),
+                        source_epoch,
+                        target_epoch,
+                        rejection_reason = "target_epoch_below_minimum",
+                        "attestation rejected"
+                    );
                     return Err(AttestationSlashingViolation::TargetEpochBelowMinimum {
                         target_epoch,
                         min_target: min,
@@ -813,6 +898,12 @@ impl SlashingDb {
 
         tx.commit()?;
         tracing::Span::current().record("rvc.slashing.result", "safe");
+        tracing::debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey),
+            source_epoch,
+            target_epoch,
+            "attestation safe"
+        );
         Ok(())
     }
 
@@ -1092,6 +1183,14 @@ impl SlashingDb {
         metrics::RVC_SLASHING_DB_PRUNE_TOTAL
             .with_label_values(&[metrics::prune_type::ATTESTATION])
             .inc_by(attestations_deleted as u64);
+
+        let pruned_count = blocks_deleted + attestations_deleted;
+        tracing::info!(
+            pruned_count,
+            blocks_deleted,
+            attestations_deleted,
+            "slashing DB prune completed"
+        );
 
         Ok(PruneStats {
             attestations_deleted: attestations_deleted as u64,

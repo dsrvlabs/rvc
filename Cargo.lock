@@ -4260,6 +4260,7 @@ dependencies = [
  "parking_lot",
  "proptest",
  "rusqlite",
+ "rvc-crypto",
  "rvc-eth-types",
  "rvc-metrics",
  "serde",
