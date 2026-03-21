@@ -60,7 +60,6 @@ pub struct BnManager {
     clients: Vec<BeaconClient>,
     sync_statuses: SharedSyncStatuses,
     health_trackers: SharedHealthTrackers,
-    overall_timeout: Option<Duration>,
     operation_timeouts: Option<OperationTimeouts>,
 }
 
@@ -110,13 +109,7 @@ impl BnManager {
         let sync_statuses = new_shared_sync_statuses(clients.len());
         let endpoints: Vec<String> = clients.iter().map(|c| c.endpoint().to_string()).collect();
         let health_trackers = new_shared_health_trackers(&endpoints);
-        Ok(Self {
-            clients,
-            sync_statuses,
-            health_trackers,
-            overall_timeout: None,
-            operation_timeouts: None,
-        })
+        Ok(Self { clients, sync_statuses, health_trackers, operation_timeouts: None })
     }
 
     /// Returns the shared sync status tracker.
@@ -127,16 +120,6 @@ impl BnManager {
     /// Returns the shared health trackers.
     pub fn health_trackers(&self) -> &SharedHealthTrackers {
         &self.health_trackers
-    }
-
-    /// Sets an overall deadline for multi-BN operations (`query_best`, `broadcast`).
-    ///
-    /// When set, the entire operation (including all BN queries and fallbacks)
-    /// is wrapped in `tokio::time::timeout`. If the deadline expires before any
-    /// BN responds, a timeout error is returned.
-    pub fn with_overall_timeout(mut self, timeout: Duration) -> Self {
-        self.overall_timeout = Some(timeout);
-        self
     }
 
     /// Sets per-operation timeouts for BN API calls.
@@ -294,22 +277,7 @@ impl BnManager {
             rvc.bn.strategy = "first",
             rvc.bn.tried = tracing::field::Empty,
         );
-        if let Some(deadline) = self.overall_timeout {
-            match tokio::time::timeout(
-                deadline,
-                self.query_first_inner(op_name, &op).instrument(strategy_span),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(BeaconError::HttpError(format!(
-                    "{op_name}: overall deadline of {}s exceeded",
-                    deadline.as_secs()
-                ))),
-            }
-        } else {
-            self.query_first_inner(op_name, &op).instrument(strategy_span).await
-        }
+        self.query_first_inner(op_name, &op).instrument(strategy_span).await
     }
 
     async fn query_first_inner<'s, T, F>(&'s self, op_name: &str, op: &F) -> Result<T, BeaconError>
@@ -397,22 +365,6 @@ impl BnManager {
             rvc.bn.strategy = "best",
             rvc.bn.tried = tracing::field::Empty,
         );
-        if let Some(deadline) = self.overall_timeout {
-            match tokio::time::timeout(
-                deadline,
-                self.query_best_inner(op_name, &op, pick_best).instrument(strategy_span),
-            )
-            .await
-            {
-                Ok(result) => return result,
-                Err(_) => {
-                    return Err(BeaconError::HttpError(format!(
-                        "{op_name}: overall deadline of {}s exceeded",
-                        deadline.as_secs()
-                    )))
-                }
-            }
-        }
         self.query_best_inner(op_name, &op, pick_best).instrument(strategy_span).await
     }
 
@@ -598,22 +550,6 @@ impl BnManager {
             rvc.bn.strategy = "broadcast",
             rvc.bn.tried = self.clients.len(),
         );
-        if let Some(deadline) = self.overall_timeout {
-            match tokio::time::timeout(
-                deadline,
-                self.broadcast_inner(op_name, &op).instrument(strategy_span),
-            )
-            .await
-            {
-                Ok(result) => return result,
-                Err(_) => {
-                    return Err(BeaconError::HttpError(format!(
-                        "{op_name}: overall deadline of {}s exceeded",
-                        deadline.as_secs()
-                    )))
-                }
-            }
-        }
         self.broadcast_inner(op_name, &op).instrument(strategy_span).await
     }
 
@@ -702,22 +638,6 @@ impl BnManager {
             rvc.bn.strategy = "broadcast",
             rvc.bn.tried = self.clients.len(),
         );
-        if let Some(deadline) = self.overall_timeout {
-            match tokio::time::timeout(
-                deadline,
-                self.broadcast_with_result_inner(op_name, &op).instrument(strategy_span),
-            )
-            .await
-            {
-                Ok(result) => return result,
-                Err(_) => {
-                    return Err(BeaconError::HttpError(format!(
-                        "{op_name}: overall deadline of {}s exceeded",
-                        deadline.as_secs()
-                    )))
-                }
-            }
-        }
         self.broadcast_with_result_inner(op_name, &op).instrument(strategy_span).await
     }
 
@@ -1034,7 +954,7 @@ impl BeaconNodeClient for BnManager {
     ) -> Result<(), BeaconError> {
         self.with_op_timeout(
             "submit_contribution_and_proofs",
-            self.op_timeout(|t| t.sync_message),
+            self.op_timeout(|t| t.sync_contribution),
             self.broadcast("submit_contribution_and_proofs", |c| {
                 Box::pin(c.submit_contribution_and_proofs(proofs))
             }),
@@ -3047,92 +2967,6 @@ mod tests {
         let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
         let version = manager.get_node_version().await.unwrap();
         assert_eq!(version, "Teku/v24.0.0");
-    }
-
-    #[tokio::test]
-    async fn test_overall_deadline_fires_when_all_bns_slow() {
-        let server = MockServer::start().await;
-
-        // Both syncing + version respond normally for setup
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/node/syncing"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "head_slot": "100", "sync_distance": "0", "is_syncing": false, "is_optimistic": false, "el_offline": false }
-            })))
-            .mount(&server)
-            .await;
-
-        // Genesis responds slowly — longer than deadline
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/beacon/genesis"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({
-                        "data": {
-                            "genesis_time": "1606824023",
-                            "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                            "genesis_fork_version": "0x00000000"
-                        }
-                    }))
-                    .set_delay(Duration::from_secs(5)),
-            )
-            .mount(&server)
-            .await;
-
-        let config = BnManagerConfig::new(vec![server.uri()]);
-        let manager =
-            BnManager::new(config).unwrap().with_overall_timeout(Duration::from_millis(200));
-
-        // Mark BN as synced so query_first is used
-        {
-            let mut statuses = manager.sync_statuses().write().await;
-            statuses[0] = BnSyncStatus::Synced;
-        }
-
-        let result = manager.get_genesis().await;
-        assert!(result.is_err(), "Should timeout when BN is slower than overall deadline");
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("deadline") || err_msg.contains("timed out"),
-            "Error should mention deadline/timeout, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_no_overall_deadline_by_default() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/node/syncing"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "head_slot": "100", "sync_distance": "0", "is_syncing": false, "is_optimistic": false, "el_offline": false }
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/beacon/genesis"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": {
-                    "genesis_time": "1606824023",
-                    "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                    "genesis_fork_version": "0x00000000"
-                }
-            })))
-            .mount(&server)
-            .await;
-
-        let config = BnManagerConfig::new(vec![server.uri()]);
-        let manager = BnManager::new(config).unwrap();
-
-        // No overall_timeout set — should default to None
-        {
-            let mut statuses = manager.sync_statuses().write().await;
-            statuses[0] = BnSyncStatus::Synced;
-        }
-
-        let result = manager.get_genesis().await;
-        assert!(result.is_ok(), "Should succeed without overall deadline");
     }
 
     #[tokio::test]
