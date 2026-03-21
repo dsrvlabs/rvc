@@ -21,23 +21,45 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Set release profile overrides for smaller binaries
+ENV CARGO_PROFILE_RELEASE_STRIP=true
+ENV CARGO_PROFILE_RELEASE_LTO=true
+
+# Cook dependencies from recipe (cached until Cargo.toml/Cargo.lock change)
+ARG FEATURES=""
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json \
+    ${FEATURES:+--features "$FEATURES"}
 
 # === Tier 2: Source Compilation ===
 
 # Stage 4: builder — compile all binaries
 FROM cook AS builder
 COPY . .
+ARG FEATURES=""
 RUN cargo build --release \
     -p rvc-bin --bin rvc \
     -p rvc-signer-bin --bin rvc-signer \
-    -p rvc-keygen --bin rvc-keygen
+    -p rvc-keygen --bin rvc-keygen \
+    ${FEATURES:+--features "$FEATURES"}
 
 # === Tier 3: Runtime Images ===
 
 # Stage 5: rvc — validator client runtime
 FROM debian:bookworm-slim AS rvc
+
+LABEL org.opencontainers.image.title="rvc" \
+      org.opencontainers.image.description="Rust Ethereum Validator Client" \
+      org.opencontainers.image.url="https://github.com/rootwarp/rvc" \
+      org.opencontainers.image.source="https://github.com/rootwarp/rvc" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
+
+ARG VERSION=""
+ARG GIT_SHA=""
+ARG BUILD_DATE=""
+LABEL org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -67,6 +89,19 @@ ENTRYPOINT ["/usr/local/bin/rvc"]
 # Stage 6: rvc-signer — remote signer runtime
 FROM debian:bookworm-slim AS rvc-signer
 
+LABEL org.opencontainers.image.title="rvc-signer" \
+      org.opencontainers.image.description="Rust Ethereum Validator Remote Signer" \
+      org.opencontainers.image.url="https://github.com/rootwarp/rvc" \
+      org.opencontainers.image.source="https://github.com/rootwarp/rvc" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
+
+ARG VERSION=""
+ARG GIT_SHA=""
+ARG BUILD_DATE=""
+LABEL org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     libgcc-s1 \
@@ -94,6 +129,19 @@ ENTRYPOINT ["/usr/local/bin/rvc-signer"]
 
 # Stage 7: rvc-keygen — key generation CLI
 FROM debian:bookworm-slim AS rvc-keygen
+
+LABEL org.opencontainers.image.title="rvc-keygen" \
+      org.opencontainers.image.description="Rust Ethereum Validator Key Generator" \
+      org.opencontainers.image.url="https://github.com/rootwarp/rvc" \
+      org.opencontainers.image.source="https://github.com/rootwarp/rvc" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0"
+
+ARG VERSION=""
+ARG GIT_SHA=""
+ARG BUILD_DATE=""
+LABEL org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${GIT_SHA}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
