@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use tracing::info;
 
+use crypto::logging::RedactedUrl;
+
 use crate::beacon_adapter::BeaconBlockAdapter;
 use crate::doppelganger_adapter::{BeaconLivenessAdapter, SlashingDbReaderAdapter};
 use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle, PubkeyMap};
@@ -64,6 +66,34 @@ pub struct ServiceBuilder {
 impl ServiceBuilder {
     pub fn new(config: Config) -> Self {
         Self { config }
+    }
+
+    pub fn log_effective_config(&self) {
+        let redacted_bns: Vec<String> = self
+            .config
+            .effective_beacon_nodes()
+            .iter()
+            .map(|u| format!("{}", RedactedUrl(u)))
+            .collect();
+
+        info!(
+            bn_urls = ?redacted_bns,
+            key_dir = ?self.config.keystore_path,
+            network = %self.config.network,
+            features = %format!(
+                "doppelganger={}, builder=true, keymanager={}",
+                self.config.doppelganger_detection,
+                self.config.keymanager_enabled
+            ),
+            "Effective configuration"
+        );
+
+        info!(
+            doppelganger_enabled = self.config.doppelganger_detection,
+            builder_enabled = true,
+            keymanager_enabled = self.config.keymanager_enabled,
+            "Feature toggles"
+        );
     }
 
     pub fn build_beacon(&self) -> Result<Arc<BeaconClient>, ConfigError> {
@@ -347,6 +377,8 @@ impl ServiceBuilder {
         ),
         ConfigError,
     > {
+        self.log_effective_config();
+
         let beacon_client = self.build_beacon()?;
         let key_manager = self.build_key_manager()?;
         let slashing_db = self.build_slashing_db()?;
@@ -682,5 +714,12 @@ mod tests {
 
         let _builder_service =
             builder.build_builder_service(signer, beacon, validator_store, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_log_effective_config_does_not_panic() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        builder.log_effective_config();
     }
 }

@@ -430,6 +430,13 @@ async fn main() -> anyhow::Result<()> {
             let tracing_config = build_tracing_config(&cfg);
             let tracing_guard = init_logging(&log_level, tracing_config.as_ref());
 
+            info!(
+                version = env!("CARGO_PKG_VERSION"),
+                network = %cfg.network,
+                commit = option_env!("GIT_COMMIT").unwrap_or("unknown"),
+                "rvc starting"
+            );
+
             if let Err(e) = cfg.validate() {
                 error!("Configuration validation failed: {}", e);
                 return Err(e.into());
@@ -601,6 +608,8 @@ async fn run_validator(
     timeouts: bn_manager::OperationTimeouts,
     tracing_guard: Option<telemetry::TracingGuard>,
 ) -> anyhow::Result<()> {
+    let startup_time = std::time::Instant::now();
+
     let redacted_nodes: Vec<String> =
         config.effective_beacon_nodes().iter().map(|u| redact_url(u)).collect();
     info!(
@@ -1055,6 +1064,8 @@ async fn run_validator(
     }
 
     // Step 8: Start main duty loop
+    let validator_count = pubkey_map.read().len();
+    let bn_count = config.effective_beacon_nodes().len();
     let (mut orchestrator, orchestrator_handle) = rvc::orchestrator::DutyOrchestrator::new(
         slot_clock,
         duty_tracker,
@@ -1094,6 +1105,7 @@ async fn run_validator(
         health_status.clone(),
     ));
 
+    startup::log_orchestrator_started(validator_count, bn_count);
     info!("Starting duty orchestrator");
 
     tokio::select! {
@@ -1114,7 +1126,7 @@ async fn run_validator(
         }
     }
 
-    info!("Initiating graceful shutdown...");
+    startup::log_shutdown_initiated("signal received");
     shutdown_token.cancel();
     orchestrator_handle.shutdown();
 
@@ -1132,7 +1144,7 @@ async fn run_validator(
     })
     .await;
 
-    info!("Validator client shut down complete");
+    info!(uptime_secs = startup_time.elapsed().as_secs(), "Validator client shut down complete");
     Ok(())
 }
 

@@ -182,6 +182,16 @@ pub async fn run_doppelganger_detection(
     Ok(all_safe)
 }
 
+/// Log that the orchestrator has been started with validator and beacon node counts.
+pub fn log_orchestrator_started(validator_count: usize, bn_count: usize) {
+    info!(validator_count, bn_count, "Orchestrator started");
+}
+
+/// Log that a shutdown has been initiated with the reason.
+pub fn log_shutdown_initiated(reason: &str) {
+    info!(reason, "Shutdown initiated");
+}
+
 /// Check that the beacon node's current head fork version is known in the schedule.
 ///
 /// Prevents future fork-version drift from silently producing invalid signatures.
@@ -691,5 +701,15 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("0xdeadbeef"));
         assert!(msg.contains("upgrade rvc"));
+    }
+
+    #[test]
+    fn test_log_orchestrator_started_does_not_panic() {
+        log_orchestrator_started(10, 3);
+    }
+
+    #[test]
+    fn test_log_shutdown_initiated_does_not_panic() {
+        log_shutdown_initiated("SIGTERM");
     }
 }

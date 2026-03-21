@@ -306,6 +306,26 @@ where
                     self.prepare_proposers().await;
                     self.submit_committee_subscriptions(current_epoch).await;
                     self.submit_committee_subscriptions(current_epoch + 1).await;
+
+                    // Epoch boundary summary
+                    let mut attester_count = 0usize;
+                    for slot_offset in 0..SLOTS_PER_EPOCH {
+                        let slot = current_epoch * SLOTS_PER_EPOCH + slot_offset;
+                        attester_count += self.duty_tracker.get_duties_for_slot(slot).await.len();
+                    }
+                    let mut proposer_count = 0usize;
+                    for slot_offset in 0..SLOTS_PER_EPOCH {
+                        let slot = current_epoch * SLOTS_PER_EPOCH + slot_offset;
+                        if self.duty_tracker.get_proposer_duty(slot).await.is_some() {
+                            proposer_count += 1;
+                        }
+                    }
+                    let sync_count =
+                        self.duty_tracker.get_sync_committee_duties(current_slot).await.len();
+                    info!(
+                        epoch = current_epoch,
+                        attester_count, proposer_count, sync_count, "Epoch boundary summary"
+                    );
                 }
                 .instrument(epoch_span)
                 .await;
@@ -347,6 +367,23 @@ where
 
                 if self.check_shutdown() {
                     return Ok(());
+                }
+
+                // Check for missed attestation deadline
+                {
+                    let slot_duration = self.clock.slot_duration();
+                    let expected_att_time =
+                        self.clock.slot_start_time(current_slot) + slot_duration.as_secs() / 3;
+                    let now = self.clock.current_time_secs();
+                    if now > expected_att_time {
+                        let delay_ms = (now - expected_att_time) * 1000;
+                        // Only warn if the delay exceeds the expected attestation window
+                        // (i.e., we're past 2/3 of the slot)
+                        let att_window = slot_duration.as_secs() / 3;
+                        if delay_ms > att_window * 1000 {
+                            warn!(slot = current_slot, delay_ms, "Missed attestation deadline");
+                        }
+                    }
                 }
 
                 if let Err(e) =
@@ -1557,6 +1594,9 @@ where
                 .with_label_values(&[orchestrator_result::SUCCESS])
                 .inc();
         }
+
+        let target_epoch = slot / SLOTS_PER_EPOCH;
+        info!(slot = slot, count = success_count, target_epoch, "Batch attestation summary");
 
         info!(
             slot = slot,
