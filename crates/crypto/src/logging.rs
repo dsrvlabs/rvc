@@ -13,7 +13,7 @@ impl<'a> TruncatedPubkey<'a> {
 impl std::fmt::Display for TruncatedPubkey<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let hex = self.0.strip_prefix("0x").unwrap_or(self.0);
-        if hex.len() > 18 {
+        if hex.len() > 18 && hex.is_ascii() {
             write!(f, "0x{}...{}", &hex[..10], &hex[hex.len() - 8..])
         } else {
             write!(f, "0x{hex}")
@@ -88,6 +88,13 @@ mod tests {
     fn test_truncated_pubkey_empty() {
         let result = TruncatedPubkey::new("").to_string();
         assert_eq!(result, "0x");
+    }
+
+    #[test]
+    fn test_truncated_pubkey_non_ascii_falls_back() {
+        let input = "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74à";
+        let result = TruncatedPubkey::new(input).to_string();
+        assert_eq!(result, "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74à");
     }
 
     // --- RedactedUrl tests ---
