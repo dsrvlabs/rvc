@@ -474,6 +474,109 @@ mod tests {
         assert!(att.try_tree_hash_root().is_err());
     }
 
+    mod fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_attestation_data() -> impl Strategy<Value = AttestationData> {
+            (
+                any::<u64>(),
+                any::<u64>(),
+                any::<[u8; 32]>(),
+                any::<u64>(),
+                any::<[u8; 32]>(),
+                any::<u64>(),
+                any::<[u8; 32]>(),
+            )
+                .prop_map(
+                    |(slot, index, bbr, src_epoch, src_root, tgt_epoch, tgt_root)| {
+                        AttestationData {
+                            slot,
+                            index,
+                            beacon_block_root: bbr,
+                            source: Checkpoint { epoch: src_epoch, root: src_root },
+                            target: Checkpoint { epoch: tgt_epoch, root: tgt_root },
+                        }
+                    },
+                )
+        }
+
+        fn arb_attestation() -> impl Strategy<Value = Attestation> {
+            (
+                proptest::collection::vec(any::<u8>(), 0..128),
+                arb_attestation_data(),
+                proptest::collection::vec(any::<u8>(), 96..=96),
+            )
+                .prop_map(|(bits, data, sig)| Attestation {
+                    aggregation_bits: bits,
+                    data,
+                    signature: sig,
+                })
+        }
+
+        fn arb_electra_attestation() -> impl Strategy<Value = ElectraAttestation> {
+            (
+                proptest::collection::vec(any::<u8>(), 0..128),
+                arb_attestation_data(),
+                proptest::collection::vec(any::<u8>(), 96..=96),
+                proptest::collection::vec(any::<u8>(), 0..64),
+            )
+                .prop_map(|(bits, data, sig, committee)| ElectraAttestation {
+                    aggregation_bits: bits,
+                    data,
+                    signature: sig,
+                    committee_bits: committee,
+                })
+        }
+
+        proptest! {
+            #[test]
+            fn fuzz_attestation_try_tree_hash_root_no_panic(att in arb_attestation()) {
+                let _ = att.try_tree_hash_root();
+            }
+
+            #[test]
+            fn fuzz_electra_attestation_try_tree_hash_root_no_panic(att in arb_electra_attestation()) {
+                let _ = att.try_tree_hash_root();
+            }
+
+            #[test]
+            fn fuzz_attestation_serde_roundtrip(att in arb_attestation()) {
+                let json = serde_json::to_string(&att).unwrap();
+                let deserialized: Attestation = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(att, deserialized);
+            }
+
+            #[test]
+            fn fuzz_aggregate_and_proof_try_tree_hash_root_no_panic(
+                att in arb_attestation(),
+                idx in any::<u64>(),
+                proof in proptest::collection::vec(any::<u8>(), 96..=96),
+            ) {
+                let agg = AggregateAndProof {
+                    aggregator_index: idx,
+                    aggregate: att,
+                    selection_proof: proof,
+                };
+                let _ = agg.try_tree_hash_root();
+            }
+
+            #[test]
+            fn fuzz_electra_aggregate_and_proof_try_tree_hash_root_no_panic(
+                att in arb_electra_attestation(),
+                idx in any::<u64>(),
+                proof in proptest::collection::vec(any::<u8>(), 96..=96),
+            ) {
+                let agg = ElectraAggregateAndProof {
+                    aggregator_index: idx,
+                    aggregate: att,
+                    selection_proof: proof,
+                };
+                let _ = agg.try_tree_hash_root();
+            }
+        }
+    }
+
     #[test]
     fn test_electra_aggregate_and_proof_try_tree_hash_root_invalid_bits() {
         let mut proof = sample_electra_aggregate_and_proof();

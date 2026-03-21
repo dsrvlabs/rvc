@@ -94,6 +94,44 @@ mod tests {
         assert!(result.is_err());
     }
 
+    mod fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn fuzz_bitlist_tree_hash_root_no_panic(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
+                let _ = bitlist_tree_hash_root(&bytes);
+            }
+
+            #[test]
+            fn fuzz_vec_u8_tree_hash_root_no_panic(bytes in proptest::collection::vec(any::<u8>(), 0..512)) {
+                let _ = vec_u8_tree_hash_root(&bytes);
+            }
+
+            #[test]
+            fn fuzz_bitlist_tree_hash_root_deterministic(bytes in proptest::collection::vec(any::<u8>(), 0..256)) {
+                let r1 = bitlist_tree_hash_root(&bytes);
+                let r2 = bitlist_tree_hash_root(&bytes);
+                prop_assert_eq!(r1.is_ok(), r2.is_ok());
+                if let (Ok(a), Ok(b)) = (r1, r2) {
+                    prop_assert_eq!(a, b);
+                }
+            }
+
+            #[test]
+            fn fuzz_valid_bitlist_has_nonzero_last_byte(
+                prefix in proptest::collection::vec(any::<u8>(), 0..64),
+                last_byte in 1u8..=255u8
+            ) {
+                let mut bytes = prefix;
+                bytes.push(last_byte);
+                let result = bitlist_tree_hash_root(&bytes);
+                prop_assert!(result.is_ok(), "valid bitlist (non-zero last byte) should succeed");
+            }
+        }
+    }
+
     #[test]
     fn test_bitlist_sentinel_only() {
         let root = bitlist_tree_hash_root(&[0x01]).unwrap();
