@@ -57,6 +57,10 @@ enum Commands {
         /// Derive keys and show output without writing files to disk
         #[arg(long)]
         dry_run: bool,
+
+        /// Write the generated mnemonic to a backup file (0o600 permissions)
+        #[arg(long)]
+        backup_file: Option<PathBuf>,
     },
 
     /// Regenerate keys from an existing mnemonic
@@ -167,6 +171,7 @@ fn main() -> anyhow::Result<()> {
             pbkdf2,
             password_file,
             dry_run,
+            backup_file,
         } => {
             let keystore_password = password::resolve_password(password_file.as_deref())?;
             new_mnemonic::run(
@@ -179,6 +184,7 @@ fn main() -> anyhow::Result<()> {
                 pbkdf2,
                 &keystore_password,
                 dry_run,
+                backup_file.as_deref(),
             )
         }
         Commands::ExistingMnemonic {
