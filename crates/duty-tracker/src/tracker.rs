@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use bn_manager::{AttesterDuty, BeaconNodeClient, ProposerDuty};
 use eth_types::{SyncCommitteeDuty, SLOTS_PER_EPOCH};
@@ -163,10 +163,12 @@ impl DutyTracker {
 
         if let Some(epoch_cache) = cache.get(&epoch) {
             if let Some(duty) = epoch_cache.get(&key) {
+                trace!(slot, epoch, cache_type = "attester", "Cache hit");
                 return Ok(duty.clone());
             }
         }
 
+        trace!(slot, epoch, cache_type = "attester", "Cache miss");
         Err(DutyTrackerError::DutyNotFound { slot, committee_index, validator_index })
     }
 
@@ -256,7 +258,12 @@ impl DutyTracker {
         if attester_removed > 0 || proposer_removed > 0 || sync_removed > 0 {
             debug!(
                 current_epoch,
-                attester_removed, proposer_removed, sync_removed, "Evicted old duty caches"
+                retain_epoch,
+                attester_removed,
+                proposer_removed,
+                sync_removed,
+                reason = "epoch older than retain window",
+                "Evicted old duty caches"
             );
         }
     }
@@ -266,15 +273,19 @@ impl DutyTracker {
         let cache = self.cache.read().await;
 
         let Some(epoch_cache) = cache.get(&epoch) else {
+            trace!(slot, epoch, cache_type = "attester", "Cache miss for slot");
             return Vec::new();
         };
 
-        epoch_cache
+        let duties: Vec<AttesterDuty> = epoch_cache
             .duties
             .iter()
             .filter(|(key, _)| key.slot == slot)
             .map(|(_, duty)| duty.clone())
-            .collect()
+            .collect();
+
+        trace!(slot, epoch, cache_type = "attester", count = duties.len(), "Cache hit for slot");
+        duties
     }
 
     pub async fn clear_epoch_cache(&self, epoch: u64) {
@@ -332,7 +343,13 @@ impl DutyTracker {
     pub async fn get_proposer_duty(&self, slot: u64) -> Option<ProposerDuty> {
         let epoch = slot / SLOTS_PER_EPOCH;
         let cache = self.proposer_cache.read().await;
-        cache.get(&epoch).and_then(|c| c.get(&slot)).cloned()
+        let result = cache.get(&epoch).and_then(|c| c.get(&slot)).cloned();
+        if result.is_some() {
+            trace!(slot, epoch, cache_type = "proposer", "Cache hit");
+        } else {
+            trace!(slot, epoch, cache_type = "proposer", "Cache miss");
+        }
+        result
     }
 
     pub async fn get_cached_proposer_dependent_root(&self, epoch: u64) -> Option<String> {
@@ -422,7 +439,16 @@ impl DutyTracker {
         let epoch = slot / SLOTS_PER_EPOCH;
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
         let cache = self.sync_committee_cache.read().await;
-        cache.get(&period).cloned().unwrap_or_default()
+        match cache.get(&period) {
+            Some(duties) => {
+                trace!(slot, epoch, cache_type = "sync", "Cache hit");
+                duties.clone()
+            }
+            None => {
+                trace!(slot, epoch, cache_type = "sync", "Cache miss");
+                Vec::new()
+            }
+        }
     }
 
     pub async fn is_sync_period_cached(&self, epoch: u64) -> bool {
@@ -445,6 +471,15 @@ impl DutyTracker {
 
     pub fn slot_to_epoch(slot: u64) -> u64 {
         slot / SLOTS_PER_EPOCH
+    }
+
+    pub async fn cached_duty_counts(&self, epoch: u64) -> (usize, usize, usize) {
+        let attester_count = self.cache.read().await.get(&epoch).map_or(0, |c| c.duties.len());
+        let proposer_count =
+            self.proposer_cache.read().await.get(&epoch).map_or(0, |c| c.duties.len());
+        let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
+        let sync_count = self.sync_committee_cache.read().await.get(&period).map_or(0, |c| c.len());
+        (attester_count, proposer_count, sync_count)
     }
 }
 

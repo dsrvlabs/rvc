@@ -587,12 +587,17 @@ where
                 ),
             }
         }
+
+        let (attester_count, proposer_count, sync_count) =
+            self.duty_tracker.cached_duty_counts(epoch).await;
+        debug!(epoch, attester_count, proposer_count, sync_count, "Duty counts for epoch");
     }
 
     #[tracing::instrument(name = "rvc.orchestrator.check_reorg", skip_all, fields(rvc.epoch = current_epoch))]
     async fn check_reorg_at_epoch_boundary(&self, current_epoch: u64) {
         for epoch in [current_epoch, current_epoch + 1] {
             let attester_cached = self.duty_tracker.is_epoch_cached(epoch).await;
+            let old_attester_root = self.duty_tracker.get_cached_dependent_root(epoch).await;
             match tokio::time::timeout(
                 self.config.timeouts.duty_fetch,
                 self.duty_tracker.check_and_refetch_if_root_changed(epoch),
@@ -600,7 +605,13 @@ where
             .await
             {
                 Ok(Ok(true)) if attester_cached => {
-                    warn!(epoch, "Reorg detected: attester duties refetched");
+                    let new_root = self.duty_tracker.get_cached_dependent_root(epoch).await;
+                    warn!(
+                        epoch,
+                        old_head = ?old_attester_root,
+                        new_head = ?new_root,
+                        "Reorg detected: attester duties refetched"
+                    );
                     RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["attester"]).inc();
                 }
                 Ok(Ok(true)) => {
@@ -620,6 +631,8 @@ where
             }
 
             let proposer_cached = self.duty_tracker.is_proposer_epoch_cached(epoch).await;
+            let old_proposer_root =
+                self.duty_tracker.get_cached_proposer_dependent_root(epoch).await;
             match tokio::time::timeout(
                 self.config.timeouts.duty_fetch,
                 self.duty_tracker.check_and_refetch_proposer_if_root_changed(epoch),
@@ -627,7 +640,14 @@ where
             .await
             {
                 Ok(Ok(true)) if proposer_cached => {
-                    warn!(epoch, "Reorg detected: proposer duties refetched");
+                    let new_root =
+                        self.duty_tracker.get_cached_proposer_dependent_root(epoch).await;
+                    warn!(
+                        epoch,
+                        old_head = ?old_proposer_root,
+                        new_head = ?new_root,
+                        "Reorg detected: proposer duties refetched"
+                    );
                     RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["proposer"]).inc();
                 }
                 Ok(Ok(true)) => {
