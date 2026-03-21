@@ -1,4 +1,5 @@
-.PHONY: build build-release check fmt clippy test coverage clean
+.PHONY: build build-release check fmt clippy test coverage clean \
+       docker-rvc docker-signer docker-keygen docker-all
 
 # Build
 build:
@@ -6,6 +7,18 @@ build:
 
 build-release:
 	cargo build --release
+
+# Docker
+docker-rvc:
+	docker build --target rvc -t rvc:latest .
+
+docker-signer:
+	docker build --target rvc-signer -t rvc-signer:latest .
+
+docker-keygen:
+	docker build --target rvc-keygen -t rvc-keygen:latest .
+
+docker-all: docker-rvc docker-signer docker-keygen
 
 # Check and lint
 check:
