@@ -16,6 +16,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tracing::{debug, warn};
 
+use crypto::logging::TruncatedPubkey;
 use crypto::{CompositeSigner, PublicKey, Signature, Signer, SigningError};
 use eth_types::{
     AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
@@ -142,7 +143,7 @@ impl SignerService {
         );
 
         debug!(
-            pubkey = %format!("0x{}", &pubkey_hex[..16]),
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
             fork_version_used = %format!("0x{}", hex::encode(fork_version)),
             genesis_validators_root = %format!("0x{}", hex::encode(genesis_validators_root)),
             domain = %format!("0x{}", hex::encode(domain)),
@@ -155,7 +156,7 @@ impl SignerService {
         let signing_root_hex = hex::encode(signing_root);
 
         debug!(
-            pubkey = %format!("0x{}", &pubkey_hex[..16]),
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
             signing_root = %format!("0x{}", &signing_root_hex),
             slot = attestation_data.slot,
             index = attestation_data.index,
@@ -192,7 +193,7 @@ impl SignerService {
             Err(e) => {
                 // Phantom entry: record exists but signing failed. This is safe per spec —
                 // missing a duty is far less harmful than double-signing.
-                warn!(error = %e, pubkey = %format!("0x{}", &pubkey_hex[..16]),
+                warn!(error = %e, pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     "Attestation signing failed after recording (phantom entry in slashing DB)");
                 return Err(e.into());
             }
@@ -255,7 +256,7 @@ impl SignerService {
             Ok(sig) => sig,
             Err(e) => {
                 // Phantom entry: record exists but signing failed. Safe per spec.
-                warn!(error = %e, pubkey = %format!("0x{}", &pubkey_hex[..16]),
+                warn!(error = %e, pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     "Block signing failed after recording (phantom entry in slashing DB)");
                 return Err(e.into());
             }

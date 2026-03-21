@@ -10,6 +10,7 @@ keywords = ["ethereum", "beacon", "consensus", "validator"]
 categories = ["cryptography::cryptocurrencies", "api-bindings"]
 
 [dependencies]
+crypto = { workspace = true }
 eth-types = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }

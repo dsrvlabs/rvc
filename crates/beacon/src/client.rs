@@ -3,23 +3,8 @@ use std::time::Duration;
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, warn, Instrument};
-use url::Url;
 
-/// Redact credentials from a URL for safe inclusion in span attributes.
-///
-/// Replaces username and password with `***` if present, leaving the rest
-/// of the URL intact. Returns the original string if parsing fails.
-fn redact_url(url: &str) -> String {
-    if let Ok(mut parsed) = Url::parse(url) {
-        if parsed.password().is_some() || !parsed.username().is_empty() {
-            let _ = parsed.set_username("***");
-            let _ = parsed.set_password(Some("***"));
-        }
-        parsed.to_string()
-    } else {
-        url.to_string()
-    }
-}
+use crypto::logging::RedactedUrl;
 
 use eth_types::{ForkSchedule, SignedValidatorRegistration, SignedVoluntaryExit};
 
@@ -751,7 +736,7 @@ impl BeaconClient {
         let span = tracing::info_span!(
             "rvc.beacon.submit_attestations",
             http.method = "POST",
-            http.url = %redact_url(&url),
+            http.url = %RedactedUrl(&url),
             http.status_code = tracing::field::Empty,
         );
         let mut trace_headers = reqwest::header::HeaderMap::new();
@@ -899,7 +884,7 @@ impl BeaconClient {
         let span = tracing::info_span!(
             "rvc.beacon.http",
             http.method = %http_method,
-            http.url = %redact_url(url),
+            http.url = %RedactedUrl(url),
             http.status_code = tracing::field::Empty,
         );
         let mut last_error = None;
@@ -998,7 +983,7 @@ impl BeaconClient {
         let span = tracing::info_span!(
             "rvc.beacon.http",
             http.method = "POST",
-            http.url = %redact_url(&url),
+            http.url = %RedactedUrl(&url),
             http.status_code = tracing::field::Empty,
         );
         let mut trace_headers = reqwest::header::HeaderMap::new();
@@ -1099,7 +1084,7 @@ impl BeaconClient {
         let span = tracing::info_span!(
             "rvc.beacon.http",
             http.method = %http_method,
-            http.url = %redact_url(url),
+            http.url = %RedactedUrl(url),
             http.status_code = tracing::field::Empty,
         );
         let mut last_error = None;

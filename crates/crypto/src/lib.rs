@@ -10,6 +10,7 @@ pub mod eip2333;
 mod error;
 mod key_manager;
 mod keystore;
+pub mod logging;
 pub mod mnemonic;
 mod remote_signer;
 mod signer_trait;
