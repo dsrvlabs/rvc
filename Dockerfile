@@ -29,7 +29,10 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Stage 4: builder — compile all binaries
 FROM cook AS builder
 COPY . .
-RUN cargo build --release --bin rvc --bin rvc-signer --bin rvc-keygen
+RUN cargo build --release \
+    -p rvc-bin --bin rvc \
+    -p rvc-signer-bin --bin rvc-signer \
+    -p rvc-keygen --bin rvc-keygen
 
 # === Tier 3: Runtime Images ===
 
