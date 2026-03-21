@@ -1,5 +1,7 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use async_trait::async_trait;
 
@@ -30,31 +32,31 @@ impl CompositeSigner {
         pubkeys: Vec<[u8; PUBLIC_KEY_BYTES_LEN]>,
         signer: Arc<dyn Signer + Send + Sync>,
     ) {
-        let mut grpc = self.grpc_remote.write().expect("grpc_remote lock poisoned");
+        let mut grpc = self.grpc_remote.write();
         for pubkey in pubkeys {
             grpc.insert(pubkey, Arc::clone(&signer));
         }
     }
 
     pub fn remove_grpc_remote_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
-        self.grpc_remote.write().expect("grpc_remote lock poisoned").remove(pubkey).is_some()
+        self.grpc_remote.write().remove(pubkey).is_some()
     }
 
     pub fn add_remote_key(&self, pubkey: [u8; PUBLIC_KEY_BYTES_LEN], signer: RemoteSigner) {
-        self.remote.write().expect("remote lock poisoned").insert(pubkey, Arc::new(signer));
+        self.remote.write().insert(pubkey, Arc::new(signer));
     }
 
     pub fn remove_remote_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
-        self.remote.write().expect("remote lock poisoned").remove(pubkey).is_some()
+        self.remote.write().remove(pubkey).is_some()
     }
 
     pub fn add_local_key(&self, secret_key: SecretKey) {
         let pubkey = secret_key.public_key().to_bytes();
-        self.dynamic_local.write().expect("dynamic_local lock poisoned").insert(pubkey, secret_key);
+        self.dynamic_local.write().insert(pubkey, secret_key);
     }
 
     pub fn remove_local_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
-        self.dynamic_local.write().expect("dynamic_local lock poisoned").remove(pubkey).is_some()
+        self.dynamic_local.write().remove(pubkey).is_some()
     }
 }
 
@@ -67,7 +69,7 @@ impl Signer for CompositeSigner {
     ) -> Result<Signature, SigningError> {
         // Check gRPC remote signers first (highest priority)
         let grpc_signer = {
-            let grpc = self.grpc_remote.read().expect("grpc_remote lock poisoned");
+            let grpc = self.grpc_remote.read();
             grpc.get(pubkey).cloned()
         };
         if let Some(signer) = grpc_signer {
@@ -76,7 +78,7 @@ impl Signer for CompositeSigner {
 
         // Check HTTP remote signers — clone Arc to release the lock before await
         let remote_signer = {
-            let remote = self.remote.read().expect("remote lock poisoned");
+            let remote = self.remote.read();
             remote.get(pubkey).cloned()
         };
         if let Some(signer) = remote_signer {
@@ -85,7 +87,7 @@ impl Signer for CompositeSigner {
 
         // Check dynamically-added local keys
         {
-            let dynamic = self.dynamic_local.read().expect("dynamic_local lock poisoned");
+            let dynamic = self.dynamic_local.read();
             if let Some(sk) = dynamic.get(pubkey) {
                 return Ok(sk.sign(signing_root));
             }
@@ -98,15 +100,15 @@ impl Signer for CompositeSigner {
     fn public_keys(&self) -> Vec<[u8; PUBLIC_KEY_BYTES_LEN]> {
         let mut keys = self.local.public_keys();
 
-        let dynamic = self.dynamic_local.read().expect("dynamic_local lock poisoned");
+        let dynamic = self.dynamic_local.read();
         keys.extend(dynamic.keys());
 
-        let remote = self.remote.read().expect("remote lock poisoned");
+        let remote = self.remote.read();
         for signer in remote.values() {
             keys.extend(signer.public_keys());
         }
 
-        let grpc = self.grpc_remote.read().expect("grpc_remote lock poisoned");
+        let grpc = self.grpc_remote.read();
         keys.extend(grpc.keys());
 
         keys.sort();
@@ -461,5 +463,37 @@ mod tests {
         let keys = composite.public_keys();
         assert_eq!(keys.len(), 1);
         assert!(keys.contains(&pk_bytes));
+    }
+
+    #[test]
+    fn test_lock_survives_panic_in_another_thread() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let composite = Arc::new(CompositeSigner::new(create_empty_local_signer()));
+
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+        composite.add_local_key(sk);
+
+        // Spawn a thread that panics while holding a write lock
+        let composite_clone = composite.clone();
+        let handle = thread::spawn(move || {
+            let _guard = composite_clone.dynamic_local.write();
+            panic!("intentional panic while holding lock");
+        });
+
+        // Thread panicked — join returns Err
+        assert!(handle.join().is_err());
+
+        // With parking_lot, the lock is NOT poisoned — we can still use it
+        assert!(composite.public_keys().contains(&pk_bytes));
+
+        // Can still add/remove keys after the panic
+        let sk2 = SecretKey::generate();
+        let pk2 = sk2.public_key().to_bytes();
+        composite.add_local_key(sk2);
+        assert!(composite.public_keys().contains(&pk2));
+        assert!(composite.remove_local_key(&pk2));
     }
 }
