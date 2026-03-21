@@ -20,4 +20,5 @@ tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 
 [dev-dependencies]
+parking_lot.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync"] }

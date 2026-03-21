@@ -193,7 +193,7 @@ impl BuilderService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     use async_trait::async_trait;
     use bn_manager::{
@@ -352,7 +352,7 @@ mod tests {
             if self.fail_prepare {
                 return Err(BeaconError::HttpError("mock prepare failure".into()));
             }
-            self.prepare_calls.lock().unwrap().push(preparations.to_vec());
+            self.prepare_calls.lock().push(preparations.to_vec());
             Ok(())
         }
         async fn submit_beacon_committee_subscriptions(
@@ -368,7 +368,7 @@ mod tests {
             if self.fail_register {
                 return Err(BeaconError::HttpError("mock register failure".into()));
             }
-            self.register_calls.lock().unwrap().push(registrations.to_vec());
+            self.register_calls.lock().push(registrations.to_vec());
             Ok(())
         }
         async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
@@ -482,7 +482,7 @@ mod tests {
             if self.fail_sign {
                 return Err(SignerError::KeyNotFound("mock sign failure".into()));
             }
-            self.sign_calls.lock().unwrap().push(pubkey.to_bytes());
+            self.sign_calls.lock().push(pubkey.to_bytes());
             Ok(vec![0xaa; 96])
         }
         async fn sign_sync_committee_selection_proof(
@@ -554,7 +554,7 @@ mod tests {
         assert!(result.is_ok());
 
         let bn = service.bn.as_ref() as *const dyn BeaconNodeClient as *const MockBn;
-        let calls = unsafe { &*bn }.register_calls.lock().unwrap();
+        let calls = unsafe { &*bn }.register_calls.lock();
         assert!(calls.is_empty());
     }
 
@@ -589,7 +589,7 @@ mod tests {
         let result = service.register_validators().await;
         assert!(result.is_ok());
 
-        let calls = bn.register_calls.lock().unwrap();
+        let calls = bn.register_calls.lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 1);
         assert_eq!(calls[0][0].message.pubkey, pk1);
@@ -597,7 +597,7 @@ mod tests {
         assert_eq!(calls[0][0].message.gas_limit, 35_000_000);
         assert_eq!(calls[0][0].signature, vec![0xaa; 96]);
 
-        let sign_calls = signer.sign_calls.lock().unwrap();
+        let sign_calls = signer.sign_calls.lock();
         assert_eq!(sign_calls.len(), 1);
     }
 
@@ -618,7 +618,7 @@ mod tests {
         let result = service.register_validators().await;
         assert!(result.is_ok());
 
-        let calls = bn.register_calls.lock().unwrap();
+        let calls = bn.register_calls.lock();
         assert_eq!(calls[0][0].message.fee_recipient, default_fr);
         assert_eq!(calls[0][0].message.gas_limit, 25_000_000);
     }
@@ -642,7 +642,7 @@ mod tests {
         let result = service.register_validators().await;
         assert!(result.is_ok());
 
-        let calls = bn.register_calls.lock().unwrap();
+        let calls = bn.register_calls.lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 2);
 
@@ -682,7 +682,7 @@ mod tests {
         assert!(result.is_ok());
 
         // No registrations submitted since signing failed
-        let calls = bn.register_calls.lock().unwrap();
+        let calls = bn.register_calls.lock();
         assert!(calls.is_empty());
     }
 
@@ -700,12 +700,12 @@ mod tests {
         // First call should register
         let result = service.register_validators().await;
         assert!(result.is_ok());
-        assert_eq!(bn.register_calls.lock().unwrap().len(), 1);
+        assert_eq!(bn.register_calls.lock().len(), 1);
 
         // Second call should skip (cached)
         let result = service.register_validators().await;
         assert!(result.is_ok());
-        assert_eq!(bn.register_calls.lock().unwrap().len(), 1); // Still 1, no new call
+        assert_eq!(bn.register_calls.lock().len(), 1); // Still 1, no new call
     }
 
     #[tokio::test]
@@ -728,7 +728,7 @@ mod tests {
 
         // First registration
         service.register_validators().await.unwrap();
-        assert_eq!(bn.register_calls.lock().unwrap().len(), 1);
+        assert_eq!(bn.register_calls.lock().len(), 1);
 
         // Change fee_recipient
         store.update_config(
@@ -741,7 +741,7 @@ mod tests {
 
         // Should re-register
         service.register_validators().await.unwrap();
-        let calls = bn.register_calls.lock().unwrap();
+        let calls = bn.register_calls.lock();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1][0].message.fee_recipient, fr2);
     }
@@ -764,7 +764,7 @@ mod tests {
             BuilderService::new(signer, bn.clone(), store.clone(), [0x00, 0x00, 0x00, 0x00]);
 
         service.register_validators().await.unwrap();
-        assert_eq!(bn.register_calls.lock().unwrap().len(), 1);
+        assert_eq!(bn.register_calls.lock().len(), 1);
 
         // Change gas_limit
         store.update_config(
@@ -776,7 +776,7 @@ mod tests {
         );
 
         service.register_validators().await.unwrap();
-        let calls = bn.register_calls.lock().unwrap();
+        let calls = bn.register_calls.lock();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1][0].message.gas_limit, 50_000_000);
     }
@@ -795,7 +795,7 @@ mod tests {
         service.register_validators().await.unwrap();
         let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-        let calls = bn.register_calls.lock().unwrap();
+        let calls = bn.register_calls.lock();
         let timestamp = calls[0][0].message.timestamp;
         assert!(timestamp >= before);
         assert!(timestamp <= after);
@@ -826,7 +826,7 @@ mod tests {
         let result = service.prepare_proposers(&indices).await;
         assert!(result.is_ok());
 
-        let calls = bn.prepare_calls.lock().unwrap();
+        let calls = bn.prepare_calls.lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 2);
 
@@ -854,7 +854,7 @@ mod tests {
 
         service.prepare_proposers(&indices).await.unwrap();
 
-        let calls = bn.prepare_calls.lock().unwrap();
+        let calls = bn.prepare_calls.lock();
         let expected_fr = format!("0x{}", hex::encode(default_fr));
         assert_eq!(calls[0][0].fee_recipient, expected_fr);
         assert_eq!(calls[0][0].validator_index, "42");
@@ -880,7 +880,7 @@ mod tests {
 
         service.prepare_proposers(&indices).await.unwrap();
 
-        let calls = bn.prepare_calls.lock().unwrap();
+        let calls = bn.prepare_calls.lock();
         assert_eq!(calls[0].len(), 1);
         assert_eq!(calls[0][0].validator_index, "100");
     }
@@ -898,7 +898,7 @@ mod tests {
         let indices = HashMap::new();
         service.prepare_proposers(&indices).await.unwrap();
 
-        let calls = bn.prepare_calls.lock().unwrap();
+        let calls = bn.prepare_calls.lock();
         assert!(calls.is_empty());
     }
 

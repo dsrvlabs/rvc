@@ -495,7 +495,7 @@ keystore_dir = "{}"
 
     #[tokio::test]
     async fn test_audit_log_emitted_on_sign_request() {
-        use std::sync::Mutex;
+        use parking_lot::Mutex;
         use tracing_subscriber::layer::SubscriberExt;
 
         // Capture log events to verify audit entry
@@ -511,7 +511,7 @@ keystore_dir = "{}"
             ) {
                 let mut visitor = MessageVisitor(String::new());
                 event.record(&mut visitor);
-                self.events.lock().unwrap().push(visitor.0);
+                self.events.lock().push(visitor.0);
             }
         }
 
@@ -559,7 +559,7 @@ keystore_dir = "{}"
         });
         svc.sign(req).await.unwrap();
 
-        let captured = events.lock().unwrap();
+        let captured = events.lock();
         assert!(
             captured
                 .iter()

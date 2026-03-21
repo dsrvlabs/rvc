@@ -39,6 +39,7 @@ bls12_381_plus = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 
 [dev-dependencies]
+parking_lot.workspace = true
 rcgen = "0.13"
 tempfile.workspace = true
 proptest.workspace = true

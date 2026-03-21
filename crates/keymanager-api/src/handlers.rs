@@ -319,7 +319,7 @@ mod tests {
     use axum::routing::get;
     use axum::Router;
     use http_body_util::BodyExt;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
     use tower::ServiceExt;
     use zeroize::Zeroizing;
 
@@ -341,11 +341,11 @@ mod tests {
 
     impl KeystoreManager for MockKeystoreManager {
         fn list_keys(&self) -> Vec<Pubkey> {
-            self.keys.lock().unwrap().clone()
+            self.keys.lock().clone()
         }
 
         fn has_key(&self, pubkey: &Pubkey) -> bool {
-            self.keys.lock().unwrap().contains(pubkey)
+            self.keys.lock().contains(pubkey)
         }
 
         fn import_keystore(
@@ -366,7 +366,7 @@ mod tests {
             let mut pubkey = [0u8; 48];
             pubkey.copy_from_slice(&bytes);
 
-            let mut keys = self.keys.lock().unwrap();
+            let mut keys = self.keys.lock();
             if keys.contains(&pubkey) {
                 return Err(ImportKeystoreError::Duplicate);
             }
@@ -375,7 +375,7 @@ mod tests {
         }
 
         fn delete_keystore(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError> {
-            let mut keys = self.keys.lock().unwrap();
+            let mut keys = self.keys.lock();
             if let Some(pos) = keys.iter().position(|k| k == pubkey) {
                 keys.remove(pos);
                 Ok(true)
@@ -397,7 +397,7 @@ mod tests {
 
     impl SlashingProtection for MockSlashingProtection {
         fn import_interchange(&self, interchange_json: &str) -> Result<(), String> {
-            self.imported.lock().unwrap().push(interchange_json.to_string());
+            self.imported.lock().push(interchange_json.to_string());
             Ok(())
         }
 
@@ -435,11 +435,11 @@ mod tests {
 
     impl ValidatorManager for MockValidatorManager {
         fn add_validator(&self, pubkey: Pubkey, enabled: bool) {
-            self.validators.lock().unwrap().push((pubkey, enabled));
+            self.validators.lock().push((pubkey, enabled));
         }
 
         fn remove_validator(&self, pubkey: &Pubkey) -> bool {
-            let mut validators = self.validators.lock().unwrap();
+            let mut validators = self.validators.lock();
             if let Some(pos) = validators.iter().position(|(pk, _)| pk == pubkey) {
                 validators.remove(pos);
                 true
@@ -461,11 +461,11 @@ mod tests {
 
     impl DoppelgangerMonitor for MockDoppelgangerMonitor {
         fn start_monitoring(&self, pubkey: Pubkey) {
-            self.monitored.lock().unwrap().push(pubkey);
+            self.monitored.lock().push(pubkey);
         }
 
         fn stop_monitoring(&self, pubkey: &Pubkey) {
-            let mut monitored = self.monitored.lock().unwrap();
+            let mut monitored = self.monitored.lock();
             if let Some(pos) = monitored.iter().position(|pk| pk == pubkey) {
                 monitored.remove(pos);
             }
@@ -488,11 +488,11 @@ mod tests {
 
     impl RemoteKeyManager for MockRemoteKeyManager {
         fn list_remote_keys(&self) -> Vec<(Pubkey, String)> {
-            self.keys.lock().unwrap().clone()
+            self.keys.lock().clone()
         }
 
         fn has_remote_key(&self, pubkey: &Pubkey) -> bool {
-            self.keys.lock().unwrap().iter().any(|(pk, _)| pk == pubkey)
+            self.keys.lock().iter().any(|(pk, _)| pk == pubkey)
         }
 
         fn import_remote_key(
@@ -500,7 +500,7 @@ mod tests {
             pubkey: Pubkey,
             url: String,
         ) -> Result<(), ImportRemoteKeyError> {
-            let mut keys = self.keys.lock().unwrap();
+            let mut keys = self.keys.lock();
             if keys.iter().any(|(pk, _)| *pk == pubkey) {
                 return Err(ImportRemoteKeyError::Duplicate);
             }
@@ -509,7 +509,7 @@ mod tests {
         }
 
         fn delete_remote_key(&self, pubkey: &Pubkey) -> Result<bool, DeleteRemoteKeyError> {
-            let mut keys = self.keys.lock().unwrap();
+            let mut keys = self.keys.lock();
             if let Some(pos) = keys.iter().position(|(pk, _)| pk == pubkey) {
                 keys.remove(pos);
                 Ok(true)
@@ -748,11 +748,11 @@ mod tests {
 
         assert!(app.keystore_manager.has_key(&test_pubkey(1)));
 
-        let validators = app.validator_manager.validators.lock().unwrap();
+        let validators = app.validator_manager.validators.lock();
         assert_eq!(validators.len(), 1);
         assert!(!validators[0].1); // disabled for doppelganger
 
-        let monitored = app.doppelganger_monitor.monitored.lock().unwrap();
+        let monitored = app.doppelganger_monitor.monitored.lock();
         assert_eq!(monitored.len(), 1);
     }
 
@@ -852,7 +852,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let imported = mock_slashing.imported.lock().unwrap();
+        let imported = mock_slashing.imported.lock();
         assert_eq!(imported.len(), 1);
     }
 
@@ -1171,11 +1171,11 @@ mod tests {
         assert!(!app.keystore_manager.has_key(&test_pubkey(1)));
 
         // No validators should have been added
-        let validators = app.validator_manager.validators.lock().unwrap();
+        let validators = app.validator_manager.validators.lock();
         assert!(validators.is_empty());
 
         // No doppelganger monitoring started
-        let monitored = app.doppelganger_monitor.monitored.lock().unwrap();
+        let monitored = app.doppelganger_monitor.monitored.lock();
         assert!(monitored.is_empty());
     }
 
@@ -1309,7 +1309,7 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::OK);
 
         // Key 1 should no longer be monitored, key 2 should remain
-        let monitored = app.doppelganger_monitor.monitored.lock().unwrap();
+        let monitored = app.doppelganger_monitor.monitored.lock();
         assert_eq!(monitored.len(), 1);
         assert_eq!(monitored[0], test_pubkey(2));
     }

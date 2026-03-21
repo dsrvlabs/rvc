@@ -22,6 +22,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 axum = { workspace = true, features = ["macros"] }
+parking_lot.workspace = true
 http-body-util = "0.1"
 hyper = "1"
 tempfile.workspace = true

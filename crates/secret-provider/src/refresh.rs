@@ -146,7 +146,7 @@ impl RefreshService {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     use async_trait::async_trait;
     use zeroize::Zeroizing;
@@ -275,7 +275,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             service
                 .run(move |_| {
-                    *call_count_clone.lock().unwrap() += 1;
+                    *call_count_clone.lock() += 1;
                 })
                 .await;
         });
@@ -287,7 +287,7 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
         assert!(result.is_ok(), "refresh loop should have stopped on cancellation");
 
-        assert_eq!(*call_count.lock().unwrap(), 0);
+        assert_eq!(*call_count.lock(), 0);
     }
 
     #[tokio::test]
@@ -355,7 +355,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             service
                 .run(move |sk| {
-                    captured_clone.lock().unwrap().push(sk.public_key().to_bytes());
+                    captured_clone.lock().push(sk.public_key().to_bytes());
                 })
                 .await;
         });
@@ -366,7 +366,7 @@ mod tests {
 
         let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
 
-        let keys = captured_keys.lock().unwrap();
+        let keys = captured_keys.lock();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0], expected_pubkey);
     }

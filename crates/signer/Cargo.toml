@@ -12,6 +12,7 @@ crypto.workspace = true
 eth-types.workspace = true
 hex.workspace = true
 metrics.workspace = true
+parking_lot.workspace = true
 slashing.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }

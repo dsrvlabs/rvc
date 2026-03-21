@@ -1,8 +1,8 @@
 //! SQLite database layer for slashing protection.
 
+use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
@@ -90,7 +90,7 @@ impl SlashingDb {
     }
 
     fn migrate(&self) -> Result<(), SlashingError> {
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS attestations (
@@ -133,7 +133,7 @@ impl SlashingDb {
         attestation: &SignedAttestation,
     ) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(&attestation.pubkey);
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO attestations (pubkey, source_epoch, target_epoch, signing_root)
              VALUES (?1, ?2, ?3, ?4)",
@@ -160,7 +160,7 @@ impl SlashingDb {
         signing_root: Option<String>,
     ) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT OR IGNORE INTO attestations (pubkey, source_epoch, target_epoch, signing_root)
              VALUES (?1, ?2, ?3, ?4)",
@@ -172,7 +172,7 @@ impl SlashingDb {
     /// Get all attestations for a given public key.
     pub fn get_attestations(&self, pubkey: &str) -> Result<Vec<SignedAttestation>, SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT pubkey, source_epoch, target_epoch, signing_root
              FROM attestations
@@ -200,7 +200,7 @@ impl SlashingDb {
     #[cfg(test)]
     pub(crate) fn insert_block(&self, block: &SignedBlock) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(&block.pubkey);
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO blocks (pubkey, slot, signing_root)
              VALUES (?1, ?2, ?3)",
@@ -212,7 +212,7 @@ impl SlashingDb {
     /// Get all blocks for a given public key.
     pub fn get_blocks(&self, pubkey: &str) -> Result<Vec<SignedBlock>, SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT pubkey, slot, signing_root
              FROM blocks
@@ -251,7 +251,7 @@ impl SlashingDb {
         target_epoch: Epoch,
     ) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
 
         // Check attestation watermarks (both source and target)
         let wm_source: Option<i64> = conn
@@ -348,7 +348,7 @@ impl SlashingDb {
     }
 
     fn get_all_pubkeys(&self) -> Result<Vec<String>, SlashingError> {
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT DISTINCT pubkey FROM attestations
              UNION
@@ -425,7 +425,7 @@ impl SlashingDb {
             });
         }
 
-        let mut conn = self.conn.lock().expect("mutex poisoned");
+        let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         for validator in &interchange.data {
@@ -479,7 +479,7 @@ impl SlashingDb {
         signing_root: Option<String>,
     ) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         conn.execute(
             "INSERT OR IGNORE INTO blocks (pubkey, slot, signing_root)
              VALUES (?1, ?2, ?3)",
@@ -504,7 +504,7 @@ impl SlashingDb {
         signing_root: Option<String>,
     ) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
 
         // Check block watermark
         let watermark: Option<i64> = conn
@@ -570,7 +570,7 @@ impl SlashingDb {
         signing_root: Option<String>,
     ) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
-        let mut conn = self.conn.lock().expect("mutex poisoned");
+        let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         // Check block watermark
@@ -676,7 +676,7 @@ impl SlashingDb {
         signing_root: Option<String>,
     ) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
-        let mut conn = self.conn.lock().expect("mutex poisoned");
+        let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         // Check attestation watermarks (both source and target)
@@ -824,7 +824,7 @@ impl SlashingDb {
         pubkey: &str,
     ) -> Result<Option<Epoch>, SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         let result: Option<i64> = conn
             .query_row(
                 "SELECT MAX(target_epoch) FROM attestations WHERE pubkey = ?1",
@@ -841,7 +841,7 @@ impl SlashingDb {
     /// Returns `None` if no blocks have been signed for this validator.
     pub fn last_signed_block_slot(&self, pubkey: &str) -> Result<Option<Slot>, SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         let result: Option<i64> = conn
             .query_row("SELECT MAX(slot) FROM blocks WHERE pubkey = ?1", [&pubkey], |row| {
                 row.get(0)
@@ -853,7 +853,7 @@ impl SlashingDb {
 
     /// Run SQLite `PRAGMA integrity_check` and return an error if the database is corrupt.
     pub fn check_integrity(&self) -> Result<(), SlashingError> {
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
         if result != "ok" {
             return Err(SlashingError::IntegrityCheckFailed(result));
@@ -863,7 +863,7 @@ impl SlashingDb {
 
     /// Read the stored genesis validators root from the metadata table.
     pub fn genesis_validators_root(&self) -> Result<Option<String>, SlashingError> {
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         let result: Option<String> = conn
             .query_row(
                 "SELECT value FROM metadata WHERE key = 'genesis_validators_root'",
@@ -879,7 +879,7 @@ impl SlashingDb {
     /// On first run, the root is stored. On subsequent runs, the stored root
     /// is compared against the provided root. If they differ, an error is returned.
     pub fn set_genesis_validators_root(&self, root: &str) -> Result<(), SlashingError> {
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         let existing: Option<String> = conn
             .query_row(
                 "SELECT value FROM metadata WHERE key = 'genesis_validators_root'",
@@ -908,7 +908,7 @@ impl SlashingDb {
     /// Watermarks can only be raised, never lowered. Setting the same value is idempotent.
     pub fn set_block_watermark(&self, pubkey: &str, slot: Slot) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
-        let mut conn = self.conn.lock().expect("mutex poisoned");
+        let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let existing: Option<i64> = tx
             .query_row(
@@ -942,7 +942,7 @@ impl SlashingDb {
     /// Get the block watermark for a validator.
     pub fn get_block_watermark(&self, pubkey: &str) -> Result<Option<Slot>, SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
         let result: Option<i64> = conn
             .query_row(
                 "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
@@ -963,7 +963,7 @@ impl SlashingDb {
         target_epoch: Epoch,
     ) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
-        let mut conn = self.conn.lock().expect("mutex poisoned");
+        let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let existing_source: Option<i64> = tx
@@ -1022,7 +1022,7 @@ impl SlashingDb {
         pubkey: &str,
     ) -> Result<Option<(Epoch, Epoch)>, SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
-        let conn = self.conn.lock().expect("mutex poisoned");
+        let conn = self.conn.lock();
 
         let source: Option<i64> = conn
             .query_row(
@@ -1051,7 +1051,7 @@ impl SlashingDb {
     /// Returns an error if no watermarks are set (safety: prevents accidental deletion of all records).
     #[tracing::instrument(name = "rvc.slashing.db.prune", skip_all)]
     pub fn prune_below_watermarks(&self) -> Result<PruneStats, SlashingError> {
-        let mut conn = self.conn.lock().expect("mutex poisoned");
+        let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
         let watermark_count: i64 =
@@ -1199,7 +1199,7 @@ mod tests {
     fn test_migration_creates_tables() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        let conn = db.conn.lock().expect("mutex poisoned");
+        let conn = db.conn.lock();
         let table_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('attestations', 'blocks')",
@@ -2821,7 +2821,7 @@ mod tests {
     #[test]
     fn test_integrity_metadata_table_created() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let conn = db.conn.lock().expect("mutex poisoned");
+        let conn = db.conn.lock();
         let table_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'metadata'",
@@ -3351,7 +3351,7 @@ mod tests {
     #[test]
     fn test_prune_watermarks_table_created_on_migration() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let conn = db.conn.lock().expect("mutex poisoned");
+        let conn = db.conn.lock();
         let table_count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = 'watermarks'",
@@ -3368,7 +3368,7 @@ mod tests {
         let path = dir.path().join("wal_test.db");
         let db = SlashingDb::open(&path).expect("failed to open db");
 
-        let conn = db.conn.lock().expect("mutex poisoned");
+        let conn = db.conn.lock();
         let mode: String = conn.pragma_query_value(None, "journal_mode", |row| row.get(0)).unwrap();
         assert_eq!(mode.to_lowercase(), "wal");
     }
@@ -3379,7 +3379,7 @@ mod tests {
         let path = dir.path().join("sync_test.db");
         let db = SlashingDb::open(&path).expect("failed to open db");
 
-        let conn = db.conn.lock().expect("mutex poisoned");
+        let conn = db.conn.lock();
         let sync_mode: i64 =
             conn.pragma_query_value(None, "synchronous", |row| row.get(0)).unwrap();
         // FULL = 2

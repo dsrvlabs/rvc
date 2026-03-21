@@ -3995,6 +3995,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "hex",
+ "parking_lot",
  "rand 0.8.5",
  "rvc-bn-manager",
  "rvc-crypto",
@@ -4135,6 +4136,7 @@ dependencies = [
  "hex",
  "http-body-util",
  "hyper",
+ "parking_lot",
  "rand 0.8.5",
  "serde",
  "serde_json",
@@ -4183,6 +4185,7 @@ dependencies = [
  "google-cloud-secretmanager-v1",
  "hex",
  "lazy_static",
+ "parking_lot",
  "prometheus",
  "rvc-crypto",
  "rvc-metrics",
@@ -4201,6 +4204,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "hex",
+ "parking_lot",
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-metrics",
@@ -4219,6 +4223,7 @@ dependencies = [
  "blst",
  "clap",
  "hex",
+ "parking_lot",
  "prometheus",
  "proptest",
  "prost 0.13.5",
@@ -4247,6 +4252,7 @@ name = "rvc-slashing"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "parking_lot",
  "proptest",
  "rusqlite",
  "rvc-eth-types",

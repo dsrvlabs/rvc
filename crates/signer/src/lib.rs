@@ -72,18 +72,17 @@ impl From<SigningError> for SignerError {
 /// validator could both pass the slashing check before either records.
 /// Different validators are NOT blocked by each other.
 pub struct ValidatorLockMap {
-    locks: std::sync::Mutex<HashMap<[u8; 48], Arc<tokio::sync::Mutex<()>>>>,
+    locks: parking_lot::Mutex<HashMap<[u8; 48], Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl ValidatorLockMap {
     pub fn new() -> Self {
-        Self { locks: std::sync::Mutex::new(HashMap::new()) }
+        Self { locks: parking_lot::Mutex::new(HashMap::new()) }
     }
 
     pub fn get(&self, pubkey: &[u8; 48]) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
             .lock()
-            .expect("validator lock map poisoned")
             .entry(*pubkey)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
