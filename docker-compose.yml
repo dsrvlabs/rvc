@@ -43,8 +43,7 @@ services:
       target: rvc-signer
     # image: ghcr.io/rootwarp/rvc/rvc-signer:latest
     ports:
-      - "50051:50051" # gRPC signer endpoint
-      - "9101:9101"   # Metrics
+      - "127.0.0.1:9101:9101" # Metrics (localhost only)
     volumes:
       - ./config:/config:ro
       - ./certs:/certs:ro

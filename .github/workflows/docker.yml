@@ -19,6 +19,7 @@ jobs:
       packages: write
 
     strategy:
+      fail-fast: false
       matrix:
         target: [rvc, rvc-signer, rvc-keygen]
 
@@ -53,11 +54,11 @@ jobs:
         with:
           context: .
           target: ${{ matrix.target }}
-          push: ${{ github.event_name != 'pull_request' }}
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,scope=${{ matrix.target }},mode=max
           build-args: |
             VERSION=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.version'] || '' }}
             GIT_SHA=${{ github.sha }}
