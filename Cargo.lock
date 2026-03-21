@@ -4054,6 +4054,7 @@ name = "rvc-doppelganger"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "rvc-crypto",
  "rvc-eth-types",
  "thiserror 2.0.18",
  "tokio",
@@ -4315,6 +4316,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "parking_lot",
+ "rvc-crypto",
  "serde",
  "tempfile",
  "thiserror 2.0.18",

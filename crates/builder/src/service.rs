@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use bn_manager::{
     BeaconError, BeaconNodeClient, ProposerPreparation, SignedValidatorRegistration,
@@ -132,9 +132,29 @@ impl BuilderService {
             return Ok(());
         }
 
-        tracing::Span::current().record("rvc.builder.batch_size", registrations.len());
-        debug!(count = registrations.len(), "submitting builder registrations");
-        self.bn.register_validators(&registrations).await?;
+        let batch_size = registrations.len();
+        tracing::Span::current().record("rvc.builder.batch_size", batch_size);
+        debug!(count = batch_size, "submitting builder registrations");
+
+        let start = Instant::now();
+        match self.bn.register_validators(&registrations).await {
+            Ok(()) => {
+                let duration_ms = start.elapsed().as_millis() as u64;
+                info!(
+                    batch_size = batch_size,
+                    duration_ms = duration_ms,
+                    "registration batch sent"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    batch_size = batch_size,
+                    "registration failure"
+                );
+                return Err(e.into());
+            }
+        }
 
         // Update cache after successful submission
         {
@@ -178,8 +198,17 @@ impl BuilderService {
             return Ok(());
         }
 
-        debug!(count = preparations.len(), "submitting proposer preparations");
-        self.bn.prepare_beacon_proposer(&preparations).await?;
+        let count = preparations.len();
+        debug!(count = count, "submitting proposer preparations");
+        match self.bn.prepare_beacon_proposer(&preparations).await {
+            Ok(()) => {
+                info!(count = count, "proposer preparation sent");
+            }
+            Err(e) => {
+                warn!(error = %e, "proposer preparation failure");
+                return Err(e.into());
+            }
+        }
 
         Ok(())
     }

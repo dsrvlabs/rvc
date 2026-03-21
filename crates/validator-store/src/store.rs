@@ -2,7 +2,9 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crypto::logging::TruncatedPubkey;
 use serde::Deserialize;
+use tracing::{info, trace, warn};
 
 use crate::config::{ValidatorConfig, ValidatorConfigUpdate};
 use crate::error::ValidatorStoreError;
@@ -92,6 +94,12 @@ impl ValidatorStore {
             validators.insert(config.pubkey, config);
         }
 
+        info!(
+            validator_count = validators.len(),
+            path = %path.display(),
+            "validator config loaded"
+        );
+
         Ok(Self {
             validators: RwLock::new(validators),
             defaults: RwLock::new(ValidatorDefaults {
@@ -121,7 +129,12 @@ impl ValidatorStore {
     }
 
     pub fn effective_fee_recipient(&self, pubkey: &[u8; 48]) -> [u8; 20] {
-        self.effective_config(pubkey).fee_recipient
+        let result = self.effective_config(pubkey).fee_recipient;
+        trace!(
+            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+            "fee recipient lookup"
+        );
+        result
     }
 
     pub fn effective_gas_limit(&self, pubkey: &[u8; 48]) -> u64 {
@@ -133,7 +146,14 @@ impl ValidatorStore {
     }
 
     pub fn is_builder_enabled(&self, pubkey: &[u8; 48]) -> bool {
-        self.validators.read().get(pubkey).map(|c| c.builder_proposals).unwrap_or(false)
+        let enabled =
+            self.validators.read().get(pubkey).map(|c| c.builder_proposals).unwrap_or(false);
+        trace!(
+            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+            is_builder_enabled = enabled,
+            "builder status lookup"
+        );
+        enabled
     }
 
     pub fn builder_boost_factor(&self, pubkey: &[u8; 48]) -> u64 {
@@ -156,10 +176,33 @@ impl ValidatorStore {
     pub fn set_enabled(&self, pubkey: &[u8; 48], enabled: bool) {
         if let Some(config) = self.validators.write().get_mut(pubkey) {
             config.enabled = enabled;
+            let pk_hex = hex::encode(pubkey);
+            if enabled {
+                info!(pubkey = %TruncatedPubkey::new(&pk_hex), "validator enabled");
+            } else {
+                warn!(pubkey = %TruncatedPubkey::new(&pk_hex), "validator disabled");
+            }
         }
     }
 
     pub fn update_config(&self, pubkey: &[u8; 48], update: ValidatorConfigUpdate) {
+        let mut changed_fields = Vec::new();
+        if update.fee_recipient.is_some() {
+            changed_fields.push("fee_recipient");
+        }
+        if update.gas_limit.is_some() {
+            changed_fields.push("gas_limit");
+        }
+        if update.graffiti.is_some() {
+            changed_fields.push("graffiti");
+        }
+        if update.builder_proposals.is_some() {
+            changed_fields.push("builder_proposals");
+        }
+        if update.builder_boost_factor.is_some() {
+            changed_fields.push("builder_boost_factor");
+        }
+
         if let Some(config) = self.validators.write().get_mut(pubkey) {
             if let Some(fr) = update.fee_recipient {
                 config.fee_recipient = fr;
@@ -176,6 +219,13 @@ impl ValidatorStore {
             if let Some(bbf) = update.builder_boost_factor {
                 config.builder_boost_factor = bbf;
             }
+
+            let pk_hex = hex::encode(pubkey);
+            info!(
+                pubkey = %TruncatedPubkey::new(&pk_hex),
+                changed_fields = changed_fields.join(","),
+                "validator config updated"
+            );
         }
     }
 
@@ -185,8 +235,14 @@ impl ValidatorStore {
             ValidatorStoreError::Config("no config path set for reload".to_string())
         })?;
 
-        let content = std::fs::read_to_string(path)?;
-        let toml_config: TomlConfig = toml::from_str(&content)?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            warn!(path = %path.display(), error = %e, "config parse error");
+            e
+        })?;
+        let toml_config: TomlConfig = toml::from_str(&content).map_err(|e| {
+            warn!(path = %path.display(), error = %e, "config parse error");
+            e
+        })?;
 
         // Parse-first: compute all new values before any mutation.
         let mut new_fee_recipient = [0u8; 20];
@@ -218,9 +274,13 @@ impl ValidatorStore {
         };
 
         let mut validators = self.validators.write();
-        for config in parsed_validators {
-            validators.insert(config.pubkey, config);
+        let existing_count = validators.len();
+        for config in &parsed_validators {
+            validators.insert(config.pubkey, config.clone());
         }
+        let added_count = validators.len().saturating_sub(existing_count);
+
+        info!(added_count = added_count, total_count = validators.len(), "config reloaded");
 
         Ok(())
     }

@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crypto::logging::TruncatedPubkey;
 use eth_types::Epoch;
-use tracing::{info, warn, Instrument};
+use tracing::{debug, info, warn, Instrument};
 
 use crate::error::DoppelgangerError;
 use crate::traits::{LivenessChecker, SlashingDbReader};
@@ -48,12 +49,18 @@ impl DoppelgangerService {
         let mut results = Vec::with_capacity(pubkeys.len());
 
         for pubkey in pubkeys {
+            info!(
+                pubkey = %TruncatedPubkey::new(pubkey),
+                check_epoch = current_epoch,
+                "doppelganger check start"
+            );
+
             let last_epoch = self.slashing_db.last_signed_attestation_epoch(pubkey)?;
 
             let status = match last_epoch {
                 Some(epoch) if current_epoch.saturating_sub(epoch) <= self.monitoring_epochs => {
                     info!(
-                        pubkey = %pubkey,
+                        pubkey = %TruncatedPubkey::new(pubkey),
                         last_epoch = epoch,
                         current_epoch = current_epoch,
                         "restart detected, skipping doppelganger monitoring"
@@ -62,7 +69,7 @@ impl DoppelgangerService {
                 }
                 _ => {
                     info!(
-                        pubkey = %pubkey,
+                        pubkey = %TruncatedPubkey::new(pubkey),
                         last_epoch = ?last_epoch,
                         current_epoch = current_epoch,
                         "validator needs doppelganger monitoring"
@@ -92,6 +99,7 @@ impl DoppelgangerService {
         current_epoch: Epoch,
     ) -> Result<DoppelgangerResult, DoppelgangerError> {
         if pubkeys_to_monitor.is_empty() {
+            debug!("monitor cycle skipped, no validators to monitor");
             return Ok(DoppelgangerResult { safe_validators: vec![], detected: vec![] });
         }
 
@@ -101,7 +109,7 @@ impl DoppelgangerService {
                 if validator_indices.contains_key(pk.as_str()) {
                     true
                 } else {
-                    warn!(pubkey = %pk, "pubkey has no validator index, skipping liveness check");
+                    warn!(pubkey = %TruncatedPubkey::new(pk), "pubkey has no validator index, skipping liveness check");
                     false
                 }
             })
@@ -148,8 +156,9 @@ impl DoppelgangerService {
 
                         if !we_signed {
                             tracing::error!(
-                                pubkey = %pubkey,
+                                pubkey = %TruncatedPubkey::new(pubkey),
                                 epoch = check_epoch,
+                                observed_activity = "is_live",
                                 "doppelganger detected: validator is live but we did not sign"
                             );
                             if !detected.contains(&pubkey.to_string()) {
@@ -163,6 +172,14 @@ impl DoppelgangerService {
 
         let safe_validators: Vec<String> =
             checked_pubkeys.iter().filter(|pk| !detected.contains(pk)).cloned().cloned().collect();
+
+        for pk in &safe_validators {
+            info!(
+                pubkey = %TruncatedPubkey::new(pk),
+                epochs_checked = self.monitoring_epochs,
+                "doppelganger check clear"
+            );
+        }
 
         tracing::Span::current().record("rvc.doppelganger.detected_count", detected.len() as u64);
 
