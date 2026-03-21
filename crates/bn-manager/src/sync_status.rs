@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beacon::BeaconClient;
+use crypto::logging::RedactedUrl;
 use futures::future::join_all;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -47,15 +48,27 @@ pub async fn check_all_sync_statuses(clients: &[BeaconClient], statuses: &Shared
         .iter()
         .enumerate()
         .map(|(i, client)| async move {
-            let status = check_single_sync_status(client).await;
-            (i, client.endpoint().to_string(), status)
+            let (status, head_slot, sync_distance) = check_single_sync_status(client).await;
+            (i, client.endpoint().to_string(), status, head_slot, sync_distance)
         })
         .collect();
 
     let results = join_all(futs).await;
 
+    let previous = { statuses.read().await.clone() };
     let mut new_statuses = vec![BnSyncStatus::Unknown; clients.len()];
-    for (i, endpoint, status) in results {
+    for (i, endpoint, status, head_slot, sync_distance) in results {
+        let old_status = previous.get(i).copied().unwrap_or(BnSyncStatus::Unknown);
+        if old_status != status {
+            info!(
+                bn_url = %RedactedUrl(&endpoint),
+                head_slot = head_slot.as_deref().unwrap_or("unknown"),
+                sync_distance = sync_distance.as_deref().unwrap_or("unknown"),
+                old_status = ?old_status,
+                new_status = ?status,
+                "BN sync status changed"
+            );
+        }
         match status {
             BnSyncStatus::Synced => {
                 info!(bn_index = i, endpoint = endpoint, "BN is synced");
@@ -90,19 +103,25 @@ pub async fn check_all_sync_statuses(clients: &[BeaconClient], statuses: &Shared
 ///
 /// Returns `ElOffline` when the beacon layer is synced but `el_offline` is true,
 /// allowing the BN to still serve non-EL-dependent queries.
-async fn check_single_sync_status(client: &BeaconClient) -> BnSyncStatus {
+/// Also returns head_slot and sync_distance for logging.
+async fn check_single_sync_status(
+    client: &BeaconClient,
+) -> (BnSyncStatus, Option<String>, Option<String>) {
     match client.get_node_syncing().await {
         Ok(response) => {
             let data = &response.data;
-            if data.is_syncing || data.is_optimistic {
+            let head_slot = Some(data.head_slot.clone());
+            let sync_distance = Some(data.sync_distance.clone());
+            let status = if data.is_syncing || data.is_optimistic {
                 BnSyncStatus::Syncing
             } else if data.el_offline {
                 BnSyncStatus::ElOffline
             } else {
                 BnSyncStatus::Synced
-            }
+            };
+            (status, head_slot, sync_distance)
         }
-        Err(_) => BnSyncStatus::Unreachable,
+        Err(_) => (BnSyncStatus::Unreachable, None, None),
     }
 }
 

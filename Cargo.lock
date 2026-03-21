@@ -3980,6 +3980,7 @@ dependencies = [
  "beacon",
  "futures",
  "reqwest-eventsource",
+ "rvc-crypto",
  "rvc-eth-types",
  "serde",
  "serde_json",

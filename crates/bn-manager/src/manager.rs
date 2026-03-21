@@ -16,23 +16,12 @@ use eth_types::{
 };
 use futures::future::join_all;
 use tracing::Instrument;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use url::Url;
 
-use crate::sync_status::BnSyncStatus;
+use crypto::logging::RedactedUrl;
 
-/// Redact credentials from a URL for safe inclusion in tracing spans.
-fn redact_url(url: &str) -> String {
-    if let Ok(mut parsed) = Url::parse(url) {
-        if parsed.password().is_some() || !parsed.username().is_empty() {
-            let _ = parsed.set_username("***");
-            let _ = parsed.set_password(Some("***"));
-        }
-        parsed.to_string()
-    } else {
-        url.to_string()
-    }
-}
+use crate::sync_status::BnSyncStatus;
 
 use crate::broadcast::{BnOutcome, BroadcastResult};
 use crate::health::{new_shared_health_trackers, SharedHealthTrackers};
@@ -234,6 +223,9 @@ impl BnManager {
         let sync_guard = self.sync_statuses.read().await;
         let health_guard = self.health_trackers.read().await;
 
+        let healthy_count = health_guard.iter().filter(|t| t.is_healthy()).count();
+        debug!(bn_count = self.clients.len(), healthy_count = healthy_count, "Health check cycle");
+
         let mut synced: Vec<usize> = sync_guard
             .iter()
             .enumerate()
@@ -277,7 +269,7 @@ impl BnManager {
             synced.iter().copied().filter(|&i| health_guard[i].is_healthy()).collect();
 
         let mut result = if healthy.is_empty() {
-            warn!("all synced BNs are unhealthy, using all synced BNs");
+            error!(bn_count = synced.len(), "All BNs unhealthy, using all synced BNs");
             synced
         } else {
             healthy
@@ -328,12 +320,12 @@ impl BnManager {
         let mut tried: usize = 0;
         let mut failed_indices: Vec<usize> = Vec::new();
 
-        for i in indices {
+        for (pos, i) in indices.iter().copied().enumerate() {
             let client = &self.clients[i];
             tried += 1;
             let attempt_span = tracing::info_span!(
                 "rvc.bn.attempt",
-                rvc.bn.url = %redact_url(client.endpoint()),
+                rvc.bn.url = %RedactedUrl(client.endpoint()),
             );
             let start = tokio::time::Instant::now();
             match op(client).instrument(attempt_span).await {
@@ -359,13 +351,23 @@ impl BnManager {
                 }
                 Err(e) => {
                     failed_indices.push(i);
-                    warn!(
-                        op = op_name,
-                        bn_index = i,
-                        endpoint = client.endpoint(),
-                        error = %e,
-                        "BN query failed, trying next"
-                    );
+                    if let Some(&next_i) = indices.get(pos + 1) {
+                        let next_client = &self.clients[next_i];
+                        warn!(
+                            failed_bn = %RedactedUrl(client.endpoint()),
+                            selected_bn = %RedactedUrl(next_client.endpoint()),
+                            reason = %e,
+                            "BN failover triggered"
+                        );
+                    } else {
+                        warn!(
+                            op = op_name,
+                            bn_index = i,
+                            endpoint = %RedactedUrl(client.endpoint()),
+                            error = %e,
+                            "BN query failed, no more BNs to try"
+                        );
+                    }
                     last_err = Some(e);
                 }
             }
@@ -428,7 +430,7 @@ impl BnManager {
             let i = indices[0];
             let attempt_span = tracing::info_span!(
                 "rvc.bn.attempt",
-                rvc.bn.url = %redact_url(client.endpoint()),
+                rvc.bn.url = %RedactedUrl(client.endpoint()),
             );
             let start = tokio::time::Instant::now();
             match op(client).instrument(attempt_span).await {
@@ -468,7 +470,7 @@ impl BnManager {
             let fut = op(client);
             let attempt_span = tracing::info_span!(
                 "rvc.bn.attempt",
-                rvc.bn.url = %redact_url(client.endpoint()),
+                rvc.bn.url = %RedactedUrl(client.endpoint()),
             );
             futs.push(Box::pin(
                 async move {
@@ -631,7 +633,7 @@ impl BnManager {
             let fut = op(client);
             let attempt_span = tracing::info_span!(
                 "rvc.bn.attempt",
-                rvc.bn.url = %redact_url(client.endpoint()),
+                rvc.bn.url = %RedactedUrl(client.endpoint()),
             );
             futs.push(Box::pin(
                 async move {

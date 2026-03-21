@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tracing::{debug, warn, Instrument};
+use tracing::{debug, error, trace, warn, Instrument};
 
 use crypto::logging::RedactedUrl;
 
@@ -133,6 +133,14 @@ impl BeaconClient {
         body: &B,
     ) -> Result<T, BeaconError> {
         let url = format!("{}{}", self.config.endpoint, path);
+        if let Ok(serialized) = serde_json::to_vec(body) {
+            trace!(
+                method = "POST",
+                endpoint = path,
+                body_bytes = serialized.len(),
+                "HTTP request body size"
+            );
+        }
         let mut trace_headers = reqwest::header::HeaderMap::new();
         telemetry::inject_trace_context(&mut trace_headers);
         let hdrs = trace_headers.clone();
@@ -888,14 +896,22 @@ impl BeaconClient {
             http.status_code = tracing::field::Empty,
         );
         let mut last_error = None;
+        let endpoint = url.split('?').next().unwrap_or(url);
 
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
                 let backoff = self.calculate_backoff(attempt - 1);
-                debug!(attempt = attempt, backoff_ms = ?backoff.as_millis(), "Retrying request");
+                debug!(
+                    endpoint = endpoint,
+                    attempt = attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    bn_url = %RedactedUrl(url),
+                    "Retrying HTTP request"
+                );
                 tokio::time::sleep(backoff).await;
             }
 
+            let request_start = std::time::Instant::now();
             match request_fn().await {
                 Ok(response) => {
                     let status = response.status();
@@ -905,6 +921,16 @@ impl BeaconClient {
                         let body = response.text().await.map_err(|e| {
                             BeaconError::ParseError(format!("failed to read response body: {e}"))
                         })?;
+                        let latency_ms = request_start.elapsed().as_millis() as u64;
+                        debug!(
+                            method = http_method,
+                            endpoint = endpoint,
+                            bn_url = %RedactedUrl(url),
+                            status_code = status.as_u16(),
+                            latency_ms = latency_ms,
+                            response_size_bytes = body.len(),
+                            "HTTP response received"
+                        );
                         return serde_json::from_str::<T>(&body).map_err(|e| {
                             let preview = body.get(..1024).unwrap_or(&body);
                             warn!(
@@ -951,7 +977,12 @@ impl BeaconClient {
                 Err(e) => {
                     if e.is_timeout() {
                         last_error = Some(BeaconError::Timeout);
-                        warn!(attempt = attempt, "Request timeout, will retry");
+                        warn!(
+                            endpoint = endpoint,
+                            timeout_ms = self.config.timeout.as_millis() as u64,
+                            attempt = attempt,
+                            "Request timeout, will retry"
+                        );
                         continue;
                     }
 
@@ -967,7 +998,14 @@ impl BeaconClient {
         }
 
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
-        span.in_scope(|| tracing::error!(error = %err, "Request failed after retries exhausted"));
+        span.in_scope(|| {
+            error!(
+                endpoint = endpoint,
+                total_attempts = self.config.max_retries + 1,
+                last_error = %err,
+                "Request failed after all retries exhausted"
+            )
+        });
         Err(err)
     }
 
@@ -990,11 +1028,18 @@ impl BeaconClient {
         telemetry::inject_trace_context(&mut trace_headers);
 
         let mut last_error = None;
+        let endpoint = url.split('?').next().unwrap_or(&url);
 
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
                 let backoff = self.calculate_backoff(attempt - 1);
-                debug!(attempt = attempt, backoff_ms = ?backoff.as_millis(), "Retrying request");
+                debug!(
+                    endpoint = endpoint,
+                    attempt = attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    bn_url = %RedactedUrl(&url),
+                    "Retrying HTTP request"
+                );
                 tokio::time::sleep(backoff).await;
             }
 
@@ -1006,12 +1051,22 @@ impl BeaconClient {
                 request = request.header(name.clone(), value.clone());
             }
 
+            let request_start = std::time::Instant::now();
             match request.send().await {
                 Ok(response) => {
                     let status = response.status();
+                    let latency_ms = request_start.elapsed().as_millis() as u64;
                     span.record("http.status_code", status.as_u16());
 
                     if status.is_success() {
+                        debug!(
+                            method = "POST",
+                            endpoint = endpoint,
+                            bn_url = %RedactedUrl(&url),
+                            status_code = status.as_u16(),
+                            latency_ms = latency_ms,
+                            "HTTP response received"
+                        );
                         return Ok(());
                     }
 
@@ -1050,7 +1105,12 @@ impl BeaconClient {
                 Err(e) => {
                     if e.is_timeout() {
                         last_error = Some(BeaconError::Timeout);
-                        warn!(attempt = attempt, "Request timeout, will retry");
+                        warn!(
+                            endpoint = endpoint,
+                            timeout_ms = self.config.timeout.as_millis() as u64,
+                            attempt = attempt,
+                            "Request timeout, will retry"
+                        );
                         continue;
                     }
 
@@ -1066,7 +1126,14 @@ impl BeaconClient {
         }
 
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
-        span.in_scope(|| tracing::error!(error = %err, "Request failed after retries exhausted"));
+        span.in_scope(|| {
+            error!(
+                endpoint = endpoint,
+                total_attempts = self.config.max_retries + 1,
+                last_error = %err,
+                "Request failed after all retries exhausted"
+            )
+        });
         Err(err)
     }
 
@@ -1088,20 +1155,37 @@ impl BeaconClient {
             http.status_code = tracing::field::Empty,
         );
         let mut last_error = None;
+        let endpoint = url.split('?').next().unwrap_or(url);
 
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
                 let backoff = self.calculate_backoff(attempt - 1);
-                debug!(attempt = attempt, backoff_ms = ?backoff.as_millis(), "Retrying request");
+                debug!(
+                    endpoint = endpoint,
+                    attempt = attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    bn_url = %RedactedUrl(url),
+                    "Retrying HTTP request"
+                );
                 tokio::time::sleep(backoff).await;
             }
 
+            let request_start = std::time::Instant::now();
             match request_fn().await {
                 Ok(response) => {
                     let status = response.status();
                     span.record("http.status_code", status.as_u16());
 
                     if status.is_success() {
+                        let latency_ms = request_start.elapsed().as_millis() as u64;
+                        debug!(
+                            method = http_method,
+                            endpoint = endpoint,
+                            bn_url = %RedactedUrl(url),
+                            status_code = status.as_u16(),
+                            latency_ms = latency_ms,
+                            "HTTP response received"
+                        );
                         return Ok(response);
                     }
 
@@ -1140,7 +1224,12 @@ impl BeaconClient {
                 Err(e) => {
                     if e.is_timeout() {
                         last_error = Some(BeaconError::Timeout);
-                        warn!(attempt = attempt, "Request timeout, will retry");
+                        warn!(
+                            endpoint = endpoint,
+                            timeout_ms = self.config.timeout.as_millis() as u64,
+                            attempt = attempt,
+                            "Request timeout, will retry"
+                        );
                         continue;
                     }
 
@@ -1156,7 +1245,14 @@ impl BeaconClient {
         }
 
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
-        span.in_scope(|| tracing::error!(error = %err, "Request failed after retries exhausted"));
+        span.in_scope(|| {
+            error!(
+                endpoint = endpoint,
+                total_attempts = self.config.max_retries + 1,
+                last_error = %err,
+                "Request failed after all retries exhausted"
+            )
+        });
         Err(err)
     }
 

@@ -4,7 +4,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crypto::logging::RedactedUrl;
 use tokio::sync::RwLock;
+use tracing::{debug, info};
 
 /// Default EMA smoothing factor (alpha). Higher = more weight on recent samples.
 const DEFAULT_EMA_ALPHA: f64 = 0.3;
@@ -48,13 +50,53 @@ impl BnHealthTracker {
     }
 
     pub fn record_success(&mut self, latency: Duration) {
+        let old_score = self.score();
+        let was_healthy = self.is_healthy();
         let ms = latency.as_secs_f64() * 1000.0;
         self.update_latency_ema(ms);
         self.push_outcome(true);
+        let new_score = self.score();
+        if (new_score - old_score).abs() > 0.01 {
+            debug!(
+                bn_url = %RedactedUrl(&self.endpoint),
+                old_score = format!("{:.3}", old_score),
+                new_score = format!("{:.3}", new_score),
+                "Health score changed"
+            );
+        }
+        if !was_healthy && self.is_healthy() {
+            info!(
+                bn_url = %RedactedUrl(&self.endpoint),
+                old_status = "unhealthy",
+                new_status = "healthy",
+                health_score = format!("{:.3}", new_score),
+                "BN health transition"
+            );
+        }
     }
 
     pub fn record_error(&mut self) {
+        let old_score = self.score();
+        let was_healthy = self.is_healthy();
         self.push_outcome(false);
+        let new_score = self.score();
+        if (new_score - old_score).abs() > 0.01 {
+            debug!(
+                bn_url = %RedactedUrl(&self.endpoint),
+                old_score = format!("{:.3}", old_score),
+                new_score = format!("{:.3}", new_score),
+                "Health score changed"
+            );
+        }
+        if was_healthy && !self.is_healthy() {
+            info!(
+                bn_url = %RedactedUrl(&self.endpoint),
+                old_status = "healthy",
+                new_status = "unhealthy",
+                health_score = format!("{:.3}", new_score),
+                "BN health transition"
+            );
+        }
     }
 
     pub fn latency_ema_ms(&self) -> Option<f64> {

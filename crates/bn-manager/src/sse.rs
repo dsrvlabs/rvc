@@ -133,8 +133,9 @@ pub async fn subscribe_events<F>(
 ) where
     F: Fn(SseEvent) + Send + Sync + 'static,
 {
+    use crypto::logging::RedactedUrl;
     use reqwest_eventsource::{Event, EventSource};
-    use tracing::{debug, info, warn};
+    use tracing::{debug, info, trace, warn};
 
     if configs.is_empty() {
         warn!("No SSE endpoints configured");
@@ -188,7 +189,11 @@ pub async fn subscribe_events<F>(
         let url =
             format!("{}/eth/v1/events?topics={}", config.endpoint.trim_end_matches('/'), topics);
 
-        debug!(url = %url, "connecting to SSE stream");
+        debug!(
+            bn_url = %RedactedUrl(&config.endpoint),
+            event_types = %topics,
+            "Connecting to SSE stream"
+        );
 
         let mut es = EventSource::get(&url);
         events_since_reconnect = 0;
@@ -203,7 +208,11 @@ pub async fn subscribe_events<F>(
                 event = futures::StreamExt::next(&mut es) => {
                     match event {
                         Some(Ok(Event::Open)) => {
-                            info!("SSE connection established");
+                            debug!(
+                                bn_url = %RedactedUrl(&config.endpoint),
+                                event_types = %topics,
+                                "SSE connection established"
+                            );
                             // Don't reset consecutive_failures on Open alone;
                             // wait for at least one valid event to confirm BN health
                         }
@@ -218,7 +227,17 @@ pub async fn subscribe_events<F>(
                                         );
                                         consecutive_failures = 0;
                                     }
-                                    debug!(event_type = %msg.event, "SSE event received");
+                                    let slot = match &sse_event {
+                                        SseEvent::Head(h) => h.slot.as_str(),
+                                        SseEvent::Block(b) => b.slot.as_str(),
+                                        SseEvent::ChainReorg(r) => r.slot.as_str(),
+                                        SseEvent::FinalizedCheckpoint(_) => "",
+                                    };
+                                    trace!(
+                                        event_type = %msg.event,
+                                        slot = slot,
+                                        "SSE event received"
+                                    );
                                     callback(sse_event);
                                 }
                                 Err(SseError::UnknownEvent(evt)) => {
@@ -230,13 +249,21 @@ pub async fn subscribe_events<F>(
                             }
                         }
                         Some(Err(err)) => {
-                            warn!(error = %err, "SSE stream error");
+                            warn!(
+                                bn_url = %RedactedUrl(&config.endpoint),
+                                reason = %err,
+                                "SSE disconnection"
+                            );
                             consecutive_failures += 1;
                             es.close();
                             break;
                         }
                         None => {
-                            warn!("SSE stream ended");
+                            warn!(
+                                bn_url = %RedactedUrl(&config.endpoint),
+                                reason = "stream ended",
+                                "SSE disconnection"
+                            );
                             consecutive_failures += 1;
                             break;
                         }
@@ -246,6 +273,11 @@ pub async fn subscribe_events<F>(
         }
 
         // Brief delay before reconnecting
+        info!(
+            bn_url = %RedactedUrl(&config.endpoint),
+            attempt = consecutive_failures,
+            "SSE reconnecting"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
