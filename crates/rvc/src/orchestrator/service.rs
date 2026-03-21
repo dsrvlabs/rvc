@@ -64,16 +64,38 @@ const SYNC_COMMITTEE_SUBNET_COUNT: u64 = 4;
 /// Constructs a hex-encoded SSZ bitlist where only the validator's position
 /// in the committee is set (pre-Electra aggregation_bits format).
 fn make_aggregation_bits(duty: &AttesterDuty) -> Option<String> {
-    let committee_length: usize = duty.committee_length.parse().unwrap_or(0);
-    let validator_committee_index: usize = duty.validator_committee_index.parse().unwrap_or(0);
+    let committee_length: usize = match duty.committee_length.parse() {
+        Ok(0) => {
+            warn!(
+                validator_index = %duty.validator_index,
+                "committee_length is 0, cannot produce aggregation bits"
+            );
+            return None;
+        }
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                validator_index = %duty.validator_index,
+                raw_value = %duty.committee_length,
+                error = %e,
+                "failed to parse committee_length, skipping duty"
+            );
+            return None;
+        }
+    };
 
-    if committee_length == 0 {
-        warn!(
-            validator_index = %duty.validator_index,
-            "committee_length is 0, cannot produce aggregation bits"
-        );
-        return None;
-    }
+    let validator_committee_index: usize = match duty.validator_committee_index.parse() {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(
+                validator_index = %duty.validator_index,
+                raw_value = %duty.validator_committee_index,
+                error = %e,
+                "failed to parse validator_committee_index, skipping duty"
+            );
+            return None;
+        }
+    };
 
     // SSZ bitlist: ceil((committee_length + 1) / 8) bytes
     // The "+1" is for the length bit at position committee_length
@@ -3776,6 +3798,34 @@ mod tests {
             committee_length: "0".to_string(),
             committees_at_slot: "1".to_string(),
             validator_committee_index: "0".to_string(),
+            slot: "100".to_string(),
+        };
+        assert!(make_aggregation_bits(&duty).is_none());
+    }
+
+    #[test]
+    fn test_make_aggregation_bits_invalid_committee_length() {
+        let duty = AttesterDuty {
+            pubkey: "0xaabb".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: "not_a_number".to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: "0".to_string(),
+            slot: "100".to_string(),
+        };
+        assert!(make_aggregation_bits(&duty).is_none());
+    }
+
+    #[test]
+    fn test_make_aggregation_bits_invalid_validator_committee_index() {
+        let duty = AttesterDuty {
+            pubkey: "0xaabb".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: "8".to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: "garbage".to_string(),
             slot: "100".to_string(),
         };
         assert!(make_aggregation_bits(&duty).is_none());
