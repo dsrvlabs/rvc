@@ -5,6 +5,7 @@
 
 mod error;
 mod service;
+pub(crate) mod sync_committee;
 pub(crate) mod utils;
 
 pub use error::OrchestratorError;
