@@ -5,6 +5,7 @@
 
 mod error;
 mod service;
+pub(crate) mod utils;
 
 pub use error::OrchestratorError;
 pub use service::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle, PubkeyMap};

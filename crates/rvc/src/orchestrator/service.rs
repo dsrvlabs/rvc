@@ -36,6 +36,7 @@ use timing::{SlotClock, SLOTS_PER_EPOCH};
 use tree_hash::TreeHash;
 
 use super::error::OrchestratorError;
+use super::utils;
 
 /// Shared, dynamically-updatable public key map.
 ///
@@ -48,58 +49,6 @@ const SYNC_COMMITTEE_SIZE: u64 = 512;
 
 /// Number of subnets the sync committee is split across.
 const SYNC_COMMITTEE_SUBNET_COUNT: u64 = 4;
-
-/// Constructs a hex-encoded SSZ bitlist where only the validator's position
-/// in the committee is set (pre-Electra aggregation_bits format).
-fn make_aggregation_bits(duty: &AttesterDuty) -> Option<String> {
-    let committee_length: usize = match duty.committee_length.parse() {
-        Ok(0) => {
-            warn!(
-                validator_index = %duty.validator_index,
-                "committee_length is 0, cannot produce aggregation bits"
-            );
-            return None;
-        }
-        Ok(v) => v,
-        Err(e) => {
-            warn!(
-                validator_index = %duty.validator_index,
-                raw_value = %duty.committee_length,
-                error = %e,
-                "failed to parse committee_length, skipping duty"
-            );
-            return None;
-        }
-    };
-
-    let validator_committee_index: usize = match duty.validator_committee_index.parse() {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(
-                validator_index = %duty.validator_index,
-                raw_value = %duty.validator_committee_index,
-                error = %e,
-                "failed to parse validator_committee_index, skipping duty"
-            );
-            return None;
-        }
-    };
-
-    // SSZ bitlist: ceil((committee_length + 1) / 8) bytes
-    // The "+1" is for the length bit at position committee_length
-    let byte_count = (committee_length + 8) / 8;
-    let mut bits = vec![0u8; byte_count];
-
-    // Set the validator's bit
-    if validator_committee_index < committee_length {
-        bits[validator_committee_index / 8] |= 1 << (validator_committee_index % 8);
-    }
-
-    // Set the length bit (sentinel) at position committee_length
-    bits[committee_length / 8] |= 1 << (committee_length % 8);
-
-    Some(format!("0x{}", hex::encode(bits)))
-}
 
 /// Configuration for the duty orchestrator.
 #[derive(Clone)]
@@ -679,7 +628,7 @@ where
 
             // We need the validator_index. Look it up from cached attester duties.
             // Iterate over current and next epoch slots to find a duty with this pubkey.
-            let normalized = Self::normalize_pubkey(pubkey_hex);
+            let normalized = utils::normalize_pubkey(pubkey_hex);
             let mut found_index = None;
 
             if let Ok(current_slot) = self.clock.current_slot() {
@@ -689,7 +638,7 @@ where
                         let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
                         let duties = self.duty_tracker.get_duties_for_slot(slot).await;
                         for duty in &duties {
-                            if Self::normalize_pubkey(&duty.pubkey) == normalized {
+                            if utils::normalize_pubkey(&duty.pubkey) == normalized {
                                 found_index = Some(duty.validator_index.clone());
                                 break;
                             }
@@ -747,9 +696,9 @@ where
 
             for duty in &duties {
                 // Only subscribe for our own validators
-                let normalized = Self::normalize_pubkey(&duty.pubkey);
+                let normalized = utils::normalize_pubkey(&duty.pubkey);
                 let pubkey =
-                    pubkey_snapshot.iter().find(|(k, _)| Self::normalize_pubkey(k) == normalized);
+                    pubkey_snapshot.iter().find(|(k, _)| utils::normalize_pubkey(k) == normalized);
 
                 let pubkey = match pubkey {
                     Some((_, pk)) => pk.clone(),
@@ -832,7 +781,7 @@ where
         };
 
         // Check if the proposer is one of our validators
-        let pubkey = match self.find_pubkey(&proposer_duty.pubkey) {
+        let pubkey = match utils::find_pubkey(&self.pubkey_map, &proposer_duty.pubkey) {
             Some(pk) => pk,
             None => return,
         };
@@ -1101,10 +1050,11 @@ where
 
     #[tracing::instrument(name = "rvc.orchestrator.produce_aggregations", skip_all, fields(rvc.slot = slot, rvc.epoch = epoch))]
     async fn maybe_produce_aggregations(&self, slot: Slot, epoch: u64) {
-        let duties = match self.get_duties_for_slot(slot).await {
-            Ok(d) => d,
-            Err(_) => return,
-        };
+        let duties =
+            match utils::get_duties_for_slot(&self.pubkey_map, &self.duty_tracker, slot).await {
+                Ok(d) => d,
+                Err(_) => return,
+            };
 
         if duties.is_empty() {
             return;
@@ -1139,7 +1089,7 @@ where
                 Err(_) => continue,
             };
 
-            let pubkey = match self.find_pubkey(&duty.pubkey) {
+            let pubkey = match utils::find_pubkey(&self.pubkey_map, &duty.pubkey) {
                 Some(pk) => pk,
                 None => continue,
             };
@@ -1219,7 +1169,7 @@ where
             };
 
             let crypto_attestation_data =
-                match Self::convert_attestation_data(&attestation_data_response.data) {
+                match utils::convert_attestation_data(&attestation_data_response.data) {
                     Ok(data) => data,
                     Err(e) => {
                         warn!(
@@ -1502,7 +1452,7 @@ where
         let mut matching_pubkeys = Vec::new();
 
         for duty in duties {
-            if let Some(pk) = self.find_pubkey(&duty.pubkey) {
+            if let Some(pk) = utils::find_pubkey(&self.pubkey_map, &duty.pubkey) {
                 matching_duties.push(duty.clone());
                 matching_pubkeys.push(pk);
             }
@@ -1520,7 +1470,7 @@ where
         {
             Ok(Ok(response)) => {
                 let root_hex = response.data.root;
-                match Self::parse_hex_root(&root_hex) {
+                match utils::parse_hex_root(&root_hex) {
                     Ok(root) => Some(root),
                     Err(e) => {
                         warn!(error = %e, "Failed to parse head block root");
@@ -1565,7 +1515,7 @@ where
             return Err(OrchestratorError::SlotMissed { slot, current_slot });
         }
 
-        let duties = self.get_duties_for_slot(slot).await?;
+        let duties = utils::get_duties_for_slot(&self.pubkey_map, &self.duty_tracker, slot).await?;
 
         if duties.is_empty() {
             debug!(slot = slot, "No attestation duties for this slot");
@@ -1629,43 +1579,6 @@ where
         Ok(results)
     }
 
-    async fn get_duties_for_slot(
-        &self,
-        slot: Slot,
-    ) -> Result<Vec<AttesterDuty>, OrchestratorError> {
-        let pubkey_snapshot = self.pubkey_map.read().clone();
-        if pubkey_snapshot.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let epoch = slot / SLOTS_PER_EPOCH;
-
-        if !self.duty_tracker.is_epoch_cached(epoch).await {
-            self.duty_tracker.fetch_duties_for_epoch(epoch).await?;
-        }
-
-        let normalized_pubkeys: std::collections::HashSet<String> =
-            pubkey_snapshot.keys().map(|k| Self::normalize_pubkey(k)).collect();
-
-        let all_duties = self.duty_tracker.get_duties_for_slot(slot).await;
-        let duties: Vec<AttesterDuty> = all_duties
-            .into_iter()
-            .filter(|duty| {
-                let normalized_duty_pubkey = Self::normalize_pubkey(&duty.pubkey);
-                normalized_pubkeys.contains(&normalized_duty_pubkey)
-            })
-            .collect();
-
-        Ok(duties)
-    }
-
-    /// Normalizes a pubkey to lowercase without 0x/0X prefix for comparison.
-    fn normalize_pubkey(pubkey: &str) -> String {
-        let without_prefix =
-            pubkey.strip_prefix("0x").or_else(|| pubkey.strip_prefix("0X")).unwrap_or(pubkey);
-        without_prefix.to_lowercase()
-    }
-
     async fn process_attestation_duty(&self, duty: AttesterDuty) -> AttestationResult {
         let validator_index = duty.validator_index.clone();
 
@@ -1713,7 +1626,7 @@ where
             );
         }
 
-        let pubkey = match self.find_pubkey(&duty.pubkey) {
+        let pubkey = match utils::find_pubkey(&self.pubkey_map, &duty.pubkey) {
             Some(pk) => pk,
             None => {
                 return AttestationResult {
@@ -1768,7 +1681,7 @@ where
         );
 
         let mut crypto_attestation_data =
-            match Self::convert_attestation_data(&beacon_attestation_data) {
+            match utils::convert_attestation_data(&beacon_attestation_data) {
                 Ok(data) => data,
                 Err(e) => {
                     return AttestationResult {
@@ -1880,7 +1793,7 @@ where
                 signature: sig_hex,
             }])
         } else {
-            let aggregation_bits = match make_aggregation_bits(&duty) {
+            let aggregation_bits = match utils::make_aggregation_bits(&duty) {
                 Some(bits) => bits,
                 None => {
                     warn!(
@@ -1947,98 +1860,6 @@ where
                 }
             }
         }
-    }
-
-    /// Finds a public key by matching against duty pubkey.
-    ///
-    /// Pubkeys are matched case-insensitively and with/without "0x" prefix.
-    fn find_pubkey(&self, duty_pubkey: &str) -> Option<PublicKey> {
-        let pubkey_map = self.pubkey_map.read();
-
-        // Try exact match first
-        if let Some(pk) = pubkey_map.get(duty_pubkey) {
-            return Some(pk.clone());
-        }
-
-        // Try with/without 0x prefix
-        let normalized_pubkey = if duty_pubkey.starts_with("0x") {
-            duty_pubkey.to_string()
-        } else {
-            format!("0x{}", duty_pubkey)
-        };
-
-        if let Some(pk) = pubkey_map.get(&normalized_pubkey) {
-            return Some(pk.clone());
-        }
-
-        // Normalize for case-insensitive matching
-        let duty_normalized = Self::normalize_pubkey(duty_pubkey);
-
-        for (key, pk) in pubkey_map.iter() {
-            if Self::normalize_pubkey(key) == duty_normalized {
-                return Some(pk.clone());
-            }
-        }
-
-        None
-    }
-
-    fn convert_attestation_data(
-        beacon_data: &beacon::AttestationData,
-    ) -> Result<eth_types::AttestationData, OrchestratorError> {
-        let slot: u64 = beacon_data
-            .slot
-            .parse()
-            .map_err(|_| OrchestratorError::ParseError("Invalid slot".to_string()))?;
-
-        let index: u64 = beacon_data
-            .index
-            .parse()
-            .map_err(|_| OrchestratorError::ParseError("Invalid index".to_string()))?;
-
-        let beacon_block_root = Self::parse_hex_root(&beacon_data.beacon_block_root)?;
-
-        let source_epoch: u64 = beacon_data
-            .source
-            .epoch
-            .parse()
-            .map_err(|_| OrchestratorError::ParseError("Invalid source epoch".to_string()))?;
-
-        let source_root = Self::parse_hex_root(&beacon_data.source.root)?;
-
-        let target_epoch: u64 = beacon_data
-            .target
-            .epoch
-            .parse()
-            .map_err(|_| OrchestratorError::ParseError("Invalid target epoch".to_string()))?;
-
-        let target_root = Self::parse_hex_root(&beacon_data.target.root)?;
-
-        Ok(eth_types::AttestationData {
-            slot,
-            index,
-            beacon_block_root,
-            source: eth_types::Checkpoint { epoch: source_epoch, root: source_root },
-            target: eth_types::Checkpoint { epoch: target_epoch, root: target_root },
-        })
-    }
-
-    fn parse_hex_root(hex_str: &str) -> Result<Root, OrchestratorError> {
-        let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-
-        let bytes = hex::decode(hex_str)
-            .map_err(|e| OrchestratorError::ParseError(format!("Invalid hex: {}", e)))?;
-
-        if bytes.len() != 32 {
-            return Err(OrchestratorError::ParseError(format!(
-                "Invalid root length: expected 32, got {}",
-                bytes.len()
-            )));
-        }
-
-        let mut root = [0u8; 32];
-        root.copy_from_slice(&bytes);
-        Ok(root)
     }
 }
 
@@ -2215,103 +2036,6 @@ mod tests {
         assert_eq!(config.timeouts.block_production, defaults.block_production);
         assert_eq!(config.timeouts.duty_fetch, defaults.duty_fetch);
         assert_eq!(config.timeouts.attestation_fetch, defaults.attestation_fetch);
-    }
-
-    #[test]
-    fn test_parse_hex_root_with_prefix() {
-        let root =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::parse_hex_root(
-                "0x1111111111111111111111111111111111111111111111111111111111111111",
-            )
-            .unwrap();
-        assert_eq!(root, [0x11; 32]);
-    }
-
-    #[test]
-    fn test_parse_hex_root_without_prefix() {
-        let root =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::parse_hex_root(
-                "2222222222222222222222222222222222222222222222222222222222222222",
-            )
-            .unwrap();
-        assert_eq!(root, [0x22; 32]);
-    }
-
-    #[test]
-    fn test_parse_hex_root_invalid_length() {
-        let result =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::parse_hex_root(
-                "0x1111111111",
-            );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_hex_root_invalid_hex() {
-        let result =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::parse_hex_root(
-                "0xgggggggg",
-            );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_convert_attestation_data_success() {
-        let beacon_data = beacon::AttestationData {
-            slot: "1000".to_string(),
-            index: "5".to_string(),
-            beacon_block_root: "0x1111111111111111111111111111111111111111111111111111111111111111"
-                .to_string(),
-            source: beacon::Checkpoint {
-                epoch: "100".to_string(),
-                root: "0x2222222222222222222222222222222222222222222222222222222222222222"
-                    .to_string(),
-            },
-            target: beacon::Checkpoint {
-                epoch: "101".to_string(),
-                root: "0x3333333333333333333333333333333333333333333333333333333333333333"
-                    .to_string(),
-            },
-        };
-
-        let crypto_data =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::convert_attestation_data(
-                &beacon_data,
-            )
-            .unwrap();
-
-        assert_eq!(crypto_data.slot, 1000);
-        assert_eq!(crypto_data.index, 5);
-        assert_eq!(crypto_data.beacon_block_root, [0x11; 32]);
-        assert_eq!(crypto_data.source.epoch, 100);
-        assert_eq!(crypto_data.source.root, [0x22; 32]);
-        assert_eq!(crypto_data.target.epoch, 101);
-        assert_eq!(crypto_data.target.root, [0x33; 32]);
-    }
-
-    #[test]
-    fn test_convert_attestation_data_invalid_slot() {
-        let beacon_data = beacon::AttestationData {
-            slot: "invalid".to_string(),
-            index: "5".to_string(),
-            beacon_block_root: "0x1111111111111111111111111111111111111111111111111111111111111111"
-                .to_string(),
-            source: beacon::Checkpoint {
-                epoch: "100".to_string(),
-                root: "0x2222222222222222222222222222222222222222222222222222222222222222"
-                    .to_string(),
-            },
-            target: beacon::Checkpoint {
-                epoch: "101".to_string(),
-                root: "0x3333333333333333333333333333333333333333333333333333333333333333"
-                    .to_string(),
-            },
-        };
-
-        let result = DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::convert_attestation_data(
-            &beacon_data,
-        );
-        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -2537,7 +2261,7 @@ mod tests {
             pubkey_map,
         );
 
-        let found = orchestrator.find_pubkey(&pubkey_hex);
+        let found = utils::find_pubkey(&orchestrator.pubkey_map, &pubkey_hex);
         assert!(found.is_some());
         assert_eq!(found.unwrap().to_bytes(), pubkey.to_bytes());
     }
@@ -2578,7 +2302,7 @@ mod tests {
             pubkey_map,
         );
 
-        let found = orchestrator.find_pubkey(&pubkey_hex.to_lowercase());
+        let found = utils::find_pubkey(&orchestrator.pubkey_map, &pubkey_hex.to_lowercase());
         assert!(found.is_some());
     }
 
@@ -2612,7 +2336,7 @@ mod tests {
             pubkey_map,
         );
 
-        let found = orchestrator.find_pubkey("0x1234567890abcdef");
+        let found = utils::find_pubkey(&orchestrator.pubkey_map, "0x1234567890abcdef");
         assert!(found.is_none());
     }
 
@@ -3792,7 +3516,7 @@ mod tests {
             validator_committee_index: "0".to_string(),
             slot: "100".to_string(),
         };
-        let bits = make_aggregation_bits(&duty).unwrap();
+        let bits = utils::make_aggregation_bits(&duty).unwrap();
         // committee_length=4, validator_committee_index=0
         // Byte 0: bit 0 set (validator) = 0x01
         // Length bit at position 4 → byte 0, bit 4 = 0x10
@@ -3811,7 +3535,7 @@ mod tests {
             validator_committee_index: "3".to_string(),
             slot: "100".to_string(),
         };
-        let bits = make_aggregation_bits(&duty).unwrap();
+        let bits = utils::make_aggregation_bits(&duty).unwrap();
         // committee_length=8, validator_committee_index=3
         // Byte 0: bit 3 set = 0x08
         // Length bit at position 8 → byte 1, bit 0 = 0x01
@@ -3830,7 +3554,7 @@ mod tests {
             validator_committee_index: "3".to_string(),
             slot: "100".to_string(),
         };
-        let bits = make_aggregation_bits(&duty).unwrap();
+        let bits = utils::make_aggregation_bits(&duty).unwrap();
         // committee_length=4, validator_committee_index=3
         // Byte 0: bit 3 set = 0x08, length bit at position 4 = 0x10
         // Combined: 0x18
@@ -3848,7 +3572,7 @@ mod tests {
             validator_committee_index: "0".to_string(),
             slot: "100".to_string(),
         };
-        assert!(make_aggregation_bits(&duty).is_none());
+        assert!(utils::make_aggregation_bits(&duty).is_none());
     }
 
     #[test]
@@ -3862,7 +3586,7 @@ mod tests {
             validator_committee_index: "0".to_string(),
             slot: "100".to_string(),
         };
-        assert!(make_aggregation_bits(&duty).is_none());
+        assert!(utils::make_aggregation_bits(&duty).is_none());
     }
 
     #[test]
@@ -3876,7 +3600,7 @@ mod tests {
             validator_committee_index: "garbage".to_string(),
             slot: "100".to_string(),
         };
-        assert!(make_aggregation_bits(&duty).is_none());
+        assert!(utils::make_aggregation_bits(&duty).is_none());
     }
 
     #[test]
@@ -4377,12 +4101,7 @@ mod tests {
             },
         };
 
-        let mut crypto_data = DutyOrchestrator::<
-            MockSlotClock,
-            MockSubmitter,
-            MockBlockBeacon,
-        >::convert_attestation_data(&beacon_data)
-        .unwrap();
+        let mut crypto_data = utils::convert_attestation_data(&beacon_data).unwrap();
 
         // Before EIP-7549, index matches BN response
         assert_eq!(crypto_data.index, 7, "index should initially match BN response");
@@ -4507,12 +4226,7 @@ mod tests {
             },
         };
 
-        let mut crypto_data = DutyOrchestrator::<
-            MockSlotClock,
-            MockSubmitter,
-            MockBlockBeacon,
-        >::convert_attestation_data(&beacon_data)
-        .unwrap();
+        let mut crypto_data = utils::convert_attestation_data(&beacon_data).unwrap();
 
         assert_eq!(crypto_data.index, 5, "index should match BN response");
 
@@ -4554,12 +4268,7 @@ mod tests {
         };
 
         // Step 1: Convert and apply EIP-7549 zeroing (what gets signed)
-        let mut crypto_data = DutyOrchestrator::<
-            MockSlotClock,
-            MockSubmitter,
-            MockBlockBeacon,
-        >::convert_attestation_data(&beacon_data)
-        .unwrap();
+        let mut crypto_data = utils::convert_attestation_data(&beacon_data).unwrap();
         assert_eq!(crypto_data.index, 7);
         crypto_data.index = 0; // EIP-7549
         let signed_root = crypto_data.tree_hash_root();
@@ -4570,12 +4279,8 @@ mod tests {
         // We reconstruct that and convert back to crypto types.
         let mut submitted_beacon_data = beacon_data;
         submitted_beacon_data.index = "0".to_string();
-        let submitted_crypto_data = DutyOrchestrator::<
-            MockSlotClock,
-            MockSubmitter,
-            MockBlockBeacon,
-        >::convert_attestation_data(&submitted_beacon_data)
-        .unwrap();
+        let submitted_crypto_data =
+            utils::convert_attestation_data(&submitted_beacon_data).unwrap();
         let submitted_root = submitted_crypto_data.tree_hash_root();
 
         assert_eq!(
