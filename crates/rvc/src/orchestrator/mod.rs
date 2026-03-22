@@ -5,6 +5,7 @@
 
 pub(crate) mod aggregation;
 pub(crate) mod attestation;
+pub(crate) mod duty_management;
 mod error;
 mod service;
 pub(crate) mod sync_committee;
