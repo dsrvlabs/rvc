@@ -5,8 +5,8 @@ use eth_types::{Root, Slot};
 use timing::SLOTS_PER_EPOCH;
 use tracing::warn;
 
+use super::coordinator::PubkeyMap;
 use super::error::OrchestratorError;
-use super::service::PubkeyMap;
 
 /// Constructs a hex-encoded SSZ bitlist where only the validator's position
 /// in the committee is set (pre-Electra aggregation_bits format).

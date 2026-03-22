@@ -10,7 +10,7 @@ use eth_types::{ContributionAndProof, Root, SignedContributionAndProof, Slot, Sy
 use signer::SignerService;
 use sync_service::is_sync_committee_aggregator;
 
-use super::service::{OrchestratorConfig, PubkeyMap};
+use super::coordinator::{OrchestratorConfig, PubkeyMap};
 use super::utils;
 
 /// Total validators in a sync committee.

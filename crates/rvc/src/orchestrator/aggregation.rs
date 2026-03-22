@@ -14,7 +14,7 @@ use metrics::definitions::{attestation_status, RVC_AGGREGATIONS_TOTAL};
 use signer::{is_aggregator, SignerService};
 use tree_hash::TreeHash;
 
-use super::service::{OrchestratorConfig, PubkeyMap};
+use super::coordinator::{OrchestratorConfig, PubkeyMap};
 use super::utils;
 
 pub(crate) struct AggregationService {

@@ -9,7 +9,7 @@ use metrics::definitions::RVC_DUTY_REORG_DETECTED_TOTAL;
 use signer::{is_aggregator, SignerService};
 use timing::{SlotClock, SLOTS_PER_EPOCH};
 
-use super::service::{OrchestratorConfig, PubkeyMap};
+use super::coordinator::{OrchestratorConfig, PubkeyMap};
 use super::utils;
 
 pub(crate) struct DutyManagementService<C: SlotClock + 'static> {

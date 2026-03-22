@@ -15,8 +15,8 @@ use propagator::{AttestationSubmitter, Propagator};
 use signer::SignerService;
 use timing::{SlotClock, SLOTS_PER_EPOCH};
 
+use super::coordinator::{AttestationResult, OrchestratorConfig, PubkeyMap};
 use super::error::OrchestratorError;
-use super::service::{AttestationResult, OrchestratorConfig, PubkeyMap};
 use super::utils;
 
 pub(crate) struct AttestationService<C, S>
