@@ -3,6 +3,7 @@
 //! This module provides the [`DutyOrchestrator`] service that coordinates
 //! attestation duties, block proposals, and sync committee participation.
 
+pub(crate) mod aggregation;
 mod error;
 mod service;
 pub(crate) mod sync_committee;
