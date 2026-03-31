@@ -402,6 +402,18 @@ fn empty_interchange() -> String {
     .to_string()
 }
 
+pub(crate) fn parse_eth_address(s: &str) -> Result<[u8; 20], ApiError> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s).map_err(|e| ApiError::BadRequest(format!("invalid hex: {e}")))?;
+    let addr: [u8; 20] =
+        bytes.try_into().map_err(|_| ApiError::BadRequest("address must be 20 bytes".into()))?;
+    Ok(addr)
+}
+
+pub(crate) fn format_pubkey(pubkey: &[u8; 48]) -> String {
+    format!("0x{}", hex::encode(pubkey))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2138,5 +2150,47 @@ mod tests {
         let resp: ImportRemoteKeysResponse = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(resp.data[0].status, ImportRemoteKeyStatus::Error);
         assert!(resp.data[0].message.contains("Private/reserved IP"));
+    }
+
+    // --- parse_eth_address tests ---
+
+    #[test]
+    fn test_parse_eth_address_valid_with_prefix() {
+        let addr = parse_eth_address("0xAbcF8e0d4e9587369b2301D0790347320302cc09").unwrap();
+        assert_eq!(addr.len(), 20);
+        assert_eq!(hex::encode(addr), "abcf8e0d4e9587369b2301d0790347320302cc09");
+    }
+
+    #[test]
+    fn test_parse_eth_address_valid_without_prefix() {
+        let addr = parse_eth_address("AbcF8e0d4e9587369b2301D0790347320302cc09").unwrap();
+        assert_eq!(hex::encode(addr), "abcf8e0d4e9587369b2301d0790347320302cc09");
+    }
+
+    #[test]
+    fn test_parse_eth_address_invalid_hex() {
+        let result = parse_eth_address("0xZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_eth_address_wrong_length() {
+        let result = parse_eth_address("0xabcdef");
+        assert!(result.is_err());
+    }
+
+    // --- format_pubkey tests ---
+
+    #[test]
+    fn test_format_pubkey() {
+        let mut pubkey = [0u8; 48];
+        pubkey[0] = 0x93;
+        pubkey[1] = 0x24;
+        pubkey[47] = 0x4a;
+        let formatted = format_pubkey(&pubkey);
+        assert!(formatted.starts_with("0x"));
+        assert_eq!(formatted.len(), 98); // 0x + 96 hex chars
+        assert_eq!(&formatted[..6], "0x9324");
+        assert!(formatted.ends_with("4a"));
     }
 }

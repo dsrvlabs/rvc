@@ -31,9 +31,112 @@ impl std::fmt::Debug for ImportKeystoresRequest {
     }
 }
 
+// --- Fee recipient types ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FeeRecipientData {
+    pub pubkey: String,
+    pub ethaddress: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FeeRecipientResponse {
+    pub data: FeeRecipientData,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetFeeRecipientRequest {
+    pub ethaddress: String,
+}
+
+// --- Gas limit types ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GasLimitData {
+    pub pubkey: String,
+    pub gas_limit: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GasLimitResponse {
+    pub data: GasLimitData,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetGasLimitRequest {
+    pub gas_limit: String,
+}
+
+// --- Graffiti types ---
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GraffitiData {
+    pub pubkey: String,
+    pub graffiti: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GraffitiResponse {
+    pub data: GraffitiData,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetGraffitiRequest {
+    pub graffiti: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_fee_recipient_response_serialization() {
+        let resp = FeeRecipientResponse {
+            data: FeeRecipientData { pubkey: "0xabc".into(), ethaddress: "0x1234".into() },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["data"]["pubkey"], "0xabc");
+        assert_eq!(json["data"]["ethaddress"], "0x1234");
+    }
+
+    #[test]
+    fn test_set_fee_recipient_request_deserialization() {
+        let json = r#"{"ethaddress": "0xAbcF8e0d4e9587369b2301D0790347320302cc09"}"#;
+        let req: SetFeeRecipientRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.ethaddress, "0xAbcF8e0d4e9587369b2301D0790347320302cc09");
+    }
+
+    #[test]
+    fn test_gas_limit_response_serialization() {
+        let resp = GasLimitResponse {
+            data: GasLimitData { pubkey: "0xabc".into(), gas_limit: "30000000".into() },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["data"]["gas_limit"], "30000000");
+    }
+
+    #[test]
+    fn test_set_gas_limit_request_deserialization() {
+        let json = r#"{"gas_limit": "30000000"}"#;
+        let req: SetGasLimitRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.gas_limit, "30000000");
+    }
+
+    #[test]
+    fn test_graffiti_response_serialization() {
+        let resp = GraffitiResponse {
+            data: GraffitiData { pubkey: "0xabc".into(), graffiti: "hello world".into() },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["data"]["graffiti"], "hello world");
+    }
+
+    #[test]
+    fn test_set_graffiti_request_deserialization() {
+        let json = r#"{"graffiti": "my graffiti"}"#;
+        let req: SetGraffitiRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.graffiti, "my graffiti");
+    }
 
     #[test]
     fn test_import_keystores_request_debug_redacts_passwords() {
