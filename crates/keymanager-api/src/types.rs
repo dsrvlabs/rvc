@@ -157,6 +157,34 @@ mod tests {
             "Debug output must NOT contain actual passwords"
         );
     }
+
+    #[test]
+    fn test_voluntary_exit_query_deserialize_with_epoch() {
+        let json = r#"{"epoch": "300000"}"#;
+        let query: VoluntaryExitQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.epoch, Some("300000".to_string()));
+    }
+
+    #[test]
+    fn test_voluntary_exit_query_deserialize_without_epoch() {
+        let json = r#"{}"#;
+        let query: VoluntaryExitQuery = serde_json::from_str(json).unwrap();
+        assert!(query.epoch.is_none());
+    }
+
+    #[test]
+    fn test_voluntary_exit_response_serialization() {
+        let resp = VoluntaryExitResponse {
+            data: eth_types::SignedVoluntaryExit {
+                message: eth_types::VoluntaryExit { epoch: 300000, validator_index: 12345 },
+                signature: vec![0xaa; 96],
+            },
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["data"]["message"]["epoch"], "300000");
+        assert_eq!(json["data"]["message"]["validator_index"], "12345");
+        assert!(json["data"]["signature"].as_str().unwrap().starts_with("0x"));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -274,4 +302,16 @@ pub struct DeleteRemoteKeyResult {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteRemoteKeysResponse {
     pub data: Vec<DeleteRemoteKeyResult>,
+}
+
+// --- Voluntary Exit ---
+
+#[derive(Debug, Deserialize)]
+pub struct VoluntaryExitQuery {
+    pub epoch: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VoluntaryExitResponse {
+    pub data: eth_types::SignedVoluntaryExit,
 }
