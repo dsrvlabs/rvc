@@ -4136,6 +4136,7 @@ dependencies = [
 name = "rvc-keymanager-api"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum 0.7.9",
  "hex",
  "http-body-util",
@@ -4143,6 +4144,7 @@ dependencies = [
  "parking_lot",
  "rand 0.8.5",
  "rvc-crypto",
+ "rvc-eth-types",
  "serde",
  "serde_json",
  "subtle",

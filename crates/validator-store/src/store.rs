@@ -3,13 +3,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crypto::logging::TruncatedPubkey;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::{info, trace, warn};
 
 use crate::config::{ValidatorConfig, ValidatorConfigUpdate};
 use crate::error::ValidatorStoreError;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct TomlConfig {
     #[serde(default)]
     defaults: Option<TomlDefaults>,
@@ -17,21 +17,27 @@ struct TomlConfig {
     validators: Vec<TomlValidator>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct TomlDefaults {
     fee_recipient: Option<String>,
     gas_limit: Option<u64>,
     graffiti: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct TomlValidator {
     pubkey: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     fee_recipient: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     gas_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     builder_proposals: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     builder_boost_factor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     graffiti: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
 }
 
@@ -229,6 +235,60 @@ impl ValidatorStore {
         }
     }
 
+    pub fn has_validator(&self, pubkey: &[u8; 48]) -> bool {
+        self.validators.read().contains_key(pubkey)
+    }
+
+    #[tracing::instrument(name = "rvc.validator_store.save_config", skip_all)]
+    pub fn save_config(&self) -> Result<(), ValidatorStoreError> {
+        let config_path = self.config_path.as_ref().ok_or_else(|| {
+            ValidatorStoreError::Config("no config path set for save".to_string())
+        })?;
+
+        let defaults = self.defaults.read();
+        let validators = self.validators.read();
+
+        let toml_defaults = TomlDefaults {
+            fee_recipient: Some(format!("0x{}", hex::encode(defaults.fee_recipient))),
+            gas_limit: Some(defaults.gas_limit),
+            graffiti: defaults.graffiti.map(|g| graffiti_to_string(&g)),
+        };
+
+        let toml_validators: Vec<TomlValidator> = validators
+            .values()
+            .map(|v| TomlValidator {
+                pubkey: format!("0x{}", hex::encode(v.pubkey)),
+                fee_recipient: v.fee_recipient.map(|fr| format!("0x{}", hex::encode(fr))),
+                gas_limit: v.gas_limit,
+                builder_proposals: Some(v.builder_proposals),
+                builder_boost_factor: Some(v.builder_boost_factor),
+                graffiti: v.graffiti.map(|g| graffiti_to_string(&g)),
+                enabled: Some(v.enabled),
+            })
+            .collect();
+
+        // Release locks before I/O
+        drop(defaults);
+        drop(validators);
+
+        let toml_config = TomlConfig { defaults: Some(toml_defaults), validators: toml_validators };
+
+        let toml_string = toml::to_string(&toml_config)
+            .map_err(|e| ValidatorStoreError::Config(e.to_string()))?;
+
+        let parent = config_path.parent().ok_or_else(|| {
+            ValidatorStoreError::Config("config path has no parent directory".to_string())
+        })?;
+
+        let tmp = tempfile::NamedTempFile::new_in(parent)?;
+        std::io::Write::write_all(&mut &tmp, toml_string.as_bytes())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(config_path).map_err(|e| ValidatorStoreError::Io(e.error))?;
+
+        info!(path = %config_path.display(), "config saved");
+        Ok(())
+    }
+
     #[tracing::instrument(name = "rvc.validator_store.reload_config", skip_all)]
     pub fn reload_config(&self) -> Result<(), ValidatorStoreError> {
         let path = self.config_path.as_ref().ok_or_else(|| {
@@ -308,6 +368,11 @@ fn parse_graffiti(s: &str) -> [u8; 32] {
     let len = bytes.len().min(32);
     graffiti[..len].copy_from_slice(&bytes[..len]);
     graffiti
+}
+
+fn graffiti_to_string(graffiti: &[u8; 32]) -> String {
+    let end = graffiti.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    String::from_utf8_lossy(&graffiti[..end]).into_owned()
 }
 
 #[cfg(test)]
@@ -1239,5 +1304,120 @@ pubkey = "{}"
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    #[test]
+    fn test_has_validator() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+
+        assert!(!store.has_validator(&pk));
+
+        store.add_validator(ValidatorConfig::new(pk));
+        assert!(store.has_validator(&pk));
+
+        assert!(!store.has_validator(&test_pubkey(99)));
+    }
+
+    #[test]
+    fn test_save_config_round_trip() {
+        let pubkey_hex = "0x".to_string() + &hex::encode([1u8; 48]);
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+
+        let toml_content = format!(
+            r#"[defaults]
+fee_recipient = "{}"
+gas_limit = 30000000
+
+[[validators]]
+pubkey = "{}"
+fee_recipient = "{}"
+gas_limit = 35000000
+builder_proposals = true
+builder_boost_factor = 200
+graffiti = "my graffiti"
+"#,
+            "0x".to_string() + &hex::encode([0xaau8; 20]),
+            pubkey_hex,
+            fr_hex,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &toml_content).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+
+        // Update fee_recipient via update_config
+        let pk = [1u8; 48];
+        let new_fr = [0xbbu8; 20];
+        store.update_config(
+            &pk,
+            ValidatorConfigUpdate { fee_recipient: Some(Some(new_fr)), ..Default::default() },
+        );
+
+        // Save and reload
+        store.save_config().unwrap();
+        let reloaded = ValidatorStore::load_from_config(&config_path).unwrap();
+
+        assert_eq!(reloaded.get_config(&pk).unwrap().fee_recipient, Some(new_fr));
+    }
+
+    #[test]
+    fn test_save_config_no_path_returns_error() {
+        let store = ValidatorStore::new([0u8; 20], 30_000_000);
+        let result = store.save_config();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_save_config_preserves_all_fields() {
+        let pubkey_hex = "0x".to_string() + &hex::encode([1u8; 48]);
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+        let default_fr_hex = "0x".to_string() + &hex::encode([0xccu8; 20]);
+
+        let toml_content = format!(
+            r#"[defaults]
+fee_recipient = "{}"
+gas_limit = 25000000
+graffiti = "default graffiti"
+
+[[validators]]
+pubkey = "{}"
+fee_recipient = "{}"
+gas_limit = 35000000
+builder_proposals = true
+builder_boost_factor = 200
+graffiti = "my graffiti"
+enabled = false
+"#,
+            default_fr_hex, pubkey_hex, fr_hex,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &toml_content).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+        store.save_config().unwrap();
+
+        let reloaded = ValidatorStore::load_from_config(&config_path).unwrap();
+
+        // Check defaults
+        assert_eq!(reloaded.defaults.read().fee_recipient, [0xccu8; 20]);
+        assert_eq!(reloaded.defaults.read().gas_limit, 25_000_000);
+        assert!(reloaded.defaults.read().graffiti.is_some());
+        let graffiti = reloaded.defaults.read().graffiti.unwrap();
+        assert_eq!(&graffiti[..16], b"default graffiti");
+
+        // Check validator
+        let pk = [1u8; 48];
+        let config = reloaded.get_config(&pk).unwrap();
+        assert_eq!(config.fee_recipient, Some([0xaau8; 20]));
+        assert_eq!(config.gas_limit, Some(35_000_000));
+        assert!(config.builder_proposals);
+        assert_eq!(config.builder_boost_factor, 200);
+        assert!(config.graffiti.is_some());
+        assert!(!config.enabled);
     }
 }
