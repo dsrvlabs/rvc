@@ -5,15 +5,16 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crypto::{CompositeSigner, Keystore, PublicKey, RemoteSigner, RemoteSignerConfig};
+use keymanager_api::error::ApiError;
 use keymanager_api::traits::{
     DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ImportKeystoreError,
     ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection,
-    ValidatorManager,
+    ValidatorConfigManager, ValidatorManager,
 };
 use slashing::SlashingDb;
 use tokio::sync::watch;
 use tracing::{info, warn};
-use validator_store::ValidatorStore;
+use validator_store::{ValidatorConfigUpdate, ValidatorStore};
 
 use crate::orchestrator::PubkeyMap;
 
@@ -376,6 +377,111 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
         } else {
             Ok(false)
         }
+    }
+}
+
+pub struct ValidatorConfigManagerAdapter {
+    validator_store: Arc<ValidatorStore>,
+}
+
+impl ValidatorConfigManagerAdapter {
+    pub fn new(validator_store: Arc<ValidatorStore>) -> Self {
+        Self { validator_store }
+    }
+
+    fn ensure_validator_exists(&self, pubkey: &Pubkey) -> Result<(), ApiError> {
+        if !self.validator_store.has_validator(pubkey) {
+            return Err(ApiError::NotFound(format!(
+                "validator 0x{} not found",
+                hex::encode(pubkey)
+            )));
+        }
+        Ok(())
+    }
+
+    fn update_and_save(
+        &self,
+        pubkey: &Pubkey,
+        update: ValidatorConfigUpdate,
+    ) -> Result<(), ApiError> {
+        self.validator_store.update_config(pubkey, update);
+        self.validator_store.save_config().map_err(|e| ApiError::Internal(e.to_string()))
+    }
+}
+
+impl ValidatorConfigManager for ValidatorConfigManagerAdapter {
+    fn get_fee_recipient(&self, pubkey: &Pubkey) -> Result<[u8; 20], ApiError> {
+        self.ensure_validator_exists(pubkey)?;
+        Ok(self.validator_store.effective_fee_recipient(pubkey))
+    }
+
+    fn set_fee_recipient(&self, pubkey: &Pubkey, address: [u8; 20]) -> Result<(), ApiError> {
+        self.ensure_validator_exists(pubkey)?;
+        self.update_and_save(
+            pubkey,
+            ValidatorConfigUpdate { fee_recipient: Some(Some(address)), ..Default::default() },
+        )
+    }
+
+    fn delete_fee_recipient(&self, pubkey: &Pubkey) -> Result<(), ApiError> {
+        self.ensure_validator_exists(pubkey)?;
+        self.update_and_save(
+            pubkey,
+            ValidatorConfigUpdate { fee_recipient: Some(None), ..Default::default() },
+        )
+    }
+
+    fn get_gas_limit(&self, pubkey: &Pubkey) -> Result<u64, ApiError> {
+        self.ensure_validator_exists(pubkey)?;
+        Ok(self.validator_store.effective_gas_limit(pubkey))
+    }
+
+    fn set_gas_limit(&self, pubkey: &Pubkey, limit: u64) -> Result<(), ApiError> {
+        self.ensure_validator_exists(pubkey)?;
+        self.update_and_save(
+            pubkey,
+            ValidatorConfigUpdate { gas_limit: Some(Some(limit)), ..Default::default() },
+        )
+    }
+
+    fn delete_gas_limit(&self, pubkey: &Pubkey) -> Result<(), ApiError> {
+        self.ensure_validator_exists(pubkey)?;
+        self.update_and_save(
+            pubkey,
+            ValidatorConfigUpdate { gas_limit: Some(None), ..Default::default() },
+        )
+    }
+
+    fn get_graffiti(&self, pubkey: &Pubkey) -> Result<String, ApiError> {
+        self.ensure_validator_exists(pubkey)?;
+        let graffiti = self.validator_store.effective_graffiti(pubkey);
+        Ok(match graffiti {
+            Some(g) => {
+                let end = g.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+                String::from_utf8_lossy(&g[..end]).into_owned()
+            }
+            None => String::new(),
+        })
+    }
+
+    fn set_graffiti(&self, pubkey: &Pubkey, graffiti: &str) -> Result<(), ApiError> {
+        self.ensure_validator_exists(pubkey)?;
+        let mut bytes = [0u8; 32];
+        let src = graffiti.as_bytes();
+        let len = src.len().min(32);
+        bytes[..len].copy_from_slice(&src[..len]);
+        self.update_and_save(
+            pubkey,
+            ValidatorConfigUpdate { graffiti: Some(Some(bytes)), ..Default::default() },
+        )
+    }
+
+    fn delete_graffiti(&self, pubkey: &Pubkey) -> Result<(), ApiError> {
+        self.ensure_validator_exists(pubkey)?;
+        self.update_and_save(
+            pubkey,
+            ValidatorConfigUpdate { graffiti: Some(None), ..Default::default() },
+        )
     }
 }
 
@@ -1224,5 +1330,180 @@ mod tests {
         let keys = adapter.list_keys();
         let has_key = adapter.has_key(&pk_bytes);
         assert_eq!(keys.contains(&pk_bytes), has_key);
+    }
+
+    // --- ValidatorConfigManagerAdapter tests ---
+
+    fn create_config_adapter_with_store() -> (ValidatorConfigManagerAdapter, Arc<ValidatorStore>) {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(
+            &config_path,
+            "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\ngas_limit = 30000000\n",
+        )
+        .unwrap();
+        let store = Arc::new(ValidatorStore::load_from_config(&config_path).unwrap());
+        // Keep TempDir alive by leaking it — tests are short-lived
+        std::mem::forget(dir);
+        let adapter = ValidatorConfigManagerAdapter::new(store.clone());
+        (adapter, store)
+    }
+
+    fn add_test_validator(store: &ValidatorStore, id: u8) -> Pubkey {
+        let pk = test_pubkey(id);
+        store.add_validator(validator_store::ValidatorConfig::new(pk));
+        pk
+    }
+
+    #[test]
+    fn test_config_adapter_unknown_pubkey_returns_not_found() {
+        let (adapter, _store) = create_config_adapter_with_store();
+        let pk = test_pubkey(99);
+
+        assert!(matches!(adapter.get_fee_recipient(&pk), Err(ApiError::NotFound(_))));
+        assert!(matches!(adapter.get_gas_limit(&pk), Err(ApiError::NotFound(_))));
+        assert!(matches!(adapter.get_graffiti(&pk), Err(ApiError::NotFound(_))));
+        assert!(matches!(adapter.set_fee_recipient(&pk, [0u8; 20]), Err(ApiError::NotFound(_))));
+        assert!(matches!(adapter.set_gas_limit(&pk, 100), Err(ApiError::NotFound(_))));
+        assert!(matches!(adapter.set_graffiti(&pk, "test"), Err(ApiError::NotFound(_))));
+        assert!(matches!(adapter.delete_fee_recipient(&pk), Err(ApiError::NotFound(_))));
+        assert!(matches!(adapter.delete_gas_limit(&pk), Err(ApiError::NotFound(_))));
+        assert!(matches!(adapter.delete_graffiti(&pk), Err(ApiError::NotFound(_))));
+    }
+
+    #[test]
+    fn test_config_adapter_get_fee_recipient_returns_default() {
+        let (adapter, store) = create_config_adapter_with_store();
+        let pk = add_test_validator(&store, 1);
+
+        let fee = adapter.get_fee_recipient(&pk).unwrap();
+        // Default from config: 0x0000000000000000000000000000000000000001
+        let mut expected = [0u8; 20];
+        expected[19] = 1;
+        assert_eq!(fee, expected);
+    }
+
+    #[test]
+    fn test_config_adapter_fee_recipient_set_get_roundtrip() {
+        let (adapter, store) = create_config_adapter_with_store();
+        let pk = add_test_validator(&store, 1);
+
+        let new_fee = [0xABu8; 20];
+        adapter.set_fee_recipient(&pk, new_fee).unwrap();
+
+        let got = adapter.get_fee_recipient(&pk).unwrap();
+        assert_eq!(got, new_fee);
+    }
+
+    #[test]
+    fn test_config_adapter_fee_recipient_delete_resets_to_default() {
+        let (adapter, store) = create_config_adapter_with_store();
+        let pk = add_test_validator(&store, 1);
+
+        let new_fee = [0xABu8; 20];
+        adapter.set_fee_recipient(&pk, new_fee).unwrap();
+        adapter.delete_fee_recipient(&pk).unwrap();
+
+        let got = adapter.get_fee_recipient(&pk).unwrap();
+        // Should be back to default
+        let mut expected = [0u8; 20];
+        expected[19] = 1;
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn test_config_adapter_get_gas_limit_returns_default() {
+        let (adapter, store) = create_config_adapter_with_store();
+        let pk = add_test_validator(&store, 1);
+
+        let limit = adapter.get_gas_limit(&pk).unwrap();
+        assert_eq!(limit, 30_000_000);
+    }
+
+    #[test]
+    fn test_config_adapter_gas_limit_set_get_roundtrip() {
+        let (adapter, store) = create_config_adapter_with_store();
+        let pk = add_test_validator(&store, 1);
+
+        adapter.set_gas_limit(&pk, 50_000_000).unwrap();
+        let got = adapter.get_gas_limit(&pk).unwrap();
+        assert_eq!(got, 50_000_000);
+    }
+
+    #[test]
+    fn test_config_adapter_gas_limit_delete_resets_to_default() {
+        let (adapter, store) = create_config_adapter_with_store();
+        let pk = add_test_validator(&store, 1);
+
+        adapter.set_gas_limit(&pk, 50_000_000).unwrap();
+        adapter.delete_gas_limit(&pk).unwrap();
+        let got = adapter.get_gas_limit(&pk).unwrap();
+        assert_eq!(got, 30_000_000);
+    }
+
+    #[test]
+    fn test_config_adapter_get_graffiti_returns_empty_when_none() {
+        let (adapter, store) = create_config_adapter_with_store();
+        let pk = add_test_validator(&store, 1);
+
+        let graffiti = adapter.get_graffiti(&pk).unwrap();
+        assert_eq!(graffiti, "");
+    }
+
+    #[test]
+    fn test_config_adapter_graffiti_set_get_roundtrip() {
+        let (adapter, store) = create_config_adapter_with_store();
+        let pk = add_test_validator(&store, 1);
+
+        adapter.set_graffiti(&pk, "hello world").unwrap();
+        let got = adapter.get_graffiti(&pk).unwrap();
+        assert_eq!(got, "hello world");
+    }
+
+    #[test]
+    fn test_config_adapter_graffiti_delete_resets_to_default() {
+        let (adapter, store) = create_config_adapter_with_store();
+        let pk = add_test_validator(&store, 1);
+
+        adapter.set_graffiti(&pk, "hello").unwrap();
+        adapter.delete_graffiti(&pk).unwrap();
+        let got = adapter.get_graffiti(&pk).unwrap();
+        assert_eq!(got, "");
+    }
+
+    #[test]
+    fn test_config_adapter_save_persists_to_file() {
+        let dir = TempDir::new().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(
+            &config_path,
+            "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\ngas_limit = 30000000\n",
+        )
+        .unwrap();
+        let store = Arc::new(ValidatorStore::load_from_config(&config_path).unwrap());
+        let adapter = ValidatorConfigManagerAdapter::new(store.clone());
+
+        let pk = test_pubkey(1);
+        store.add_validator(validator_store::ValidatorConfig::new(pk));
+
+        let fee = [0xFFu8; 20];
+        adapter.set_fee_recipient(&pk, fee).unwrap();
+
+        // Reload from disk and verify
+        let store2 = ValidatorStore::load_from_config(&config_path).unwrap();
+        let loaded_fee = store2.effective_fee_recipient(&pk);
+        assert_eq!(loaded_fee, fee);
+    }
+
+    #[test]
+    fn test_config_adapter_graffiti_truncates_long_input() {
+        let (adapter, store) = create_config_adapter_with_store();
+        let pk = add_test_validator(&store, 1);
+
+        let long_graffiti = "a".repeat(64);
+        adapter.set_graffiti(&pk, &long_graffiti).unwrap();
+        let got = adapter.get_graffiti(&pk).unwrap();
+        assert_eq!(got.len(), 32);
+        assert_eq!(got, "a".repeat(32));
     }
 }
