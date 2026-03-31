@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
 use axum::Json;
 use crypto::logging::{RedactedUrl, TruncatedPubkey};
 use tracing::{info, warn};
@@ -8,14 +9,17 @@ use tracing::{info, warn};
 use crate::error::ApiError;
 use crate::traits::{
     DoppelgangerMonitor, ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey,
-    RemoteKeyManager, SlashingProtection, ValidatorManager,
+    RemoteKeyManager, SlashingProtection, ValidatorConfigManager, ValidatorManager,
 };
 use crate::types::{
     DeleteKeystoreResult, DeleteKeystoresRequest, DeleteKeystoresResponse, DeleteRemoteKeyResult,
     DeleteRemoteKeyStatus, DeleteRemoteKeysRequest, DeleteRemoteKeysResponse, DeleteStatus,
-    ImportKeystoreResult, ImportKeystoresRequest, ImportKeystoresResponse, ImportRemoteKeyResult,
-    ImportRemoteKeyStatus, ImportRemoteKeysRequest, ImportRemoteKeysResponse, ImportStatus,
-    KeystoreInfo, ListKeystoresResponse, ListRemoteKeysResponse, RemoteKeyEntry,
+    FeeRecipientData, FeeRecipientResponse, GasLimitData, GasLimitResponse, GraffitiData,
+    GraffitiResponse, ImportKeystoreResult, ImportKeystoresRequest, ImportKeystoresResponse,
+    ImportRemoteKeyResult, ImportRemoteKeyStatus, ImportRemoteKeysRequest,
+    ImportRemoteKeysResponse, ImportStatus, KeystoreInfo, ListKeystoresResponse,
+    ListRemoteKeysResponse, RemoteKeyEntry, SetFeeRecipientRequest, SetGasLimitRequest,
+    SetGraffitiRequest,
 };
 use crate::url_validator;
 
@@ -25,6 +29,7 @@ pub struct AppState {
     pub validator_manager: Arc<dyn ValidatorManager>,
     pub doppelganger_monitor: Arc<dyn DoppelgangerMonitor>,
     pub remote_key_manager: Arc<dyn RemoteKeyManager>,
+    pub config_manager: Arc<dyn ValidatorConfigManager>,
     pub allow_insecure_remote_signer: bool,
 }
 
@@ -380,6 +385,114 @@ pub async fn delete_remote_keys(
     Json(DeleteRemoteKeysResponse { data: results })
 }
 
+// --- Fee Recipient ---
+
+pub async fn get_fee_recipient(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+) -> Result<Json<FeeRecipientResponse>, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    let addr = state.config_manager.get_fee_recipient(&pubkey)?;
+    Ok(Json(FeeRecipientResponse {
+        data: FeeRecipientData {
+            pubkey: format_pubkey(&pubkey),
+            ethaddress: format!("0x{}", hex::encode(addr)),
+        },
+    }))
+}
+
+pub async fn set_fee_recipient(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+    Json(request): Json<SetFeeRecipientRequest>,
+) -> Result<StatusCode, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    let addr = parse_eth_address(&request.ethaddress)?;
+    if addr == [0u8; 20] {
+        return Err(ApiError::BadRequest("fee recipient cannot be zero address".into()));
+    }
+    state.config_manager.set_fee_recipient(&pubkey, addr)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+pub async fn delete_fee_recipient(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    state.config_manager.delete_fee_recipient(&pubkey)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Gas Limit ---
+
+pub async fn get_gas_limit(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+) -> Result<Json<GasLimitResponse>, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    let gas_limit = state.config_manager.get_gas_limit(&pubkey)?;
+    Ok(Json(GasLimitResponse {
+        data: GasLimitData { pubkey: format_pubkey(&pubkey), gas_limit: gas_limit.to_string() },
+    }))
+}
+
+pub async fn set_gas_limit(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+    Json(request): Json<SetGasLimitRequest>,
+) -> Result<StatusCode, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    let limit = request
+        .gas_limit
+        .parse::<u64>()
+        .map_err(|_| ApiError::BadRequest("invalid gas_limit: must be a numeric string".into()))?;
+    state.config_manager.set_gas_limit(&pubkey, limit)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+pub async fn delete_gas_limit(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    state.config_manager.delete_gas_limit(&pubkey)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Graffiti ---
+
+pub async fn get_graffiti(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+) -> Result<Json<GraffitiResponse>, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    let graffiti = state.config_manager.get_graffiti(&pubkey)?;
+    Ok(Json(GraffitiResponse { data: GraffitiData { pubkey: format_pubkey(&pubkey), graffiti } }))
+}
+
+pub async fn set_graffiti(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+    Json(request): Json<SetGraffitiRequest>,
+) -> Result<StatusCode, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    if request.graffiti.len() > 32 {
+        return Err(ApiError::BadRequest("graffiti must be 32 bytes or less".into()));
+    }
+    state.config_manager.set_graffiti(&pubkey, &request.graffiti)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+pub async fn delete_graffiti(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    state.config_manager.delete_graffiti(&pubkey)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn parse_pubkey(s: &str) -> Result<Pubkey, String> {
     let hex_str = s.strip_prefix("0x").unwrap_or(s);
     let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
@@ -628,6 +741,109 @@ mod tests {
         }
     }
 
+    struct MockValidatorConfigManager {
+        fee_recipients: Mutex<std::collections::HashMap<Pubkey, [u8; 20]>>,
+        gas_limits: Mutex<std::collections::HashMap<Pubkey, u64>>,
+        graffiti: Mutex<std::collections::HashMap<Pubkey, String>>,
+        known_pubkeys: Mutex<Vec<Pubkey>>,
+    }
+
+    impl MockValidatorConfigManager {
+        fn new() -> Self {
+            Self {
+                fee_recipients: Mutex::new(std::collections::HashMap::new()),
+                gas_limits: Mutex::new(std::collections::HashMap::new()),
+                graffiti: Mutex::new(std::collections::HashMap::new()),
+                known_pubkeys: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_validator(pubkey: Pubkey) -> Self {
+            let m = Self::new();
+            m.known_pubkeys.lock().push(pubkey);
+            m
+        }
+    }
+
+    impl ValidatorConfigManager for MockValidatorConfigManager {
+        fn get_fee_recipient(&self, pubkey: &Pubkey) -> Result<[u8; 20], ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.fee_recipients
+                .lock()
+                .get(pubkey)
+                .copied()
+                .ok_or_else(|| ApiError::NotFound("fee recipient not set".into()))
+        }
+
+        fn set_fee_recipient(&self, pubkey: &Pubkey, address: [u8; 20]) -> Result<(), ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.fee_recipients.lock().insert(*pubkey, address);
+            Ok(())
+        }
+
+        fn delete_fee_recipient(&self, pubkey: &Pubkey) -> Result<(), ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.fee_recipients.lock().remove(pubkey);
+            Ok(())
+        }
+
+        fn get_gas_limit(&self, pubkey: &Pubkey) -> Result<u64, ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.gas_limits
+                .lock()
+                .get(pubkey)
+                .copied()
+                .ok_or_else(|| ApiError::NotFound("gas limit not set".into()))
+        }
+
+        fn set_gas_limit(&self, pubkey: &Pubkey, limit: u64) -> Result<(), ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.gas_limits.lock().insert(*pubkey, limit);
+            Ok(())
+        }
+
+        fn delete_gas_limit(&self, pubkey: &Pubkey) -> Result<(), ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.gas_limits.lock().remove(pubkey);
+            Ok(())
+        }
+
+        fn get_graffiti(&self, pubkey: &Pubkey) -> Result<String, ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            Ok(self.graffiti.lock().get(pubkey).cloned().unwrap_or_default())
+        }
+
+        fn set_graffiti(&self, pubkey: &Pubkey, graffiti: &str) -> Result<(), ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.graffiti.lock().insert(*pubkey, graffiti.to_string());
+            Ok(())
+        }
+
+        fn delete_graffiti(&self, pubkey: &Pubkey) -> Result<(), ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.graffiti.lock().remove(pubkey);
+            Ok(())
+        }
+    }
+
     // --- Test helpers ---
 
     fn test_pubkey(id: u8) -> Pubkey {
@@ -650,6 +866,7 @@ mod tests {
         validator_manager: Arc<MockValidatorManager>,
         doppelganger_monitor: Arc<MockDoppelgangerMonitor>,
         remote_key_manager: Arc<MockRemoteKeyManager>,
+        config_manager: Arc<MockValidatorConfigManager>,
     }
 
     impl TestApp {
@@ -660,6 +877,7 @@ mod tests {
                 validator_manager: Arc::new(MockValidatorManager::new()),
                 doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
                 remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+                config_manager: Arc::new(MockValidatorConfigManager::new()),
             }
         }
 
@@ -670,6 +888,7 @@ mod tests {
                 validator_manager: Arc::new(MockValidatorManager::new()),
                 doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
                 remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+                config_manager: Arc::new(MockValidatorConfigManager::new()),
             }
         }
 
@@ -680,6 +899,7 @@ mod tests {
                 validator_manager: Arc::new(MockValidatorManager::new()),
                 doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
                 remote_key_manager: Arc::new(MockRemoteKeyManager::with_keys(keys)),
+                config_manager: Arc::new(MockValidatorConfigManager::new()),
             }
         }
 
@@ -690,6 +910,7 @@ mod tests {
                 validator_manager: Arc::new(MockValidatorManager::new()),
                 doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
                 remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+                config_manager: Arc::new(MockValidatorConfigManager::new()),
             }
         }
 
@@ -703,6 +924,18 @@ mod tests {
                 validator_manager: Arc::new(MockValidatorManager::new()),
                 doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
                 remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+                config_manager: Arc::new(MockValidatorConfigManager::new()),
+            }
+        }
+
+        fn with_config_manager(config_manager: MockValidatorConfigManager) -> Self {
+            Self {
+                keystore_manager: Arc::new(MockKeystoreManager::new()),
+                slashing_protection: Arc::new(MockSlashingProtection::new()),
+                validator_manager: Arc::new(MockValidatorManager::new()),
+                doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+                remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+                config_manager: Arc::new(config_manager),
             }
         }
 
@@ -713,6 +946,7 @@ mod tests {
                 validator_manager: self.validator_manager.clone(),
                 doppelganger_monitor: self.doppelganger_monitor.clone(),
                 remote_key_manager: self.remote_key_manager.clone(),
+                config_manager: self.config_manager.clone(),
                 allow_insecure_remote_signer: true,
             });
             Router::new()
@@ -931,6 +1165,7 @@ mod tests {
             validator_manager: Arc::new(MockValidatorManager::new()),
             doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
             remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+            config_manager: Arc::new(MockValidatorConfigManager::new()),
         };
         let slashing_data = serde_json::json!({
             "metadata": {
@@ -1698,6 +1933,7 @@ mod tests {
                 test_pubkey(2),
                 "https://signer.example.com".into(),
             )])),
+            config_manager: Arc::new(MockValidatorConfigManager::new()),
         };
 
         let response = app
@@ -1843,6 +2079,7 @@ mod tests {
             app.validator_manager.clone(),
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
+            app.config_manager.clone(),
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec![],
@@ -1879,6 +2116,7 @@ mod tests {
             app.validator_manager.clone(),
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
+            app.config_manager.clone(),
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec![],
@@ -1922,6 +2160,7 @@ mod tests {
             app.validator_manager.clone(),
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
+            app.config_manager.clone(),
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec![],
@@ -1959,6 +2198,7 @@ mod tests {
             app.validator_manager.clone(),
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
+            app.config_manager.clone(),
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec!["http://localhost:3000".to_string()],
@@ -1996,6 +2236,7 @@ mod tests {
             app.validator_manager.clone(),
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
+            app.config_manager.clone(),
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec!["http://localhost:3000".to_string()],
@@ -2032,6 +2273,7 @@ mod tests {
             validator_manager: app.validator_manager.clone(),
             doppelganger_monitor: app.doppelganger_monitor.clone(),
             remote_key_manager: app.remote_key_manager.clone(),
+            config_manager: app.config_manager.clone(),
             allow_insecure_remote_signer: false,
         });
 
@@ -2075,6 +2317,7 @@ mod tests {
             validator_manager: app.validator_manager.clone(),
             doppelganger_monitor: app.doppelganger_monitor.clone(),
             remote_key_manager: app.remote_key_manager.clone(),
+            config_manager: app.config_manager.clone(),
             allow_insecure_remote_signer: false,
         });
 
@@ -2118,6 +2361,7 @@ mod tests {
             validator_manager: app.validator_manager.clone(),
             doppelganger_monitor: app.doppelganger_monitor.clone(),
             remote_key_manager: app.remote_key_manager.clone(),
+            config_manager: app.config_manager.clone(),
             allow_insecure_remote_signer: false,
         });
 
@@ -2192,5 +2436,381 @@ mod tests {
         assert_eq!(formatted.len(), 98); // 0x + 96 hex chars
         assert_eq!(&formatted[..6], "0x9324");
         assert!(formatted.ends_with("4a"));
+    }
+
+    // --- Fee recipient handler tests ---
+
+    fn config_router(config_manager: MockValidatorConfigManager) -> Router {
+        let app = TestApp::with_config_manager(config_manager);
+        let state = Arc::new(AppState {
+            keystore_manager: app.keystore_manager.clone(),
+            slashing_protection: app.slashing_protection.clone(),
+            validator_manager: app.validator_manager.clone(),
+            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            remote_key_manager: app.remote_key_manager.clone(),
+            config_manager: app.config_manager.clone(),
+            allow_insecure_remote_signer: true,
+        });
+        Router::new()
+            .route(
+                "/eth/v1/validator/:pubkey/feerecipient",
+                get(get_fee_recipient).post(set_fee_recipient).delete(delete_fee_recipient),
+            )
+            .route(
+                "/eth/v1/validator/:pubkey/gas_limit",
+                get(get_gas_limit).post(set_gas_limit).delete(delete_gas_limit),
+            )
+            .route(
+                "/eth/v1/validator/:pubkey/graffiti",
+                get(get_graffiti).post(set_graffiti).delete(delete_graffiti),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_get_fee_recipient_returns_value() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let addr = [0xABu8; 20];
+        mock.fee_recipients.lock().insert(pk, addr);
+
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/feerecipient", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["ethaddress"], format!("0x{}", hex::encode(addr)));
+    }
+
+    #[tokio::test]
+    async fn test_get_fee_recipient_unknown_pubkey_404() {
+        let mock = MockValidatorConfigManager::new();
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/feerecipient", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_set_fee_recipient_valid_202() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/feerecipient", test_pubkey_hex(1));
+        let body = serde_json::json!({"ethaddress": "0xAbcF8e0d4e9587369b2301D0790347320302cc09"});
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_set_fee_recipient_zero_address_400() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/feerecipient", test_pubkey_hex(1));
+        let body = serde_json::json!({"ethaddress": "0x0000000000000000000000000000000000000000"});
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_delete_fee_recipient_204() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/feerecipient", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_fee_recipient_unknown_pubkey_404() {
+        let mock = MockValidatorConfigManager::new();
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/feerecipient", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- Gas limit handler tests ---
+
+    #[tokio::test]
+    async fn test_get_gas_limit_returns_value() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        mock.gas_limits.lock().insert(pk, 30_000_000);
+
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/gas_limit", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["gas_limit"], "30000000");
+    }
+
+    #[tokio::test]
+    async fn test_get_gas_limit_unknown_pubkey_404() {
+        let mock = MockValidatorConfigManager::new();
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/gas_limit", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_set_gas_limit_valid_202() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/gas_limit", test_pubkey_hex(1));
+        let body = serde_json::json!({"gas_limit": "30000000"});
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_set_gas_limit_non_numeric_400() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/gas_limit", test_pubkey_hex(1));
+        let body = serde_json::json!({"gas_limit": "not_a_number"});
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_delete_gas_limit_204() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/gas_limit", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_gas_limit_unknown_pubkey_404() {
+        let mock = MockValidatorConfigManager::new();
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/gas_limit", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- Graffiti handler tests ---
+
+    #[tokio::test]
+    async fn test_get_graffiti_returns_value() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        mock.graffiti.lock().insert(pk, "hello world".to_string());
+
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/graffiti", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["graffiti"], "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_get_graffiti_unknown_pubkey_404() {
+        let mock = MockValidatorConfigManager::new();
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/graffiti", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_set_graffiti_valid_202() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/graffiti", test_pubkey_hex(1));
+        let body = serde_json::json!({"graffiti": "my graffiti"});
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_set_graffiti_too_long_400() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/graffiti", test_pubkey_hex(1));
+        let body = serde_json::json!({"graffiti": "a]".repeat(17)}); // 34 bytes > 32
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_delete_graffiti_204() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/graffiti", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_graffiti_unknown_pubkey_404() {
+        let mock = MockValidatorConfigManager::new();
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/graffiti", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -12,7 +12,8 @@ use zeroize::Zeroizing;
 use crate::auth;
 use crate::handlers::{self, AppState};
 use crate::traits::{
-    DoppelgangerMonitor, KeystoreManager, RemoteKeyManager, SlashingProtection, ValidatorManager,
+    DoppelgangerMonitor, KeystoreManager, RemoteKeyManager, SlashingProtection,
+    ValidatorConfigManager, ValidatorManager,
 };
 
 pub const DEFAULT_ADDR: SocketAddr =
@@ -36,6 +37,7 @@ impl KeymanagerServer {
         validator_manager: Arc<dyn ValidatorManager>,
         doppelganger_monitor: Arc<dyn DoppelgangerMonitor>,
         remote_key_manager: Arc<dyn RemoteKeyManager>,
+        config_manager: Arc<dyn ValidatorConfigManager>,
         token: String,
         addr: SocketAddr,
         cors_origins: Vec<String>,
@@ -49,6 +51,7 @@ impl KeymanagerServer {
                 validator_manager,
                 doppelganger_monitor,
                 remote_key_manager,
+                config_manager,
                 allow_insecure_remote_signer,
             }),
             token: Arc::new(Zeroizing::new(token)),

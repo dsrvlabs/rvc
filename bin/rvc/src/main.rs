@@ -14,7 +14,7 @@ use rvc::config::{redact_url, CliOverrides, Config, Network, ServiceBuilder};
 use rvc::duty_tracker::DutyTrackerService;
 use rvc::keymanager_adapters::{
     DoppelgangerMonitorAdapter, KeystoreManagerAdapter, RemoteKeyManagerAdapter,
-    SlashingProtectionAdapter, ValidatorManagerAdapter,
+    SlashingProtectionAdapter, StubValidatorConfigManager, ValidatorManagerAdapter,
 };
 use rvc::startup;
 use rvc::DutyTrackerServer;
@@ -1041,12 +1041,16 @@ async fn run_validator(
             config.remote_signer_allowed_hosts.clone(),
         ));
 
+        // TODO(issue-2.7): Replace StubValidatorConfigManager with real adapter
+        let config_mgr = std::sync::Arc::new(StubValidatorConfigManager);
+
         let km_server = keymanager_api::KeymanagerServer::new(
             keystore_mgr,
             slashing_prot,
             validator_mgr,
             doppelganger_mon,
             remote_key_mgr,
+            config_mgr,
             token.to_string(),
             km_addr,
             config.keymanager_cors_origins.clone(),
