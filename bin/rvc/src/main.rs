@@ -82,7 +82,7 @@ enum Commands {
         #[arg(long, default_value = DEFAULT_GRPC_ADDRESS)]
         grpc_address: String,
 
-        /// Network preset (mainnet, hoodi, custom)
+        /// Network preset (mainnet, hoodi, holesky, sepolia, custom)
         #[arg(long)]
         network: Option<String>,
 
@@ -255,7 +255,7 @@ enum Commands {
         #[arg(long)]
         slashing_db_path: Option<PathBuf>,
 
-        /// Network preset (mainnet, hoodi, custom)
+        /// Network preset (mainnet, hoodi, holesky, sepolia, custom)
         #[arg(long)]
         network: Option<String>,
 
