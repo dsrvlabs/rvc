@@ -1,4 +1,7 @@
+use async_trait::async_trait;
 use thiserror::Error;
+
+use crate::error::ApiError;
 
 pub type Pubkey = [u8; 48];
 
@@ -70,4 +73,27 @@ pub trait RemoteKeyManager: Send + Sync {
     fn has_remote_key(&self, pubkey: &Pubkey) -> bool;
     fn import_remote_key(&self, pubkey: Pubkey, url: String) -> Result<(), ImportRemoteKeyError>;
     fn delete_remote_key(&self, pubkey: &Pubkey) -> Result<bool, DeleteRemoteKeyError>;
+}
+
+/// Manages per-validator configuration: fee recipient, gas limit, and graffiti.
+pub trait ValidatorConfigManager: Send + Sync {
+    fn get_fee_recipient(&self, pubkey: &Pubkey) -> Result<[u8; 20], ApiError>;
+    fn set_fee_recipient(&self, pubkey: &Pubkey, address: [u8; 20]) -> Result<(), ApiError>;
+    fn delete_fee_recipient(&self, pubkey: &Pubkey) -> Result<(), ApiError>;
+    fn get_gas_limit(&self, pubkey: &Pubkey) -> Result<u64, ApiError>;
+    fn set_gas_limit(&self, pubkey: &Pubkey, limit: u64) -> Result<(), ApiError>;
+    fn delete_gas_limit(&self, pubkey: &Pubkey) -> Result<(), ApiError>;
+    fn get_graffiti(&self, pubkey: &Pubkey) -> Result<String, ApiError>;
+    fn set_graffiti(&self, pubkey: &Pubkey, graffiti: &str) -> Result<(), ApiError>;
+    fn delete_graffiti(&self, pubkey: &Pubkey) -> Result<(), ApiError>;
+}
+
+/// Manages voluntary exit signing for validators.
+#[async_trait]
+pub trait VoluntaryExitManager: Send + Sync {
+    async fn sign_voluntary_exit(
+        &self,
+        pubkey: &Pubkey,
+        epoch: Option<u64>,
+    ) -> Result<eth_types::SignedVoluntaryExit, ApiError>;
 }

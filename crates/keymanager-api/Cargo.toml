@@ -7,8 +7,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 axum.workspace = true
 crypto.workspace = true
+eth-types.workspace = true
 hex.workspace = true
 rand.workspace = true
 serde.workspace = true
