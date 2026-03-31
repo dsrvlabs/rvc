@@ -31,11 +31,35 @@ pub const HOODI: KeygenNetwork = KeygenNetwork {
     capella_fork_version: [0x40, 0x00, 0x09, 0x10],
 };
 
+pub const HOLESKY: KeygenNetwork = KeygenNetwork {
+    name: "holesky",
+    genesis_fork_version: [0x01, 0x01, 0x70, 0x00],
+    genesis_validators_root: [
+        0x91, 0x43, 0xaa, 0x7c, 0x61, 0x5a, 0x7f, 0x71, 0x15, 0xe2, 0xb6, 0xaa, 0xc3, 0x19, 0xc0,
+        0x35, 0x29, 0xdf, 0x82, 0x42, 0xae, 0x70, 0x5f, 0xba, 0x9d, 0xf3, 0x9b, 0x79, 0xc5, 0x9f,
+        0xa8, 0xb1,
+    ],
+    capella_fork_version: [0x04, 0x01, 0x70, 0x00],
+};
+
+pub const SEPOLIA: KeygenNetwork = KeygenNetwork {
+    name: "sepolia",
+    genesis_fork_version: [0x90, 0x00, 0x00, 0x69],
+    genesis_validators_root: [
+        0xd8, 0xea, 0x17, 0x1f, 0x3c, 0x94, 0xae, 0xa2, 0x1e, 0xbc, 0x42, 0xa1, 0xed, 0x61, 0x05,
+        0x2a, 0xcf, 0x3f, 0x92, 0x09, 0xc0, 0x0e, 0x4e, 0xfb, 0xaa, 0xdd, 0xac, 0x09, 0xed, 0x9b,
+        0x80, 0x78,
+    ],
+    capella_fork_version: [0x90, 0x00, 0x00, 0x72],
+};
+
 pub fn from_name(name: &str) -> Result<&'static KeygenNetwork> {
     match name.to_lowercase().as_str() {
         "mainnet" => Ok(&MAINNET),
         "hoodi" => Ok(&HOODI),
-        other => bail!("Unknown network: '{}'. Supported: mainnet, hoodi", other),
+        "holesky" => Ok(&HOLESKY),
+        "sepolia" => Ok(&SEPOLIA),
+        other => bail!("Unknown network: '{}'. Supported: mainnet, hoodi, holesky, sepolia", other),
     }
 }
 
@@ -83,9 +107,27 @@ mod tests {
     }
 
     #[test]
+    fn test_from_name_holesky() {
+        let net = from_name("holesky").unwrap();
+        assert_eq!(net.name, "holesky");
+        assert_eq!(net.genesis_fork_version, [0x01, 0x01, 0x70, 0x00]);
+        assert_eq!(net.capella_fork_version, [0x04, 0x01, 0x70, 0x00]);
+    }
+
+    #[test]
+    fn test_from_name_sepolia() {
+        let net = from_name("sepolia").unwrap();
+        assert_eq!(net.name, "sepolia");
+        assert_eq!(net.genesis_fork_version, [0x90, 0x00, 0x00, 0x69]);
+        assert_eq!(net.capella_fork_version, [0x90, 0x00, 0x00, 0x72]);
+    }
+
+    #[test]
     fn test_from_name_case_insensitive() {
         assert!(from_name("Mainnet").is_ok());
         assert!(from_name("HOODI").is_ok());
+        assert!(from_name("Holesky").is_ok());
+        assert!(from_name("SEPOLIA").is_ok());
     }
 
     #[test]
@@ -109,6 +151,22 @@ mod tests {
             hex::decode("212f13fc4df078b6cb7db228f1c8307566dcecf900867401a92023d7ba99cb5f")
                 .unwrap();
         assert_eq!(HOODI.genesis_validators_root, expected.as_slice());
+    }
+
+    #[test]
+    fn test_holesky_genesis_root() {
+        let expected =
+            hex::decode("9143aa7c615a7f7115e2b6aac319c03529df8242ae705fba9df39b79c59fa8b1")
+                .unwrap();
+        assert_eq!(HOLESKY.genesis_validators_root, expected.as_slice());
+    }
+
+    #[test]
+    fn test_sepolia_genesis_root() {
+        let expected =
+            hex::decode("d8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078")
+                .unwrap();
+        assert_eq!(SEPOLIA.genesis_validators_root, expected.as_slice());
     }
 
     #[test]
