@@ -311,7 +311,7 @@ pub struct VoluntaryExitQuery {
     pub epoch: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct VoluntaryExitResponse {
     pub data: eth_types::SignedVoluntaryExit,
 }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use crypto::logging::{RedactedUrl, TruncatedPubkey};
@@ -10,6 +10,7 @@ use crate::error::ApiError;
 use crate::traits::{
     DoppelgangerMonitor, ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey,
     RemoteKeyManager, SlashingProtection, ValidatorConfigManager, ValidatorManager,
+    VoluntaryExitManager,
 };
 use crate::types::{
     DeleteKeystoreResult, DeleteKeystoresRequest, DeleteKeystoresResponse, DeleteRemoteKeyResult,
@@ -19,7 +20,7 @@ use crate::types::{
     ImportRemoteKeyResult, ImportRemoteKeyStatus, ImportRemoteKeysRequest,
     ImportRemoteKeysResponse, ImportStatus, KeystoreInfo, ListKeystoresResponse,
     ListRemoteKeysResponse, RemoteKeyEntry, SetFeeRecipientRequest, SetGasLimitRequest,
-    SetGraffitiRequest,
+    SetGraffitiRequest, VoluntaryExitQuery, VoluntaryExitResponse,
 };
 use crate::url_validator;
 
@@ -30,6 +31,7 @@ pub struct AppState {
     pub doppelganger_monitor: Arc<dyn DoppelgangerMonitor>,
     pub remote_key_manager: Arc<dyn RemoteKeyManager>,
     pub config_manager: Arc<dyn ValidatorConfigManager>,
+    pub exit_manager: Option<Arc<dyn VoluntaryExitManager>>,
     pub allow_insecure_remote_signer: bool,
 }
 
@@ -493,6 +495,32 @@ pub async fn delete_graffiti(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// --- Voluntary Exit ---
+
+pub async fn sign_voluntary_exit(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+    Query(query): Query<VoluntaryExitQuery>,
+) -> Result<Json<VoluntaryExitResponse>, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+
+    let epoch = query
+        .epoch
+        .map(|e| e.parse::<u64>())
+        .transpose()
+        .map_err(|_| ApiError::BadRequest("invalid epoch".into()))?;
+
+    let exit_manager = state.exit_manager.as_ref().ok_or_else(|| {
+        ApiError::Internal("voluntary exit not available: beacon node not configured".into())
+    })?;
+
+    warn!(pubkey = %pubkey_hex, epoch = ?epoch, "Voluntary exit requested — THIS IS IRREVERSIBLE");
+
+    let signed_exit = exit_manager.sign_voluntary_exit(&pubkey, epoch).await?;
+
+    Ok(Json(VoluntaryExitResponse { data: signed_exit }))
+}
+
 fn parse_pubkey(s: &str) -> Result<Pubkey, String> {
     let hex_str = s.strip_prefix("0x").unwrap_or(s);
     let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
@@ -947,6 +975,7 @@ mod tests {
                 doppelganger_monitor: self.doppelganger_monitor.clone(),
                 remote_key_manager: self.remote_key_manager.clone(),
                 config_manager: self.config_manager.clone(),
+                exit_manager: None,
                 allow_insecure_remote_signer: true,
             });
             Router::new()
@@ -2080,6 +2109,7 @@ mod tests {
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
             app.config_manager.clone(),
+            None,
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec![],
@@ -2117,6 +2147,7 @@ mod tests {
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
             app.config_manager.clone(),
+            None,
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec![],
@@ -2161,6 +2192,7 @@ mod tests {
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
             app.config_manager.clone(),
+            None,
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec![],
@@ -2199,6 +2231,7 @@ mod tests {
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
             app.config_manager.clone(),
+            None,
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec!["http://localhost:3000".to_string()],
@@ -2237,6 +2270,7 @@ mod tests {
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
             app.config_manager.clone(),
+            None,
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec!["http://localhost:3000".to_string()],
@@ -2274,6 +2308,7 @@ mod tests {
             doppelganger_monitor: app.doppelganger_monitor.clone(),
             remote_key_manager: app.remote_key_manager.clone(),
             config_manager: app.config_manager.clone(),
+            exit_manager: None,
             allow_insecure_remote_signer: false,
         });
 
@@ -2318,6 +2353,7 @@ mod tests {
             doppelganger_monitor: app.doppelganger_monitor.clone(),
             remote_key_manager: app.remote_key_manager.clone(),
             config_manager: app.config_manager.clone(),
+            exit_manager: None,
             allow_insecure_remote_signer: false,
         });
 
@@ -2362,6 +2398,7 @@ mod tests {
             doppelganger_monitor: app.doppelganger_monitor.clone(),
             remote_key_manager: app.remote_key_manager.clone(),
             config_manager: app.config_manager.clone(),
+            exit_manager: None,
             allow_insecure_remote_signer: false,
         });
 
@@ -2449,6 +2486,7 @@ mod tests {
             doppelganger_monitor: app.doppelganger_monitor.clone(),
             remote_key_manager: app.remote_key_manager.clone(),
             config_manager: app.config_manager.clone(),
+            exit_manager: None,
             allow_insecure_remote_signer: true,
         });
         Router::new()
@@ -2812,5 +2850,176 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- Voluntary exit handler tests ---
+
+    use crate::types::VoluntaryExitResponse;
+
+    struct MockVoluntaryExitManager {
+        known_pubkeys: Mutex<Vec<Pubkey>>,
+    }
+
+    impl MockVoluntaryExitManager {
+        fn new() -> Self {
+            Self { known_pubkeys: Mutex::new(Vec::new()) }
+        }
+
+        fn with_validator(pubkey: Pubkey) -> Self {
+            let m = Self::new();
+            m.known_pubkeys.lock().push(pubkey);
+            m
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VoluntaryExitManager for MockVoluntaryExitManager {
+        async fn sign_voluntary_exit(
+            &self,
+            pubkey: &Pubkey,
+            epoch: Option<u64>,
+        ) -> Result<eth_types::SignedVoluntaryExit, ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound(format!(
+                    "validator 0x{} not found",
+                    hex::encode(pubkey)
+                )));
+            }
+            let epoch = epoch.unwrap_or(100);
+            Ok(eth_types::SignedVoluntaryExit {
+                message: eth_types::VoluntaryExit { epoch, validator_index: 42 },
+                signature: vec![0xaa; 96],
+            })
+        }
+    }
+
+    fn exit_router(exit_manager: Option<Arc<dyn VoluntaryExitManager>>) -> Router {
+        let app = TestApp::new();
+        let state = Arc::new(AppState {
+            keystore_manager: app.keystore_manager.clone(),
+            slashing_protection: app.slashing_protection.clone(),
+            validator_manager: app.validator_manager.clone(),
+            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            remote_key_manager: app.remote_key_manager.clone(),
+            config_manager: app.config_manager.clone(),
+            exit_manager,
+            allow_insecure_remote_signer: true,
+        });
+        Router::new()
+            .route(
+                "/eth/v1/validator/:pubkey/voluntary_exit",
+                axum::routing::post(sign_voluntary_exit),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_with_explicit_epoch() {
+        let pk = test_pubkey(1);
+        let mock = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let router = exit_router(Some(mock));
+
+        let uri = format!("/eth/v1/validator/0x{}/voluntary_exit?epoch=300000", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let resp: VoluntaryExitResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(resp.data.message.epoch, 300000);
+        assert_eq!(resp.data.message.validator_index, 42);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_without_epoch_auto_detect() {
+        let pk = test_pubkey(1);
+        let mock = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let router = exit_router(Some(mock));
+
+        let uri = format!("/eth/v1/validator/0x{}/voluntary_exit", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let resp: VoluntaryExitResponse = serde_json::from_slice(&body_bytes).unwrap();
+        // Mock returns epoch=100 when None is passed
+        assert_eq!(resp.data.message.epoch, 100);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_invalid_epoch_400() {
+        let pk = test_pubkey(1);
+        let mock = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let router = exit_router(Some(mock));
+
+        let uri = format!("/eth/v1/validator/0x{}/voluntary_exit?epoch=abc", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_unknown_pubkey_404() {
+        let mock = Arc::new(MockVoluntaryExitManager::new());
+        let router = exit_router(Some(mock));
+
+        let uri = format!("/eth/v1/validator/0x{}/voluntary_exit", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_no_exit_manager_500() {
+        let router = exit_router(None);
+
+        let uri = format!("/eth/v1/validator/0x{}/voluntary_exit", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

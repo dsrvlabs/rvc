@@ -14,7 +14,8 @@ use rvc::config::{redact_url, CliOverrides, Config, Network, ServiceBuilder};
 use rvc::duty_tracker::DutyTrackerService;
 use rvc::keymanager_adapters::{
     DoppelgangerMonitorAdapter, KeystoreManagerAdapter, RemoteKeyManagerAdapter,
-    SlashingProtectionAdapter, StubValidatorConfigManager, ValidatorManagerAdapter,
+    SlashingProtectionAdapter, ValidatorConfigManagerAdapter, ValidatorManagerAdapter,
+    VoluntaryExitManagerAdapter,
 };
 use rvc::startup;
 use rvc::DutyTrackerServer;
@@ -1041,8 +1042,16 @@ async fn run_validator(
             config.remote_signer_allowed_hosts.clone(),
         ));
 
-        // TODO(issue-2.7): Replace StubValidatorConfigManager with real adapter
-        let config_mgr = std::sync::Arc::new(StubValidatorConfigManager);
+        let config_mgr =
+            std::sync::Arc::new(ValidatorConfigManagerAdapter::new(validator_store.clone()));
+
+        let exit_mgr: Option<std::sync::Arc<dyn keymanager_api::traits::VoluntaryExitManager>> =
+            Some(std::sync::Arc::new(VoluntaryExitManagerAdapter::new(
+                beacon_client.clone(),
+                signer.clone(),
+                orchestrator_config.fork_schedule.clone(),
+                genesis_validators_root,
+            )));
 
         let km_server = keymanager_api::KeymanagerServer::new(
             keystore_mgr,
@@ -1051,6 +1060,7 @@ async fn run_validator(
             doppelganger_mon,
             remote_key_mgr,
             config_mgr,
+            exit_mgr,
             token.to_string(),
             km_addr,
             config.keymanager_cors_origins.clone(),

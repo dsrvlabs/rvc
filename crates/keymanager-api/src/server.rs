@@ -4,7 +4,7 @@ use std::sync::Arc;
 use axum::extract::DefaultBodyLimit;
 use axum::http::header;
 use axum::http::Method;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use zeroize::Zeroizing;
@@ -13,7 +13,7 @@ use crate::auth;
 use crate::handlers::{self, AppState};
 use crate::traits::{
     DoppelgangerMonitor, KeystoreManager, RemoteKeyManager, SlashingProtection,
-    ValidatorConfigManager, ValidatorManager,
+    ValidatorConfigManager, ValidatorManager, VoluntaryExitManager,
 };
 
 pub const DEFAULT_ADDR: SocketAddr =
@@ -38,6 +38,7 @@ impl KeymanagerServer {
         doppelganger_monitor: Arc<dyn DoppelgangerMonitor>,
         remote_key_manager: Arc<dyn RemoteKeyManager>,
         config_manager: Arc<dyn ValidatorConfigManager>,
+        exit_manager: Option<Arc<dyn VoluntaryExitManager>>,
         token: String,
         addr: SocketAddr,
         cors_origins: Vec<String>,
@@ -52,6 +53,7 @@ impl KeymanagerServer {
                 doppelganger_monitor,
                 remote_key_manager,
                 config_manager,
+                exit_manager,
                 allow_insecure_remote_signer,
             }),
             token: Arc::new(Zeroizing::new(token)),
@@ -85,6 +87,25 @@ impl KeymanagerServer {
                     .post(handlers::import_remote_keys)
                     .delete(handlers::delete_remote_keys),
             )
+            .route(
+                "/eth/v1/validator/:pubkey/feerecipient",
+                get(handlers::get_fee_recipient)
+                    .post(handlers::set_fee_recipient)
+                    .delete(handlers::delete_fee_recipient),
+            )
+            .route(
+                "/eth/v1/validator/:pubkey/gas_limit",
+                get(handlers::get_gas_limit)
+                    .post(handlers::set_gas_limit)
+                    .delete(handlers::delete_gas_limit),
+            )
+            .route(
+                "/eth/v1/validator/:pubkey/graffiti",
+                get(handlers::get_graffiti)
+                    .post(handlers::set_graffiti)
+                    .delete(handlers::delete_graffiti),
+            )
+            .route("/eth/v1/validator/:pubkey/voluntary_exit", post(handlers::sign_voluntary_exit))
             .layer(DefaultBodyLimit::max(self.body_limit))
             .with_state(self.state.clone());
 

@@ -830,9 +830,10 @@ mod tests {
             slashing_db,
             "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         ));
-        let validator_mgr = Arc::new(ValidatorManagerAdapter::new(validator_store));
+        let validator_mgr = Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
         let doppelganger_mon = Arc::new(DoppelgangerMonitorAdapter::new());
         let remote_key_mgr = Arc::new(RemoteKeyManagerAdapter::new(composite, None));
+        let config_mgr = Arc::new(ValidatorConfigManagerAdapter::new(validator_store));
 
         let token = "deadbeef".repeat(8);
         let addr = "127.0.0.1:0".parse().unwrap();
@@ -843,6 +844,8 @@ mod tests {
             validator_mgr,
             doppelganger_mon,
             remote_key_mgr,
+            config_mgr,
+            None,
             token,
             addr,
             vec![],
@@ -940,9 +943,10 @@ mod tests {
             slashing_db,
             "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         ));
-        let validator_mgr = Arc::new(ValidatorManagerAdapter::new(validator_store));
+        let validator_mgr = Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
         let doppelganger_mon = Arc::new(DoppelgangerMonitorAdapter::new());
         let remote_key_mgr = Arc::new(RemoteKeyManagerAdapter::new(composite.clone(), None));
+        let config_mgr = Arc::new(ValidatorConfigManagerAdapter::new(validator_store));
 
         let token = "deadbeef".repeat(8);
         let addr = "127.0.0.1:0".parse().unwrap();
@@ -953,6 +957,8 @@ mod tests {
             validator_mgr,
             doppelganger_mon,
             remote_key_mgr,
+            config_mgr,
+            None,
             token.clone(),
             addr,
             vec![],
