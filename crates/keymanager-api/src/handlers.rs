@@ -3022,4 +3022,474 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
+
+    // ================================================================
+    // Integration tests: full HTTP round-trip with auth (Issues 4.1–4.3)
+    // ================================================================
+
+    fn full_authed_router(
+        config_manager: MockValidatorConfigManager,
+        exit_manager: Option<Arc<dyn VoluntaryExitManager>>,
+    ) -> (Router, String) {
+        let token = "test_integration_token_1234567890abcdef".to_string();
+        let state = Arc::new(AppState {
+            keystore_manager: Arc::new(MockKeystoreManager::new()),
+            slashing_protection: Arc::new(MockSlashingProtection::new()),
+            validator_manager: Arc::new(MockValidatorManager::new()),
+            doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+            remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+            config_manager: Arc::new(config_manager),
+            exit_manager,
+            allow_insecure_remote_signer: true,
+        });
+
+        let api = Router::new()
+            .route(
+                "/eth/v1/validator/:pubkey/feerecipient",
+                get(get_fee_recipient).post(set_fee_recipient).delete(delete_fee_recipient),
+            )
+            .route(
+                "/eth/v1/validator/:pubkey/gas_limit",
+                get(get_gas_limit).post(set_gas_limit).delete(delete_gas_limit),
+            )
+            .route(
+                "/eth/v1/validator/:pubkey/graffiti",
+                get(get_graffiti).post(set_graffiti).delete(delete_graffiti),
+            )
+            .route(
+                "/eth/v1/validator/:pubkey/voluntary_exit",
+                axum::routing::post(sign_voluntary_exit),
+            )
+            .with_state(state);
+
+        let router = auth::with_auth(api, Arc::new(Zeroizing::new(token.clone())));
+        (router, token)
+    }
+
+    fn authed_get(token: &str, uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    fn authed_post(token: &str, uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    fn authed_post_json(
+        token: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn authed_delete(token: &str, uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    fn unauthenticated_request(method: &str, uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    // --- Issue 4.1: Fee recipient integration tests ---
+
+    #[tokio::test]
+    async fn test_fee_recipient_lifecycle() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/feerecipient");
+        let eth_addr = "0xAbcF8e0d4e9587369b2301D0790347320302cc09";
+
+        // POST: set fee recipient → 202
+        let resp = router
+            .clone()
+            .oneshot(authed_post_json(&token, &uri, serde_json::json!({ "ethaddress": eth_addr })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // GET: verify it was set → 200
+        let resp = router.clone().oneshot(authed_get(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["data"]["ethaddress"].as_str().unwrap().to_lowercase(),
+            eth_addr.to_lowercase()
+        );
+
+        // DELETE: remove fee recipient → 204
+        let resp = router.clone().oneshot(authed_delete(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // GET: verify it returns 404 after deletion
+        let resp = router.clone().oneshot(authed_get(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_fee_recipient_auth_required() {
+        let pk = test_pubkey(1);
+        let (router, _token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/feerecipient");
+
+        let resp = router.oneshot(unauthenticated_request("GET", &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_fee_recipient_unknown_pubkey() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let unknown_hex = format!("0x{}", test_pubkey_hex(99));
+        let uri = format!("/eth/v1/validator/{unknown_hex}/feerecipient");
+
+        let resp = router.oneshot(authed_get(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_fee_recipient_invalid_address() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/feerecipient");
+
+        let resp = router
+            .oneshot(authed_post_json(
+                &token,
+                &uri,
+                serde_json::json!({ "ethaddress": "0xinvalid" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_fee_recipient_zero_address() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/feerecipient");
+
+        let resp = router
+            .oneshot(authed_post_json(
+                &token,
+                &uri,
+                serde_json::json!({ "ethaddress": "0x0000000000000000000000000000000000000000" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // --- Issue 4.2: Gas limit + graffiti integration tests ---
+
+    #[tokio::test]
+    async fn test_gas_limit_lifecycle() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/gas_limit");
+
+        // POST: set gas limit → 202
+        let resp = router
+            .clone()
+            .oneshot(authed_post_json(&token, &uri, serde_json::json!({ "gas_limit": "30000000" })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // GET: verify → 200
+        let resp = router.clone().oneshot(authed_get(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["gas_limit"], "30000000");
+
+        // DELETE → 204
+        let resp = router.clone().oneshot(authed_delete(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // GET: verify 404 after deletion
+        let resp = router.clone().oneshot(authed_get(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_gas_limit_string_encoding() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/gas_limit");
+
+        router
+            .clone()
+            .oneshot(authed_post_json(&token, &uri, serde_json::json!({ "gas_limit": "30000000" })))
+            .await
+            .unwrap();
+
+        let resp = router.oneshot(authed_get(&token, &uri)).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["data"]["gas_limit"].is_string(),
+            "gas_limit must be a JSON string, not number"
+        );
+        assert_eq!(json["data"]["gas_limit"].as_str().unwrap(), "30000000");
+    }
+
+    #[tokio::test]
+    async fn test_gas_limit_invalid_value() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/gas_limit");
+
+        let resp = router
+            .oneshot(authed_post_json(
+                &token,
+                &uri,
+                serde_json::json!({ "gas_limit": "not_a_number" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_graffiti_lifecycle() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/graffiti");
+
+        // POST: set graffiti → 202
+        let resp = router
+            .clone()
+            .oneshot(authed_post_json(
+                &token,
+                &uri,
+                serde_json::json!({ "graffiti": "hello world" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // GET: verify → 200
+        let resp = router.clone().oneshot(authed_get(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["graffiti"], "hello world");
+
+        // DELETE → 204
+        let resp = router.clone().oneshot(authed_delete(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // GET: after delete returns empty default
+        let resp = router.clone().oneshot(authed_get(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["graffiti"], "");
+    }
+
+    #[tokio::test]
+    async fn test_graffiti_max_length() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/graffiti");
+
+        // 33 bytes → 400
+        let resp = router
+            .clone()
+            .oneshot(authed_post_json(
+                &token,
+                &uri,
+                serde_json::json!({ "graffiti": "a".repeat(33) }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // 32 bytes → 202
+        let resp = router
+            .oneshot(authed_post_json(
+                &token,
+                &uri,
+                serde_json::json!({ "graffiti": "a".repeat(32) }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_graffiti_auth_required() {
+        let pk = test_pubkey(1);
+        let (router, _token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/graffiti");
+
+        let resp = router.oneshot(unauthenticated_request("GET", &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // --- Issue 4.3: Voluntary exit integration tests ---
+
+    #[tokio::test]
+    async fn test_voluntary_exit_with_epoch_integration() {
+        let pk = test_pubkey(1);
+        let exit_mgr = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), Some(exit_mgr));
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/voluntary_exit?epoch=300000");
+
+        let resp = router.oneshot(authed_post(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["message"]["epoch"], "300000");
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_auto_epoch_integration() {
+        let pk = test_pubkey(1);
+        let exit_mgr = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), Some(exit_mgr));
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/voluntary_exit");
+
+        let resp = router.oneshot(authed_post(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Mock defaults to epoch 100 when not specified
+        assert_eq!(json["data"]["message"]["epoch"], "100");
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_invalid_epoch_integration() {
+        let pk = test_pubkey(1);
+        let exit_mgr = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), Some(exit_mgr));
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/voluntary_exit?epoch=abc");
+
+        let resp = router.oneshot(authed_post(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_unknown_pubkey_integration() {
+        let pk = test_pubkey(1);
+        let exit_mgr = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), Some(exit_mgr));
+        let unknown_hex = format!("0x{}", test_pubkey_hex(99));
+        let uri = format!("/eth/v1/validator/{unknown_hex}/voluntary_exit");
+
+        let resp = router.oneshot(authed_post(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_no_manager_integration() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/voluntary_exit");
+
+        let resp = router.oneshot(authed_post(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_auth_required_integration() {
+        let pk = test_pubkey(1);
+        let exit_mgr = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let (router, _token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), Some(exit_mgr));
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/voluntary_exit");
+
+        let resp = router.oneshot(unauthenticated_request("POST", &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_response_schema() {
+        let pk = test_pubkey(1);
+        let exit_mgr = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), Some(exit_mgr));
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/voluntary_exit?epoch=300000");
+
+        let resp = router.oneshot(authed_post(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // epoch and validator_index must be strings per Eth2 spec
+        assert!(json["data"]["message"]["epoch"].is_string(), "epoch must be a string");
+        assert!(
+            json["data"]["message"]["validator_index"].is_string(),
+            "validator_index must be a string"
+        );
+
+        // signature must be 0x-prefixed hex
+        let sig = json["data"]["signature"].as_str().expect("signature must be a string");
+        assert!(sig.starts_with("0x"), "signature must start with 0x");
+        assert!(
+            hex::decode(sig.strip_prefix("0x").unwrap()).is_ok(),
+            "signature must be valid hex"
+        );
+    }
 }
