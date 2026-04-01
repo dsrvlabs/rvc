@@ -3967,6 +3967,7 @@ dependencies = [
  "clap",
  "hex",
  "libc",
+ "logroller",
  "parking_lot",
  "reqwest 0.12.28",
  "rustls",
@@ -3984,6 +3985,7 @@ dependencies = [
  "rvc-telemetry",
  "rvc-timing",
  "rvc-validator-store",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
@@ -3993,6 +3995,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "url",
+ "wiremock",
 ]
 
 [[package]]
