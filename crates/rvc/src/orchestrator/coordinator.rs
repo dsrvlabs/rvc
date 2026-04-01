@@ -9,11 +9,14 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use block_service::{BeaconBlockClient, BlockService};
 use bn_manager::{BeaconNodeClient, OperationTimeouts};
-use builder::BuilderService;
+use builder::{BuilderService, CircuitBreakerState};
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkSchedule, Root, Slot};
-use metrics::definitions::{attestation_status, RVC_ATTESTATIONS_TOTAL};
+use metrics::definitions::{
+    attestation_status, RVC_ATTESTATIONS_TOTAL, RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL,
+    RVC_BUILDER_CONSECUTIVE_MISSES, RVC_BUILDER_EPOCH_MISSES,
+};
 use propagator::{AttestationSubmitter, Propagator};
 use signer::SignerService;
 use timing::{SlotClock, SLOTS_PER_EPOCH};
@@ -101,6 +104,7 @@ where
     duty_tracker: Arc<DutyTracker>,
     block_service: BlockService<SignerService, B>,
     builder_service: Option<Arc<BuilderService>>,
+    circuit_breaker: Arc<CircuitBreakerState>,
     config: OrchestratorConfig,
     pubkey_map: PubkeyMap,
     attestation_service: AttestationService<C, S>,
@@ -144,6 +148,7 @@ where
             config,
             pubkey_map,
             key_gen_rx,
+            Arc::new(CircuitBreakerState::new(0, 0)),
         )
     }
 
@@ -160,15 +165,17 @@ where
         config: OrchestratorConfig,
         pubkey_map: PubkeyMap,
         key_gen_rx: watch::Receiver<u64>,
+        circuit_breaker: Arc<CircuitBreakerState>,
     ) -> (Self, OrchestratorHandle) {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let block_service = BlockService::new(
+        let block_service = BlockService::with_circuit_breaker(
             signer.clone(),
             block_beacon,
             validator_store.clone(),
             config.fork_schedule.clone(),
             config.genesis_validators_root,
+            circuit_breaker.clone(),
         );
 
         let aggregation_service = AggregationService::new(
@@ -212,6 +219,7 @@ where
             duty_tracker,
             block_service,
             builder_service,
+            circuit_breaker,
             config,
             pubkey_map,
             attestation_service,
@@ -272,6 +280,10 @@ where
 
             // Proposer preparation and committee subscriptions (non-fatal)
             if current_slot % SLOTS_PER_EPOCH == 0 {
+                self.circuit_breaker.reset_epoch(current_epoch);
+                self.update_circuit_breaker_metrics();
+                info!(epoch = current_epoch, "Circuit breaker reset at epoch boundary");
+
                 let epoch_span =
                     info_span!(parent: &slot_span, "rvc.epoch.boundary", rvc.epoch = current_epoch);
                 async {
@@ -505,6 +517,11 @@ where
         }
     }
 
+    fn update_circuit_breaker_metrics(&self) {
+        RVC_BUILDER_CONSECUTIVE_MISSES.set(self.circuit_breaker.consecutive_misses() as i64);
+        RVC_BUILDER_EPOCH_MISSES.set(self.circuit_breaker.epoch_misses() as i64);
+    }
+
     #[tracing::instrument(name = "rvc.orchestrator.maybe_propose_block", skip_all, fields(rvc.slot = slot, rvc.epoch = epoch))]
     async fn maybe_propose_block(&self, slot: Slot, epoch: u64) {
         let proposer_duty = match self.duty_tracker.get_proposer_duty(slot).await {
@@ -528,6 +545,12 @@ where
         .await
         {
             Ok(Ok(result)) => {
+                let was_tripped = self.circuit_breaker.is_tripped();
+                self.circuit_breaker.record_success();
+                self.update_circuit_breaker_metrics();
+                if was_tripped && !self.circuit_breaker.is_tripped() {
+                    info!(slot, "Builder circuit breaker reset after successful proposal");
+                }
                 info!(
                     slot,
                     blinded = result.is_blinded,
@@ -536,6 +559,13 @@ where
                 );
             }
             Ok(Err(e)) => {
+                let was_tripped = self.circuit_breaker.is_tripped();
+                self.circuit_breaker.record_miss();
+                self.update_circuit_breaker_metrics();
+                if !was_tripped && self.circuit_breaker.is_tripped() {
+                    RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.inc();
+                    warn!(slot, "Builder circuit breaker tripped");
+                }
                 error!(
                     slot,
                     epoch,
@@ -544,6 +574,13 @@ where
                 );
             }
             Err(_) => {
+                let was_tripped = self.circuit_breaker.is_tripped();
+                self.circuit_breaker.record_miss();
+                self.update_circuit_breaker_metrics();
+                if !was_tripped && self.circuit_breaker.is_tripped() {
+                    RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.inc();
+                    warn!(slot, "Builder circuit breaker tripped");
+                }
                 error!(
                     slot,
                     epoch,

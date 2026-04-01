@@ -223,6 +223,18 @@ enum Commands {
         /// Path to the CA certificate for gRPC signer mTLS
         #[arg(long)]
         grpc_signer_tls_ca_cert: Option<PathBuf>,
+
+        /// Builder circuit breaker: consecutive missed slots before fallback to local block (default: 3, 0 to disable)
+        #[arg(long)]
+        builder_circuit_breaker_consecutive_limit: Option<u32>,
+
+        /// Builder circuit breaker: total epoch missed slots before fallback to local block (default: 5, 0 to disable)
+        #[arg(long)]
+        builder_circuit_breaker_epoch_limit: Option<u32>,
+
+        /// Disable keystore file locking (for DVT setups with shared key material)
+        #[arg(long)]
+        disable_keystore_locking: bool,
     },
 
     /// Submit a voluntary exit for a validator
@@ -326,6 +338,9 @@ async fn main() -> anyhow::Result<()> {
             grpc_signer_tls_cert,
             grpc_signer_tls_key,
             grpc_signer_tls_ca_cert,
+            builder_circuit_breaker_consecutive_limit,
+            builder_circuit_breaker_epoch_limit,
+            disable_keystore_locking,
         } => {
             // Validate gRPC signer flags: if URL is set, all TLS flags are required
             if grpc_signer_url.is_some()
@@ -423,6 +438,9 @@ async fn main() -> anyhow::Result<()> {
                 grpc_signer_tls_cert,
                 grpc_signer_tls_key,
                 grpc_signer_tls_ca_cert,
+                builder_circuit_breaker_consecutive_limit,
+                builder_circuit_breaker_epoch_limit,
+                disable_keystore_locking: if disable_keystore_locking { Some(true) } else { None },
             };
 
             let mut cfg = load_config(config)?;
@@ -670,6 +688,20 @@ async fn run_validator(
     } else {
         slashing_db.check_file_permissions();
     }
+
+    // Step 2c: Acquire keystore lock
+    let _keystore_lock_guard = if config.disable_keystore_locking {
+        warn!("Keystore locking disabled -- ensure no duplicate instances");
+        None
+    } else {
+        match startup::acquire_keystore_lock(&config.keystore_path) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                error!("Failed to acquire keystore lock: {}", e);
+                std::process::exit(startup::EXIT_KEYSTORE_LOCKED);
+            }
+        }
+    };
 
     // Step 3: Create beacon client and BnManager
     let beacon_client = match builder.build_beacon() {
@@ -1078,20 +1110,34 @@ async fn run_validator(
     }
 
     // Step 8: Start main duty loop
+    let circuit_breaker = std::sync::Arc::new(builder::CircuitBreakerState::new(
+        config.builder_circuit_breaker_consecutive_limit,
+        config.builder_circuit_breaker_epoch_limit,
+    ));
+    info!(
+        consecutive_limit = config.builder_circuit_breaker_consecutive_limit,
+        epoch_limit = config.builder_circuit_breaker_epoch_limit,
+        "Builder circuit breaker configured"
+    );
+
     let validator_count = pubkey_map.read().len();
     let bn_count = config.effective_beacon_nodes().len();
-    let (mut orchestrator, orchestrator_handle) = rvc::orchestrator::DutyOrchestrator::new(
-        slot_clock,
-        duty_tracker,
-        signer,
-        propagator,
-        beacon,
-        block_beacon,
-        builder_service,
-        validator_store,
-        orchestrator_config,
-        pubkey_map,
-    );
+    let (_key_gen_tx, key_gen_rx) = tokio::sync::watch::channel(0u64);
+    let (mut orchestrator, orchestrator_handle) =
+        rvc::orchestrator::DutyOrchestrator::new_with_key_gen(
+            slot_clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            block_beacon,
+            builder_service,
+            validator_store,
+            orchestrator_config,
+            pubkey_map,
+            key_gen_rx,
+            circuit_breaker,
+        );
 
     finalize_health_status(&health_status).await;
 

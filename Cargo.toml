@@ -100,6 +100,9 @@ bls12_381_plus = "0.8"
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# File locking
+fd-lock = "4"
+
 # Dev dependencies
 tempfile = "3"
 wiremock = "0.6"

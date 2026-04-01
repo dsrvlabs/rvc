@@ -105,6 +105,15 @@ pub struct Config {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grpc_signer_tls_ca_cert: Option<PathBuf>,
+
+    #[serde(default = "default_circuit_breaker_consecutive_limit")]
+    pub builder_circuit_breaker_consecutive_limit: u32,
+
+    #[serde(default = "default_circuit_breaker_epoch_limit")]
+    pub builder_circuit_breaker_epoch_limit: u32,
+
+    #[serde(default)]
+    pub disable_keystore_locking: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -142,6 +151,14 @@ fn default_gcp_secret_prefix() -> String {
 
 fn default_keymanager_body_limit() -> usize {
     10 * 1024 * 1024 // 10 MB
+}
+
+fn default_circuit_breaker_consecutive_limit() -> u32 {
+    3
+}
+
+fn default_circuit_breaker_epoch_limit() -> u32 {
+    5
 }
 
 fn default_tracing_exporter() -> String {
@@ -189,6 +206,9 @@ impl Default for Config {
             grpc_signer_tls_cert: None,
             grpc_signer_tls_key: None,
             grpc_signer_tls_ca_cert: None,
+            builder_circuit_breaker_consecutive_limit: default_circuit_breaker_consecutive_limit(),
+            builder_circuit_breaker_epoch_limit: default_circuit_breaker_epoch_limit(),
+            disable_keystore_locking: false,
         }
     }
 }
@@ -507,6 +527,18 @@ impl Config {
         if let Some(ref path) = cli.grpc_signer_tls_ca_cert {
             self.grpc_signer_tls_ca_cert = Some(path.clone());
         }
+
+        if let Some(limit) = cli.builder_circuit_breaker_consecutive_limit {
+            self.builder_circuit_breaker_consecutive_limit = limit;
+        }
+
+        if let Some(limit) = cli.builder_circuit_breaker_epoch_limit {
+            self.builder_circuit_breaker_epoch_limit = limit;
+        }
+
+        if let Some(disable) = cli.disable_keystore_locking {
+            self.disable_keystore_locking = disable;
+        }
     }
 }
 
@@ -566,6 +598,9 @@ pub struct CliOverrides {
     pub grpc_signer_tls_cert: Option<PathBuf>,
     pub grpc_signer_tls_key: Option<PathBuf>,
     pub grpc_signer_tls_ca_cert: Option<PathBuf>,
+    pub builder_circuit_breaker_consecutive_limit: Option<u32>,
+    pub builder_circuit_breaker_epoch_limit: Option<u32>,
+    pub disable_keystore_locking: Option<bool>,
 }
 
 #[cfg(test)]
@@ -1617,5 +1652,60 @@ log_level = "info"
         assert!(config.validate().is_ok(), "Should pass with RVC_ALLOW_INSECURE=true");
 
         std::env::remove_var("RVC_ALLOW_INSECURE");
+    }
+
+    #[test]
+    fn test_default_circuit_breaker_limits() {
+        let config = Config::default();
+        assert_eq!(config.builder_circuit_breaker_consecutive_limit, 3);
+        assert_eq!(config.builder_circuit_breaker_epoch_limit, 5);
+    }
+
+    #[test]
+    fn test_default_keystore_locking_enabled() {
+        let config = Config::default();
+        assert!(!config.disable_keystore_locking);
+    }
+
+    #[test]
+    fn test_merge_circuit_breaker_limits() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            builder_circuit_breaker_consecutive_limit: Some(10),
+            builder_circuit_breaker_epoch_limit: Some(20),
+            ..Default::default()
+        };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.builder_circuit_breaker_consecutive_limit, 10);
+        assert_eq!(config.builder_circuit_breaker_epoch_limit, 20);
+    }
+
+    #[test]
+    fn test_merge_disable_keystore_locking() {
+        let mut config = Config::default();
+        let cli = CliOverrides { disable_keystore_locking: Some(true), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert!(config.disable_keystore_locking);
+    }
+
+    #[test]
+    fn test_circuit_breaker_toml_parsing() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+builder_circuit_breaker_consecutive_limit = 7
+builder_circuit_breaker_epoch_limit = 12
+disable_keystore_locking = true
+"#
+        )
+        .unwrap();
+        let config = Config::from_file(f.path()).unwrap();
+        assert_eq!(config.builder_circuit_breaker_consecutive_limit, 7);
+        assert_eq!(config.builder_circuit_breaker_epoch_limit, 12);
+        assert!(config.disable_keystore_locking);
     }
 }

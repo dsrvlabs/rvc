@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use tracing::{debug, error, info, Instrument};
+use builder::CircuitBreakerState;
+use tracing::{debug, error, info, warn, Instrument};
 use tree_hash::TreeHash;
 
 use crypto::logging::TruncatedPubkey;
@@ -29,6 +30,7 @@ pub struct BlockService<S: ValidatorSigner, B: BeaconBlockClient> {
     validator_store: Arc<ValidatorStore>,
     fork_schedule: Arc<ForkSchedule>,
     genesis_validators_root: Root,
+    circuit_breaker: Arc<CircuitBreakerState>,
 }
 
 impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
@@ -39,7 +41,32 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         fork_schedule: Arc<ForkSchedule>,
         genesis_validators_root: Root,
     ) -> Self {
-        Self { signer, beacon, validator_store, fork_schedule, genesis_validators_root }
+        Self::with_circuit_breaker(
+            signer,
+            beacon,
+            validator_store,
+            fork_schedule,
+            genesis_validators_root,
+            Arc::new(CircuitBreakerState::new(0, 0)),
+        )
+    }
+
+    pub fn with_circuit_breaker(
+        signer: Arc<S>,
+        beacon: Arc<B>,
+        validator_store: Arc<ValidatorStore>,
+        fork_schedule: Arc<ForkSchedule>,
+        genesis_validators_root: Root,
+        circuit_breaker: Arc<CircuitBreakerState>,
+    ) -> Self {
+        Self {
+            signer,
+            beacon,
+            validator_store,
+            fork_schedule,
+            genesis_validators_root,
+            circuit_breaker,
+        }
     }
 
     #[tracing::instrument(
@@ -83,11 +110,16 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         );
         let randao_hex = format!("0x{}", hex::encode(&randao_bytes));
 
-        // 2. Get validator preferences
+        // 2. Get validator preferences, checking circuit breaker
         let pubkey_bytes = pubkey.to_bytes();
         let graffiti = self.validator_store.effective_graffiti(&pubkey_bytes);
         let graffiti_hex = graffiti.map(|g| format!("0x{}", hex::encode(g)));
-        let boost = self.validator_store.builder_boost_factor(&pubkey_bytes);
+        let boost = if self.circuit_breaker.is_tripped() {
+            warn!(slot = slot, "Builder circuit breaker tripped, using local block only");
+            0
+        } else {
+            self.validator_store.builder_boost_factor(&pubkey_bytes)
+        };
 
         // 3. Request block from beacon node
         let response = self
