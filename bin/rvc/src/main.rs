@@ -309,6 +309,20 @@ enum Commands {
         /// Log level for file logging (default: same as --log-level)
         #[arg(long)]
         logfile_level: Option<String>,
+
+        // --- Block selection mode (T4.4) ---
+        /// Block selection mode: max-profit (default), execution-only, builder-always, builder-only
+        #[arg(long)]
+        block_selection_mode: Option<String>,
+
+        // --- Registration batching (T4.12/T4.13) ---
+        /// Maximum number of validator registrations per batch (default: 500, 0 = send all at once)
+        #[arg(long)]
+        validator_registration_batch_size: Option<usize>,
+
+        /// Delay in milliseconds between registration batches (default: 500)
+        #[arg(long)]
+        validator_registration_batch_delay: Option<u64>,
     },
 
     /// Submit a voluntary exit for a validator
@@ -348,6 +362,64 @@ enum Commands {
         /// Genesis validators root override (hex string with 0x prefix)
         #[arg(long)]
         genesis_validators_root: Option<String>,
+
+        /// Log level (trace, debug, info, warn, error)
+        #[arg(long, default_value = "info")]
+        log_level: String,
+    },
+
+    /// Prepare a pre-signed voluntary exit (sign and save to file, without submitting)
+    PrepareExit {
+        /// Validator public key (hex, with or without 0x prefix)
+        #[arg(long)]
+        pubkey: String,
+
+        /// Exit epoch (defaults to current epoch if not specified)
+        #[arg(long)]
+        epoch: Option<u64>,
+
+        /// Output directory for the signed exit JSON file
+        #[arg(long, default_value = ".")]
+        output: PathBuf,
+
+        /// Beacon node URL (e.g., http://localhost:5052)
+        #[arg(long, default_value = "http://localhost:5052")]
+        beacon_url: String,
+
+        /// Path to the keystore directory
+        #[arg(long)]
+        keystore_path: PathBuf,
+
+        /// Path to the password file for keystore decryption
+        #[arg(long)]
+        password_file: PathBuf,
+
+        /// Path to the slashing protection database
+        #[arg(long)]
+        slashing_db_path: Option<PathBuf>,
+
+        /// Network preset (mainnet, hoodi, holesky, sepolia, custom)
+        #[arg(long)]
+        network: Option<String>,
+
+        /// Genesis validators root override (hex string with 0x prefix)
+        #[arg(long)]
+        genesis_validators_root: Option<String>,
+
+        /// Log level (trace, debug, info, warn, error)
+        #[arg(long, default_value = "info")]
+        log_level: String,
+    },
+
+    /// Submit a pre-signed voluntary exit to the beacon node (no signing keys required)
+    SubmitExit {
+        /// Path to the signed voluntary exit JSON file
+        #[arg(long)]
+        file: PathBuf,
+
+        /// Beacon node URL (e.g., http://localhost:5052)
+        #[arg(long, default_value = "http://localhost:5052")]
+        beacon_url: String,
 
         /// Log level (trace, debug, info, warn, error)
         #[arg(long, default_value = "info")]
@@ -432,6 +504,9 @@ async fn main() -> anyhow::Result<()> {
             logfile_max_number,
             logfile_compress,
             logfile_level,
+            block_selection_mode,
+            validator_registration_batch_size,
+            validator_registration_batch_delay,
         } => {
             // Validate gRPC signer flags: if URL is set, all TLS flags are required
             if grpc_signer_url.is_some()
@@ -557,6 +632,12 @@ async fn main() -> anyhow::Result<()> {
                 logfile_max_number,
                 logfile_compress: if logfile_compress { Some(true) } else { None },
                 logfile_level,
+                block_selection_mode: block_selection_mode
+                    .map(|s| s.parse::<rvc::config::BlockSelectionMode>())
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                validator_registration_batch_size,
+                validator_registration_batch_delay,
             };
 
             let mut cfg = load_config(config)?;
@@ -619,6 +700,41 @@ async fn main() -> anyhow::Result<()> {
             };
 
             commands::voluntary_exit::execute(args).await?;
+        }
+        Commands::PrepareExit {
+            pubkey,
+            epoch,
+            output,
+            beacon_url,
+            keystore_path,
+            password_file,
+            slashing_db_path,
+            network,
+            genesis_validators_root,
+            log_level,
+        } => {
+            init_logging(&log_level, None, None);
+
+            let args = commands::prepare_exit::PrepareExitArgs {
+                pubkey,
+                epoch,
+                output,
+                beacon_url,
+                keystore_path,
+                password_file,
+                slashing_db_path,
+                network,
+                genesis_validators_root,
+            };
+
+            commands::prepare_exit::execute(args).await?;
+        }
+        Commands::SubmitExit { file, beacon_url, log_level } => {
+            init_logging(&log_level, None, None);
+
+            let args = commands::submit_exit::SubmitExitArgs { file, beacon_url };
+
+            commands::submit_exit::execute(args).await?;
         }
     }
 

@@ -178,6 +178,17 @@ pub struct Config {
     // --- Role-based BN fields (T4.9/T4.11) ---
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub beacon_nodes_config: Vec<BeaconNodeEntry>,
+
+    // --- Block selection mode (T4.1/T4.4) ---
+    #[serde(default)]
+    pub block_selection_mode: validator_store::BlockSelectionMode,
+
+    // --- Registration batching (T4.12/T4.13) ---
+    #[serde(default = "default_validator_registration_batch_size")]
+    pub validator_registration_batch_size: usize,
+
+    #[serde(default = "default_validator_registration_batch_delay")]
+    pub validator_registration_batch_delay: u64,
 }
 
 fn default_monitoring_interval() -> u64 {
@@ -210,6 +221,14 @@ pub struct BeaconNodeEntry {
 
 fn default_bn_roles() -> Vec<String> {
     vec!["all".to_string()]
+}
+
+fn default_validator_registration_batch_size() -> usize {
+    500
+}
+
+fn default_validator_registration_batch_delay() -> u64 {
+    500
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -324,6 +343,9 @@ impl Default for Config {
             logfile_level: None,
             bn_sync_tolerances: None,
             beacon_nodes_config: Vec::new(),
+            block_selection_mode: validator_store::BlockSelectionMode::default(),
+            validator_registration_batch_size: default_validator_registration_batch_size(),
+            validator_registration_batch_delay: default_validator_registration_batch_delay(),
         }
     }
 }
@@ -796,6 +818,18 @@ impl Config {
         if let Some(ref level) = cli.logfile_level {
             self.logfile_level = Some(level.clone());
         }
+
+        if let Some(mode) = cli.block_selection_mode {
+            self.block_selection_mode = mode;
+        }
+
+        if let Some(size) = cli.validator_registration_batch_size {
+            self.validator_registration_batch_size = size;
+        }
+
+        if let Some(delay) = cli.validator_registration_batch_delay {
+            self.validator_registration_batch_delay = delay;
+        }
     }
 }
 
@@ -875,6 +909,9 @@ pub struct CliOverrides {
     pub logfile_max_number: Option<usize>,
     pub logfile_compress: Option<bool>,
     pub logfile_level: Option<String>,
+    pub block_selection_mode: Option<validator_store::BlockSelectionMode>,
+    pub validator_registration_batch_size: Option<usize>,
+    pub validator_registration_batch_delay: Option<u64>,
 }
 
 #[cfg(test)]

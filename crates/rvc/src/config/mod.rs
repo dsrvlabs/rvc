@@ -9,3 +9,4 @@ pub use builder::{BuiltServices, ServiceBuilder};
 pub use error::ConfigError;
 pub use network::Network;
 pub use types::{redact_url, CliOverrides, Config, GcpSecretConfig, SecretProviderConfig};
+pub use validator_store::BlockSelectionMode;

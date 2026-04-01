@@ -11,4 +11,7 @@ pub enum BlockServiceError {
 
     #[error("slot mismatch: requested {requested}, got {got}")]
     SlotMismatch { requested: u64, got: u64 },
+
+    #[error("builder-only mode: {0}")]
+    BuilderOnly(String),
 }

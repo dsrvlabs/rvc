@@ -6,6 +6,7 @@ use crypto::logging::TruncatedPubkey;
 use serde::{Deserialize, Serialize};
 use tracing::{info, trace, warn};
 
+use crate::block_selection::BlockSelectionMode;
 use crate::config::{ValidatorConfig, ValidatorConfigUpdate};
 use crate::error::ValidatorStoreError;
 
@@ -39,6 +40,8 @@ struct TomlValidator {
     graffiti: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_selection_mode: Option<BlockSelectionMode>,
 }
 
 fn parse_hex_bytes<const N: usize>(s: &str) -> Result<[u8; N], ValidatorStoreError> {
@@ -58,6 +61,7 @@ pub struct ValidatorStore {
     validators: RwLock<HashMap<[u8; 48], ValidatorConfig>>,
     defaults: RwLock<ValidatorDefaults>,
     config_path: Option<PathBuf>,
+    global_block_selection_mode: RwLock<BlockSelectionMode>,
 }
 
 impl ValidatorStore {
@@ -70,6 +74,7 @@ impl ValidatorStore {
                 graffiti: None,
             }),
             config_path: None,
+            global_block_selection_mode: RwLock::new(BlockSelectionMode::default()),
         }
     }
 
@@ -114,6 +119,7 @@ impl ValidatorStore {
                 graffiti: default_graffiti,
             }),
             config_path: Some(path.to_path_buf()),
+            global_block_selection_mode: RwLock::new(BlockSelectionMode::default()),
         })
     }
 
@@ -166,6 +172,18 @@ impl ValidatorStore {
         self.validators.read().get(pubkey).map(|c| c.builder_boost_factor).unwrap_or(100)
     }
 
+    pub fn effective_block_selection_mode(&self, pubkey: &[u8; 48]) -> BlockSelectionMode {
+        self.validators
+            .read()
+            .get(pubkey)
+            .and_then(|c| c.block_selection_mode)
+            .unwrap_or(*self.global_block_selection_mode.read())
+    }
+
+    pub fn set_global_block_selection_mode(&self, mode: BlockSelectionMode) {
+        *self.global_block_selection_mode.write() = mode;
+    }
+
     #[tracing::instrument(name = "rvc.validator_store.list_enabled_pubkeys", skip_all)]
     pub fn list_enabled_pubkeys(&self) -> Vec<[u8; 48]> {
         self.validators.read().values().filter(|c| c.enabled).map(|c| c.pubkey).collect()
@@ -208,6 +226,9 @@ impl ValidatorStore {
         if update.builder_boost_factor.is_some() {
             changed_fields.push("builder_boost_factor");
         }
+        if update.block_selection_mode.is_some() {
+            changed_fields.push("block_selection_mode");
+        }
 
         if let Some(config) = self.validators.write().get_mut(pubkey) {
             if let Some(fr) = update.fee_recipient {
@@ -224,6 +245,9 @@ impl ValidatorStore {
             }
             if let Some(bbf) = update.builder_boost_factor {
                 config.builder_boost_factor = bbf;
+            }
+            if let Some(bsm) = update.block_selection_mode {
+                config.block_selection_mode = bsm;
             }
 
             let pk_hex = hex::encode(pubkey);
@@ -264,6 +288,7 @@ impl ValidatorStore {
                 builder_boost_factor: Some(v.builder_boost_factor),
                 graffiti: v.graffiti.map(|g| graffiti_to_string(&g)),
                 enabled: Some(v.enabled),
+                block_selection_mode: v.block_selection_mode,
             })
             .collect();
 
@@ -359,6 +384,7 @@ fn parse_validator(v: &TomlValidator) -> Result<ValidatorConfig, ValidatorStoreE
         builder_boost_factor: v.builder_boost_factor.unwrap_or(100),
         graffiti,
         enabled: v.enabled.unwrap_or(true),
+        block_selection_mode: v.block_selection_mode,
     })
 }
 
@@ -643,6 +669,7 @@ mod tests {
             builder_proposals: Some(true),
             builder_boost_factor: Some(150),
             graffiti: None, // no change
+            block_selection_mode: None,
         };
 
         store.update_config(&pk, update);
@@ -1247,6 +1274,7 @@ pubkey = "{}"
                 builder_proposals: false,
                 builder_boost_factor: 100,
                 enabled: true,
+                block_selection_mode: None,
             },
         );
 
@@ -1286,6 +1314,7 @@ pubkey = "{}"
                 builder_proposals: false,
                 builder_boost_factor: 100,
                 enabled: true,
+                block_selection_mode: None,
             },
         );
 
@@ -1419,5 +1448,86 @@ enabled = false
         assert_eq!(config.builder_boost_factor, 200);
         assert!(config.graffiti.is_some());
         assert!(!config.enabled);
+    }
+
+    // --- Block selection mode tests (T4.4) ---
+
+    #[test]
+    fn test_effective_block_selection_mode_default() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+        store.add_validator(ValidatorConfig::new(pk));
+
+        assert_eq!(store.effective_block_selection_mode(&pk), BlockSelectionMode::MaxProfit,);
+    }
+
+    #[test]
+    fn test_effective_block_selection_mode_global_override() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+        store.add_validator(ValidatorConfig::new(pk));
+        store.set_global_block_selection_mode(BlockSelectionMode::ExecutionOnly);
+
+        assert_eq!(store.effective_block_selection_mode(&pk), BlockSelectionMode::ExecutionOnly,);
+    }
+
+    #[test]
+    fn test_effective_block_selection_mode_per_validator_override() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+        let mut config = ValidatorConfig::new(pk);
+        config.block_selection_mode = Some(BlockSelectionMode::BuilderOnly);
+        store.add_validator(config);
+
+        // Global is MaxProfit, but per-validator is BuilderOnly
+        assert_eq!(store.effective_block_selection_mode(&pk), BlockSelectionMode::BuilderOnly,);
+    }
+
+    #[test]
+    fn test_effective_block_selection_mode_per_validator_overrides_global() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+        let mut config = ValidatorConfig::new(pk);
+        config.block_selection_mode = Some(BlockSelectionMode::BuilderAlways);
+        store.add_validator(config);
+        store.set_global_block_selection_mode(BlockSelectionMode::ExecutionOnly);
+
+        // Per-validator (BuilderAlways) takes precedence over global (ExecutionOnly)
+        assert_eq!(store.effective_block_selection_mode(&pk), BlockSelectionMode::BuilderAlways,);
+    }
+
+    #[test]
+    fn test_effective_block_selection_mode_unknown_pubkey_returns_global() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let unknown_pk = test_pubkey(99);
+        store.set_global_block_selection_mode(BlockSelectionMode::BuilderOnly);
+
+        assert_eq!(
+            store.effective_block_selection_mode(&unknown_pk),
+            BlockSelectionMode::BuilderOnly,
+        );
+    }
+
+    #[test]
+    fn test_block_selection_mode_toml_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validators.toml");
+
+        let toml_content = r#"
+[defaults]
+fee_recipient = "0x0000000000000000000000000000000000000001"
+gas_limit = 30000000
+
+[[validators]]
+pubkey = "0x010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+builder_proposals = true
+block_selection_mode = "builder-only"
+"#;
+        std::fs::write(&path, toml_content).unwrap();
+
+        let store = ValidatorStore::load_from_config(&path).unwrap();
+        let pk = test_pubkey(1);
+        let config = store.get_config(&pk).unwrap();
+        assert_eq!(config.block_selection_mode, Some(BlockSelectionMode::BuilderOnly));
     }
 }

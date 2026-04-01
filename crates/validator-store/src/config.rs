@@ -1,3 +1,5 @@
+use crate::BlockSelectionMode;
+
 #[derive(Debug, Clone)]
 pub struct ValidatorConfig {
     pub pubkey: [u8; 48],
@@ -7,6 +9,7 @@ pub struct ValidatorConfig {
     pub builder_boost_factor: u64,
     pub graffiti: Option<[u8; 32]>,
     pub enabled: bool,
+    pub block_selection_mode: Option<BlockSelectionMode>,
 }
 
 impl ValidatorConfig {
@@ -19,6 +22,7 @@ impl ValidatorConfig {
             builder_boost_factor: 100,
             graffiti: None,
             enabled: true,
+            block_selection_mode: None,
         }
     }
 }
@@ -30,4 +34,5 @@ pub struct ValidatorConfigUpdate {
     pub graffiti: Option<Option<[u8; 32]>>,
     pub builder_proposals: Option<bool>,
     pub builder_boost_factor: Option<u64>,
+    pub block_selection_mode: Option<Option<BlockSelectionMode>>,
 }

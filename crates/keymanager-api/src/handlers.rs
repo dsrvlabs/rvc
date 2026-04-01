@@ -534,6 +534,33 @@ pub async fn sign_voluntary_exit(
     Ok(Json(VoluntaryExitResponse { data: signed_exit }))
 }
 
+/// Pre-signed exit: signs the voluntary exit and returns it without submitting.
+///
+/// `POST /rvc/v1/validator/:pubkey/prepare_exit`
+pub async fn prepare_exit(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+    Query(query): Query<VoluntaryExitQuery>,
+) -> Result<Json<VoluntaryExitResponse>, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+
+    let epoch = query
+        .epoch
+        .map(|e| e.parse::<u64>())
+        .transpose()
+        .map_err(|_| ApiError::BadRequest("invalid epoch".into()))?;
+
+    let exit_manager = state.exit_manager.as_ref().ok_or_else(|| {
+        ApiError::Internal("voluntary exit not available: beacon node not configured".into())
+    })?;
+
+    info!(pubkey = %pubkey_hex, epoch = ?epoch, "Preparing pre-signed voluntary exit (not submitting)");
+
+    let signed_exit = exit_manager.sign_voluntary_exit(&pubkey, epoch).await?;
+
+    Ok(Json(VoluntaryExitResponse { data: signed_exit }))
+}
+
 fn parse_pubkey(s: &str) -> Result<Pubkey, String> {
     let hex_str = s.strip_prefix("0x").unwrap_or(s);
     let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
@@ -3063,6 +3090,111 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // --- prepare_exit handler tests ---
+
+    fn prepare_exit_router(exit_manager: Option<Arc<dyn VoluntaryExitManager>>) -> Router {
+        let app = TestApp::new();
+        let state = Arc::new(AppState {
+            keystore_manager: app.keystore_manager.clone(),
+            slashing_protection: app.slashing_protection.clone(),
+            validator_manager: app.validator_manager.clone(),
+            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            remote_key_manager: app.remote_key_manager.clone(),
+            config_manager: app.config_manager.clone(),
+            exit_manager,
+            allow_insecure_remote_signer: true,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+        });
+        Router::new()
+            .route("/rvc/v1/validator/:pubkey/prepare_exit", axum::routing::post(prepare_exit))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_prepare_exit_returns_signed_exit() {
+        let pk = test_pubkey(1);
+        let mock = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let router = prepare_exit_router(Some(mock));
+
+        let uri = format!("/rvc/v1/validator/0x{}/prepare_exit?epoch=300000", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let resp: VoluntaryExitResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(resp.data.message.epoch, 300000);
+        assert_eq!(resp.data.message.validator_index, 42);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_exit_unknown_pubkey_404() {
+        let mock = Arc::new(MockVoluntaryExitManager::new());
+        let router = prepare_exit_router(Some(mock));
+
+        let uri = format!("/rvc/v1/validator/0x{}/prepare_exit", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_exit_no_exit_manager_500() {
+        let router = prepare_exit_router(None);
+
+        let uri = format!("/rvc/v1/validator/0x{}/prepare_exit", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_exit_invalid_epoch_400() {
+        let pk = test_pubkey(1);
+        let mock = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let router = prepare_exit_router(Some(mock));
+
+        let uri = format!("/rvc/v1/validator/0x{}/prepare_exit?epoch=abc", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     // ================================================================

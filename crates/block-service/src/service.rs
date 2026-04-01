@@ -11,6 +11,7 @@ use signer::ValidatorSigner;
 use validator_store::ValidatorStore;
 
 use crate::traits::{BeaconBlockClient, ProduceBlockResponse};
+use crate::types::BlockSelectionMode;
 use crate::BlockServiceError;
 
 /// Result of a successful block proposal.
@@ -84,10 +85,20 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         slot: Slot,
         pubkey: &PublicKey,
     ) -> Result<BlockProposalResult, BlockServiceError> {
+        let mode = self.validator_store.effective_block_selection_mode(&pubkey.to_bytes());
+        self.propose_block_with_mode(slot, pubkey, mode).await
+    }
+
+    pub async fn propose_block_with_mode(
+        &self,
+        slot: Slot,
+        pubkey: &PublicKey,
+        mode: BlockSelectionMode,
+    ) -> Result<BlockProposalResult, BlockServiceError> {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let proposal_start = std::time::Instant::now();
 
-        info!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), "Block proposal started");
+        info!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), %mode, "Block proposal started");
 
         let epoch = slot / SLOTS_PER_EPOCH;
 
@@ -110,15 +121,53 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         );
         let randao_hex = format!("0x{}", hex::encode(&randao_bytes));
 
-        // 2. Get validator preferences, checking circuit breaker
+        // 2. Get validator preferences, applying block selection mode
         let pubkey_bytes = pubkey.to_bytes();
         let graffiti = self.validator_store.effective_graffiti(&pubkey_bytes);
         let graffiti_hex = graffiti.map(|g| format!("0x{}", hex::encode(g)));
-        let boost = if self.circuit_breaker.is_tripped() {
-            warn!(slot = slot, "Builder circuit breaker tripped, using local block only");
-            0
-        } else {
-            self.validator_store.builder_boost_factor(&pubkey_bytes)
+
+        // Check circuit breaker for builder modes first
+        let circuit_breaker_tripped = self.circuit_breaker.is_tripped();
+
+        let boost = match mode {
+            BlockSelectionMode::ExecutionOnly => {
+                debug!(slot = slot, "ExecutionOnly: builder_boost_factor=0");
+                0
+            }
+            BlockSelectionMode::MaxProfit => {
+                if circuit_breaker_tripped {
+                    warn!(slot = slot, "Builder circuit breaker tripped, using local block only");
+                    0
+                } else {
+                    self.validator_store.builder_boost_factor(&pubkey_bytes)
+                }
+            }
+            BlockSelectionMode::BuilderAlways => {
+                if circuit_breaker_tripped {
+                    warn!(
+                        slot = slot,
+                        "BuilderAlways: circuit breaker tripped, falling back to local"
+                    );
+                    0
+                } else {
+                    debug!(slot = slot, "BuilderAlways: builder_boost_factor=u64::MAX");
+                    u64::MAX
+                }
+            }
+            BlockSelectionMode::BuilderOnly => {
+                if circuit_breaker_tripped {
+                    error!(
+                        slot = slot,
+                        pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                        "BuilderOnly mode: circuit breaker tripped, proposal will be missed"
+                    );
+                    return Err(BlockServiceError::BuilderOnly(
+                        "circuit breaker tripped — proposal missed".to_string(),
+                    ));
+                }
+                debug!(slot = slot, "BuilderOnly: builder_boost_factor=u64::MAX");
+                u64::MAX
+            }
         };
 
         // 3. Request block from beacon node
@@ -126,11 +175,27 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .beacon
             .produce_block_v3(slot, &randao_hex, graffiti_hex.as_deref(), Some(boost))
             .instrument(tracing::info_span!("rvc.beacon.produce_block_v3"))
-            .await
-            .map_err(|e| {
+            .await;
+
+        // Handle BuilderOnly failure: never fall back
+        let response = match response {
+            Ok(resp) => resp,
+            Err(e) => {
+                if mode == BlockSelectionMode::BuilderOnly {
+                    error!(
+                        slot = slot,
+                        pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                        error = %e,
+                        "BuilderOnly mode: builder failed, proposal will be missed"
+                    );
+                    return Err(BlockServiceError::BuilderOnly(format!(
+                        "builder block production failed: {e}"
+                    )));
+                }
                 error!(slot = slot, error = %e, "Block production failed");
-                e
-            })?;
+                return Err(e);
+            }
+        };
 
         info!(
             slot = slot,
@@ -1595,5 +1660,218 @@ mod tests {
 
         // Blinded flag should be true
         assert!(ssz_calls[0].2);
+    }
+
+    // --- Block selection mode tests (T4.2, T4.3) ---
+
+    struct BoostCapturingBeacon {
+        inner: MockBeaconClient,
+        boost_arg: Mutex<Option<u64>>,
+    }
+
+    #[async_trait(?Send)]
+    impl BeaconBlockClient for BoostCapturingBeacon {
+        async fn produce_block_v3(
+            &self,
+            slot: Slot,
+            randao_reveal: &str,
+            graffiti: Option<&str>,
+            builder_boost_factor: Option<u64>,
+        ) -> Result<ProduceBlockResponse, BlockServiceError> {
+            *self.boost_arg.lock().unwrap() = builder_boost_factor;
+            self.inner.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+        }
+        async fn publish_block(
+            &self,
+            s: &SignedBeaconBlock,
+            v: &str,
+        ) -> Result<(), BlockServiceError> {
+            self.inner.publish_block(s, v).await
+        }
+        async fn publish_blinded_block(
+            &self,
+            s: &SignedBlindedBeaconBlock,
+            v: &str,
+        ) -> Result<(), BlockServiceError> {
+            self.inner.publish_blinded_block(s, v).await
+        }
+        async fn publish_block_ssz(
+            &self,
+            b: &[u8],
+            v: &str,
+            bl: bool,
+        ) -> Result<(), BlockServiceError> {
+            self.inner.publish_block_ssz(b, v, bl).await
+        }
+    }
+
+    fn build_service_with_mode(
+        beacon: BoostCapturingBeacon,
+        pubkey: &PublicKey,
+        circuit_breaker: Arc<CircuitBreakerState>,
+    ) -> BlockService<MockSigner, BoostCapturingBeacon> {
+        let store = test_validator_store(pubkey);
+        BlockService::with_circuit_breaker(
+            Arc::new(MockSigner::new()),
+            Arc::new(beacon),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+            circuit_breaker,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_execution_only_sets_boost_factor_zero() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(0, 0));
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::ExecutionOnly).await;
+        assert!(result.is_ok());
+
+        let boost = *service.beacon.boost_arg.lock().unwrap();
+        assert_eq!(boost, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_max_profit_uses_configured_boost_factor() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(0, 0));
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::MaxProfit).await;
+        assert!(result.is_ok());
+
+        // test_validator_store sets builder_boost_factor=150
+        let boost = *service.beacon.boost_arg.lock().unwrap();
+        assert_eq!(boost, Some(150));
+    }
+
+    #[tokio::test]
+    async fn test_builder_always_sets_boost_factor_max() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(0, 0));
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderAlways).await;
+        assert!(result.is_ok());
+
+        let boost = *service.beacon.boost_arg.lock().unwrap();
+        assert_eq!(boost, Some(u64::MAX));
+    }
+
+    #[tokio::test]
+    async fn test_builder_always_falls_back_on_circuit_breaker() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(1, 0));
+        cb.record_miss(); // trip it
+        assert!(cb.is_tripped());
+
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderAlways).await;
+        // BuilderAlways falls back to local (boost=0)
+        assert!(result.is_ok());
+        let boost = *service.beacon.boost_arg.lock().unwrap();
+        assert_eq!(boost, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_builder_only_sets_boost_factor_max() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(0, 0));
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderOnly).await;
+        assert!(result.is_ok());
+
+        let boost = *service.beacon.boost_arg.lock().unwrap();
+        assert_eq!(boost, Some(u64::MAX));
+    }
+
+    #[tokio::test]
+    async fn test_builder_only_fails_on_circuit_breaker_tripped() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(1, 0));
+        cb.record_miss(); // trip it
+        assert!(cb.is_tripped());
+
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderOnly).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), BlockServiceError::BuilderOnly(_)));
+    }
+
+    #[tokio::test]
+    async fn test_builder_only_fails_on_builder_error() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)).with_produce_error(),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(0, 0));
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderOnly).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), BlockServiceError::BuilderOnly(_)));
+    }
+
+    #[tokio::test]
+    async fn test_max_profit_circuit_breaker_tripped_uses_zero() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(1, 0));
+        cb.record_miss();
+        assert!(cb.is_tripped());
+
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::MaxProfit).await;
+        assert!(result.is_ok());
+        let boost = *service.beacon.boost_arg.lock().unwrap();
+        assert_eq!(boost, Some(0));
     }
 }
