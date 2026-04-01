@@ -131,6 +131,30 @@ pub struct Config {
     #[serde(default)]
     pub monitoring_endpoint_insecure: bool,
 
+    // --- Proposer nodes fields (T3.1/T3.2) ---
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposer_nodes: Vec<String>,
+
+    // --- Broadcast topics fields (T3.3/T3.4) ---
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broadcast: Vec<String>,
+
+    // --- Proposer config URL fields (T3.11/T3.12/T3.13) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposer_config_url: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposer_config_file: Option<String>,
+
+    #[serde(default = "default_proposer_config_refresh_interval")]
+    pub proposer_config_refresh_interval: u64,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposer_config_url_token: Option<String>,
+
+    #[serde(default)]
+    pub proposer_config_url_insecure: bool,
+
     // --- Log rotation fields (T3.8/T3.9/T3.10) ---
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logfile: Option<PathBuf>,
@@ -149,6 +173,10 @@ pub struct Config {
 }
 
 fn default_monitoring_interval() -> u64 {
+    384
+}
+
+fn default_proposer_config_refresh_interval() -> u64 {
     384
 }
 
@@ -259,6 +287,13 @@ impl Default for Config {
             builder_circuit_breaker_consecutive_limit: default_circuit_breaker_consecutive_limit(),
             builder_circuit_breaker_epoch_limit: default_circuit_breaker_epoch_limit(),
             disable_keystore_locking: false,
+            proposer_nodes: Vec::new(),
+            broadcast: Vec::new(),
+            proposer_config_url: None,
+            proposer_config_file: None,
+            proposer_config_refresh_interval: default_proposer_config_refresh_interval(),
+            proposer_config_url_token: None,
+            proposer_config_url_insecure: false,
             monitoring_endpoint: None,
             monitoring_interval: default_monitoring_interval(),
             monitoring_endpoint_insecure: false,
@@ -370,6 +405,46 @@ impl Config {
             self.validate_insecure_env_var()?;
         }
 
+        // Validate proposer_config_url and proposer_config_file mutual exclusivity
+        if self.proposer_config_url.is_some() && self.proposer_config_file.is_some() {
+            return Err(ConfigError::MissingField(
+                "--proposer-config-url and --proposer-config-file are mutually exclusive; use only one".to_string(),
+            ));
+        }
+
+        // Validate broadcast topics
+        for topic in &self.broadcast {
+            match topic.as_str() {
+                "attestations" | "blocks" | "sync-committee" | "subscriptions" | "none" => {}
+                other => {
+                    return Err(ConfigError::MissingField(format!(
+                        "invalid broadcast topic '{}': must be one of attestations, blocks, sync-committee, subscriptions, none",
+                        other
+                    )));
+                }
+            }
+        }
+        if self.broadcast.contains(&"none".to_string()) && self.broadcast.len() > 1 {
+            return Err(ConfigError::MissingField(
+                "broadcast topic 'none' cannot be combined with other topics".to_string(),
+            ));
+        }
+
+        // Validate proposer node URLs
+        for node_url in &self.proposer_nodes {
+            if node_url.is_empty() {
+                return Err(ConfigError::InvalidBeaconUrl(
+                    "proposer_nodes entry cannot be empty".to_string(),
+                ));
+            }
+            if !node_url.starts_with("http://") && !node_url.starts_with("https://") {
+                return Err(ConfigError::InvalidBeaconUrl(format!(
+                    "proposer_nodes entry must start with http:// or https://: {}",
+                    node_url
+                )));
+            }
+        }
+
         match self.slashed_validators_action.as_str() {
             "disable-only" | "shutdown" | "none" => {}
             other => {
@@ -420,6 +495,30 @@ impl Config {
         }
 
         Ok(passwords)
+    }
+
+    /// Parses the `broadcast` config field into `BroadcastTopics`.
+    ///
+    /// If empty, returns default (all enabled). If "none", all disabled.
+    /// Otherwise, only listed topics are enabled.
+    pub fn effective_broadcast_topics(&self) -> bn_manager::BroadcastTopics {
+        if self.broadcast.is_empty() {
+            return bn_manager::BroadcastTopics::default();
+        }
+        if self.broadcast.len() == 1 && self.broadcast[0] == "none" {
+            return bn_manager::BroadcastTopics {
+                attestations: false,
+                blocks: false,
+                sync_committee: false,
+                subscriptions: false,
+            };
+        }
+        bn_manager::BroadcastTopics {
+            attestations: self.broadcast.contains(&"attestations".to_string()),
+            blocks: self.broadcast.contains(&"blocks".to_string()),
+            sync_committee: self.broadcast.contains(&"sync-committee".to_string()),
+            subscriptions: self.broadcast.contains(&"subscriptions".to_string()),
+        }
     }
 
     /// Returns the effective list of beacon node endpoints.
@@ -616,6 +715,34 @@ impl Config {
             self.disable_keystore_locking = disable;
         }
 
+        if let Some(ref nodes) = cli.proposer_nodes {
+            self.proposer_nodes = nodes.clone();
+        }
+
+        if let Some(ref topics) = cli.broadcast {
+            self.broadcast = topics.clone();
+        }
+
+        if let Some(ref url) = cli.proposer_config_url {
+            self.proposer_config_url = Some(url.clone());
+        }
+
+        if let Some(ref file) = cli.proposer_config_file {
+            self.proposer_config_file = Some(file.clone());
+        }
+
+        if let Some(interval) = cli.proposer_config_refresh_interval {
+            self.proposer_config_refresh_interval = interval;
+        }
+
+        if let Some(ref token) = cli.proposer_config_url_token {
+            self.proposer_config_url_token = Some(token.clone());
+        }
+
+        if let Some(insecure) = cli.proposer_config_url_insecure {
+            self.proposer_config_url_insecure = insecure;
+        }
+
         if let Some(ref endpoint) = cli.monitoring_endpoint {
             self.monitoring_endpoint = Some(endpoint.clone());
         }
@@ -711,6 +838,13 @@ pub struct CliOverrides {
     pub builder_circuit_breaker_consecutive_limit: Option<u32>,
     pub builder_circuit_breaker_epoch_limit: Option<u32>,
     pub disable_keystore_locking: Option<bool>,
+    pub proposer_nodes: Option<Vec<String>>,
+    pub broadcast: Option<Vec<String>>,
+    pub proposer_config_url: Option<String>,
+    pub proposer_config_file: Option<String>,
+    pub proposer_config_refresh_interval: Option<u64>,
+    pub proposer_config_url_token: Option<String>,
+    pub proposer_config_url_insecure: Option<bool>,
     pub monitoring_endpoint: Option<String>,
     pub monitoring_interval: Option<u64>,
     pub monitoring_endpoint_insecure: Option<bool>,
@@ -1825,5 +1959,147 @@ disable_keystore_locking = true
         assert_eq!(config.builder_circuit_breaker_consecutive_limit, 7);
         assert_eq!(config.builder_circuit_breaker_epoch_limit, 12);
         assert!(config.disable_keystore_locking);
+    }
+
+    // --- T3.2/T3.4: Proposer nodes and broadcast topics config ---
+
+    #[test]
+    fn test_effective_broadcast_topics_default() {
+        let config = Config::default();
+        let topics = config.effective_broadcast_topics();
+        assert!(topics.attestations);
+        assert!(topics.blocks);
+        assert!(topics.sync_committee);
+        assert!(topics.subscriptions);
+    }
+
+    #[test]
+    fn test_effective_broadcast_topics_none() {
+        let config = Config { broadcast: vec!["none".to_string()], ..Default::default() };
+        let topics = config.effective_broadcast_topics();
+        assert!(!topics.attestations);
+        assert!(!topics.blocks);
+        assert!(!topics.sync_committee);
+        assert!(!topics.subscriptions);
+    }
+
+    #[test]
+    fn test_effective_broadcast_topics_partial() {
+        let config = Config {
+            broadcast: vec!["blocks".to_string(), "attestations".to_string()],
+            ..Default::default()
+        };
+        let topics = config.effective_broadcast_topics();
+        assert!(topics.attestations);
+        assert!(topics.blocks);
+        assert!(!topics.sync_committee);
+        assert!(!topics.subscriptions);
+    }
+
+    #[test]
+    fn test_validate_invalid_broadcast_topic() {
+        let config = Config { broadcast: vec!["invalid-topic".to_string()], ..Default::default() };
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_broadcast_none_with_others_fails() {
+        let config = Config {
+            broadcast: vec!["none".to_string(), "blocks".to_string()],
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_proposer_config_mutual_exclusivity() {
+        let config = Config {
+            proposer_config_url: Some("https://example.com/config".to_string()),
+            proposer_config_file: Some("/path/to/config.json".to_string()),
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_proposer_config_url_only() {
+        let config = Config {
+            proposer_config_url: Some("https://example.com/config".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_proposer_config_file_only() {
+        let config = Config {
+            proposer_config_file: Some("/path/to/config.json".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_default_config_proposer_fields() {
+        let config = Config::default();
+        assert!(config.proposer_nodes.is_empty());
+        assert!(config.broadcast.is_empty());
+        assert!(config.proposer_config_url.is_none());
+        assert!(config.proposer_config_file.is_none());
+        assert_eq!(config.proposer_config_refresh_interval, 384);
+        assert!(config.proposer_config_url_token.is_none());
+        assert!(!config.proposer_config_url_insecure);
+    }
+
+    #[test]
+    fn test_proposer_nodes_toml_parsing() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+proposer_nodes = ["http://proposer1:5052", "http://proposer2:5052"]
+broadcast = ["blocks", "attestations"]
+"#
+        )
+        .unwrap();
+        let config = Config::from_file(f.path()).unwrap();
+        assert_eq!(config.proposer_nodes.len(), 2);
+        assert_eq!(config.proposer_nodes[0], "http://proposer1:5052");
+        assert_eq!(config.broadcast.len(), 2);
+    }
+
+    #[test]
+    fn test_validate_invalid_proposer_node_url() {
+        let config =
+            Config { proposer_nodes: vec!["ftp://invalid:5052".to_string()], ..Default::default() };
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_merge_with_cli_proposer_fields() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            proposer_nodes: Some(vec!["http://p1:5052".to_string()]),
+            broadcast: Some(vec!["blocks".to_string()]),
+            proposer_config_url: Some("https://example.com/config".to_string()),
+            proposer_config_refresh_interval: Some(60),
+            proposer_config_url_token: Some("my-token".to_string()),
+            proposer_config_url_insecure: Some(true),
+            ..Default::default()
+        };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.proposer_nodes.len(), 1);
+        assert_eq!(config.broadcast, vec!["blocks".to_string()]);
+        assert_eq!(config.proposer_config_url, Some("https://example.com/config".to_string()));
+        assert_eq!(config.proposer_config_refresh_interval, 60);
+        assert_eq!(config.proposer_config_url_token, Some("my-token".to_string()));
+        assert!(config.proposer_config_url_insecure);
     }
 }

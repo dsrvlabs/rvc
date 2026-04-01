@@ -189,6 +189,25 @@ pub enum BnSelectionStrategy {
     Best,
 }
 
+/// Controls which message types are broadcast to all BNs vs sent to the first healthy BN.
+///
+/// When a topic is `true`, the corresponding submission is broadcast to all BNs.
+/// When `false`, only the first healthy BN receives the message (query_first strategy).
+/// Default: all topics enabled (current behavior preserved).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastTopics {
+    pub attestations: bool,
+    pub blocks: bool,
+    pub sync_committee: bool,
+    pub subscriptions: bool,
+}
+
+impl Default for BroadcastTopics {
+    fn default() -> Self {
+        Self { attestations: true, blocks: true, sync_committee: true, subscriptions: true }
+    }
+}
+
 /// Configuration for the beacon node manager.
 #[derive(Debug, Clone)]
 pub struct BnManagerConfig {
@@ -198,6 +217,8 @@ pub struct BnManagerConfig {
     pub selection_strategy: BnSelectionStrategy,
     /// Per-BN request timeout.
     pub timeout: Duration,
+    /// Which submission types are broadcast to all BNs.
+    pub broadcast_topics: BroadcastTopics,
 }
 
 impl BnManagerConfig {
@@ -206,6 +227,7 @@ impl BnManagerConfig {
             endpoints,
             selection_strategy: BnSelectionStrategy::First,
             timeout: Duration::from_secs(30),
+            broadcast_topics: BroadcastTopics::default(),
         }
     }
 }
@@ -624,5 +646,67 @@ mod tests {
         let mock: Arc<dyn BeaconNodeClient> = Arc::new(MockBeaconNodeClient);
         let result = mock.get_genesis().await;
         assert!(result.is_err());
+    }
+
+    // -- BroadcastTopics --
+
+    #[test]
+    fn test_broadcast_topics_default_all_enabled() {
+        let topics = BroadcastTopics::default();
+        assert!(topics.attestations);
+        assert!(topics.blocks);
+        assert!(topics.sync_committee);
+        assert!(topics.subscriptions);
+    }
+
+    #[test]
+    fn test_broadcast_topics_all_disabled() {
+        let topics = BroadcastTopics {
+            attestations: false,
+            blocks: false,
+            sync_committee: false,
+            subscriptions: false,
+        };
+        assert!(!topics.attestations);
+        assert!(!topics.blocks);
+    }
+
+    #[test]
+    fn test_broadcast_topics_partial() {
+        let topics = BroadcastTopics {
+            attestations: false,
+            blocks: true,
+            sync_committee: false,
+            subscriptions: true,
+        };
+        assert!(!topics.attestations);
+        assert!(topics.blocks);
+        assert!(!topics.sync_committee);
+        assert!(topics.subscriptions);
+    }
+
+    #[test]
+    fn test_broadcast_topics_clone() {
+        let topics = BroadcastTopics {
+            attestations: true,
+            blocks: false,
+            sync_committee: true,
+            subscriptions: false,
+        };
+        let cloned = topics.clone();
+        assert_eq!(topics, cloned);
+    }
+
+    #[test]
+    fn test_broadcast_topics_debug() {
+        let topics = BroadcastTopics::default();
+        let debug = format!("{:?}", topics);
+        assert!(debug.contains("BroadcastTopics"));
+    }
+
+    #[test]
+    fn test_bn_manager_config_includes_broadcast_topics() {
+        let config = BnManagerConfig::new(vec!["http://localhost:5052".to_string()]);
+        assert_eq!(config.broadcast_topics, BroadcastTopics::default());
     }
 }

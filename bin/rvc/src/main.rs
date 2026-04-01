@@ -245,6 +245,37 @@ enum Commands {
         #[arg(long)]
         disable_keystore_locking: bool,
 
+        // --- Proposer nodes flags (T3.1/T3.2) ---
+        /// Comma-separated list of dedicated proposer beacon node URLs for block production
+        #[arg(long, value_delimiter = ',')]
+        proposer_nodes: Option<Vec<String>>,
+
+        // --- Broadcast topics flags (T3.3/T3.4) ---
+        /// Comma-separated list of message types to broadcast to all BNs (attestations,blocks,sync-committee,subscriptions,none)
+        #[arg(long, value_delimiter = ',')]
+        broadcast: Option<Vec<String>>,
+
+        // --- Proposer config URL flags (T3.11/T3.12/T3.13) ---
+        /// Remote URL for proposer configuration (mutually exclusive with --proposer-config-file)
+        #[arg(long, conflicts_with = "proposer_config_file")]
+        proposer_config_url: Option<String>,
+
+        /// Local file path for proposer configuration (mutually exclusive with --proposer-config-url)
+        #[arg(long, conflicts_with = "proposer_config_url")]
+        proposer_config_file: Option<String>,
+
+        /// Refresh interval in seconds for proposer config URL (default: 384, i.e., one epoch)
+        #[arg(long)]
+        proposer_config_refresh_interval: Option<u64>,
+
+        /// Bearer token for proposer config URL authentication
+        #[arg(long)]
+        proposer_config_url_token: Option<String>,
+
+        /// Allow HTTP (non-HTTPS) proposer config URL
+        #[arg(long)]
+        proposer_config_url_insecure: bool,
+
         // --- Monitoring flags (T3.7) ---
         /// Remote monitoring endpoint URL (e.g., https://beaconcha.in/api/v1/client/metrics?apikey=...)
         #[arg(long)]
@@ -386,6 +417,13 @@ async fn main() -> anyhow::Result<()> {
             builder_circuit_breaker_consecutive_limit,
             builder_circuit_breaker_epoch_limit,
             disable_keystore_locking,
+            proposer_nodes,
+            broadcast,
+            proposer_config_url,
+            proposer_config_file,
+            proposer_config_refresh_interval,
+            proposer_config_url_token,
+            proposer_config_url_insecure,
             monitoring_endpoint,
             monitoring_interval,
             monitoring_endpoint_insecure,
@@ -496,6 +534,17 @@ async fn main() -> anyhow::Result<()> {
                 builder_circuit_breaker_consecutive_limit,
                 builder_circuit_breaker_epoch_limit,
                 disable_keystore_locking: if disable_keystore_locking { Some(true) } else { None },
+                proposer_nodes,
+                broadcast,
+                proposer_config_url,
+                proposer_config_file,
+                proposer_config_refresh_interval,
+                proposer_config_url_token,
+                proposer_config_url_insecure: if proposer_config_url_insecure {
+                    Some(true)
+                } else {
+                    None
+                },
                 monitoring_endpoint,
                 monitoring_interval,
                 monitoring_endpoint_insecure: if monitoring_endpoint_insecure {
@@ -1131,8 +1180,41 @@ async fn run_validator(
         .build_orchestrator_config(genesis_validators_root, fork_schedule)
         .with_timeouts(timeouts);
 
-    let block_beacon =
-        std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(beacon_client.clone()));
+    // Build proposer BnManager if proposer nodes are configured (T3.1)
+    let proposer_bn_manager = match builder.build_proposer_bn_manager() {
+        Ok(Some(mgr)) => {
+            info!(
+                proposer_nodes = ?config.proposer_nodes,
+                "Proposer nodes configured — block production will use dedicated pool"
+            );
+            Some(mgr)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            error!("Failed to create proposer BnManager: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    // Use proposer BnManager for block production if available, otherwise main beacon_client
+    let block_beacon = match &proposer_bn_manager {
+        Some(_proposer_mgr) => {
+            std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(
+                // We need an Arc<BeaconClient> - but proposer_mgr is an Arc<BnManager>.
+                // The BeaconBlockAdapter wraps a BeaconClient. For proposer nodes,
+                // we use the first proposer node endpoint to create a new BeaconClient.
+                {
+                    let proposer_endpoint = &config.proposer_nodes[0];
+                    let proposer_config =
+                        beacon::BeaconClientConfig::new(proposer_endpoint.clone())
+                            .with_timeout(std::time::Duration::from_secs(30))
+                            .with_max_retries(0);
+                    std::sync::Arc::new(beacon::BeaconClient::new(proposer_config)?)
+                },
+            ))
+        }
+        None => std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(beacon_client.clone())),
+    };
 
     #[allow(clippy::arc_with_non_send_sync)]
     let builder_service = Some(std::sync::Arc::new(builder::BuilderService::new(
@@ -1372,6 +1454,50 @@ async fn run_validator(
             monitoring_shutdown,
             move || (validator_count as u32, validator_count as u32),
         ));
+    }
+
+    // Spawn proposer config URL refresh task if configured (T3.12)
+    if let Some(ref proposer_config_url) = config.proposer_config_url {
+        let settings = rvc::config_url::ProposerConfigUrlSettings {
+            url: proposer_config_url.clone(),
+            refresh_interval: std::time::Duration::from_secs(
+                config.proposer_config_refresh_interval,
+            ),
+            token: config.proposer_config_url_token.clone(),
+            insecure: config.proposer_config_url_insecure,
+        };
+        let config_refresh_shutdown = shutdown_token.clone();
+        info!(
+            url = %rvc::config::redact_url(proposer_config_url),
+            refresh_interval_secs = config.proposer_config_refresh_interval,
+            "Starting proposer config URL refresh task"
+        );
+        tokio::spawn(rvc::config_url::start_proposer_config_refresh(
+            settings,
+            config_refresh_shutdown,
+            move |updates, _default| {
+                for update in &updates {
+                    info!(
+                        pubkey = %update.pubkey,
+                        fee_recipient = ?update.fee_recipient,
+                        builder_enabled = ?update.builder_enabled,
+                        "Proposer config update from URL"
+                    );
+                }
+            },
+        ));
+    }
+
+    // Log broadcast topics if non-default (T3.4)
+    {
+        let topics = config.effective_broadcast_topics();
+        info!(
+            attestations = topics.attestations,
+            blocks = topics.blocks,
+            sync_committee = topics.sync_committee,
+            subscriptions = topics.subscriptions,
+            "Active broadcast topics"
+        );
     }
 
     startup::log_orchestrator_started(validator_count, bn_count);

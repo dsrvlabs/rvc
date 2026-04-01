@@ -108,14 +108,43 @@ impl ServiceBuilder {
 
     pub fn build_bn_manager(&self) -> Result<Arc<BnManager>, ConfigError> {
         let endpoints = self.config.effective_beacon_nodes();
-        let config = BnManagerConfig::new(endpoints.clone());
+        let broadcast_topics = self.config.effective_broadcast_topics();
+        let mut config = BnManagerConfig::new(endpoints.clone());
+        config.broadcast_topics = broadcast_topics.clone();
         let manager = BnManager::new(config)
             .map_err(|e| {
                 ConfigError::InvalidBeaconUrl(format!("failed to create BnManager: {}", e))
             })?
             .with_operation_timeouts(bn_manager::OperationTimeouts::default());
-        info!(endpoints = ?endpoints, "Created BnManager with {} beacon nodes", endpoints.len());
+        info!(
+            endpoints = ?endpoints,
+            broadcast_topics = ?broadcast_topics,
+            "Created BnManager with {} beacon nodes",
+            endpoints.len()
+        );
         Ok(Arc::new(manager))
+    }
+
+    /// Builds a separate BnManager for proposer nodes if configured.
+    ///
+    /// Returns `None` if `proposer_nodes` is empty (main pool handles all).
+    pub fn build_proposer_bn_manager(&self) -> Result<Option<Arc<BnManager>>, ConfigError> {
+        if self.config.proposer_nodes.is_empty() {
+            return Ok(None);
+        }
+        let endpoints = self.config.proposer_nodes.clone();
+        let config = BnManagerConfig::new(endpoints.clone());
+        let manager = BnManager::new(config)
+            .map_err(|e| {
+                ConfigError::InvalidBeaconUrl(format!("failed to create proposer BnManager: {}", e))
+            })?
+            .with_operation_timeouts(bn_manager::OperationTimeouts::default());
+        info!(
+            endpoints = ?endpoints,
+            "Created proposer BnManager with {} proposer nodes",
+            endpoints.len()
+        );
+        Ok(Some(Arc::new(manager)))
     }
 
     pub fn build_doppelganger_service(

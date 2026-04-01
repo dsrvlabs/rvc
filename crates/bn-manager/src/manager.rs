@@ -53,6 +53,7 @@ pub struct BnManager {
     sync_statuses: SharedSyncStatuses,
     health_trackers: SharedHealthTrackers,
     operation_timeouts: Option<OperationTimeouts>,
+    broadcast_topics: crate::traits::BroadcastTopics,
 }
 
 impl BnManager {
@@ -98,10 +99,17 @@ impl BnManager {
             clients.push(client);
         }
 
+        let broadcast_topics = config.broadcast_topics.clone();
         let sync_statuses = new_shared_sync_statuses(clients.len());
         let endpoints: Vec<String> = clients.iter().map(|c| c.endpoint().to_string()).collect();
         let health_trackers = new_shared_health_trackers(&endpoints);
-        Ok(Self { clients, sync_statuses, health_trackers, operation_timeouts: None })
+        Ok(Self {
+            clients,
+            sync_statuses,
+            health_trackers,
+            operation_timeouts: None,
+            broadcast_topics,
+        })
     }
 
     /// Returns the shared sync status tracker.
@@ -834,14 +842,25 @@ impl BeaconNodeClient for BnManager {
         signed_block: &SignedBeaconBlock,
         consensus_version: &str,
     ) -> Result<(), BeaconError> {
-        self.with_op_timeout(
-            "publish_block",
-            self.op_timeout(|t| t.block_publication),
-            self.broadcast("publish_block", |c| {
-                Box::pin(c.publish_block(signed_block, consensus_version))
-            }),
-        )
-        .await
+        if self.broadcast_topics.blocks {
+            self.with_op_timeout(
+                "publish_block",
+                self.op_timeout(|t| t.block_publication),
+                self.broadcast("publish_block", |c| {
+                    Box::pin(c.publish_block(signed_block, consensus_version))
+                }),
+            )
+            .await
+        } else {
+            self.with_op_timeout(
+                "publish_block",
+                self.op_timeout(|t| t.block_publication),
+                self.query_first("publish_block", false, |c| {
+                    Box::pin(c.publish_block(signed_block, consensus_version))
+                }),
+            )
+            .await
+        }
     }
 
     async fn publish_blinded_block(
@@ -849,14 +868,25 @@ impl BeaconNodeClient for BnManager {
         signed_blinded_block: &SignedBlindedBeaconBlock,
         consensus_version: &str,
     ) -> Result<(), BeaconError> {
-        self.with_op_timeout(
-            "publish_blinded_block",
-            self.op_timeout(|t| t.block_publication),
-            self.broadcast("publish_blinded_block", |c| {
-                Box::pin(c.publish_blinded_block(signed_blinded_block, consensus_version))
-            }),
-        )
-        .await
+        if self.broadcast_topics.blocks {
+            self.with_op_timeout(
+                "publish_blinded_block",
+                self.op_timeout(|t| t.block_publication),
+                self.broadcast("publish_blinded_block", |c| {
+                    Box::pin(c.publish_blinded_block(signed_blinded_block, consensus_version))
+                }),
+            )
+            .await
+        } else {
+            self.with_op_timeout(
+                "publish_blinded_block",
+                self.op_timeout(|t| t.block_publication),
+                self.query_first("publish_blinded_block", false, |c| {
+                    Box::pin(c.publish_blinded_block(signed_blinded_block, consensus_version))
+                }),
+            )
+            .await
+        }
     }
 
     // -- Attestation data: query(First) + attestation_fetch timeout --
@@ -882,14 +912,25 @@ impl BeaconNodeClient for BnManager {
         &self,
         attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError> {
-        self.with_op_timeout(
-            "submit_attestation",
-            self.op_timeout(|t| t.attestation_submit),
-            self.broadcast_with_result("submit_attestation", |c| {
-                Box::pin(c.submit_attestation(attestations))
-            }),
-        )
-        .await
+        if self.broadcast_topics.attestations {
+            self.with_op_timeout(
+                "submit_attestation",
+                self.op_timeout(|t| t.attestation_submit),
+                self.broadcast_with_result("submit_attestation", |c| {
+                    Box::pin(c.submit_attestation(attestations))
+                }),
+            )
+            .await
+        } else {
+            self.with_op_timeout(
+                "submit_attestation",
+                self.op_timeout(|t| t.attestation_submit),
+                self.query_first("submit_attestation", true, |c| {
+                    Box::pin(c.submit_attestation(attestations))
+                }),
+            )
+            .await
+        }
     }
 
     // -- Aggregation: query(First) + aggregate_fetch timeout for fetching, broadcast + aggregate_submit timeout for submitting --
@@ -930,14 +971,25 @@ impl BeaconNodeClient for BnManager {
         &self,
         messages: &[SyncCommitteeMessage],
     ) -> Result<(), BeaconError> {
-        self.with_op_timeout(
-            "submit_sync_committee_messages",
-            self.op_timeout(|t| t.sync_message),
-            self.broadcast("submit_sync_committee_messages", |c| {
-                Box::pin(c.submit_sync_committee_messages(messages))
-            }),
-        )
-        .await
+        if self.broadcast_topics.sync_committee {
+            self.with_op_timeout(
+                "submit_sync_committee_messages",
+                self.op_timeout(|t| t.sync_message),
+                self.broadcast("submit_sync_committee_messages", |c| {
+                    Box::pin(c.submit_sync_committee_messages(messages))
+                }),
+            )
+            .await
+        } else {
+            self.with_op_timeout(
+                "submit_sync_committee_messages",
+                self.op_timeout(|t| t.sync_message),
+                self.query_first("submit_sync_committee_messages", true, |c| {
+                    Box::pin(c.submit_sync_committee_messages(messages))
+                }),
+            )
+            .await
+        }
     }
 
     async fn get_sync_committee_contribution(
@@ -1002,14 +1054,25 @@ impl BeaconNodeClient for BnManager {
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
-        self.with_op_timeout(
-            "submit_beacon_committee_subscriptions",
-            self.op_timeout(|t| t.preparation),
-            self.broadcast("submit_beacon_committee_subscriptions", |c| {
-                Box::pin(c.submit_beacon_committee_subscriptions(subscriptions))
-            }),
-        )
-        .await
+        if self.broadcast_topics.subscriptions {
+            self.with_op_timeout(
+                "submit_beacon_committee_subscriptions",
+                self.op_timeout(|t| t.preparation),
+                self.broadcast("submit_beacon_committee_subscriptions", |c| {
+                    Box::pin(c.submit_beacon_committee_subscriptions(subscriptions))
+                }),
+            )
+            .await
+        } else {
+            self.with_op_timeout(
+                "submit_beacon_committee_subscriptions",
+                self.op_timeout(|t| t.preparation),
+                self.query_first("submit_beacon_committee_subscriptions", true, |c| {
+                    Box::pin(c.submit_beacon_committee_subscriptions(subscriptions))
+                }),
+            )
+            .await
+        }
     }
 
     // -- Builder: broadcast + preparation timeout --

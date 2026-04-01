@@ -16,7 +16,8 @@ pub use sse::{
 };
 pub use sync_status::{BnSyncStatus, SharedSyncStatuses};
 pub use traits::{
-    BeaconNodeClient, BnHealthScore, BnManagerConfig, BnSelectionStrategy, OperationTimeouts,
+    BeaconNodeClient, BnHealthScore, BnManagerConfig, BnSelectionStrategy, BroadcastTopics,
+    OperationTimeouts,
 };
 
 // Re-export types used in trait signatures so downstream crates

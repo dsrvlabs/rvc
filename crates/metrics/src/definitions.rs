@@ -228,6 +228,57 @@ lazy_static! {
         counter
     };
 
+    /// Gauge for proposer BN pool health score.
+    /// Labels: endpoint
+    pub static ref RVC_PROPOSER_BN_HEALTH_SCORE: prometheus::GaugeVec = {
+        let opts = Opts::new(
+            "rvc_proposer_bn_health_score",
+            "Health score of proposer beacon nodes"
+        ).const_label("pool", "proposer");
+        let gauge = prometheus::GaugeVec::new(opts, &["endpoint"])
+            .expect("Failed to create rvc_proposer_bn_health_score metric");
+        REGISTRY.register(Box::new(gauge.clone()))
+            .expect("Failed to register rvc_proposer_bn_health_score metric");
+        gauge
+    };
+
+    /// Histogram for proposer BN latency in milliseconds.
+    /// Labels: endpoint
+    pub static ref RVC_PROPOSER_BN_LATENCY_MS: HistogramVec = {
+        let opts = HistogramOpts::new(
+            "rvc_proposer_bn_latency_ms",
+            "Latency of proposer beacon node requests in milliseconds"
+        ).buckets(vec![5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0])
+        .const_label("pool", "proposer");
+        let histogram = HistogramVec::new(opts, &["endpoint"])
+            .expect("Failed to create rvc_proposer_bn_latency_ms metric");
+        REGISTRY.register(Box::new(histogram.clone()))
+            .expect("Failed to register rvc_proposer_bn_latency_ms metric");
+        histogram
+    };
+
+    /// Counter for proposer config URL refresh successes.
+    pub static ref RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL: IntCounter = {
+        let counter = IntCounter::new(
+            "rvc_proposer_config_refresh_success_total",
+            "Total number of successful proposer config URL refreshes"
+        ).expect("Failed to create rvc_proposer_config_refresh_success_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_proposer_config_refresh_success_total metric");
+        counter
+    };
+
+    /// Counter for proposer config URL refresh failures.
+    pub static ref RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL: IntCounter = {
+        let counter = IntCounter::new(
+            "rvc_proposer_config_refresh_failures_total",
+            "Total number of failed proposer config URL refreshes"
+        ).expect("Failed to create rvc_proposer_config_refresh_failures_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_proposer_config_refresh_failures_total metric");
+        counter
+    };
+
     /// Counter for failed monitoring pushes.
     pub static ref RVC_MONITORING_PUSH_FAILURES_TOTAL: IntCounter = {
         let counter = IntCounter::new(
@@ -262,6 +313,10 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_BUILDER_EPOCH_MISSES);
     lazy_static::initialize(&RVC_MONITORING_PUSH_SUCCESS_TOTAL);
     lazy_static::initialize(&RVC_MONITORING_PUSH_FAILURES_TOTAL);
+    lazy_static::initialize(&RVC_PROPOSER_BN_HEALTH_SCORE);
+    lazy_static::initialize(&RVC_PROPOSER_BN_LATENCY_MS);
+    lazy_static::initialize(&RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL);
+    lazy_static::initialize(&RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL);
 }
 
 /// Attestation status label values.
