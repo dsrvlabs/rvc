@@ -1,7 +1,5 @@
 {
   "enabledPlugins": {
-    "dev-planner@claude-plugin-dev-assistant": true,
-    "implementer@claude-plugin-dev-assistant": true,
     "rust@claude-plugin-dev-assistant": true
   }
 }
