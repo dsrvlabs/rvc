@@ -244,6 +244,40 @@ enum Commands {
         /// Disable keystore file locking (for DVT setups with shared key material)
         #[arg(long)]
         disable_keystore_locking: bool,
+
+        // --- Monitoring flags (T3.7) ---
+        /// Remote monitoring endpoint URL (e.g., https://beaconcha.in/api/v1/client/metrics?apikey=...)
+        #[arg(long)]
+        monitoring_endpoint: Option<String>,
+
+        /// Monitoring push interval in seconds (default: 384, i.e., one epoch)
+        #[arg(long)]
+        monitoring_interval: Option<u64>,
+
+        /// Allow HTTP (non-HTTPS) monitoring endpoint
+        #[arg(long)]
+        monitoring_endpoint_insecure: bool,
+
+        // --- Log rotation flags (T3.8/T3.9/T3.10) ---
+        /// Path to the log file (enables file logging alongside stdout)
+        #[arg(long)]
+        logfile: Option<std::path::PathBuf>,
+
+        /// Maximum log file size in MB before rotation (default: 200)
+        #[arg(long)]
+        logfile_max_size: Option<u64>,
+
+        /// Maximum number of rotated log files to keep (default: 5)
+        #[arg(long)]
+        logfile_max_number: Option<usize>,
+
+        /// Enable gzip compression of rotated log files
+        #[arg(long)]
+        logfile_compress: bool,
+
+        /// Log level for file logging (default: same as --log-level)
+        #[arg(long)]
+        logfile_level: Option<String>,
     },
 
     /// Submit a voluntary exit for a validator
@@ -352,6 +386,14 @@ async fn main() -> anyhow::Result<()> {
             builder_circuit_breaker_consecutive_limit,
             builder_circuit_breaker_epoch_limit,
             disable_keystore_locking,
+            monitoring_endpoint,
+            monitoring_interval,
+            monitoring_endpoint_insecure,
+            logfile,
+            logfile_max_size,
+            logfile_max_number,
+            logfile_compress,
+            logfile_level,
         } => {
             // Validate gRPC signer flags: if URL is set, all TLS flags are required
             if grpc_signer_url.is_some()
@@ -454,13 +496,27 @@ async fn main() -> anyhow::Result<()> {
                 builder_circuit_breaker_consecutive_limit,
                 builder_circuit_breaker_epoch_limit,
                 disable_keystore_locking: if disable_keystore_locking { Some(true) } else { None },
+                monitoring_endpoint,
+                monitoring_interval,
+                monitoring_endpoint_insecure: if monitoring_endpoint_insecure {
+                    Some(true)
+                } else {
+                    None
+                },
+                logfile,
+                logfile_max_size,
+                logfile_max_number,
+                logfile_compress: if logfile_compress { Some(true) } else { None },
+                logfile_level,
             };
 
             let mut cfg = load_config(config)?;
             cfg.merge_with_cli(&cli_overrides);
 
             let tracing_config = build_tracing_config(&cfg);
-            let tracing_guard = init_logging(&log_level, tracing_config.as_ref());
+            let file_layer_config = build_file_layer_config(&cfg);
+            let logging_guards =
+                init_logging(&log_level, tracing_config.as_ref(), file_layer_config.as_ref());
 
             info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -483,7 +539,7 @@ async fn main() -> anyhow::Result<()> {
                 strict_permissions,
                 strict_slashing_semantics,
                 timeouts,
-                tracing_guard,
+                logging_guards,
             )
             .await?;
         }
@@ -499,7 +555,7 @@ async fn main() -> anyhow::Result<()> {
             genesis_validators_root,
             log_level,
         } => {
-            init_logging(&log_level, None);
+            init_logging(&log_level, None, None);
 
             let args = commands::voluntary_exit::VoluntaryExitArgs {
                 pubkey,
@@ -520,27 +576,53 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Guards returned from init_logging that must be held for application lifetime.
+struct LoggingGuards {
+    _tracing_guard: Option<telemetry::TracingGuard>,
+    _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+}
+
 fn init_logging(
     level: &str,
     tracing_config: Option<&telemetry::TelemetryConfig>,
-) -> Option<telemetry::TracingGuard> {
+    file_config: Option<&telemetry::FileAppenderConfig>,
+) -> LoggingGuards {
+    use tracing_subscriber::layer::Layer;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    let fmt_layer = tracing_subscriber::fmt::layer();
 
-    match tracing_config {
+    let (file_layer, file_guard): (
+        Option<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>>,
+        Option<tracing_appender::non_blocking::WorkerGuard>,
+    ) = match file_config {
+        Some(config) => match telemetry::create_file_layer(config) {
+            Ok((layer, guard)) => {
+                eprintln!("File logging enabled: {}/{}", config.directory, config.filename);
+                (Some(layer), Some(guard))
+            }
+            Err(e) => {
+                eprintln!("WARNING: Failed to initialize file logging: {e}");
+                (None, None)
+            }
+        },
+        None => (None, None),
+    };
+
+    // Collect all boxed layers to apply to Registry in a single .with() call.
+    // This avoids type issues when mixing Box<dyn Layer<Registry>> with generic layers.
+    let mut boxed_layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
+        Vec::new();
+
+    let tracing_guard = match tracing_config {
         Some(config) => match telemetry::init_tracing(config) {
             Ok((otel_layer, guard)) => {
-                // otel_layer is Box<dyn Layer<Registry>>, so it must be
-                // applied directly to the registry before other layers.
-                tracing_subscriber::registry().with(otel_layer).with(fmt_layer).with(filter).init();
+                boxed_layers.push(otel_layer);
                 eprintln!("OpenTelemetry tracing enabled (endpoint: {})", config.endpoint);
                 Some(guard)
             }
             Err(e) => {
-                tracing_subscriber::fmt().with_env_filter(filter).init();
                 eprintln!(
                     "WARNING: Failed to initialize OpenTelemetry tracing: {e}. \
                      Falling back to fmt-only logging."
@@ -548,11 +630,20 @@ fn init_logging(
                 None
             }
         },
-        None => {
-            tracing_subscriber::fmt().with_env_filter(filter).init();
-            None
-        }
+        None => None,
+    };
+
+    if let Some(fl) = file_layer {
+        boxed_layers.push(fl);
     }
+
+    tracing_subscriber::registry()
+        .with(boxed_layers)
+        .with(tracing_subscriber::fmt::layer())
+        .with(filter)
+        .init();
+
+    LoggingGuards { _tracing_guard: tracing_guard, _file_guard: file_guard }
 }
 
 fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
@@ -633,12 +724,36 @@ fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfig> {
     })
 }
 
+fn build_file_layer_config(config: &Config) -> Option<telemetry::FileAppenderConfig> {
+    let logfile = config.logfile.as_ref()?;
+
+    let directory = logfile
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    let filename = logfile
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| "rvc.log".to_string());
+
+    let level = config.logfile_level.clone().unwrap_or_else(|| config.log_level.clone());
+
+    Some(telemetry::FileAppenderConfig {
+        directory,
+        filename,
+        max_size_mb: config.logfile_max_size,
+        max_files: config.logfile_max_number,
+        compress: config.logfile_compress,
+        level,
+    })
+}
+
 async fn run_validator(
     config: Config,
     strict_permissions: bool,
     strict_slashing_semantics: bool,
     timeouts: bn_manager::OperationTimeouts,
-    tracing_guard: Option<telemetry::TracingGuard>,
+    _logging_guards: LoggingGuards,
 ) -> anyhow::Result<()> {
     let startup_time = std::time::Instant::now();
 
@@ -1239,6 +1354,26 @@ async fn run_validator(
         health_status.clone(),
     ));
 
+    // Spawn monitoring push task if endpoint is configured (T3.6)
+    if let Some(ref monitoring_endpoint) = config.monitoring_endpoint {
+        let monitoring_config = rvc::monitoring::MonitoringConfig {
+            endpoint: monitoring_endpoint.clone(),
+            interval: std::time::Duration::from_secs(config.monitoring_interval),
+            insecure: config.monitoring_endpoint_insecure,
+        };
+        let monitoring_shutdown = shutdown_token.clone();
+        info!(
+            endpoint = %rvc::config::redact_url(monitoring_endpoint),
+            interval_secs = config.monitoring_interval,
+            "Starting monitoring push task"
+        );
+        tokio::spawn(rvc::monitoring::start_monitoring_push(
+            monitoring_config,
+            monitoring_shutdown,
+            move || (validator_count as u32, validator_count as u32),
+        ));
+    }
+
     startup::log_orchestrator_started(validator_count, bn_count);
     info!("Starting duty orchestrator");
 
@@ -1266,10 +1401,8 @@ async fn run_validator(
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Flush OpenTelemetry traces after orchestrator shutdown
-    if let Some(guard) = tracing_guard {
-        telemetry::shutdown_tracing(guard).await;
-    }
+    // Logging guards (tracing + file) are held by _logging_guards and
+    // dropped at the end of the caller's scope, flushing pending data.
 
     // Gracefully shut down metrics server with a brief timeout
     metrics_handle.abort();

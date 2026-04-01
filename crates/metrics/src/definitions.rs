@@ -217,6 +217,28 @@ lazy_static! {
         gauge
     };
 
+    /// Counter for successful monitoring pushes.
+    pub static ref RVC_MONITORING_PUSH_SUCCESS_TOTAL: IntCounter = {
+        let counter = IntCounter::new(
+            "rvc_monitoring_push_success_total",
+            "Total number of successful monitoring metric pushes"
+        ).expect("Failed to create rvc_monitoring_push_success_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_monitoring_push_success_total metric");
+        counter
+    };
+
+    /// Counter for failed monitoring pushes.
+    pub static ref RVC_MONITORING_PUSH_FAILURES_TOTAL: IntCounter = {
+        let counter = IntCounter::new(
+            "rvc_monitoring_push_failures_total",
+            "Total number of failed monitoring metric pushes"
+        ).expect("Failed to create rvc_monitoring_push_failures_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_monitoring_push_failures_total metric");
+        counter
+    };
+
 }
 
 /// Initializes all core metrics by accessing the lazy_static variables.
@@ -238,6 +260,8 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL);
     lazy_static::initialize(&RVC_BUILDER_CONSECUTIVE_MISSES);
     lazy_static::initialize(&RVC_BUILDER_EPOCH_MISSES);
+    lazy_static::initialize(&RVC_MONITORING_PUSH_SUCCESS_TOTAL);
+    lazy_static::initialize(&RVC_MONITORING_PUSH_FAILURES_TOTAL);
 }
 
 /// Attestation status label values.

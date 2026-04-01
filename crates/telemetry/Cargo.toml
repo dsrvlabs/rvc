@@ -17,9 +17,14 @@ opentelemetry-otlp = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 reqwest = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+logroller = { workspace = true }
 
 # GCP (optional)
 opentelemetry-gcloud-trace = { version = "0.22", optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

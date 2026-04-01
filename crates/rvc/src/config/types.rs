@@ -120,6 +120,44 @@ pub struct Config {
 
     #[serde(default)]
     pub disable_keystore_locking: bool,
+
+    // --- Monitoring fields (T3.7) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitoring_endpoint: Option<String>,
+
+    #[serde(default = "default_monitoring_interval")]
+    pub monitoring_interval: u64,
+
+    #[serde(default)]
+    pub monitoring_endpoint_insecure: bool,
+
+    // --- Log rotation fields (T3.8/T3.9/T3.10) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logfile: Option<PathBuf>,
+
+    #[serde(default = "default_logfile_max_size")]
+    pub logfile_max_size: u64,
+
+    #[serde(default = "default_logfile_max_number")]
+    pub logfile_max_number: usize,
+
+    #[serde(default)]
+    pub logfile_compress: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logfile_level: Option<String>,
+}
+
+fn default_monitoring_interval() -> u64 {
+    384
+}
+
+fn default_logfile_max_size() -> u64 {
+    200
+}
+
+fn default_logfile_max_number() -> usize {
+    5
 }
 
 fn default_slashed_validators_action() -> String {
@@ -221,6 +259,14 @@ impl Default for Config {
             builder_circuit_breaker_consecutive_limit: default_circuit_breaker_consecutive_limit(),
             builder_circuit_breaker_epoch_limit: default_circuit_breaker_epoch_limit(),
             disable_keystore_locking: false,
+            monitoring_endpoint: None,
+            monitoring_interval: default_monitoring_interval(),
+            monitoring_endpoint_insecure: false,
+            logfile: None,
+            logfile_max_size: default_logfile_max_size(),
+            logfile_max_number: default_logfile_max_number(),
+            logfile_compress: false,
+            logfile_level: None,
         }
     }
 }
@@ -569,6 +615,38 @@ impl Config {
         if let Some(disable) = cli.disable_keystore_locking {
             self.disable_keystore_locking = disable;
         }
+
+        if let Some(ref endpoint) = cli.monitoring_endpoint {
+            self.monitoring_endpoint = Some(endpoint.clone());
+        }
+
+        if let Some(interval) = cli.monitoring_interval {
+            self.monitoring_interval = interval;
+        }
+
+        if let Some(insecure) = cli.monitoring_endpoint_insecure {
+            self.monitoring_endpoint_insecure = insecure;
+        }
+
+        if let Some(ref logfile) = cli.logfile {
+            self.logfile = Some(logfile.clone());
+        }
+
+        if let Some(max_size) = cli.logfile_max_size {
+            self.logfile_max_size = max_size;
+        }
+
+        if let Some(max_number) = cli.logfile_max_number {
+            self.logfile_max_number = max_number;
+        }
+
+        if let Some(compress) = cli.logfile_compress {
+            self.logfile_compress = compress;
+        }
+
+        if let Some(ref level) = cli.logfile_level {
+            self.logfile_level = Some(level.clone());
+        }
     }
 }
 
@@ -633,6 +711,14 @@ pub struct CliOverrides {
     pub builder_circuit_breaker_consecutive_limit: Option<u32>,
     pub builder_circuit_breaker_epoch_limit: Option<u32>,
     pub disable_keystore_locking: Option<bool>,
+    pub monitoring_endpoint: Option<String>,
+    pub monitoring_interval: Option<u64>,
+    pub monitoring_endpoint_insecure: Option<bool>,
+    pub logfile: Option<PathBuf>,
+    pub logfile_max_size: Option<u64>,
+    pub logfile_max_number: Option<usize>,
+    pub logfile_compress: Option<bool>,
+    pub logfile_level: Option<String>,
 }
 
 #[cfg(test)]

@@ -103,6 +103,14 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 # File locking
 fd-lock = "4"
 
+# System info
+libc = "0.2"
+
+# Log rotation
+logroller = "0.1"
+tracing-appender = "0.2"
+flate2 = "1"
+
 # Dev dependencies
 tempfile = "3"
 wiremock = "0.6"

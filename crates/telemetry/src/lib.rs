@@ -4,11 +4,13 @@
 //! export and optional GCP Cloud Trace support.
 
 pub mod config;
+pub mod file_appender;
 pub mod init;
 pub mod propagation;
 pub mod shutdown;
 
 pub use config::{ExporterKind, TelemetryConfig};
+pub use file_appender::{create_file_layer, FileAppenderConfig};
 pub use init::init_tracing;
 pub use propagation::inject_trace_context;
 pub use shutdown::shutdown_tracing;

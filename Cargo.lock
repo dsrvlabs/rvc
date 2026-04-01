@@ -789,8 +789,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -974,6 +976,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]
@@ -2589,6 +2600,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "logroller"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83db12bbf439ebe64c0b0e4402f435b6f866db498fc1ae17e1b5d1a01625e2be"
+dependencies = [
+ "chrono",
+ "flate2",
+ "regex",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3896,8 +3919,10 @@ dependencies = [
  "fd-lock",
  "hex",
  "http-body-util",
+ "libc",
  "parking_lot",
  "prost 0.13.5",
+ "reqwest 0.12.28",
  "rvc-block-service",
  "rvc-bn-manager",
  "rvc-builder",
@@ -3920,6 +3945,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tonic 0.12.3",
  "tonic-build",
@@ -3936,6 +3962,7 @@ name = "rvc-bin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "beacon",
  "clap",
  "hex",
@@ -3956,11 +3983,14 @@ dependencies = [
  "rvc-slashing",
  "rvc-telemetry",
  "rvc-timing",
+ "rvc-validator-store",
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
  "tonic 0.12.3",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "url",
 ]
@@ -4303,13 +4333,16 @@ name = "rvc-telemetry"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "logroller",
  "opentelemetry",
  "opentelemetry-gcloud-trace",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "reqwest 0.12.28",
+ "tempfile",
  "tokio",
  "tracing",
+ "tracing-appender",
  "tracing-opentelemetry",
  "tracing-subscriber",
 ]
@@ -5289,6 +5322,18 @@ dependencies = [
  "pin-project-lite",
  "tracing-attributes",
  "tracing-core",
+]
+
+[[package]]
+name = "tracing-appender"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "786d480bce6247ab75f005b14ae1624ad978d3029d9113f0a22fa1ac773faeaf"
+dependencies = [
+ "crossbeam-channel",
+ "thiserror 2.0.18",
+ "time",
+ "tracing-subscriber",
 ]
 
 [[package]]
