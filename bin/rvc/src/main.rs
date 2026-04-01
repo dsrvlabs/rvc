@@ -232,6 +232,18 @@ enum Commands {
         /// Action when a slashed validator is detected: disable-only, shutdown, none
         #[arg(long, default_value = "disable-only")]
         slashed_validators_action: String,
+
+        /// Builder circuit breaker: consecutive missed slots before fallback to local block (default: 3, 0 to disable)
+        #[arg(long)]
+        builder_circuit_breaker_consecutive_limit: Option<u32>,
+
+        /// Builder circuit breaker: total epoch missed slots before fallback to local block (default: 5, 0 to disable)
+        #[arg(long)]
+        builder_circuit_breaker_epoch_limit: Option<u32>,
+
+        /// Disable keystore file locking (for DVT setups with shared key material)
+        #[arg(long)]
+        disable_keystore_locking: bool,
     },
 
     /// Submit a voluntary exit for a validator
@@ -337,6 +349,9 @@ async fn main() -> anyhow::Result<()> {
             grpc_signer_tls_ca_cert,
             disable_attesting,
             slashed_validators_action,
+            builder_circuit_breaker_consecutive_limit,
+            builder_circuit_breaker_epoch_limit,
+            disable_keystore_locking,
         } => {
             // Validate gRPC signer flags: if URL is set, all TLS flags are required
             if grpc_signer_url.is_some()
@@ -436,6 +451,9 @@ async fn main() -> anyhow::Result<()> {
                 grpc_signer_tls_ca_cert,
                 disable_attesting: if disable_attesting { Some(true) } else { None },
                 slashed_validators_action: Some(slashed_validators_action),
+                builder_circuit_breaker_consecutive_limit,
+                builder_circuit_breaker_epoch_limit,
+                disable_keystore_locking: if disable_keystore_locking { Some(true) } else { None },
             };
 
             let mut cfg = load_config(config)?;
@@ -1142,6 +1160,7 @@ async fn run_validator(
             validator_store.clone(),
             orchestrator_config,
             pubkey_map.clone(),
+            circuit_breaker,
             attesting_enabled.clone(),
         );
 

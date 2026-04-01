@@ -5,7 +5,7 @@
 //! and slashing protection.
 
 use lazy_static::lazy_static;
-use prometheus::{Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts};
+use prometheus::{Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts};
 
 use crate::REGISTRY;
 
@@ -184,6 +184,39 @@ lazy_static! {
         counter
     };
 
+    /// Counter for circuit breaker trip events.
+    pub static ref RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL: IntCounter = {
+        let counter = IntCounter::new(
+            "rvc_builder_circuit_breaker_trips_total",
+            "Total number of times the builder circuit breaker has tripped"
+        ).expect("Failed to create rvc_builder_circuit_breaker_trips_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_builder_circuit_breaker_trips_total metric");
+        counter
+    };
+
+    /// Gauge for current consecutive builder misses.
+    pub static ref RVC_BUILDER_CONSECUTIVE_MISSES: IntGauge = {
+        let gauge = IntGauge::new(
+            "rvc_builder_consecutive_misses",
+            "Current number of consecutive builder misses"
+        ).expect("Failed to create rvc_builder_consecutive_misses metric");
+        REGISTRY.register(Box::new(gauge.clone()))
+            .expect("Failed to register rvc_builder_consecutive_misses metric");
+        gauge
+    };
+
+    /// Gauge for current epoch builder misses.
+    pub static ref RVC_BUILDER_EPOCH_MISSES: IntGauge = {
+        let gauge = IntGauge::new(
+            "rvc_builder_epoch_misses",
+            "Current number of builder misses in the current epoch"
+        ).expect("Failed to create rvc_builder_epoch_misses metric");
+        REGISTRY.register(Box::new(gauge.clone()))
+            .expect("Failed to register rvc_builder_epoch_misses metric");
+        gauge
+    };
+
 }
 
 /// Initializes all core metrics by accessing the lazy_static variables.
@@ -202,6 +235,9 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_DUTY_REORG_DETECTED_TOTAL);
     lazy_static::initialize(&RVC_ATTESTING_ENABLED);
     lazy_static::initialize(&RVC_VALIDATORS_SLASHED_TOTAL);
+    lazy_static::initialize(&RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL);
+    lazy_static::initialize(&RVC_BUILDER_CONSECUTIVE_MISSES);
+    lazy_static::initialize(&RVC_BUILDER_EPOCH_MISSES);
 }
 
 /// Attestation status label values.

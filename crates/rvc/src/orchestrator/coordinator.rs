@@ -151,6 +151,7 @@ where
             config,
             pubkey_map,
             key_gen_rx,
+            Arc::new(CircuitBreakerState::new(0, 0)),
             attesting_enabled,
         )
     }
@@ -168,6 +169,7 @@ where
         validator_store: Arc<validator_store::ValidatorStore>,
         config: OrchestratorConfig,
         pubkey_map: PubkeyMap,
+        circuit_breaker: Arc<CircuitBreakerState>,
         attesting_enabled: Arc<AtomicBool>,
     ) -> (Self, OrchestratorHandle) {
         let (_key_gen_tx, key_gen_rx) = watch::channel(0u64);
@@ -183,6 +185,7 @@ where
             config,
             pubkey_map,
             key_gen_rx,
+            circuit_breaker,
             attesting_enabled,
         )
     }
@@ -200,6 +203,7 @@ where
         config: OrchestratorConfig,
         pubkey_map: PubkeyMap,
         key_gen_rx: watch::Receiver<u64>,
+        circuit_breaker: Arc<CircuitBreakerState>,
         attesting_enabled: Arc<AtomicBool>,
     ) -> (Self, OrchestratorHandle) {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
