@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use axum::extract::DefaultBodyLimit;
@@ -44,6 +45,7 @@ impl KeymanagerServer {
         cors_origins: Vec<String>,
         body_limit: usize,
         allow_insecure_remote_signer: bool,
+        attesting_enabled: Arc<AtomicBool>,
     ) -> Self {
         Self {
             state: Arc::new(AppState {
@@ -55,6 +57,7 @@ impl KeymanagerServer {
                 config_manager,
                 exit_manager,
                 allow_insecure_remote_signer,
+                attesting_enabled,
             }),
             token: Arc::new(Zeroizing::new(token)),
             addr,
@@ -106,6 +109,7 @@ impl KeymanagerServer {
                     .delete(handlers::delete_graffiti),
             )
             .route("/eth/v1/validator/:pubkey/voluntary_exit", post(handlers::sign_voluntary_exit))
+            .route("/rvc/v1/attesting", post(handlers::set_attesting_enabled))
             .layer(DefaultBodyLimit::max(self.body_limit))
             .with_state(self.state.clone());
 

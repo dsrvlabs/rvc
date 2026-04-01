@@ -224,17 +224,14 @@ enum Commands {
         #[arg(long)]
         grpc_signer_tls_ca_cert: Option<PathBuf>,
 
-        /// Builder circuit breaker: consecutive missed slots before fallback to local block (default: 3, 0 to disable)
+        // --- Safety flags (Tier 2) ---
+        /// Disable attestation duties at startup (emergency use only)
         #[arg(long)]
-        builder_circuit_breaker_consecutive_limit: Option<u32>,
+        disable_attesting: bool,
 
-        /// Builder circuit breaker: total epoch missed slots before fallback to local block (default: 5, 0 to disable)
-        #[arg(long)]
-        builder_circuit_breaker_epoch_limit: Option<u32>,
-
-        /// Disable keystore file locking (for DVT setups with shared key material)
-        #[arg(long)]
-        disable_keystore_locking: bool,
+        /// Action when a slashed validator is detected: disable-only, shutdown, none
+        #[arg(long, default_value = "disable-only")]
+        slashed_validators_action: String,
     },
 
     /// Submit a voluntary exit for a validator
@@ -338,9 +335,8 @@ async fn main() -> anyhow::Result<()> {
             grpc_signer_tls_cert,
             grpc_signer_tls_key,
             grpc_signer_tls_ca_cert,
-            builder_circuit_breaker_consecutive_limit,
-            builder_circuit_breaker_epoch_limit,
-            disable_keystore_locking,
+            disable_attesting,
+            slashed_validators_action,
         } => {
             // Validate gRPC signer flags: if URL is set, all TLS flags are required
             if grpc_signer_url.is_some()
@@ -438,9 +434,8 @@ async fn main() -> anyhow::Result<()> {
                 grpc_signer_tls_cert,
                 grpc_signer_tls_key,
                 grpc_signer_tls_ca_cert,
-                builder_circuit_breaker_consecutive_limit,
-                builder_circuit_breaker_epoch_limit,
-                disable_keystore_locking: if disable_keystore_locking { Some(true) } else { None },
+                disable_attesting: if disable_attesting { Some(true) } else { None },
+                slashed_validators_action: Some(slashed_validators_action),
             };
 
             let mut cfg = load_config(config)?;
@@ -1026,6 +1021,18 @@ async fn run_validator(
         info!(url = %url, "Remote signer URL configured");
     }
 
+    // Step 7b2: Create attesting_enabled toggle (shared with orchestrator + API)
+    let attesting_enabled =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(!config.disable_attesting));
+    metrics::definitions::RVC_ATTESTING_ENABLED.set(if config.disable_attesting {
+        0.0
+    } else {
+        1.0
+    });
+    if config.disable_attesting {
+        warn!("Attestation duties disabled at startup (--disable-attesting)");
+    }
+
     // Step 7c: Optionally start Keymanager API server
     if config.keymanager_enabled {
         let token_path = config
@@ -1098,6 +1105,7 @@ async fn run_validator(
             config.keymanager_cors_origins.clone(),
             config.keymanager_body_limit,
             config.allow_insecure_remote_signer,
+            attesting_enabled.clone(),
         );
 
         info!(addr = %km_addr, token_path = %token_path.display(), "Keymanager API enabled");
@@ -1122,22 +1130,69 @@ async fn run_validator(
 
     let validator_count = pubkey_map.read().len();
     let bn_count = config.effective_beacon_nodes().len();
-    let (_key_gen_tx, key_gen_rx) = tokio::sync::watch::channel(0u64);
     let (mut orchestrator, orchestrator_handle) =
-        rvc::orchestrator::DutyOrchestrator::new_with_key_gen(
+        rvc::orchestrator::DutyOrchestrator::new_with_attesting_enabled(
             slot_clock,
             duty_tracker,
             signer,
             propagator,
-            beacon,
+            beacon.clone(),
             block_beacon,
             builder_service,
-            validator_store,
+            validator_store.clone(),
             orchestrator_config,
-            pubkey_map,
-            key_gen_rx,
-            circuit_breaker,
+            pubkey_map.clone(),
+            attesting_enabled.clone(),
         );
+
+    // Step 8b: Spawn slashing monitor background task
+    {
+        let slashed_action: rvc::slashing_monitor::SlashedAction =
+            config.slashed_validators_action.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+
+        if slashed_action != rvc::slashing_monitor::SlashedAction::None {
+            let monitor_beacon = beacon.clone();
+            let monitor_store = validator_store.clone();
+            let monitor_shutdown = shutdown_token.clone();
+            let monitor_orch_handle_shutdown = {
+                // We need to signal the orchestrator. Create a watch channel for it.
+                let (tx, _rx) = tokio::sync::watch::channel(false);
+                tx
+            };
+            // We'll re-purpose: the slashing monitor just cancels the shutdown_token
+            // and the main select! picks it up.
+            tokio::spawn(async move {
+                let slot_duration = std::time::Duration::from_secs(12);
+                let epoch_duration = slot_duration * 32;
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(epoch_duration) => {}
+                        _ = monitor_shutdown.cancelled() => {
+                            break;
+                        }
+                    }
+
+                    rvc::slashing_monitor::check_slashed_validators(
+                        monitor_beacon.as_ref(),
+                        &monitor_store,
+                        slashed_action,
+                        &monitor_orch_handle_shutdown,
+                    )
+                    .await;
+
+                    // If shutdown action was triggered, cancel everything
+                    if *monitor_orch_handle_shutdown.borrow() {
+                        monitor_shutdown.cancel();
+                        break;
+                    }
+                }
+            });
+            info!(
+                action = %config.slashed_validators_action,
+                "Slashing monitor started"
+            );
+        }
+    }
 
     finalize_health_status(&health_status).await;
 

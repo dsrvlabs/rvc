@@ -5,7 +5,7 @@
 //! and slashing protection.
 
 use lazy_static::lazy_static;
-use prometheus::{Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts};
+use prometheus::{Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, Opts};
 
 use crate::REGISTRY;
 
@@ -158,37 +158,30 @@ lazy_static! {
         counter
     };
 
-    /// Counter for circuit breaker trip events.
-    pub static ref RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL: IntCounter = {
-        let counter = IntCounter::new(
-            "rvc_builder_circuit_breaker_trips_total",
-            "Total number of times the builder circuit breaker has tripped"
-        ).expect("Failed to create rvc_builder_circuit_breaker_trips_total metric");
+    /// Gauge for attestation enabled state (1=enabled, 0=disabled).
+    pub static ref RVC_ATTESTING_ENABLED: Gauge = {
+        let opts = Opts::new(
+            "rvc_attesting_enabled",
+            "Whether attestation duties are enabled (1=enabled, 0=disabled)"
+        );
+        let gauge = Gauge::with_opts(opts)
+            .expect("Failed to create rvc_attesting_enabled metric");
+        REGISTRY.register(Box::new(gauge.clone()))
+            .expect("Failed to register rvc_attesting_enabled metric");
+        gauge
+    };
+
+    /// Counter for slashed validators detected.
+    pub static ref RVC_VALIDATORS_SLASHED_TOTAL: IntCounter = {
+        let opts = Opts::new(
+            "rvc_validators_slashed_total",
+            "Total number of slashed validators detected"
+        );
+        let counter = IntCounter::with_opts(opts)
+            .expect("Failed to create rvc_validators_slashed_total metric");
         REGISTRY.register(Box::new(counter.clone()))
-            .expect("Failed to register rvc_builder_circuit_breaker_trips_total metric");
+            .expect("Failed to register rvc_validators_slashed_total metric");
         counter
-    };
-
-    /// Gauge for current consecutive builder misses.
-    pub static ref RVC_BUILDER_CONSECUTIVE_MISSES: IntGauge = {
-        let gauge = IntGauge::new(
-            "rvc_builder_consecutive_misses",
-            "Current number of consecutive builder misses"
-        ).expect("Failed to create rvc_builder_consecutive_misses metric");
-        REGISTRY.register(Box::new(gauge.clone()))
-            .expect("Failed to register rvc_builder_consecutive_misses metric");
-        gauge
-    };
-
-    /// Gauge for current epoch builder misses.
-    pub static ref RVC_BUILDER_EPOCH_MISSES: IntGauge = {
-        let gauge = IntGauge::new(
-            "rvc_builder_epoch_misses",
-            "Current number of builder misses in the current epoch"
-        ).expect("Failed to create rvc_builder_epoch_misses metric");
-        REGISTRY.register(Box::new(gauge.clone()))
-            .expect("Failed to register rvc_builder_epoch_misses metric");
-        gauge
     };
 
 }
@@ -207,9 +200,8 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS);
     lazy_static::initialize(&RVC_SLASHING_DB_PRUNE_TOTAL);
     lazy_static::initialize(&RVC_DUTY_REORG_DETECTED_TOTAL);
-    lazy_static::initialize(&RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL);
-    lazy_static::initialize(&RVC_BUILDER_CONSECUTIVE_MISSES);
-    lazy_static::initialize(&RVC_BUILDER_EPOCH_MISSES);
+    lazy_static::initialize(&RVC_ATTESTING_ENABLED);
+    lazy_static::initialize(&RVC_VALIDATORS_SLASHED_TOTAL);
 }
 
 /// Attestation status label values.

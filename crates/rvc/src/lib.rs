@@ -6,6 +6,7 @@ pub mod doppelganger_adapter;
 pub mod duty_tracker;
 pub mod keymanager_adapters;
 pub mod orchestrator;
+pub mod slashing_monitor;
 pub mod startup;
 
 pub mod proto {

@@ -1,6 +1,7 @@
 //! Main duty orchestrator implementation.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -113,6 +114,7 @@ where
     duty_management: DutyManagementService<C>,
     key_gen_rx: watch::Receiver<u64>,
     shutdown_rx: watch::Receiver<bool>,
+    attesting_enabled: Arc<AtomicBool>,
 }
 
 impl<C, S, B> DutyOrchestrator<C, S, B>
@@ -135,6 +137,7 @@ where
         config: OrchestratorConfig,
         pubkey_map: PubkeyMap,
     ) -> (Self, OrchestratorHandle) {
+        let attesting_enabled = Arc::new(AtomicBool::new(true));
         let (_key_gen_tx, key_gen_rx) = watch::channel(0u64);
         Self::new_with_key_gen(
             clock,
@@ -148,7 +151,39 @@ where
             config,
             pubkey_map,
             key_gen_rx,
-            Arc::new(CircuitBreakerState::new(0, 0)),
+            attesting_enabled,
+        )
+    }
+
+    /// Creates a new DutyOrchestrator with a shared attesting_enabled flag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_attesting_enabled(
+        clock: Arc<C>,
+        duty_tracker: Arc<DutyTracker>,
+        signer: Arc<SignerService>,
+        propagator: Arc<Propagator<S>>,
+        beacon: Arc<dyn BeaconNodeClient>,
+        block_beacon: Arc<B>,
+        builder_service: Option<Arc<BuilderService>>,
+        validator_store: Arc<validator_store::ValidatorStore>,
+        config: OrchestratorConfig,
+        pubkey_map: PubkeyMap,
+        attesting_enabled: Arc<AtomicBool>,
+    ) -> (Self, OrchestratorHandle) {
+        let (_key_gen_tx, key_gen_rx) = watch::channel(0u64);
+        Self::new_with_key_gen(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            block_beacon,
+            builder_service,
+            validator_store,
+            config,
+            pubkey_map,
+            key_gen_rx,
+            attesting_enabled,
         )
     }
 
@@ -165,7 +200,7 @@ where
         config: OrchestratorConfig,
         pubkey_map: PubkeyMap,
         key_gen_rx: watch::Receiver<u64>,
-        circuit_breaker: Arc<CircuitBreakerState>,
+        attesting_enabled: Arc<AtomicBool>,
     ) -> (Self, OrchestratorHandle) {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -228,6 +263,7 @@ where
             duty_management,
             key_gen_rx,
             shutdown_rx,
+            attesting_enabled,
         };
 
         let handle = OrchestratorHandle { shutdown_tx };
@@ -371,33 +407,37 @@ where
                     }
                 }
 
-                if let Err(e) = self
-                    .attestation_service
-                    .process_slot(current_slot)
-                    .instrument(att_phase_span.clone())
-                    .await
-                {
-                    let _guard = att_phase_span.enter();
-                    match &e {
-                        OrchestratorError::SlotMissed { slot, current_slot } => {
-                            warn!(slot = slot, current_slot = current_slot, "Missed slot");
-                            RVC_ATTESTATIONS_TOTAL
-                                .with_label_values(&[attestation_status::SKIPPED])
-                                .inc();
-                        }
-                        OrchestratorError::NoDutiesForSlot { slot } => {
-                            debug!(slot = slot, "No duties for slot");
-                        }
-                        _ => {
-                            error!(slot = current_slot, error = %e, "Error processing slot");
+                if self.attesting_enabled.load(Ordering::Relaxed) {
+                    if let Err(e) = self
+                        .attestation_service
+                        .process_slot(current_slot)
+                        .instrument(att_phase_span.clone())
+                        .await
+                    {
+                        let _guard = att_phase_span.enter();
+                        match &e {
+                            OrchestratorError::SlotMissed { slot, current_slot } => {
+                                warn!(slot = slot, current_slot = current_slot, "Missed slot");
+                                RVC_ATTESTATIONS_TOTAL
+                                    .with_label_values(&[attestation_status::SKIPPED])
+                                    .inc();
+                            }
+                            OrchestratorError::NoDutiesForSlot { slot } => {
+                                debug!(slot = slot, "No duties for slot");
+                            }
+                            _ => {
+                                error!(slot = current_slot, error = %e, "Error processing slot");
+                            }
                         }
                     }
-                }
 
-                self.sync_committee_service
-                    .maybe_produce_sync_messages(current_slot, current_epoch)
-                    .instrument(att_phase_span)
-                    .await;
+                    self.sync_committee_service
+                        .maybe_produce_sync_messages(current_slot, current_epoch)
+                        .instrument(att_phase_span)
+                        .await;
+                } else {
+                    debug!(slot = current_slot, "Attestation duties skipped (disabled)");
+                }
             }
 
             if self.check_shutdown() {
@@ -438,14 +478,18 @@ where
                     return Ok(());
                 }
 
-                self.sync_committee_service
-                    .maybe_produce_sync_contributions(current_slot, current_epoch)
-                    .instrument(agg_phase_span.clone())
-                    .await;
-                self.aggregation_service
-                    .maybe_produce_aggregations(current_slot, current_epoch)
-                    .instrument(agg_phase_span)
-                    .await;
+                if self.attesting_enabled.load(Ordering::Relaxed) {
+                    self.sync_committee_service
+                        .maybe_produce_sync_contributions(current_slot, current_epoch)
+                        .instrument(agg_phase_span.clone())
+                        .await;
+                    self.aggregation_service
+                        .maybe_produce_aggregations(current_slot, current_epoch)
+                        .instrument(agg_phase_span)
+                        .await;
+                } else {
+                    debug!(slot = current_slot, "Aggregation duties skipped (attesting disabled)");
+                }
             }
 
             // === Post-duty: builder registration (epoch boundary only) ===

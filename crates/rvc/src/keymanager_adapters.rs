@@ -851,6 +851,7 @@ mod tests {
             vec![],
             keymanager_api::DEFAULT_BODY_LIMIT,
             true,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         )
     }
 
@@ -964,6 +965,7 @@ mod tests {
             vec![],
             keymanager_api::DEFAULT_BODY_LIMIT,
             true,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         );
 
         // 1. Import a remote key

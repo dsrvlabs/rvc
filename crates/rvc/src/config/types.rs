@@ -106,14 +106,15 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grpc_signer_tls_ca_cert: Option<PathBuf>,
 
-    #[serde(default = "default_circuit_breaker_consecutive_limit")]
-    pub builder_circuit_breaker_consecutive_limit: u32,
-
-    #[serde(default = "default_circuit_breaker_epoch_limit")]
-    pub builder_circuit_breaker_epoch_limit: u32,
-
     #[serde(default)]
-    pub disable_keystore_locking: bool,
+    pub disable_attesting: bool,
+
+    #[serde(default = "default_slashed_validators_action")]
+    pub slashed_validators_action: String,
+}
+
+fn default_slashed_validators_action() -> String {
+    "disable-only".to_string()
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -206,9 +207,8 @@ impl Default for Config {
             grpc_signer_tls_cert: None,
             grpc_signer_tls_key: None,
             grpc_signer_tls_ca_cert: None,
-            builder_circuit_breaker_consecutive_limit: default_circuit_breaker_consecutive_limit(),
-            builder_circuit_breaker_epoch_limit: default_circuit_breaker_epoch_limit(),
-            disable_keystore_locking: false,
+            disable_attesting: false,
+            slashed_validators_action: default_slashed_validators_action(),
         }
     }
 }
@@ -310,6 +310,16 @@ impl Config {
 
         if self.allow_insecure_remote_signer {
             self.validate_insecure_env_var()?;
+        }
+
+        match self.slashed_validators_action.as_str() {
+            "disable-only" | "shutdown" | "none" => {}
+            other => {
+                return Err(ConfigError::MissingField(format!(
+                    "invalid --slashed-validators-action '{}': must be one of disable-only, shutdown, none",
+                    other
+                )));
+            }
         }
 
         Ok(())
@@ -528,16 +538,12 @@ impl Config {
             self.grpc_signer_tls_ca_cert = Some(path.clone());
         }
 
-        if let Some(limit) = cli.builder_circuit_breaker_consecutive_limit {
-            self.builder_circuit_breaker_consecutive_limit = limit;
+        if let Some(disable_attesting) = cli.disable_attesting {
+            self.disable_attesting = disable_attesting;
         }
 
-        if let Some(limit) = cli.builder_circuit_breaker_epoch_limit {
-            self.builder_circuit_breaker_epoch_limit = limit;
-        }
-
-        if let Some(disable) = cli.disable_keystore_locking {
-            self.disable_keystore_locking = disable;
+        if let Some(ref action) = cli.slashed_validators_action {
+            self.slashed_validators_action = action.clone();
         }
     }
 }
@@ -598,9 +604,8 @@ pub struct CliOverrides {
     pub grpc_signer_tls_cert: Option<PathBuf>,
     pub grpc_signer_tls_key: Option<PathBuf>,
     pub grpc_signer_tls_ca_cert: Option<PathBuf>,
-    pub builder_circuit_breaker_consecutive_limit: Option<u32>,
-    pub builder_circuit_breaker_epoch_limit: Option<u32>,
-    pub disable_keystore_locking: Option<bool>,
+    pub disable_attesting: Option<bool>,
+    pub slashed_validators_action: Option<String>,
 }
 
 #[cfg(test)]

@@ -12,6 +12,7 @@ axum.workspace = true
 crypto.workspace = true
 eth-types.workspace = true
 hex.workspace = true
+metrics.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

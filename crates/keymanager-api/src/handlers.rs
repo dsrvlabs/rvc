@@ -1,9 +1,11 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use crypto::logging::{RedactedUrl, TruncatedPubkey};
+use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::error::ApiError;
@@ -33,6 +35,17 @@ pub struct AppState {
     pub config_manager: Arc<dyn ValidatorConfigManager>,
     pub exit_manager: Option<Arc<dyn VoluntaryExitManager>>,
     pub allow_insecure_remote_signer: bool,
+    pub attesting_enabled: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetAttestingRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SetAttestingResponse {
+    pub enabled: bool,
 }
 
 pub async fn list_keystores(State(state): State<Arc<AppState>>) -> Json<ListKeystoresResponse> {
@@ -555,6 +568,24 @@ pub(crate) fn format_pubkey(pubkey: &[u8; 48]) -> String {
     format!("0x{}", hex::encode(pubkey))
 }
 
+pub async fn set_attesting_enabled(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SetAttestingRequest>,
+) -> Json<SetAttestingResponse> {
+    let previous = state.attesting_enabled.swap(request.enabled, Ordering::Relaxed);
+    let current = request.enabled;
+
+    if previous && !current {
+        warn!("Attestation duties disabled via API");
+    } else if !previous && current {
+        info!("Attestation duties re-enabled via API");
+    }
+
+    metrics::definitions::RVC_ATTESTING_ENABLED.set(if current { 1.0 } else { 0.0 });
+
+    Json(SetAttestingResponse { enabled: current })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -977,6 +1008,7 @@ mod tests {
                 config_manager: self.config_manager.clone(),
                 exit_manager: None,
                 allow_insecure_remote_signer: true,
+                attesting_enabled: Arc::new(AtomicBool::new(true)),
             });
             Router::new()
                 .route(
@@ -2115,6 +2147,7 @@ mod tests {
             vec![],
             1024, // 1 KB limit
             true,
+            Arc::new(AtomicBool::new(true)),
         );
 
         let big_body = "x".repeat(2048); // 2 KB > 1 KB limit
@@ -2153,6 +2186,7 @@ mod tests {
             vec![],
             10 * 1024 * 1024, // 10 MB
             true,
+            Arc::new(AtomicBool::new(true)),
         );
 
         let body = serde_json::json!({
@@ -2198,6 +2232,7 @@ mod tests {
             vec![],
             10 * 1024 * 1024,
             true,
+            Arc::new(AtomicBool::new(true)),
         );
 
         let response = server
@@ -2237,6 +2272,7 @@ mod tests {
             vec!["http://localhost:3000".to_string()],
             10 * 1024 * 1024,
             true,
+            Arc::new(AtomicBool::new(true)),
         );
 
         let response = server
@@ -2276,6 +2312,7 @@ mod tests {
             vec!["http://localhost:3000".to_string()],
             10 * 1024 * 1024,
             true,
+            Arc::new(AtomicBool::new(true)),
         );
 
         let response = server
@@ -2310,6 +2347,7 @@ mod tests {
             config_manager: app.config_manager.clone(),
             exit_manager: None,
             allow_insecure_remote_signer: false,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
         });
 
         let router = Router::new()
@@ -2355,6 +2393,7 @@ mod tests {
             config_manager: app.config_manager.clone(),
             exit_manager: None,
             allow_insecure_remote_signer: false,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
         });
 
         let router = Router::new()
@@ -2400,6 +2439,7 @@ mod tests {
             config_manager: app.config_manager.clone(),
             exit_manager: None,
             allow_insecure_remote_signer: false,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
         });
 
         let router = Router::new()
@@ -2488,6 +2528,7 @@ mod tests {
             config_manager: app.config_manager.clone(),
             exit_manager: None,
             allow_insecure_remote_signer: true,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
         });
         Router::new()
             .route(
@@ -2904,6 +2945,7 @@ mod tests {
             config_manager: app.config_manager.clone(),
             exit_manager,
             allow_insecure_remote_signer: true,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
         });
         Router::new()
             .route(
@@ -3041,6 +3083,7 @@ mod tests {
             config_manager: Arc::new(config_manager),
             exit_manager,
             allow_insecure_remote_signer: true,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
         });
 
         let api = Router::new()
