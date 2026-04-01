@@ -7,6 +7,8 @@ use futures::future::join_all;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use crate::types::{HealthTier, TierThresholds};
+
 /// Sync status of a single beacon node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BnSyncStatus {
@@ -34,12 +36,59 @@ impl BnSyncStatus {
     }
 }
 
+/// Extended sync status with additional fields for health tier computation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BnSyncDetail {
+    pub status: BnSyncStatus,
+    pub sync_distance: Option<u64>,
+    pub is_optimistic: bool,
+    pub el_offline: bool,
+}
+
+impl BnSyncDetail {
+    /// Creates a detail with unknown status.
+    pub fn unknown() -> Self {
+        Self {
+            status: BnSyncStatus::Unknown,
+            sync_distance: None,
+            is_optimistic: false,
+            el_offline: false,
+        }
+    }
+
+    /// Computes the health tier from sync distance and thresholds.
+    ///
+    /// - Unreachable/Unknown BNs are always `Unsynced`
+    /// - EL-offline BNs are `Unsynced` (not eligible for EL-dependent operations)
+    /// - Optimistic BNs are deprioritized within same tier
+    /// - Otherwise, tier is derived from sync_distance
+    pub fn tier(&self, thresholds: &TierThresholds) -> HealthTier {
+        match self.status {
+            BnSyncStatus::Unreachable | BnSyncStatus::Unknown => HealthTier::Unsynced,
+            BnSyncStatus::ElOffline => HealthTier::Unsynced,
+            BnSyncStatus::Syncing | BnSyncStatus::Synced => {
+                match self.sync_distance {
+                    Some(d) => thresholds.tier_for_distance(d),
+                    // No distance info — treat as unsynced if syncing, synced if synced
+                    None => {
+                        if self.status == BnSyncStatus::Synced {
+                            HealthTier::Synced
+                        } else {
+                            HealthTier::Unsynced
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Shared sync status tracker for all configured beacon nodes.
-pub type SharedSyncStatuses = Arc<RwLock<Vec<BnSyncStatus>>>;
+pub type SharedSyncStatuses = Arc<RwLock<Vec<BnSyncDetail>>>;
 
 /// Creates a new shared sync status vector, initially marking all BNs as unknown.
 pub fn new_shared_sync_statuses(count: usize) -> SharedSyncStatuses {
-    Arc::new(RwLock::new(vec![BnSyncStatus::Unknown; count]))
+    Arc::new(RwLock::new(vec![BnSyncDetail::unknown(); count]))
 }
 
 /// Polls the sync status of all beacon nodes in parallel and updates the shared state.
@@ -48,28 +97,27 @@ pub async fn check_all_sync_statuses(clients: &[BeaconClient], statuses: &Shared
         .iter()
         .enumerate()
         .map(|(i, client)| async move {
-            let (status, head_slot, sync_distance) = check_single_sync_status(client).await;
-            (i, client.endpoint().to_string(), status, head_slot, sync_distance)
+            let detail = check_single_sync_status(client).await;
+            (i, client.endpoint().to_string(), detail)
         })
         .collect();
 
     let results = join_all(futs).await;
 
     let previous = { statuses.read().await.clone() };
-    let mut new_statuses = vec![BnSyncStatus::Unknown; clients.len()];
-    for (i, endpoint, status, head_slot, sync_distance) in results {
-        let old_status = previous.get(i).copied().unwrap_or(BnSyncStatus::Unknown);
-        if old_status != status {
+    let mut new_statuses = vec![BnSyncDetail::unknown(); clients.len()];
+    for (i, endpoint, detail) in results {
+        let old_status = previous.get(i).map(|d| d.status).unwrap_or(BnSyncStatus::Unknown);
+        if old_status != detail.status {
             info!(
                 bn_url = %RedactedUrl(&endpoint),
-                head_slot = head_slot.as_deref().unwrap_or("unknown"),
-                sync_distance = sync_distance.as_deref().unwrap_or("unknown"),
+                sync_distance = detail.sync_distance.map(|d| d.to_string()).as_deref().unwrap_or("unknown"),
                 old_status = ?old_status,
-                new_status = ?status,
+                new_status = ?detail.status,
                 "BN sync status changed"
             );
         }
-        match status {
+        match detail.status {
             BnSyncStatus::Synced => {
                 info!(bn_index = i, endpoint = %RedactedUrl(&endpoint), "BN is synced");
             }
@@ -92,7 +140,7 @@ pub async fn check_all_sync_statuses(clients: &[BeaconClient], statuses: &Shared
             }
             BnSyncStatus::Unknown => {}
         }
-        new_statuses[i] = status;
+        new_statuses[i] = detail;
     }
 
     let mut guard = statuses.write().await;
@@ -103,15 +151,14 @@ pub async fn check_all_sync_statuses(clients: &[BeaconClient], statuses: &Shared
 ///
 /// Returns `ElOffline` when the beacon layer is synced but `el_offline` is true,
 /// allowing the BN to still serve non-EL-dependent queries.
-/// Also returns head_slot and sync_distance for logging.
-async fn check_single_sync_status(
-    client: &BeaconClient,
-) -> (BnSyncStatus, Option<String>, Option<String>) {
+/// Stores sync_distance and flags for health tier computation.
+async fn check_single_sync_status(client: &BeaconClient) -> BnSyncDetail {
     match client.get_node_syncing().await {
         Ok(response) => {
             let data = &response.data;
-            let head_slot = Some(data.head_slot.clone());
-            let sync_distance = Some(data.sync_distance.clone());
+            let sync_distance = data.sync_distance.parse::<u64>().ok();
+            let is_optimistic = data.is_optimistic;
+            let el_offline = data.el_offline;
             let status = if data.is_syncing || data.is_optimistic {
                 BnSyncStatus::Syncing
             } else if data.el_offline {
@@ -119,9 +166,14 @@ async fn check_single_sync_status(
             } else {
                 BnSyncStatus::Synced
             };
-            (status, head_slot, sync_distance)
+            BnSyncDetail { status, sync_distance, is_optimistic, el_offline }
         }
-        Err(_) => (BnSyncStatus::Unreachable, None, None),
+        Err(_) => BnSyncDetail {
+            status: BnSyncStatus::Unreachable,
+            sync_distance: None,
+            is_optimistic: false,
+            el_offline: false,
+        },
     }
 }
 
@@ -202,58 +254,278 @@ mod tests {
             let statuses = new_shared_sync_statuses(3);
             let guard = statuses.read().await;
             assert_eq!(guard.len(), 3);
-            assert!(guard.iter().all(|s| *s == BnSyncStatus::Unknown));
+            assert!(guard.iter().all(|d| d.status == BnSyncStatus::Unknown));
         });
     }
 
     #[tokio::test]
     async fn test_is_usable_filter_all_synced() {
         let statuses = Arc::new(RwLock::new(vec![
-            BnSyncStatus::Synced,
-            BnSyncStatus::Synced,
-            BnSyncStatus::Synced,
+            BnSyncDetail {
+                status: BnSyncStatus::Synced,
+                sync_distance: Some(0),
+                is_optimistic: false,
+                el_offline: false,
+            },
+            BnSyncDetail {
+                status: BnSyncStatus::Synced,
+                sync_distance: Some(0),
+                is_optimistic: false,
+                el_offline: false,
+            },
+            BnSyncDetail {
+                status: BnSyncStatus::Synced,
+                sync_distance: Some(0),
+                is_optimistic: false,
+                el_offline: false,
+            },
         ]));
         let guard = statuses.read().await;
-        let usable: Vec<usize> =
-            guard.iter().enumerate().filter(|(_, s)| s.is_usable()).map(|(i, _)| i).collect();
+        let usable: Vec<usize> = guard
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.status.is_usable())
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(usable, vec![0, 1, 2]);
     }
 
     #[tokio::test]
     async fn test_is_usable_filter_some_syncing() {
         let statuses = Arc::new(RwLock::new(vec![
-            BnSyncStatus::Synced,
-            BnSyncStatus::Syncing,
-            BnSyncStatus::Synced,
+            BnSyncDetail {
+                status: BnSyncStatus::Synced,
+                sync_distance: Some(0),
+                is_optimistic: false,
+                el_offline: false,
+            },
+            BnSyncDetail {
+                status: BnSyncStatus::Syncing,
+                sync_distance: Some(500),
+                is_optimistic: false,
+                el_offline: false,
+            },
+            BnSyncDetail {
+                status: BnSyncStatus::Synced,
+                sync_distance: Some(0),
+                is_optimistic: false,
+                el_offline: false,
+            },
         ]));
         let guard = statuses.read().await;
-        let usable: Vec<usize> =
-            guard.iter().enumerate().filter(|(_, s)| s.is_usable()).map(|(i, _)| i).collect();
+        let usable: Vec<usize> = guard
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.status.is_usable())
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(usable, vec![0, 2]);
     }
 
     #[tokio::test]
     async fn test_is_usable_filter_all_unreachable() {
-        let statuses =
-            Arc::new(RwLock::new(vec![BnSyncStatus::Unreachable, BnSyncStatus::Unreachable]));
+        let statuses = Arc::new(RwLock::new(vec![
+            BnSyncDetail {
+                status: BnSyncStatus::Unreachable,
+                sync_distance: None,
+                is_optimistic: false,
+                el_offline: false,
+            },
+            BnSyncDetail {
+                status: BnSyncStatus::Unreachable,
+                sync_distance: None,
+                is_optimistic: false,
+                el_offline: false,
+            },
+        ]));
         let guard = statuses.read().await;
-        let usable: Vec<usize> =
-            guard.iter().enumerate().filter(|(_, s)| s.is_usable()).map(|(i, _)| i).collect();
+        let usable: Vec<usize> = guard
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.status.is_usable())
+            .map(|(i, _)| i)
+            .collect();
         assert!(usable.is_empty());
     }
 
     #[tokio::test]
     async fn test_is_usable_filter_mixed() {
         let statuses = Arc::new(RwLock::new(vec![
-            BnSyncStatus::Syncing,
-            BnSyncStatus::Synced,
-            BnSyncStatus::Unreachable,
-            BnSyncStatus::Synced,
+            BnSyncDetail {
+                status: BnSyncStatus::Syncing,
+                sync_distance: Some(500),
+                is_optimistic: false,
+                el_offline: false,
+            },
+            BnSyncDetail {
+                status: BnSyncStatus::Synced,
+                sync_distance: Some(0),
+                is_optimistic: false,
+                el_offline: false,
+            },
+            BnSyncDetail {
+                status: BnSyncStatus::Unreachable,
+                sync_distance: None,
+                is_optimistic: false,
+                el_offline: false,
+            },
+            BnSyncDetail {
+                status: BnSyncStatus::Synced,
+                sync_distance: Some(0),
+                is_optimistic: false,
+                el_offline: false,
+            },
         ]));
         let guard = statuses.read().await;
-        let usable: Vec<usize> =
-            guard.iter().enumerate().filter(|(_, s)| s.is_usable()).map(|(i, _)| i).collect();
+        let usable: Vec<usize> = guard
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.status.is_usable())
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(usable, vec![1, 3]);
+    }
+
+    // -- BnSyncDetail tier tests --
+
+    #[test]
+    fn test_sync_detail_tier_synced() {
+        let thresholds = TierThresholds::default();
+        let detail = BnSyncDetail {
+            status: BnSyncStatus::Synced,
+            sync_distance: Some(0),
+            is_optimistic: false,
+            el_offline: false,
+        };
+        assert_eq!(detail.tier(&thresholds), HealthTier::Synced);
+
+        let detail = BnSyncDetail {
+            status: BnSyncStatus::Synced,
+            sync_distance: Some(8),
+            is_optimistic: false,
+            el_offline: false,
+        };
+        assert_eq!(detail.tier(&thresholds), HealthTier::Synced);
+    }
+
+    #[test]
+    fn test_sync_detail_tier_small_lag() {
+        let thresholds = TierThresholds::default();
+        let detail = BnSyncDetail {
+            status: BnSyncStatus::Synced,
+            sync_distance: Some(9),
+            is_optimistic: false,
+            el_offline: false,
+        };
+        assert_eq!(detail.tier(&thresholds), HealthTier::SmallLag);
+
+        let detail = BnSyncDetail {
+            status: BnSyncStatus::Synced,
+            sync_distance: Some(16),
+            is_optimistic: false,
+            el_offline: false,
+        };
+        assert_eq!(detail.tier(&thresholds), HealthTier::SmallLag);
+    }
+
+    #[test]
+    fn test_sync_detail_tier_large_lag() {
+        let thresholds = TierThresholds::default();
+        let detail = BnSyncDetail {
+            status: BnSyncStatus::Synced,
+            sync_distance: Some(17),
+            is_optimistic: false,
+            el_offline: false,
+        };
+        assert_eq!(detail.tier(&thresholds), HealthTier::LargeLag);
+
+        let detail = BnSyncDetail {
+            status: BnSyncStatus::Synced,
+            sync_distance: Some(64),
+            is_optimistic: false,
+            el_offline: false,
+        };
+        assert_eq!(detail.tier(&thresholds), HealthTier::LargeLag);
+    }
+
+    #[test]
+    fn test_sync_detail_tier_unsynced_by_distance() {
+        let thresholds = TierThresholds::default();
+        let detail = BnSyncDetail {
+            status: BnSyncStatus::Synced,
+            sync_distance: Some(65),
+            is_optimistic: false,
+            el_offline: false,
+        };
+        assert_eq!(detail.tier(&thresholds), HealthTier::Unsynced);
+    }
+
+    #[test]
+    fn test_sync_detail_tier_unreachable_is_unsynced() {
+        let thresholds = TierThresholds::default();
+        let detail = BnSyncDetail {
+            status: BnSyncStatus::Unreachable,
+            sync_distance: None,
+            is_optimistic: false,
+            el_offline: false,
+        };
+        assert_eq!(detail.tier(&thresholds), HealthTier::Unsynced);
+    }
+
+    #[test]
+    fn test_sync_detail_tier_el_offline_is_unsynced() {
+        let thresholds = TierThresholds::default();
+        let detail = BnSyncDetail {
+            status: BnSyncStatus::ElOffline,
+            sync_distance: Some(0),
+            is_optimistic: false,
+            el_offline: true,
+        };
+        assert_eq!(detail.tier(&thresholds), HealthTier::Unsynced);
+    }
+
+    #[test]
+    fn test_sync_detail_tier_unknown_is_unsynced() {
+        let thresholds = TierThresholds::default();
+        let detail = BnSyncDetail::unknown();
+        assert_eq!(detail.tier(&thresholds), HealthTier::Unsynced);
+    }
+
+    #[test]
+    fn test_sync_detail_tier_syncing_with_distance() {
+        let thresholds = TierThresholds::default();
+        // Syncing but close — still classified by distance
+        let detail = BnSyncDetail {
+            status: BnSyncStatus::Syncing,
+            sync_distance: Some(5),
+            is_optimistic: false,
+            el_offline: false,
+        };
+        assert_eq!(detail.tier(&thresholds), HealthTier::Synced);
+    }
+
+    #[test]
+    fn test_sync_detail_tier_no_distance_synced() {
+        let thresholds = TierThresholds::default();
+        let detail = BnSyncDetail {
+            status: BnSyncStatus::Synced,
+            sync_distance: None,
+            is_optimistic: false,
+            el_offline: false,
+        };
+        assert_eq!(detail.tier(&thresholds), HealthTier::Synced);
+    }
+
+    #[test]
+    fn test_sync_detail_tier_no_distance_syncing() {
+        let thresholds = TierThresholds::default();
+        let detail = BnSyncDetail {
+            status: BnSyncStatus::Syncing,
+            sync_distance: None,
+            is_optimistic: false,
+            el_offline: false,
+        };
+        assert_eq!(detail.tier(&thresholds), HealthTier::Unsynced);
     }
 
     // -- Integration tests with wiremock --
@@ -295,8 +567,9 @@ mod tests {
         check_all_sync_statuses(&clients, &statuses).await;
 
         let guard = statuses.read().await;
-        assert_eq!(guard[0], BnSyncStatus::Synced);
-        assert_eq!(guard[1], BnSyncStatus::Synced);
+        assert_eq!(guard[0].status, BnSyncStatus::Synced);
+        assert_eq!(guard[0].sync_distance, Some(0));
+        assert_eq!(guard[1].status, BnSyncStatus::Synced);
     }
 
     #[tokio::test]
@@ -322,8 +595,9 @@ mod tests {
         check_all_sync_statuses(&clients, &statuses).await;
 
         let guard = statuses.read().await;
-        assert_eq!(guard[0], BnSyncStatus::Synced);
-        assert_eq!(guard[1], BnSyncStatus::Syncing);
+        assert_eq!(guard[0].status, BnSyncStatus::Synced);
+        assert_eq!(guard[1].status, BnSyncStatus::Syncing);
+        assert_eq!(guard[1].sync_distance, Some(500));
     }
 
     #[tokio::test]
@@ -342,7 +616,8 @@ mod tests {
         check_all_sync_statuses(&clients, &statuses).await;
 
         let guard = statuses.read().await;
-        assert_eq!(guard[0], BnSyncStatus::Unreachable);
+        assert_eq!(guard[0].status, BnSyncStatus::Unreachable);
+        assert_eq!(guard[0].sync_distance, None);
     }
 
     #[tokio::test]
@@ -367,7 +642,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let guard = statuses.read().await;
-        assert_eq!(guard[0], BnSyncStatus::Synced);
+        assert_eq!(guard[0].status, BnSyncStatus::Synced);
         drop(guard);
 
         // Shut down
@@ -399,7 +674,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let guard = statuses.read().await;
-        assert_eq!(guard[0], BnSyncStatus::Syncing);
+        assert_eq!(guard[0].status, BnSyncStatus::Syncing);
         drop(guard);
 
         shutdown_tx.send(true).unwrap();
@@ -424,7 +699,8 @@ mod tests {
         check_all_sync_statuses(&clients, &statuses).await;
 
         let guard = statuses.read().await;
-        assert_eq!(guard[0], BnSyncStatus::ElOffline);
+        assert_eq!(guard[0].status, BnSyncStatus::ElOffline);
+        assert!(guard[0].el_offline);
     }
 
     #[tokio::test]
@@ -443,7 +719,8 @@ mod tests {
         check_all_sync_statuses(&clients, &statuses).await;
 
         let guard = statuses.read().await;
-        assert_eq!(guard[0], BnSyncStatus::Syncing);
+        assert_eq!(guard[0].status, BnSyncStatus::Syncing);
+        assert!(guard[0].is_optimistic);
     }
 
     #[tokio::test]
@@ -487,8 +764,8 @@ mod tests {
         );
 
         let guard = statuses.read().await;
-        assert_eq!(guard[0], BnSyncStatus::Synced);
-        assert_eq!(guard[1], BnSyncStatus::Synced);
+        assert_eq!(guard[0].status, BnSyncStatus::Synced);
+        assert_eq!(guard[1].status, BnSyncStatus::Synced);
     }
 
     #[test]
@@ -535,7 +812,7 @@ mod tests {
         check_all_sync_statuses(&clients, &statuses).await;
 
         let guard = statuses.read().await;
-        assert_eq!(guard[0], BnSyncStatus::Syncing);
+        assert_eq!(guard[0].status, BnSyncStatus::Syncing);
     }
 
     #[tokio::test]
@@ -557,19 +834,74 @@ mod tests {
         check_all_sync_statuses(&clients, &statuses).await;
 
         let guard = statuses.read().await;
-        assert_eq!(guard[0], BnSyncStatus::Syncing);
+        assert_eq!(guard[0].status, BnSyncStatus::Syncing);
     }
 
     #[tokio::test]
     async fn test_unknown_status_not_usable_in_filter() {
         let statuses = Arc::new(RwLock::new(vec![
-            BnSyncStatus::Unknown,
-            BnSyncStatus::Synced,
-            BnSyncStatus::Unknown,
+            BnSyncDetail::unknown(),
+            BnSyncDetail {
+                status: BnSyncStatus::Synced,
+                sync_distance: Some(0),
+                is_optimistic: false,
+                el_offline: false,
+            },
+            BnSyncDetail::unknown(),
         ]));
         let guard = statuses.read().await;
-        let usable: Vec<usize> =
-            guard.iter().enumerate().filter(|(_, s)| s.is_usable()).map(|(i, _)| i).collect();
+        let usable: Vec<usize> = guard
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.status.is_usable())
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(usable, vec![1]);
+    }
+
+    // -- Sync distance storage tests --
+
+    #[tokio::test]
+    async fn test_sync_distance_stored_for_synced_bn() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"head_slot":"1000","sync_distance":"5","is_syncing":false,"is_optimistic":false,"el_offline":false}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let clients = vec![make_client(&server.uri())];
+        let statuses = new_shared_sync_statuses(1);
+
+        check_all_sync_statuses(&clients, &statuses).await;
+
+        let guard = statuses.read().await;
+        assert_eq!(guard[0].sync_distance, Some(5));
+        assert_eq!(guard[0].tier(&TierThresholds::default()), HealthTier::Synced);
+    }
+
+    #[tokio::test]
+    async fn test_sync_distance_tier_for_syncing_bn() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"head_slot":"900","sync_distance":"100","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let clients = vec![make_client(&server.uri())];
+        let statuses = new_shared_sync_statuses(1);
+
+        check_all_sync_statuses(&clients, &statuses).await;
+
+        let guard = statuses.read().await;
+        assert_eq!(guard[0].sync_distance, Some(100));
+        assert_eq!(guard[0].tier(&TierThresholds::default()), HealthTier::Unsynced);
     }
 }

@@ -7,6 +7,7 @@ mod manager;
 pub mod sse;
 mod sync_status;
 mod traits;
+pub mod types;
 
 pub use error::BnManagerError;
 pub use manager::BnManager;
@@ -14,11 +15,12 @@ pub use sse::{
     parse_sse_event, BlockEvent, ChainReorgEvent, FinalizedCheckpointEvent, HeadEvent, SseConfig,
     SseConnectionState, SseError, SseEvent, DEFAULT_SSE_TOPICS,
 };
-pub use sync_status::{BnSyncStatus, SharedSyncStatuses};
+pub use sync_status::{BnSyncDetail, BnSyncStatus, SharedSyncStatuses};
 pub use traits::{
     BeaconNodeClient, BnHealthScore, BnManagerConfig, BnSelectionStrategy, BroadcastTopics,
     OperationTimeouts,
 };
+pub use types::{BnRole, HealthTier, TierThresholds};
 
 // Re-export types used in trait signatures so downstream crates
 // don't need to depend on `beacon` directly.

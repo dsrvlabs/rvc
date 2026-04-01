@@ -290,6 +290,20 @@ lazy_static! {
         counter
     };
 
+    /// Gauge for per-BN health tier (1=Synced, 2=SmallLag, 3=LargeLag, 4=Unsynced).
+    /// Labels: endpoint
+    pub static ref RVC_BN_HEALTH_TIER: prometheus::IntGaugeVec = {
+        let opts = Opts::new(
+            "rvc_bn_health_tier",
+            "Health tier of each beacon node (1=synced, 2=small-lag, 3=large-lag, 4=unsynced)"
+        );
+        let gauge = prometheus::IntGaugeVec::new(opts, &["endpoint"])
+            .expect("Failed to create rvc_bn_health_tier metric");
+        REGISTRY.register(Box::new(gauge.clone()))
+            .expect("Failed to register rvc_bn_health_tier metric");
+        gauge
+    };
+
 }
 
 /// Initializes all core metrics by accessing the lazy_static variables.
@@ -317,6 +331,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_PROPOSER_BN_LATENCY_MS);
     lazy_static::initialize(&RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL);
     lazy_static::initialize(&RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL);
+    lazy_static::initialize(&RVC_BN_HEALTH_TIER);
 }
 
 /// Attestation status label values.

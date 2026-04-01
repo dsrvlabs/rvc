@@ -219,15 +219,29 @@ pub struct BnManagerConfig {
     pub timeout: Duration,
     /// Which submission types are broadcast to all BNs.
     pub broadcast_topics: BroadcastTopics,
+    /// Per-BN role assignments (parallel to endpoints). Default: {All} for each.
+    pub roles: Vec<std::collections::HashSet<crate::types::BnRole>>,
+    /// Health tier thresholds for sync distance classification.
+    pub tier_thresholds: crate::types::TierThresholds,
 }
 
 impl BnManagerConfig {
     pub fn new(endpoints: Vec<String>) -> Self {
+        let count = endpoints.len();
         Self {
             endpoints,
             selection_strategy: BnSelectionStrategy::First,
             timeout: Duration::from_secs(30),
             broadcast_topics: BroadcastTopics::default(),
+            roles: vec![
+                {
+                    let mut s = std::collections::HashSet::new();
+                    s.insert(crate::types::BnRole::All);
+                    s
+                };
+                count
+            ],
+            tier_thresholds: crate::types::TierThresholds::default(),
         }
     }
 }

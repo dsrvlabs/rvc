@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -30,6 +31,7 @@ use crate::sync_status::{
     check_all_sync_statuses, new_shared_sync_statuses, start_sync_monitor, SharedSyncStatuses,
 };
 use crate::traits::{BeaconNodeClient, BnHealthScore, BnManagerConfig, OperationTimeouts};
+use crate::types::{BnRole, HealthTier, TierThresholds};
 use crate::BnManagerError;
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, BeaconError>> + Send + 'a>>;
@@ -54,6 +56,8 @@ pub struct BnManager {
     health_trackers: SharedHealthTrackers,
     operation_timeouts: Option<OperationTimeouts>,
     broadcast_topics: crate::traits::BroadcastTopics,
+    roles: Vec<HashSet<BnRole>>,
+    tier_thresholds: TierThresholds,
 }
 
 impl BnManager {
@@ -100,6 +104,19 @@ impl BnManager {
         }
 
         let broadcast_topics = config.broadcast_topics.clone();
+        let roles = if config.roles.len() == clients.len() {
+            config.roles.clone()
+        } else {
+            vec![
+                {
+                    let mut s = HashSet::new();
+                    s.insert(BnRole::All);
+                    s
+                };
+                clients.len()
+            ]
+        };
+        let tier_thresholds = config.tier_thresholds.clone();
         let sync_statuses = new_shared_sync_statuses(clients.len());
         let endpoints: Vec<String> = clients.iter().map(|c| c.endpoint().to_string()).collect();
         let health_trackers = new_shared_health_trackers(&endpoints);
@@ -109,6 +126,8 @@ impl BnManager {
             health_trackers,
             operation_timeouts: None,
             broadcast_topics,
+            roles,
+            tier_thresholds,
         })
     }
 
@@ -162,12 +181,15 @@ impl BnManager {
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                let sync_status = sync_guard.get(i).copied().unwrap_or(BnSyncStatus::Unknown);
+                let detail = sync_guard
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(crate::sync_status::BnSyncDetail::unknown);
                 BnHealthScore {
                     endpoint: t.endpoint().to_string(),
-                    is_reachable: !matches!(sync_status, BnSyncStatus::Unreachable),
-                    is_synced: matches!(sync_status, BnSyncStatus::Synced),
-                    is_el_offline: matches!(sync_status, BnSyncStatus::ElOffline),
+                    is_reachable: !matches!(detail.status, BnSyncStatus::Unreachable),
+                    is_synced: matches!(detail.status, BnSyncStatus::Synced),
+                    is_el_offline: matches!(detail.status, BnSyncStatus::ElOffline),
                     head_slot: None,
                     latency: t.latency_ema_ms().map(|ms| Duration::from_secs_f64(ms / 1000.0)),
                     latency_ms: t.latency_ema_ms().unwrap_or(0.0),
@@ -221,64 +243,109 @@ impl BnManager {
         })
     }
 
-    /// Returns indices of synced+healthy BNs, ordered by health score (highest first).
-    /// Falls back to all BNs if none are synced (single-BN mode logs a warning).
+    /// Returns indices of BNs matching the given role and meeting the minimum health tier,
+    /// ordered by health score (highest first).
     ///
-    /// When `allow_el_offline` is true, BNs with `ElOffline` status are included
-    /// alongside fully synced BNs (for non-EL-dependent operations).
-    #[tracing::instrument(name = "rvc.bn_manager.synced_indices", skip_all)]
-    async fn synced_indices(&self, allow_el_offline: bool) -> Vec<usize> {
+    /// Filtering order: role → tier → health score.
+    ///
+    /// Fallback chain:
+    /// 1. If no BNs match the role, fall back to `All`-role BNs with WARN
+    /// 2. If no BNs meet the tier, try the next lower tier with WARN
+    /// 3. If still empty, fall back to all BNs
+    #[tracing::instrument(name = "rvc.bn_manager.synced_indices", skip_all, fields(role = %role, min_tier = %min_tier))]
+    async fn synced_indices(&self, role: BnRole, min_tier: HealthTier) -> Vec<usize> {
         let sync_guard = self.sync_statuses.read().await;
         let health_guard = self.health_trackers.read().await;
 
         let healthy_count = health_guard.iter().filter(|t| t.is_healthy()).count();
         debug!(bn_count = self.clients.len(), healthy_count = healthy_count, "Health check cycle");
 
-        let mut synced: Vec<usize> = sync_guard
+        // Step 1: Filter by role
+        let role_indices: Vec<usize> =
+            (0..self.clients.len()).filter(|&i| BnRole::matches(&self.roles[i], role)).collect();
+
+        // Cross-role fallback: if no BNs for the role, use All-role BNs
+        let role_indices = if role_indices.is_empty() {
+            warn!(
+                role = %role,
+                "no BNs assigned for role, falling back to all-role BNs"
+            );
+            (0..self.clients.len())
+                .filter(|&i| {
+                    BnRole::matches(&self.roles[i], BnRole::All)
+                        || self.roles[i].contains(&BnRole::All)
+                })
+                .collect::<Vec<usize>>()
+        } else {
+            role_indices
+        };
+
+        // If still empty after role fallback, use all BNs
+        let role_indices = if role_indices.is_empty() {
+            warn!("no BNs with All role either, falling back to all BNs");
+            (0..self.clients.len()).collect()
+        } else {
+            role_indices
+        };
+
+        // Step 2: Filter by tier
+        let mut tier_filtered: Vec<usize> = role_indices
             .iter()
-            .enumerate()
-            .filter(
-                |(_, s)| {
-                    if allow_el_offline {
-                        s.is_usable_for_non_el()
-                    } else {
-                        s.is_usable()
-                    }
-                },
-            )
-            .map(|(i, _)| i)
+            .copied()
+            .filter(|&i| sync_guard[i].tier(&self.tier_thresholds) <= min_tier)
             .collect();
 
-        if synced.is_empty() {
+        // Tier fallback: progressively relax tier requirement
+        if tier_filtered.is_empty() {
+            let fallback_tiers = match min_tier {
+                HealthTier::Synced => {
+                    vec![HealthTier::SmallLag, HealthTier::LargeLag, HealthTier::Unsynced]
+                }
+                HealthTier::SmallLag => vec![HealthTier::LargeLag, HealthTier::Unsynced],
+                HealthTier::LargeLag => vec![HealthTier::Unsynced],
+                HealthTier::Unsynced => vec![],
+            };
+
+            for fallback_tier in fallback_tiers {
+                tier_filtered = role_indices
+                    .iter()
+                    .copied()
+                    .filter(|&i| sync_guard[i].tier(&self.tier_thresholds) <= fallback_tier)
+                    .collect();
+                if !tier_filtered.is_empty() {
+                    warn!(
+                        requested_tier = %min_tier,
+                        actual_tier = %fallback_tier,
+                        "no BNs at requested tier, falling back to lower tier"
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Last resort: use all role-matching BNs regardless of tier
+        if tier_filtered.is_empty() {
             if self.clients.len() == 1 {
                 warn!(
                     endpoint = %RedactedUrl(self.clients[0].endpoint()),
                     "single BN is not synced, continuing with degraded service"
                 );
             } else {
-                warn!("no synced BNs available, falling back to all BNs");
+                warn!("no BNs meet tier requirements, falling back to all role-matching BNs");
             }
-            // When EL-offline BNs are excluded (block production), don't include them in fallback
-            synced = if allow_el_offline {
-                (0..self.clients.len()).collect()
-            } else {
-                (0..self.clients.len())
-                    .filter(|&i| !matches!(sync_guard[i], BnSyncStatus::ElOffline))
-                    .collect()
-            };
-            // If still empty after filtering, fall back to truly all BNs as last resort
-            if synced.is_empty() {
-                synced = (0..self.clients.len()).collect();
-            }
+            tier_filtered = role_indices;
         }
 
-        // Filter out unhealthy BNs (unless it would leave none)
+        // Step 3: Filter out unhealthy BNs (unless it would leave none)
         let healthy: Vec<usize> =
-            synced.iter().copied().filter(|&i| health_guard[i].is_healthy()).collect();
+            tier_filtered.iter().copied().filter(|&i| health_guard[i].is_healthy()).collect();
 
         let mut result = if healthy.is_empty() {
-            error!(bn_count = synced.len(), "All BNs unhealthy, using all synced BNs");
-            synced
+            error!(
+                bn_count = tier_filtered.len(),
+                "All BNs unhealthy, using all tier-matching BNs"
+            );
+            tier_filtered
         } else {
             healthy
         };
@@ -298,7 +365,8 @@ impl BnManager {
     async fn query_first<'s, T, F>(
         &'s self,
         op_name: &str,
-        allow_el_offline: bool,
+        role: BnRole,
+        min_tier: HealthTier,
         op: F,
     ) -> Result<T, BeaconError>
     where
@@ -310,20 +378,21 @@ impl BnManager {
             rvc.bn.strategy = "first",
             rvc.bn.tried = tracing::field::Empty,
         );
-        self.query_first_inner(op_name, allow_el_offline, &op).instrument(strategy_span).await
+        self.query_first_inner(op_name, role, min_tier, &op).instrument(strategy_span).await
     }
 
     async fn query_first_inner<'s, T, F>(
         &'s self,
         op_name: &str,
-        allow_el_offline: bool,
+        role: BnRole,
+        min_tier: HealthTier,
         op: &F,
     ) -> Result<T, BeaconError>
     where
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        let indices = self.synced_indices(allow_el_offline).await;
+        let indices = self.synced_indices(role, min_tier).await;
         let mut last_err = None;
         let mut tried: usize = 0;
         let mut failed_indices: Vec<usize> = Vec::new();
@@ -401,7 +470,8 @@ impl BnManager {
     async fn query_best<'s, T, F>(
         &'s self,
         op_name: &str,
-        allow_el_offline: bool,
+        role: BnRole,
+        min_tier: HealthTier,
         op: F,
         pick_best: fn(&T, &T) -> bool,
     ) -> Result<T, BeaconError>
@@ -414,7 +484,7 @@ impl BnManager {
             rvc.bn.strategy = "best",
             rvc.bn.tried = tracing::field::Empty,
         );
-        self.query_best_inner(op_name, allow_el_offline, &op, pick_best)
+        self.query_best_inner(op_name, role, min_tier, &op, pick_best)
             .instrument(strategy_span)
             .await
     }
@@ -422,7 +492,8 @@ impl BnManager {
     async fn query_best_inner<'s, T, F>(
         &'s self,
         op_name: &str,
-        allow_el_offline: bool,
+        role: BnRole,
+        min_tier: HealthTier,
         op: &F,
         pick_best: fn(&T, &T) -> bool,
     ) -> Result<T, BeaconError>
@@ -430,7 +501,7 @@ impl BnManager {
         T: Send + 'static,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        let indices = self.synced_indices(allow_el_offline).await;
+        let indices = self.synced_indices(role, min_tier).await;
         tracing::Span::current().record("rvc.bn.tried", indices.len());
 
         if indices.len() == 1 {
@@ -461,10 +532,7 @@ impl BnManager {
                         error = %e,
                         "BN query failed, trying unsynced BNs"
                     );
-                    return self
-                        .fallback_unsynced(op_name, &op, &indices, allow_el_offline)
-                        .await
-                        .ok_or(e);
+                    return self.fallback_unsynced(op_name, &op, &indices).await.ok_or(e);
                 }
             }
         }
@@ -534,9 +602,7 @@ impl BnManager {
                 Ok(value)
             }
             None => {
-                if let Some(result) =
-                    self.fallback_unsynced(op_name, &op, &indices, allow_el_offline).await
-                {
+                if let Some(result) = self.fallback_unsynced(op_name, &op, &indices).await {
                     return Ok(result);
                 }
                 Err(BeaconError::HttpError(format!("{op_name}: all BNs failed in best-selection")))
@@ -550,26 +616,13 @@ impl BnManager {
         op_name: &str,
         op: &F,
         tried_indices: &[usize],
-        allow_el_offline: bool,
     ) -> Option<T>
     where
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        let sync_statuses = self.sync_statuses.read().await;
-        let unsynced: Vec<usize> = (0..self.clients.len())
-            .filter(|i| !tried_indices.contains(i))
-            .filter(|&i| {
-                // When EL-offline BNs are excluded (e.g., block production),
-                // don't fall back to them
-                allow_el_offline
-                    || !matches!(
-                        sync_statuses.get(i).copied().unwrap_or(BnSyncStatus::Unknown),
-                        BnSyncStatus::ElOffline
-                    )
-            })
-            .collect();
-        drop(sync_statuses);
+        let unsynced: Vec<usize> =
+            (0..self.clients.len()).filter(|i| !tried_indices.contains(i)).collect();
 
         if unsynced.is_empty() {
             return None;
@@ -741,29 +794,44 @@ fn is_better_block(a: &ProduceBlockResponse, b: &ProduceBlockResponse) -> bool {
 
 #[async_trait]
 impl BeaconNodeClient for BnManager {
-    // -- State / Config: query(First) --
+    // -- State / Config: query(First), any role, accept SmallLag --
 
     async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-        self.query_first("get_genesis", true, |c| Box::pin(c.get_genesis())).await
+        self.query_first("get_genesis", BnRole::All, HealthTier::SmallLag, |c| {
+            Box::pin(c.get_genesis())
+        })
+        .await
     }
 
     async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-        self.query_first("get_config_spec", true, |c| Box::pin(c.get_config_spec())).await
+        self.query_first("get_config_spec", BnRole::All, HealthTier::SmallLag, |c| {
+            Box::pin(c.get_config_spec())
+        })
+        .await
     }
 
     async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-        self.query_first("get_fork_schedule", true, |c| Box::pin(c.get_fork_schedule())).await
+        self.query_first("get_fork_schedule", BnRole::All, HealthTier::SmallLag, |c| {
+            Box::pin(c.get_fork_schedule())
+        })
+        .await
     }
 
     async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError> {
-        self.query_first("get_fork", true, |c| Box::pin(c.get_fork(state_id))).await
+        self.query_first("get_fork", BnRole::All, HealthTier::SmallLag, |c| {
+            Box::pin(c.get_fork(state_id))
+        })
+        .await
     }
 
     async fn get_validators(&self, pubkeys: &[String]) -> Result<ValidatorsResponse, BeaconError> {
-        self.query_first("get_validators", true, |c| Box::pin(c.get_validators(pubkeys))).await
+        self.query_first("get_validators", BnRole::All, HealthTier::SmallLag, |c| {
+            Box::pin(c.get_validators(pubkeys))
+        })
+        .await
     }
 
-    // -- Duties: query(First) + duty_fetch timeout --
+    // -- Duties: query(First) + duty_fetch timeout, accept SmallLag --
 
     async fn get_attester_duties(
         &self,
@@ -773,9 +841,12 @@ impl BeaconNodeClient for BnManager {
         self.with_op_timeout(
             "get_attester_duties",
             self.op_timeout(|t| t.duty_fetch),
-            self.query_first("get_attester_duties", true, |c| {
-                Box::pin(c.get_attester_duties(epoch, validator_indices))
-            }),
+            self.query_first(
+                "get_attester_duties",
+                BnRole::Attestation,
+                HealthTier::SmallLag,
+                |c| Box::pin(c.get_attester_duties(epoch, validator_indices)),
+            ),
         )
         .await
     }
@@ -784,7 +855,7 @@ impl BeaconNodeClient for BnManager {
         self.with_op_timeout(
             "get_proposer_duties",
             self.op_timeout(|t| t.duty_fetch),
-            self.query_first("get_proposer_duties", true, |c| {
+            self.query_first("get_proposer_duties", BnRole::Proposal, HealthTier::Synced, |c| {
                 Box::pin(c.get_proposer_duties(epoch))
             }),
         )
@@ -799,14 +870,17 @@ impl BeaconNodeClient for BnManager {
         self.with_op_timeout(
             "post_sync_committee_duties",
             self.op_timeout(|t| t.duty_fetch),
-            self.query_first("post_sync_committee_duties", true, |c| {
-                Box::pin(c.post_sync_committee_duties(epoch, validator_indices))
-            }),
+            self.query_first(
+                "post_sync_committee_duties",
+                BnRole::SyncCommittee,
+                HealthTier::SmallLag,
+                |c| Box::pin(c.post_sync_committee_duties(epoch, validator_indices)),
+            ),
         )
         .await
     }
 
-    // -- Block production: query(Best) + block_production timeout --
+    // -- Block production: query(Best), Proposal role, require Synced --
 
     async fn produce_block_v3(
         &self,
@@ -820,7 +894,8 @@ impl BeaconNodeClient for BnManager {
             self.op_timeout(|t| t.block_production),
             self.query_best(
                 "produce_block_v3",
-                false,
+                BnRole::Proposal,
+                HealthTier::Synced,
                 |c| {
                     Box::pin(c.produce_block_v3(
                         slot,
@@ -835,7 +910,7 @@ impl BeaconNodeClient for BnManager {
         .await
     }
 
-    // -- Submissions: broadcast + block_publication timeout --
+    // -- Submissions: broadcast + block_publication timeout, accept LargeLag --
 
     async fn publish_block(
         &self,
@@ -855,7 +930,7 @@ impl BeaconNodeClient for BnManager {
             self.with_op_timeout(
                 "publish_block",
                 self.op_timeout(|t| t.block_publication),
-                self.query_first("publish_block", false, |c| {
+                self.query_first("publish_block", BnRole::Submission, HealthTier::LargeLag, |c| {
                     Box::pin(c.publish_block(signed_block, consensus_version))
                 }),
             )
@@ -881,15 +956,18 @@ impl BeaconNodeClient for BnManager {
             self.with_op_timeout(
                 "publish_blinded_block",
                 self.op_timeout(|t| t.block_publication),
-                self.query_first("publish_blinded_block", false, |c| {
-                    Box::pin(c.publish_blinded_block(signed_blinded_block, consensus_version))
-                }),
+                self.query_first(
+                    "publish_blinded_block",
+                    BnRole::Submission,
+                    HealthTier::LargeLag,
+                    |c| Box::pin(c.publish_blinded_block(signed_blinded_block, consensus_version)),
+                ),
             )
             .await
         }
     }
 
-    // -- Attestation data: query(First) + attestation_fetch timeout --
+    // -- Attestation data: query(First), Attestation role, accept SmallLag --
 
     async fn get_attestation_data(
         &self,
@@ -899,14 +977,17 @@ impl BeaconNodeClient for BnManager {
         self.with_op_timeout(
             "get_attestation_data",
             self.op_timeout(|t| t.attestation_fetch),
-            self.query_first("get_attestation_data", true, |c| {
-                Box::pin(c.get_attestation_data(slot, committee_index))
-            }),
+            self.query_first(
+                "get_attestation_data",
+                BnRole::Attestation,
+                HealthTier::SmallLag,
+                |c| Box::pin(c.get_attestation_data(slot, committee_index)),
+            ),
         )
         .await
     }
 
-    // -- Attestation submission: broadcast + attestation_submit timeout --
+    // -- Attestation submission: broadcast or Submission role, accept LargeLag --
 
     async fn submit_attestation(
         &self,
@@ -925,15 +1006,18 @@ impl BeaconNodeClient for BnManager {
             self.with_op_timeout(
                 "submit_attestation",
                 self.op_timeout(|t| t.attestation_submit),
-                self.query_first("submit_attestation", true, |c| {
-                    Box::pin(c.submit_attestation(attestations))
-                }),
+                self.query_first(
+                    "submit_attestation",
+                    BnRole::Submission,
+                    HealthTier::LargeLag,
+                    |c| Box::pin(c.submit_attestation(attestations)),
+                ),
             )
             .await
         }
     }
 
-    // -- Aggregation: query(First) + aggregate_fetch timeout for fetching, broadcast + aggregate_submit timeout for submitting --
+    // -- Aggregation: Aggregation role, accept SmallLag for fetch; broadcast for submit --
 
     async fn get_aggregate_attestation(
         &self,
@@ -944,9 +1028,18 @@ impl BeaconNodeClient for BnManager {
         self.with_op_timeout(
             "get_aggregate_attestation",
             self.op_timeout(|t| t.aggregate_fetch),
-            self.query_first("get_aggregate_attestation", true, |c| {
-                Box::pin(c.get_aggregate_attestation(slot, attestation_data_root, committee_index))
-            }),
+            self.query_first(
+                "get_aggregate_attestation",
+                BnRole::Aggregation,
+                HealthTier::SmallLag,
+                |c| {
+                    Box::pin(c.get_aggregate_attestation(
+                        slot,
+                        attestation_data_root,
+                        committee_index,
+                    ))
+                },
+            ),
         )
         .await
     }
@@ -965,7 +1058,7 @@ impl BeaconNodeClient for BnManager {
         .await
     }
 
-    // -- Sync committee: broadcast + sync_message/sync_contribution timeout --
+    // -- Sync committee: SyncCommittee role, accept SmallLag --
 
     async fn submit_sync_committee_messages(
         &self,
@@ -984,9 +1077,12 @@ impl BeaconNodeClient for BnManager {
             self.with_op_timeout(
                 "submit_sync_committee_messages",
                 self.op_timeout(|t| t.sync_message),
-                self.query_first("submit_sync_committee_messages", true, |c| {
-                    Box::pin(c.submit_sync_committee_messages(messages))
-                }),
+                self.query_first(
+                    "submit_sync_committee_messages",
+                    BnRole::SyncCommittee,
+                    HealthTier::SmallLag,
+                    |c| Box::pin(c.submit_sync_committee_messages(messages)),
+                ),
             )
             .await
         }
@@ -1001,13 +1097,18 @@ impl BeaconNodeClient for BnManager {
         self.with_op_timeout(
             "get_sync_committee_contribution",
             self.op_timeout(|t| t.sync_contribution),
-            self.query_first("get_sync_committee_contribution", true, |c| {
-                Box::pin(c.get_sync_committee_contribution(
-                    slot,
-                    subcommittee_index,
-                    beacon_block_root,
-                ))
-            }),
+            self.query_first(
+                "get_sync_committee_contribution",
+                BnRole::SyncCommittee,
+                HealthTier::SmallLag,
+                |c| {
+                    Box::pin(c.get_sync_committee_contribution(
+                        slot,
+                        subcommittee_index,
+                        beacon_block_root,
+                    ))
+                },
+            ),
         )
         .await
     }
@@ -1029,10 +1130,13 @@ impl BeaconNodeClient for BnManager {
     // -- Blocks --
 
     async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-        self.query_first("get_block_root", true, |c| Box::pin(c.get_block_root(block_id))).await
+        self.query_first("get_block_root", BnRole::All, HealthTier::SmallLag, |c| {
+            Box::pin(c.get_block_root(block_id))
+        })
+        .await
     }
 
-    // -- Proposer preparation: broadcast + preparation timeout --
+    // -- Proposer preparation: broadcast --
 
     async fn prepare_beacon_proposer(
         &self,
@@ -1048,7 +1152,7 @@ impl BeaconNodeClient for BnManager {
         .await
     }
 
-    // -- Committee subscriptions: broadcast + preparation timeout --
+    // -- Committee subscriptions: broadcast or Submission role --
 
     async fn submit_beacon_committee_subscriptions(
         &self,
@@ -1067,15 +1171,18 @@ impl BeaconNodeClient for BnManager {
             self.with_op_timeout(
                 "submit_beacon_committee_subscriptions",
                 self.op_timeout(|t| t.preparation),
-                self.query_first("submit_beacon_committee_subscriptions", true, |c| {
-                    Box::pin(c.submit_beacon_committee_subscriptions(subscriptions))
-                }),
+                self.query_first(
+                    "submit_beacon_committee_subscriptions",
+                    BnRole::Submission,
+                    HealthTier::LargeLag,
+                    |c| Box::pin(c.submit_beacon_committee_subscriptions(subscriptions)),
+                ),
             )
             .await
         }
     }
 
-    // -- Builder: broadcast + preparation timeout --
+    // -- Builder: broadcast --
 
     async fn register_validators(
         &self,
@@ -1091,14 +1198,20 @@ impl BeaconNodeClient for BnManager {
         .await
     }
 
-    // -- Node status: query(First) --
+    // -- Node status: query(First), any role --
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-        self.query_first("get_node_syncing", true, |c| Box::pin(c.get_node_syncing())).await
+        self.query_first("get_node_syncing", BnRole::All, HealthTier::Unsynced, |c| {
+            Box::pin(c.get_node_syncing())
+        })
+        .await
     }
 
     async fn get_node_version(&self) -> Result<String, BeaconError> {
-        self.query_first("get_node_version", true, |c| Box::pin(c.get_node_version())).await
+        self.query_first("get_node_version", BnRole::All, HealthTier::Unsynced, |c| {
+            Box::pin(c.get_node_version())
+        })
+        .await
     }
 }
 
@@ -1269,7 +1382,7 @@ mod tests {
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use crate::sync_status::BnSyncStatus;
+    use crate::sync_status::{BnSyncDetail, BnSyncStatus};
 
     use super::*;
 
@@ -2284,7 +2397,7 @@ mod tests {
         manager.check_sync_status().await;
 
         let guard = manager.sync_statuses().read().await;
-        assert_eq!(guard[0], BnSyncStatus::Synced);
+        assert_eq!(guard[0].status, BnSyncStatus::Synced);
     }
 
     #[tokio::test]
@@ -2301,7 +2414,7 @@ mod tests {
         manager.check_sync_status().await;
 
         let guard = manager.sync_statuses().read().await;
-        assert_eq!(guard[0], BnSyncStatus::Syncing);
+        assert_eq!(guard[0].status, BnSyncStatus::Syncing);
     }
 
     #[tokio::test]
@@ -2318,7 +2431,7 @@ mod tests {
         manager.check_sync_status().await;
 
         let guard = manager.sync_statuses().read().await;
-        assert_eq!(guard[0], BnSyncStatus::Unreachable);
+        assert_eq!(guard[0].status, BnSyncStatus::Unreachable);
     }
 
     #[tokio::test]
@@ -2496,7 +2609,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let guard = manager.sync_statuses().read().await;
-        assert_eq!(guard[0], BnSyncStatus::Synced);
+        assert_eq!(guard[0].status, BnSyncStatus::Synced);
         drop(guard);
 
         shutdown_tx.send(true).unwrap();
@@ -2604,7 +2717,7 @@ mod tests {
         let manager = make_manager(&server.uri());
 
         let guard = manager.sync_statuses().read().await;
-        assert_eq!(guard[0], BnSyncStatus::Unknown);
+        assert_eq!(guard[0].status, BnSyncStatus::Unknown);
         drop(guard);
 
         // Without calling check_sync_status, BN should still be tried via fallback
@@ -3060,7 +3173,12 @@ mod tests {
         // Set sync status to Synced
         {
             let mut statuses = manager.sync_statuses().write().await;
-            statuses[0] = BnSyncStatus::Synced;
+            statuses[0] = BnSyncDetail {
+                status: BnSyncStatus::Synced,
+                sync_distance: Some(0),
+                is_optimistic: false,
+                el_offline: false,
+            };
         }
 
         let scores = manager.health_scores().await;
@@ -3084,7 +3202,12 @@ mod tests {
         // Set sync status to Syncing
         {
             let mut statuses = manager.sync_statuses().write().await;
-            statuses[0] = BnSyncStatus::Syncing;
+            statuses[0] = BnSyncDetail {
+                status: BnSyncStatus::Syncing,
+                sync_distance: Some(100),
+                is_optimistic: false,
+                el_offline: false,
+            };
         }
 
         let scores = manager.health_scores().await;
@@ -3107,7 +3230,12 @@ mod tests {
         // Set sync status to Unreachable
         {
             let mut statuses = manager.sync_statuses().write().await;
-            statuses[0] = BnSyncStatus::Unreachable;
+            statuses[0] = BnSyncDetail {
+                status: BnSyncStatus::Unreachable,
+                sync_distance: None,
+                is_optimistic: false,
+                el_offline: false,
+            };
         }
 
         let scores = manager.health_scores().await;
@@ -3273,7 +3401,7 @@ mod tests {
         manager.check_sync_status().await;
 
         let guard = manager.sync_statuses().read().await;
-        assert_eq!(guard[0], BnSyncStatus::ElOffline);
+        assert_eq!(guard[0].status, BnSyncStatus::ElOffline);
     }
 
     #[tokio::test]

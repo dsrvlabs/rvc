@@ -170,6 +170,14 @@ pub struct Config {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub logfile_level: Option<String>,
+
+    // --- Health tier fields (T4.5/T4.8) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bn_sync_tolerances: Option<String>,
+
+    // --- Role-based BN fields (T4.9/T4.11) ---
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub beacon_nodes_config: Vec<BeaconNodeEntry>,
 }
 
 fn default_monitoring_interval() -> u64 {
@@ -190,6 +198,18 @@ fn default_logfile_max_number() -> usize {
 
 fn default_slashed_validators_action() -> String {
     "disable-only".to_string()
+}
+
+/// Per-BN configuration entry for `[[beacon_nodes]]` TOML tables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeaconNodeEntry {
+    pub url: String,
+    #[serde(default = "default_bn_roles")]
+    pub roles: Vec<String>,
+}
+
+fn default_bn_roles() -> Vec<String> {
+    vec!["all".to_string()]
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -302,6 +322,8 @@ impl Default for Config {
             logfile_max_number: default_logfile_max_number(),
             logfile_compress: false,
             logfile_level: None,
+            bn_sync_tolerances: None,
+            beacon_nodes_config: Vec::new(),
         }
     }
 }
