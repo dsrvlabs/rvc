@@ -109,6 +109,7 @@ impl KeymanagerServer {
                     .delete(handlers::delete_graffiti),
             )
             .route("/eth/v1/validator/:pubkey/voluntary_exit", post(handlers::sign_voluntary_exit))
+            .route("/rvc/v1/validator/:pubkey/prepare_exit", post(handlers::prepare_exit))
             .route("/rvc/v1/attesting", post(handlers::set_attesting_enabled))
             .layer(DefaultBodyLimit::max(self.body_limit))
             .with_state(self.state.clone());

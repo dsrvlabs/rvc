@@ -6,7 +6,9 @@
 mod error;
 mod service;
 mod traits;
+mod types;
 
 pub use error::BlockServiceError;
 pub use service::{BlockProposalResult, BlockService};
 pub use traits::{BeaconBlockClient, ProduceBlockResponse};
+pub use types::BlockSelectionMode;
