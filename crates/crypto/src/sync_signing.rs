@@ -150,20 +150,10 @@ mod tests {
         let beacon_block_root = [0x11; 32];
         let genesis_root = test_genesis_validators_root();
 
-        let schedule = test_fork_schedule();
+        let schedule = compressed_test_fork_schedule();
 
-        // Phase0 slot (epoch 0)
-        let slot_phase0: Slot = 0;
-        let sig_phase0 = sign_sync_committee_message(
-            &beacon_block_root,
-            slot_phase0,
-            &secret_key,
-            &schedule,
-            genesis_root,
-        );
-
-        // Altair slot (epoch 74240)
-        let slot_altair: Slot = 74240 * SLOTS_PER_EPOCH;
+        // Altair slot (epoch 10 in compressed schedule)
+        let slot_altair: Slot = 10 * SLOTS_PER_EPOCH;
         let sig_altair = sign_sync_committee_message(
             &beacon_block_root,
             slot_altair,
@@ -172,7 +162,17 @@ mod tests {
             genesis_root,
         );
 
-        assert_ne!(sig_phase0.to_bytes(), sig_altair.to_bytes());
+        // Bellatrix slot (epoch 20 in compressed schedule)
+        let slot_bellatrix: Slot = 20 * SLOTS_PER_EPOCH;
+        let sig_bellatrix = sign_sync_committee_message(
+            &beacon_block_root,
+            slot_bellatrix,
+            &secret_key,
+            &schedule,
+            genesis_root,
+        );
+
+        assert_ne!(sig_altair.to_bytes(), sig_bellatrix.to_bytes());
 
         // Verify altair signature uses altair fork version
         let domain =

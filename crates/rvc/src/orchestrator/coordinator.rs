@@ -2784,6 +2784,27 @@ mod tests {
 
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
         orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+
+        // Verify pre-Electra requests do NOT contain committee_index query param
+        let requests = mock_server.received_requests().await.unwrap();
+        let aggregate_requests: Vec<_> = requests
+            .iter()
+            .filter(|r| {
+                r.url.path() == "/eth/v1/validator/aggregate_attestation"
+                    && r.method == wiremock::http::Method::GET
+            })
+            .collect();
+        assert!(
+            !aggregate_requests.is_empty(),
+            "expected at least one aggregate_attestation request"
+        );
+        for req in &aggregate_requests {
+            let query = req.url.query().unwrap_or("");
+            assert!(
+                !query.contains("committee_index"),
+                "pre-Electra aggregate_attestation must not include committee_index, but got: {query}"
+            );
+        }
     }
 
     #[tokio::test]

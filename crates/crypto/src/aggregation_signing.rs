@@ -123,8 +123,9 @@ mod tests {
                     slot,
                     index: 1,
                     beacon_block_root: [1u8; 32],
-                    source: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [2u8; 32] },
-                    target: Checkpoint { epoch: slot / SLOTS_PER_EPOCH + 1, root: [3u8; 32] },
+                    // Source is a prior justified checkpoint; target is the current epoch
+                    source: Checkpoint { epoch: slot / SLOTS_PER_EPOCH - 1, root: [2u8; 32] },
+                    target: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [3u8; 32] },
                 },
                 signature: vec![0xaa; 96],
             },
@@ -338,8 +339,9 @@ mod tests {
                     slot,
                     index: 0,
                     beacon_block_root: [1u8; 32],
-                    source: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [2u8; 32] },
-                    target: Checkpoint { epoch: slot / SLOTS_PER_EPOCH + 1, root: [3u8; 32] },
+                    // Source is a prior justified checkpoint; target is the current epoch
+                    source: Checkpoint { epoch: slot / SLOTS_PER_EPOCH - 1, root: [2u8; 32] },
+                    target: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [3u8; 32] },
                 },
                 signature: vec![0xaa; 96],
                 committee_bits: vec![0x01, 0, 0, 0, 0, 0, 0, 0],

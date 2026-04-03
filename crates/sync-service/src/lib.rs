@@ -493,7 +493,21 @@ mod tests {
     }
 
     fn sample_pubkeys(count: usize) -> Vec<PublicKey> {
-        (0..count).map(|i| vec![i as u8; 48]).collect()
+        (0..count)
+            .map(|i| {
+                let mut key = vec![0u8; 48];
+                key[0] = (i & 0xFF) as u8;
+                key[1] = ((i >> 8) & 0xFF) as u8;
+                key
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_sample_pubkeys_512_unique() {
+        let keys = sample_pubkeys(512);
+        let unique: std::collections::HashSet<Vec<u8>> = keys.into_iter().collect();
+        assert_eq!(unique.len(), 512);
     }
 
     /// Find a selection proof that passes the aggregator check.
