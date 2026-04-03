@@ -3903,6 +3903,94 @@ mod edge_case_tests {
         assert_eq!(db.get_block_watermark("0xval").expect("get"), Some(200));
     }
 
+    // Finding #16: Epoch 0 / Slot 0 slashing protection boundary tests
+
+    #[test]
+    fn test_attestation_at_epoch_zero() {
+        let db = SlashingDb::open_in_memory().expect("open");
+
+        db.check_and_record_attestation("0xval", 0, 0, Some("0xroot_a".into()))
+            .expect("first attestation at epoch 0");
+
+        let result = db.check_and_record_attestation("0xval", 0, 0, Some("0xroot_b".into()));
+        assert!(result.is_err(), "double vote at target epoch 0 must be rejected");
+        match result.unwrap_err() {
+            SlashingError::SlashableAttestation(AttestationSlashingViolation::DoubleVote {
+                target_epoch,
+            }) => {
+                assert_eq!(target_epoch, 0);
+            }
+            other => panic!("expected DoubleVote at epoch 0, got: {other:?}"),
+        }
+
+        assert_eq!(db.get_attestations("0xval").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_surround_vote_at_epoch_zero_boundary() {
+        let db = SlashingDb::open_in_memory().expect("open");
+
+        // Wide attestation: source=0, target=2
+        db.check_and_record_attestation("0xval", 0, 2, Some("0xroot_wide".into()))
+            .expect("wide attestation at epoch 0 boundary");
+
+        // Narrow attestation: source=1, target=1 — surrounded by (0,2)
+        // existing_source(0) < new_source(1) AND existing_target(2) > new_target(1)
+        let result = db.check_and_record_attestation("0xval", 1, 1, Some("0xroot_narrow".into()));
+        assert!(result.is_err(), "surrounded vote at epoch 0 boundary must be rejected");
+        match result.unwrap_err() {
+            SlashingError::SlashableAttestation(AttestationSlashingViolation::SurroundedVote {
+                ..
+            }) => {}
+            other => panic!("expected SurroundedVote, got: {other:?}"),
+        }
+
+        assert_eq!(db.get_attestations("0xval").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_block_proposal_at_slot_zero() {
+        let db = SlashingDb::open_in_memory().expect("open");
+
+        db.check_and_record_block("0xval", 0, Some("0xblock_a".into()))
+            .expect("first block at slot 0");
+
+        let result = db.check_and_record_block("0xval", 0, Some("0xblock_b".into()));
+        assert!(result.is_err(), "double proposal at slot 0 must be rejected");
+        match result.unwrap_err() {
+            SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal { slot }) => {
+                assert_eq!(slot, 0);
+            }
+            other => panic!("expected DoubleBlockProposal at slot 0, got: {other:?}"),
+        }
+
+        assert_eq!(db.get_blocks("0xval").unwrap().len(), 1);
+    }
+
+    // Finding #30: Surrounded vote test at check_and_record level
+
+    #[test]
+    fn test_surrounded_vote_at_check_and_record_level() {
+        let db = SlashingDb::open_in_memory().expect("open");
+
+        // Wide attestation: source=2, target=10
+        db.check_and_record_attestation("0xval", 2, 10, Some("0xroot_wide".into()))
+            .expect("wide attestation");
+
+        // Narrow attestation: source=5, target=7 — surrounded by (2,10)
+        // existing_source(2) < new_source(5) AND existing_target(10) > new_target(7)
+        let result = db.check_and_record_attestation("0xval", 5, 7, Some("0xroot_narrow".into()));
+        assert!(result.is_err(), "surrounded vote must be rejected");
+        match result.unwrap_err() {
+            SlashingError::SlashableAttestation(AttestationSlashingViolation::SurroundedVote {
+                ..
+            }) => {}
+            other => panic!("expected SurroundedVote, got: {other:?}"),
+        }
+
+        assert_eq!(db.get_attestations("0xval").unwrap().len(), 1);
+    }
+
     // LOW-17: File permissions on DB creation
     #[cfg(unix)]
     #[test]
