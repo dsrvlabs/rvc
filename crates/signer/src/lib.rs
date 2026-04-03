@@ -1986,17 +1986,18 @@ mod tests {
         let genesis_root = [0xaa; 32];
         let barrier = Arc::new(Barrier::new(2));
 
-        // Both attestations use the SAME source/target so the second would normally
-        // fail without the mutex. With the mutex, only one runs at a time, and the
-        // second will see the same signing_root already recorded (which is allowed).
-        let data = create_test_attestation_data(59, 60);
+        // Task A: (source=59, target=60), Task B: (source=58, target=60)
+        // Same target, different source = double-vote attempt.
+        // The per-validator mutex serializes access so the second task sees
+        // the first's record and gets rejected by slashing protection.
+        let data_a = create_test_attestation_data(59, 60);
+        let data_b = create_test_attestation_data(58, 60);
 
         let mut handles = vec![];
-        for _ in 0..2 {
+        for d in [data_a, data_b] {
             let service = service.clone();
             let pk = pubkey.clone();
             let f = fork_schedule.clone();
-            let d = data.clone();
             let barrier = barrier.clone();
 
             handles.push(tokio::spawn(async move {
@@ -2005,12 +2006,15 @@ mod tests {
             }));
         }
 
-        // Both should succeed because they have the same signing root
-        // and the mutex ensures they run sequentially
+        let mut results = vec![];
         for h in handles {
-            let result = h.await.unwrap();
-            assert!(result.is_ok(), "signing should succeed: {:?}", result.err());
+            results.push(h.await.unwrap());
         }
+
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let failures = results.iter().filter(|r| r.is_err()).count();
+        assert_eq!(successes, 1, "exactly one concurrent attestation must succeed");
+        assert_eq!(failures, 1, "exactly one concurrent attestation must be rejected");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2074,5 +2078,56 @@ mod tests {
             SignerError::KeyNotFound(_) | SignerError::SigningFailed(_) => {}
             other => panic!("expected signing failure, got: {other}"),
         }
+
+        // Query the DB to verify the phantom record was actually written
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("failed to query slashing db");
+        assert_eq!(attestations.len(), 1, "phantom entry must exist after signing failure");
+        assert_eq!(attestations[0].source_epoch, 59);
+        assert_eq!(attestations[0].target_epoch, 60);
+    }
+
+    #[tokio::test]
+    async fn test_db_error_returns_error_not_silent_success() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = dir.path().join("slashing.sqlite");
+        let fork_schedule = create_test_fork_schedule_for_attestation();
+        let genesis_root = [0xaa; 32];
+
+        // Record one valid attestation via a first service instance, then drop it
+        {
+            let sk = SecretKey::generate();
+            let pk = sk.public_key();
+            let signer = create_test_composite_signer_with_key(sk);
+            let slashing_db = Arc::new(SlashingDb::open(&db_path).expect("failed to open db"));
+            let service = SignerService::new(signer, slashing_db);
+            let data = create_test_attestation_data(59, 60);
+            let result = service.sign_attestation(&data, &pk, &fork_schedule, &genesis_root).await;
+            assert!(result.is_ok(), "first attestation should succeed");
+        }
+        // Connection is dropped, flushing WAL to disk
+
+        // Corrupt the SQLite database file and remove WAL/SHM sidecars
+        std::fs::write(&db_path, b"corrupted").expect("failed to corrupt db");
+        let wal_path = db_path.with_extension("sqlite-wal");
+        let shm_path = db_path.with_extension("sqlite-shm");
+        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(&shm_path);
+
+        // Open a new service from the corrupted database
+        let sk2 = SecretKey::generate();
+        let pk2 = sk2.public_key();
+        let signer = create_test_composite_signer_with_key(sk2);
+        let corrupted_db = SlashingDb::open(&db_path);
+
+        if let Ok(db) = corrupted_db {
+            // SQLite may lazily open — error surfaces on first query
+            let service = SignerService::new(signer, Arc::new(db));
+            let data = create_test_attestation_data(60, 61);
+            let result = service.sign_attestation(&data, &pk2, &fork_schedule, &genesis_root).await;
+            assert!(result.is_err(), "DB error must propagate, not be swallowed");
+        }
+        // If SlashingDb::open itself fails on corrupted file, that's also fail-closed behavior
     }
 }

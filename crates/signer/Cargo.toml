@@ -20,4 +20,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 crypto = { workspace = true, features = ["test-utils"] }
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }
