@@ -379,6 +379,92 @@ mod tests {
         assert_ne!(sig_sub0.to_bytes(), sig_sub1.to_bytes());
     }
 
+    fn compressed_test_fork_schedule() -> ForkSchedule {
+        ForkSchedule {
+            genesis_fork_version: [0x00, 0x00, 0x00, 0x00],
+            altair_fork_epoch: 10,
+            altair_fork_version: [0x01, 0x00, 0x00, 0x00],
+            bellatrix_fork_epoch: 20,
+            bellatrix_fork_version: [0x02, 0x00, 0x00, 0x00],
+            capella_fork_epoch: 30,
+            capella_fork_version: [0x03, 0x00, 0x00, 0x00],
+            deneb_fork_epoch: 40,
+            deneb_fork_version: [0x04, 0x00, 0x00, 0x00],
+            electra_fork_epoch: 50,
+            electra_fork_version: [0x05, 0x00, 0x00, 0x00],
+            fulu_fork_epoch: 60,
+            fulu_fork_version: [0x06, 0x00, 0x00, 0x00],
+        }
+    }
+
+    #[test]
+    fn test_sign_contribution_and_proof_altair() {
+        let secret_key = SecretKey::generate();
+        let public_key = secret_key.public_key();
+        let schedule = compressed_test_fork_schedule();
+        let genesis_root = test_genesis_validators_root();
+
+        let altair_slot: Slot = 10 * SLOTS_PER_EPOCH;
+        let cap = create_test_contribution_and_proof(altair_slot);
+        let sig_altair = sign_contribution_and_proof(&cap, &secret_key, &schedule, genesis_root);
+
+        // Verify signature is valid against the Altair fork version domain
+        let domain = compute_domain(
+            DOMAIN_CONTRIBUTION_AND_PROOF,
+            schedule.altair_fork_version,
+            genesis_root,
+        );
+        let signing_root = compute_signing_root(&cap, domain);
+        assert!(sig_altair.verify(&public_key, &signing_root).is_ok());
+
+        // Phase0 slot must produce a different signature (different domain)
+        let phase0_cap = create_test_contribution_and_proof(0);
+        let sig_phase0 =
+            sign_contribution_and_proof(&phase0_cap, &secret_key, &schedule, genesis_root);
+        assert_ne!(sig_altair.to_bytes(), sig_phase0.to_bytes());
+    }
+
+    #[test]
+    fn test_sign_contribution_and_proof_electra() {
+        let secret_key = SecretKey::generate();
+        let public_key = secret_key.public_key();
+        let schedule = compressed_test_fork_schedule();
+        let genesis_root = test_genesis_validators_root();
+
+        let electra_slot: Slot = 50 * SLOTS_PER_EPOCH;
+        let cap = create_test_contribution_and_proof(electra_slot);
+        let sig_electra = sign_contribution_and_proof(&cap, &secret_key, &schedule, genesis_root);
+
+        // Verify signature is valid against the Electra fork version domain
+        let domain = compute_domain(
+            DOMAIN_CONTRIBUTION_AND_PROOF,
+            schedule.electra_fork_version,
+            genesis_root,
+        );
+        let signing_root = compute_signing_root(&cap, domain);
+        assert!(sig_electra.verify(&public_key, &signing_root).is_ok());
+    }
+
+    #[test]
+    fn test_sign_contribution_and_proof_fork_boundary() {
+        let secret_key = SecretKey::generate();
+        let schedule = compressed_test_fork_schedule();
+        let genesis_root = test_genesis_validators_root();
+
+        // Last pre-Altair slot (epoch 9, last slot)
+        let pre_altair_slot: Slot = 10 * SLOTS_PER_EPOCH - 1;
+        let cap_pre = create_test_contribution_and_proof(pre_altair_slot);
+        let sig_pre = sign_contribution_and_proof(&cap_pre, &secret_key, &schedule, genesis_root);
+
+        // First Altair slot (epoch 10, first slot)
+        let altair_slot: Slot = 10 * SLOTS_PER_EPOCH;
+        let cap_post = create_test_contribution_and_proof(altair_slot);
+        let sig_post = sign_contribution_and_proof(&cap_post, &secret_key, &schedule, genesis_root);
+
+        // Fork boundary must change signing domain → different signatures
+        assert_ne!(sig_pre.to_bytes(), sig_post.to_bytes());
+    }
+
     fn create_test_contribution_and_proof(slot: Slot) -> ContributionAndProof {
         ContributionAndProof {
             aggregator_index: 42,
