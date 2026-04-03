@@ -492,6 +492,17 @@ mod tests {
             self.fail_block = true;
             self
         }
+
+        fn assert_last_sign_block_domain(&self, expected_fork: &ForkSchedule, expected_gvr: &Root) {
+            let calls = self.block_calls.lock().unwrap();
+            assert!(!calls.is_empty(), "no sign_block calls captured");
+            let last = calls.last().unwrap();
+            assert_eq!(last.fork_schedule, *expected_fork, "sign_block fork_schedule mismatch");
+            assert_eq!(
+                last.genesis_validators_root, *expected_gvr,
+                "sign_block genesis_validators_root mismatch"
+            );
+        }
     }
 
     #[async_trait(?Send)]
@@ -728,6 +739,57 @@ mod tests {
             self.fail_publish = true;
             self
         }
+
+        fn assert_last_produce_slot(&self, expected_slot: Slot) {
+            let calls = self.produce_full_calls.lock().unwrap();
+            assert!(!calls.is_empty(), "no produce_block_v3 calls captured");
+            let last = calls.last().unwrap();
+            assert_eq!(
+                last.slot, expected_slot,
+                "produce_block_v3 slot mismatch: expected {expected_slot}, got {}",
+                last.slot
+            );
+        }
+
+        fn assert_last_published_block(&self, expected_slot: Slot, expected_proposer: u64) {
+            let calls = self.publish_full_calls.lock().unwrap();
+            assert!(!calls.is_empty(), "no publish_block calls captured");
+            let last = calls.last().unwrap();
+            assert_eq!(
+                last.slot, expected_slot,
+                "published block slot mismatch: expected {expected_slot}, got {}",
+                last.slot
+            );
+            assert_eq!(
+                last.proposer_index, expected_proposer,
+                "published block proposer_index mismatch: expected {expected_proposer}, got {}",
+                last.proposer_index
+            );
+            assert!(
+                !last.signature_bytes.is_empty(),
+                "published block signature must not be empty"
+            );
+        }
+
+        fn assert_last_published_blinded_block(&self, expected_slot: Slot, expected_proposer: u64) {
+            let calls = self.publish_blinded_full_calls.lock().unwrap();
+            assert!(!calls.is_empty(), "no publish_blinded_block calls captured");
+            let last = calls.last().unwrap();
+            assert_eq!(
+                last.slot, expected_slot,
+                "published blinded block slot mismatch: expected {expected_slot}, got {}",
+                last.slot
+            );
+            assert_eq!(
+                last.proposer_index, expected_proposer,
+                "published blinded block proposer_index mismatch: expected {expected_proposer}, got {}",
+                last.proposer_index
+            );
+            assert!(
+                !last.signature_bytes.is_empty(),
+                "published blinded block signature must not be empty"
+            );
+        }
     }
 
     #[async_trait(?Send)]
@@ -938,7 +1000,19 @@ mod tests {
         let block = test_block(slot);
         let beacon = MockBeaconClient::unblinded(block);
         let signer = MockSigner::new();
-        let service = build_service(signer, beacon, &pubkey);
+        let fork = test_fork_schedule();
+        let gvr: Root = [0xaa; 32];
+
+        let signer_arc = Arc::new(signer);
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(fork.clone()),
+            gvr,
+        );
 
         let result = service.propose_block(slot, &pubkey).await;
 
@@ -949,6 +1023,10 @@ mod tests {
         assert_eq!(proposal.consensus_version, "deneb");
         assert_eq!(proposal.value_wei, Some("12345".to_string()));
         assert_ne!(proposal.block_root, [0u8; 32]);
+
+        beacon_arc.assert_last_produce_slot(slot);
+        beacon_arc.assert_last_published_block(slot, 42);
+        signer_arc.assert_last_sign_block_domain(&fork, &gvr);
     }
 
     #[tokio::test]
@@ -958,7 +1036,19 @@ mod tests {
         let block = test_blinded_block(slot);
         let beacon = MockBeaconClient::blinded(block);
         let signer = MockSigner::new();
-        let service = build_service(signer, beacon, &pubkey);
+        let fork = test_fork_schedule();
+        let gvr: Root = [0xaa; 32];
+
+        let signer_arc = Arc::new(signer);
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(fork.clone()),
+            gvr,
+        );
 
         let result = service.propose_block(slot, &pubkey).await;
 
@@ -969,6 +1059,10 @@ mod tests {
         assert_eq!(proposal.consensus_version, "deneb");
         assert!(proposal.value_wei.is_none());
         assert_ne!(proposal.block_root, [0u8; 32]);
+
+        beacon_arc.assert_last_produce_slot(slot);
+        beacon_arc.assert_last_published_blinded_block(slot, 42);
+        signer_arc.assert_last_sign_block_domain(&fork, &gvr);
     }
 
     #[tokio::test]
@@ -1143,6 +1237,8 @@ mod tests {
 
         assert_eq!(beacon_arc.publish_blinded_calls.lock().unwrap().len(), 1);
         assert!(beacon_arc.publish_calls.lock().unwrap().is_empty());
+        beacon_arc.assert_last_produce_slot(slot);
+        beacon_arc.assert_last_published_blinded_block(slot, 42);
     }
 
     #[tokio::test]
@@ -1168,6 +1264,8 @@ mod tests {
 
         assert_eq!(beacon_arc.publish_calls.lock().unwrap().len(), 1);
         assert!(beacon_arc.publish_blinded_calls.lock().unwrap().is_empty());
+        beacon_arc.assert_last_produce_slot(slot);
+        beacon_arc.assert_last_published_block(slot, 42);
     }
 
     #[tokio::test]
@@ -1602,6 +1700,8 @@ mod tests {
         let block = test_block(slot);
         let beacon = MockBeaconClient::unblinded(block);
         let signer = MockSigner::new();
+        let fork = test_fork_schedule();
+        let gvr: Root = [0xaa; 32];
 
         let signer_arc = Arc::new(signer);
         let store = test_validator_store(&pubkey);
@@ -1609,8 +1709,8 @@ mod tests {
             signer_arc.clone(),
             Arc::new(beacon),
             Arc::new(store),
-            Arc::new(test_fork_schedule()),
-            [0xaa; 32],
+            Arc::new(fork.clone()),
+            gvr,
         );
 
         let result = service.propose_block(slot, &pubkey).await;
@@ -1619,6 +1719,9 @@ mod tests {
         let calls = signer_arc.randao_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], 10); // epoch = 320/32
+        drop(calls);
+
+        signer_arc.assert_last_sign_block_domain(&fork, &gvr);
     }
 
     #[tokio::test]
@@ -1960,9 +2063,8 @@ mod tests {
         let result = service.propose_block(slot, &pubkey).await;
         assert!(result.is_ok());
 
+        beacon_arc.assert_last_produce_slot(slot);
         let calls = beacon_arc.produce_full_calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].slot, slot);
         assert!(calls[0].randao_reveal.starts_with("0x"));
         assert!(calls[0].graffiti.is_some());
         assert_eq!(calls[0].builder_boost_factor, Some(150));
@@ -1988,10 +2090,8 @@ mod tests {
         let result = service.propose_block(slot, &pubkey).await;
         assert!(result.is_ok());
 
+        beacon_arc.assert_last_published_block(slot, 42);
         let calls = beacon_arc.publish_full_calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].slot, slot);
-        assert_eq!(calls[0].proposer_index, 42);
         assert_eq!(calls[0].consensus_version, "deneb");
         assert_eq!(calls[0].signature_bytes, vec![0xbb; 96]);
     }
@@ -2016,10 +2116,8 @@ mod tests {
         let result = service.propose_block(slot, &pubkey).await;
         assert!(result.is_ok());
 
+        beacon_arc.assert_last_published_blinded_block(slot, 42);
         let calls = beacon_arc.publish_blinded_full_calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].slot, slot);
-        assert_eq!(calls[0].proposer_index, 42);
         assert_eq!(calls[0].consensus_version, "deneb");
         assert_eq!(calls[0].signature_bytes, vec![0xbb; 96]);
     }
@@ -2033,25 +2131,277 @@ mod tests {
         let signer = MockSigner::new();
 
         let signer_arc = Arc::new(signer);
-        let fork_schedule = Arc::new(test_fork_schedule());
+        let fork = test_fork_schedule();
         let gvr: Root = [0xaa; 32];
         let store = test_validator_store(&pubkey);
         let service = BlockService::new(
             signer_arc.clone(),
             Arc::new(beacon),
             Arc::new(store),
-            fork_schedule.clone(),
+            Arc::new(fork.clone()),
             gvr,
         );
 
         let result = service.propose_block(slot, &pubkey).await;
         assert!(result.is_ok());
 
+        signer_arc.assert_last_sign_block_domain(&fork, &gvr);
         let calls = signer_arc.block_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].slot, slot);
         assert_eq!(calls[0].pubkey, pubkey);
-        assert_eq!(calls[0].fork_schedule, *fork_schedule);
-        assert_eq!(calls[0].genesis_validators_root, gvr);
+    }
+
+    // --- Assertion helper tests ---
+
+    #[tokio::test]
+    async fn test_assert_last_produce_slot_passes_on_correct_slot() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        beacon_arc.assert_last_produce_slot(slot);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "produce_block_v3 slot mismatch")]
+    async fn test_assert_last_produce_slot_fails_on_wrong_slot() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        // This should panic: production code sent slot=100, we assert slot+1=101
+        beacon_arc.assert_last_produce_slot(slot + 1);
+    }
+
+    #[tokio::test]
+    async fn test_assert_last_published_block_passes_on_correct_fields() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        beacon_arc.assert_last_published_block(slot, 42);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "published block slot mismatch")]
+    async fn test_assert_last_published_block_fails_on_wrong_slot() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        beacon_arc.assert_last_published_block(slot + 1, 42);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "published block proposer_index mismatch")]
+    async fn test_assert_last_published_block_fails_on_wrong_proposer() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        beacon_arc.assert_last_published_block(slot, 99);
+    }
+
+    #[tokio::test]
+    async fn test_assert_last_published_block_checks_signature() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        // Verify signature is non-empty (MockSigner returns 0xbb * 96)
+        let calls = beacon_arc.publish_full_calls.lock().unwrap();
+        assert!(!calls[0].signature_bytes.is_empty(), "signature must be non-empty");
+        assert_eq!(calls[0].signature_bytes, vec![0xbb; 96]);
+    }
+
+    #[tokio::test]
+    async fn test_assert_last_published_blinded_block_passes() {
+        let pubkey = test_pubkey();
+        let slot = 200;
+        let block = test_blinded_block(slot);
+        let beacon = MockBeaconClient::blinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        beacon_arc.assert_last_published_blinded_block(slot, 42);
+    }
+
+    #[tokio::test]
+    async fn test_assert_last_sign_block_domain_passes_on_correct_values() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+        let fork = test_fork_schedule();
+        let gvr: Root = [0xaa; 32];
+
+        let signer_arc = Arc::new(signer);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            Arc::new(beacon),
+            Arc::new(store),
+            Arc::new(fork.clone()),
+            gvr,
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        signer_arc.assert_last_sign_block_domain(&fork, &gvr);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "sign_block fork_schedule mismatch")]
+    async fn test_assert_last_sign_block_domain_fails_on_wrong_fork() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+        let fork = test_fork_schedule();
+        let gvr: Root = [0xaa; 32];
+
+        let signer_arc = Arc::new(signer);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            Arc::new(beacon),
+            Arc::new(store),
+            Arc::new(fork),
+            gvr,
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        let mut wrong_fork = test_fork_schedule();
+        wrong_fork.altair_fork_epoch = 999;
+        signer_arc.assert_last_sign_block_domain(&wrong_fork, &gvr);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "sign_block genesis_validators_root mismatch")]
+    async fn test_assert_last_sign_block_domain_fails_on_wrong_gvr() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+        let fork = test_fork_schedule();
+        let gvr: Root = [0xaa; 32];
+
+        let signer_arc = Arc::new(signer);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            Arc::new(beacon),
+            Arc::new(store),
+            Arc::new(fork.clone()),
+            gvr,
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        let wrong_gvr: Root = [0xbb; 32];
+        signer_arc.assert_last_sign_block_domain(&fork, &wrong_gvr);
     }
 }
