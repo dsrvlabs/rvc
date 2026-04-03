@@ -256,13 +256,15 @@ mod tests {
     #[test]
     fn test_is_aggregator_modulo_committee_128() {
         // committee_length=128 → modulo = 128/16 = 8
-        // All validators are aggregators with ~12.5% probability
         use eth_types::TARGET_AGGREGATORS_PER_COMMITTEE;
         let modulo = (128u64 / TARGET_AGGREGATORS_PER_COMMITTEE).max(1);
         assert_eq!(modulo, 8);
 
-        // Verify the function runs without error
-        let _ = is_aggregator(128, &[0xaa; 96]);
+        let agg_proof = find_aggregator_proof_for_modulo(modulo);
+        assert!(is_aggregator(128, &agg_proof));
+
+        let non_agg_proof = find_non_aggregator_proof_for_modulo(modulo);
+        assert!(!is_aggregator(128, &non_agg_proof));
     }
 
     #[test]
@@ -292,10 +294,10 @@ mod tests {
 
     #[test]
     fn test_is_aggregator_different_proofs_may_differ() {
-        let proof1 = vec![0x00; 96];
-        let proof2 = vec![0x01; 96];
-        let _ = is_aggregator(128, &proof1);
-        let _ = is_aggregator(128, &proof2);
+        // committee_length=128 → modulo=8
+        let agg_proof = find_aggregator_proof_for_modulo(8);
+        let non_agg_proof = find_non_aggregator_proof_for_modulo(8);
+        assert_ne!(is_aggregator(128, &agg_proof), is_aggregator(128, &non_agg_proof),);
     }
 
     #[test]
@@ -315,12 +317,16 @@ mod tests {
 
     #[test]
     fn test_is_aggregator_large_committee() {
-        // committee_length=256 → 256/16 = 16 → ~6.25% selected
+        // committee_length=256 → 256/16 = 16
         use eth_types::TARGET_AGGREGATORS_PER_COMMITTEE;
         let modulo = (256u64 / TARGET_AGGREGATORS_PER_COMMITTEE).max(1);
         assert_eq!(modulo, 16);
 
-        let _ = is_aggregator(256, &[0xaa; 96]);
+        let agg_proof = find_aggregator_proof_for_modulo(modulo);
+        assert!(is_aggregator(256, &agg_proof));
+
+        let non_agg_proof = find_non_aggregator_proof_for_modulo(modulo);
+        assert!(!is_aggregator(256, &non_agg_proof));
     }
 
     fn sample_electra_aggregate_and_proof(slot: Slot) -> ElectraAggregateAndProof {
@@ -400,5 +406,29 @@ mod tests {
             compute_domain(DOMAIN_SELECTION_PROOF, schedule.genesis_fork_version, genesis_root);
         let wrong_signing_root = compute_signing_root(&agg_and_proof, wrong_domain);
         assert!(signature.verify(&public_key, &wrong_signing_root).is_err());
+    }
+
+    fn find_aggregator_proof_for_modulo(modulo: u64) -> Vec<u8> {
+        for i in 0u64.. {
+            let proof = i.to_le_bytes().to_vec();
+            let hash = Sha256::digest(&proof);
+            let value = u64::from_le_bytes(hash[..8].try_into().unwrap());
+            if value % modulo == 0 {
+                return proof;
+            }
+        }
+        unreachable!()
+    }
+
+    fn find_non_aggregator_proof_for_modulo(modulo: u64) -> Vec<u8> {
+        for i in 0u64.. {
+            let proof = i.to_le_bytes().to_vec();
+            let hash = Sha256::digest(&proof);
+            let value = u64::from_le_bytes(hash[..8].try_into().unwrap());
+            if value % modulo != 0 {
+                return proof;
+            }
+        }
+        unreachable!()
     }
 }

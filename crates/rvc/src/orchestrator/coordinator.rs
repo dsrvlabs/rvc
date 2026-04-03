@@ -1490,8 +1490,8 @@ mod tests {
         let slot = 100u64;
         let epoch = slot / SLOTS_PER_EPOCH;
 
-        // Use a very large committee_length so is_aggregator is very unlikely
-        // committee_length=100000 → modulo=6250 → ~0.016% chance
+        // Use committee_length=u64::MAX so is_aggregator is deterministically false
+        // modulo = u64::MAX / 16 → probability ~5.4e-18, effectively zero
         Mock::given(method("POST"))
             .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -1501,7 +1501,7 @@ mod tests {
                     "pubkey": pubkey_hex,
                     "validator_index": "42",
                     "committee_index": "1",
-                    "committee_length": "100000",
+                    "committee_length": "18446744073709551615",
                     "committees_at_slot": "4",
                     "validator_committee_index": "0",
                     "slot": slot.to_string()

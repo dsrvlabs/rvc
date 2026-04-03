@@ -306,7 +306,8 @@ mod tests {
             aggregation_bits: vec![0xff; 4],
             data: AttestationData {
                 slot: 100,
-                index: 1,
+                // EIP-7549: index must be 0 for Electra attestations
+                index: 0,
                 beacon_block_root: [1u8; 32],
                 source: Checkpoint { epoch: 3, root: [2u8; 32] },
                 target: Checkpoint { epoch: 4, root: [3u8; 32] },
