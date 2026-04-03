@@ -252,6 +252,66 @@ mod tests {
         assert_eq!(crypto_data.target.root, [0x33; 32]);
     }
 
+    fn make_duty_with_committee(
+        committee_length: &str,
+        validator_committee_index: &str,
+    ) -> AttesterDuty {
+        AttesterDuty {
+            pubkey: "0xaabb".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: committee_length.to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: validator_committee_index.to_string(),
+            slot: "100".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_aggregation_bits_index_equals_length() {
+        // Out-of-bounds: validator_committee_index == committee_length
+        // Current behavior: returns Some with only the sentinel bit set (no validator bit).
+        // The validator's position bit is silently skipped because index < length is false.
+        let duty = make_duty_with_committee("4", "4");
+        let result = make_aggregation_bits(&duty);
+        assert!(result.is_some(), "OOB index produces a bitlist with only the sentinel bit");
+        let bits_hex = result.unwrap();
+
+        // Compare with in-bounds case to show the validator bit is missing
+        let in_bounds_duty = make_duty_with_committee("4", "2");
+        let in_bounds = make_aggregation_bits(&in_bounds_duty).unwrap();
+        assert_ne!(
+            bits_hex, in_bounds,
+            "OOB result must differ from in-bounds (validator bit not set)"
+        );
+    }
+
+    #[test]
+    fn test_aggregation_bits_index_far_exceeds_length() {
+        // Out-of-bounds: validator_committee_index >> committee_length
+        // Same behavior as index == length: sentinel only, no validator bit.
+        let duty = make_duty_with_committee("4", "100");
+        let result = make_aggregation_bits(&duty);
+        assert!(result.is_some(), "far OOB index still returns a bitlist");
+
+        // Verify it matches the index-equals-length case (both produce sentinel-only bitlist)
+        let boundary_duty = make_duty_with_committee("4", "4");
+        let boundary_result = make_aggregation_bits(&boundary_duty).unwrap();
+        assert_eq!(
+            result.unwrap(),
+            boundary_result,
+            "all OOB indices produce the same sentinel-only bitlist"
+        );
+    }
+
+    #[test]
+    fn test_aggregation_bits_committee_length_zero() {
+        // committee_length == 0 returns None (early return with warning)
+        let duty = make_duty_with_committee("0", "0");
+        let result = make_aggregation_bits(&duty);
+        assert!(result.is_none(), "committee_length=0 must return None");
+    }
+
     #[test]
     fn test_convert_attestation_data_invalid_slot() {
         let beacon_data = beacon::AttestationData {
