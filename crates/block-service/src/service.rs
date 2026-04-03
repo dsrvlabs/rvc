@@ -437,13 +437,40 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use validator_store::ValidatorStore;
 
+    // --- Captured call structs ---
+
+    #[derive(Debug, Clone)]
+    struct CapturedProduceCall {
+        slot: Slot,
+        randao_reveal: String,
+        graffiti: Option<String>,
+        builder_boost_factor: Option<u64>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CapturedPublishCall {
+        consensus_version: String,
+        slot: Slot,
+        proposer_index: u64,
+        signature_bytes: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CapturedSignBlockCall {
+        block_root: Root,
+        slot: Slot,
+        pubkey: PublicKey,
+        fork_schedule: ForkSchedule,
+        genesis_validators_root: Root,
+    }
+
     // --- Mock Signer ---
 
     struct MockSigner {
         fail_randao: bool,
         fail_block: bool,
         randao_calls: Mutex<Vec<u64>>,
-        block_calls: Mutex<Vec<(Root, Slot)>>,
+        block_calls: Mutex<Vec<CapturedSignBlockCall>>,
     }
 
     impl MockSigner {
@@ -483,11 +510,17 @@ mod tests {
             &self,
             block_root: &Root,
             slot: Slot,
-            _pubkey: &PublicKey,
-            _fork_schedule: &ForkSchedule,
-            _genesis_validators_root: &Root,
+            pubkey: &PublicKey,
+            fork_schedule: &ForkSchedule,
+            genesis_validators_root: &Root,
         ) -> Result<Vec<u8>, SignerError> {
-            self.block_calls.lock().unwrap().push((*block_root, slot));
+            self.block_calls.lock().unwrap().push(CapturedSignBlockCall {
+                block_root: *block_root,
+                slot,
+                pubkey: pubkey.clone(),
+                fork_schedule: fork_schedule.clone(),
+                genesis_validators_root: *genesis_validators_root,
+            });
             if self.fail_block {
                 Err(SignerError::KeyNotFound("test".to_string()))
             } else {
@@ -601,6 +634,9 @@ mod tests {
         publish_calls: Mutex<Vec<String>>,
         publish_blinded_calls: Mutex<Vec<String>>,
         publish_ssz_calls: Mutex<Vec<(Vec<u8>, String, bool)>>,
+        produce_full_calls: Mutex<Vec<CapturedProduceCall>>,
+        publish_full_calls: Mutex<Vec<CapturedPublishCall>>,
+        publish_blinded_full_calls: Mutex<Vec<CapturedPublishCall>>,
     }
 
     impl MockBeaconClient {
@@ -620,6 +656,9 @@ mod tests {
                 publish_calls: Mutex::new(Vec::new()),
                 publish_blinded_calls: Mutex::new(Vec::new()),
                 publish_ssz_calls: Mutex::new(Vec::new()),
+                produce_full_calls: Mutex::new(Vec::new()),
+                publish_full_calls: Mutex::new(Vec::new()),
+                publish_blinded_full_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -639,6 +678,9 @@ mod tests {
                 publish_calls: Mutex::new(Vec::new()),
                 publish_blinded_calls: Mutex::new(Vec::new()),
                 publish_ssz_calls: Mutex::new(Vec::new()),
+                produce_full_calls: Mutex::new(Vec::new()),
+                publish_full_calls: Mutex::new(Vec::new()),
+                publish_blinded_full_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -671,6 +713,9 @@ mod tests {
                 publish_calls: Mutex::new(Vec::new()),
                 publish_blinded_calls: Mutex::new(Vec::new()),
                 publish_ssz_calls: Mutex::new(Vec::new()),
+                produce_full_calls: Mutex::new(Vec::new()),
+                publish_full_calls: Mutex::new(Vec::new()),
+                publish_blinded_full_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -689,11 +734,17 @@ mod tests {
     impl BeaconBlockClient for MockBeaconClient {
         async fn produce_block_v3(
             &self,
-            _slot: Slot,
-            _randao_reveal: &str,
-            _graffiti: Option<&str>,
-            _builder_boost_factor: Option<u64>,
+            slot: Slot,
+            randao_reveal: &str,
+            graffiti: Option<&str>,
+            builder_boost_factor: Option<u64>,
         ) -> Result<ProduceBlockResponse, BlockServiceError> {
+            self.produce_full_calls.lock().unwrap().push(CapturedProduceCall {
+                slot,
+                randao_reveal: randao_reveal.to_string(),
+                graffiti: graffiti.map(|s| s.to_string()),
+                builder_boost_factor,
+            });
             if self.fail_produce {
                 return Err(BlockServiceError::Beacon("beacon down".to_string()));
             }
@@ -702,10 +753,16 @@ mod tests {
 
         async fn publish_block(
             &self,
-            _signed_block: &SignedBeaconBlock,
+            signed_block: &SignedBeaconBlock,
             consensus_version: &str,
         ) -> Result<(), BlockServiceError> {
             self.publish_calls.lock().unwrap().push(consensus_version.to_string());
+            self.publish_full_calls.lock().unwrap().push(CapturedPublishCall {
+                consensus_version: consensus_version.to_string(),
+                slot: signed_block.message.slot,
+                proposer_index: signed_block.message.proposer_index,
+                signature_bytes: signed_block.signature.clone(),
+            });
             if self.fail_publish {
                 return Err(BlockServiceError::Beacon("publish failed".to_string()));
             }
@@ -714,10 +771,16 @@ mod tests {
 
         async fn publish_blinded_block(
             &self,
-            _signed_block: &SignedBlindedBeaconBlock,
+            signed_block: &SignedBlindedBeaconBlock,
             consensus_version: &str,
         ) -> Result<(), BlockServiceError> {
             self.publish_blinded_calls.lock().unwrap().push(consensus_version.to_string());
+            self.publish_blinded_full_calls.lock().unwrap().push(CapturedPublishCall {
+                consensus_version: consensus_version.to_string(),
+                slot: signed_block.message.slot,
+                proposer_index: signed_block.message.proposer_index,
+                signature_bytes: signed_block.signature.clone(),
+            });
             if self.fail_publish {
                 return Err(BlockServiceError::Beacon("publish failed".to_string()));
             }
@@ -1194,8 +1257,8 @@ mod tests {
         let blinded_calls = signer2_arc.block_calls.lock().unwrap();
         assert_eq!(unblinded_calls.len(), 1);
         assert_eq!(blinded_calls.len(), 1);
-        assert_eq!(unblinded_calls[0].0, unblinded_result.block_root);
-        assert_eq!(blinded_calls[0].0, blinded_result.block_root);
+        assert_eq!(unblinded_calls[0].block_root, unblinded_result.block_root);
+        assert_eq!(blinded_calls[0].block_root, blinded_result.block_root);
     }
 
     // --- SSZ path tests ---
@@ -1367,7 +1430,7 @@ mod tests {
         // Verify signer was called with the tree_hash root
         let block_calls = signer_arc.block_calls.lock().unwrap();
         assert_eq!(block_calls.len(), 1);
-        assert_eq!(block_calls[0].0, expected_root);
+        assert_eq!(block_calls[0].block_root, expected_root);
     }
 
     #[test]
@@ -1873,5 +1936,122 @@ mod tests {
         assert!(result.is_ok());
         let boost = *service.beacon.boost_arg.lock().unwrap();
         assert_eq!(boost, Some(0));
+    }
+
+    // --- CapturedCall infrastructure tests ---
+
+    #[tokio::test]
+    async fn test_produce_call_captures_slot_and_args() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        let calls = beacon_arc.produce_full_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].slot, slot);
+        assert!(calls[0].randao_reveal.starts_with("0x"));
+        assert!(calls[0].graffiti.is_some());
+        assert_eq!(calls[0].builder_boost_factor, Some(150));
+    }
+
+    #[tokio::test]
+    async fn test_publish_call_captures_block_fields() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        let calls = beacon_arc.publish_full_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].slot, slot);
+        assert_eq!(calls[0].proposer_index, 42);
+        assert_eq!(calls[0].consensus_version, "deneb");
+        assert_eq!(calls[0].signature_bytes, vec![0xbb; 96]);
+    }
+
+    #[tokio::test]
+    async fn test_publish_blinded_call_captures_block_fields() {
+        let pubkey = test_pubkey();
+        let slot = 200;
+        let block = test_blinded_block(slot);
+        let beacon = MockBeaconClient::blinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        let calls = beacon_arc.publish_blinded_full_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].slot, slot);
+        assert_eq!(calls[0].proposer_index, 42);
+        assert_eq!(calls[0].consensus_version, "deneb");
+        assert_eq!(calls[0].signature_bytes, vec![0xbb; 96]);
+    }
+
+    #[tokio::test]
+    async fn test_sign_block_captures_fork_schedule_and_genesis_root() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+
+        let signer_arc = Arc::new(signer);
+        let fork_schedule = Arc::new(test_fork_schedule());
+        let gvr: Root = [0xaa; 32];
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            Arc::new(beacon),
+            Arc::new(store),
+            fork_schedule.clone(),
+            gvr,
+        );
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
+
+        let calls = signer_arc.block_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].slot, slot);
+        assert_eq!(calls[0].pubkey, pubkey);
+        assert_eq!(calls[0].fork_schedule, *fork_schedule);
+        assert_eq!(calls[0].genesis_validators_root, gvr);
     }
 }
