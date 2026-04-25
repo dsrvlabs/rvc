@@ -79,11 +79,11 @@ async fn test_blinded_block_double_proposal_rejected() {
 }
 
 // --------------------------------------------------------------------------
-// Test 3: signer failure returns NotFound; slashing row pre-committed
+// Test 3: signer failure does NOT persist a row (A15 stage→sign→commit)
 // --------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_blinded_block_signer_failure_returns_not_found() {
+async fn test_blinded_block_signer_failure_does_not_persist_row() {
     use helpers::make_service_with_db_unknown_key;
 
     let (svc, db_path) = make_service_with_db_unknown_key();
@@ -99,9 +99,12 @@ async fn test_blinded_block_signer_failure_returns_not_found() {
         svc.sign_blinded_beacon_block(req).await.expect_err("sign should fail for unknown key");
     assert_eq!(err.code(), tonic::Code::NotFound);
 
+    // Critical: no phantom row on signer failure (A15 guarantee).
     let db = slashing::SlashingDb::open(&db_path).expect("re-open db");
     let pubkey_hex = format!("0x{}", hex::encode(*KNOWN_PUBKEY_BYTES));
     let blocks = db.get_blocks(&pubkey_hex).expect("get_blocks");
-    assert_eq!(blocks.len(), 1, "slashing row is committed before sign (conservative design)");
-    assert_eq!(blocks[0].slot, 400);
+    assert!(
+        blocks.is_empty(),
+        "signer failure must not commit a slashing row — no phantom row (A15 stage→sign→commit)"
+    );
 }

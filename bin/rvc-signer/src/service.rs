@@ -10,72 +10,53 @@
 //! `SignRandaoReveal` are implemented here (ISSUE-1.6a).  The remaining 7
 //! typed RPCs land in ISSUE-1.6b–d.
 //!
-//! # Lock-vs-await strategy
+//! # Lock-vs-await strategy for slashable block RPCs
 //!
-//! `StagedBlock<'_>` / `StagedAttestation<'_>` hold a `parking_lot::MutexGuard`
-//! (`!Send`) over the SQLite connection.  They **cannot** be held across an
-//! `.await` boundary in a multi-threaded tokio runtime.
+//! `StagedBlock<'_>` holds a `parking_lot::MutexGuard` (`!Send`).  Holding it
+//! across an `.await` boundary is a compile error in a multi-threaded tokio
+//! runtime.  The correct solution — and the only one that preserves the
+//! stage → sign → commit semantic required by ISSUE-1.4 / architecture A15 —
+//! is to run the entire triple on a single OS thread via
+//! `tokio::task::spawn_blocking`.
 //!
-//! Resolution chosen: **split the locking window** — the slashing check and
-//! commit are done in two *separate* synchronous sections, with the async
-//! backend sign call in between.  Concretely:
+//! ## Why `spawn_blocking` + `Handle::block_on` is the right fit
 //!
-//! 1. Validate + compute signing root (synchronous, no lock needed).
-//! 2. `stage_block(...)` — acquires the DB mutex, runs the EIP-3076 check,
-//!    leaves the transaction open.  We immediately call `commit()` in the same
-//!    synchronous section and pass the pre-computed signing root as proof.
-//!    Wait — that loses the "commit only on signer success" guarantee.
+//! `tokio::task::spawn_blocking` runs a closure on a dedicated thread-pool
+//! thread that is allowed to block.  `tokio::runtime::Handle::current()` returns
+//! a handle to the current runtime, and `handle.block_on(future)` drives a
+//! future to completion on that same thread — this is the documented way to call
+//! async code from a blocking context (e.g. from within `spawn_blocking`).
 //!
-//! Actually: we restructure around the fact that `parking_lot::MutexGuard`
-//! is `!Send` but the guard can be held for the *entire* sync sub-task.  We use
-//! `tokio::task::spawn_blocking` to run stage+sign+commit on a dedicated blocking
-//! thread where `.await` is not needed.  The backend `sign` call on `BasicSigner`
-//! is already synchronous under the hood (`BLS::sign` is CPU-bound, sub-ms),
-//! so wrapping it in `spawn_blocking` is sound.
+//! ```text
+//! spawn_blocking(move || {
+//!     let staged = scoped.stage_block(...)?;   // acquires MutexGuard
+//!     let sig = Handle::current()
+//!         .block_on(backend.sign(...));        // async sign, no .await on calling task
+//!     match sig {
+//!         Ok(sig) => { staged.commit()?; Ok(sig) }
+//!         Err(e)  => { staged.discard();    Err(e) }
+//!     }
+//! }).await
+//! ```
 //!
-//! Strategy: `spawn_blocking(|| { stage → sign_sync → commit })`.
-//! `BasicSigner` exposes a sync `sign_sync` path; for the async `SigningBackend`
-//! trait we instead pass the pre-computed signing root and pubkey into
-//! `spawn_blocking`, acquire the DB lock, run the violation check, call
-//! `backend.sign_sync()` if available, otherwise use a channel to hand the
-//! result back out.
+//! The `StagedBlock` guard — and the `MutexGuard` it contains — never crosses
+//! an OS-thread boundary: everything runs on the same `spawn_blocking` thread.
+//! The async `backend.sign` future is resolved via `block_on`, which drives the
+//! future to completion without suspending the closure.
 //!
-//! **Simpler alternative chosen**: We break the atomic "stage → sign → commit"
-//! into a "check + reserve" step followed by a sign then a "finalize" step:
+//! ## Consequence
 //!
-//! 1. `stage_block(slot, root)` — acquire lock, check violations, **commit** the
-//!    row immediately (conservative: behaves like the old `check_and_record`).
-//! 2. `backend.sign(root, pubkey).await`.
-//! 3. On sign success → return sig.  On sign failure → **delete the row** that
-//!    was just committed (compensating action).
+//! - Signer failure → `staged.discard()` → DB transaction rolled back → no
+//!   phantom row (M-1 fix, per architecture A15).
+//! - Signer success → `staged.commit()` → row persisted atomically.
+//! - `sign_randao_reveal` has no slashing check and does not use staging; it
+//!   calls `backend.sign` directly via `.await` in the async handler.
 //!
-//! This preserves the safety invariant (only signed roots survive in DB) while
-//! keeping the async sign call outside the mutex window.  The trade-off vs the
-//! RAII guard design: there is a tiny window between commit and the compensating
-//! delete where a signer crash would leave a phantom row.  This is equivalent to
-//! the pre-A15 behavior and is acceptable for ISSUE-1.6a; the pure RAII approach
-//! (spawn_blocking with sync sign) can replace it in a future ISSUE when
-//! `BasicSigner` gains a sync trait.
+//! ## `SigningBackend` is `Send + Sync`
 //!
-//! **Update — actual implementation**: after reading `stage.rs` more carefully,
-//! `StagedBlock` holds a `MutexGuard` but does NOT implement `Send`.  However,
-//! `spawn_blocking` requires `Send`.  So the split approach above is used:
-//! the stage guard is acquired and committed/discarded before the `.await` on
-//! sign.
-//!
-//! FINAL strategy:
-//! - `stage_block` → if OK, immediately consume the guard via `commit()` (row
-//!   committed) before the `.await`.
-//! - `backend.sign(...).await`.
-//! - If sign fails → we cannot un-commit, BUT we can log a warning.  The row is
-//!   still safe (it records the intent to sign slot N; re-signing slot N with the
-//!   same root is idempotent; re-signing with a different root is caught by the
-//!   double-proposal check which is correct behavior).
-//!
-//! This is the **safe conservative** approach: over-protective (phantom rows on
-//! signer failure) rather than under-protective (unsigned rows in DB).  The
-//! pure RAII approach that avoids phantom rows entirely requires a sync sign path
-//! and is deferred to a follow-up issue.
+//! Because `SigningBackend` is `Send + Sync`, the `Arc<dyn SigningBackend>` can
+//! be moved into the `spawn_blocking` closure and the inner async future it
+//! spawns is also `Send`, which is what `Handle::block_on` requires.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -329,6 +310,7 @@ impl SignerService for SignerServiceImpl {
 impl SignerServiceV2 for SignerServiceImpl {
     // ── SignBeaconBlock ───────────────���───────────────────────────────────────
 
+    #[allow(clippy::result_large_err)]
     #[tracing::instrument(name = "rvc.signer.v2.sign_beacon_block", skip_all, fields(pubkey, slot))]
     async fn sign_beacon_block(
         &self,
@@ -357,55 +339,56 @@ impl SignerServiceV2 for SignerServiceImpl {
         let db = self.require_db()?;
         let scoped = ScopedSlashingDb::new(Arc::clone(db), client_cn.clone(), gvr);
 
-        // Stage the block — acquires the DB mutex, runs EIP-3076 check.
-        // IMPORTANT: commit() is called immediately here (before the .await below)
-        // because StagedBlock holds a parking_lot::MutexGuard which is !Send and
-        // cannot be held across an .await in a multi-threaded tokio runtime.
+        // Stage → sign → commit, all on one OS thread via spawn_blocking.
         //
-        // Trade-off: this is the "safe conservative" approach — the row is committed
-        // before the sign, so a signer failure leaves a committed row (same behavior
-        // as the pre-A15 check_and_record flow). The row is still safe: re-signing
-        // the same (pubkey, slot, signing_root) is idempotent; re-signing with a
-        // different root for the same slot is caught by the double-proposal check.
-        // The pure RAII approach (stage → sign_sync → commit) requires a sync sign
-        // path and is deferred to a future issue.
-        {
+        // `StagedBlock<'_>` holds a `parking_lot::MutexGuard` (`!Send`) and
+        // therefore cannot be held across an `.await`.  We run the entire
+        // stage+sign+commit triple inside `spawn_blocking`; the async
+        // `backend.sign` call is resolved via `Handle::current().block_on()`
+        // which drives the future to completion on the same blocking thread.
+        //
+        // On signer error the staged guard is discarded (transaction rolled
+        // back), so no phantom row is committed — this is the A15 guarantee.
+        let backend = Arc::clone(&self.backend);
+        let handle = tokio::runtime::Handle::current();
+
+        let sig = tokio::task::spawn_blocking(move || -> Result<[u8; 96], Status> {
             let staged = scoped
                 .stage_block(&pubkey_hex_str, slot, signing_root_hex)
                 .map_err(slashing_err)?;
-            staged
-                .commit()
-                .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")))?;
-        } // MutexGuard released here before .await
 
-        // Sign the block (async, after releasing the DB mutex).
-        let sign_result = self.backend.sign(&signing_root, &pubkey).await;
+            let sign_result = handle.block_on(backend.sign(&signing_root, &pubkey));
 
-        match sign_result {
-            Ok(sig) => {
-                tracing::info!(
-                    pubkey = %pubkey_hex_str,
-                    slot,
-                    client_cn = %client_cn,
-                    "sign_beacon_block: success"
-                );
-                Ok(Response::new(SignResponseV2 { signature: sig.to_vec() }))
+            match sign_result {
+                Ok(sig) => {
+                    staged
+                        .commit()
+                        .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")))?;
+                    Ok(sig)
+                }
+                Err(e) => {
+                    staged.discard();
+                    Err(backend_err_to_status(e))
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    pubkey = %pubkey_hex_str,
-                    slot,
-                    client_cn = %client_cn,
-                    error = %e,
-                    "sign_beacon_block: backend error (slashing row already committed)"
-                );
-                Err(backend_err_to_status(e))
-            }
-        }
+        })
+        .await
+        .map_err(|join_err| {
+            Status::internal(format!("sign_beacon_block blocking task panicked: {join_err}"))
+        })??;
+
+        tracing::info!(
+            pubkey = %pubkey_hex(&pubkey),
+            slot,
+            client_cn = %client_cn,
+            "sign_beacon_block: success"
+        );
+        Ok(Response::new(SignResponseV2 { signature: sig.to_vec() }))
     }
 
     // ── SignBlindedBeaconBlock ───────────────────────────────��────────────────
 
+    #[allow(clippy::result_large_err)]
     #[tracing::instrument(
         name = "rvc.signer.v2.sign_blinded_beacon_block",
         skip_all,
@@ -438,40 +421,45 @@ impl SignerServiceV2 for SignerServiceImpl {
         let db = self.require_db()?;
         let scoped = ScopedSlashingDb::new(Arc::clone(db), client_cn.clone(), gvr);
 
-        // Same conservative commit-before-sign pattern as sign_beacon_block.
-        // See the design note there for the rationale.
-        {
+        // Same stage → sign → commit pattern as sign_beacon_block.
+        // See the module-level docstring for the spawn_blocking + block_on rationale.
+        let backend = Arc::clone(&self.backend);
+        let handle = tokio::runtime::Handle::current();
+
+        let sig = tokio::task::spawn_blocking(move || -> Result<[u8; 96], Status> {
             let staged = scoped
                 .stage_block(&pubkey_hex_str, slot, signing_root_hex)
                 .map_err(slashing_err)?;
-            staged
-                .commit()
-                .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")))?;
-        }
 
-        let sign_result = self.backend.sign(&signing_root, &pubkey).await;
+            let sign_result = handle.block_on(backend.sign(&signing_root, &pubkey));
 
-        match sign_result {
-            Ok(sig) => {
-                tracing::info!(
-                    pubkey = %pubkey_hex_str,
-                    slot,
-                    client_cn = %client_cn,
-                    "sign_blinded_beacon_block: success"
-                );
-                Ok(Response::new(SignResponseV2 { signature: sig.to_vec() }))
+            match sign_result {
+                Ok(sig) => {
+                    staged
+                        .commit()
+                        .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")))?;
+                    Ok(sig)
+                }
+                Err(e) => {
+                    staged.discard();
+                    Err(backend_err_to_status(e))
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    pubkey = %pubkey_hex_str,
-                    slot,
-                    client_cn = %client_cn,
-                    error = %e,
-                    "sign_blinded_beacon_block: backend error (slashing row already committed)"
-                );
-                Err(backend_err_to_status(e))
-            }
-        }
+        })
+        .await
+        .map_err(|join_err| {
+            Status::internal(format!(
+                "sign_blinded_beacon_block blocking task panicked: {join_err}"
+            ))
+        })??;
+
+        tracing::info!(
+            pubkey = %pubkey_hex(&pubkey),
+            slot,
+            client_cn = %client_cn,
+            "sign_blinded_beacon_block: success"
+        );
+        Ok(Response::new(SignResponseV2 { signature: sig.to_vec() }))
     }
 
     // ── SignRandaoReveal ──────────────────────���───────────────────────────────
@@ -785,16 +773,33 @@ mod tests {
 
     #[tokio::test]
     async fn test_v2_sign_beacon_block_unknown_key_returns_not_found() {
-        let svc = make_service_v2(MockBackend::empty());
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db_path = tmp.path().to_path_buf();
+        let db = Arc::new(slashing::SlashingDb::open(&db_path).unwrap());
+        std::mem::forget(tmp);
+        let pubkey = [1u8; 48];
+        let svc = SignerServiceImpl::new_v2(
+            Arc::new(MockBackend::empty()),
+            "basic".to_string(),
+            Arc::clone(&db),
+        );
 
         let req = Request::new(SignBeaconBlockRequest {
-            pubkey: vec![1u8; 48],
+            pubkey: pubkey.to_vec(),
             fork_info: Some(sample_fork_info()),
             block_ssz: sample_block_ssz(42),
             fork_id: 4,
         });
         let err = svc.sign_beacon_block(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::NotFound);
+
+        // Critical: signer failure must NOT leave a phantom row (M-1 fix, A15).
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey));
+        let blocks = db.get_blocks(&pubkey_hex).expect("get_blocks");
+        assert!(
+            blocks.is_empty(),
+            "signer failure must not commit a slashing row (stage→sign→commit A15)"
+        );
     }
 
     #[tokio::test]

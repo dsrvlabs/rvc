@@ -79,16 +79,15 @@ async fn test_block_double_proposal_rejected() {
 }
 
 // --------------------------------------------------------------------------
-// Test 3: signer failure returns NotFound; slashing row is pre-committed
+// Test 3: signer failure does NOT persist a row (A15 stage→sign→commit)
 //
-// DESIGN NOTE: This implementation uses "commit-before-sign" to avoid holding
-// the !Send parking_lot::MutexGuard across the async sign call.  The slashing
-// row is committed before the sign; a signer failure leaves the row in the DB
-// (preventing slashable replay), which is the safe conservative behavior.
+// With spawn_blocking + Handle::block_on the StagedBlock guard is discarded
+// on signer error before the transaction is committed, so no phantom row is
+// written to the DB.  This is the core M-1 fix from architecture A15.
 // --------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_block_signer_failure_returns_not_found() {
+async fn test_block_signer_failure_does_not_persist_row() {
     use helpers::make_service_with_db_unknown_key;
 
     let (svc, db_path) = make_service_with_db_unknown_key();
@@ -103,10 +102,12 @@ async fn test_block_signer_failure_returns_not_found() {
     let err = svc.sign_beacon_block(req).await.expect_err("sign should fail for unknown key");
     assert_eq!(err.code(), tonic::Code::NotFound, "unknown key must return NotFound");
 
-    // Row IS committed (conservative design) — prevents slashable replay
+    // Critical: the slashing row must NOT be committed when the signer fails.
     let db = slashing::SlashingDb::open(&db_path).expect("re-open db");
     let pubkey_hex = format!("0x{}", hex::encode(*KNOWN_PUBKEY_BYTES));
     let blocks = db.get_blocks(&pubkey_hex).expect("get_blocks");
-    assert_eq!(blocks.len(), 1, "slashing row is committed before sign (conservative design)");
-    assert_eq!(blocks[0].slot, 77);
+    assert!(
+        blocks.is_empty(),
+        "signer failure must not commit a slashing row — no phantom row (A15 stage→sign→commit)"
+    );
 }
