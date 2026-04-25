@@ -65,6 +65,44 @@ fn resolve_block_offset(bytes: &[u8], format: SszBlockFormat) -> Result<usize, B
     }
 }
 
+/// Resolves where the `BeaconBlock` region ends within `bytes`.
+///
+/// For `BeaconBlock` format the block fills the entire payload. For
+/// `BlockContents` (Deneb+ unblinded path) the outer SSZ container holds three
+/// variable-length fields — `(BeaconBlock, kzg_proofs, blobs)` — and the second
+/// 4-byte offset (`bytes[4..8]`) marks the start of the `kzg_proofs` region,
+/// which is the upper bound of the BeaconBlock body. Reading past that bound
+/// pulls KZG-proof bytes into `body` and corrupts the recomputed root.
+fn resolve_block_region_end(
+    bytes: &[u8],
+    format: SszBlockFormat,
+    block_offset: usize,
+) -> Result<usize, BeaconError> {
+    match format {
+        SszBlockFormat::BeaconBlock => Ok(bytes.len()),
+        SszBlockFormat::BlockContents => {
+            // BLOCK_CONTENTS_FIXED_LEN bytes already verified by resolve_block_offset.
+            let kzg_offset =
+                u32::from_le_bytes(bytes[4..8].try_into().expect("slice length verified above"))
+                    as usize;
+            if kzg_offset < block_offset {
+                return Err(BeaconError::ParseError(format!(
+                    "SSZ BlockContents kzg_proofs offset {} precedes block offset {}",
+                    kzg_offset, block_offset,
+                )));
+            }
+            if kzg_offset > bytes.len() {
+                return Err(BeaconError::ParseError(format!(
+                    "SSZ BlockContents kzg_proofs offset {} exceeds buffer length {}",
+                    kzg_offset,
+                    bytes.len(),
+                )));
+            }
+            Ok(kzg_offset)
+        }
+    }
+}
+
 /// Extracts slot and proposer_index from raw SSZ bytes.
 ///
 /// The `format` parameter determines how to locate the `BeaconBlock` within
@@ -119,7 +157,8 @@ pub fn deserialize_beacon_block_from_ssz(
     format: SszBlockFormat,
 ) -> Result<(BeaconBlock, usize), BeaconError> {
     let block_offset = resolve_block_offset(bytes, format)?;
-    let block = deserialize_block_fields(bytes, block_offset)?;
+    let block_region_end = resolve_block_region_end(bytes, format, block_offset)?;
+    let block = deserialize_block_fields(bytes, block_offset, block_region_end)?;
     Ok((block, block_offset))
 }
 
@@ -136,7 +175,8 @@ pub fn deserialize_blinded_beacon_block_from_ssz(
     format: SszBlockFormat,
 ) -> Result<(BlindedBeaconBlock, usize), BeaconError> {
     let block_offset = resolve_block_offset(bytes, format)?;
-    let block = deserialize_block_fields(bytes, block_offset)?;
+    let block_region_end = resolve_block_region_end(bytes, format, block_offset)?;
+    let block = deserialize_block_fields(bytes, block_offset, block_region_end)?;
     let blinded = BlindedBeaconBlock {
         slot: block.slot,
         proposer_index: block.proposer_index,
@@ -148,18 +188,24 @@ pub fn deserialize_blinded_beacon_block_from_ssz(
 }
 
 /// Parses the fixed fields and body of a `BeaconBlock` starting at `block_offset`.
-fn deserialize_block_fields(bytes: &[u8], block_offset: usize) -> Result<BeaconBlock, BeaconError> {
+///
+/// `block_region_end` is the upper bound of the block region within `bytes`
+/// (computed by `resolve_block_region_end`); for `BlockContents` payloads it is
+/// the kzg_proofs offset, for raw `BeaconBlock` it is `bytes.len()`. Reading
+/// past this bound corrupts the body with kzg/blob bytes — see C-1 / ISSUE-1.1.
+fn deserialize_block_fields(
+    bytes: &[u8],
+    block_offset: usize,
+    block_region_end: usize,
+) -> Result<BeaconBlock, BeaconError> {
     let fixed_end = block_offset
         .checked_add(BEACON_BLOCK_FIXED_LEN)
         .ok_or_else(|| BeaconError::ParseError("SSZ offset overflow".to_string()))?;
 
-    if bytes.len() < fixed_end {
+    if block_region_end < fixed_end {
         return Err(BeaconError::ParseError(format!(
-            "SSZ BeaconBlock too short: {} bytes, need at least {} (offset {} + fixed {})",
-            bytes.len(),
-            fixed_end,
-            block_offset,
-            BEACON_BLOCK_FIXED_LEN,
+            "SSZ BeaconBlock too short: region ends at {}, need at least {} (offset {} + fixed {})",
+            block_region_end, fixed_end, block_offset, BEACON_BLOCK_FIXED_LEN,
         )));
     }
 
@@ -183,11 +229,6 @@ fn deserialize_block_fields(bytes: &[u8], block_offset: usize) -> Result<BeaconB
             body_offset_rel, BEACON_BLOCK_FIXED_LEN,
         )));
     }
-
-    // Determine the end of the BeaconBlock region within bytes.
-    // For BlockContents, the second offset (kzg_proofs) marks the end of BeaconBlock.
-    // For bare BeaconBlock, it extends to the end of bytes.
-    let block_region_end = bytes.len();
 
     let body_start = block_offset + body_offset_rel;
     if body_start > block_region_end {
@@ -463,7 +504,7 @@ mod tests {
         let block_ssz = build_beacon_block_ssz(200, 55, parent_root, state_root, &body);
         let block_len = block_ssz.len();
 
-        // BlockContents: [block_offset(4) | kzg_offset(4) | blobs_offset(4) | BeaconBlock...]
+        // BlockContents: [block_offset(4) | kzg_offset(4) | blobs_offset(4) | BeaconBlock | kzg | blobs]
         let block_offset: u32 = 12;
         let kzg_offset: u32 = block_offset + block_len as u32;
         let blobs_offset: u32 = kzg_offset;
@@ -482,10 +523,133 @@ mod tests {
         assert_eq!(block.proposer_index, 55);
         assert_eq!(block.parent_root, parent_root);
         assert_eq!(block.state_root, state_root);
-        // Body includes everything from body_offset to end of buffer (past kzg/blobs area)
-        // since we don't limit by kzg_offset in the current implementation.
-        // The body starts at block_offset + 84 = 96 and goes to end of buf.
-        assert!(block.body.starts_with(&body));
+        // Body is bounded by kzg_offset (no kzg/blobs trailing data here).
+        assert_eq!(block.body, body);
+    }
+
+    /// Regression for C-1 / ISSUE-1.1: when parsing a `BlockContents` payload that
+    /// contains real kzg_proofs and blobs trailing data, the body region MUST be
+    /// bounded by the kzg_proofs offset from the outer SSZ container — not the
+    /// end of the buffer. Otherwise the recomputed `tree_hash_root` drifts from
+    /// the BN-reported root because the body absorbs kzg/blob bytes.
+    #[test]
+    fn test_block_contents_kzg_offset_bounds_body_with_trailing_data() {
+        use tree_hash::TreeHash;
+
+        let parent_root = [0xa1; 32];
+        let state_root = [0xa2; 32];
+        let body = vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+
+        let block_ssz = build_beacon_block_ssz(1234, 567, parent_root, state_root, &body);
+        let block_len = block_ssz.len() as u32;
+
+        // Two kzg "proofs" of 48 bytes each + one 131072-byte blob region marker.
+        let kzg_data = vec![0xee; 48 * 2];
+        let blobs_data = vec![0xdd; 256];
+
+        let block_offset: u32 = 12;
+        let kzg_offset: u32 = block_offset + block_len;
+        let blobs_offset: u32 = kzg_offset + kzg_data.len() as u32;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&block_offset.to_le_bytes());
+        buf.extend_from_slice(&kzg_offset.to_le_bytes());
+        buf.extend_from_slice(&blobs_offset.to_le_bytes());
+        buf.extend_from_slice(&block_ssz);
+        buf.extend_from_slice(&kzg_data);
+        buf.extend_from_slice(&blobs_data);
+
+        let (parsed, offset) =
+            deserialize_beacon_block_from_ssz(&buf, SszBlockFormat::BlockContents).unwrap();
+
+        assert_eq!(offset, 12);
+        assert_eq!(parsed.slot, 1234);
+        assert_eq!(parsed.proposer_index, 567);
+
+        // Body must equal exactly the inner block body — no kzg/blob bleed-through.
+        assert_eq!(parsed.body, body);
+        assert!(!parsed.body.contains(&0xee), "body must not include kzg_proofs bytes");
+        assert!(!parsed.body.contains(&0xdd), "body must not include blobs bytes");
+
+        // Recomputed root matches the canonical root of the inner BeaconBlock.
+        let canonical = BeaconBlock {
+            slot: 1234,
+            proposer_index: 567,
+            parent_root,
+            state_root,
+            body: body.clone(),
+        };
+        assert_eq!(parsed.tree_hash_root(), canonical.tree_hash_root());
+    }
+
+    #[test]
+    fn test_block_contents_kzg_offset_used_as_block_end_deneb() {
+        // Deneb: 2 kzg proofs (96 bytes) + 1 blob (representative).
+        // Verifies the offset-table parse picks kzg_offset (not bytes.len()).
+        let block_ssz =
+            build_beacon_block_ssz(7_000_000, 1234, [0x10; 32], [0x20; 32], &[0xab; 96]);
+        let block_offset: u32 = 12;
+        let kzg_offset: u32 = block_offset + block_ssz.len() as u32;
+        let kzg = vec![0x77; 96];
+        let blobs_offset: u32 = kzg_offset + kzg.len() as u32;
+        let blobs = vec![0x88; 131072];
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&block_offset.to_le_bytes());
+        buf.extend_from_slice(&kzg_offset.to_le_bytes());
+        buf.extend_from_slice(&blobs_offset.to_le_bytes());
+        buf.extend_from_slice(&block_ssz);
+        buf.extend_from_slice(&kzg);
+        buf.extend_from_slice(&blobs);
+
+        let (block, _) =
+            deserialize_beacon_block_from_ssz(&buf, SszBlockFormat::BlockContents).unwrap();
+        assert_eq!(block.slot, 7_000_000);
+        assert_eq!(block.body.len(), 96);
+        assert!(block.body.iter().all(|b| *b == 0xab));
+    }
+
+    #[test]
+    fn test_block_contents_kzg_offset_used_as_block_end_electra() {
+        // Electra slot range — same offset semantics, just a different fork epoch.
+        let block_ssz = build_beacon_block_ssz(11_649_024, 99, [0xee; 32], [0xff; 32], &[0xbb; 64]);
+        let block_offset: u32 = 12;
+        let kzg_offset: u32 = block_offset + block_ssz.len() as u32;
+        let blobs_offset: u32 = kzg_offset;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&block_offset.to_le_bytes());
+        buf.extend_from_slice(&kzg_offset.to_le_bytes());
+        buf.extend_from_slice(&blobs_offset.to_le_bytes());
+        buf.extend_from_slice(&block_ssz);
+        buf.extend_from_slice(&[0x99; 64]); // trailing data past kzg_offset
+
+        let (block, _) =
+            deserialize_beacon_block_from_ssz(&buf, SszBlockFormat::BlockContents).unwrap();
+        assert_eq!(block.slot, 11_649_024);
+        assert_eq!(block.body, vec![0xbb; 64]);
+    }
+
+    #[test]
+    fn test_block_contents_kzg_offset_used_as_block_end_fulu() {
+        // Fulu slot range — same offset semantics.
+        let block_ssz =
+            build_beacon_block_ssz(15_000_000, 200, [0x55; 32], [0x66; 32], &[0xcc; 32]);
+        let block_offset: u32 = 12;
+        let kzg_offset: u32 = block_offset + block_ssz.len() as u32;
+        let blobs_offset: u32 = kzg_offset;
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&block_offset.to_le_bytes());
+        buf.extend_from_slice(&kzg_offset.to_le_bytes());
+        buf.extend_from_slice(&blobs_offset.to_le_bytes());
+        buf.extend_from_slice(&block_ssz);
+        buf.extend_from_slice(&[0x44; 128]); // trailing data past kzg_offset
+
+        let (block, _) =
+            deserialize_beacon_block_from_ssz(&buf, SszBlockFormat::BlockContents).unwrap();
+        assert_eq!(block.slot, 15_000_000);
+        assert_eq!(block.body, vec![0xcc; 32]);
     }
 
     #[test]
