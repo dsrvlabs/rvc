@@ -88,8 +88,14 @@ use crate::proto::signer_v2::{
     SignSyncCommitteeMessageRequest, SignVoluntaryExitRequest,
 };
 
-use crypto::{compute_domain, compute_signing_root, DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
-use eth_types::{decode_beacon_block_ssz, decode_blinded_beacon_block_ssz, SszDecodeError};
+use crypto::{
+    compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
+    DOMAIN_RANDAO,
+};
+use eth_types::{
+    decode_attestation_ssz, decode_beacon_block_ssz, decode_blinded_beacon_block_ssz,
+    AggregateAndProof, AttestationData, Checkpoint, SszDecodeError, DOMAIN_AGGREGATE_AND_PROOF,
+};
 use slashing::SlashingDb;
 
 // ─────────���───────────────────────────────────────────────────────────────────
@@ -520,18 +526,207 @@ impl SignerServiceV2 for SignerServiceImpl {
     // These return `Status::unimplemented` until the corresponding issues land.
     // They MUST be present to satisfy the generated trait.
 
+    // ── SignAttestationData ───────────────────────────────────────────────────
+
+    #[allow(clippy::result_large_err)]
+    #[tracing::instrument(
+        name = "rvc.signer.v2.sign_attestation_data",
+        skip_all,
+        fields(pubkey, source_epoch, target_epoch)
+    )]
     async fn sign_attestation_data(
         &self,
-        _req: Request<SignAttestationDataRequest>,
+        req: Request<SignAttestationDataRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        Err(Status::unimplemented("sign_attestation_data: not yet implemented (ISSUE-1.6b)"))
+        let client_cn = audit::cn::extract_client_cn(&req);
+        let r = req.into_inner();
+
+        let pubkey = validate_pubkey(&r.pubkey)?;
+        let pubkey_hex_str = pubkey_hex(&pubkey);
+        Span::current().record("pubkey", pubkey_hex_str.as_str());
+
+        let fork_info =
+            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
+        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
+        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+
+        // Decode AttestationData from proto message fields.
+        // Per ISSUE-1.6b spec: the proto carries AttestationData as explicit fields.
+        // EIP-7549 index-zeroing is the client's responsibility (H-2 / Phase 2).
+        let proto_data =
+            r.data.ok_or_else(|| Status::invalid_argument("attestation data required"))?;
+        let proto_source = proto_data
+            .source
+            .ok_or_else(|| Status::invalid_argument("source checkpoint required"))?;
+        let proto_target = proto_data
+            .target
+            .ok_or_else(|| Status::invalid_argument("target checkpoint required"))?;
+
+        let source_root: [u8; 32] = proto_source.root.as_slice().try_into().map_err(|_| {
+            Status::invalid_argument(format!(
+                "source.root must be 32 bytes, got {}",
+                proto_source.root.len()
+            ))
+        })?;
+        let target_root: [u8; 32] = proto_target.root.as_slice().try_into().map_err(|_| {
+            Status::invalid_argument(format!(
+                "target.root must be 32 bytes, got {}",
+                proto_target.root.len()
+            ))
+        })?;
+        let beacon_block_root: [u8; 32] =
+            proto_data.beacon_block_root.as_slice().try_into().map_err(|_| {
+                Status::invalid_argument(format!(
+                    "beacon_block_root must be 32 bytes, got {}",
+                    proto_data.beacon_block_root.len()
+                ))
+            })?;
+
+        let source_epoch = proto_source.epoch;
+        let target_epoch = proto_target.epoch;
+        Span::current().record("source_epoch", source_epoch);
+        Span::current().record("target_epoch", target_epoch);
+
+        let att_data = AttestationData {
+            slot: proto_data.slot,
+            index: proto_data.index,
+            beacon_block_root,
+            source: Checkpoint { epoch: source_epoch, root: source_root },
+            target: Checkpoint { epoch: target_epoch, root: target_root },
+        };
+
+        let domain = compute_domain(DOMAIN_BEACON_ATTESTER, current_version, gvr);
+        let signing_root = compute_signing_root(&att_data, domain);
+        let signing_root_hex = Some(root_hex(&signing_root));
+
+        let db = self.require_db()?;
+        let scoped = ScopedSlashingDb::new(Arc::clone(db), client_cn.clone(), gvr);
+
+        // Stage → sign → commit pattern (A15).
+        // See module-level docstring for the spawn_blocking + block_on rationale.
+        let backend = Arc::clone(&self.backend);
+        let handle = tokio::runtime::Handle::current();
+
+        let sig = tokio::task::spawn_blocking(move || -> Result<[u8; 96], Status> {
+            let staged = scoped
+                .stage_attestation(&pubkey_hex_str, source_epoch, target_epoch, signing_root_hex)
+                .map_err(slashing_err)?;
+
+            let sign_result = handle.block_on(backend.sign(&signing_root, &pubkey));
+
+            match sign_result {
+                Ok(sig) => {
+                    staged
+                        .commit()
+                        .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")))?;
+                    Ok(sig)
+                }
+                Err(e) => {
+                    staged.discard();
+                    Err(backend_err_to_status(e))
+                }
+            }
+        })
+        .await
+        .map_err(|join_err| {
+            Status::internal(format!("sign_attestation_data blocking task panicked: {join_err}"))
+        })??;
+
+        tracing::info!(
+            pubkey = %pubkey_hex(&pubkey),
+            source_epoch,
+            target_epoch,
+            client_cn = %client_cn,
+            "sign_attestation_data: success"
+        );
+        Ok(Response::new(SignResponseV2 { signature: sig.to_vec() }))
     }
 
+    // ── SignAggregateAndProof ─────────────────────────────────────────────────
+
+    #[allow(clippy::result_large_err)]
+    #[tracing::instrument(
+        name = "rvc.signer.v2.sign_aggregate_and_proof",
+        skip_all,
+        fields(pubkey, source_epoch, target_epoch)
+    )]
     async fn sign_aggregate_and_proof(
         &self,
-        _req: Request<SignAggregateAndProofRequest>,
+        req: Request<SignAggregateAndProofRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        Err(Status::unimplemented("sign_aggregate_and_proof: not yet implemented (ISSUE-1.6b)"))
+        let client_cn = audit::cn::extract_client_cn(&req);
+        let r = req.into_inner();
+
+        let pubkey = validate_pubkey(&r.pubkey)?;
+        let pubkey_hex_str = pubkey_hex(&pubkey);
+        Span::current().record("pubkey", pubkey_hex_str.as_str());
+
+        let fork_info =
+            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
+        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
+        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+
+        // Decode the inner Attestation from aggregate_ssz.
+        // The proto carries: aggregator_index, aggregate_ssz (SSZ Attestation),
+        // selection_proof. We reconstruct AggregateAndProof and sign over its hash.
+        let attestation = decode_attestation_ssz(&r.aggregate_ssz, r.fork_id).map_err(ssz_err)?;
+
+        let source_epoch = attestation.data.source.epoch;
+        let target_epoch = attestation.data.target.epoch;
+        Span::current().record("source_epoch", source_epoch);
+        Span::current().record("target_epoch", target_epoch);
+
+        let agg_and_proof = AggregateAndProof {
+            aggregator_index: r.aggregator_index,
+            aggregate: attestation,
+            selection_proof: r.selection_proof,
+        };
+
+        let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, current_version, gvr);
+        let signing_root = compute_signing_root(&agg_and_proof, domain);
+        let signing_root_hex = Some(root_hex(&signing_root));
+
+        let db = self.require_db()?;
+        let scoped = ScopedSlashingDb::new(Arc::clone(db), client_cn.clone(), gvr);
+
+        // Stage → sign → commit pattern (A15).
+        // Slashing check uses the inner Attestation's (source_epoch, target_epoch).
+        let backend = Arc::clone(&self.backend);
+        let handle = tokio::runtime::Handle::current();
+
+        let sig = tokio::task::spawn_blocking(move || -> Result<[u8; 96], Status> {
+            let staged = scoped
+                .stage_attestation(&pubkey_hex_str, source_epoch, target_epoch, signing_root_hex)
+                .map_err(slashing_err)?;
+
+            let sign_result = handle.block_on(backend.sign(&signing_root, &pubkey));
+
+            match sign_result {
+                Ok(sig) => {
+                    staged
+                        .commit()
+                        .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")))?;
+                    Ok(sig)
+                }
+                Err(e) => {
+                    staged.discard();
+                    Err(backend_err_to_status(e))
+                }
+            }
+        })
+        .await
+        .map_err(|join_err| {
+            Status::internal(format!("sign_aggregate_and_proof blocking task panicked: {join_err}"))
+        })??;
+
+        tracing::info!(
+            pubkey = %pubkey_hex(&pubkey),
+            source_epoch,
+            target_epoch,
+            client_cn = %client_cn,
+            "sign_aggregate_and_proof: success"
+        );
+        Ok(Response::new(SignResponseV2 { signature: sig.to_vec() }))
     }
 
     async fn sign_sync_committee_message(
