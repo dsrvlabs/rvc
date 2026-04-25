@@ -16,6 +16,7 @@ mod remote_signer;
 mod signer_trait;
 mod signing;
 mod sync_signing;
+pub mod typed_signer;
 mod voluntary_exit_signing;
 
 pub use aggregation_signing::{
@@ -42,4 +43,5 @@ pub use signing::{
 pub use sync_signing::{
     sign_contribution_and_proof, sign_sync_committee_message, sign_sync_committee_selection_proof,
 };
+pub use typed_signer::{capella_capped_fork_version, RawSigner, SignContext, TypedSigner};
 pub use voluntary_exit_signing::sign_voluntary_exit;

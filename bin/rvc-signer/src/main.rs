@@ -24,6 +24,9 @@ pub mod proto {
     pub mod signer {
         tonic::include_proto!("signer");
     }
+    pub mod signer_v2 {
+        tonic::include_proto!("signer.v2");
+    }
 }
 
 #[cfg(feature = "dvt")]
@@ -2014,5 +2017,228 @@ mod tests {
             assert_eq!(keys.len(), 1);
             assert_eq!(keys[0], pk);
         }
+    }
+}
+
+/// Compile-time smoke tests: verify that all signer.v2 proto types are
+/// reachable from `bin/rvc-signer`.  No server is started; this is purely
+/// a static accessibility check so the CI can confirm the generated module
+/// is wired up correctly.
+#[cfg(test)]
+mod v2_proto_compile_tests {
+    use crate::proto::signer_v2::{
+        AttestationData, Checkpoint, ForkInfo, GetStatusRequest, GetStatusResponse,
+        ListPublicKeysRequest, ListPublicKeysResponse, PartialSignAttestationDataRequest,
+        PartialSignBeaconBlockRequest, PartialSignResponse, PartialSignSyncCommitteeRequest,
+        SignAggregateAndProofRequest, SignAttestationDataRequest, SignBeaconBlockRequest,
+        SignBlindedBeaconBlockRequest, SignBuilderRegistrationRequest,
+        SignContributionAndProofRequest, SignRandaoRevealRequest, SignResponse,
+        SignSyncAggregatorSelectionDataRequest, SignSyncCommitteeMessageRequest,
+        SignVoluntaryExitRequest,
+    };
+
+    fn make_fork_info() -> ForkInfo {
+        ForkInfo {
+            previous_version: vec![0x03u8; 4],
+            current_version: vec![0x04u8; 4],
+            epoch: 40_000,
+            genesis_validators_root: vec![0xaau8; 32],
+        }
+    }
+
+    #[test]
+    fn test_v2_sign_beacon_block_request_reachable() {
+        let req = SignBeaconBlockRequest {
+            pubkey: vec![0u8; 48],
+            fork_info: Some(make_fork_info()),
+            block_ssz: vec![0u8; 84],
+            fork_id: 4,
+        };
+        assert_eq!(req.fork_id, 4);
+    }
+
+    #[test]
+    fn test_v2_sign_blinded_beacon_block_request_reachable() {
+        let req = SignBlindedBeaconBlockRequest {
+            pubkey: vec![0u8; 48],
+            fork_info: Some(make_fork_info()),
+            block_ssz: vec![0u8; 84],
+            fork_id: 4,
+        };
+        assert_eq!(req.pubkey.len(), 48);
+    }
+
+    #[test]
+    fn test_v2_sign_attestation_data_request_reachable() {
+        let req = SignAttestationDataRequest {
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            data: Some(AttestationData {
+                slot: 100,
+                index: 0,
+                beacon_block_root: vec![0u8; 32],
+                source: Some(Checkpoint { epoch: 9, root: vec![0u8; 32] }),
+                target: Some(Checkpoint { epoch: 10, root: vec![0u8; 32] }),
+            }),
+            fork_id: 4,
+        };
+        assert!(req.data.is_some());
+    }
+
+    #[test]
+    fn test_v2_sign_aggregate_and_proof_request_reachable() {
+        let req = SignAggregateAndProofRequest {
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            aggregator_index: 42,
+            aggregate_ssz: vec![0u8; 16],
+            selection_proof: vec![0u8; 96],
+            fork_id: 4,
+        };
+        assert_eq!(req.aggregator_index, 42);
+    }
+
+    #[test]
+    fn test_v2_sign_sync_committee_message_request_reachable() {
+        let req = SignSyncCommitteeMessageRequest {
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            slot: 500,
+            beacon_block_root: vec![0u8; 32],
+            fork_id: 4,
+        };
+        assert_eq!(req.slot, 500);
+    }
+
+    #[test]
+    fn test_v2_sign_sync_aggregator_selection_data_request_reachable() {
+        let req = SignSyncAggregatorSelectionDataRequest {
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            slot: 600,
+            subcommittee_index: 3,
+            fork_id: 4,
+        };
+        assert_eq!(req.subcommittee_index, 3);
+    }
+
+    #[test]
+    fn test_v2_sign_contribution_and_proof_request_reachable() {
+        let req = SignContributionAndProofRequest {
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            aggregator_index: 7,
+            contribution_ssz: vec![0u8; 56],
+            selection_proof: vec![0u8; 96],
+            fork_id: 4,
+        };
+        assert_eq!(req.aggregator_index, 7);
+    }
+
+    #[test]
+    fn test_v2_sign_builder_registration_request_reachable() {
+        let req = SignBuilderRegistrationRequest {
+            pubkey: vec![0u8; 48],
+            fee_recipient: vec![0u8; 20],
+            gas_limit: 30_000_000,
+            timestamp: 1_700_000_000,
+        };
+        assert_eq!(req.gas_limit, 30_000_000);
+    }
+
+    #[test]
+    fn test_v2_sign_randao_reveal_request_reachable() {
+        let req = SignRandaoRevealRequest {
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            epoch: 42,
+            fork_id: 4,
+        };
+        assert_eq!(req.epoch, 42);
+    }
+
+    #[test]
+    fn test_v2_sign_voluntary_exit_request_reachable() {
+        let req = SignVoluntaryExitRequest {
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            epoch: 200,
+            validator_index: 99,
+            fork_id: 5,
+        };
+        assert_eq!(req.validator_index, 99);
+    }
+
+    #[test]
+    fn test_v2_sign_response_reachable() {
+        let resp = SignResponse { signature: vec![0u8; 96] };
+        assert_eq!(resp.signature.len(), 96);
+    }
+
+    #[test]
+    fn test_v2_partial_sign_beacon_block_request_reachable() {
+        let req = PartialSignBeaconBlockRequest {
+            requester_index: 1,
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            block_ssz: vec![0u8; 84],
+            fork_id: 4,
+        };
+        assert_eq!(req.requester_index, 1);
+    }
+
+    #[test]
+    fn test_v2_partial_sign_attestation_data_request_reachable() {
+        let req = PartialSignAttestationDataRequest {
+            requester_index: 2,
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            data: None,
+            fork_id: 4,
+        };
+        assert_eq!(req.requester_index, 2);
+    }
+
+    #[test]
+    fn test_v2_partial_sign_sync_committee_request_reachable() {
+        let req = PartialSignSyncCommitteeRequest {
+            requester_index: 3,
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            slot: 700,
+            beacon_block_root: vec![0u8; 32],
+            fork_id: 4,
+        };
+        assert_eq!(req.requester_index, 3);
+    }
+
+    #[test]
+    fn test_v2_partial_sign_response_reachable() {
+        let resp = PartialSignResponse { partial_signature: vec![0u8; 96], share_index: 1 };
+        assert_eq!(resp.share_index, 1);
+    }
+
+    #[test]
+    fn test_v2_list_public_keys_request_reachable() {
+        let req = ListPublicKeysRequest {};
+        let _ = req;
+    }
+
+    #[test]
+    fn test_v2_list_public_keys_response_reachable() {
+        let resp = ListPublicKeysResponse { pubkeys: vec![vec![0u8; 48]] };
+        assert_eq!(resp.pubkeys.len(), 1);
+    }
+
+    #[test]
+    fn test_v2_get_status_request_reachable() {
+        let req = GetStatusRequest {};
+        let _ = req;
+    }
+
+    #[test]
+    fn test_v2_get_status_response_reachable() {
+        let resp = GetStatusResponse { ready: true, backend: "local".to_string(), key_count: 5 };
+        assert!(resp.ready);
     }
 }
