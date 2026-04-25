@@ -222,7 +222,17 @@ impl SlashingDb {
     ///
     /// # Errors
     /// Returns `SlashingError::MigrationFailed` if the backup cannot be created.
-    pub fn backup_before_migrate(conn: &Connection, path: &Path) -> Result<PathBuf, SlashingError> {
+    ///
+    /// # Symlink note
+    /// The backup destination uses a UNIX-timestamp suffix that is predictable
+    /// to the second. A local attacker who can write to the parent directory
+    /// could pre-create that path as a symlink. The temp-then-rename pattern
+    /// limits the impact (the main DB file is never truncated), but a future
+    /// hardening pass could open with `O_NOFOLLOW`.
+    pub(crate) fn backup_before_migrate(
+        conn: &Connection,
+        path: &Path,
+    ) -> Result<PathBuf, SlashingError> {
         // Checkpoint the WAL so the main file is self-consistent.
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
 
@@ -240,13 +250,30 @@ impl SlashingDb {
         let backup_name = format!("{file_name}.bak.{ts}");
         let backup_path = parent.join(&backup_name);
 
-        // Write to a temp file first, then rename (atomic on POSIX).
-        let tmp_name = format!("{file_name}.bak.tmp");
+        // Write to a temp file first, then rename (atomic on POSIX). The temp
+        // name embeds the same UNIX_TS as the final backup so concurrent
+        // migrations on different DB files in the same parent dir cannot
+        // collide on the temp path.
+        let tmp_name = format!("{file_name}.bak.{ts}.tmp");
         let tmp_path = parent.join(&tmp_name);
 
         std::fs::copy(path, &tmp_path).map_err(|e| {
             SlashingError::MigrationFailed(format!("failed to copy DB to temp file: {e}"))
         })?;
+
+        // Match the main DB file's 0o600 mode so the backup is not
+        // world-readable on hosts with a permissive umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).map_err(
+                |e| {
+                    SlashingError::MigrationFailed(format!(
+                        "failed to set 0o600 on backup file: {e}"
+                    ))
+                },
+            )?;
+        }
 
         {
             let f = std::fs::OpenOptions::new().write(true).open(&tmp_path).map_err(|e| {
