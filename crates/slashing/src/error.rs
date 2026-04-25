@@ -48,6 +48,9 @@ pub enum SlashingError {
 
     #[error("unsafe file permissions on {path} (mode {mode}): group or world accessible")]
     UnsafePermissions { path: String, mode: String },
+
+    #[error("Slashing DB refused to open with non-WAL journal mode: actual={actual}. {hint}")]
+    JournalMode { actual: String, hint: String },
 }
 
 /// Specific types of attestation slashing violations per EIP-3076.

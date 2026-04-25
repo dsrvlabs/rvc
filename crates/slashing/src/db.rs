@@ -61,22 +61,9 @@ impl SlashingDb {
         let path = path.as_ref();
         let conn = Connection::open(path)?;
 
-        // Enable WAL journal mode for crash-safe durability.
-        // WAL creates -wal and -shm sidecar files, so this must be set before permissions.
-        let journal_mode: String =
-            conn.pragma_update_and_check(None, "journal_mode", "wal", |row| row.get(0))?;
-        if !journal_mode.eq_ignore_ascii_case("wal") {
-            tracing::warn!(
-                actual_mode = %journal_mode,
-                "WAL journal mode not supported; falling back to '{}'",
-                journal_mode,
-            );
-        }
+        Self::configure_pragmas(&conn)?;
 
-        // Set synchronous=FULL unconditionally for durability (works with both WAL and DELETE).
-        conn.pragma_update(None, "synchronous", "FULL")?;
-
-        // Set restrictive file permissions (owner-only read/write)
+        // Set restrictive file permissions (owner-only read/write).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -103,6 +90,77 @@ impl SlashingDb {
         db.migrate_to_v2(path)?;
 
         tracing::info!(path = %path.display(), "slashing protection database opened");
+        Ok(db)
+    }
+
+    /// Apply durability pragmas to an open SQLite connection.
+    ///
+    /// Pragma sequence (per architecture A4 §"Internal data flow"):
+    /// 1. `journal_mode=wal` — attempt WAL. If the result is not "wal", check
+    ///    `RVC_ALLOW_NON_WAL_SLASHING_DB`. Absent/false → fatal error. True → loud
+    ///    `error!` log and continue (durability degraded).
+    /// 2. `synchronous=EXTRA` — FULL + dir-fsync; belt-and-braces in case anything
+    ///    ever falls through to DELETE journal mode.
+    /// 3. `fullfsync=ON` (macOS only) — force F_FULLFSYNC so device caches are
+    ///    flushed; macOS's `fsync(2)` does not guarantee this without F_FULLFSYNC.
+    fn configure_pragmas(conn: &Connection) -> Result<(), SlashingError> {
+        // --- 1. WAL mode ---
+        let journal_mode: String =
+            conn.pragma_update_and_check(None, "journal_mode", "wal", |row| row.get(0))?;
+        if !journal_mode.eq_ignore_ascii_case("wal") {
+            const HINT: &str = "Set RVC_ALLOW_NON_WAL_SLASHING_DB=true to override \
+                (durability degraded), or move the DB to a WAL-capable filesystem \
+                (avoid tmpfs / NFSv3 / SMB).";
+            let allow = std::env::var("RVC_ALLOW_NON_WAL_SLASHING_DB")
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !allow {
+                return Err(SlashingError::JournalMode {
+                    actual: journal_mode,
+                    hint: HINT.to_owned(),
+                });
+            }
+            tracing::error!(
+                actual_mode = %journal_mode,
+                "running without WAL — slashing protection durability degraded"
+            );
+        }
+
+        // --- 2. synchronous=EXTRA ---
+        conn.pragma_update(None, "synchronous", "EXTRA")?;
+
+        // --- 3. fullfsync=ON (macOS only) ---
+        #[cfg(target_os = "macos")]
+        conn.pragma_update(None, "fullfsync", "ON")?;
+
+        Ok(())
+    }
+
+    /// Open a database with a pre-configured connection.
+    ///
+    /// # Purpose
+    /// Allows integration tests (and any code with access to a `Connection`) to inject
+    /// a connection whose journal mode has been forced to a non-WAL value (e.g. an
+    /// in-memory DB where WAL returns `"memory"`) in order to exercise the WAL hard-fail
+    /// and env-var opt-out code paths.
+    ///
+    /// Runs `configure_pragmas` and the schema migration, but skips file-permission
+    /// checks because the connection may not be backed by a file.
+    ///
+    /// # Note
+    /// This is a test helper. Do not use it in production paths; prefer `open` or
+    /// `open_in_memory` instead.
+    #[doc(hidden)]
+    pub fn open_with_conn_for_testing(conn: Connection) -> Result<Self, SlashingError> {
+        Self::configure_pragmas(&conn)?;
+        let db =
+            Self { conn: Mutex::new(conn), path: None, strict_semantics: AtomicBool::new(false) };
+        db.migrate()?;
+        {
+            let mut conn = db.conn.lock();
+            Self::run_v2_migration_transaction(&mut conn)
+                .map_err(|e| SlashingError::MigrationFailed(format!("{e}")))?;
+        }
         Ok(db)
     }
 
@@ -1599,6 +1657,20 @@ impl SlashingDb {
     #[cfg(not(unix))]
     pub fn check_file_permissions_strict(&self) -> Result<(), SlashingError> {
         Ok(())
+    }
+
+    /// Query a PRAGMA that returns a single integer value.
+    ///
+    /// Allows integration tests to verify connection-level pragma settings
+    /// (e.g. `synchronous`, `fullfsync`) that cannot be read from a separate connection
+    /// because they are per-connection settings that reset on every new open.
+    ///
+    /// # Note
+    /// This is a test helper. Do not use it in production paths.
+    #[doc(hidden)]
+    pub fn query_pragma_i64(&self, name: &str) -> Result<i64, rusqlite::Error> {
+        let conn = self.conn.lock();
+        conn.pragma_query_value(None, name, |row| row.get(0))
     }
 }
 
@@ -4003,7 +4075,7 @@ mod tests {
     }
 
     #[test]
-    fn test_open_sets_synchronous_full() {
+    fn test_open_sets_synchronous_extra() {
         let dir = tempdir().expect("failed to create temp dir");
         let path = dir.path().join("sync_test.db");
         let db = SlashingDb::open(&path).expect("failed to open db");
@@ -4011,8 +4083,8 @@ mod tests {
         let conn = db.conn.lock();
         let sync_mode: i64 =
             conn.pragma_query_value(None, "synchronous", |row| row.get(0)).unwrap();
-        // FULL = 2
-        assert_eq!(sync_mode, 2);
+        // EXTRA = 3 (belt-and-braces: FULL + dir-fsync on DELETE-mode journal unlink)
+        assert_eq!(sync_mode, 3, "synchronous should be 3 (EXTRA), got {sync_mode}");
     }
 
     #[test]
