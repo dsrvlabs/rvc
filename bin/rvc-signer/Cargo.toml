@@ -10,6 +10,10 @@ repository.workspace = true
 name = "rvc-signer"
 path = "src/main.rs"
 
+[lib]
+name = "rvc_signer_bin"
+path = "src/lib.rs"
+
 [features]
 default = []
 dvt = ["vsss-rs", "bls12_381_plus", "rand"]
@@ -19,10 +23,12 @@ async-trait.workspace = true
 blst.workspace = true
 clap.workspace = true
 crypto.workspace = true
+eth-types.workspace = true
 hex.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+slashing.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -39,6 +45,8 @@ bls12_381_plus = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 
 [dev-dependencies]
+async-trait.workspace = true
+hex.workspace = true
 parking_lot.workspace = true
 rcgen = "0.13"
 tempfile.workspace = true
@@ -46,6 +54,9 @@ proptest.workspace = true
 rand.workspace = true
 tokio-stream.workspace = true
 grpc-signer.workspace = true
+crypto.workspace = true
+eth-types.workspace = true
+slashing.workspace = true
 
 # DVT test dependencies (always available in tests when dvt feature is on)
 vsss-rs.workspace = true

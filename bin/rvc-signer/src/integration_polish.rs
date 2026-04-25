@@ -482,6 +482,7 @@ keystore_dir = "{}"
             backend: "basic".to_string(),
             result: "success".to_string(),
             duration_ms: 42,
+            rpc: None,
         };
 
         assert!(!entry.timestamp.is_empty());
@@ -586,7 +587,7 @@ keystore_dir = "{}"
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
 
-        let cn = crate::audit::extract_cn_from_der(cert.der().as_ref());
+        let cn = crate::audit::cn::extract_cn_from_der(cert.der().as_ref());
         assert_eq!(cn, Some("integration-test-client".to_string()));
     }
 
