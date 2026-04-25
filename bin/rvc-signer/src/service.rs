@@ -6,9 +6,11 @@
 //! to the v1 handler.
 //!
 //! # V2 service (`SignerService` from `signer.v2.proto`)
-//! Typed RPCs for `SignBeaconBlock`, `SignBlindedBeaconBlock`, and
-//! `SignRandaoReveal` are implemented here (ISSUE-1.6a).  The remaining 7
-//! typed RPCs land in ISSUE-1.6b–d.
+//! All 10 typed RPCs are implemented (ISSUE-1.6a–d):
+//! `SignBeaconBlock`, `SignBlindedBeaconBlock`, `SignRandaoReveal`,
+//! `SignAttestationData`, `SignAggregateAndProof`, `SignSyncCommitteeMessage`,
+//! `SignSyncAggregatorSelectionData`, `SignContributionAndProof`,
+//! `SignBuilderRegistration`, and `SignVoluntaryExit`.
 //!
 //! # Lock-vs-await strategy for slashable block RPCs
 //!
@@ -95,8 +97,10 @@ use crypto::{
 use eth_types::{
     decode_attestation_ssz, decode_beacon_block_ssz, decode_blinded_beacon_block_ssz,
     decode_sync_committee_contribution_ssz, AggregateAndProof, AttestationData, Checkpoint,
-    ContributionAndProof, SszDecodeError, SyncAggregatorSelectionData, DOMAIN_AGGREGATE_AND_PROOF,
+    ContributionAndProof, SszDecodeError, SyncAggregatorSelectionData, ValidatorRegistrationV1,
+    VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
     DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_VOLUNTARY_EXIT,
 };
 use slashing::SlashingDb;
 
@@ -523,11 +527,6 @@ impl SignerServiceV2 for SignerServiceImpl {
         }
     }
 
-    // ── Remaining typed RPCs (1.6b / 1.6c / 1.6d) — placeholder stubs ────────
-    //
-    // These return `Status::unimplemented` until the corresponding issues land.
-    // They MUST be present to satisfy the generated trait.
-
     // ── SignAttestationData ───────────────────────────────────────────────────
 
     #[allow(clippy::result_large_err)]
@@ -903,18 +902,130 @@ impl SignerServiceV2 for SignerServiceImpl {
         }
     }
 
+    // ── SignBuilderRegistration ────────────────────────────────────────────────
+    //
+    // Per MEV-Boost spec (confirmed as correct by audit "False positive" note):
+    // domain = DOMAIN_APPLICATION_BUILDER + GENESIS_FORK_VERSION + ZERO_HASH
+    // These are **fixed** constants — NOT from ForkInfo.
+    //
+    // The request carries `pubkey` (top-level, 48 bytes) which is used as both
+    // the signing key and the registration body's `pubkey` field.
+    //
+    // Per architecture §4 §"BUILDER" comment: the signer asserts that the
+    // `request.pubkey` matches the registration body pubkey.  Since this proto
+    // uses the single `pubkey` field for both roles, the equality is structural:
+    // we construct `ValidatorRegistrationV1 { pubkey: request.pubkey, ... }` and
+    // then sign over its tree hash.  There is no separate registration_pubkey
+    // field to mismatch against, but we do validate all byte-length constraints.
+    //
+    // Not slashable — no stage/commit calls.
+    #[tracing::instrument(
+        name = "rvc.signer.v2.sign_builder_registration",
+        skip_all,
+        fields(pubkey)
+    )]
     async fn sign_builder_registration(
         &self,
-        _req: Request<SignBuilderRegistrationRequest>,
+        req: Request<SignBuilderRegistrationRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        Err(Status::unimplemented("sign_builder_registration: not yet implemented (ISSUE-1.6d)"))
+        let _client_cn = audit::cn::extract_client_cn(&req);
+        let r = req.into_inner();
+
+        let pubkey = validate_pubkey(&r.pubkey)?;
+        let pubkey_hex_str = pubkey_hex(&pubkey);
+        Span::current().record("pubkey", pubkey_hex_str.as_str());
+
+        let fee_recipient: [u8; 20] = r.fee_recipient.as_slice().try_into().map_err(|_| {
+            Status::invalid_argument(format!(
+                "fee_recipient must be 20 bytes, got {}",
+                r.fee_recipient.len()
+            ))
+        })?;
+
+        let registration = ValidatorRegistrationV1 {
+            fee_recipient,
+            gas_limit: r.gas_limit,
+            timestamp: r.timestamp,
+            pubkey,
+        };
+
+        // Per MEV-Boost spec: fixed GENESIS_FORK_VERSION=[0u8;4], ZERO_HASH=[0u8;32]
+        // The audit "False positive" note confirms this is the correct domain for
+        // builder registrations — do NOT use fork_info.current_version or gvr.
+        let genesis_fork_version = [0u8; 4];
+        let zero_hash = [0u8; 32];
+        let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_hash);
+        let signing_root = compute_signing_root(&registration, domain);
+
+        match self.backend.sign(&signing_root, &pubkey).await {
+            Ok(sig) => {
+                tracing::info!(
+                    pubkey = %pubkey_hex_str,
+                    "sign_builder_registration: success"
+                );
+                Ok(Response::new(SignResponseV2 { signature: sig.to_vec() }))
+            }
+            Err(e) => Err(backend_err_to_status(e)),
+        }
     }
 
+    // ── SignVoluntaryExit ──────────────────────────────────────────────────────
+    //
+    // Domain: DOMAIN_VOLUNTARY_EXIT + fork_info.current_version + gvr.
+    //
+    // EIP-7044 caller responsibility: the caller MUST pass a `current_version`
+    // that is already Capella-capped for any post-Capella exit.  The server
+    // signs as-given (`ctx.fork_info.current_version` is used directly, per the
+    // TypedSigner::sign_voluntary_exit rustdoc contract).  Use
+    // `crypto::capella_capped_fork_version(epoch, &fork_schedule)` in callers
+    // that have access to a fork schedule; otherwise, pass Capella fork version
+    // explicitly for any post-Capella exit.
+    //
+    // Not slashable — no stage/commit calls.
+    #[tracing::instrument(
+        name = "rvc.signer.v2.sign_voluntary_exit",
+        skip_all,
+        fields(pubkey, epoch, validator_index)
+    )]
     async fn sign_voluntary_exit(
         &self,
-        _req: Request<SignVoluntaryExitRequest>,
+        req: Request<SignVoluntaryExitRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        Err(Status::unimplemented("sign_voluntary_exit: not yet implemented (ISSUE-1.6d)"))
+        let _client_cn = audit::cn::extract_client_cn(&req);
+        let r = req.into_inner();
+
+        let pubkey = validate_pubkey(&r.pubkey)?;
+        let pubkey_hex_str = pubkey_hex(&pubkey);
+        Span::current().record("pubkey", pubkey_hex_str.as_str());
+
+        let fork_info =
+            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
+        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
+        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+
+        let epoch = r.epoch;
+        let validator_index = r.validator_index;
+        Span::current().record("epoch", epoch);
+        Span::current().record("validator_index", validator_index);
+
+        let exit = VoluntaryExit { epoch, validator_index };
+
+        // Domain: DOMAIN_VOLUNTARY_EXIT + current_version (caller-capped per EIP-7044).
+        let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, current_version, gvr);
+        let signing_root = compute_signing_root(&exit, domain);
+
+        match self.backend.sign(&signing_root, &pubkey).await {
+            Ok(sig) => {
+                tracing::info!(
+                    pubkey = %pubkey_hex_str,
+                    epoch,
+                    validator_index,
+                    "sign_voluntary_exit: success"
+                );
+                Ok(Response::new(SignResponseV2 { signature: sig.to_vec() }))
+            }
+            Err(e) => Err(backend_err_to_status(e)),
+        }
     }
 
     async fn list_public_keys(
