@@ -19,7 +19,10 @@ url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+hex.workspace = true
 rcgen = "0.13"
+slashing.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-stream.workspace = true
 tracing-subscriber.workspace = true

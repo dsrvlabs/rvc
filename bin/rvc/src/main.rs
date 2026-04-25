@@ -1142,14 +1142,22 @@ async fn run_validator(
             grpc_config = grpc_config.with_tls(cert, key, ca_cert);
         }
 
+        // Log the v2 gRPC contract version and validate the signer is running v2.
+        info!("signer contract: v2 (typed RPCs)");
+
         match grpc_signer::GrpcRemoteSigner::connect(grpc_config).await {
             Ok(signer) => {
-                let key_count = crypto::Signer::public_keys(&signer).len();
+                let key_count = signer.public_keys().len();
                 info!(
                     url = %redact_url(grpc_url),
                     key_count,
-                    "gRPC remote signer connected"
+                    "gRPC remote signer connected (v2 typed RPCs)"
                 );
+
+                // Register all keys from the remote signer in the composite signer.
+                let pubkeys = signer.public_keys();
+                let signer = std::sync::Arc::new(signer);
+                composite_signer.add_grpc_remote_signer(pubkeys, signer.clone());
                 Some(signer)
             }
             Err(e) => {

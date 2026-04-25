@@ -267,7 +267,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     #[cfg(not(feature = "dvt"))]
-    let (signing_backend, peer_signer_service, basic_signer_ref): (
+    let (signing_backend, _peer_signer_service, basic_signer_ref): (
         Arc<dyn backend::SigningBackend>,
         Option<()>,
         Option<Arc<backend::basic::BasicSigner>>,
