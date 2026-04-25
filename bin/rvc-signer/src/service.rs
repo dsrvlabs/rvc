@@ -94,7 +94,9 @@ use crypto::{
 };
 use eth_types::{
     decode_attestation_ssz, decode_beacon_block_ssz, decode_blinded_beacon_block_ssz,
-    AggregateAndProof, AttestationData, Checkpoint, SszDecodeError, DOMAIN_AGGREGATE_AND_PROOF,
+    decode_sync_committee_contribution_ssz, AggregateAndProof, AttestationData, Checkpoint,
+    ContributionAndProof, SszDecodeError, SyncAggregatorSelectionData, DOMAIN_AGGREGATE_AND_PROOF,
+    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
 };
 use slashing::SlashingDb;
 
@@ -729,27 +731,176 @@ impl SignerServiceV2 for SignerServiceImpl {
         Ok(Response::new(SignResponseV2 { signature: sig.to_vec() }))
     }
 
+    // ── SignSyncCommitteeMessage ──────────────────────────────────────────────
+
+    /// Sign a sync committee message over `beacon_block_root`.
+    ///
+    /// Per FR-P0-3 / NFR-1: sync messages are **not slashable** — no staging,
+    /// no slashing DB write.  The handler calls `backend.sign` directly.
+    #[tracing::instrument(
+        name = "rvc.signer.v2.sign_sync_committee_message",
+        skip_all,
+        fields(pubkey, slot)
+    )]
     async fn sign_sync_committee_message(
         &self,
-        _req: Request<SignSyncCommitteeMessageRequest>,
+        req: Request<SignSyncCommitteeMessageRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        Err(Status::unimplemented("sign_sync_committee_message: not yet implemented (ISSUE-1.6c)"))
+        let client_cn = audit::cn::extract_client_cn(&req);
+        let r = req.into_inner();
+
+        let pubkey = validate_pubkey(&r.pubkey)?;
+        let pubkey_hex_str = pubkey_hex(&pubkey);
+        Span::current().record("pubkey", pubkey_hex_str.as_str());
+
+        let fork_info =
+            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
+        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
+        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+
+        let slot = r.slot;
+        Span::current().record("slot", slot);
+
+        let beacon_block_root: [u8; 32] =
+            r.beacon_block_root.as_slice().try_into().map_err(|_| {
+                Status::invalid_argument(format!(
+                    "beacon_block_root must be 32 bytes, got {}",
+                    r.beacon_block_root.len()
+                ))
+            })?;
+
+        // Sync committee messages sign over beacon_block_root directly.
+        // Domain: DOMAIN_SYNC_COMMITTEE (0x07000000).
+        // No slashing check per FR-P0-3.
+        let domain = compute_domain(DOMAIN_SYNC_COMMITTEE, current_version, gvr);
+        let signing_root = compute_signing_root(&beacon_block_root, domain);
+
+        match self.backend.sign(&signing_root, &pubkey).await {
+            Ok(sig) => {
+                tracing::info!(
+                    pubkey = %pubkey_hex_str,
+                    slot,
+                    client_cn = %client_cn,
+                    "sign_sync_committee_message: success"
+                );
+                Ok(Response::new(SignResponseV2 { signature: sig.to_vec() }))
+            }
+            Err(e) => Err(backend_err_to_status(e)),
+        }
     }
 
+    // ── SignSyncAggregatorSelectionData ───────────────────────────────────────
+
+    /// Sign a sync aggregator selection proof over `(slot, subcommittee_index)`.
+    ///
+    /// Per FR-P0-3 / NFR-1: not slashable — no staging.
+    #[tracing::instrument(
+        name = "rvc.signer.v2.sign_sync_aggregator_selection_data",
+        skip_all,
+        fields(pubkey, slot)
+    )]
     async fn sign_sync_aggregator_selection_data(
         &self,
-        _req: Request<SignSyncAggregatorSelectionDataRequest>,
+        req: Request<SignSyncAggregatorSelectionDataRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        Err(Status::unimplemented(
-            "sign_sync_aggregator_selection_data: not yet implemented (ISSUE-1.6c)",
-        ))
+        let client_cn = audit::cn::extract_client_cn(&req);
+        let r = req.into_inner();
+
+        let pubkey = validate_pubkey(&r.pubkey)?;
+        let pubkey_hex_str = pubkey_hex(&pubkey);
+        Span::current().record("pubkey", pubkey_hex_str.as_str());
+
+        let fork_info =
+            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
+        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
+        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+
+        let slot = r.slot;
+        Span::current().record("slot", slot);
+
+        // Domain: DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF (0x08000000).
+        // Message: SyncAggregatorSelectionData { slot, subcommittee_index }.
+        let domain = compute_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, current_version, gvr);
+        let selection_data =
+            SyncAggregatorSelectionData { slot, subcommittee_index: r.subcommittee_index };
+        let signing_root = compute_signing_root(&selection_data, domain);
+
+        match self.backend.sign(&signing_root, &pubkey).await {
+            Ok(sig) => {
+                tracing::info!(
+                    pubkey = %pubkey_hex_str,
+                    slot,
+                    subcommittee_index = r.subcommittee_index,
+                    client_cn = %client_cn,
+                    "sign_sync_aggregator_selection_data: success"
+                );
+                Ok(Response::new(SignResponseV2 { signature: sig.to_vec() }))
+            }
+            Err(e) => Err(backend_err_to_status(e)),
+        }
     }
 
+    // ── SignContributionAndProof ───────────────────────────────────────────────
+
+    /// Sign a `ContributionAndProof`.
+    ///
+    /// `contribution_ssz` is SSZ-encoded `SyncCommitteeContribution`; the server
+    /// decodes it and wraps it in `ContributionAndProof { aggregator_index,
+    /// contribution, selection_proof }` before signing.
+    ///
+    /// Per FR-P0-3 / NFR-1: not slashable — no staging.
+    #[tracing::instrument(
+        name = "rvc.signer.v2.sign_contribution_and_proof",
+        skip_all,
+        fields(pubkey, slot)
+    )]
     async fn sign_contribution_and_proof(
         &self,
-        _req: Request<SignContributionAndProofRequest>,
+        req: Request<SignContributionAndProofRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        Err(Status::unimplemented("sign_contribution_and_proof: not yet implemented (ISSUE-1.6c)"))
+        let client_cn = audit::cn::extract_client_cn(&req);
+        let r = req.into_inner();
+
+        let pubkey = validate_pubkey(&r.pubkey)?;
+        let pubkey_hex_str = pubkey_hex(&pubkey);
+        Span::current().record("pubkey", pubkey_hex_str.as_str());
+
+        let fork_info =
+            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
+        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
+        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+
+        let contribution = decode_sync_committee_contribution_ssz(&r.contribution_ssz, r.fork_id)
+            .map_err(ssz_err)?;
+
+        let slot = contribution.slot;
+        Span::current().record("slot", slot);
+
+        // The server does NOT verify the selection_proof BLS signature — it is
+        // the client's responsibility (per architecture §4 §"SYNC" comment).
+        let cap = ContributionAndProof {
+            aggregator_index: r.aggregator_index,
+            contribution,
+            selection_proof: r.selection_proof,
+        };
+
+        // Domain: DOMAIN_CONTRIBUTION_AND_PROOF (0x09000000).
+        let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, current_version, gvr);
+        let signing_root = compute_signing_root(&cap, domain);
+
+        match self.backend.sign(&signing_root, &pubkey).await {
+            Ok(sig) => {
+                tracing::info!(
+                    pubkey = %pubkey_hex_str,
+                    slot,
+                    aggregator_index = r.aggregator_index,
+                    client_cn = %client_cn,
+                    "sign_contribution_and_proof: success"
+                );
+                Ok(Response::new(SignResponseV2 { signature: sig.to_vec() }))
+            }
+            Err(e) => Err(backend_err_to_status(e)),
+        }
     }
 
     async fn sign_builder_registration(
