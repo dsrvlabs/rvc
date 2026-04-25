@@ -36,16 +36,16 @@ use eth_types::{Epoch, Root, Slot};
 use metrics::definitions as metrics;
 
 /// Normalize a pubkey to lowercase with 0x prefix for consistent DB storage/lookup.
-fn normalize_pubkey(pubkey: &str) -> String {
+pub(crate) fn normalize_pubkey(pubkey: &str) -> String {
     let stripped = pubkey.strip_prefix("0x").unwrap_or(pubkey);
     format!("0x{}", stripped.to_lowercase())
 }
 
 /// SQLite-backed database for storing slashing protection data.
 pub struct SlashingDb {
-    conn: Mutex<Connection>,
+    pub(crate) conn: Mutex<Connection>,
     path: Option<PathBuf>,
-    strict_semantics: AtomicBool,
+    pub(crate) strict_semantics: AtomicBool,
 }
 
 impl SlashingDb {
