@@ -182,6 +182,24 @@ fn validate_gvr(gvr: &[u8]) -> Result<[u8; 32], Status> {
     })
 }
 
+/// Validate that `selection_proof` is exactly 96 bytes (a BLS signature share).
+///
+/// The proto schema for `AggregateAndProof` and `ContributionAndProof` documents
+/// `selection_proof` as a 96-byte BLS signature. The server does NOT verify the
+/// signature itself — that is the client's responsibility — but the length must
+/// be enforced because `vec_u8_tree_hash_root` is permissive and would silently
+/// produce a wrong signing root for any other length.
+#[allow(clippy::result_large_err)]
+fn validate_selection_proof(bytes: &[u8]) -> Result<Vec<u8>, Status> {
+    if bytes.len() != 96 {
+        return Err(Status::invalid_argument(format!(
+            "selection_proof must be 96 bytes, got {}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes.to_vec())
+}
+
 /// Convert a `SszDecodeError` to a gRPC `Status::invalid_argument`.
 fn ssz_err(e: SszDecodeError) -> Status {
     Status::invalid_argument(format!("SSZ decode error: {e}"))
@@ -677,10 +695,11 @@ impl SignerServiceV2 for SignerServiceImpl {
         Span::current().record("source_epoch", source_epoch);
         Span::current().record("target_epoch", target_epoch);
 
+        let selection_proof = validate_selection_proof(&r.selection_proof)?;
         let agg_and_proof = AggregateAndProof {
             aggregator_index: r.aggregator_index,
             aggregate: attestation,
-            selection_proof: r.selection_proof,
+            selection_proof,
         };
 
         let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, current_version, gvr);
@@ -876,11 +895,14 @@ impl SignerServiceV2 for SignerServiceImpl {
         Span::current().record("slot", slot);
 
         // The server does NOT verify the selection_proof BLS signature — it is
-        // the client's responsibility (per architecture §4 §"SYNC" comment).
+        // the client's responsibility (per architecture §4 §"SYNC" comment) —
+        // but its length is enforced (96 bytes) so the signing-root computation
+        // is well-defined.
+        let selection_proof = validate_selection_proof(&r.selection_proof)?;
         let cap = ContributionAndProof {
             aggregator_index: r.aggregator_index,
             contribution,
-            selection_proof: r.selection_proof,
+            selection_proof,
         };
 
         // Domain: DOMAIN_CONTRIBUTION_AND_PROOF (0x09000000).
@@ -1075,6 +1097,32 @@ mod tests {
     use crate::backend::SigningBackendError;
     use async_trait::async_trait;
     use std::sync::Arc;
+
+    #[test]
+    fn test_validate_selection_proof_accepts_96_bytes() {
+        let buf = [0u8; 96];
+        let result = validate_selection_proof(&buf).expect("96 bytes should pass");
+        assert_eq!(result.len(), 96);
+    }
+
+    #[test]
+    fn test_validate_selection_proof_rejects_short() {
+        let err = validate_selection_proof(&[0u8; 95]).expect_err("95 bytes must fail");
+        assert!(err.message().contains("96 bytes"), "msg: {}", err.message());
+        assert!(err.message().contains("95"));
+    }
+
+    #[test]
+    fn test_validate_selection_proof_rejects_long() {
+        let err = validate_selection_proof(&[0u8; 97]).expect_err("97 bytes must fail");
+        assert!(err.message().contains("96 bytes"), "msg: {}", err.message());
+    }
+
+    #[test]
+    fn test_validate_selection_proof_rejects_empty() {
+        let err = validate_selection_proof(&[]).expect_err("empty must fail");
+        assert!(err.message().contains("96 bytes"));
+    }
 
     struct MockBackend {
         keys: Vec<[u8; 48]>,
