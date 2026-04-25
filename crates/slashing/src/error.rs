@@ -13,6 +13,9 @@ pub enum SlashingError {
     #[error("migration error: {0}")]
     MigrationError(String),
 
+    #[error("schema migration failed: {0}")]
+    MigrationFailed(String),
+
     #[error("attestation slashable: {0}")]
     SlashableAttestation(#[from] AttestationSlashingViolation),
 

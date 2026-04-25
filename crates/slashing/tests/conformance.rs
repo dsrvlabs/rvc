@@ -101,7 +101,13 @@ fn run_complete(test: &TestCase) {
         // Run block checks
         for (i, block) in step.blocks.iter().enumerate() {
             let slot: u64 = block.slot.parse().unwrap();
-            let result = db.check_and_record_block(&block.pubkey, slot, block.signing_root.clone());
+            let result = db.check_and_record_block(
+                "local-vc",
+                &block.pubkey,
+                slot,
+                block.signing_root.clone(),
+                &[0u8; 32],
+            );
 
             if block.should_succeed_complete {
                 assert!(
@@ -126,10 +132,12 @@ fn run_complete(test: &TestCase) {
             let source: u64 = att.source_epoch.parse().unwrap();
             let target: u64 = att.target_epoch.parse().unwrap();
             let result = db.check_and_record_attestation(
+                "local-vc",
                 &att.pubkey,
                 source,
                 target,
                 att.signing_root.clone(),
+                &[0u8; 32],
             );
 
             if att.should_succeed_complete {

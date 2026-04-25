@@ -177,10 +177,12 @@ impl SignerService {
         let slashing_check_result = {
             let _span = tracing::info_span!("rvc.slashing.check").entered();
             self.slashing_db.check_and_record_attestation(
+                "local-vc",
                 &pubkey_hex,
                 source_epoch,
                 target_epoch,
                 Some(signing_root_hex),
+                genesis_validators_root,
             )
         };
 
@@ -270,7 +272,13 @@ impl SignerService {
 
         let slashing_check_result = {
             let _span = tracing::info_span!("rvc.slashing.check").entered();
-            self.slashing_db.check_and_record_block(&pubkey_hex, slot, Some(signing_root_hex))
+            self.slashing_db.check_and_record_block(
+                "local-vc",
+                &pubkey_hex,
+                slot,
+                Some(signing_root_hex),
+                genesis_validators_root,
+            )
         };
 
         if let Err(e) = slashing_check_result {

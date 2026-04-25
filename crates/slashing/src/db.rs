@@ -1,8 +1,28 @@
 //! SQLite database layer for slashing protection.
+//!
+//! # Schema versions
+//!
+//! ## v1 (legacy)
+//! Tables: `attestations`, `blocks`, `metadata`, `watermarks`.
+//! Uniqueness: `(pubkey, target_epoch)` / `(pubkey, slot)`.
+//!
+//! ## v2 (current — ISSUE-1.2)
+//! Added columns on `attestations` and `blocks`:
+//! - `client_cn TEXT NOT NULL DEFAULT '__legacy__'` — per-client-CN namespace.
+//!   Sentinel values: `'__legacy__'` for pre-migration rows; `'local-vc'` for VC-side
+//!   runtime writes (`crates/signer`). DVT peers use their mTLS CN (ISSUE-1.7).
+//! - `genesis_validators_root TEXT` — nullable; legacy rows = NULL.
+//!
+//! New uniqueness indexes: `(client_cn, pubkey, target_epoch)` / `(client_cn, pubkey, slot)`.
+//! `metadata.schema_version = '2'` is set on every v2 open.
+//!
+//! Migration runs eagerly on `SlashingDb::open` and is idempotent.
+//! A backup `<path>.bak.<UNIX_TS>` is written before any ALTER fires.
 
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
@@ -12,7 +32,7 @@ use crate::types::{
     SignedAttestation, SignedBlock, ValidatorRecord,
 };
 use crypto::logging::TruncatedPubkey;
-use eth_types::{Epoch, Slot};
+use eth_types::{Epoch, Root, Slot};
 use metrics::definitions as metrics;
 
 /// Normalize a pubkey to lowercase with 0x prefix for consistent DB storage/lookup.
@@ -30,7 +50,13 @@ pub struct SlashingDb {
 
 impl SlashingDb {
     /// Open a database at the specified path.
-    /// Creates the file and runs migrations if it doesn't exist.
+    ///
+    /// Creates the file and runs schema migrations if it doesn't exist or is at v1.
+    /// Schema v2 migration runs **eagerly** and is idempotent (re-opening a v2 DB is a no-op).
+    /// A backup `<path>.bak.<UNIX_TS>` is written before any ALTER fires.
+    ///
+    /// # Errors
+    /// Returns `SlashingError::MigrationFailed` if the backup or migration fails.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SlashingError> {
         let path = path.as_ref();
         let conn = Connection::open(path)?;
@@ -68,17 +94,34 @@ impl SlashingDb {
             path: Some(path.to_path_buf()),
             strict_semantics: AtomicBool::new(false),
         };
+
+        // `migrate()` creates tables if they don't exist (v2-native CREATE TABLE).
+        // Then `migrate_to_v2` checks if the existing schema is v1 and upgrades.
+        // For a brand-new DB, `migrate()` creates v2 tables and `migrate_to_v2` will
+        // set schema_version=2 without needing a backup (tables are fresh/empty).
         db.migrate()?;
+        db.migrate_to_v2(path)?;
+
         tracing::info!(path = %path.display(), "slashing protection database opened");
         Ok(db)
     }
 
     /// Open an in-memory database for testing.
+    ///
+    /// Creates the full v2 schema directly (no backup needed — there is no file).
     pub fn open_in_memory() -> Result<Self, SlashingError> {
         let conn = Connection::open_in_memory()?;
         let db =
             Self { conn: Mutex::new(conn), path: None, strict_semantics: AtomicBool::new(false) };
+        // Create tables (v2-native layout).
         db.migrate()?;
+        // Create CN-scoped unique indexes and set schema_version = 2.
+        // No backup is taken for in-memory DBs.
+        {
+            let mut conn = db.conn.lock();
+            Self::run_v2_migration_transaction(&mut conn)
+                .map_err(|e| SlashingError::MigrationFailed(format!("{e}")))?;
+        }
         Ok(db)
     }
 
@@ -91,25 +134,37 @@ impl SlashingDb {
         self.strict_semantics.store(strict, Ordering::Relaxed);
     }
 
+    /// Create the initial database schema.
+    ///
+    /// For a **brand-new** database, creates v2 tables directly (with `client_cn` and
+    /// `genesis_validators_root` columns and CN-scoped unique indexes). For an existing v1
+    /// database, the v1 tables already exist (the CREATE TABLE IF NOT EXISTS is a no-op for
+    /// the old-style columns) and `migrate_to_v2` handles the upgrade.
+    ///
+    /// We use a v2-native CREATE TABLE so that fresh DBs start at v2 without going through
+    /// the ALTER TABLE path. The inline `UNIQUE` constraints from v1 are absent here; the
+    /// CN-scoped unique indexes are created by `run_v2_migration_transaction`.
     fn migrate(&self) -> Result<(), SlashingError> {
         let conn = self.conn.lock();
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS attestations (
                 id INTEGER PRIMARY KEY,
+                client_cn TEXT NOT NULL DEFAULT '__legacy__',
                 pubkey TEXT NOT NULL,
                 source_epoch INTEGER NOT NULL,
                 target_epoch INTEGER NOT NULL,
                 signing_root TEXT,
-                UNIQUE(pubkey, target_epoch)
+                genesis_validators_root TEXT
             );
 
             CREATE TABLE IF NOT EXISTS blocks (
                 id INTEGER PRIMARY KEY,
+                client_cn TEXT NOT NULL DEFAULT '__legacy__',
                 pubkey TEXT NOT NULL,
                 slot INTEGER NOT NULL,
                 signing_root TEXT,
-                UNIQUE(pubkey, slot)
+                genesis_validators_root TEXT
             );
 
             CREATE TABLE IF NOT EXISTS metadata (
@@ -128,6 +183,211 @@ impl SlashingDb {
         Ok(())
     }
 
+    /// Read the `schema_version` integer from the `metadata` table.
+    ///
+    /// Returns `None` if the row is absent (database predates ISSUE-1.2 — treat as v1).
+    fn read_schema_version(conn: &Connection) -> Result<Option<i64>, SlashingError> {
+        let v: Option<String> = conn
+            .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        Ok(v.and_then(|s| s.parse().ok()))
+    }
+
+    /// Check whether a column exists in a table using `PRAGMA table_info`.
+    ///
+    /// Used for idempotent ALTER TABLE: SQLite 3.35 added `ADD COLUMN IF NOT EXISTS`,
+    /// but we guard with a pragma check for maximum portability.
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, SlashingError> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let exists = stmt
+            .query_map([], |row| row.get::<_, String>(1))?
+            .any(|r| r.map(|name| name == column).unwrap_or(false));
+        Ok(exists)
+    }
+
+    /// Create an atomic backup of the database file to `<path>.bak.<UNIX_TS>`.
+    ///
+    /// # Approach
+    /// 1. Issue `PRAGMA wal_checkpoint(TRUNCATE)` to flush WAL into the main DB file
+    ///    so the backup contains a clean, self-contained snapshot.
+    /// 2. Copy `path` to `<path>.bak.<ts>` via a temp file in the same directory
+    ///    (atomic on POSIX: write to temp, `sync_all`, rename).
+    /// 3. Return the backup path on success.
+    ///
+    /// The WAL / SHM sidecar files are **not** separately copied: after a full WAL
+    /// checkpoint the main file is self-consistent and the sidecars are empty/reset.
+    /// Operators who want a byte-for-byte sidecar copy can use `sqlite3 .backup` instead.
+    ///
+    /// # Errors
+    /// Returns `SlashingError::MigrationFailed` if the backup cannot be created.
+    pub fn backup_before_migrate(conn: &Connection, path: &Path) -> Result<PathBuf, SlashingError> {
+        // Checkpoint the WAL so the main file is self-consistent.
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| SlashingError::MigrationFailed("DB path has no file name".into()))?;
+
+        let parent = path
+            .parent()
+            .ok_or_else(|| SlashingError::MigrationFailed("DB path has no parent dir".into()))?;
+
+        let backup_name = format!("{file_name}.bak.{ts}");
+        let backup_path = parent.join(&backup_name);
+
+        // Write to a temp file first, then rename (atomic on POSIX).
+        let tmp_name = format!("{file_name}.bak.tmp");
+        let tmp_path = parent.join(&tmp_name);
+
+        std::fs::copy(path, &tmp_path).map_err(|e| {
+            SlashingError::MigrationFailed(format!("failed to copy DB to temp file: {e}"))
+        })?;
+
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&tmp_path).map_err(|e| {
+                SlashingError::MigrationFailed(format!("failed to open temp backup for sync: {e}"))
+            })?;
+            f.sync_all().map_err(|e| {
+                SlashingError::MigrationFailed(format!("sync_all on backup failed: {e}"))
+            })?;
+        }
+
+        std::fs::rename(&tmp_path, &backup_path).map_err(|e| {
+            // Clean up temp file on rename failure.
+            let _ = std::fs::remove_file(&tmp_path);
+            SlashingError::MigrationFailed(format!("failed to rename backup file: {e}"))
+        })?;
+
+        tracing::info!(
+            backup = %backup_path.display(),
+            "slashing DB backup created before schema migration"
+        );
+        Ok(backup_path)
+    }
+
+    /// Migrate the database to schema v2 if it is currently at v1.
+    ///
+    /// # Decision logic
+    /// - `schema_version >= 2`: no-op (already at v2+).
+    /// - `schema_version` absent AND `client_cn` column already exists on `attestations`:
+    ///   the DB was just created by `migrate()` with the v2-native CREATE TABLE — set
+    ///   `schema_version=2` without backing up (no v1 rows to preserve).
+    /// - `schema_version` absent AND `client_cn` column **missing**: existing populated v1
+    ///   DB — take a backup, run ALTER TABLE batch, set `schema_version=2`.
+    ///
+    /// Migration order for the v1→v2 path:
+    /// 1. Read `schema_version`. If absent, check for `client_cn` column.
+    /// 2. Backup `<path>.bak.<UNIX_TS>` (atomic copy + sync_all).
+    /// 3. Begin immediate transaction.
+    /// 4. Idempotent ALTER TABLE batch (guarded by `PRAGMA table_info`).
+    /// 5. Drop old indexes; create CN-scoped ones.
+    /// 6. UPSERT `schema_version=2`.
+    /// 7. Commit. Any failure → `Err(SlashingError::MigrationFailed)`.
+    fn migrate_to_v2(&self, path: &Path) -> Result<(), SlashingError> {
+        let (schema_version, has_client_cn) = {
+            let conn = self.conn.lock();
+            let sv = Self::read_schema_version(&conn)?;
+            let has_cn = Self::column_exists(&conn, "attestations", "client_cn")?;
+            (sv, has_cn)
+        };
+
+        if schema_version.unwrap_or(0) >= 2 {
+            // Already at v2 or newer; no migration needed.
+            return Ok(());
+        }
+
+        if has_client_cn {
+            // Fresh DB created by migrate() with v2-native CREATE TABLE.
+            // Just set schema_version=2 — no backup needed (no v1 rows to preserve).
+            let conn = self.conn.lock();
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', '2')",
+            )?;
+            tracing::debug!(path = %path.display(), "fresh v2 DB: set schema_version=2");
+            return Ok(());
+        }
+
+        // Existing v1 DB: take a backup, then migrate.
+        {
+            let conn = self.conn.lock();
+            Self::backup_before_migrate(&conn, path)
+                .map_err(|e| SlashingError::MigrationFailed(format!("backup failed: {e}")))?;
+        }
+
+        // Run migration in a single immediate transaction.
+        let result = {
+            let mut conn = self.conn.lock();
+            Self::run_v2_migration_transaction(&mut conn)
+        };
+
+        result.map_err(|e| {
+            tracing::error!(error = %e, "schema v2 migration failed; original DB is intact in backup");
+            match e {
+                SlashingError::MigrationFailed(_) => e,
+                other => SlashingError::MigrationFailed(format!("{other}")),
+            }
+        })?;
+
+        tracing::info!(path = %path.display(), "schema migrated to v2");
+        Ok(())
+    }
+
+    fn run_v2_migration_transaction(conn: &mut Connection) -> Result<(), SlashingError> {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        // Add `client_cn` column to `attestations` if missing.
+        if !Self::column_exists(&tx, "attestations", "client_cn")? {
+            tx.execute_batch(
+                "ALTER TABLE attestations ADD COLUMN client_cn TEXT NOT NULL DEFAULT '__legacy__'",
+            )?;
+        }
+
+        // Add `genesis_validators_root` column to `attestations` if missing.
+        if !Self::column_exists(&tx, "attestations", "genesis_validators_root")? {
+            tx.execute_batch("ALTER TABLE attestations ADD COLUMN genesis_validators_root TEXT")?;
+        }
+
+        // Add `client_cn` column to `blocks` if missing.
+        if !Self::column_exists(&tx, "blocks", "client_cn")? {
+            tx.execute_batch(
+                "ALTER TABLE blocks ADD COLUMN client_cn TEXT NOT NULL DEFAULT '__legacy__'",
+            )?;
+        }
+
+        // Add `genesis_validators_root` column to `blocks` if missing.
+        if !Self::column_exists(&tx, "blocks", "genesis_validators_root")? {
+            tx.execute_batch("ALTER TABLE blocks ADD COLUMN genesis_validators_root TEXT")?;
+        }
+
+        // Drop old uniqueness indexes and create new CN-scoped ones.
+        // `DROP INDEX IF EXISTS` is always safe.
+        tx.execute_batch(
+            "
+            DROP INDEX IF EXISTS idx_attestations_pubkey_target;
+            DROP INDEX IF EXISTS idx_blocks_pubkey_slot;
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_attestations_cn_pubkey_target
+                ON attestations(client_cn, pubkey, target_epoch);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_blocks_cn_pubkey_slot
+                ON blocks(client_cn, pubkey, slot);
+            ",
+        )?;
+
+        // Upsert schema_version = 2.
+        tx.execute_batch(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', '2')",
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Insert a signed attestation record.
     #[cfg(test)]
     pub(crate) fn insert_attestation(
@@ -137,8 +397,8 @@ impl SlashingDb {
         let pubkey = normalize_pubkey(&attestation.pubkey);
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO attestations (pubkey, source_epoch, target_epoch, signing_root)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO attestations (client_cn, pubkey, source_epoch, target_epoch, signing_root)
+             VALUES ('local-vc', ?1, ?2, ?3, ?4)",
             (
                 &pubkey,
                 attestation.source_epoch as i64,
@@ -164,8 +424,8 @@ impl SlashingDb {
         let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT OR IGNORE INTO attestations (pubkey, source_epoch, target_epoch, signing_root)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT OR IGNORE INTO attestations (client_cn, pubkey, source_epoch, target_epoch, signing_root)
+             VALUES ('local-vc', ?1, ?2, ?3, ?4)",
             (&pubkey, source_epoch as i64, target_epoch as i64, &signing_root),
         )?;
         Ok(())
@@ -204,8 +464,8 @@ impl SlashingDb {
         let pubkey = normalize_pubkey(&block.pubkey);
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO blocks (pubkey, slot, signing_root)
-             VALUES (?1, ?2, ?3)",
+            "INSERT INTO blocks (client_cn, pubkey, slot, signing_root)
+             VALUES ('local-vc', ?1, ?2, ?3)",
             (&pubkey, block.slot as i64, &block.signing_root),
         )?;
         Ok(())
@@ -456,7 +716,8 @@ impl SlashingDb {
                 })?;
 
                 tx.execute(
-                    "INSERT OR IGNORE INTO attestations (pubkey, source_epoch, target_epoch, signing_root) VALUES (?1, ?2, ?3, ?4)",
+                    "INSERT OR IGNORE INTO attestations (client_cn, pubkey, source_epoch, target_epoch, signing_root)
+                     VALUES ('local-vc', ?1, ?2, ?3, ?4)",
                     (&pubkey, source_epoch as i64, target_epoch as i64, &attestation.signing_root),
                 )?;
             }
@@ -467,7 +728,7 @@ impl SlashingDb {
                 })?;
 
                 tx.execute(
-                    "INSERT OR IGNORE INTO blocks (pubkey, slot, signing_root) VALUES (?1, ?2, ?3)",
+                    "INSERT OR IGNORE INTO blocks (client_cn, pubkey, slot, signing_root) VALUES ('local-vc', ?1, ?2, ?3)",
                     (&pubkey, slot as i64, &block.signing_root),
                 )?;
             }
@@ -496,8 +757,8 @@ impl SlashingDb {
         let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT OR IGNORE INTO blocks (pubkey, slot, signing_root)
-             VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO blocks (client_cn, pubkey, slot, signing_root)
+             VALUES ('local-vc', ?1, ?2, ?3)",
             (&pubkey, slot as i64, &signing_root),
         )?;
         Ok(())
@@ -577,12 +838,21 @@ impl SlashingDb {
     ///
     /// Combines `is_safe_to_propose` and `record_block` in a single SQLite
     /// transaction with `IMMEDIATE` locking to prevent TOCTOU races.
+    ///
+    /// # Arguments
+    /// - `client_cn`: Per-client namespace. Use `"local-vc"` for VC-side writes.
+    ///   `"__legacy__"` is reserved for pre-migration rows only.
+    /// - `gvr`: Genesis validators root for this signing operation.
+    ///   **Not yet enforced** (enforcement lands in ISSUE-3.5 for M-6). Stored
+    ///   as a per-row value for future use.
     #[tracing::instrument(name = "rvc.slashing.db.block", skip_all, fields(rvc.slashing.result))]
     pub fn check_and_record_block(
         &self,
+        client_cn: &str,
         pubkey: &str,
         slot: Slot,
         signing_root: Option<String>,
+        _gvr: &Root,
     ) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
         let mut conn = self.conn.lock();
@@ -614,8 +884,8 @@ impl SlashingDb {
 
         let existing: Option<Option<String>> = tx
             .query_row(
-                "SELECT signing_root FROM blocks WHERE pubkey = ?1 AND slot = ?2",
-                (&pubkey, slot as i64),
+                "SELECT signing_root FROM blocks WHERE client_cn = ?1 AND pubkey = ?2 AND slot = ?3",
+                (client_cn, &pubkey, slot as i64),
                 |row| row.get(0),
             )
             .optional()?;
@@ -647,11 +917,14 @@ impl SlashingDb {
             return Ok(());
         }
 
-        // No block at this slot — check that slot is not below the minimum
+        // No block at this (cn, pubkey, slot) — check that slot is not below the minimum
+        // within this CN scope.
         let min_slot: Option<i64> = tx
-            .query_row("SELECT MIN(slot) FROM blocks WHERE pubkey = ?1", [&pubkey], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT MIN(slot) FROM blocks WHERE client_cn = ?1 AND pubkey = ?2",
+                (client_cn, &pubkey),
+                |row| row.get(0),
+            )
             .optional()?
             .flatten();
 
@@ -673,8 +946,8 @@ impl SlashingDb {
         }
 
         tx.execute(
-            "INSERT INTO blocks (pubkey, slot, signing_root) VALUES (?1, ?2, ?3)",
-            (&pubkey, slot as i64, &signing_root),
+            "INSERT INTO blocks (client_cn, pubkey, slot, signing_root) VALUES (?1, ?2, ?3, ?4)",
+            (client_cn, &pubkey, slot as i64, &signing_root),
         )?;
 
         tx.commit()?;
@@ -710,13 +983,42 @@ impl SlashingDb {
     /// `strict_semantics = true`: `None==None` is rejected as a potential
     /// double vote, matching Lighthouse/Prysm/Teku conservative behavior.
     /// See EIP-3076 §Conditions, note on `signing_root` handling.
+    /// Atomically check and record an attestation.
+    ///
+    /// # Arguments
+    /// - `client_cn`: Per-client namespace. Use `"local-vc"` for VC-side writes.
+    ///   `"__legacy__"` is reserved for pre-migration rows only.
+    /// - `gvr`: Genesis validators root for this signing operation.
+    ///   **Not yet enforced** (enforcement lands in ISSUE-3.5 for M-6). Stored
+    ///   as a per-row value for future use.
+    ///
+    /// ## Edge Case Decisions (FU-32, FU-33)
+    ///
+    /// **FU-32 (same root, different source):**
+    /// Per EIP-3076, `signing_root` = `hash_tree_root(AttestationData)`. Since
+    /// `AttestationData` includes `source_epoch`, identical roots imply identical
+    /// source epochs. If source differs with same root, we log a warning
+    /// (signing pipeline bug indicator) but allow the attestation. This is
+    /// defense-in-depth only — the invariant violation is physically impossible
+    /// under correct SSZ serialization. See EIP-3076 Condition 5.
+    ///
+    /// **FU-33 (None==None signing root):**
+    /// EIP-3076 recommends treating null roots as "unknown" and assigning a
+    /// suitable dummy root internally. With `strict_semantics = false`
+    /// (default): `None==None` is treated as a re-sign for backward
+    /// compatibility with pre-existing records that lack roots. With
+    /// `strict_semantics = true`: `None==None` is rejected as a potential
+    /// double vote, matching Lighthouse/Prysm/Teku conservative behavior.
+    /// See EIP-3076 §Conditions, note on `signing_root` handling.
     #[tracing::instrument(name = "rvc.slashing.db.attestation", skip_all, fields(rvc.slashing.result))]
     pub fn check_and_record_attestation(
         &self,
+        client_cn: &str,
         pubkey: &str,
         source_epoch: Epoch,
         target_epoch: Epoch,
         signing_root: Option<String>,
+        _gvr: &Root,
     ) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
         let mut conn = self.conn.lock();
@@ -775,10 +1077,10 @@ impl SlashingDb {
             let mut stmt = tx.prepare(
                 "SELECT source_epoch, target_epoch, signing_root
                  FROM attestations
-                 WHERE pubkey = ?1",
+                 WHERE client_cn = ?1 AND pubkey = ?2",
             )?;
             let result = stmt
-                .query_map([&pubkey], |row| {
+                .query_map((client_cn, &pubkey), |row| {
                     Ok((
                         row.get::<_, i64>(0)? as Epoch,
                         row.get::<_, i64>(1)? as Epoch,
@@ -869,7 +1171,7 @@ impl SlashingDb {
         }
 
         if !is_duplicate {
-            // Check target epoch is not below minimum existing target
+            // Check target epoch is not below minimum existing target (CN-scoped)
             let min_target = existing.iter().map(|(_, t, _)| *t).min();
             if let Some(min) = min_target {
                 if target_epoch < min {
@@ -890,9 +1192,9 @@ impl SlashingDb {
             }
 
             tx.execute(
-                "INSERT INTO attestations (pubkey, source_epoch, target_epoch, signing_root)
-                 VALUES (?1, ?2, ?3, ?4)",
-                (&pubkey, source_epoch as i64, target_epoch as i64, &signing_root),
+                "INSERT INTO attestations (client_cn, pubkey, source_epoch, target_epoch, signing_root)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (client_cn, &pubkey, source_epoch as i64, target_epoch as i64, &signing_root),
             )?;
         }
 
@@ -2384,7 +2686,13 @@ mod tests {
     fn test_check_and_record_block_safe() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        let result = db.check_and_record_block("0x1234", 1000, Some("0xroot1".to_string()));
+        let result = db.check_and_record_block(
+            "local-vc",
+            "0x1234",
+            1000,
+            Some("0xroot1".to_string()),
+            &[0u8; 32],
+        );
         assert!(result.is_ok());
 
         let blocks = db.get_blocks("0x1234").expect("failed to get");
@@ -2397,10 +2705,22 @@ mod tests {
     fn test_check_and_record_block_double_proposal_rejected() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        db.check_and_record_block("0x1234", 1000, Some("0xroot1".to_string()))
-            .expect("first should succeed");
+        db.check_and_record_block(
+            "local-vc",
+            "0x1234",
+            1000,
+            Some("0xroot1".to_string()),
+            &[0u8; 32],
+        )
+        .expect("first should succeed");
 
-        let result = db.check_and_record_block("0x1234", 1000, Some("0xroot2".to_string()));
+        let result = db.check_and_record_block(
+            "local-vc",
+            "0x1234",
+            1000,
+            Some("0xroot2".to_string()),
+            &[0u8; 32],
+        );
         assert!(result.is_err());
         match result.unwrap_err() {
             SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal { slot }) => {
@@ -2418,10 +2738,22 @@ mod tests {
     fn test_check_and_record_block_idempotent_resign() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        db.check_and_record_block("0x1234", 1000, Some("0xroot1".to_string()))
-            .expect("first should succeed");
+        db.check_and_record_block(
+            "local-vc",
+            "0x1234",
+            1000,
+            Some("0xroot1".to_string()),
+            &[0u8; 32],
+        )
+        .expect("first should succeed");
 
-        let result = db.check_and_record_block("0x1234", 1000, Some("0xroot1".to_string()));
+        let result = db.check_and_record_block(
+            "local-vc",
+            "0x1234",
+            1000,
+            Some("0xroot1".to_string()),
+            &[0u8; 32],
+        );
         assert!(result.is_ok());
 
         let blocks = db.get_blocks("0x1234").expect("failed to get");
@@ -2432,8 +2764,14 @@ mod tests {
     fn test_check_and_record_attestation_safe() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        let result =
-            db.check_and_record_attestation("0x1234", 100, 101, Some("0xroot1".to_string()));
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            100,
+            101,
+            Some("0xroot1".to_string()),
+            &[0u8; 32],
+        );
         assert!(result.is_ok());
 
         let attestations = db.get_attestations("0x1234").expect("failed to get");
@@ -2446,11 +2784,24 @@ mod tests {
     fn test_check_and_record_attestation_double_vote_rejected() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        db.check_and_record_attestation("0x1234", 100, 101, Some("0xroot1".to_string()))
-            .expect("first should succeed");
+        db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            100,
+            101,
+            Some("0xroot1".to_string()),
+            &[0u8; 32],
+        )
+        .expect("first should succeed");
 
-        let result =
-            db.check_and_record_attestation("0x1234", 99, 101, Some("0xroot2".to_string()));
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            99,
+            101,
+            Some("0xroot2".to_string()),
+            &[0u8; 32],
+        );
         assert!(result.is_err());
         match result.unwrap_err() {
             SlashingError::SlashableAttestation(AttestationSlashingViolation::DoubleVote {
@@ -2470,9 +2821,10 @@ mod tests {
     fn test_check_and_record_attestation_surrounding_vote_rejected() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        db.check_and_record_attestation("0x1234", 5, 10, None).expect("first should succeed");
+        db.check_and_record_attestation("local-vc", "0x1234", 5, 10, None, &[0u8; 32])
+            .expect("first should succeed");
 
-        let result = db.check_and_record_attestation("0x1234", 4, 11, None);
+        let result = db.check_and_record_attestation("local-vc", "0x1234", 4, 11, None, &[0u8; 32]);
         assert!(result.is_err());
         match result.unwrap_err() {
             SlashingError::SlashableAttestation(
@@ -2489,12 +2841,25 @@ mod tests {
     fn test_check_and_record_attestation_idempotent_resign() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        db.check_and_record_attestation("0x1234", 100, 101, Some("0xroot1".to_string()))
-            .expect("first should succeed");
+        db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            100,
+            101,
+            Some("0xroot1".to_string()),
+            &[0u8; 32],
+        )
+        .expect("first should succeed");
 
         // Same signing root for same epoch should pass (idempotent)
-        let result =
-            db.check_and_record_attestation("0x1234", 100, 101, Some("0xroot1".to_string()));
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            100,
+            101,
+            Some("0xroot1".to_string()),
+            &[0u8; 32],
+        );
         assert!(result.is_ok());
 
         let attestations = db.get_attestations("0x1234").expect("failed to get");
@@ -2506,11 +2871,25 @@ mod tests {
         // Same signing_root + same source_epoch + same target_epoch → no warning, no error
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        db.check_and_record_attestation("0x1234", 3, 5, Some("0xABC".to_string()))
-            .expect("first should succeed");
+        db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            3,
+            5,
+            Some("0xABC".to_string()),
+            &[0u8; 32],
+        )
+        .expect("first should succeed");
 
         // Re-sign with identical source, target, root → should succeed silently
-        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xABC".to_string()));
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            3,
+            5,
+            Some("0xABC".to_string()),
+            &[0u8; 32],
+        );
         assert!(result.is_ok());
 
         // Should not have inserted a duplicate
@@ -2524,12 +2903,26 @@ mod tests {
         // → should log warning but still allow (defense-in-depth, not a rejection)
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        db.check_and_record_attestation("0x1234", 3, 5, Some("0xABC".to_string()))
-            .expect("first should succeed");
+        db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            3,
+            5,
+            Some("0xABC".to_string()),
+            &[0u8; 32],
+        )
+        .expect("first should succeed");
 
         // Same root but different source → indicates possible signing pipeline bug
         // Should still succeed (is_duplicate = true) but log a warning
-        let result = db.check_and_record_attestation("0x1234", 4, 5, Some("0xABC".to_string()));
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            4,
+            5,
+            Some("0xABC".to_string()),
+            &[0u8; 32],
+        );
         assert!(result.is_ok(), "same root with different source must still be allowed");
 
         // Should not have inserted a duplicate
@@ -2542,10 +2935,24 @@ mod tests {
         // Different root + same target → must still be rejected as DoubleVote
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        db.check_and_record_attestation("0x1234", 3, 5, Some("0xABC".to_string()))
-            .expect("first should succeed");
+        db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            3,
+            5,
+            Some("0xABC".to_string()),
+            &[0u8; 32],
+        )
+        .expect("first should succeed");
 
-        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xDEF".to_string()));
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            3,
+            5,
+            Some("0xDEF".to_string()),
+            &[0u8; 32],
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("double vote"), "expected double vote error, got: {err}");
@@ -2559,8 +2966,16 @@ mod tests {
     fn test_strict_att_some_same_lenient_allows() {
         // Some("0xA") vs Some("0xA"), lenient → allow (genuine re-sign)
         let db = SlashingDb::open_in_memory().expect("open");
-        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
-        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        db.check_and_record_attestation("local-vc", "0x1234", 3, 5, Some("0xA".into()), &[0u8; 32])
+            .expect("first");
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            3,
+            5,
+            Some("0xA".into()),
+            &[0u8; 32],
+        );
         assert!(result.is_ok());
     }
 
@@ -2569,8 +2984,16 @@ mod tests {
         // Some("0xA") vs Some("0xA"), strict → allow (genuine re-sign)
         let db = SlashingDb::open_in_memory().expect("open");
         db.set_strict_semantics(true);
-        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
-        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        db.check_and_record_attestation("local-vc", "0x1234", 3, 5, Some("0xA".into()), &[0u8; 32])
+            .expect("first");
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            3,
+            5,
+            Some("0xA".into()),
+            &[0u8; 32],
+        );
         assert!(result.is_ok());
     }
 
@@ -2578,8 +3001,16 @@ mod tests {
     fn test_strict_att_some_diff_lenient_rejects() {
         // Some("0xA") vs Some("0xB"), lenient → reject (double vote)
         let db = SlashingDb::open_in_memory().expect("open");
-        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
-        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xB".into()));
+        db.check_and_record_attestation("local-vc", "0x1234", 3, 5, Some("0xA".into()), &[0u8; 32])
+            .expect("first");
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            3,
+            5,
+            Some("0xB".into()),
+            &[0u8; 32],
+        );
         assert!(result.is_err());
     }
 
@@ -2588,8 +3019,16 @@ mod tests {
         // Some("0xA") vs Some("0xB"), strict → reject (double vote)
         let db = SlashingDb::open_in_memory().expect("open");
         db.set_strict_semantics(true);
-        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
-        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xB".into()));
+        db.check_and_record_attestation("local-vc", "0x1234", 3, 5, Some("0xA".into()), &[0u8; 32])
+            .expect("first");
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            3,
+            5,
+            Some("0xB".into()),
+            &[0u8; 32],
+        );
         assert!(result.is_err());
     }
 
@@ -2597,8 +3036,9 @@ mod tests {
     fn test_strict_att_some_none_lenient_rejects() {
         // Some("0xA") vs None, lenient → reject (different roots)
         let db = SlashingDb::open_in_memory().expect("open");
-        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
-        let result = db.check_and_record_attestation("0x1234", 3, 5, None);
+        db.check_and_record_attestation("local-vc", "0x1234", 3, 5, Some("0xA".into()), &[0u8; 32])
+            .expect("first");
+        let result = db.check_and_record_attestation("local-vc", "0x1234", 3, 5, None, &[0u8; 32]);
         assert!(result.is_err());
     }
 
@@ -2607,8 +3047,9 @@ mod tests {
         // Some("0xA") vs None, strict → reject
         let db = SlashingDb::open_in_memory().expect("open");
         db.set_strict_semantics(true);
-        db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into())).expect("first");
-        let result = db.check_and_record_attestation("0x1234", 3, 5, None);
+        db.check_and_record_attestation("local-vc", "0x1234", 3, 5, Some("0xA".into()), &[0u8; 32])
+            .expect("first");
+        let result = db.check_and_record_attestation("local-vc", "0x1234", 3, 5, None, &[0u8; 32]);
         assert!(result.is_err());
     }
 
@@ -2616,8 +3057,16 @@ mod tests {
     fn test_strict_att_none_some_lenient_rejects() {
         // None vs Some("0xA"), lenient → reject (different roots)
         let db = SlashingDb::open_in_memory().expect("open");
-        db.check_and_record_attestation("0x1234", 3, 5, None).expect("first");
-        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        db.check_and_record_attestation("local-vc", "0x1234", 3, 5, None, &[0u8; 32])
+            .expect("first");
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            3,
+            5,
+            Some("0xA".into()),
+            &[0u8; 32],
+        );
         assert!(result.is_err());
     }
 
@@ -2626,8 +3075,16 @@ mod tests {
         // None vs Some("0xA"), strict → reject
         let db = SlashingDb::open_in_memory().expect("open");
         db.set_strict_semantics(true);
-        db.check_and_record_attestation("0x1234", 3, 5, None).expect("first");
-        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        db.check_and_record_attestation("local-vc", "0x1234", 3, 5, None, &[0u8; 32])
+            .expect("first");
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            3,
+            5,
+            Some("0xA".into()),
+            &[0u8; 32],
+        );
         assert!(result.is_err());
     }
 
@@ -2635,8 +3092,9 @@ mod tests {
     fn test_strict_att_none_none_lenient_allows() {
         // None vs None, lenient (default) → allow (treat as re-sign)
         let db = SlashingDb::open_in_memory().expect("open");
-        db.check_and_record_attestation("0x1234", 3, 5, None).expect("first");
-        let result = db.check_and_record_attestation("0x1234", 3, 5, None);
+        db.check_and_record_attestation("local-vc", "0x1234", 3, 5, None, &[0u8; 32])
+            .expect("first");
+        let result = db.check_and_record_attestation("local-vc", "0x1234", 3, 5, None, &[0u8; 32]);
         assert!(result.is_ok());
     }
 
@@ -2645,8 +3103,9 @@ mod tests {
         // None vs None, strict → reject (unknown root = potential double vote)
         let db = SlashingDb::open_in_memory().expect("open");
         db.set_strict_semantics(true);
-        db.check_and_record_attestation("0x1234", 3, 5, None).expect("first");
-        let result = db.check_and_record_attestation("0x1234", 3, 5, None);
+        db.check_and_record_attestation("local-vc", "0x1234", 3, 5, None, &[0u8; 32])
+            .expect("first");
+        let result = db.check_and_record_attestation("local-vc", "0x1234", 3, 5, None, &[0u8; 32]);
         assert!(result.is_err(), "strict mode should reject None==None as potential double vote");
     }
 
@@ -2654,7 +3113,14 @@ mod tests {
     fn test_strict_att_no_existing_lenient_inserts() {
         // No existing record, lenient → insert
         let db = SlashingDb::open_in_memory().expect("open");
-        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            3,
+            5,
+            Some("0xA".into()),
+            &[0u8; 32],
+        );
         assert!(result.is_ok());
         assert_eq!(db.get_attestations("0x1234").unwrap().len(), 1);
     }
@@ -2664,7 +3130,14 @@ mod tests {
         // No existing record, strict → insert
         let db = SlashingDb::open_in_memory().expect("open");
         db.set_strict_semantics(true);
-        let result = db.check_and_record_attestation("0x1234", 3, 5, Some("0xA".into()));
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            3,
+            5,
+            Some("0xA".into()),
+            &[0u8; 32],
+        );
         assert!(result.is_ok());
         assert_eq!(db.get_attestations("0x1234").unwrap().len(), 1);
     }
@@ -2675,8 +3148,8 @@ mod tests {
     fn test_strict_block_none_none_lenient_allows() {
         // None vs None block, lenient → allow
         let db = SlashingDb::open_in_memory().expect("open");
-        db.check_and_record_block("0x1234", 100, None).expect("first");
-        let result = db.check_and_record_block("0x1234", 100, None);
+        db.check_and_record_block("local-vc", "0x1234", 100, None, &[0u8; 32]).expect("first");
+        let result = db.check_and_record_block("local-vc", "0x1234", 100, None, &[0u8; 32]);
         assert!(result.is_ok());
     }
 
@@ -2685,8 +3158,8 @@ mod tests {
         // None vs None block, strict → reject
         let db = SlashingDb::open_in_memory().expect("open");
         db.set_strict_semantics(true);
-        db.check_and_record_block("0x1234", 100, None).expect("first");
-        let result = db.check_and_record_block("0x1234", 100, None);
+        db.check_and_record_block("local-vc", "0x1234", 100, None, &[0u8; 32]).expect("first");
+        let result = db.check_and_record_block("local-vc", "0x1234", 100, None, &[0u8; 32]);
         assert!(
             result.is_err(),
             "strict mode should reject None==None block as potential double proposal"
@@ -2698,8 +3171,10 @@ mod tests {
         // Some("0xA") vs Some("0xA") block, strict → allow (genuine re-sign)
         let db = SlashingDb::open_in_memory().expect("open");
         db.set_strict_semantics(true);
-        db.check_and_record_block("0x1234", 100, Some("0xA".into())).expect("first");
-        let result = db.check_and_record_block("0x1234", 100, Some("0xA".into()));
+        db.check_and_record_block("local-vc", "0x1234", 100, Some("0xA".into()), &[0u8; 32])
+            .expect("first");
+        let result =
+            db.check_and_record_block("local-vc", "0x1234", 100, Some("0xA".into()), &[0u8; 32]);
         assert!(result.is_ok());
     }
 
@@ -2708,8 +3183,9 @@ mod tests {
         // None vs Some("0xA") block, strict → reject
         let db = SlashingDb::open_in_memory().expect("open");
         db.set_strict_semantics(true);
-        db.check_and_record_block("0x1234", 100, None).expect("first");
-        let result = db.check_and_record_block("0x1234", 100, Some("0xA".into()));
+        db.check_and_record_block("local-vc", "0x1234", 100, None, &[0u8; 32]).expect("first");
+        let result =
+            db.check_and_record_block("local-vc", "0x1234", 100, Some("0xA".into()), &[0u8; 32]);
         assert!(result.is_err());
     }
 
@@ -2731,12 +3207,24 @@ mod tests {
 
         let handle1 = thread::spawn(move || {
             b1.wait();
-            db1.check_and_record_block("0x1234", 1000, Some("0xroot1".to_string()))
+            db1.check_and_record_block(
+                "local-vc",
+                "0x1234",
+                1000,
+                Some("0xroot1".to_string()),
+                &[0u8; 32],
+            )
         });
 
         let handle2 = thread::spawn(move || {
             b2.wait();
-            db2.check_and_record_block("0x1234", 1000, Some("0xroot2".to_string()))
+            db2.check_and_record_block(
+                "local-vc",
+                "0x1234",
+                1000,
+                Some("0xroot2".to_string()),
+                &[0u8; 32],
+            )
         });
 
         let r1 = handle1.join().expect("thread panicked");
@@ -2804,12 +3292,26 @@ mod tests {
 
         let handle1 = thread::spawn(move || {
             b1.wait();
-            db1.check_and_record_attestation("0x1234", 100, 101, Some("0xroot1".to_string()))
+            db1.check_and_record_attestation(
+                "local-vc",
+                "0x1234",
+                100,
+                101,
+                Some("0xroot1".to_string()),
+                &[0u8; 32],
+            )
         });
 
         let handle2 = thread::spawn(move || {
             b2.wait();
-            db2.check_and_record_attestation("0x1234", 99, 101, Some("0xroot2".to_string()))
+            db2.check_and_record_attestation(
+                "local-vc",
+                "0x1234",
+                99,
+                101,
+                Some("0xroot2".to_string()),
+                &[0u8; 32],
+            )
         });
 
         let r1 = handle1.join().expect("thread panicked");
@@ -3289,7 +3791,7 @@ mod tests {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
         db.set_block_watermark("0x1234", 1000).expect("set should succeed");
 
-        let result = db.check_and_record_block("0x1234", 999, None);
+        let result = db.check_and_record_block("local-vc", "0x1234", 999, None, &[0u8; 32]);
         assert!(result.is_err());
         match result.unwrap_err() {
             SlashingError::BelowBlockWatermark { .. } => {}
@@ -3306,7 +3808,8 @@ mod tests {
         db.set_attestation_watermark("0x1234", 100, 101).expect("set should succeed");
 
         // source=100 is at source watermark, but target=100 < target watermark=101
-        let result = db.check_and_record_attestation("0x1234", 100, 100, None);
+        let result =
+            db.check_and_record_attestation("local-vc", "0x1234", 100, 100, None, &[0u8; 32]);
         assert!(result.is_err());
         match result.unwrap_err() {
             SlashingError::BelowAttestationWatermark { .. } => {}
@@ -3342,7 +3845,7 @@ mod tests {
         db.set_attestation_watermark("0x1234", 20, 20).expect("set should succeed");
 
         // source=1 is below source watermark=20
-        let result = db.check_and_record_attestation("0x1234", 1, 31, None);
+        let result = db.check_and_record_attestation("local-vc", "0x1234", 1, 31, None, &[0u8; 32]);
         assert!(result.is_err());
         match result.unwrap_err() {
             SlashingError::BelowAttestationSourceWatermark { .. } => {}
@@ -3693,11 +4196,25 @@ mod edge_case_tests {
         // idempotent re-sign. No warning, no rejection.
         let db = SlashingDb::open_in_memory().expect("open");
 
-        db.check_and_record_attestation("0xval", 10, 20, Some("0xdeadbeef".into()))
-            .expect("initial attestation");
+        db.check_and_record_attestation(
+            "local-vc",
+            "0xval",
+            10,
+            20,
+            Some("0xdeadbeef".into()),
+            &[0u8; 32],
+        )
+        .expect("initial attestation");
 
         // Identical re-sign: same source, same target, same root
-        let result = db.check_and_record_attestation("0xval", 10, 20, Some("0xdeadbeef".into()));
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0xval",
+            10,
+            20,
+            Some("0xdeadbeef".into()),
+            &[0u8; 32],
+        );
         assert!(result.is_ok(), "identical re-sign must be allowed silently");
 
         // Should not create a duplicate record
@@ -3718,11 +4235,25 @@ mod edge_case_tests {
         // would only hurt a client with a minor bookkeeping bug.
         let db = SlashingDb::open_in_memory().expect("open");
 
-        db.check_and_record_attestation("0xval", 10, 20, Some("0xdeadbeef".into()))
-            .expect("initial attestation");
+        db.check_and_record_attestation(
+            "local-vc",
+            "0xval",
+            10,
+            20,
+            Some("0xdeadbeef".into()),
+            &[0u8; 32],
+        )
+        .expect("initial attestation");
 
         // Same root but source_epoch differs (10 → 15): warns internally
-        let result = db.check_and_record_attestation("0xval", 15, 20, Some("0xdeadbeef".into()));
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0xval",
+            15,
+            20,
+            Some("0xdeadbeef".into()),
+            &[0u8; 32],
+        );
         assert!(
             result.is_ok(),
             "same root with different source must still be allowed (defense-in-depth warning only)"
@@ -3763,10 +4294,10 @@ mod edge_case_tests {
         // Our lenient interpretation: unknown == unknown → same message.
         let db = SlashingDb::open_in_memory().expect("open");
 
-        db.check_and_record_attestation("0xval", 10, 20, None)
+        db.check_and_record_attestation("local-vc", "0xval", 10, 20, None, &[0u8; 32])
             .expect("initial attestation without root");
 
-        let result = db.check_and_record_attestation("0xval", 10, 20, None);
+        let result = db.check_and_record_attestation("local-vc", "0xval", 10, 20, None, &[0u8; 32]);
         assert!(result.is_ok(), "lenient mode: None==None must be allowed as re-sign");
     }
 
@@ -3787,10 +4318,10 @@ mod edge_case_tests {
         let db = SlashingDb::open_in_memory().expect("open");
         db.set_strict_semantics(true);
 
-        db.check_and_record_attestation("0xval", 10, 20, None)
+        db.check_and_record_attestation("local-vc", "0xval", 10, 20, None, &[0u8; 32])
             .expect("initial attestation without root");
 
-        let result = db.check_and_record_attestation("0xval", 10, 20, None);
+        let result = db.check_and_record_attestation("local-vc", "0xval", 10, 20, None, &[0u8; 32]);
         assert!(
             result.is_err(),
             "strict mode: None==None must be rejected as potential double vote"
@@ -3809,14 +4340,30 @@ mod edge_case_tests {
         let db = SlashingDb::open_in_memory().expect("open");
 
         // Case 1: existing=Some, new=None
-        db.check_and_record_attestation("0xval_a", 10, 20, Some("0xroot".into()))
-            .expect("initial with root");
-        let result = db.check_and_record_attestation("0xval_a", 10, 20, None);
+        db.check_and_record_attestation(
+            "local-vc",
+            "0xval_a",
+            10,
+            20,
+            Some("0xroot".into()),
+            &[0u8; 32],
+        )
+        .expect("initial with root");
+        let result =
+            db.check_and_record_attestation("local-vc", "0xval_a", 10, 20, None, &[0u8; 32]);
         assert!(result.is_err(), "Some vs None must always reject");
 
         // Case 2: existing=None, new=Some
-        db.check_and_record_attestation("0xval_b", 10, 20, None).expect("initial without root");
-        let result = db.check_and_record_attestation("0xval_b", 10, 20, Some("0xroot".into()));
+        db.check_and_record_attestation("local-vc", "0xval_b", 10, 20, None, &[0u8; 32])
+            .expect("initial without root");
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0xval_b",
+            10,
+            20,
+            Some("0xroot".into()),
+            &[0u8; 32],
+        );
         assert!(result.is_err(), "None vs Some must always reject");
     }
 
@@ -3830,9 +4377,10 @@ mod edge_case_tests {
         let db = SlashingDb::open_in_memory().expect("open");
         db.set_strict_semantics(true);
 
-        db.check_and_record_block("0xval", 500, None).expect("initial block without root");
+        db.check_and_record_block("local-vc", "0xval", 500, None, &[0u8; 32])
+            .expect("initial block without root");
 
-        let result = db.check_and_record_block("0xval", 500, None);
+        let result = db.check_and_record_block("local-vc", "0xval", 500, None, &[0u8; 32]);
         assert!(
             result.is_err(),
             "strict mode: None==None block must be rejected as potential double proposal"
@@ -3909,10 +4457,24 @@ mod edge_case_tests {
     fn test_attestation_at_epoch_zero() {
         let db = SlashingDb::open_in_memory().expect("open");
 
-        db.check_and_record_attestation("0xval", 0, 0, Some("0xroot_a".into()))
-            .expect("first attestation at epoch 0");
+        db.check_and_record_attestation(
+            "local-vc",
+            "0xval",
+            0,
+            0,
+            Some("0xroot_a".into()),
+            &[0u8; 32],
+        )
+        .expect("first attestation at epoch 0");
 
-        let result = db.check_and_record_attestation("0xval", 0, 0, Some("0xroot_b".into()));
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0xval",
+            0,
+            0,
+            Some("0xroot_b".into()),
+            &[0u8; 32],
+        );
         assert!(result.is_err(), "double vote at target epoch 0 must be rejected");
         match result.unwrap_err() {
             SlashingError::SlashableAttestation(AttestationSlashingViolation::DoubleVote {
@@ -3931,12 +4493,26 @@ mod edge_case_tests {
         let db = SlashingDb::open_in_memory().expect("open");
 
         // Wide attestation: source=0, target=2
-        db.check_and_record_attestation("0xval", 0, 2, Some("0xroot_wide".into()))
-            .expect("wide attestation at epoch 0 boundary");
+        db.check_and_record_attestation(
+            "local-vc",
+            "0xval",
+            0,
+            2,
+            Some("0xroot_wide".into()),
+            &[0u8; 32],
+        )
+        .expect("wide attestation at epoch 0 boundary");
 
         // Narrow attestation: source=1, target=1 — surrounded by (0,2)
         // existing_source(0) < new_source(1) AND existing_target(2) > new_target(1)
-        let result = db.check_and_record_attestation("0xval", 1, 1, Some("0xroot_narrow".into()));
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0xval",
+            1,
+            1,
+            Some("0xroot_narrow".into()),
+            &[0u8; 32],
+        );
         assert!(result.is_err(), "surrounded vote at epoch 0 boundary must be rejected");
         match result.unwrap_err() {
             SlashingError::SlashableAttestation(AttestationSlashingViolation::SurroundedVote {
@@ -3952,10 +4528,11 @@ mod edge_case_tests {
     fn test_block_proposal_at_slot_zero() {
         let db = SlashingDb::open_in_memory().expect("open");
 
-        db.check_and_record_block("0xval", 0, Some("0xblock_a".into()))
+        db.check_and_record_block("local-vc", "0xval", 0, Some("0xblock_a".into()), &[0u8; 32])
             .expect("first block at slot 0");
 
-        let result = db.check_and_record_block("0xval", 0, Some("0xblock_b".into()));
+        let result =
+            db.check_and_record_block("local-vc", "0xval", 0, Some("0xblock_b".into()), &[0u8; 32]);
         assert!(result.is_err(), "double proposal at slot 0 must be rejected");
         match result.unwrap_err() {
             SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal { slot }) => {
@@ -3974,12 +4551,26 @@ mod edge_case_tests {
         let db = SlashingDb::open_in_memory().expect("open");
 
         // Wide attestation: source=2, target=10
-        db.check_and_record_attestation("0xval", 2, 10, Some("0xroot_wide".into()))
-            .expect("wide attestation");
+        db.check_and_record_attestation(
+            "local-vc",
+            "0xval",
+            2,
+            10,
+            Some("0xroot_wide".into()),
+            &[0u8; 32],
+        )
+        .expect("wide attestation");
 
         // Narrow attestation: source=5, target=7 — surrounded by (2,10)
         // existing_source(2) < new_source(5) AND existing_target(10) > new_target(7)
-        let result = db.check_and_record_attestation("0xval", 5, 7, Some("0xroot_narrow".into()));
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0xval",
+            5,
+            7,
+            Some("0xroot_narrow".into()),
+            &[0u8; 32],
+        );
         assert!(result.is_err(), "surrounded vote must be rejected");
         match result.unwrap_err() {
             SlashingError::SlashableAttestation(AttestationSlashingViolation::SurroundedVote {
