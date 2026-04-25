@@ -125,7 +125,22 @@ pub trait TypedSigner: Send + Sync {
         ctx: &SignContext,
     ) -> Result<Signature, SigningError>;
 
-    /// Sign a voluntary exit (DOMAIN_VOLUNTARY_EXIT, EIP-7044 Capella cap).
+    /// Sign a voluntary exit (DOMAIN_VOLUNTARY_EXIT).
+    ///
+    /// # EIP-7044 caller responsibility
+    ///
+    /// Per EIP-7044, voluntary-exit signatures must use the **Capella fork
+    /// version** for any post-Capella exit so that signatures remain valid
+    /// across hard forks.  This trait does **not** apply that cap internally:
+    /// `ctx.fork_info.current_version` is used as-is.  The caller MUST pass
+    /// a `SignContext` whose `fork_info.current_version` is the Capella-capped
+    /// version when the exit's `epoch` is at or after the Capella fork.
+    ///
+    /// Use [`capella_capped_fork_version`] to compute the correct version
+    /// before constructing the `SignContext`. The server-side dispatch in
+    /// `bin/rvc-signer` (ISSUE-1.6d) is the canonical caller; any new caller
+    /// must mirror that logic to avoid producing signatures the BN will
+    /// reject after a fork transition.
     async fn sign_voluntary_exit(
         &self,
         exit: &VoluntaryExit,

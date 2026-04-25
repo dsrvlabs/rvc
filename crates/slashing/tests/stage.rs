@@ -297,3 +297,65 @@ fn test_stage_attestation_resign_is_idempotent() {
     let atts = db.get_attestations(PUBKEY).expect("get");
     assert_eq!(atts.len(), 1, "re-sign must not create a duplicate attestation row");
 }
+
+/// Discarding (or dropping) a re-sign stage must NOT delete the existing
+/// committed row.  The transaction was effectively read-only on the resign
+/// path, so ROLLBACK is a data no-op — but a future refactor could break
+/// this if e.g. the resign path started doing speculative writes.
+#[test]
+fn test_stage_block_resign_discard_keeps_existing_row() {
+    let db = SlashingDb::open_in_memory().expect("open");
+
+    db.stage_block(CN, PUBKEY, 500, Some("0xresign_keep".into()), GVR)
+        .expect("first stage")
+        .commit()
+        .expect("first commit");
+
+    let before = db.get_blocks(PUBKEY).expect("get before");
+    assert_eq!(before.len(), 1);
+
+    // Same signing root — resign path.  Discard instead of commit.
+    db.stage_block(CN, PUBKEY, 500, Some("0xresign_keep".into()), GVR)
+        .expect("resign stage")
+        .discard();
+
+    let after = db.get_blocks(PUBKEY).expect("get after");
+    assert_eq!(after.len(), 1, "resign+discard must not delete the existing row");
+    assert_eq!(after[0].slot, 500);
+    assert_eq!(after[0].signing_root.as_deref(), Some("0xresign_keep"));
+
+    // Bare drop (no explicit commit/discard) on a resign must also be safe.
+    {
+        let _staged = db
+            .stage_block(CN, PUBKEY, 500, Some("0xresign_keep".into()), GVR)
+            .expect("resign stage 2");
+        // _staged is dropped here without commit/discard.
+    }
+
+    let final_rows = db.get_blocks(PUBKEY).expect("get final");
+    assert_eq!(final_rows.len(), 1, "resign+drop must not delete the existing row");
+}
+
+/// Same property for attestations: a duplicate stage that is discarded must
+/// leave the previously committed attestation row intact.
+#[test]
+fn test_stage_attestation_duplicate_discard_keeps_existing_row() {
+    let db = SlashingDb::open_in_memory().expect("open");
+
+    db.stage_attestation(CN, PUBKEY, 7, 30, Some("0xdup_keep".into()), GVR)
+        .expect("first stage")
+        .commit()
+        .expect("first commit");
+
+    let before = db.get_attestations(PUBKEY).expect("get before");
+    assert_eq!(before.len(), 1);
+
+    db.stage_attestation(CN, PUBKEY, 7, 30, Some("0xdup_keep".into()), GVR)
+        .expect("duplicate stage")
+        .discard();
+
+    let after = db.get_attestations(PUBKEY).expect("get after");
+    assert_eq!(after.len(), 1, "duplicate+discard must not delete the existing attestation");
+    assert_eq!(after[0].source_epoch, 7);
+    assert_eq!(after[0].target_epoch, 30);
+}

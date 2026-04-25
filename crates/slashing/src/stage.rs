@@ -65,6 +65,16 @@ use eth_types::{Epoch, Root, Slot};
 
 use std::sync::atomic::Ordering;
 
+/// Result of the EIP-3076 violation check for a staged block.
+///
+/// `Stage` means the row is new and `commit()` will run the INSERT.
+/// `Resign` means the row already exists with an identical signing root, so
+/// `commit()` skips the INSERT and just closes the transaction.
+enum BlockStageOutcome {
+    Stage,
+    Resign,
+}
+
 // ── BlockRow ──────────────────────────────────────────────────────────────────
 
 /// Parameters for the staged block INSERT — stored in the guard so `commit` can
@@ -288,92 +298,91 @@ impl SlashingDb {
 
         guard.execute_batch("BEGIN IMMEDIATE")?;
 
-        // ── Watermark check ──────────────────────────────────────────────────
-        let watermark: Option<i64> = guard
-            .query_row(
-                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
-                [&pubkey],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(wm) = watermark {
-            if (slot as i64) < wm {
-                let _ = guard.execute_batch("ROLLBACK");
-                return Err(SlashingError::BelowBlockWatermark {
-                    slot,
-                    watermark_slot: wm as Slot,
-                });
-            }
-        }
-
-        // ── Double-proposal check (CN-scoped) ────────────────────────────────
-        let existing: Option<Option<String>> = guard
-            .query_row(
-                "SELECT signing_root FROM blocks \
-                 WHERE client_cn = ?1 AND pubkey = ?2 AND slot = ?3",
-                (client_cn, &pubkey, slot as i64),
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        if let Some(existing_root) = existing {
-            let strict = self.strict_semantics.load(Ordering::Relaxed);
-            let is_resign = match (&existing_root, &signing_root_hex) {
-                (Some(er), Some(nr)) if er == nr => true,
-                (None, None) if !strict => true,
-                _ => false,
-            };
-            if !is_resign {
-                tracing::error!(
-                    pubkey = %TruncatedPubkey::new(&pubkey),
-                    slot,
-                    rejection_reason = "double_block_proposal",
-                    "stage_block rejected"
-                );
-                let _ = guard.execute_batch("ROLLBACK");
-                return Err(BlockSlashingViolation::DoubleBlockProposal { slot }.into());
-            }
-            // Same signing root — idempotent re-sign.  Keep the transaction open
-            // and return a guard with `is_resign = true` so `commit()` skips the
-            // INSERT but still issues `COMMIT` to close the transaction cleanly.
-            // If the caller calls `discard()` or drops the guard, the `DROP`
-            // handler issues `ROLLBACK`, which is harmless for a re-sign.
-            return Ok(StagedBlock {
-                guard: Some(guard),
-                row: BlockRow {
-                    client_cn: client_cn.to_owned(),
-                    pubkey,
-                    slot,
-                    signing_root: signing_root_hex,
-                    is_resign: true,
-                },
-                committed: false,
-            });
-        }
-
-        // ── Slot-below-minimum check ─────────────────────────────────────────
-        let min_slot: Option<i64> = guard
-            .query_row(
-                "SELECT MIN(slot) FROM blocks WHERE client_cn = ?1 AND pubkey = ?2",
-                (client_cn, &pubkey),
-                |row| row.get(0),
-            )
-            .optional()?
-            .flatten();
-
-        if let Some(min) = min_slot {
-            if (slot as i64) < min {
-                let _ = guard.execute_batch("ROLLBACK");
-                return Err(BlockSlashingViolation::SlotBelowMinimum {
-                    slot,
-                    min_slot: min as Slot,
+        let strict = self.strict_semantics.load(Ordering::Relaxed);
+        // Run violation checks inside a closure so any error — whether a SQL
+        // I/O error from `?`-propagation or an EIP-3076 violation — funnels
+        // through a single ROLLBACK before we return. Without this wrapper a
+        // SQL error between `BEGIN IMMEDIATE` and the guard transfer would
+        // drop the MutexGuard with the transaction still open, leaving the
+        // connection in a broken "transaction within transaction" state.
+        let outcome = (|| -> Result<BlockStageOutcome, SlashingError> {
+            let watermark: Option<i64> = guard
+                .query_row(
+                    "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
+                    [&pubkey],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(wm) = watermark {
+                if (slot as i64) < wm {
+                    return Err(SlashingError::BelowBlockWatermark {
+                        slot,
+                        watermark_slot: wm as Slot,
+                    });
                 }
-                .into());
             }
-        }
 
-        // Violation checks passed.  Return the guard; the transaction is open
-        // until commit() or drop().
+            let existing: Option<Option<String>> = guard
+                .query_row(
+                    "SELECT signing_root FROM blocks \
+                     WHERE client_cn = ?1 AND pubkey = ?2 AND slot = ?3",
+                    (client_cn, &pubkey, slot as i64),
+                    |row| row.get(0),
+                )
+                .optional()?;
+
+            if let Some(existing_root) = existing {
+                let is_resign = match (&existing_root, &signing_root_hex) {
+                    (Some(er), Some(nr)) if er == nr => true,
+                    (None, None) if !strict => true,
+                    _ => false,
+                };
+                if !is_resign {
+                    tracing::error!(
+                        pubkey = %TruncatedPubkey::new(&pubkey),
+                        slot,
+                        rejection_reason = "double_block_proposal",
+                        "stage_block rejected"
+                    );
+                    return Err(BlockSlashingViolation::DoubleBlockProposal { slot }.into());
+                }
+                return Ok(BlockStageOutcome::Resign);
+            }
+
+            let min_slot: Option<i64> = guard
+                .query_row(
+                    "SELECT MIN(slot) FROM blocks WHERE client_cn = ?1 AND pubkey = ?2",
+                    (client_cn, &pubkey),
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+
+            if let Some(min) = min_slot {
+                if (slot as i64) < min {
+                    return Err(BlockSlashingViolation::SlotBelowMinimum {
+                        slot,
+                        min_slot: min as Slot,
+                    }
+                    .into());
+                }
+            }
+
+            Ok(BlockStageOutcome::Stage)
+        })();
+
+        let outcome = match outcome {
+            Ok(o) => o,
+            Err(e) => {
+                let _ = guard.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        };
+
+        // Same signing root on a Resign — keep the transaction open and let
+        // `commit()` skip the INSERT but still close the transaction. A
+        // `discard()` or bare drop issues `ROLLBACK`, which is harmless on
+        // a read-only transaction.
         Ok(StagedBlock {
             guard: Some(guard),
             row: BlockRow {
@@ -381,7 +390,7 @@ impl SlashingDb {
                 pubkey,
                 slot,
                 signing_root: signing_root_hex,
-                is_resign: false,
+                is_resign: matches!(outcome, BlockStageOutcome::Resign),
             },
             committed: false,
         })
@@ -410,152 +419,156 @@ impl SlashingDb {
 
         guard.execute_batch("BEGIN IMMEDIATE")?;
 
-        // ── Watermark checks ─────────────────────────────────────────────────
-        let wm_source: Option<i64> = guard
-            .query_row(
-                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
-                [&pubkey],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(ws) = wm_source {
-            if (source_epoch as i64) < ws {
-                let _ = guard.execute_batch("ROLLBACK");
-                return Err(SlashingError::BelowAttestationSourceWatermark {
-                    source_epoch,
-                    watermark_source: ws as Epoch,
-                });
+        let strict = self.strict_semantics.load(Ordering::Relaxed);
+        // Wrap the violation-check phase so any error — SQL I/O or EIP-3076 —
+        // funnels through a single ROLLBACK before we return.  See the
+        // matching note in `stage_block`.
+        let outcome = (|| -> Result<bool, SlashingError> {
+            let wm_source: Option<i64> = guard
+                .query_row(
+                    "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
+                    [&pubkey],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(ws) = wm_source {
+                if (source_epoch as i64) < ws {
+                    return Err(SlashingError::BelowAttestationSourceWatermark {
+                        source_epoch,
+                        watermark_source: ws as Epoch,
+                    });
+                }
             }
-        }
 
-        let wm_target: Option<i64> = guard
-            .query_row(
-                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
-                [&pubkey],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(wt) = wm_target {
-            if (target_epoch as i64) < wt {
-                let _ = guard.execute_batch("ROLLBACK");
-                return Err(SlashingError::BelowAttestationWatermark {
-                    target_epoch,
-                    watermark_target: wt as Epoch,
-                });
+            let wm_target: Option<i64> = guard
+                .query_row(
+                    "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
+                    [&pubkey],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(wt) = wm_target {
+                if (target_epoch as i64) < wt {
+                    return Err(SlashingError::BelowAttestationWatermark {
+                        target_epoch,
+                        watermark_target: wt as Epoch,
+                    });
+                }
             }
-        }
 
-        // ── Fetch existing attestations (CN-scoped) ──────────────────────────
-        let existing: Vec<(Epoch, Epoch, Option<String>)> = {
-            let mut stmt = guard.prepare(
-                "SELECT source_epoch, target_epoch, signing_root \
-                 FROM attestations \
-                 WHERE client_cn = ?1 AND pubkey = ?2",
-            )?;
-            let rows = stmt
-                .query_map((client_cn, &pubkey), |row| {
-                    Ok((
-                        row.get::<_, i64>(0)? as Epoch,
-                        row.get::<_, i64>(1)? as Epoch,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows
-        };
+            let existing: Vec<(Epoch, Epoch, Option<String>)> = {
+                let mut stmt = guard.prepare(
+                    "SELECT source_epoch, target_epoch, signing_root \
+                     FROM attestations \
+                     WHERE client_cn = ?1 AND pubkey = ?2",
+                )?;
+                let rows = stmt
+                    .query_map((client_cn, &pubkey), |row| {
+                        Ok((
+                            row.get::<_, i64>(0)? as Epoch,
+                            row.get::<_, i64>(1)? as Epoch,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
 
-        let mut is_duplicate = false;
+            let mut is_duplicate = false;
 
-        for (existing_source, existing_target, existing_root) in &existing {
-            if target_epoch == *existing_target {
-                let strict = self.strict_semantics.load(Ordering::Relaxed);
-                match (existing_root, &signing_root_hex) {
-                    (Some(er), Some(nr)) if er == nr => {
-                        if source_epoch != *existing_source {
-                            tracing::warn!(
-                                pubkey,
+            for (existing_source, existing_target, existing_root) in &existing {
+                if target_epoch == *existing_target {
+                    match (existing_root, &signing_root_hex) {
+                        (Some(er), Some(nr)) if er == nr => {
+                            if source_epoch != *existing_source {
+                                tracing::warn!(
+                                    pubkey,
+                                    target_epoch,
+                                    existing_source = *existing_source,
+                                    new_source = source_epoch,
+                                    "stage_attestation: same signing root but different source epoch"
+                                );
+                            }
+                            is_duplicate = true;
+                            continue;
+                        }
+                        (None, None) if !strict => {
+                            is_duplicate = true;
+                            continue;
+                        }
+                        _ => {
+                            tracing::error!(
+                                pubkey = %TruncatedPubkey::new(&pubkey),
+                                source_epoch,
                                 target_epoch,
-                                existing_source = *existing_source,
-                                new_source = source_epoch,
-                                "stage_attestation: same signing root but different source epoch"
+                                rejection_reason = "double_vote",
+                                "stage_attestation rejected"
+                            );
+                            return Err(
+                                AttestationSlashingViolation::DoubleVote { target_epoch }.into()
                             );
                         }
-                        is_duplicate = true;
-                        continue;
-                    }
-                    (None, None) if !strict => {
-                        is_duplicate = true;
-                        continue;
-                    }
-                    _ => {
-                        tracing::error!(
-                            pubkey = %TruncatedPubkey::new(&pubkey),
-                            source_epoch,
-                            target_epoch,
-                            rejection_reason = "double_vote",
-                            "stage_attestation rejected"
-                        );
-                        let _ = guard.execute_batch("ROLLBACK");
-                        return Err(
-                            AttestationSlashingViolation::DoubleVote { target_epoch }.into()
-                        );
                     }
                 }
-            }
 
-            // Surrounding vote: new surrounds existing (new_source < existing_source AND new_target > existing_target)
-            if source_epoch < *existing_source && target_epoch > *existing_target {
-                tracing::error!(
-                    pubkey = %TruncatedPubkey::new(&pubkey),
-                    source_epoch,
-                    target_epoch,
-                    rejection_reason = "surrounding_vote",
-                    "stage_attestation rejected"
-                );
-                let _ = guard.execute_batch("ROLLBACK");
-                return Err(AttestationSlashingViolation::SurroundingVote {
-                    new_source: source_epoch,
-                    new_target: target_epoch,
-                    existing_source: *existing_source,
-                    existing_target: *existing_target,
-                }
-                .into());
-            }
-
-            // Surrounded vote: existing surrounds new (existing_source < new_source AND existing_target > new_target)
-            if *existing_source < source_epoch && *existing_target > target_epoch {
-                tracing::error!(
-                    pubkey = %TruncatedPubkey::new(&pubkey),
-                    source_epoch,
-                    target_epoch,
-                    rejection_reason = "surrounded_vote",
-                    "stage_attestation rejected"
-                );
-                let _ = guard.execute_batch("ROLLBACK");
-                return Err(AttestationSlashingViolation::SurroundedVote {
-                    new_source: source_epoch,
-                    new_target: target_epoch,
-                    existing_source: *existing_source,
-                    existing_target: *existing_target,
-                }
-                .into());
-            }
-        }
-
-        if !is_duplicate {
-            // Target-below-minimum check.
-            let min_target = existing.iter().map(|(_, t, _)| *t).min();
-            if let Some(min) = min_target {
-                if target_epoch < min {
-                    let _ = guard.execute_batch("ROLLBACK");
-                    return Err(AttestationSlashingViolation::TargetEpochBelowMinimum {
+                if source_epoch < *existing_source && target_epoch > *existing_target {
+                    tracing::error!(
+                        pubkey = %TruncatedPubkey::new(&pubkey),
+                        source_epoch,
                         target_epoch,
-                        min_target: min,
+                        rejection_reason = "surrounding_vote",
+                        "stage_attestation rejected"
+                    );
+                    return Err(AttestationSlashingViolation::SurroundingVote {
+                        new_source: source_epoch,
+                        new_target: target_epoch,
+                        existing_source: *existing_source,
+                        existing_target: *existing_target,
+                    }
+                    .into());
+                }
+
+                if *existing_source < source_epoch && *existing_target > target_epoch {
+                    tracing::error!(
+                        pubkey = %TruncatedPubkey::new(&pubkey),
+                        source_epoch,
+                        target_epoch,
+                        rejection_reason = "surrounded_vote",
+                        "stage_attestation rejected"
+                    );
+                    return Err(AttestationSlashingViolation::SurroundedVote {
+                        new_source: source_epoch,
+                        new_target: target_epoch,
+                        existing_source: *existing_source,
+                        existing_target: *existing_target,
                     }
                     .into());
                 }
             }
-        }
+
+            if !is_duplicate {
+                let min_target = existing.iter().map(|(_, t, _)| *t).min();
+                if let Some(min) = min_target {
+                    if target_epoch < min {
+                        return Err(AttestationSlashingViolation::TargetEpochBelowMinimum {
+                            target_epoch,
+                            min_target: min,
+                        }
+                        .into());
+                    }
+                }
+            }
+
+            Ok(is_duplicate)
+        })();
+
+        let is_duplicate = match outcome {
+            Ok(d) => d,
+            Err(e) => {
+                let _ = guard.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        };
 
         Ok(StagedAttestation {
             guard: Some(guard),
