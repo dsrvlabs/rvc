@@ -310,7 +310,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_success_with_mock() {
-        use wiremock::matchers::{header, method};
+        use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;

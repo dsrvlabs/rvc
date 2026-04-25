@@ -1131,8 +1131,10 @@ mod tests {
         assert!(result.is_ok());
 
         // All 3 batches should have been attempted
-        let calls = bn.register_calls.lock();
-        assert_eq!(calls.len(), 3);
+        {
+            let calls = bn.register_calls.lock();
+            assert_eq!(calls.len(), 3);
+        }
 
         // Cache should only contain validators from successful batches (0 and 2)
         let cache = service.cache.read().await;

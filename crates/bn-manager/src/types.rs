@@ -206,11 +206,11 @@ mod tests {
         // SmallLag meets SmallLag and below
         assert!(HealthTier::SmallLag <= HealthTier::SmallLag);
         assert!(HealthTier::SmallLag <= HealthTier::LargeLag);
-        assert!(!(HealthTier::SmallLag <= HealthTier::Synced));
+        assert!(HealthTier::SmallLag > HealthTier::Synced);
 
         // LargeLag only meets LargeLag and Unsynced
         assert!(HealthTier::LargeLag <= HealthTier::LargeLag);
-        assert!(!(HealthTier::LargeLag <= HealthTier::SmallLag));
+        assert!(HealthTier::LargeLag > HealthTier::SmallLag);
     }
 
     // -- TierThresholds tests --
