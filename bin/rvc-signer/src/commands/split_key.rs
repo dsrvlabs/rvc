@@ -408,7 +408,7 @@ mod tests {
         ];
 
         for subset_idx in &subsets {
-            let subset: Vec<BlsShare> = subset_idx.iter().map(|&i| all_shares[i].clone()).collect();
+            let subset: Vec<BlsShare> = subset_idx.iter().map(|&i| all_shares[i]).collect();
             let reconstructed: IdentifierPrimeField<Scalar> =
                 subset.combine().expect("combine should succeed");
             let recovered_blst = scalar_to_blst_sk(&reconstructed.0).unwrap();

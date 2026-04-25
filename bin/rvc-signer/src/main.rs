@@ -7,7 +7,7 @@ use rvc_signer_bin::{
     backend, config, metrics, reload, service, slashing, SignerServiceServer, SignerServiceServerV2,
 };
 #[cfg(feature = "dvt")]
-use rvc_signer_bin::{dvt, PeerSignerService, PeerSignerServiceServer};
+use rvc_signer_bin::{dvt, PeerSignerServiceServerV2};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -141,6 +141,12 @@ struct ServeArgs {
     #[cfg(feature = "dvt")]
     #[arg(long, default_value = "2000")]
     dvt_timeout: u64,
+
+    /// Path to the DVT allow-list TOML file (required when backend=dvt).
+    /// Format: [[peer]] entries with peer_cn and share_index.
+    #[cfg(feature = "dvt")]
+    #[arg(long)]
+    dvt_allowed_peers: Option<PathBuf>,
 }
 
 #[cfg(feature = "dvt")]
@@ -232,11 +238,15 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Set up Prometheus metrics early so DVT backend can use them
     let signer_metrics = Arc::new(metrics::SignerMetrics::new());
 
-    // Build the signing backend and optional peer signer service
+    // Build the signing backend and optional share-map for the PeerSignerService.
+    // The PeerSignerService is constructed later (after the slashing DB is opened),
+    // so build_dvt_backend returns the raw share_map rather than a complete service.
     #[cfg(feature = "dvt")]
-    let (signing_backend, peer_signer_service, basic_signer_ref): (
+    type ShareMap = Arc<std::collections::HashMap<[u8; 48], dvt::types::ShareInfo>>;
+    #[cfg(feature = "dvt")]
+    let (signing_backend, dvt_share_map_opt, basic_signer_ref): (
         Arc<dyn backend::SigningBackend>,
-        Option<dvt::peer_service::PeerSignerServiceImpl>,
+        Option<ShareMap>,
         Option<Arc<backend::basic::BasicSigner>>,
     ) = match parse_backend(&resolved.backend)? {
         Backend::Basic => {
@@ -245,14 +255,14 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             (Arc::clone(&signer) as Arc<dyn backend::SigningBackend>, None, Some(signer))
         }
         Backend::Dvt => {
-            let (backend, peer_svc) = build_dvt_backend(
+            let (backend, share_map) = build_dvt_backend(
                 &resolved,
                 &password,
                 tls_config.as_ref(),
                 Arc::new(signer_metrics.dvt.clone()),
             )
             .await?;
-            (backend, peer_svc, None)
+            (backend, Some(share_map), None)
         }
     };
 
@@ -372,6 +382,34 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let svc_v1 = make_svc(slashing_db_opt.as_ref());
     let svc_v2 = make_svc(slashing_db_opt.as_ref());
 
+    // Build the PeerSignerService (DVT) now that we have the slashing DB.
+    // allow-list loading: mandatory when DVT is enabled (backend=dvt).
+    #[cfg(feature = "dvt")]
+    let peer_signer_service: Option<dvt::peer_service::PeerSignerServiceImpl> =
+        if let Some(share_map) = dvt_share_map_opt {
+            // Load the allow-list (required for DVT).
+            let allow_list_path = args.dvt_allowed_peers.as_deref().ok_or(
+                "DVT is enabled but --dvt-allowed-peers was not provided. \
+                 Create a dvt-allowed-peers.toml file and pass its path via --dvt-allowed-peers.",
+            )?;
+            let allow_list = dvt::allow_list::AllowedPeers::load_from_path(allow_list_path)
+                .map_err(|e| format!("failed to load DVT allow-list: {e}"))?;
+            info!(
+                path = %allow_list_path.display(),
+                peer_count = allow_list.peers.len(),
+                "Loaded DVT allow-list"
+            );
+            let allow_list = std::sync::Arc::new(allow_list);
+            let peer_svc = dvt::peer_service::PeerSignerServiceImpl::new(
+                share_map,
+                allow_list,
+                slashing_db_opt.clone(),
+            );
+            Some(peer_svc)
+        } else {
+            None
+        };
+
     let addr = resolved.listen_address.parse()?;
 
     let mut builder = tonic::transport::Server::builder();
@@ -396,20 +434,20 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     #[cfg(feature = "dvt")]
     let router = if let Some(peer_svc) = peer_signer_service {
-        info!("PeerSignerService registered for DVT");
-        router.add_service(PeerSignerServiceServer::new(peer_svc))
+        info!("PeerSignerService v2 registered for DVT");
+        router.add_service(PeerSignerServiceServerV2::new(peer_svc))
     } else {
         router
     };
-
-    #[cfg(not(feature = "dvt"))]
-    let _ = peer_signer_service;
 
     router.serve_with_shutdown(addr, shutdown_signal()).await?;
 
     Ok(())
 }
 
+/// Returns the DVT signing backend AND the share map (for `PeerSignerService`).
+/// The share map is returned separately so the caller can build `PeerSignerServiceImpl`
+/// AFTER the slashing DB is opened (allowing CN-scoped slashing for DVT peers).
 #[cfg(feature = "dvt")]
 async fn build_dvt_backend(
     resolved: &config::ResolvedConfig,
@@ -417,7 +455,10 @@ async fn build_dvt_backend(
     tls_config: Option<&rvc_signer_bin::tls::TlsConfig>,
     dvt_metrics: Arc<metrics::DvtMetrics>,
 ) -> Result<
-    (Arc<dyn backend::SigningBackend>, Option<dvt::peer_service::PeerSignerServiceImpl>),
+    (
+        Arc<dyn backend::SigningBackend>,
+        Arc<std::collections::HashMap<[u8; 48], dvt::types::ShareInfo>>,
+    ),
     Box<dyn std::error::Error>,
 > {
     use std::collections::HashMap;
@@ -442,9 +483,8 @@ async fn build_dvt_backend(
     );
 
     let share_map: HashMap<[u8; 48], dvt::types::ShareInfo> =
-        shares.iter().map(|s| (s.aggregate_pubkey, clone_share_info(s))).collect();
-
-    let peer_signer_service = dvt::peer_service::PeerSignerServiceImpl::new(Arc::new(share_map));
+        shares.iter().map(|s| (s.aggregate_pubkey, s.clone())).collect();
+    let share_map = Arc::new(share_map);
 
     let peer_requester = if !resolved.dvt_peers.is_empty() {
         let requester =
@@ -468,18 +508,7 @@ async fn build_dvt_backend(
     )
     .with_metrics(dvt_metrics);
 
-    Ok((Arc::new(dvt_signer), Some(peer_signer_service)))
-}
-
-#[cfg(feature = "dvt")]
-fn clone_share_info(s: &dvt::types::ShareInfo) -> dvt::types::ShareInfo {
-    dvt::types::ShareInfo {
-        index: s.index,
-        threshold: s.threshold,
-        total: s.total,
-        scalar_bytes: s.scalar_bytes.clone(),
-        aggregate_pubkey: s.aggregate_pubkey,
-    }
+    Ok((Arc::new(dvt_signer), share_map))
 }
 
 fn resolve_config(args: &ServeArgs) -> Result<config::ResolvedConfig, Box<dyn std::error::Error>> {
@@ -551,4 +580,50 @@ fn load_serve_password(
 async fn shutdown_signal() {
     tokio::signal::ctrl_c().await.expect("failed to install Ctrl+C handler");
     info!("Shutdown signal received");
+}
+
+/// Parse the backend string into a `Backend` enum.
+#[cfg(feature = "dvt")]
+fn parse_backend(backend: &str) -> Result<Backend, Box<dyn std::error::Error>> {
+    match backend {
+        "basic" => Ok(Backend::Basic),
+        "dvt" => Ok(Backend::Dvt),
+        other => Err(format!("unknown backend: {other}; expected 'basic' or 'dvt'").into()),
+    }
+}
+
+/// Run the split-key subcommand.
+#[cfg(feature = "dvt")]
+fn run_split_key(args: SplitKeyCliArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use rvc_signer_bin::commands::split_key::{execute, SplitKeyArgs};
+    use zeroize::Zeroizing;
+
+    let password = if let Some(ref pw) = args.password {
+        Zeroizing::new(pw.clone())
+    } else if let Some(ref file) = args.password_file {
+        let content = std::fs::read_to_string(file)?;
+        Zeroizing::new(content.trim_end_matches('\n').to_string())
+    } else {
+        Zeroizing::new(String::new())
+    };
+
+    let output_password = if let Some(ref pw) = args.output_password {
+        Zeroizing::new(pw.clone())
+    } else if let Some(ref file) = args.output_password_file {
+        let content = std::fs::read_to_string(file)?;
+        Zeroizing::new(content.trim_end_matches('\n').to_string())
+    } else {
+        Zeroizing::new(String::new())
+    };
+
+    execute(SplitKeyArgs {
+        keystore: args.keystore,
+        password,
+        threshold: args.threshold,
+        shares: args.shares,
+        output_dir: args.output_dir,
+        output_password,
+    })?;
+    info!("Split key successfully");
+    Ok(())
 }

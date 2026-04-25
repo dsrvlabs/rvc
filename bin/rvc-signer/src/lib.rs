@@ -39,3 +39,9 @@ pub use proto::signer::{
 
 // V2 server exports
 pub use proto::signer_v2::signer_service_server::SignerServiceServer as SignerServiceServerV2;
+
+// V2 PeerSignerService server export (DVT)
+#[cfg(feature = "dvt")]
+pub use proto::signer_v2::peer_signer_service_server::{
+    PeerSignerService as PeerSignerServiceV2, PeerSignerServiceServer as PeerSignerServiceServerV2,
+};
