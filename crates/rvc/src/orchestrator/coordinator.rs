@@ -583,12 +583,27 @@ where
             None => return,
         };
 
-        info!(slot, validator_index = proposer_duty.validator_index, "Proposing block");
+        // H-4: parse validator_index for proposer_index validation (returned as String by the BN type)
+        let expected_proposer_index: u64 = match proposer_duty.validator_index.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                error!(slot, raw = %proposer_duty.validator_index,
+                    "Cannot parse proposer duty validator_index as u64 — dropping duty");
+                return;
+            }
+        };
+
+        info!(slot, validator_index = %proposer_duty.validator_index, "Proposing block");
 
         // Wrap with combined produce + publish timeout
         match tokio::time::timeout(
             self.config.timeouts.block_production + self.config.timeouts.block_publication,
-            self.block_service.propose_block(slot, &pubkey),
+            self.block_service.propose_block_validated(
+                slot,
+                &pubkey,
+                expected_proposer_index,
+                None,
+            ),
         )
         .await
         {
@@ -661,7 +676,7 @@ mod tests {
     use slashing::SlashingDb;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use timing::MockSlotClock;
     use tree_hash::TreeHash;
     use validator_store::ValidatorStore;
@@ -779,6 +794,71 @@ mod tests {
 
     fn create_mock_block_beacon() -> Arc<MockBlockBeacon> {
         Arc::new(MockBlockBeacon)
+    }
+
+    /// Block beacon that returns a block with a configurable `proposer_index`
+    /// and tracks whether `publish_block` / `publish_blinded_block` /
+    /// `publish_block_ssz` is called.  Used by the H-4 coordinator integration
+    /// test to verify that a wrong `proposer_index` causes the duty to be
+    /// dropped before any publish attempt.
+    struct BadProposerBlockBeacon {
+        slot: Slot,
+        bad_proposer_index: u64,
+        publish_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait(?Send)]
+    impl BeaconBlockClient for BadProposerBlockBeacon {
+        async fn produce_block_v3(
+            &self,
+            _slot: Slot,
+            _randao_reveal: &str,
+            _graffiti: Option<&str>,
+            _builder_boost_factor: Option<u64>,
+        ) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
+            Ok(ProduceBlockResponse {
+                data: serde_json::json!({
+                    "slot": self.slot.to_string(),
+                    "proposer_index": self.bad_proposer_index.to_string(),
+                    "parent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "state_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "body": "0x"
+                }),
+                is_blinded: false,
+                consensus_version: "deneb".to_string(),
+                execution_payload_value: None,
+                is_ssz: false,
+                ssz_bytes: None,
+            })
+        }
+
+        async fn publish_block(
+            &self,
+            _signed_block: &eth_types::SignedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), block_service::BlockServiceError> {
+            self.publish_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn publish_blinded_block(
+            &self,
+            _signed_block: &eth_types::SignedBlindedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), block_service::BlockServiceError> {
+            self.publish_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn publish_block_ssz(
+            &self,
+            _ssz_bytes: &[u8],
+            _consensus_version: &str,
+            _is_blinded: bool,
+        ) -> Result<(), block_service::BlockServiceError> {
+            self.publish_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     fn create_mock_validator_store() -> Arc<ValidatorStore> {
@@ -4364,6 +4444,108 @@ mod tests {
             capturing.captured().len(),
             1,
             "Only the first attestation should be submitted; double vote must not be propagated"
+        );
+    }
+
+    /// H-4 coordinator integration test: when the BN returns a block whose
+    /// `proposer_index` does not match the duty's `validator_index`, the duty
+    /// must be silently dropped — no signer call and no publish call.
+    ///
+    /// RED against d490044: `propose_block` (unvalidated) ignores the
+    /// `proposer_index` and proceeds to sign + publish, so `publish_called`
+    /// becomes `true` → assertion fails.
+    ///
+    /// GREEN after Critical #1: `propose_block_validated` is wired in;
+    /// the mismatch is caught before signing, `publish_called` stays `false`.
+    #[tokio::test]
+    async fn test_maybe_propose_block_bad_proposer_index_drops_duty() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        // The duty says this validator should propose at slot 100.
+        let expected_validator_index = 42u64;
+        // The BN returns a block with a different (forged) proposer_index.
+        let bad_proposer_index = 99u64;
+
+        // Generate a real key so RANDAO signing succeeds and we reach the
+        // proposer_index validation step.
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+
+        // Beacon client for duty fetching (backed by wiremock).
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        // Serve proposer duties for the epoch.
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/validator/duties/proposer/{}", epoch)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": expected_validator_index.to_string(),
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+        // Pre-populate the proposer duty cache before calling maybe_propose_block.
+        duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+        // Block beacon: returns a block with wrong proposer_index; tracks publish.
+        let publish_called = Arc::new(AtomicBool::new(false));
+        let block_beacon = Arc::new(BadProposerBlockBeacon {
+            slot,
+            bad_proposer_index,
+            publish_called: publish_called.clone(),
+        });
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey_hex.clone(), pubkey.clone());
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(slot);
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            block_beacon,
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        // Invoke the proposer path directly.
+        orchestrator.maybe_propose_block(slot, epoch).await;
+
+        // H-4: a forged proposer_index must drop the duty before any
+        // signing or publishing occurs.
+        assert!(
+            !publish_called.load(Ordering::SeqCst),
+            "publish_block must NOT be called when proposer_index mismatches the duty"
         );
     }
 }
