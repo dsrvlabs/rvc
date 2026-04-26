@@ -127,8 +127,17 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
     /// Prefetches sync committee duties for the next period when within the last
     /// `PREFETCH_LOOKAHEAD` epochs of the current period.
     ///
-    /// Uses a `HashSet<Period>` guard to ensure the fetch and subscription submission
-    /// happen at most once per period even if called multiple times in the lookahead window.
+    /// Uses a `HashSet<Period>` guard to ensure the fetch happens at most once per period
+    /// even if called multiple times in the lookahead window. Failures are retried because
+    /// the period is only marked as done on a successful fetch.
+    ///
+    /// Attester committee subscriptions for `next_period_first_epoch` are intentionally
+    /// NOT submitted here: at the time this prefetch fires (epoch `PERIOD - 2`), the
+    /// attester duty cache for `next_period_first_epoch` is not yet populated, so any
+    /// subscription call would be a no-op. The coordinator's normal epoch-boundary path
+    /// calls `submit_committee_subscriptions(current_epoch + 1)` at epoch `PERIOD - 1`,
+    /// which is still within the two-epoch lookahead window and has the attester cache
+    /// fully populated at that point.
     async fn maybe_prefetch_next_sync_period(&self, current_epoch: u64) {
         let pos = current_epoch % EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
         if pos < EPOCHS_PER_SYNC_COMMITTEE_PERIOD - PREFETCH_LOOKAHEAD {
@@ -139,6 +148,8 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         let next_period_first_epoch = next_period * EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
 
         // Idempotency: skip if this period has already been successfully prefetched.
+        // INVARIANT: this function is called from a single sequential task (the slot loop),
+        // so the read → write gap below is not a TOCTOU race in practice.
         {
             let guard = self.prefetched_periods.read().await;
             if guard.contains(&next_period) {
@@ -166,6 +177,9 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
                     next_period,
                     next_period_first_epoch, "Prefetched sync committee duties for next period"
                 );
+                // Mark as done immediately after a successful fetch so that the next call
+                // in the lookahead window skips the BN round-trip.
+                self.prefetched_periods.write().await.insert(next_period);
             }
             Ok(Err(e)) => {
                 warn!(
@@ -174,7 +188,6 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
                     error = %e,
                     "Failed to prefetch sync committee duties for next period"
                 );
-                return;
             }
             Err(_) => {
                 warn!(
@@ -183,16 +196,8 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
                     "Sync committee duty prefetch timed out after {}s",
                     self.config.timeouts.duty_fetch.as_secs()
                 );
-                return;
             }
         }
-
-        // Submit subnet subscriptions for the first epoch of the next period so the
-        // BN subscribes to the correct subnets before the period starts.
-        self.submit_committee_subscriptions(next_period_first_epoch).await;
-
-        // Mark as prefetched only after a successful fetch so failures are retried.
-        self.prefetched_periods.write().await.insert(next_period);
     }
 
     #[tracing::instrument(name = "rvc.orchestrator.check_reorg", skip_all, fields(rvc.epoch = current_epoch))]
@@ -437,7 +442,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use beacon::{BeaconClient, BeaconClientConfig};
-    use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
+    use crypto::{CompositeSigner, KeyManager, LocalSigner};
     use duty_tracker::DutyTracker;
     use eth_types::ForkSchedule;
     use signer::SignerService;
@@ -655,20 +660,19 @@ mod tests {
     // test_subnet_subscriptions_submitted_in_window (RED → GREEN)
     // ──────────────────────────────────────────────────────────────────────────
 
-    /// When attester duties for the next period's first epoch are in the cache,
-    /// `submit_committee_subscriptions` is invoked as part of the prefetch window.
+    /// `maybe_prefetch_next_sync_period` does NOT call the beacon committee subscription
+    /// endpoint — the attester duty cache for `next_period_first_epoch` is always empty
+    /// at epoch PERIOD-2, so any subscription call would be a no-op.  The coordinator's
+    /// normal epoch-boundary path submits subscriptions at epoch PERIOD-1 (still within
+    /// the two-epoch lookahead window) when the cache is populated.
+    ///
+    /// This test asserts the prefetch calls the sync-duty endpoint exactly once and
+    /// never touches the subscription endpoint.
     #[tokio::test]
     async fn test_subnet_subscriptions_submitted_in_window() {
         let server = MockServer::start().await;
 
-        let validator_index = "42";
-        // Use the hex of the real secret key; registered in the pubkey_map below.
-        // We generate the secret key first and then set up the mock with its pubkey hex.
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
-
-        // Sync committee duties for the next period
+        // Sync committee duties for the next period — must fire exactly once.
         Mock::given(method("POST"))
             .and(path(format!("/eth/v1/validator/duties/sync/{}", PERIOD)))
             .respond_with(ResponseTemplate::new(200).set_body_json(sync_duties_response()))
@@ -676,72 +680,20 @@ mod tests {
             .mount(&server)
             .await;
 
-        // Committee subscription endpoint must be called exactly once
+        // The beacon committee subscription endpoint must NOT be called by the prefetch:
+        // attester duties for the next period's first epoch are not yet cached at PERIOD-2.
         Mock::given(method("POST"))
             .and(path("/eth/v1/validator/beacon_committee_subscriptions"))
             .respond_with(ResponseTemplate::new(200))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
 
-        // Attester duties for the next period's first epoch — pre-populated below
-        let first_slot = PERIOD * SLOTS_PER_EPOCH;
-        Mock::given(method("POST"))
-            .and(path(format!("/eth/v1/validator/duties/attester/{}", PERIOD)))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                "execution_optimistic": false,
-                "data": [{
-                    "pubkey": pubkey_hex,
-                    "validator_index": validator_index,
-                    "committee_index": "0",
-                    "committee_length": "128",
-                    "committees_at_slot": "4",
-                    "validator_committee_index": "0",
-                    "slot": first_slot.to_string()
-                }]
-            })))
-            .mount(&server)
-            .await;
-
-        let beacon_config = BeaconClientConfig::new(server.uri())
-            .with_timeout(Duration::from_secs(5))
-            .with_max_retries(1);
-        let beacon_client = Arc::new(BeaconClient::new(beacon_config).unwrap());
-        let beacon: Arc<dyn BeaconNodeClient> = beacon_client.clone();
-
-        let duty_tracker =
-            Arc::new(DutyTracker::new(beacon.clone(), vec![validator_index.to_string()]));
-
-        // Pre-populate the attester duty cache for PERIOD (next period's first epoch)
-        duty_tracker.fetch_duties_for_epoch(PERIOD).await.unwrap();
-
-        let mut key_manager = KeyManager::new();
-        key_manager.insert(secret_key);
-        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
-
-        let clock = Arc::new(MockSlotClock::new(1606824023, Duration::from_secs(12), 0));
-
-        let mut pubkey_map_inner = HashMap::new();
-        pubkey_map_inner.insert(pubkey_hex, pubkey);
-        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
-        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
-
-        let service = DutyManagementService::new(
-            clock,
-            signer,
-            beacon,
-            duty_tracker,
-            validator_store,
-            pubkey_map,
-            make_config(),
-        );
+        let service = build_service_no_validators(&server.uri()).await;
 
         // Trigger prefetch at the second-to-last epoch of period 0
         service.maybe_prefetch_next_sync_period(PERIOD - 2).await;
-        // wiremock asserts both expect(1)s on drop
+        // wiremock asserts expect(1) for sync duties and expect(0) for subscriptions on drop
     }
 
     // ──────────────────────────────────────────────────────────────────────────
