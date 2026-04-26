@@ -1,7 +1,7 @@
 use beacon::AttesterDuty;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
-use eth_types::{Root, Slot};
+use eth_types::{ForkName, Root, Slot};
 use timing::SLOTS_PER_EPOCH;
 use tracing::warn;
 
@@ -99,6 +99,26 @@ pub(crate) fn normalize_pubkey(pubkey: &str) -> String {
     let without_prefix =
         pubkey.strip_prefix("0x").or_else(|| pubkey.strip_prefix("0X")).unwrap_or(pubkey);
     without_prefix.to_lowercase()
+}
+
+/// Converts BN-supplied attestation data and normalizes it per-fork.
+///
+/// Per EIP-7549 (active in Electra+): `AttestationData.index` must be set to 0
+/// before computing the tree-hash root or signing. The BN still returns the
+/// real committee index in the response, so callers must zero it explicitly.
+/// Pre-Electra forks keep the original index intact.
+///
+/// Use this helper everywhere a signing root or aggregate query root is needed
+/// to ensure consistent normalization across the attestation and aggregation paths.
+pub(crate) fn convert_and_normalize_attestation_data(
+    beacon_data: &beacon::AttestationData,
+    fork_name: ForkName,
+) -> Result<eth_types::AttestationData, OrchestratorError> {
+    let mut data = convert_attestation_data(beacon_data)?;
+    if fork_name >= ForkName::Electra {
+        data.index = 0;
+    }
+    Ok(data)
 }
 
 pub(crate) fn convert_attestation_data(
@@ -333,5 +353,102 @@ mod tests {
 
         let result = convert_attestation_data(&beacon_data);
         assert!(result.is_err());
+    }
+
+    fn make_test_beacon_attestation_data(index: &str) -> beacon::AttestationData {
+        beacon::AttestationData {
+            slot: "1000".to_string(),
+            index: index.to_string(),
+            beacon_block_root: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            source: beacon::Checkpoint {
+                epoch: "100".to_string(),
+                root: "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+            },
+            target: beacon::Checkpoint {
+                epoch: "101".to_string(),
+                root: "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    .to_string(),
+            },
+        }
+    }
+
+    // --- RED tests for convert_and_normalize_attestation_data ---
+
+    #[test]
+    fn test_convert_and_normalize_electra_zeros_index() {
+        let beacon_data = make_test_beacon_attestation_data("5");
+        let result =
+            convert_and_normalize_attestation_data(&beacon_data, ForkName::Electra).unwrap();
+        assert_eq!(
+            result.index, 0,
+            "Electra: EIP-7549 requires index zeroed before tree_hash_root"
+        );
+    }
+
+    #[test]
+    fn test_convert_and_normalize_fulu_zeros_index() {
+        let beacon_data = make_test_beacon_attestation_data("7");
+        let result = convert_and_normalize_attestation_data(&beacon_data, ForkName::Fulu).unwrap();
+        assert_eq!(result.index, 0, "Fulu inherits EIP-7549: index must be zeroed");
+    }
+
+    #[test]
+    fn test_convert_and_normalize_deneb_keeps_index() {
+        let beacon_data = make_test_beacon_attestation_data("5");
+        let result = convert_and_normalize_attestation_data(&beacon_data, ForkName::Deneb).unwrap();
+        assert_eq!(result.index, 5, "Deneb: index must NOT be zeroed (pre-Electra)");
+    }
+
+    #[test]
+    fn test_convert_and_normalize_phase0_keeps_index() {
+        let beacon_data = make_test_beacon_attestation_data("3");
+        let result =
+            convert_and_normalize_attestation_data(&beacon_data, ForkName::Phase0).unwrap();
+        assert_eq!(result.index, 3, "Phase0: index must NOT be zeroed");
+    }
+
+    #[test]
+    fn test_convert_and_normalize_altair_keeps_index() {
+        let beacon_data = make_test_beacon_attestation_data("2");
+        let result =
+            convert_and_normalize_attestation_data(&beacon_data, ForkName::Altair).unwrap();
+        assert_eq!(result.index, 2, "Altair: index must NOT be zeroed");
+    }
+
+    #[test]
+    fn test_convert_and_normalize_capella_keeps_index() {
+        let beacon_data = make_test_beacon_attestation_data("6");
+        let result =
+            convert_and_normalize_attestation_data(&beacon_data, ForkName::Capella).unwrap();
+        assert_eq!(result.index, 6, "Capella: index must NOT be zeroed");
+    }
+
+    #[test]
+    fn test_convert_and_normalize_preserves_other_fields() {
+        let beacon_data = make_test_beacon_attestation_data("5");
+        let result =
+            convert_and_normalize_attestation_data(&beacon_data, ForkName::Electra).unwrap();
+        assert_eq!(result.slot, 1000);
+        assert_eq!(result.beacon_block_root, [0x11; 32]);
+        assert_eq!(result.source.epoch, 100);
+        assert_eq!(result.target.epoch, 101);
+    }
+
+    #[test]
+    fn test_convert_and_normalize_invalid_data_returns_err() {
+        let mut beacon_data = make_test_beacon_attestation_data("5");
+        beacon_data.slot = "invalid".to_string();
+        let result = convert_and_normalize_attestation_data(&beacon_data, ForkName::Electra);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_convert_and_normalize_electra_zero_index_input_stays_zero() {
+        let beacon_data = make_test_beacon_attestation_data("0");
+        let result =
+            convert_and_normalize_attestation_data(&beacon_data, ForkName::Electra).unwrap();
+        assert_eq!(result.index, 0);
     }
 }

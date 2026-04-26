@@ -238,29 +238,23 @@ where
             "Attestation data fetched from BN"
         );
 
-        let mut crypto_attestation_data =
-            match utils::convert_attestation_data(&beacon_attestation_data) {
-                Ok(data) => data,
-                Err(e) => {
-                    return AttestationResult {
-                        validator_index,
-                        slot,
-                        success: false,
-                        error: Some(format!("Failed to convert attestation data: {}", e)),
-                    };
-                }
-            };
-
-        let target_epoch = crypto_attestation_data.target.epoch;
-
-        debug!(
-            validator = %validator_index,
-            slot = crypto_attestation_data.slot,
-            index = crypto_attestation_data.index,
-            target_epoch = target_epoch,
-            source_epoch = crypto_attestation_data.source.epoch,
-            "Converted attestation data"
-        );
+        // Pre-parse target epoch to derive the fork before full conversion.
+        // This allows `convert_and_normalize_attestation_data` to handle the
+        // EIP-7549 index-zeroing in one place for both attestation and aggregation paths.
+        let target_epoch: u64 = match beacon_attestation_data.target.epoch.parse() {
+            Ok(e) => e,
+            Err(_) => {
+                return AttestationResult {
+                    validator_index,
+                    slot,
+                    success: false,
+                    error: Some(format!(
+                        "Failed to parse target epoch: {}",
+                        beacon_attestation_data.target.epoch
+                    )),
+                };
+            }
+        };
 
         let fork_name = ForkName::from_epoch(target_epoch, &self.config.fork_schedule);
         let is_electra = fork_name >= ForkName::Electra;
@@ -273,18 +267,32 @@ where
             "Fork derived for attestation"
         );
 
-        // EIP-7549: For Electra, set data.index = 0 BEFORE signing because
-        // the index field is part of the signed AttestationData.
-        if is_electra {
-            let original_index = crypto_attestation_data.index;
-            crypto_attestation_data.index = 0;
-            debug!(
-                validator = %validator_index,
-                original_index = original_index,
-                zeroed_index = 0u64,
-                "EIP-7549: zeroed attestation data index for Electra signing"
-            );
-        }
+        // EIP-7549: For Electra+, `AttestationData.index` must be zeroed before
+        // signing. `convert_and_normalize_attestation_data` handles this centrally
+        // so both the attestation and aggregation paths stay in sync.
+        let crypto_attestation_data = match utils::convert_and_normalize_attestation_data(
+            &beacon_attestation_data,
+            fork_name,
+        ) {
+            Ok(data) => data,
+            Err(e) => {
+                return AttestationResult {
+                    validator_index,
+                    slot,
+                    success: false,
+                    error: Some(format!("Failed to convert attestation data: {}", e)),
+                };
+            }
+        };
+
+        debug!(
+            validator = %validator_index,
+            slot = crypto_attestation_data.slot,
+            index = crypto_attestation_data.index,
+            target_epoch = target_epoch,
+            source_epoch = crypto_attestation_data.source.epoch,
+            "Converted attestation data"
+        );
 
         let signature = match self
             .signer

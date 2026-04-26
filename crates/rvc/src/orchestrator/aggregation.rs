@@ -156,22 +156,26 @@ impl AggregationService {
                 }
             };
 
-            let crypto_attestation_data =
-                match utils::convert_attestation_data(&attestation_data_response.data) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        warn!(
-                            slot,
-                            validator_index = %duty.validator_index,
-                            error = %e,
-                            "Failed to convert attestation data for aggregation"
-                        );
-                        RVC_AGGREGATIONS_TOTAL
-                            .with_label_values(&[attestation_status::FAILED])
-                            .inc();
-                        continue;
-                    }
-                };
+            // EIP-7549: For Electra+, `AttestationData.index` must be zeroed
+            // before computing the tree-hash root used in the aggregate query.
+            // The BN returns the real committee index in its response; we must
+            // normalize it away here. Pre-Electra forks keep the index intact.
+            let crypto_attestation_data = match utils::convert_and_normalize_attestation_data(
+                &attestation_data_response.data,
+                fork_name,
+            ) {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        error = %e,
+                        "Failed to convert attestation data for aggregation"
+                    );
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    continue;
+                }
+            };
 
             let att_data_root = crypto_attestation_data.tree_hash_root();
             let att_data_root_hex = format!("0x{}", hex::encode(att_data_root.0));
@@ -430,5 +434,105 @@ impl AggregationService {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tree_hash::TreeHash;
+
+    use eth_types::{AttestationData, Checkpoint, ForkName};
+
+    use super::utils;
+
+    fn make_beacon_attestation_data(index: &str) -> beacon::AttestationData {
+        beacon::AttestationData {
+            slot: "500".to_string(),
+            index: index.to_string(),
+            beacon_block_root: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            source: beacon::Checkpoint {
+                epoch: "15".to_string(),
+                root: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            },
+            target: beacon::Checkpoint {
+                epoch: "16".to_string(),
+                root: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .to_string(),
+            },
+        }
+    }
+
+    /// Builds an `eth_types::AttestationData` directly for root comparison.
+    fn make_crypto_attestation_data(index: u64) -> AttestationData {
+        AttestationData {
+            slot: 500,
+            index,
+            beacon_block_root: [0xaa; 32],
+            source: Checkpoint { epoch: 15, root: [0xbb; 32] },
+            target: Checkpoint { epoch: 16, root: [0xcc; 32] },
+        }
+    }
+
+    /// H-2 regression test: Electra aggregator must zero `index` before
+    /// computing `tree_hash_root` (EIP-7549).
+    ///
+    /// Pre-fix: `aggregation.rs` called `tree_hash_root()` with the BN-supplied
+    /// committee index intact, producing a root the BN doesn't recognise (→ 404).
+    /// Post-fix: `convert_and_normalize_attestation_data` zeros the index first.
+    #[test]
+    fn test_electra_aggregator_root_zero_index() {
+        let beacon_data = make_beacon_attestation_data("5");
+
+        // Simulate the aggregation path: convert + normalize for Electra
+        let normalized =
+            utils::convert_and_normalize_attestation_data(&beacon_data, ForkName::Electra)
+                .expect("conversion must succeed");
+
+        let agg_root = normalized.tree_hash_root();
+
+        // Expected: root computed with index explicitly set to 0
+        let expected = make_crypto_attestation_data(0).tree_hash_root();
+
+        assert_eq!(
+            agg_root, expected,
+            "Electra aggregator root must equal the root with index=0 (EIP-7549)"
+        );
+
+        // Guard: root with the original index differs (validates the test is meaningful)
+        let wrong_root = make_crypto_attestation_data(5).tree_hash_root();
+        assert_ne!(
+            agg_root, wrong_root,
+            "Root with original index must differ (test fixture must use non-zero index)"
+        );
+    }
+
+    /// Regression guard: pre-Electra forks must NOT zero the committee index.
+    ///
+    /// Zeroing the index for Phase0..Deneb would change the attestation data
+    /// root and break all pre-Electra aggregator duties.
+    #[test]
+    fn test_pre_electra_aggregator_root_keeps_index() {
+        let beacon_data = make_beacon_attestation_data("5");
+
+        // Simulate the aggregation path for Deneb (last pre-Electra fork)
+        let normalized =
+            utils::convert_and_normalize_attestation_data(&beacon_data, ForkName::Deneb)
+                .expect("conversion must succeed");
+
+        let agg_root = normalized.tree_hash_root();
+
+        // Expected: root computed with the original index (5), NOT zeroed
+        let expected = make_crypto_attestation_data(5).tree_hash_root();
+
+        assert_eq!(
+            agg_root, expected,
+            "Pre-Electra aggregator root must be computed with original index (no EIP-7549 zeroing)"
+        );
+
+        // Guard: zero-index root differs from the preserved-index root
+        let zero_root = make_crypto_attestation_data(0).tree_hash_root();
+        assert_ne!(agg_root, zero_root, "Pre-Electra root must differ from the zero-index root");
     }
 }
