@@ -12,6 +12,7 @@ use validator_store::ValidatorStore;
 
 use crate::traits::{BeaconBlockClient, ProduceBlockResponse};
 use crate::types::BlockSelectionMode;
+use crate::validation::BlockResponseValidator;
 use crate::BlockServiceError;
 
 /// Result of a successful block proposal.
@@ -89,11 +90,43 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         self.propose_block_with_mode(slot, pubkey, mode).await
     }
 
+    /// Propose a block with explicit duty validation (H-4).
+    ///
+    /// Validates `proposer_index` against `expected_proposer_index` and, when
+    /// `expected_parent_root` is `Some`, validates `parent_root` against the
+    /// BN-reported head before calling the signer. On validation failure the
+    /// duty is dropped with an `error!` log and no signer call is made.
+    pub async fn propose_block_validated(
+        &self,
+        slot: Slot,
+        pubkey: &PublicKey,
+        expected_proposer_index: u64,
+        expected_parent_root: Option<Root>,
+    ) -> Result<BlockProposalResult, BlockServiceError> {
+        let mode = self.validator_store.effective_block_selection_mode(&pubkey.to_bytes());
+        let validator = BlockResponseValidator {
+            expected_proposer_index,
+            expected_parent_root,
+            expected_slot: slot,
+        };
+        self.propose_block_impl(slot, pubkey, mode, Some(&validator)).await
+    }
+
     pub async fn propose_block_with_mode(
         &self,
         slot: Slot,
         pubkey: &PublicKey,
         mode: BlockSelectionMode,
+    ) -> Result<BlockProposalResult, BlockServiceError> {
+        self.propose_block_impl(slot, pubkey, mode, None).await
+    }
+
+    async fn propose_block_impl(
+        &self,
+        slot: Slot,
+        pubkey: &PublicKey,
+        mode: BlockSelectionMode,
+        validator: Option<&BlockResponseValidator>,
     ) -> Result<BlockProposalResult, BlockServiceError> {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let proposal_start = std::time::Instant::now();
@@ -215,11 +248,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         // 4. Sign and publish based on block type
         debug!(slot = slot, is_blinded = response.is_blinded, "Blinded/unblinded path chosen");
         let (block_root, is_blinded) = if response.is_ssz {
-            self.sign_and_publish_ssz(&response, slot, pubkey).await
+            self.sign_and_publish_ssz(&response, slot, pubkey, validator).await
         } else if response.is_blinded {
-            self.sign_and_publish_blinded(&response, slot, pubkey).await
+            self.sign_and_publish_blinded(&response, slot, pubkey, validator).await
         } else {
-            self.sign_and_publish_full(&response, slot, pubkey).await
+            self.sign_and_publish_full(&response, slot, pubkey, validator).await
         }
         .map_err(|e| {
             error!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), error = %e, "Block publication failed");
@@ -249,6 +282,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         response: &ProduceBlockResponse,
         slot: Slot,
         pubkey: &PublicKey,
+        validator: Option<&BlockResponseValidator>,
     ) -> Result<(Root, bool), BlockServiceError> {
         let ssz_bytes = response.ssz_bytes.as_ref().ok_or_else(|| {
             BlockServiceError::Parse("SSZ response missing ssz_bytes".to_string())
@@ -265,6 +299,12 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     block.slot, slot,
                 )));
             }
+            if let Some(v) = validator {
+                v.validate_blinded(&block).map_err(|e| {
+                    error!(slot = slot, error = %e, "BN SSZ blinded block validation failed — dropping duty");
+                    e
+                })?;
+            }
             (compute_blinded_block_root(&block), offset)
         } else {
             let (block, offset) =
@@ -275,6 +315,12 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     "SSZ block slot mismatch: header has {}, expected {}",
                     block.slot, slot,
                 )));
+            }
+            if let Some(v) = validator {
+                v.validate_full(&block).map_err(|e| {
+                    error!(slot = slot, error = %e, "BN SSZ block validation failed — dropping duty");
+                    e
+                })?;
             }
             (compute_block_root(&block), offset)
         };
@@ -320,12 +366,21 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         response: &ProduceBlockResponse,
         slot: Slot,
         pubkey: &PublicKey,
+        validator: Option<&BlockResponseValidator>,
     ) -> Result<(Root, bool), BlockServiceError> {
         let block_contents = response.parse_full_block()?;
         let block = block_contents.block().clone();
 
         if block.slot != slot {
             return Err(BlockServiceError::SlotMismatch { requested: slot, got: block.slot });
+        }
+
+        // H-4: validate proposer_index and parent_root before signing.
+        if let Some(v) = validator {
+            v.validate_full(&block).map_err(|e| {
+                error!(slot = slot, error = %e, "BN block response validation failed — dropping duty");
+                e
+            })?;
         }
 
         let block_root = compute_block_root(&block);
@@ -363,11 +418,20 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         response: &ProduceBlockResponse,
         slot: Slot,
         pubkey: &PublicKey,
+        validator: Option<&BlockResponseValidator>,
     ) -> Result<(Root, bool), BlockServiceError> {
         let block = response.parse_blinded_block()?;
 
         if block.slot != slot {
             return Err(BlockServiceError::SlotMismatch { requested: slot, got: block.slot });
+        }
+
+        // H-4: validate proposer_index and parent_root before signing.
+        if let Some(v) = validator {
+            v.validate_blinded(&block).map_err(|e| {
+                error!(slot = slot, error = %e, "BN blinded block response validation failed — dropping duty");
+                e
+            })?;
         }
 
         let block_root = compute_blinded_block_root(&block);
@@ -2875,5 +2939,173 @@ mod tests {
             baseline_root,
             "root must change when body changes"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests: propose_block_validated (H-4 wiring)
+    // -----------------------------------------------------------------------
+
+    /// BN returns block with wrong proposer_index — signer must NOT be called.
+    #[tokio::test]
+    async fn test_propose_block_validated_proposer_index_mismatch_drops_duty() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        // Block has proposer_index = 42; duty expects 99
+        let block = test_block(slot); // proposer_index = 42
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+
+        let signer_arc = Arc::new(signer);
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        // Duty says expected_proposer_index = 99, but BN returns 42
+        let result = service.propose_block_validated(slot, &pubkey, 99, None).await;
+
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                BlockServiceError::ProposerIndexMismatch { expected: 99, got: 42 }
+            ),
+            "expected ProposerIndexMismatch"
+        );
+        // No signer call must have been made
+        assert!(
+            signer_arc.block_calls.lock().unwrap().is_empty(),
+            "signer must not be called when proposer_index validation fails"
+        );
+        // No publish call either
+        assert!(beacon_arc.publish_calls.lock().unwrap().is_empty());
+    }
+
+    /// BN returns block with wrong parent_root — signer must NOT be called.
+    #[tokio::test]
+    async fn test_propose_block_validated_parent_root_mismatch_drops_duty() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        // Block has parent_root = [1u8; 32]; we expect [0xee; 32]
+        let block = test_block(slot); // parent_root = [1u8; 32]
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+
+        let signer_arc = Arc::new(signer);
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let expected_parent: Root = [0xee; 32];
+        let result =
+            service.propose_block_validated(slot, &pubkey, 42, Some(expected_parent)).await;
+
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), BlockServiceError::ParentRootMismatch { .. }),
+            "expected ParentRootMismatch"
+        );
+        assert!(
+            signer_arc.block_calls.lock().unwrap().is_empty(),
+            "signer must not be called when parent_root validation fails"
+        );
+        assert!(beacon_arc.publish_calls.lock().unwrap().is_empty());
+    }
+
+    /// Correct proposer_index with None parent_root — proposal proceeds.
+    #[tokio::test]
+    async fn test_propose_block_validated_correct_proposer_no_parent_root_succeeds() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot); // proposer_index = 42
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+
+        let signer_arc = Arc::new(signer);
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block_validated(slot, &pubkey, 42, None).await;
+
+        assert!(result.is_ok());
+        // Signer WAS called
+        assert_eq!(
+            signer_arc.block_calls.lock().unwrap().len(),
+            1,
+            "signer must be called for valid proposal"
+        );
+        beacon_arc.assert_last_published_block(slot, 42);
+    }
+
+    /// Blinded path: wrong proposer_index — signer must NOT be called.
+    #[tokio::test]
+    async fn test_propose_block_validated_blinded_proposer_mismatch_drops_duty() {
+        let pubkey = test_pubkey();
+        let slot = 200;
+        // Blinded block has proposer_index = 42
+        let block = test_blinded_block(slot);
+        let beacon = MockBeaconClient::blinded(block);
+        let signer = MockSigner::new();
+
+        let signer_arc = Arc::new(signer);
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        // Expect proposer 77, BN returns 42
+        let result = service.propose_block_validated(slot, &pubkey, 77, None).await;
+
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                BlockServiceError::ProposerIndexMismatch { expected: 77, got: 42 }
+            ),
+            "expected ProposerIndexMismatch on blinded path"
+        );
+        assert!(
+            signer_arc.block_calls.lock().unwrap().is_empty(),
+            "signer must not be called when blinded proposer_index validation fails"
+        );
+        assert!(beacon_arc.publish_blinded_calls.lock().unwrap().is_empty());
+    }
+
+    /// propose_block (unvalidated) still works when proposer_index differs — backward compat.
+    #[tokio::test]
+    async fn test_propose_block_unvalidated_ignores_proposer_index() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot); // proposer_index = 42
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        // propose_block does NOT check proposer_index — should succeed regardless
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(result.is_ok());
     }
 }
