@@ -123,6 +123,18 @@ impl ValidatorStore {
         })
     }
 
+    /// Returns the default fee recipient address applied to any validator
+    /// that does not have a per-validator override.
+    pub fn default_fee_recipient(&self) -> [u8; 20] {
+        self.defaults.read().fee_recipient
+    }
+
+    /// Returns the default gas limit applied to any validator that does not
+    /// have a per-validator override.
+    pub fn default_gas_limit(&self) -> u64 {
+        self.defaults.read().gas_limit
+    }
+
     pub fn get_config(&self, pubkey: &[u8; 48]) -> Option<ValidatorConfig> {
         self.validators.read().get(pubkey).cloned()
     }

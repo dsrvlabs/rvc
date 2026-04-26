@@ -296,10 +296,30 @@ impl ServiceBuilder {
         Ok(Arc::new(schedule))
     }
 
-    pub fn build_validator_store(&self) -> Arc<ValidatorStore> {
-        let store = ValidatorStore::new([0u8; 20], 100);
+    /// Constructs the [`ValidatorStore`], loading defaults from a TOML file if
+    /// one is provided.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ZeroFeeRecipient`] if the effective default fee
+    /// recipient is the zero address.  Operators must set a non-zero address in
+    /// the validators config file passed via `--validators-config`.
+    pub fn build_validator_store(
+        &self,
+        validators_config: Option<&std::path::Path>,
+    ) -> Result<Arc<ValidatorStore>, ConfigError> {
+        let store = match validators_config {
+            Some(path) => ValidatorStore::load_from_config(path)
+                .map_err(|e| ConfigError::ValidatorStoreError(e.to_string()))?,
+            None => ValidatorStore::new([0u8; 20], 30_000_000),
+        };
+
+        if store.default_fee_recipient() == [0u8; 20] {
+            return Err(ConfigError::ZeroFeeRecipient);
+        }
+
         info!("Created validator store");
-        Arc::new(store)
+        Ok(Arc::new(store))
     }
 
     pub fn build_builder_service(
@@ -421,7 +441,8 @@ impl ServiceBuilder {
         let signer = self.build_signer(composite_signer.clone(), slashing_db.clone());
         let propagator = self.build_propagator(beacon_client.clone());
         let slot_clock = self.build_slot_clock()?;
-        let validator_store = self.build_validator_store();
+        let validator_store =
+            self.build_validator_store(self.config.validators_config.as_deref())?;
 
         let beacon: Arc<dyn BeaconNodeClient> = beacon_client.clone();
         let duty_tracker = self.build_duty_tracker(beacon.clone(), validator_indices);
@@ -739,7 +760,14 @@ mod tests {
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let signer = builder.build_signer(composite, slashing_db);
-        let validator_store = builder.build_validator_store();
+
+        // Build a temp validators config with a non-zero fee_recipient to satisfy the guard.
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+        std::fs::write(&config_path, format!("[defaults]\nfee_recipient = \"{fr_hex}\"\n"))
+            .unwrap();
+        let validator_store = builder.build_validator_store(Some(&config_path)).unwrap();
 
         let _builder_service =
             builder.build_builder_service(signer, beacon, validator_store, [0, 0, 0, 0]);
@@ -750,5 +778,60 @@ mod tests {
         let config = create_minimal_config();
         let builder = ServiceBuilder::new(config);
         builder.log_effective_config();
+    }
+
+    // --- ISSUE-2.1: H-1 fee recipient + gas-limit defaults ---
+
+    /// Zero fee recipient must be refused with a loud, actionable error.
+    #[test]
+    fn test_zero_fee_recipient_refused() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        // No config file → default fee recipient is [0u8; 20] → must fail
+        let result = builder.build_validator_store(None);
+        assert!(
+            matches!(result, Err(ConfigError::ZeroFeeRecipient)),
+            "expected ZeroFeeRecipient, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// When the TOML does not specify gas_limit the store must default to 30_000_000.
+    #[test]
+    fn test_default_gas_limit_30m() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+        // TOML with non-zero fee_recipient but no gas_limit field
+        let toml = format!("[defaults]\nfee_recipient = \"{fr_hex}\"\n", fr_hex = fr_hex);
+        std::fs::write(&config_path, toml).unwrap();
+
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let result = builder.build_validator_store(Some(&config_path));
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        let store = result.unwrap();
+        assert_eq!(store.default_gas_limit(), 30_000_000);
+    }
+
+    /// `build_validator_store` must wire `load_from_config` so TOML defaults are reflected.
+    #[test]
+    fn test_from_toml_paths_wired() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let fr_hex = "0x".to_string() + &hex::encode([0xbbu8; 20]);
+        let toml = format!(
+            "[defaults]\nfee_recipient = \"{fr_hex}\"\ngas_limit = 50000000\n",
+            fr_hex = fr_hex
+        );
+        std::fs::write(&config_path, toml).unwrap();
+
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let result = builder.build_validator_store(Some(&config_path));
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        let store = result.unwrap();
+        assert_eq!(store.default_fee_recipient(), [0xbbu8; 20]);
+        assert_eq!(store.default_gas_limit(), 50_000_000);
     }
 }

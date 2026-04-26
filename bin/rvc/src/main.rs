@@ -323,6 +323,17 @@ enum Commands {
         /// Delay in milliseconds between registration batches (default: 500)
         #[arg(long)]
         validator_registration_batch_delay: Option<u64>,
+
+        // --- Validator config (ISSUE-2.1 / H-1) ---
+        /// Path to a TOML file containing per-validator fee_recipient and gas_limit overrides.
+        /// rvc refuses to start if default_fee_recipient is the zero address (0x000…000).
+        ///
+        /// Example file:
+        ///   [defaults]
+        ///   fee_recipient = "0xYourAddress"
+        ///   gas_limit = 30000000
+        #[arg(long)]
+        validators_config: Option<PathBuf>,
     },
 
     /// Submit a voluntary exit for a validator
@@ -507,6 +518,7 @@ async fn main() -> anyhow::Result<()> {
             block_selection_mode,
             validator_registration_batch_size,
             validator_registration_batch_delay,
+            validators_config,
         } => {
             // Validate gRPC signer flags: if URL is set, all TLS flags are required
             if grpc_signer_url.is_some()
@@ -638,6 +650,7 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(|e| anyhow::anyhow!("{e}"))?,
                 validator_registration_batch_size,
                 validator_registration_batch_delay,
+                validators_config,
             };
 
             let mut cfg = load_config(config)?;
@@ -1268,7 +1281,7 @@ async fn run_validator(
     // Step 7: Build remaining services
     let signer = builder.build_signer(composite_signer.clone(), slashing_db.clone());
     let propagator = builder.build_propagator(beacon_client.clone());
-    let validator_store = builder.build_validator_store();
+    let validator_store = builder.build_validator_store(config.validators_config.as_deref())?;
 
     let beacon: std::sync::Arc<dyn BeaconNodeClient> = bn_manager;
     let validator_indices: Vec<String> = match validator_index_map {

@@ -189,6 +189,13 @@ pub struct Config {
 
     #[serde(default = "default_validator_registration_batch_delay")]
     pub validator_registration_batch_delay: u64,
+
+    // --- Validator per-validator config (ISSUE-2.1 / H-1) ---
+    /// Path to a TOML file containing per-validator and default fee_recipient /
+    /// gas_limit overrides.  rvc refuses to start if `default_fee_recipient`
+    /// resolves to the zero address (0x000…000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validators_config: Option<PathBuf>,
 }
 
 fn default_monitoring_interval() -> u64 {
@@ -346,6 +353,7 @@ impl Default for Config {
             block_selection_mode: validator_store::BlockSelectionMode::default(),
             validator_registration_batch_size: default_validator_registration_batch_size(),
             validator_registration_batch_delay: default_validator_registration_batch_delay(),
+            validators_config: None,
         }
     }
 }
@@ -830,6 +838,10 @@ impl Config {
         if let Some(delay) = cli.validator_registration_batch_delay {
             self.validator_registration_batch_delay = delay;
         }
+
+        if let Some(ref path) = cli.validators_config {
+            self.validators_config = Some(path.clone());
+        }
     }
 }
 
@@ -912,6 +924,7 @@ pub struct CliOverrides {
     pub block_selection_mode: Option<validator_store::BlockSelectionMode>,
     pub validator_registration_batch_size: Option<usize>,
     pub validator_registration_batch_delay: Option<u64>,
+    pub validators_config: Option<PathBuf>,
 }
 
 #[cfg(test)]
