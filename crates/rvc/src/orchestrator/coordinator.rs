@@ -622,12 +622,23 @@ where
                 );
             }
             Ok(Err(e)) => {
-                let was_tripped = self.circuit_breaker.is_tripped();
-                self.circuit_breaker.record_miss();
-                self.update_circuit_breaker_metrics();
-                if !was_tripped && self.circuit_breaker.is_tripped() {
-                    RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.inc();
-                    warn!(slot, "Builder circuit breaker tripped");
+                // H-3: only record a miss when the failure originated from the
+                // builder path.  Signer errors, BN errors on the local-only
+                // path (boost = 0), and validation failures must not trip the
+                // builder circuit breaker.
+                let is_builder_failure = matches!(
+                    e,
+                    block_service::BlockServiceError::BuilderFailure(_)
+                        | block_service::BlockServiceError::BuilderOnly(_)
+                );
+                if is_builder_failure {
+                    let was_tripped = self.circuit_breaker.is_tripped();
+                    self.circuit_breaker.record_miss();
+                    self.update_circuit_breaker_metrics();
+                    if !was_tripped && self.circuit_breaker.is_tripped() {
+                        RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.inc();
+                        warn!(slot, "Builder circuit breaker tripped");
+                    }
                 }
                 error!(
                     slot,
@@ -637,13 +648,10 @@ where
                 );
             }
             Err(_) => {
-                let was_tripped = self.circuit_breaker.is_tripped();
-                self.circuit_breaker.record_miss();
-                self.update_circuit_breaker_metrics();
-                if !was_tripped && self.circuit_breaker.is_tripped() {
-                    RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.inc();
-                    warn!(slot, "Builder circuit breaker tripped");
-                }
+                // Outer timeout: we cannot determine whether the builder relay
+                // was involved.  Do not record a miss — a transient BN or
+                // network slowdown that fires the outer timeout should not
+                // disable MEV for a full epoch (H-3).
                 error!(
                     slot,
                     epoch,
@@ -4546,6 +4554,271 @@ mod tests {
         assert!(
             !publish_called.load(Ordering::SeqCst),
             "publish_block must NOT be called when proposer_index mismatches the duty"
+        );
+    }
+
+    // ── H-3: circuit-breaker scoping helpers ────────────────────────────────
+
+    /// Wire up a proposer duty in a wiremock mock server so that
+    /// `duty_tracker.fetch_proposer_duties(epoch)` succeeds and the duty is
+    /// cached for `slot`.
+    async fn setup_proposer_duty(
+        mock_server: &wiremock::MockServer,
+        epoch: u64,
+        slot: u64,
+        pubkey_hex: &str,
+        validator_index: u64,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/validator/duties/proposer/{}", epoch)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": validator_index.to_string(),
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    /// H-3: A BN error on the **non-builder** path (ExecutionOnly mode →
+    /// `builder_boost_factor = 0`) must NOT trip the circuit breaker.
+    ///
+    /// RED before fix: the coordinator calls `record_miss()` unconditionally
+    /// on every `Ok(Err(e))` arm, so `consecutive_misses` becomes 1.
+    ///
+    /// GREEN after fix: only `BuilderFailure` / `BuilderOnly` errors call
+    /// `record_miss()`; a plain `Beacon` error leaves the counter at 0.
+    #[tokio::test]
+    async fn test_non_builder_timeout_does_not_trip_breaker() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let validator_index = 1u64;
+
+        // Real key so RANDAO signing succeeds and we reach the BN call.
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+
+        // Serve proposer duties so the cache is warm.
+        setup_proposer_duty(&mock_server, epoch, slot, &pubkey_hex, validator_index).await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+        duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        // ExecutionOnly → builder_boost_factor = 0 → not a builder attempt.
+        let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        validator_store
+            .set_global_block_selection_mode(validator_store::BlockSelectionMode::ExecutionOnly);
+
+        let config = create_test_config();
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(slot);
+
+        // Shared circuit breaker with realistic limits so we can observe misses.
+        let circuit_breaker = Arc::new(CircuitBreakerState::new(3, 5));
+
+        let (orchestrator, _handle) = DutyOrchestrator::new_with_attesting_enabled(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            // MockBlockBeacon always returns Beacon("mock") error.
+            create_mock_block_beacon(),
+            None,
+            validator_store,
+            config,
+            pubkey_map,
+            circuit_breaker.clone(),
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        orchestrator.maybe_propose_block(slot, epoch).await;
+
+        // Non-builder BN error must NOT record a miss.
+        assert_eq!(
+            circuit_breaker.consecutive_misses(),
+            0,
+            "BN error on non-builder path must not trip the circuit breaker (H-3)"
+        );
+    }
+
+    /// H-3: A BN error on the **builder** path (BuilderAlways mode →
+    /// `builder_boost_factor = u64::MAX`) MUST trip the circuit breaker.
+    ///
+    /// This test is GREEN with the current code and remains GREEN after the
+    /// fix — it guards against regressing builder-failure detection.
+    #[tokio::test]
+    async fn test_builder_timeout_trips_breaker() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+
+        let slot = 200u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let validator_index = 2u64;
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+
+        setup_proposer_duty(&mock_server, epoch, slot, &pubkey_hex, validator_index).await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+        duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        // BuilderAlways → builder_boost_factor = u64::MAX → builder attempt.
+        let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        validator_store
+            .set_global_block_selection_mode(validator_store::BlockSelectionMode::BuilderAlways);
+
+        let config = create_test_config();
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(slot);
+
+        let circuit_breaker = Arc::new(CircuitBreakerState::new(3, 5));
+
+        let (orchestrator, _handle) = DutyOrchestrator::new_with_attesting_enabled(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            validator_store,
+            config,
+            pubkey_map,
+            circuit_breaker.clone(),
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        orchestrator.maybe_propose_block(slot, epoch).await;
+
+        // Builder BN error MUST record a miss.
+        assert_eq!(
+            circuit_breaker.consecutive_misses(),
+            1,
+            "BN error on builder path must trip the circuit breaker (H-3)"
+        );
+    }
+
+    /// H-3: A local signer error must NOT trip the circuit breaker.
+    ///
+    /// RED before fix: `record_miss()` is called unconditionally, so the
+    /// signer error (RANDAO signing fails because the key is absent from the
+    /// KeyManager) increments `consecutive_misses` to 1.
+    ///
+    /// GREEN after fix: only `BuilderFailure` / `BuilderOnly` call
+    /// `record_miss()`.  `Signer` errors are ignored by the breaker.
+    #[tokio::test]
+    async fn test_signer_error_does_not_trip_breaker() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+
+        let slot = 300u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let validator_index = 3u64;
+
+        // Generate a keypair but intentionally do NOT insert the secret key
+        // into the KeyManager so RANDAO signing will fail.
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+        // secret_key is dropped here — not in KeyManager.
+
+        setup_proposer_duty(&mock_server, epoch, slot, &pubkey_hex, validator_index).await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+        duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+        // Empty KeyManager → sign_randao_reveal will return SignerError.
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+
+        let config = create_test_config();
+        let mut pubkey_map_inner = HashMap::new();
+        // pubkey is in the map so find_pubkey succeeds, but the secret key is absent.
+        pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(slot);
+
+        let circuit_breaker = Arc::new(CircuitBreakerState::new(3, 5));
+
+        let (orchestrator, _handle) = DutyOrchestrator::new_with_attesting_enabled(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            validator_store,
+            config,
+            pubkey_map,
+            circuit_breaker.clone(),
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        orchestrator.maybe_propose_block(slot, epoch).await;
+
+        // Signer error must NOT record a miss.
+        assert_eq!(
+            circuit_breaker.consecutive_misses(),
+            0,
+            "Local signer error must not trip the circuit breaker (H-3)"
         );
     }
 }

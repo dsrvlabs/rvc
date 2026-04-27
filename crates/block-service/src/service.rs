@@ -210,11 +210,13 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .instrument(tracing::info_span!("rvc.beacon.produce_block_v3"))
             .await;
 
-        // Handle BuilderOnly failure: never fall back
+        // Handle block-production failure, tagging the error so the coordinator
+        // can apply H-3 circuit-breaker scoping.
         let response = match response {
             Ok(resp) => resp,
             Err(e) => {
                 if mode == BlockSelectionMode::BuilderOnly {
+                    // BuilderOnly: never fall back; always fail the proposal.
                     error!(
                         slot = slot,
                         pubkey = %TruncatedPubkey::new(&pubkey_hex),
@@ -225,6 +227,20 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                         "builder block production failed: {e}"
                     )));
                 }
+                if boost > 0 {
+                    // The BN was asked to contact the builder relay (boost > 0).
+                    // Tag the error as BuilderFailure so the coordinator records
+                    // a miss on the circuit breaker (H-3).
+                    error!(
+                        slot = slot,
+                        boost,
+                        error = %e,
+                        "Builder block production failed"
+                    );
+                    return Err(BlockServiceError::BuilderFailure(e.to_string()));
+                }
+                // boost == 0: pure local-execution path; BN failure is not a
+                // builder-relay issue and must not trip the circuit breaker.
                 error!(slot = slot, error = %e, "Block production failed");
                 return Err(e);
             }
@@ -3107,5 +3123,76 @@ mod tests {
         // propose_block does NOT check proposer_index — should succeed regardless
         let result = service.propose_block(slot, &pubkey).await;
         assert!(result.is_ok());
+    }
+
+    // ── H-3: BuilderFailure tagging ──────────────────────────────────────────
+
+    /// H-3: When `produce_block_v3` fails **and** `boost > 0` (builder attempt),
+    /// `propose_block_impl` must return `BlockServiceError::BuilderFailure`.
+    ///
+    /// The coordinator pattern-matches this variant to call `record_miss()`.
+    #[tokio::test]
+    async fn test_bn_error_with_builder_boost_returns_builder_failure() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = MockBeaconClient::unblinded(test_block(slot)).with_produce_error();
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        // BuilderAlways → boost = u64::MAX > 0 → BN error is a builder failure.
+        let err = service
+            .propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderAlways)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BlockServiceError::BuilderFailure(_)),
+            "expected BuilderFailure, got {err:?}"
+        );
+    }
+
+    /// H-3: When `produce_block_v3` fails **and** `boost == 0` (ExecutionOnly),
+    /// `propose_block_impl` must NOT return `BuilderFailure` — it returns a
+    /// plain `Beacon` error so the coordinator leaves the circuit breaker alone.
+    #[tokio::test]
+    async fn test_bn_error_with_zero_boost_returns_beacon_not_builder_failure() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = MockBeaconClient::unblinded(test_block(slot)).with_produce_error();
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        // ExecutionOnly → boost = 0 → BN error must NOT be tagged BuilderFailure.
+        let err = service
+            .propose_block_with_mode(slot, &pubkey, BlockSelectionMode::ExecutionOnly)
+            .await
+            .unwrap_err();
+
+        assert!(
+            !matches!(err, BlockServiceError::BuilderFailure(_)),
+            "ExecutionOnly BN error must NOT be BuilderFailure, got {err:?}"
+        );
+    }
+
+    /// H-3: MaxProfit with non-zero boost returns `BuilderFailure` on BN error.
+    #[tokio::test]
+    async fn test_bn_error_with_max_profit_nonzero_boost_returns_builder_failure() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = MockBeaconClient::unblinded(test_block(slot)).with_produce_error();
+        let signer = MockSigner::new();
+        // build_service wires the validator store with builder_boost_factor = 150.
+        let service = build_service(signer, beacon, &pubkey);
+
+        // MaxProfit + circuit breaker not tripped → boost = 150 > 0 → BuilderFailure.
+        let err = service
+            .propose_block_with_mode(slot, &pubkey, BlockSelectionMode::MaxProfit)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BlockServiceError::BuilderFailure(_)),
+            "MaxProfit BN error with non-zero boost must be BuilderFailure, got {err:?}"
+        );
     }
 }
