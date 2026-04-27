@@ -1179,6 +1179,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_propose_block_beacon_produce_failure() {
+        // test_validator_store wires builder_boost_factor = 150, so the
+        // default MaxProfit mode sends boost = 150 > 0 to the BN.  After the
+        // H-3 fix, a BN error on a builder attempt is tagged BuilderFailure
+        // (not Beacon) so that the coordinator can correctly scope
+        // circuit-breaker misses.
         let pubkey = test_pubkey();
         let slot = 100;
         let block = test_block(slot);
@@ -1190,7 +1195,11 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, BlockServiceError::Beacon(_)));
+        // MaxProfit with boost = 150 → BuilderFailure (not Beacon) — H-3.
+        assert!(
+            matches!(err, BlockServiceError::BuilderFailure(_)),
+            "MaxProfit BN error must be BuilderFailure, got {err:?}"
+        );
     }
 
     #[tokio::test]
