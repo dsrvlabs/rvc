@@ -97,6 +97,9 @@ tokio-stream = "0.1"
 vsss-rs = { version = "5.3", default-features = false, features = ["std"] }
 bls12_381_plus = "0.8"
 
+# Bytes
+bytes = "1"
+
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
 

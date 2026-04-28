@@ -99,10 +99,15 @@ impl ServiceBuilder {
     pub fn build_beacon(&self) -> Result<Arc<BeaconClient>, ConfigError> {
         let beacon_config = BeaconClientConfig::new(&self.config.beacon_url)
             .with_timeout(Duration::from_secs(30))
-            .with_max_retries(3);
+            .with_max_retries(3)
+            .with_max_body_bytes(self.config.beacon_max_body_bytes);
 
         let client = BeaconClient::new(beacon_config)?;
-        info!(url = %self.config.beacon_url, "Created beacon client");
+        info!(
+            url = %self.config.beacon_url,
+            max_body_bytes = self.config.beacon_max_body_bytes,
+            "Created beacon client"
+        );
         Ok(Arc::new(client))
     }
 

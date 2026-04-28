@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use url::Url;
 
+use beacon::ResponseCaps;
+
 use super::error::ConfigError;
 use super::network::Network;
 
@@ -196,6 +198,18 @@ pub struct Config {
     /// resolves to the zero address (0x000…000).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validators_config: Option<PathBuf>,
+
+    // --- BN HTTP caps (ISSUE-2.13 / H-12) ---
+    /// Maximum JSON response body size in bytes from the beacon node (H-12).
+    ///
+    /// Requests whose body (or `Content-Length`) exceeds this value are rejected before
+    /// the full body is allocated.  Default: 32 MiB.
+    #[serde(default = "default_beacon_max_body_bytes")]
+    pub beacon_max_body_bytes: usize,
+}
+
+fn default_beacon_max_body_bytes() -> usize {
+    ResponseCaps::DEFAULT_MAX_BODY_BYTES
 }
 
 fn default_monitoring_interval() -> u64 {
@@ -354,6 +368,7 @@ impl Default for Config {
             validator_registration_batch_size: default_validator_registration_batch_size(),
             validator_registration_batch_delay: default_validator_registration_batch_delay(),
             validators_config: None,
+            beacon_max_body_bytes: default_beacon_max_body_bytes(),
         }
     }
 }
@@ -842,6 +857,10 @@ impl Config {
         if let Some(ref path) = cli.validators_config {
             self.validators_config = Some(path.clone());
         }
+
+        if let Some(v) = cli.beacon_max_body_bytes {
+            self.beacon_max_body_bytes = v;
+        }
     }
 }
 
@@ -925,6 +944,8 @@ pub struct CliOverrides {
     pub validator_registration_batch_size: Option<usize>,
     pub validator_registration_batch_delay: Option<u64>,
     pub validators_config: Option<PathBuf>,
+    /// Maximum JSON response body size from the BN (H-12).
+    pub beacon_max_body_bytes: Option<usize>,
 }
 
 #[cfg(test)]

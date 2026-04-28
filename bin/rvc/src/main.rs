@@ -207,6 +207,17 @@ enum Commands {
         #[arg(long, default_value_t = keymanager_api::DEFAULT_BODY_LIMIT)]
         keymanager_body_limit: usize,
 
+        // --- BN HTTP cap flags (H-12) ---
+        /// Maximum JSON response body size in bytes from the beacon node.
+        ///
+        /// Requests whose body (or Content-Length) exceeds this value are rejected
+        /// before the full body is allocated.  Raise this only if your beacon node
+        /// legitimately returns larger responses.
+        ///
+        /// Default: 33554432 (32 MiB).
+        #[arg(long, default_value_t = beacon::ResponseCaps::DEFAULT_MAX_BODY_BYTES)]
+        beacon_max_body_bytes: usize,
+
         // --- gRPC remote signer flags ---
         /// gRPC remote signer URL (e.g., https://signer.example.com:50051)
         #[arg(long)]
@@ -519,6 +530,7 @@ async fn main() -> anyhow::Result<()> {
             validator_registration_batch_size,
             validator_registration_batch_delay,
             validators_config,
+            beacon_max_body_bytes,
         } => {
             // Validate gRPC signer flags: if URL is set, all TLS flags are required
             if grpc_signer_url.is_some()
@@ -651,6 +663,7 @@ async fn main() -> anyhow::Result<()> {
                 validator_registration_batch_size,
                 validator_registration_batch_delay,
                 validators_config,
+                beacon_max_body_bytes: Some(beacon_max_body_bytes),
             };
 
             let mut cfg = load_config(config)?;
@@ -1345,7 +1358,8 @@ async fn run_validator(
                     let proposer_config =
                         beacon::BeaconClientConfig::new(proposer_endpoint.clone())
                             .with_timeout(std::time::Duration::from_secs(30))
-                            .with_max_retries(0);
+                            .with_max_retries(0)
+                            .with_max_body_bytes(config.beacon_max_body_bytes);
                     std::sync::Arc::new(beacon::BeaconClient::new(proposer_config)?)
                 },
             ))

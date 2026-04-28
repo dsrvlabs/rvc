@@ -21,6 +21,12 @@ pub enum BeaconError {
 
     #[error("Invalid endpoint URL: {0}")]
     InvalidUrl(String),
+
+    /// Response body exceeds the configured cap (H-12).
+    #[error(
+        "response body too large: expected \u{2264} {expected} bytes, received {got_so_far} bytes"
+    )]
+    BodyTooLarge { expected: usize, got_so_far: usize },
 }
 
 #[cfg(test)]

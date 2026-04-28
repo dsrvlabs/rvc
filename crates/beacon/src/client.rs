@@ -8,6 +8,7 @@ use crypto::logging::RedactedUrl;
 
 use eth_types::{ForkSchedule, SignedValidatorRegistration, SignedVoluntaryExit};
 
+use crate::http_caps::{read_body_capped, ResponseCaps};
 use crate::types::{
     parse_fork_schedule, AttestationDataResponse, AttesterDutiesResponse,
     BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, DataResponse,
@@ -36,6 +37,8 @@ pub struct BeaconClientConfig {
     pub timeout: Duration,
     pub max_retries: u32,
     pub initial_backoff: Duration,
+    /// Maximum bytes allowed in a JSON response body (H-12).
+    pub max_body_bytes: usize,
 }
 
 impl BeaconClientConfig {
@@ -45,6 +48,7 @@ impl BeaconClientConfig {
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: Duration::from_millis(DEFAULT_INITIAL_BACKOFF_MS),
+            max_body_bytes: ResponseCaps::DEFAULT_MAX_BODY_BYTES,
         }
     }
 
@@ -60,6 +64,15 @@ impl BeaconClientConfig {
 
     pub fn with_initial_backoff(mut self, initial_backoff: Duration) -> Self {
         self.initial_backoff = initial_backoff;
+        self
+    }
+
+    /// Set the maximum JSON response body size (H-12 body cap).
+    ///
+    /// Default: 32 MiB.  Raise this if a beacon node legitimately returns
+    /// larger responses (e.g. during initial sync).
+    pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes;
         self
     }
 }
@@ -919,9 +932,8 @@ impl BeaconClient {
                     span.record("http.status_code", status.as_u16());
 
                     if status.is_success() {
-                        let body = response.text().await.map_err(|e| {
-                            BeaconError::ParseError(format!("failed to read response body: {e}"))
-                        })?;
+                        // H-12: stream body with configurable cap before allocation.
+                        let body = read_body_capped(response, self.config.max_body_bytes).await?;
                         let latency_ms = request_start.elapsed().as_millis() as u64;
                         debug!(
                             method = http_method,
@@ -932,8 +944,10 @@ impl BeaconClient {
                             response_size_bytes = body.len(),
                             "HTTP response received"
                         );
-                        return serde_json::from_str::<T>(&body).map_err(|e| {
-                            let preview = body.get(..1024).unwrap_or(&body);
+                        return serde_json::from_slice::<T>(&body).map_err(|e| {
+                            let preview_end = body.len().min(1024);
+                            let preview =
+                                std::str::from_utf8(&body[..preview_end]).unwrap_or("<non-utf8>");
                             warn!(
                                 error = %e,
                                 body_preview = preview,
