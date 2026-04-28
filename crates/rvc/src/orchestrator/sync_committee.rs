@@ -11,6 +11,7 @@ use signer::SignerService;
 use sync_service::is_sync_committee_aggregator;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
+use super::slot_context::SlotContext;
 use super::utils;
 
 /// Total validators in a sync committee.
@@ -39,7 +40,12 @@ impl SyncCommitteeService {
     }
 
     #[tracing::instrument(name = "rvc.orchestrator.produce_sync_messages", skip_all, fields(rvc.slot = slot))]
-    pub(crate) async fn maybe_produce_sync_messages(&self, slot: Slot, _epoch: u64) {
+    pub(crate) async fn maybe_produce_sync_messages(
+        &self,
+        slot: Slot,
+        _epoch: u64,
+        _ctx: &SlotContext,
+    ) {
         let duties = self.duty_tracker.get_sync_committee_duties(slot).await;
         if duties.is_empty() {
             return;
@@ -108,7 +114,12 @@ impl SyncCommitteeService {
     }
 
     #[tracing::instrument(name = "rvc.orchestrator.produce_sync_contributions", skip_all, fields(rvc.slot = slot))]
-    pub(crate) async fn maybe_produce_sync_contributions(&self, slot: Slot, _epoch: u64) {
+    pub(crate) async fn maybe_produce_sync_contributions(
+        &self,
+        slot: Slot,
+        _epoch: u64,
+        _ctx: &SlotContext,
+    ) {
         let duties = self.duty_tracker.get_sync_committee_duties(slot).await;
         if duties.is_empty() {
             return;

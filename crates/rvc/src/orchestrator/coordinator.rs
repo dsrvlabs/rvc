@@ -26,6 +26,7 @@ use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
 use super::duty_management::DutyManagementService;
 use super::error::OrchestratorError;
+use super::slot_context::SlotContext;
 use super::sync_committee::SyncCommitteeService;
 use super::utils;
 
@@ -102,6 +103,7 @@ where
     B: BeaconBlockClient + 'static,
 {
     clock: Arc<C>,
+    beacon: Arc<dyn BeaconNodeClient>,
     duty_tracker: Arc<DutyTracker>,
     block_service: BlockService<SignerService, B>,
     builder_service: Option<Arc<BuilderService>>,
@@ -246,7 +248,7 @@ where
         let duty_management = DutyManagementService::new(
             clock.clone(),
             signer,
-            beacon,
+            beacon.clone(),
             duty_tracker.clone(),
             validator_store,
             pubkey_map.clone(),
@@ -255,6 +257,7 @@ where
 
         let orchestrator = Self {
             clock,
+            beacon,
             duty_tracker,
             block_service,
             builder_service,
@@ -357,9 +360,12 @@ where
             }
 
             // === Phase 1: t=0 — Block proposal ===
+            // Capture slot context once; downstream phases reuse the same head root
+            // to avoid TOCTOU races (H-5). Uses slot-qualified query, not "head" (L-5).
+            let ctx = SlotContext::capture(&*self.beacon, current_slot, current_epoch).await;
             {
                 let phase_span = info_span!(parent: &slot_span, "rvc.slot.phase.block");
-                self.maybe_propose_block(current_slot, current_epoch).instrument(phase_span).await;
+                self.maybe_propose_block(ctx.slot, ctx.epoch, &ctx).instrument(phase_span).await;
             }
 
             if self.check_shutdown() {
@@ -436,7 +442,7 @@ where
                     }
 
                     self.sync_committee_service
-                        .maybe_produce_sync_messages(current_slot, current_epoch)
+                        .maybe_produce_sync_messages(current_slot, current_epoch, &ctx)
                         .instrument(att_phase_span)
                         .await;
                 } else {
@@ -484,7 +490,7 @@ where
 
                 if self.attesting_enabled.load(Ordering::Relaxed) {
                     self.sync_committee_service
-                        .maybe_produce_sync_contributions(current_slot, current_epoch)
+                        .maybe_produce_sync_contributions(current_slot, current_epoch, &ctx)
                         .instrument(agg_phase_span.clone())
                         .await;
                     self.aggregation_service
@@ -571,7 +577,7 @@ where
     }
 
     #[tracing::instrument(name = "rvc.orchestrator.maybe_propose_block", skip_all, fields(rvc.slot = slot, rvc.epoch = epoch))]
-    async fn maybe_propose_block(&self, slot: Slot, epoch: u64) {
+    async fn maybe_propose_block(&self, slot: Slot, epoch: u64, ctx: &SlotContext) {
         let proposer_duty = match self.duty_tracker.get_proposer_duty(slot).await {
             Some(duty) => duty,
             None => return,
@@ -602,7 +608,7 @@ where
                 slot,
                 &pubkey,
                 expected_proposer_index,
-                None,
+                ctx.head_root,
             ),
         )
         .await
@@ -3399,7 +3405,10 @@ mod tests {
                             // Advance past 2/3 of slot so all phases run without waiting
         clock.advance_time(9);
 
-        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+        // Use 0 retries so that failed HTTP calls (localhost:5052 unavailable) return
+        // immediately, keeping the test well within its 5-second window even after
+        // SlotContext::capture adds a get_block_root call to the slot loop.
+        let beacon_config = BeaconClientConfig::new("http://localhost:5052").with_max_retries(0);
         let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
@@ -3682,7 +3691,10 @@ mod tests {
         clock.set_slot(65); // non-boundary slot
         clock.advance_time(9);
 
-        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+        // Use 0 retries so that failed HTTP calls (localhost:5052 unavailable) return
+        // immediately, keeping the test well within its 5-second window even after
+        // SlotContext::capture adds a get_block_root call to the slot loop.
+        let beacon_config = BeaconClientConfig::new("http://localhost:5052").with_max_retries(0);
         let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
@@ -4547,7 +4559,8 @@ mod tests {
         );
 
         // Invoke the proposer path directly.
-        orchestrator.maybe_propose_block(slot, epoch).await;
+        let ctx = SlotContext { slot, epoch, head_root: None };
+        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
 
         // H-4: a forged proposer_index must drop the duty before any
         // signing or publishing occurs.
@@ -4659,7 +4672,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
         );
 
-        orchestrator.maybe_propose_block(slot, epoch).await;
+        let ctx = SlotContext { slot, epoch, head_root: None };
+        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
 
         // Non-builder BN error must NOT record a miss.
         assert_eq!(
@@ -4734,7 +4748,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
         );
 
-        orchestrator.maybe_propose_block(slot, epoch).await;
+        let ctx = SlotContext { slot, epoch, head_root: None };
+        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
 
         // Builder BN error MUST record a miss.
         assert_eq!(
@@ -4812,7 +4827,8 @@ mod tests {
             Arc::new(AtomicBool::new(true)),
         );
 
-        orchestrator.maybe_propose_block(slot, epoch).await;
+        let ctx = SlotContext { slot, epoch, head_root: None };
+        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
 
         // Signer error must NOT record a miss.
         assert_eq!(

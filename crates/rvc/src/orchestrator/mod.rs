@@ -8,6 +8,7 @@ pub(crate) mod attestation;
 mod coordinator;
 pub(crate) mod duty_management;
 mod error;
+pub(crate) mod slot_context;
 pub(crate) mod sync_committee;
 pub(crate) mod utils;
 
