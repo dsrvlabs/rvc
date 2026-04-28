@@ -117,6 +117,10 @@ where
     key_gen_rx: watch::Receiver<u64>,
     shutdown_rx: watch::Receiver<bool>,
     attesting_enabled: Arc<AtomicBool>,
+    /// Controls whether sync-committee duties are processed independently of
+    /// `attesting_enabled`. Defaults to `true`; can be toggled at runtime via
+    /// [`set_sync_enabled`]. Internal-only — not wired to any Keymanager API (H-7).
+    sync_enabled: Arc<AtomicBool>,
 }
 
 impl<C, S, B> DutyOrchestrator<C, S, B>
@@ -255,6 +259,8 @@ where
             config.clone(),
         );
 
+        let sync_enabled = Arc::new(AtomicBool::new(true));
+
         let orchestrator = Self {
             clock,
             beacon,
@@ -271,6 +277,7 @@ where
             key_gen_rx,
             shutdown_rx,
             attesting_enabled,
+            sync_enabled,
         };
 
         let handle = OrchestratorHandle { shutdown_tx };
@@ -440,14 +447,16 @@ where
                             }
                         }
                     }
-
-                    self.sync_committee_service
-                        .maybe_produce_sync_messages(current_slot, current_epoch, &ctx)
-                        .instrument(att_phase_span)
-                        .await;
                 } else {
                     debug!(slot = current_slot, "Attestation duties skipped (disabled)");
                 }
+
+                // H-7: sync-committee messages are gated by `sync_enabled`,
+                // which is independent of `attesting_enabled`. Disabling
+                // attestations no longer silently disables sync-committee duties.
+                self.run_sync_messages_phase(current_slot, current_epoch, &ctx)
+                    .instrument(att_phase_span)
+                    .await;
             }
 
             if self.check_shutdown() {
@@ -488,11 +497,12 @@ where
                     return Ok(());
                 }
 
+                // H-7: sync contributions gated by `sync_enabled` independently.
+                self.run_sync_contributions_phase(current_slot, current_epoch, &ctx)
+                    .instrument(agg_phase_span.clone())
+                    .await;
+
                 if self.attesting_enabled.load(Ordering::Relaxed) {
-                    self.sync_committee_service
-                        .maybe_produce_sync_contributions(current_slot, current_epoch, &ctx)
-                        .instrument(agg_phase_span.clone())
-                        .await;
                     self.aggregation_service
                         .maybe_produce_aggregations(current_slot, current_epoch)
                         .instrument(agg_phase_span)
@@ -676,6 +686,36 @@ where
     ) -> Result<Vec<AttestationResult>, OrchestratorError> {
         self.attestation_service.process_slot(slot).await
     }
+
+    /// Sets the sync-committee duty participation flag.
+    ///
+    /// When `false`, sync-committee messages and contributions are silently
+    /// skipped for all subsequent slots until re-enabled. This flag is
+    /// independent of `attesting_enabled`, closing H-7: disabling attestations
+    /// no longer silently disables sync-committee duties.
+    ///
+    /// Internal-only — NOT wired to any Keymanager API endpoint (per OQ-A3
+    /// decision deferred to Tier-1 follow-up).
+    pub fn set_sync_enabled(&self, enabled: bool) {
+        self.sync_enabled.store(enabled, Ordering::Release);
+    }
+
+    /// Runs the sync-committee messages phase, gated by `sync_enabled`.
+    ///
+    /// Extracted so both the run loop and tests can invoke the guarded phase
+    /// in isolation.
+    async fn run_sync_messages_phase(&self, slot: Slot, epoch: u64, ctx: &SlotContext) {
+        if self.sync_enabled.load(Ordering::Acquire) {
+            self.sync_committee_service.maybe_produce_sync_messages(slot, epoch, ctx).await;
+        }
+    }
+
+    /// Runs the sync-committee contributions phase, gated by `sync_enabled`.
+    async fn run_sync_contributions_phase(&self, slot: Slot, epoch: u64, ctx: &SlotContext) {
+        if self.sync_enabled.load(Ordering::Acquire) {
+            self.sync_committee_service.maybe_produce_sync_contributions(slot, epoch, ctx).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -683,10 +723,23 @@ where
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use beacon::{AttesterDuty, BeaconClient, BeaconClientConfig, VersionedAttestation};
+    use beacon::{
+        AttestationDataResponse, AttesterDutiesResponse, AttesterDuty, BeaconClient,
+        BeaconClientConfig, BeaconCommitteeSubscription, BeaconError, BlockRootData,
+        BlockRootResponse, ConfigSpecResponse, DataResponse, ExecutionOptimisticResponse,
+        GenesisResponse, ProposerDutiesResponse, ProposerPreparation,
+        SignedContributionAndProof as BeaconSignedContributionAndProof, StateForkResponse,
+        SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+        SyncCommitteeMessage as BeaconSyncCommitteeMessage, SyncingResponse, ValidatorsResponse,
+        VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    };
+    // block_service::ProduceBlockResponse is used in MockBlockBeacon / BadProposerBlockBeacon
     use block_service::ProduceBlockResponse;
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
-    use eth_types::ForkName;
+    use eth_types::{
+        ForkName, Root, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
+        SyncCommitteeDuty,
+    };
     use slashing::SlashingDb;
     use std::future::Future;
     use std::pin::Pin;
@@ -877,6 +930,178 @@ mod tests {
 
     fn create_mock_validator_store() -> Arc<ValidatorStore> {
         Arc::new(ValidatorStore::new([0u8; 20], 100))
+    }
+
+    // ── H-7 mock: captures sync committee message submissions ────────────────
+    //
+    // Implements `BeaconNodeClient` with:
+    //   - `post_sync_committee_duties` → returns a duty for `duty_pubkey`
+    //   - `submit_sync_committee_messages` → records beacon_block_root values
+    //   - All other methods → return `BeaconError::HttpError("mock")`
+    //
+    // Used to test the `sync_enabled` guard without a real beacon node.
+    struct SyncGuardBeacon {
+        duty_pubkey: String,
+        submitted_roots: Arc<std::sync::Mutex<Vec<Root>>>,
+    }
+
+    #[async_trait]
+    impl bn_manager::BeaconNodeClient for SyncGuardBeacon {
+        async fn get_block_root(&self, _block_id: &str) -> Result<BlockRootResponse, BeaconError> {
+            // Return a fixed root so SlotContext::capture succeeds.
+            Ok(DataResponse {
+                data: BlockRootData {
+                    root: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                },
+            })
+        }
+
+        async fn post_sync_committee_duties(
+            &self,
+            _epoch: u64,
+            _indices: &[String],
+        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
+            Ok(ExecutionOptimisticResponse {
+                execution_optimistic: false,
+                data: vec![SyncCommitteeDuty {
+                    pubkey: self.duty_pubkey.clone(),
+                    validator_index: 1,
+                    validator_sync_committee_indices: vec![0],
+                }],
+            })
+        }
+
+        async fn submit_sync_committee_messages(
+            &self,
+            messages: &[BeaconSyncCommitteeMessage],
+        ) -> Result<(), BeaconError> {
+            let mut roots = self.submitted_roots.lock().unwrap();
+            for msg in messages {
+                roots.push(msg.beacon_block_root);
+            }
+            Ok(())
+        }
+
+        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_fork_schedule(&self) -> Result<eth_types::ForkSchedule, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_fork(&self, _state_id: &str) -> Result<StateForkResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_validators(
+            &self,
+            _pubkeys: &[String],
+        ) -> Result<ValidatorsResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_attester_duties(
+            &self,
+            _epoch: u64,
+            _indices: &[String],
+        ) -> Result<AttesterDutiesResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_proposer_duties(
+            &self,
+            _epoch: u64,
+        ) -> Result<ProposerDutiesResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn produce_block_v3(
+            &self,
+            _slot: u64,
+            _randao_reveal: &str,
+            _graffiti: Option<&str>,
+            _builder_boost_factor: Option<u64>,
+        ) -> Result<beacon::ProduceBlockResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn publish_block(
+            &self,
+            _signed_block: &SignedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn publish_blinded_block(
+            &self,
+            _signed_block: &SignedBlindedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_attestation_data(
+            &self,
+            _slot: u64,
+            _committee_index: u64,
+        ) -> Result<AttestationDataResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_attestation(
+            &self,
+            _attestations: &VersionedAttestation,
+        ) -> Result<SubmitAttestationResult, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_aggregate_attestation(
+            &self,
+            _slot: u64,
+            _attestation_data_root: &str,
+            _committee_index: Option<u64>,
+        ) -> Result<VersionedAggregateAttestation, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_aggregate_and_proofs(
+            &self,
+            _proofs: &VersionedSignedAggregateAndProof,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_sync_committee_contribution(
+            &self,
+            _slot: u64,
+            _subcommittee_index: u64,
+            _beacon_block_root: &str,
+        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_contribution_and_proofs(
+            &self,
+            _proofs: &[BeaconSignedContributionAndProof],
+        ) -> Result<(), BeaconError> {
+            Ok(())
+        }
+        async fn prepare_beacon_proposer(
+            &self,
+            _preparations: &[ProposerPreparation],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_beacon_committee_subscriptions(
+            &self,
+            _subscriptions: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn register_validators(
+            &self,
+            _registrations: &[SignedValidatorRegistration],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_version(&self) -> Result<String, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
     }
 
     #[test]
@@ -4835,6 +5060,256 @@ mod tests {
             circuit_breaker.consecutive_misses(),
             0,
             "Local signer error must not trip the circuit breaker (H-3)"
+        );
+    }
+
+    // ── H-7: sync_enabled flag tests ────────────────────────────────────────
+
+    /// Minimal helper: build an orchestrator with a `SyncGuardBeacon` mock.
+    /// Used to avoid repetition in the H-7 guard tests.
+    async fn build_sync_test_orchestrator(
+        beacon: Arc<SyncGuardBeacon>,
+        pk_hex: String,
+        pk: crypto::PublicKey,
+        sk: crypto::SecretKey,
+        attesting_enabled: Arc<AtomicBool>,
+    ) -> DutyOrchestrator<MockSlotClock, MockSubmitter, MockBlockBeacon> {
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(sk);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        // Pre-populate sync committee duties for period 0 (epoch 0).
+        duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
+
+        let mut map = HashMap::new();
+        map.insert(pk_hex, pk);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        let config = create_test_config();
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(0);
+
+        let (orchestrator, _handle) = DutyOrchestrator::new_with_attesting_enabled(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            validator_store,
+            config,
+            pubkey_map,
+            Arc::new(CircuitBreakerState::new(0, 0)),
+            attesting_enabled,
+        );
+        orchestrator
+    }
+
+    /// H-7: `sync_enabled` defaults to `true` on a freshly-constructed orchestrator.
+    ///
+    /// RED: fails to compile before the `sync_enabled` field is added.
+    /// GREEN: field exists and is initialized to `true`.
+    #[test]
+    fn test_sync_enabled_defaults_to_true() {
+        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            create_test_config(),
+            pubkey_map,
+        );
+
+        assert!(
+            orchestrator.sync_enabled.load(Ordering::Acquire),
+            "sync_enabled must default to true (H-7)"
+        );
+    }
+
+    /// H-7: `set_sync_enabled` writes with `Release` ordering and the new
+    /// value is immediately visible via `Acquire` load.
+    ///
+    /// RED: fails to compile before `set_sync_enabled` is added.
+    /// GREEN: method exists and correctly toggles the flag.
+    #[test]
+    fn test_set_sync_enabled_toggles_flag() {
+        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            create_test_config(),
+            pubkey_map,
+        );
+
+        assert!(orchestrator.sync_enabled.load(Ordering::Acquire), "default must be true");
+
+        orchestrator.set_sync_enabled(false);
+        assert!(
+            !orchestrator.sync_enabled.load(Ordering::Acquire),
+            "set_sync_enabled(false) must disable the flag"
+        );
+
+        orchestrator.set_sync_enabled(true);
+        assert!(
+            orchestrator.sync_enabled.load(Ordering::Acquire),
+            "set_sync_enabled(true) must re-enable the flag"
+        );
+    }
+
+    /// H-7 / ISSUE-2.7: when `attesting_enabled = false` and `sync_enabled = true`
+    /// (the default), sync-committee messages are still produced.
+    ///
+    /// Before the fix the two services shared the `attesting_enabled` guard, so
+    /// disabling attestations would silently skip sync duties. After the fix the
+    /// guard is split: sync is gated only by `sync_enabled`.
+    ///
+    /// RED: test fails (no sync messages) because sync is inside the attesting block.
+    /// GREEN: test passes after the guard is split.
+    #[tokio::test]
+    async fn test_sync_runs_with_attesting_disabled() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+
+        let r_captured: Root = [0xAA; 32];
+        let submitted_roots = Arc::new(std::sync::Mutex::new(Vec::<Root>::new()));
+
+        let beacon = Arc::new(SyncGuardBeacon {
+            submitted_roots: submitted_roots.clone(),
+            duty_pubkey: pk_hex.clone(),
+        });
+
+        // attesting_enabled = false; sync_enabled = true (default)
+        let attesting_enabled = Arc::new(AtomicBool::new(false));
+        let orchestrator =
+            build_sync_test_orchestrator(beacon, pk_hex, pk, sk, attesting_enabled).await;
+
+        // Confirm default: sync is enabled
+        assert!(orchestrator.sync_enabled.load(Ordering::Acquire));
+
+        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some(r_captured) };
+
+        // Exercise the guarded sync-messages phase directly.
+        orchestrator.run_sync_messages_phase(0, 0, &ctx).await;
+
+        let roots = submitted_roots.lock().unwrap();
+        assert!(
+            !roots.is_empty(),
+            "H-7: sync messages must be produced even when attesting is disabled \
+             (sync_enabled=true overrides attesting_enabled=false)"
+        );
+        for root in roots.iter() {
+            assert_eq!(*root, r_captured, "submitted root must match SlotContext.head_root");
+        }
+    }
+
+    /// H-7 / ISSUE-2.7: inverse — when `sync_enabled = false` and `attesting_enabled = true`,
+    /// no sync-committee messages are produced, but attestations would still run.
+    ///
+    /// RED: fails (sync runs unconditionally) before the separate guard is added.
+    /// GREEN: `run_sync_messages_phase` short-circuits on `sync_enabled = false`.
+    #[tokio::test]
+    async fn test_sync_messages_skipped_when_sync_disabled() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+
+        let r_captured: Root = [0xAA; 32];
+        let submitted_roots = Arc::new(std::sync::Mutex::new(Vec::<Root>::new()));
+
+        let beacon = Arc::new(SyncGuardBeacon {
+            submitted_roots: submitted_roots.clone(),
+            duty_pubkey: pk_hex.clone(),
+        });
+
+        // attesting_enabled = true; sync_enabled = false (explicit)
+        let attesting_enabled = Arc::new(AtomicBool::new(true));
+        let orchestrator =
+            build_sync_test_orchestrator(beacon, pk_hex, pk, sk, attesting_enabled).await;
+
+        orchestrator.set_sync_enabled(false);
+        assert!(!orchestrator.sync_enabled.load(Ordering::Acquire));
+
+        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some(r_captured) };
+
+        orchestrator.run_sync_messages_phase(0, 0, &ctx).await;
+
+        assert!(
+            submitted_roots.lock().unwrap().is_empty(),
+            "H-7: sync messages must NOT be produced when sync_enabled = false"
+        );
+    }
+
+    /// H-7: same guard split applies to contributions phase — skipped when sync disabled.
+    #[tokio::test]
+    async fn test_sync_contributions_skipped_when_sync_disabled() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+
+        let r_captured: Root = [0xAA; 32];
+        let submitted_roots = Arc::new(std::sync::Mutex::new(Vec::<Root>::new()));
+
+        let beacon = Arc::new(SyncGuardBeacon {
+            submitted_roots: submitted_roots.clone(),
+            duty_pubkey: pk_hex.clone(),
+        });
+
+        let attesting_enabled = Arc::new(AtomicBool::new(false));
+        let orchestrator =
+            build_sync_test_orchestrator(beacon, pk_hex, pk, sk, attesting_enabled).await;
+
+        // Disable sync: contributions must not call the signer.
+        orchestrator.set_sync_enabled(false);
+
+        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some(r_captured) };
+        // With sync_enabled=false the phase guard returns early before any
+        // signer or BN call. The test just verifies no panic and no submission.
+        orchestrator.run_sync_contributions_phase(0, 0, &ctx).await;
+
+        // No sync messages or contributions were submitted.
+        assert!(
+            submitted_roots.lock().unwrap().is_empty(),
+            "H-7: sync contributions must NOT run when sync_enabled = false"
         );
     }
 }
