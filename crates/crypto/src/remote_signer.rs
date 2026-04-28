@@ -8,8 +8,38 @@ use tracing::Instrument;
 use url::Url;
 
 use super::bls::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
+use super::insecure::{InsecureGate, InsecureMode};
 use super::signer_trait::{Signer, SigningError};
 use eth_types::Root;
+
+/// Environment variable that must be set to `"true"` to allow plaintext
+/// `http://` remote-signer URLs.  `https://` URLs always pass without
+/// consulting this variable.
+pub const REMOTE_SIGNER_INSECURE_ENV_VAR: &str = "RVC_REMOTE_SIGNER_ALLOW_INSECURE";
+
+/// Gate `url` against the plaintext-URL policy.
+///
+/// - `https://` URLs pass immediately — no env-var check, no log.
+/// - Any other scheme (e.g. `http://`) is evaluated by [`InsecureGate`]:
+///   - `mode = Warn` (Phase 2 default): emits an `error!`-level log and
+///     returns `Ok(())` so existing deployments are not hard-broken.
+///   - `mode = Refuse` (Phase 3, ISSUE-3.13): returns
+///     `Err(SigningError::RemoteSignerError(...))` unless the operator has set
+///     `RVC_REMOTE_SIGNER_ALLOW_INSECURE=true`.
+///
+/// The predicate passed to the gate is `|| true`: the scheme check is already
+/// done above, so the remaining question is purely "has the operator opted
+/// in via the env var?".  Predicate `true` means the gate's combined
+/// condition (`env_ok && pred_ok`) becomes `env_ok`, giving clean opt-in
+/// semantics.
+pub fn check_remote_signer_url(url: &str, mode: InsecureMode) -> Result<(), SigningError> {
+    if url.trim_end_matches('/').starts_with("https://") {
+        return Ok(());
+    }
+    InsecureGate::with_predicate(REMOTE_SIGNER_INSECURE_ENV_VAR, mode, || true)
+        .check()
+        .map_err(|e| SigningError::RemoteSignerError(e.to_string()))
+}
 
 fn redact_url(url: &str) -> String {
     if let Ok(mut parsed) = Url::parse(url) {
@@ -55,12 +85,9 @@ impl RemoteSigner {
     ) -> Result<Self, SigningError> {
         let url = config.url.trim_end_matches('/').to_string();
 
-        if url.starts_with("http://") {
-            tracing::warn!(
-                url = %redact_url(&url),
-                "Remote signer URL uses plaintext HTTP — consider using HTTPS"
-            );
-        }
+        // Gate plaintext URLs. Phase 2: Warn mode logs an error but allows
+        // startup to continue. Phase 3 (ISSUE-3.13) flips to Refuse.
+        check_remote_signer_url(&url, InsecureMode::Warn)?;
 
         let client = Client::builder()
             .timeout(config.timeout)

@@ -8,7 +8,10 @@ pub mod proto {
     }
 }
 
-pub use client::{GrpcRemoteSigner, GrpcRemoteSignerConfig, SIGNER_V2_PACKAGE_NAME};
+pub use client::{
+    GrpcRemoteSigner, GrpcRemoteSignerConfig, REMOTE_SIGNER_INSECURE_ENV_VAR,
+    SIGNER_V2_PACKAGE_NAME,
+};
 
 // V1 proto re-exports (kept for the ListPublicKeys/GetStatus RPCs used during connect)
 pub use proto::signer::signer_service_client::SignerServiceClient;

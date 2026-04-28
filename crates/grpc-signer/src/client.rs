@@ -8,6 +8,7 @@ use zeroize::Zeroizing;
 
 use crypto::logging::TruncatedPubkey;
 use crypto::typed_signer::SignContext;
+use crypto::{InsecureGate, InsecureMode};
 use crypto::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
 use crypto::{SigningError, TypedSigner};
 use eth_types::{
@@ -32,6 +33,11 @@ use crate::proto::signer::signer_service_client::SignerServiceClient;
 /// The proto package name emitted by the v2 `GetStatus` response.
 /// `bin/rvc` checks this at startup to refuse a v1 signer.
 pub const SIGNER_V2_PACKAGE_NAME: &str = "signer.v2";
+
+/// Environment variable that must be set to `"true"` to allow plaintext
+/// `http://` gRPC remote-signer URLs.  `https://` URLs always pass without
+/// consulting this variable.
+pub const REMOTE_SIGNER_INSECURE_ENV_VAR: &str = "RVC_REMOTE_SIGNER_ALLOW_INSECURE";
 
 fn redact_url(url: &str) -> String {
     if let Ok(mut parsed) = Url::parse(url) {
@@ -64,6 +70,24 @@ impl GrpcRemoteSignerConfig {
         self.tls_ca_cert = Some(ca_cert);
         self
     }
+
+    /// Gate this config's URL against the plaintext-URL policy.
+    ///
+    /// - `https://` URLs pass immediately — no env-var check, no log.
+    /// - `http://` (or any other non-HTTPS scheme) is evaluated by
+    ///   [`InsecureGate`] using [`REMOTE_SIGNER_INSECURE_ENV_VAR`]:
+    ///   - `mode = Warn` (Phase 2 default): emits an `error!`-level log and
+    ///     returns `Ok(())`.
+    ///   - `mode = Refuse` (Phase 3, ISSUE-3.13): returns
+    ///     `Err(SigningError::RemoteSignerError(...))` unless env var is set.
+    pub fn check_url_security(&self, mode: InsecureMode) -> Result<(), SigningError> {
+        if self.url.trim_end_matches('/').starts_with("https://") {
+            return Ok(());
+        }
+        InsecureGate::with_predicate(REMOTE_SIGNER_INSECURE_ENV_VAR, mode, || true)
+            .check()
+            .map_err(|e| SigningError::RemoteSignerError(e.to_string()))
+    }
 }
 
 /// gRPC remote signer client.
@@ -83,6 +107,10 @@ pub struct GrpcRemoteSigner {
 impl GrpcRemoteSigner {
     #[tracing::instrument(name = "rvc.grpc_signer.connect", skip_all)]
     pub async fn connect(config: GrpcRemoteSignerConfig) -> Result<Self, SigningError> {
+        // Gate plaintext URLs. Phase 2: Warn mode logs an error but allows
+        // the connection to proceed. Phase 3 (ISSUE-3.13) flips to Refuse.
+        config.check_url_security(InsecureMode::Warn)?;
+
         let url = config.url.trim_end_matches('/').to_string();
         let tls_enabled = config.tls_cert.is_some();
 

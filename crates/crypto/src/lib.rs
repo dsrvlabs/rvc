@@ -36,7 +36,9 @@ pub use eth_types::{DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
 pub use insecure::{InsecureGate, InsecureGateError, InsecureMode};
 pub use key_manager::KeyManager;
 pub use keystore::{EncryptionKdf, KdfParams, Keystore, Pbkdf2Params, ScryptParams};
-pub use remote_signer::{RemoteSigner, RemoteSignerConfig};
+pub use remote_signer::{
+    check_remote_signer_url, RemoteSigner, RemoteSignerConfig, REMOTE_SIGNER_INSECURE_ENV_VAR,
+};
 pub use signer_trait::{LocalSigner, Signer, SigningError};
 pub use signing::{
     compute_domain, compute_fork_data_root, compute_signing_root, sign_attestation,
