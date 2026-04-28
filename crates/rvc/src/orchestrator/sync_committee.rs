@@ -6,7 +6,7 @@ use tracing::{debug, info, warn};
 use bn_manager::BeaconNodeClient;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
-use eth_types::{ContributionAndProof, Root, SignedContributionAndProof, Slot, SyncCommitteeDuty};
+use eth_types::{ContributionAndProof, SignedContributionAndProof, Slot, SyncCommitteeDuty};
 use signer::SignerService;
 use sync_service::is_sync_committee_aggregator;
 
@@ -335,7 +335,8 @@ mod tests {
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
     use duty_tracker::DutyTracker;
     use eth_types::{
-        ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
+        ForkSchedule, Root, SignedBeaconBlock, SignedBlindedBeaconBlock,
+        SignedValidatorRegistration,
     };
     use signer::SignerService;
     use slashing::SlashingDb;
