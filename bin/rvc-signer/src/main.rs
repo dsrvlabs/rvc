@@ -4,7 +4,8 @@
 //! This file only handles CLI parsing and wires up the library.
 
 use rvc_signer_bin::{
-    backend, config, metrics, reload, service, slashing, SignerServiceServer, SignerServiceServerV2,
+    backend, config, insecure_startup, metrics, reload, service, slashing, SignerServiceServer,
+    SignerServiceServerV2,
 };
 #[cfg(feature = "dvt")]
 use rvc_signer_bin::{dvt, PeerSignerServiceServerV2};
@@ -419,6 +420,18 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.tls_config(server_tls)?;
         info!("mTLS enabled");
     } else if args.insecure {
+        // ── H-9: env-var double-confirm + loopback gate ───────────────────
+        //
+        // `--insecure` requires BOTH `RVC_SIGNER_ALLOW_INSECURE=true` in the
+        // environment AND a loopback bind address.  In Phase 2 the gate runs in
+        // Warn mode (logs an error but does not block startup); Phase 3
+        // ISSUE-3.13 flips the default to Refuse.
+        insecure_startup::check_insecure_startup(true, addr, crypto::InsecureMode::Warn).map_err(
+            |e| {
+                error!(error = %e, "insecure startup refused by gate");
+                e
+            },
+        )?;
         tracing::warn!("TLS disabled via --insecure flag. Do NOT use in production!");
     } else {
         return Err("TLS is required. Provide --tls-cert, --tls-key, and --tls-ca-cert, \
