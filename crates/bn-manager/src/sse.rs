@@ -295,7 +295,15 @@ pub async fn subscribe_events<F>(
                                             warn!("SSE callback channel full; dropping event");
                                         }
                                         Err(TrySendError::Closed(_)) => {
-                                            // Consumer task exited; nothing to do.
+                                            // Consumer task exited — reconnect to re-create
+                                            // the tx/rx pair so events are not silently dropped.
+                                            warn!(
+                                                bn_url = %RedactedUrl(&config.endpoint),
+                                                "SSE callback consumer exited; reconnecting"
+                                            );
+                                            consecutive_failures += 1;
+                                            es.close();
+                                            break;
                                         }
                                     }
                                 }

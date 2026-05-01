@@ -98,7 +98,8 @@ impl BnManager {
 
             let client_config = beacon::BeaconClientConfig::new(endpoint.clone())
                 .with_timeout(config.timeout)
-                .with_max_retries(0);
+                .with_max_retries(0)
+                .with_max_body_bytes(config.max_body_bytes);
             let client = BeaconClient::new(client_config)?;
             clients.push(client);
         }

@@ -223,6 +223,11 @@ pub struct BnManagerConfig {
     pub roles: Vec<std::collections::HashSet<crate::types::BnRole>>,
     /// Health tier thresholds for sync distance classification.
     pub tier_thresholds: crate::types::TierThresholds,
+    /// Maximum bytes allowed in a JSON response body (H-12).
+    ///
+    /// Applied to every `BeaconClient` created by `BnManager::new`.
+    /// Default: 32 MiB (`ResponseCaps::DEFAULT_MAX_BODY_BYTES`).
+    pub max_body_bytes: usize,
 }
 
 impl BnManagerConfig {
@@ -242,7 +247,14 @@ impl BnManagerConfig {
                 count
             ],
             tier_thresholds: crate::types::TierThresholds::default(),
+            max_body_bytes: beacon::ResponseCaps::DEFAULT_MAX_BODY_BYTES,
         }
+    }
+
+    /// Set the maximum JSON response body size for all per-BN clients.
+    pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes;
+        self
     }
 }
 

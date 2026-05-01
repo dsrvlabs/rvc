@@ -34,6 +34,21 @@ impl Default for ResponseCaps {
     }
 }
 
+/// Read a response body up to `cap` bytes for diagnostic use, returning a lossy UTF-8 string.
+///
+/// Calls `read_body_capped` and converts the result to a `String`.  Intended for
+/// error-path message extraction where the body is diagnostic-only and its exact
+/// content does not matter: if the cap is exceeded or the bytes are not valid
+/// UTF-8, an empty string is returned instead of propagating an error.
+///
+/// Default cap for error-path diagnostic bodies: 16 KiB.
+pub(crate) async fn read_body_capped_lossy(response: reqwest::Response, cap: usize) -> String {
+    match read_body_capped(response, cap).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
 /// Read a response body up to `cap` bytes, streaming in chunks.
 ///
 /// Rejects *before* any allocation when `Content-Length` header exceeds `cap`.
