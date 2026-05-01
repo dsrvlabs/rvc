@@ -204,6 +204,14 @@ async fn test_request_timeout() {
     // Wait until the server handler has started (its sleep timer is running).
     notifier.notified().await;
 
+    // Yield once so the handler future actually progresses past notify_one() and
+    // registers its `tokio::time::sleep(30s)` with the runtime's time driver
+    // BEFORE we freeze the virtual clock.  Without this yield the test has a
+    // scheduling race: pause() can fire before the timer is registered, and on
+    // a loaded CI runner the timer ends up scheduled at virtual t=11s instead
+    // of t=0s — leading to nondeterministic outcomes (review M-10 MF-2).
+    tokio::task::yield_now().await;
+
     // Freeze the tokio clock and jump forward 11 s — past the 10 s server timeout.
     tokio::time::pause();
     tokio::time::advance(Duration::from_secs(11)).await;
@@ -223,14 +231,19 @@ async fn test_request_timeout() {
 /// - `concurrency_limit_per_connection(32)` (Tower) caps handler concurrency
 /// - `max_concurrent_streams(Some(64))` (H2 SETTINGS) caps open streams
 ///
-/// Observed peak concurrent handler invocations must be ≤ 64.
+/// Observed peak concurrent handler invocations must be ≤ 32 — the Tower
+/// `concurrency_limit_per_connection` is the binding cap because it queues
+/// requests beyond the 32-handler ceiling, while `max_concurrent_streams=64`
+/// only bounds H2 streams (Tonic admits streams 1–64 and Tower then queues
+/// requests 33–64 inside the call queue).  Asserting ≤ 32 means a regression
+/// that silently removes the Tower cap fails the test (review M-10 MF-1).
 ///
-/// Excess streams beyond the `max_concurrent_streams=64` limit are **refused**
-/// by the server with `RST_STREAM(REFUSED_STREAM)` — per RFC 7540 §8.1.4 such
+/// Excess streams beyond `max_concurrent_streams=64` are **refused** by the
+/// server with `RST_STREAM(REFUSED_STREAM)` — per RFC 7540 §8.1.4 such
 /// streams are safe to retry.  Tonic surfaces these as `Unavailable`.  The test
 /// therefore accepts `Unavailable` for some requests and verifies:
 /// 1. No error other than `Unavailable` is seen (no data-loss errors).
-/// 2. Peak concurrent handler invocations ≤ 64.
+/// 2. Peak concurrent handler invocations ≤ 32.
 #[tokio::test]
 async fn test_concurrent_stream_surge_bounded() {
     const NUM_REQUESTS: usize = 100;
@@ -281,9 +294,9 @@ async fn test_concurrent_stream_surge_bounded() {
 
     let peak_value = peak.load(Ordering::SeqCst);
     assert!(
-        peak_value <= 64,
-        "peak concurrent handler invocations was {peak_value}, expected ≤ 64 \
-         (max_concurrent_streams=64 + concurrency_limit_per_connection=32); \
+        peak_value <= 32,
+        "peak concurrent handler invocations was {peak_value}, expected ≤ 32 \
+         (concurrency_limit_per_connection=32 is the Tower-level binding cap); \
          succeeded={succeeded} refused={refused}"
     );
 }

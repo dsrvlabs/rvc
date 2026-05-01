@@ -20,6 +20,12 @@ use tonic::transport::Server;
 /// |                                   |           | blocks stream-flood DoS                |
 /// | `timeout`                         | 10 s      | Sign must finish well within one slot  |
 /// |                                   |           | (12 s); 10 s is a generous upper bound |
+/// | `tcp_keepalive`                   | 60 s      | Drop dead peer FDs without waiting for |
+/// |                                   |           | the kernel default (~2 h)              |
+/// | `http2_keepalive_interval`        | 60 s      | Probe idle-but-alive connections via   |
+/// |                                   |           | H2 PING; pairs with the timeout below  |
+/// | `http2_keepalive_timeout`         | 20 s      | If a PING ack is not received in 20 s, |
+/// |                                   |           | drop the connection                    |
 ///
 /// **Per-service `max_decoding_message_size`** is NOT set here because Tonic
 /// exposes it only on the `ServiceServer` wrapper, not the `Server` builder.
@@ -38,6 +44,9 @@ pub fn hardened_server_builder() -> Server {
         .concurrency_limit_per_connection(32)
         .max_concurrent_streams(Some(64))
         .timeout(Duration::from_secs(10))
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .http2_keepalive_interval(Some(Duration::from_secs(60)))
+        .http2_keepalive_timeout(Some(Duration::from_secs(20)))
 }
 
 #[cfg(test)]
