@@ -11,6 +11,7 @@ mod error;
 pub(crate) mod slot_context;
 pub(crate) mod sync_committee;
 pub(crate) mod utils;
+pub mod validation;
 
 pub use coordinator::{
     AttestationResult, DutyOrchestrator, OrchestratorConfig, OrchestratorHandle, PubkeyMap,

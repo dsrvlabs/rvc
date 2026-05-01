@@ -18,6 +18,7 @@ use timing::{SlotClock, SLOTS_PER_EPOCH};
 use super::coordinator::{AttestationResult, OrchestratorConfig, PubkeyMap};
 use super::error::OrchestratorError;
 use super::utils;
+use super::validation::attestation_data::validate_attestation_data;
 
 pub(crate) struct AttestationService<C, S>
 where
@@ -293,6 +294,44 @@ where
             source_epoch = crypto_attestation_data.source.epoch,
             "Converted attestation data"
         );
+
+        // M-2: local AttestationData sanity check before sign.
+        // Re-fetch the current clock slot here so the window check uses the
+        // most recent local view (≤1 ms delta from the check at process_slot).
+        let current_clock_slot = match self.clock.current_slot() {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    validator = %validator_index,
+                    slot,
+                    "Failed to read clock slot for AttestationData sanity check; \
+                     dropping duty"
+                );
+                return AttestationResult {
+                    validator_index,
+                    slot,
+                    success: false,
+                    error: Some(format!("Clock error during attestation validation: {e}")),
+                };
+            }
+        };
+        if let Err(e) =
+            validate_attestation_data(&crypto_attestation_data, slot, current_clock_slot)
+        {
+            tracing::error!(
+                error = %e,
+                validator = %validator_index,
+                slot,
+                "AttestationData failed sanity check (M-2); dropping duty"
+            );
+            return AttestationResult {
+                validator_index,
+                slot,
+                success: false,
+                error: Some(format!("AttestationData sanity check failed: {e}")),
+            };
+        }
 
         let signature = match self
             .signer
