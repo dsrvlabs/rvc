@@ -46,6 +46,7 @@ impl KeymanagerServer {
         body_limit: usize,
         allow_insecure_remote_signer: bool,
         attesting_enabled: Arc<AtomicBool>,
+        doppelganger_window: std::time::Duration,
     ) -> Self {
         Self {
             state: Arc::new(AppState {
@@ -59,6 +60,7 @@ impl KeymanagerServer {
                 allow_insecure_remote_signer,
                 attesting_enabled,
                 last_set_attesting_enabled: std::sync::Mutex::new(None),
+                doppelganger_window,
             }),
             token: Arc::new(Zeroizing::new(token)),
             addr,

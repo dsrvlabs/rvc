@@ -13,9 +13,8 @@ use metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
 use rvc::config::{redact_url, CliOverrides, Config, Network, ServiceBuilder};
 use rvc::duty_tracker::DutyTrackerService;
 use rvc::keymanager_adapters::{
-    DoppelgangerMonitorAdapter, KeystoreManagerAdapter, RemoteKeyManagerAdapter,
-    SlashingProtectionAdapter, ValidatorConfigManagerAdapter, ValidatorManagerAdapter,
-    VoluntaryExitManagerAdapter,
+    KeystoreManagerAdapter, RemoteKeyManagerAdapter, SlashingProtectionAdapter,
+    ValidatorConfigManagerAdapter, ValidatorManagerAdapter, VoluntaryExitManagerAdapter,
 };
 use rvc::startup;
 use rvc::DutyTrackerServer;
@@ -1431,7 +1430,19 @@ async fn run_validator(
         ));
         let validator_mgr =
             std::sync::Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
-        let doppelganger_mon = std::sync::Arc::new(DoppelgangerMonitorAdapter::new());
+        // M-12: use a time-based doppelganger gate for newly imported keys.
+        // When doppelganger detection is disabled (doppelganger_enabled = false)
+        // the window is Duration::ZERO so keys are immediately enabled.
+        let doppelganger_window = if doppelganger_enabled {
+            // 2 epochs × 32 slots/epoch × 12 s/slot = 768 s (mainnet default)
+            std::time::Duration::from_secs(
+                2 * eth_types::SLOTS_PER_EPOCH * eth_types::SECONDS_PER_SLOT,
+            )
+        } else {
+            std::time::Duration::ZERO
+        };
+        let doppelganger_mon =
+            std::sync::Arc::new(keymanager_api::gate::DoppelgangerGate::new(doppelganger_window));
         let remote_key_mgr = std::sync::Arc::new(RemoteKeyManagerAdapter::new(
             km_composite,
             config.remote_signer_allowed_hosts.clone(),
@@ -1462,6 +1473,7 @@ async fn run_validator(
             config.keymanager_body_limit,
             config.allow_insecure_remote_signer,
             attesting_enabled.clone(),
+            doppelganger_window,
         );
 
         info!(addr = %km_addr, token_path = %token_path.display(), "Keymanager API enabled");

@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod error;
+pub mod gate;
 pub mod handlers;
 pub mod server;
 pub mod traits;

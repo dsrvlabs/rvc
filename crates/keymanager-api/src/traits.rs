@@ -45,12 +45,21 @@ pub trait SlashingProtection: Send + Sync {
 pub trait ValidatorManager: Send + Sync {
     fn add_validator(&self, pubkey: Pubkey, enabled: bool);
     fn remove_validator(&self, pubkey: &Pubkey) -> bool;
+    /// Flip the attesting-enabled state of an existing validator.
+    ///
+    /// No-op if `pubkey` is not tracked (e.g. already deleted).
+    fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool);
 }
 
 /// Triggers doppelganger detection for newly imported keys.
 pub trait DoppelgangerMonitor: Send + Sync {
     fn start_monitoring(&self, pubkey: Pubkey);
     fn stop_monitoring(&self, pubkey: &Pubkey);
+    /// Returns `true` if the doppelganger window for this key has elapsed.
+    ///
+    /// Keys that are not under active monitoring (e.g. existing keys loaded at
+    /// startup) are considered safe and return `true` by default.
+    fn is_doppelganger_safe(&self, pubkey: &Pubkey) -> bool;
 }
 
 #[derive(Debug, Error)]

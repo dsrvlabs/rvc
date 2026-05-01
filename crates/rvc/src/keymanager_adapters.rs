@@ -242,6 +242,12 @@ impl ValidatorManager for ValidatorManagerAdapter {
         }
         removed
     }
+
+    fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) {
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey));
+        self.validator_store.set_enabled(pubkey, enabled);
+        info!(pubkey = %pubkey_hex, enabled, "Validator enabled state updated");
+    }
 }
 
 #[derive(Default)]
@@ -260,6 +266,10 @@ impl DoppelgangerMonitor for DoppelgangerMonitorAdapter {
 
     fn stop_monitoring(&self, pubkey: &Pubkey) {
         info!(pubkey = %format!("0x{}", hex::encode(pubkey)), "Doppelganger monitoring stop requested");
+    }
+
+    fn is_doppelganger_safe(&self, _pubkey: &Pubkey) -> bool {
+        true
     }
 }
 
@@ -852,6 +862,7 @@ mod tests {
             keymanager_api::DEFAULT_BODY_LIMIT,
             true,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            std::time::Duration::ZERO,
         )
     }
 
@@ -966,6 +977,7 @@ mod tests {
             keymanager_api::DEFAULT_BODY_LIMIT,
             true,
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            std::time::Duration::ZERO,
         );
 
         // 1. Import a remote key

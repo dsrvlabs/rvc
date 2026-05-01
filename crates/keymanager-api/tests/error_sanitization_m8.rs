@@ -93,6 +93,7 @@ impl ValidatorManager for NoopValidatorManager {
     fn remove_validator(&self, _: &Pubkey) -> bool {
         false
     }
+    fn set_validator_enabled(&self, _: &Pubkey, _: bool) {}
 }
 
 struct NoopDoppelgangerMonitor;
@@ -100,6 +101,9 @@ struct NoopDoppelgangerMonitor;
 impl DoppelgangerMonitor for NoopDoppelgangerMonitor {
     fn start_monitoring(&self, _: Pubkey) {}
     fn stop_monitoring(&self, _: &Pubkey) {}
+    fn is_doppelganger_safe(&self, _: &Pubkey) -> bool {
+        true
+    }
 }
 
 struct SimpleRemoteKeyManager;
@@ -212,6 +216,7 @@ async fn test_internal_error_sanitized() {
         allow_insecure_remote_signer: true,
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         last_set_attesting_enabled: std::sync::Mutex::new(None),
+        doppelganger_window: std::time::Duration::ZERO,
     });
 
     let slashing_data = r#"{"metadata":{"interchange_format_version":"5","genesis_validators_root":"0x0000000000000000000000000000000000000000000000000000000000000000"},"data":[]}"#;
@@ -262,6 +267,7 @@ async fn test_keystore_import_item_error_sanitized() {
         allow_insecure_remote_signer: true,
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         last_set_attesting_enabled: std::sync::Mutex::new(None),
+        doppelganger_window: std::time::Duration::ZERO,
     });
 
     let body = serde_json::json!({
@@ -314,6 +320,7 @@ async fn test_remote_key_import_item_error_sanitized() {
         allow_insecure_remote_signer: true,
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         last_set_attesting_enabled: std::sync::Mutex::new(None),
+        doppelganger_window: std::time::Duration::ZERO,
     });
 
     let pubkey_str = format!("0x{}", pubkey_hex(3));

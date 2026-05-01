@@ -6,6 +6,21 @@ pub struct KeystoreInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub derivation_path: Option<String>,
     pub readonly: bool,
+    /// Whether this key has passed the post-import doppelganger window.
+    ///
+    /// `false` means the key was recently imported and is still in the
+    /// doppelganger window — attestation is not yet enabled.
+    /// `true` means the window has elapsed (or the key was not imported
+    /// via the API) and the key may attest normally.
+    ///
+    /// Defaults to `true` when deserialising older responses that lack this
+    /// field (backward-compat with pre-M-12 clients).
+    #[serde(default = "default_doppelganger_safe")]
+    pub doppelganger_safe: bool,
+}
+
+fn default_doppelganger_safe() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]

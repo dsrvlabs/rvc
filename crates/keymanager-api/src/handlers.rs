@@ -39,6 +39,11 @@ pub struct AppState {
     pub attesting_enabled: Arc<AtomicBool>,
     /// Last time `set_attesting_enabled` was accepted; used for rate limiting.
     pub last_set_attesting_enabled: Mutex<Option<tokio::time::Instant>>,
+    /// Duration of the per-key doppelganger window applied to newly imported
+    /// keys.  Must match the window configured in the [`DoppelgangerMonitor`]
+    /// implementation.  `Duration::ZERO` disables the gate (keys are enabled
+    /// immediately, equivalent to turning off doppelganger detection).
+    pub doppelganger_window: std::time::Duration,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,10 +63,15 @@ pub async fn list_keystores(State(state): State<Arc<AppState>>) -> Json<ListKeys
 
     let data: Vec<KeystoreInfo> = local_keys
         .into_iter()
-        .map(|pk| KeystoreInfo {
-            validating_pubkey: format!("0x{}", hex::encode(pk)),
-            derivation_path: None,
-            readonly: false,
+        .map(|pk| {
+            // M-12: expose whether this key has passed the doppelganger window.
+            let doppelganger_safe = state.doppelganger_monitor.is_doppelganger_safe(&pk);
+            KeystoreInfo {
+                validating_pubkey: format!("0x{}", hex::encode(pk)),
+                derivation_path: None,
+                readonly: false,
+                doppelganger_safe,
+            }
         })
         .collect();
 
@@ -107,8 +117,38 @@ pub async fn import_keystores(
                     status = "imported",
                     "Keystore import result"
                 );
+                // M-12: add the validator as disabled and start doppelganger
+                // monitoring. A background task flips it to attesting-enabled
+                // once the window elapses.
+                //
+                // BEHAVIOR CHANGE (GA release): imported keys are no longer
+                // immediately active. They are held in the doppelganger window
+                // (default 2 epochs ≈ 768 s on mainnet) before attestation is
+                // enabled. Operators who relied on instant activation must
+                // account for this delay.
                 state.validator_manager.add_validator(pubkey, false);
                 state.doppelganger_monitor.start_monitoring(pubkey);
+
+                {
+                    let vm = Arc::clone(&state.validator_manager);
+                    let window = state.doppelganger_window;
+                    let pk_hex = pubkey_hex.clone();
+                    // Capture the deadline NOW (before spawn) so that
+                    // `sleep_until(deadline)` resolves correctly even when the
+                    // tokio mock clock is paused in tests: the deadline is a
+                    // fixed instant, not a relative duration computed at
+                    // first-poll time.
+                    let deadline = tokio::time::Instant::now() + window;
+                    tokio::spawn(async move {
+                        tokio::time::sleep_until(deadline).await;
+                        vm.set_validator_enabled(&pubkey, true);
+                        info!(
+                            pubkey = %TruncatedPubkey::new(&pk_hex),
+                            "Doppelganger window elapsed; enabling validator for attestation"
+                        );
+                    });
+                }
+
                 results.push(ImportKeystoreResult {
                     status: ImportStatus::Imported,
                     message: String::new(),
@@ -815,6 +855,13 @@ mod tests {
                 false
             }
         }
+
+        fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) {
+            let mut validators = self.validators.lock();
+            if let Some((_, e)) = validators.iter_mut().find(|(pk, _)| pk == pubkey) {
+                *e = enabled;
+            }
+        }
     }
 
     struct MockDoppelgangerMonitor {
@@ -837,6 +884,10 @@ mod tests {
             if let Some(pos) = monitored.iter().position(|pk| pk == pubkey) {
                 monitored.remove(pos);
             }
+        }
+
+        fn is_doppelganger_safe(&self, _pubkey: &Pubkey) -> bool {
+            true
         }
     }
 
@@ -1097,6 +1148,7 @@ mod tests {
                 allow_insecure_remote_signer: true,
                 attesting_enabled: Arc::new(AtomicBool::new(true)),
                 last_set_attesting_enabled: std::sync::Mutex::new(None),
+                doppelganger_window: std::time::Duration::ZERO,
             });
             Router::new()
                 .route(
@@ -2236,6 +2288,7 @@ mod tests {
             1024, // 1 KB limit
             true,
             Arc::new(AtomicBool::new(true)),
+            std::time::Duration::ZERO,
         );
 
         let big_body = "x".repeat(2048); // 2 KB > 1 KB limit
@@ -2275,6 +2328,7 @@ mod tests {
             10 * 1024 * 1024, // 10 MB
             true,
             Arc::new(AtomicBool::new(true)),
+            std::time::Duration::ZERO,
         );
 
         let body = serde_json::json!({
@@ -2321,6 +2375,7 @@ mod tests {
             10 * 1024 * 1024,
             true,
             Arc::new(AtomicBool::new(true)),
+            std::time::Duration::ZERO,
         );
 
         let response = server
@@ -2361,6 +2416,7 @@ mod tests {
             10 * 1024 * 1024,
             true,
             Arc::new(AtomicBool::new(true)),
+            std::time::Duration::ZERO,
         );
 
         let response = server
@@ -2401,6 +2457,7 @@ mod tests {
             10 * 1024 * 1024,
             true,
             Arc::new(AtomicBool::new(true)),
+            std::time::Duration::ZERO,
         );
 
         let response = server
@@ -2437,6 +2494,7 @@ mod tests {
             allow_insecure_remote_signer: false,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
+            doppelganger_window: std::time::Duration::ZERO,
         });
 
         let router = Router::new()
@@ -2484,6 +2542,7 @@ mod tests {
             allow_insecure_remote_signer: false,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
+            doppelganger_window: std::time::Duration::ZERO,
         });
 
         let router = Router::new()
@@ -2531,6 +2590,7 @@ mod tests {
             allow_insecure_remote_signer: false,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
+            doppelganger_window: std::time::Duration::ZERO,
         });
 
         let router = Router::new()
@@ -2621,6 +2681,7 @@ mod tests {
             allow_insecure_remote_signer: true,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
+            doppelganger_window: std::time::Duration::ZERO,
         });
         Router::new()
             .route(
@@ -3039,6 +3100,7 @@ mod tests {
             allow_insecure_remote_signer: true,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
+            doppelganger_window: std::time::Duration::ZERO,
         });
         Router::new()
             .route(
@@ -3173,6 +3235,7 @@ mod tests {
             allow_insecure_remote_signer: true,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
+            doppelganger_window: std::time::Duration::ZERO,
         });
         Router::new()
             .route("/rvc/v1/validator/:pubkey/prepare_exit", axum::routing::post(prepare_exit))
@@ -3284,6 +3347,7 @@ mod tests {
             allow_insecure_remote_signer: true,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
+            doppelganger_window: std::time::Duration::ZERO,
         });
 
         let api = Router::new()

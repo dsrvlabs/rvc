@@ -56,12 +56,16 @@ impl ValidatorManager for NoopValidatorManager {
     fn remove_validator(&self, _: &Pubkey) -> bool {
         false
     }
+    fn set_validator_enabled(&self, _: &Pubkey, _: bool) {}
 }
 
 struct NoopDoppelgangerMonitor;
 impl DoppelgangerMonitor for NoopDoppelgangerMonitor {
     fn start_monitoring(&self, _: Pubkey) {}
     fn stop_monitoring(&self, _: &Pubkey) {}
+    fn is_doppelganger_safe(&self, _: &Pubkey) -> bool {
+        true
+    }
 }
 
 struct NoopRemoteKeyManager;
@@ -125,6 +129,7 @@ fn make_state() -> Arc<AppState> {
         allow_insecure_remote_signer: false,
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         last_set_attesting_enabled: Mutex::new(None),
+        doppelganger_window: std::time::Duration::ZERO,
     })
 }
 
