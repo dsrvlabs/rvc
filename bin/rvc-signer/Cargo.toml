@@ -55,6 +55,7 @@ tempfile.workspace = true
 proptest.workspace = true
 rand.workspace = true
 tokio-stream.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 grpc-signer.workspace = true
 crypto.workspace = true
 eth-types.workspace = true

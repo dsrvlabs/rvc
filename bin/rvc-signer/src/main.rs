@@ -4,8 +4,8 @@
 //! This file only handles CLI parsing and wires up the library.
 
 use rvc_signer_bin::{
-    backend, config, insecure_startup, metrics, reload, service, slashing, SignerServiceServer,
-    SignerServiceServerV2,
+    backend, config, insecure_startup, metrics, reload, service, slashing, tls,
+    SignerServiceServer, SignerServiceServerV2,
 };
 #[cfg(feature = "dvt")]
 use rvc_signer_bin::{dvt, PeerSignerServiceServerV2};
@@ -413,10 +413,19 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = resolved.listen_address.parse()?;
 
-    let mut builder = tonic::transport::Server::builder();
+    // ── M-10: hardened server builder (concurrency + timeout limits) ──────────
+    //
+    // `hardened_server_builder()` applies per research/05 §"Recommended values":
+    //   - concurrency_limit_per_connection(32) — Tower-level cap per connection
+    //   - max_concurrent_streams(Some(64))     — H2 SETTINGS frame to clients
+    //   - timeout(Duration::from_secs(10))     — per-request timeout via Tower
+    //
+    // Per-service max_decoding_message_size(1 MiB) is set on each ServiceServer
+    // below (Tonic exposes it only at the service level, not the builder level).
+    let mut builder = tls::server_builder::hardened_server_builder();
 
-    if let Some(ref tls) = tls_config {
-        let server_tls = tls.to_server_tls_config()?;
+    if let Some(ref tls_cfg) = tls_config {
+        let server_tls = tls_cfg.to_server_tls_config()?;
         builder = builder.tls_config(server_tls)?;
         info!("mTLS enabled");
     } else if args.insecure {
@@ -441,14 +450,23 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     info!(address = %addr, "gRPC server listening");
 
+    // 1 MiB per-message decode cap (M-10): blocks memory-pressure via oversized
+    // request bodies.  Signing a BeaconBlock is well under 1 MiB after SSZ
+    // encoding; 1 MiB is a comfortable upper bound per research/05.
+    const MAX_DECODE_BYTES: usize = 1 << 20; // 1 MiB
+
     let router = builder
-        .add_service(SignerServiceServer::new(svc_v1))
-        .add_service(SignerServiceServerV2::new(svc_v2));
+        .add_service(SignerServiceServer::new(svc_v1).max_decoding_message_size(MAX_DECODE_BYTES))
+        .add_service(
+            SignerServiceServerV2::new(svc_v2).max_decoding_message_size(MAX_DECODE_BYTES),
+        );
 
     #[cfg(feature = "dvt")]
     let router = if let Some(peer_svc) = peer_signer_service {
         info!("PeerSignerService v2 registered for DVT");
-        router.add_service(PeerSignerServiceServerV2::new(peer_svc))
+        router.add_service(
+            PeerSignerServiceServerV2::new(peer_svc).max_decoding_message_size(MAX_DECODE_BYTES),
+        )
     } else {
         router
     };
