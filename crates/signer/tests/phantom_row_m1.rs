@@ -54,7 +54,7 @@ const GVR: Root = [0xaa; 32];
 /// signing call fails.  After the fix, the slashing-DB must remain empty.
 ///
 /// Before the fix this test fails because the phantom row IS committed.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_signer_failure_does_not_commit_row_attestation() {
     // Signer with no keys — signing will fail with KeyNotFound.
     let empty_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(KeyManager::new())));
@@ -82,7 +82,7 @@ async fn test_signer_failure_does_not_commit_row_attestation() {
 }
 
 /// M-1 regression: same for `sign_block`.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_signer_failure_does_not_commit_row_block() {
     let empty_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
@@ -113,7 +113,7 @@ async fn test_signer_failure_does_not_commit_row_block() {
 /// 1. First sign call fails (signer error) — must NOT commit a row.
 /// 2. Second sign call with a different signing root must succeed (not be
 ///    rejected as DoubleVote due to a phantom row from step 1).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_retry_after_signer_failure_succeeds() {
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();
@@ -159,7 +159,7 @@ async fn test_retry_after_signer_failure_succeeds() {
 
 /// Happy path: a successful sign must persist the row so a subsequent
 /// conflicting sign is rejected as DoubleVote.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_successful_sign_commits_row_and_double_vote_rejected() {
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();
@@ -201,7 +201,7 @@ async fn test_successful_sign_commits_row_and_double_vote_rejected() {
 }
 
 /// Same happy-path test for `sign_block`.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_successful_sign_block_commits_row_and_double_proposal_rejected() {
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();

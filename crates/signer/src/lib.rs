@@ -209,72 +209,85 @@ impl SignerService {
         // async sign call to completion without crossing `.await` on the calling
         // task.  On signer failure `staged.discard()` rolls back the SQLite
         // transaction so no phantom row is committed (M-1 fix, architecture A15).
-        let outcome = tokio::task::spawn_blocking(move || -> Result<Signature, SignerError> {
-            let staged = db
-                .stage_attestation(
-                    "local-vc",
-                    &pubkey_hex_clone,
-                    source_epoch,
-                    target_epoch,
-                    Some(signing_root_hex),
-                    &gvr,
-                )
-                .map_err(|e| {
-                    error!(
-                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                        slot = slot_for_log,
-                        source_epoch = source_epoch,
-                        target_epoch = target_epoch,
-                        rejection_reason = %e,
-                        "Slashing protection rejected attestation"
-                    );
-                    RVC_SLASHING_PROTECTION_CHECKS_TOTAL
-                        .with_label_values(&[slashing_result::BLOCKED])
-                        .inc();
-                    RVC_ATTESTATIONS_TOTAL.with_label_values(&["failed"]).inc();
-                    SignerError::SlashingProtectionBlocked(e)
-                })?;
-
-            RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
-
-            let sign_result = handle.block_on(signer.sign(&signing_root, &pubkey_bytes));
-
-            match sign_result {
-                Ok(sig) => {
-                    if let Err(e) = staged.commit() {
+        let inner_result =
+            tokio::task::spawn_blocking(move || -> Result<Signature, SignerError> {
+                let staged = db
+                    .stage_attestation(
+                        "local-vc",
+                        &pubkey_hex_clone,
+                        source_epoch,
+                        target_epoch,
+                        Some(signing_root_hex),
+                        &gvr,
+                    )
+                    .map_err(|e| {
                         error!(
                             pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
                             slot = slot_for_log,
-                            error = %e,
-                            "Failed to commit attestation to slashing DB after successful sign"
+                            source_epoch = source_epoch,
+                            target_epoch = target_epoch,
+                            rejection_reason = %e,
+                            "Slashing protection rejected attestation"
                         );
-                        return Err(SignerError::SlashingProtectionBlocked(e));
+                        RVC_SLASHING_PROTECTION_CHECKS_TOTAL
+                            .with_label_values(&[slashing_result::BLOCKED])
+                            .inc();
+                        RVC_ATTESTATIONS_TOTAL.with_label_values(&["failed"]).inc();
+                        SignerError::SlashingProtectionBlocked(e)
+                    })?;
+
+                RVC_SLASHING_PROTECTION_CHECKS_TOTAL
+                    .with_label_values(&[slashing_result::SAFE])
+                    .inc();
+
+                let sign_result = handle.block_on(signer.sign(&signing_root, &pubkey_bytes));
+
+                match sign_result {
+                    Ok(sig) => {
+                        if let Err(e) = staged.commit() {
+                            error!(
+                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                                slot = slot_for_log,
+                                error = %e,
+                                "Failed to commit attestation to slashing DB after successful sign"
+                            );
+                            return Err(SignerError::SlashingProtectionBlocked(e));
+                        }
+                        Ok(sig)
                     }
-                    Ok(sig)
+                    Err(e) => {
+                        // Signer failed — discard the staged transaction so no phantom row
+                        // remains in the DB (M-1 fix).
+                        staged.discard();
+                        warn!(
+                            pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                            error = %e,
+                            signing_type = "attestation",
+                            "Signing failed; staged slashing-DB row discarded (no phantom row)"
+                        );
+                        Err(e.into())
+                    }
                 }
-                Err(e) => {
-                    // Signer failed — discard the staged transaction so no phantom row
-                    // remains in the DB (M-1 fix).
-                    staged.discard();
-                    warn!(
-                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                        error = %e,
-                        signing_type = "attestation",
-                        "Signing failed; staged slashing-DB row discarded (no phantom row)"
-                    );
-                    Err(e.into())
-                }
+            })
+            .await
+            .map_err(|join_err| {
+                error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %join_err,
+                    "sign_attestation blocking task panicked"
+                );
+                SignerError::SigningFailed(format!("sign_attestation task panicked: {join_err}"))
+            })?;
+
+        // Now in async context — `Span::current()` refers to the
+        // `#[tracing::instrument]` span declared on this method, so recording
+        // `rvc.slashing.result` actually lands on the instrument span.
+        let outcome = inner_result.map_err(|e| {
+            if matches!(e, SignerError::SlashingProtectionBlocked(_)) {
+                tracing::Span::current().record("rvc.slashing.result", "blocked");
             }
-        })
-        .await
-        .map_err(|join_err| {
-            error!(
-                pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                error = %join_err,
-                "sign_attestation blocking task panicked"
-            );
-            SignerError::SigningFailed(format!("sign_attestation task panicked: {join_err}"))
-        })??;
+            e
+        })?;
 
         tracing::Span::current().record("rvc.slashing.result", "safe");
         let duration = start.elapsed().as_secs_f64();
@@ -336,61 +349,71 @@ impl SignerService {
         let pubkey_hex_clone = pubkey_hex.clone();
         let gvr = *genesis_validators_root;
 
-        let outcome = tokio::task::spawn_blocking(move || -> Result<Signature, SignerError> {
-            let staged = db
-                .stage_block("local-vc", &pubkey_hex_clone, slot, Some(signing_root_hex), &gvr)
-                .map_err(|e| {
-                    error!(
-                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                        slot = slot,
-                        rejection_reason = %e,
-                        "Slashing protection rejected block proposal"
-                    );
-                    RVC_SLASHING_PROTECTION_CHECKS_TOTAL
-                        .with_label_values(&[slashing_result::BLOCKED])
-                        .inc();
-                    SignerError::SlashingProtectionBlocked(e)
-                })?;
-
-            RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
-
-            let sign_result = handle.block_on(signer.sign(&signing_root, &pubkey_bytes));
-
-            match sign_result {
-                Ok(sig) => {
-                    if let Err(e) = staged.commit() {
+        let inner_result =
+            tokio::task::spawn_blocking(move || -> Result<Signature, SignerError> {
+                let staged = db
+                    .stage_block("local-vc", &pubkey_hex_clone, slot, Some(signing_root_hex), &gvr)
+                    .map_err(|e| {
                         error!(
                             pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
                             slot = slot,
-                            error = %e,
-                            "Failed to commit block to slashing DB after successful sign"
+                            rejection_reason = %e,
+                            "Slashing protection rejected block proposal"
                         );
-                        return Err(SignerError::SlashingProtectionBlocked(e));
+                        RVC_SLASHING_PROTECTION_CHECKS_TOTAL
+                            .with_label_values(&[slashing_result::BLOCKED])
+                            .inc();
+                        SignerError::SlashingProtectionBlocked(e)
+                    })?;
+
+                RVC_SLASHING_PROTECTION_CHECKS_TOTAL
+                    .with_label_values(&[slashing_result::SAFE])
+                    .inc();
+
+                let sign_result = handle.block_on(signer.sign(&signing_root, &pubkey_bytes));
+
+                match sign_result {
+                    Ok(sig) => {
+                        if let Err(e) = staged.commit() {
+                            error!(
+                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                                slot = slot,
+                                error = %e,
+                                "Failed to commit block to slashing DB after successful sign"
+                            );
+                            return Err(SignerError::SlashingProtectionBlocked(e));
+                        }
+                        Ok(sig)
                     }
-                    Ok(sig)
+                    Err(e) => {
+                        // Signer failed — discard the staged transaction (M-1 fix).
+                        staged.discard();
+                        warn!(
+                            pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                            error = %e,
+                            signing_type = "block",
+                            "Signing failed; staged slashing-DB row discarded (no phantom row)"
+                        );
+                        Err(e.into())
+                    }
                 }
-                Err(e) => {
-                    // Signer failed — discard the staged transaction (M-1 fix).
-                    staged.discard();
-                    warn!(
-                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                        error = %e,
-                        signing_type = "block",
-                        "Signing failed; staged slashing-DB row discarded (no phantom row)"
-                    );
-                    Err(e.into())
-                }
+            })
+            .await
+            .map_err(|join_err| {
+                error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %join_err,
+                    "sign_block blocking task panicked"
+                );
+                SignerError::SigningFailed(format!("sign_block task panicked: {join_err}"))
+            })?;
+
+        let outcome = inner_result.map_err(|e| {
+            if matches!(e, SignerError::SlashingProtectionBlocked(_)) {
+                tracing::Span::current().record("rvc.slashing.result", "blocked");
             }
-        })
-        .await
-        .map_err(|join_err| {
-            error!(
-                pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                error = %join_err,
-                "sign_block blocking task panicked"
-            );
-            SignerError::SigningFailed(format!("sign_block task panicked: {join_err}"))
-        })??;
+            e
+        })?;
 
         tracing::Span::current().record("rvc.slashing.result", "safe");
         let duration = start.elapsed().as_secs_f64();
