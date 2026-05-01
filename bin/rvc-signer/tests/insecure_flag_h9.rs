@@ -7,9 +7,15 @@
 //! - Loopback + env var → silent `Ok` (fully opted-in).
 
 use std::net::SocketAddr;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crypto::InsecureMode;
 use rvc_signer_bin::insecure_startup::check_insecure_startup;
+
+fn env_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// `--insecure` is false → `check_insecure_startup` is a no-op regardless of
 /// bind address or env var.
@@ -27,6 +33,7 @@ fn test_no_insecure_flag_is_always_ok() {
 /// `test_refuse_non_loopback_without_env_var`.
 #[test]
 fn test_refuse_non_loopback_without_env_var() {
+    let _lock = env_lock();
     let var = "RVC_SIGNER_ALLOW_INSECURE_H9_T1";
     // Temporarily shadow the real env var name inside the gate by providing a
     // unique var; we call the helper with a custom var via the lower-level gate
@@ -53,6 +60,7 @@ fn test_refuse_non_loopback_without_env_var() {
 /// `test_warn_non_loopback_with_env_var_warn_mode`.
 #[test]
 fn test_warn_non_loopback_with_env_var_warn_mode() {
+    let _lock = env_lock();
     let _guard = EnvGuard::set("RVC_SIGNER_ALLOW_INSECURE", "true");
 
     let addr: SocketAddr = "0.0.0.0:50051".parse().unwrap();
@@ -66,6 +74,7 @@ fn test_warn_non_loopback_with_env_var_warn_mode() {
 /// `test_loopback_bind_with_env_var_succeeds`.
 #[test]
 fn test_loopback_bind_with_env_var_succeeds() {
+    let _lock = env_lock();
     let _guard = EnvGuard::set("RVC_SIGNER_ALLOW_INSECURE", "true");
 
     let addr: SocketAddr = "127.0.0.1:50051".parse().unwrap();
@@ -77,6 +86,7 @@ fn test_loopback_bind_with_env_var_succeeds() {
 /// BOTH conditions (env var AND loopback) must be satisfied.
 #[test]
 fn test_refuse_loopback_without_env_var() {
+    let _lock = env_lock();
     let _guard = EnvGuard::remove("RVC_SIGNER_ALLOW_INSECURE");
 
     let addr: SocketAddr = "127.0.0.1:50051".parse().unwrap();
@@ -88,6 +98,7 @@ fn test_refuse_loopback_without_env_var() {
 /// Loopback is required even when the env var is present.
 #[test]
 fn test_refuse_non_loopback_with_env_var() {
+    let _lock = env_lock();
     let _guard = EnvGuard::set("RVC_SIGNER_ALLOW_INSECURE", "true");
 
     let addr: SocketAddr = "0.0.0.0:50051".parse().unwrap();
@@ -98,6 +109,7 @@ fn test_refuse_non_loopback_with_env_var() {
 /// IPv6 loopback (`::1`) + env var + `Warn` mode → `Ok`.
 #[test]
 fn test_ipv6_loopback_with_env_var_warn_mode() {
+    let _lock = env_lock();
     let _guard = EnvGuard::set("RVC_SIGNER_ALLOW_INSECURE", "true");
 
     let addr: SocketAddr = "[::1]:50051".parse().unwrap();
