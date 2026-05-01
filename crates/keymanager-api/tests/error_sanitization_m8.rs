@@ -1,0 +1,334 @@
+//! Integration tests for M-8: keymanager-api error sanitization.
+//!
+//! Verifies that verbose internal error details are never echoed to API clients.
+//! Full error chains are logged server-side (with a request ID); the client only
+//! receives a stable, generic message.
+
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+use axum::routing::{get, post};
+use axum::Router;
+use http_body_util::BodyExt;
+use tower::ServiceExt;
+
+use rvc_keymanager_api::error::ApiError;
+use rvc_keymanager_api::handlers::{
+    import_keystores, import_remote_keys, list_keystores, AppState,
+};
+use rvc_keymanager_api::traits::{
+    DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ImportKeystoreError,
+    ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection,
+    ValidatorConfigManager, ValidatorManager,
+};
+
+// ── Verbose error string that must never reach the client ──────────────────
+const VERBOSE_ERROR: &str =
+    "INTERNAL_SECRET: file=/var/secrets/keystore.db syscall=open errno=ENOMEM detail=heap_alloc_failed_0xdeadbeef";
+
+// ── Minimal mock implementations ──────────────────────────────────────────
+
+struct SimpleKeystoreManager;
+
+impl KeystoreManager for SimpleKeystoreManager {
+    fn list_keys(&self) -> Vec<Pubkey> {
+        vec![]
+    }
+    fn has_key(&self, _: &Pubkey) -> bool {
+        false
+    }
+    fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
+        Ok([1u8; 48])
+    }
+    fn delete_keystore(&self, _: &Pubkey) -> Result<bool, DeleteKeystoreError> {
+        Ok(false)
+    }
+}
+
+/// Always returns a verbose I/O error from `import_keystore`.
+struct VerboseFailingKeystoreManager;
+
+impl KeystoreManager for VerboseFailingKeystoreManager {
+    fn list_keys(&self) -> Vec<Pubkey> {
+        vec![]
+    }
+    fn has_key(&self, _: &Pubkey) -> bool {
+        false
+    }
+    fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
+        Err(ImportKeystoreError::Io(VERBOSE_ERROR.to_string()))
+    }
+    fn delete_keystore(&self, _: &Pubkey) -> Result<bool, DeleteKeystoreError> {
+        Ok(false)
+    }
+}
+
+struct SimpleSlashingProtection;
+
+impl SlashingProtection for SimpleSlashingProtection {
+    fn import_interchange(&self, _: &str) -> Result<(), String> {
+        Ok(())
+    }
+    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, String> {
+        Ok(r#"{"metadata":{"interchange_format_version":"5","genesis_validators_root":"0x0000000000000000000000000000000000000000000000000000000000000000"},"data":[]}"#.to_string())
+    }
+}
+
+/// Always returns a verbose error from `import_interchange`.
+struct VerboseFailingSlashingProtection;
+
+impl SlashingProtection for VerboseFailingSlashingProtection {
+    fn import_interchange(&self, _: &str) -> Result<(), String> {
+        Err(VERBOSE_ERROR.to_string())
+    }
+    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, String> {
+        Err(VERBOSE_ERROR.to_string())
+    }
+}
+
+struct NoopValidatorManager;
+
+impl ValidatorManager for NoopValidatorManager {
+    fn add_validator(&self, _: Pubkey, _: bool) {}
+    fn remove_validator(&self, _: &Pubkey) -> bool {
+        false
+    }
+}
+
+struct NoopDoppelgangerMonitor;
+
+impl DoppelgangerMonitor for NoopDoppelgangerMonitor {
+    fn start_monitoring(&self, _: Pubkey) {}
+    fn stop_monitoring(&self, _: &Pubkey) {}
+}
+
+struct SimpleRemoteKeyManager;
+
+impl RemoteKeyManager for SimpleRemoteKeyManager {
+    fn list_remote_keys(&self) -> Vec<(Pubkey, String)> {
+        vec![]
+    }
+    fn has_remote_key(&self, _: &Pubkey) -> bool {
+        false
+    }
+    fn import_remote_key(&self, _: Pubkey, _: String) -> Result<(), ImportRemoteKeyError> {
+        Ok(())
+    }
+    fn delete_remote_key(&self, _: &Pubkey) -> Result<bool, DeleteRemoteKeyError> {
+        Ok(false)
+    }
+}
+
+/// Always returns a verbose `Other` error from `import_remote_key`.
+struct VerboseFailingRemoteKeyManager;
+
+impl RemoteKeyManager for VerboseFailingRemoteKeyManager {
+    fn list_remote_keys(&self) -> Vec<(Pubkey, String)> {
+        vec![]
+    }
+    fn has_remote_key(&self, _: &Pubkey) -> bool {
+        false
+    }
+    fn import_remote_key(&self, _: Pubkey, _: String) -> Result<(), ImportRemoteKeyError> {
+        Err(ImportRemoteKeyError::Other(VERBOSE_ERROR.to_string()))
+    }
+    fn delete_remote_key(&self, _: &Pubkey) -> Result<bool, DeleteRemoteKeyError> {
+        Ok(false)
+    }
+}
+
+struct NoopConfigManager;
+
+impl ValidatorConfigManager for NoopConfigManager {
+    fn get_fee_recipient(&self, _: &Pubkey) -> Result<[u8; 20], ApiError> {
+        Err(ApiError::NotFound("not found".into()))
+    }
+    fn set_fee_recipient(&self, _: &Pubkey, _: [u8; 20]) -> Result<(), ApiError> {
+        Ok(())
+    }
+    fn delete_fee_recipient(&self, _: &Pubkey) -> Result<(), ApiError> {
+        Ok(())
+    }
+    fn get_gas_limit(&self, _: &Pubkey) -> Result<u64, ApiError> {
+        Err(ApiError::NotFound("not found".into()))
+    }
+    fn set_gas_limit(&self, _: &Pubkey, _: u64) -> Result<(), ApiError> {
+        Ok(())
+    }
+    fn delete_gas_limit(&self, _: &Pubkey) -> Result<(), ApiError> {
+        Ok(())
+    }
+    fn get_graffiti(&self, _: &Pubkey) -> Result<String, ApiError> {
+        Ok(String::new())
+    }
+    fn set_graffiti(&self, _: &Pubkey, _: &str) -> Result<(), ApiError> {
+        Ok(())
+    }
+    fn delete_graffiti(&self, _: &Pubkey) -> Result<(), ApiError> {
+        Ok(())
+    }
+}
+
+// ── Test helpers ───────────────────────────────────────────────────────────
+
+fn pubkey_hex(seed: u8) -> String {
+    hex::encode([seed; 48])
+}
+
+fn keystore_json(seed: u8) -> String {
+    serde_json::json!({ "pubkey": pubkey_hex(seed) }).to_string()
+}
+
+fn make_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/eth/v1/keystores", get(list_keystores).post(import_keystores))
+        .route("/eth/v1/remotekeys", post(import_remote_keys))
+        .with_state(state)
+}
+
+fn post_request(uri: &str, body: String) -> axum::http::Request<axum::body::Body> {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+// ── Spot 1: slashing-protection import failure ─────────────────────────────
+
+/// Spot 1 — when slashing-protection import fails, the HTTP 500 body must NOT
+/// contain the verbose internal error string; only a generic message is sent.
+#[tokio::test]
+async fn test_internal_error_sanitized() {
+    let state = Arc::new(AppState {
+        keystore_manager: Arc::new(SimpleKeystoreManager),
+        slashing_protection: Arc::new(VerboseFailingSlashingProtection),
+        validator_manager: Arc::new(NoopValidatorManager),
+        doppelganger_monitor: Arc::new(NoopDoppelgangerMonitor),
+        remote_key_manager: Arc::new(SimpleRemoteKeyManager),
+        config_manager: Arc::new(NoopConfigManager),
+        exit_manager: None,
+        allow_insecure_remote_signer: true,
+        attesting_enabled: Arc::new(AtomicBool::new(true)),
+    });
+
+    let slashing_data = r#"{"metadata":{"interchange_format_version":"5","genesis_validators_root":"0x0000000000000000000000000000000000000000000000000000000000000000"},"data":[]}"#;
+    let body = serde_json::json!({
+        "keystores": [keystore_json(1)],
+        "passwords": ["pass"],
+        "slashing_protection": slashing_data
+    })
+    .to_string();
+
+    let response =
+        make_router(state).oneshot(post_request("/eth/v1/keystores", body)).await.unwrap();
+
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        "expected 500 when slashing import fails"
+    );
+
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let msg = json["message"].as_str().unwrap_or("");
+
+    assert!(
+        !msg.contains(VERBOSE_ERROR),
+        "spot 1: verbose internal error was leaked to API client — message: {msg}"
+    );
+    assert!(
+        msg.contains("internal error"),
+        "spot 1: expected a generic 'internal error' message, got: {msg}"
+    );
+}
+
+// ── Spot 2: keystore import per-item error ─────────────────────────────────
+
+/// Spot 2 — when a single keystore import fails with an internal error, the
+/// per-item `message` in the 200 response must NOT contain verbose internals.
+#[tokio::test]
+async fn test_keystore_import_item_error_sanitized() {
+    let state = Arc::new(AppState {
+        keystore_manager: Arc::new(VerboseFailingKeystoreManager),
+        slashing_protection: Arc::new(SimpleSlashingProtection),
+        validator_manager: Arc::new(NoopValidatorManager),
+        doppelganger_monitor: Arc::new(NoopDoppelgangerMonitor),
+        remote_key_manager: Arc::new(SimpleRemoteKeyManager),
+        config_manager: Arc::new(NoopConfigManager),
+        exit_manager: None,
+        allow_insecure_remote_signer: true,
+        attesting_enabled: Arc::new(AtomicBool::new(true)),
+    });
+
+    let body = serde_json::json!({
+        "keystores": [keystore_json(2)],
+        "passwords": ["pass"]
+    })
+    .to_string();
+
+    let response =
+        make_router(state).oneshot(post_request("/eth/v1/keystores", body)).await.unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let msg = json["data"][0]["message"].as_str().unwrap_or("");
+
+    assert!(
+        !msg.contains(VERBOSE_ERROR),
+        "spot 2: verbose internal error was leaked to API client — message: {msg}"
+    );
+    assert!(
+        !msg.is_empty(),
+        "spot 2: error result must have a non-empty message for clients to surface"
+    );
+}
+
+// ── Spot 3: remote-key import per-item error ───────────────────────────────
+
+/// Spot 3 — when a remote-key import fails with an internal `Other` error, the
+/// per-item `message` in the 200 response must NOT contain verbose internals.
+#[tokio::test]
+async fn test_remote_key_import_item_error_sanitized() {
+    let state = Arc::new(AppState {
+        keystore_manager: Arc::new(SimpleKeystoreManager),
+        slashing_protection: Arc::new(SimpleSlashingProtection),
+        validator_manager: Arc::new(NoopValidatorManager),
+        doppelganger_monitor: Arc::new(NoopDoppelgangerMonitor),
+        remote_key_manager: Arc::new(VerboseFailingRemoteKeyManager),
+        config_manager: Arc::new(NoopConfigManager),
+        exit_manager: None,
+        allow_insecure_remote_signer: true,
+        attesting_enabled: Arc::new(AtomicBool::new(true)),
+    });
+
+    let pubkey_str = format!("0x{}", pubkey_hex(3));
+    let body = serde_json::json!({
+        "remote_keys": [{
+            "pubkey": pubkey_str,
+            "url": "https://signer.example.com"
+        }]
+    })
+    .to_string();
+
+    let response =
+        make_router(state).oneshot(post_request("/eth/v1/remotekeys", body)).await.unwrap();
+
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let msg = json["data"][0]["message"].as_str().unwrap_or("");
+
+    assert!(
+        !msg.contains(VERBOSE_ERROR),
+        "spot 3: verbose internal error was leaked to API client — message: {msg}"
+    );
+    assert!(
+        !msg.is_empty(),
+        "spot 3: error result must have a non-empty message for clients to surface"
+    );
+}

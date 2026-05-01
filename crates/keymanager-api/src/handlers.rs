@@ -6,7 +6,8 @@ use axum::http::StatusCode;
 use axum::Json;
 use crypto::logging::{RedactedUrl, TruncatedPubkey};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::traits::{
@@ -89,7 +90,7 @@ pub async fn import_keystores(
     // This prevents a window where signing keys exist without slashing records.
     if let Some(ref slashing_json) = request.slashing_protection {
         if let Err(e) = state.slashing_protection.import_interchange(slashing_json) {
-            return Err(ApiError::Internal(format!("failed to import slashing protection: {e}")));
+            return Err(sanitize_internal(e, "slashing protection import failed"));
         }
     }
 
@@ -119,10 +120,9 @@ pub async fn import_keystores(
                 });
             }
             Err(e) => {
-                warn!(status = "error", error = %e, "Keystore import result");
                 results.push(ImportKeystoreResult {
                     status: ImportStatus::Error,
-                    message: e.to_string(),
+                    message: sanitize_item_err(e, "keystore import failed"),
                 });
             }
         }
@@ -299,15 +299,9 @@ pub async fn import_remote_keys(
                         });
                     }
                     Err(e) => {
-                        warn!(
-                            pubkey = %TruncatedPubkey::new(&key_import.pubkey),
-                            status = "error",
-                            error = %e,
-                            "Remote key import result"
-                        );
                         results.push(ImportRemoteKeyResult {
                             status: ImportRemoteKeyStatus::Error,
-                            message: e.to_string(),
+                            message: sanitize_item_err(e, "remote key import failed"),
                         });
                     }
                 }
@@ -559,6 +553,22 @@ pub async fn prepare_exit(
     let signed_exit = exit_manager.sign_voluntary_exit(&pubkey, epoch).await?;
 
     Ok(Json(VoluntaryExitResponse { data: signed_exit }))
+}
+
+/// Logs `err` at `error!` level with a fresh request ID and returns a generic
+/// `ApiError::Internal` whose message is safe to send to API clients.
+fn sanitize_internal<E: std::fmt::Display>(err: E, ctx: &str) -> ApiError {
+    let req_id = Uuid::new_v4();
+    error!(request_id = %req_id, error = %err, "{ctx}");
+    ApiError::Internal(format!("internal error (request_id={req_id})"))
+}
+
+/// Logs `err` at `error!` level with a fresh request ID and returns a generic
+/// string suitable for the per-item `message` field in bulk-operation responses.
+fn sanitize_item_err<E: std::fmt::Display>(err: E, ctx: &str) -> String {
+    let req_id = Uuid::new_v4();
+    error!(request_id = %req_id, error = %err, "{ctx}");
+    format!("key error (request_id={req_id})")
 }
 
 fn parse_pubkey(s: &str) -> Result<Pubkey, String> {
