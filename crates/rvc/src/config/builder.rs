@@ -156,13 +156,17 @@ impl ServiceBuilder {
         &self,
         beacon: Arc<BeaconClient>,
         slashing_db: Arc<SlashingDb>,
-    ) -> DoppelgangerService {
-        let genesis_time = self.config.effective_genesis_time().unwrap_or(0);
+    ) -> Result<DoppelgangerService, ConfigError> {
+        // M-7 (ISSUE-3.6 review): propagate the genesis_time error rather than
+        // silently defaulting to 0.  A genesis_time of 0 would compute
+        // current_epoch ≈ now_unix / 384 (meaninglessly large) and silently
+        // disable doppelganger monitoring for misconfigured custom networks.
+        let genesis_time = self.config.effective_genesis_time()?;
         let liveness_checker = Arc::new(BeaconLivenessAdapter::new(beacon));
         let slashing_reader = Arc::new(SlashingDbReaderAdapter::new(slashing_db));
         let service = DoppelgangerService::new(liveness_checker, slashing_reader, genesis_time);
         info!(genesis_time, "Created doppelganger detection service");
-        service
+        Ok(service)
     }
 
     pub fn build_key_manager(&self) -> Result<Arc<KeyManager>, ConfigError> {
@@ -454,7 +458,7 @@ impl ServiceBuilder {
         let duty_tracker = self.build_duty_tracker(beacon.clone(), validator_indices);
 
         let doppelganger_service = if self.config.doppelganger_detection {
-            Some(self.build_doppelganger_service(beacon_client.clone(), slashing_db.clone()))
+            Some(self.build_doppelganger_service(beacon_client.clone(), slashing_db.clone())?)
         } else {
             None
         };
@@ -708,7 +712,7 @@ mod tests {
         let builder = ServiceBuilder::new(config);
         let beacon = builder.build_beacon().unwrap();
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let _service = builder.build_doppelganger_service(beacon, slashing_db);
+        let _service = builder.build_doppelganger_service(beacon, slashing_db).unwrap();
     }
 
     #[tokio::test]

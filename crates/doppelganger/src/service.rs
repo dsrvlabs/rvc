@@ -62,11 +62,18 @@ impl DoppelgangerService {
         self
     }
 
-    /// Override the clock anchor — intended for testing.
+    /// Override the clock anchor — TEST-ONLY (do not call from production).
     ///
     /// Replaces the captured `service_start_instant` and `start_unix_time` with
     /// the supplied values so that `current_epoch()` can be driven with
     /// deterministic, controlled time values.
+    ///
+    /// **Safety note:** `service_start_instant` MUST be in the past relative
+    /// to the time `current_epoch()` will be called.  A future `Instant` will
+    /// panic inside `current_epoch()` via `Instant::elapsed()` on stable Rust.
+    /// We accept this contract rather than gating the function behind a
+    /// `cfg(test)` flag because the function is required by integration tests
+    /// in `tests/clock_m7.rs` which are compiled as a separate crate.
     pub fn with_start_time(mut self, service_start_instant: Instant, start_unix_time: u64) -> Self {
         self.service_start_instant = service_start_instant;
         self.start_unix_time = start_unix_time;
@@ -113,7 +120,16 @@ impl DoppelgangerService {
             let last_epoch = self.slashing_db.last_signed_attestation_epoch(pubkey)?;
 
             let status = match last_epoch {
-                Some(epoch) if current_epoch.saturating_sub(epoch) <= self.monitoring_epochs => {
+                // Guard `current_epoch > self.monitoring_epochs` prevents the
+                // pre-genesis-clock-skew bypass (M-7 review SF-1): if
+                // `start_unix_time < genesis_time`, `current_epoch()` collapses
+                // to 0, and `0.saturating_sub(N) = 0 <= monitoring_epochs`
+                // would otherwise mark every validator with any history Safe
+                // without completing the monitoring window.
+                Some(epoch)
+                    if current_epoch > self.monitoring_epochs
+                        && current_epoch.saturating_sub(epoch) <= self.monitoring_epochs =>
+                {
                     info!(
                         pubkey = %TruncatedPubkey::new(pubkey),
                         last_epoch = epoch,
@@ -811,14 +827,22 @@ mod tests {
     }
 
     #[test]
-    fn test_check_validators_epoch_zero_with_history() {
-        // Current epoch 0, signed at epoch 0 => 0-0=0 <= 2, safe
+    fn test_check_validators_epoch_zero_with_history_is_not_safe() {
+        // M-7 review SF-1: epoch 0 must NEVER mark a validator Safe via the
+        // restart-skip arm. If start_unix_time < genesis_time, current_epoch()
+        // collapses to 0 and the old condition `0.saturating_sub(N) = 0 <= 2`
+        // would have skipped monitoring for any validator with any history.
+        // The new guard `current_epoch > monitoring_epochs` blocks that path.
         let slashing_db = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", Some(0)));
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
         let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let result = service.check_validators(&[pk("0xpk1")], 0).expect("should succeed");
-        assert_eq!(result[0].1, DoppelgangerStatus::Safe);
+        assert_eq!(
+            result[0].1,
+            DoppelgangerStatus::DetectionInProgress,
+            "epoch 0 must require monitoring even with history (pre-genesis-skew guard)"
+        );
     }
 
     // -- DoppelgangerStatus tests --

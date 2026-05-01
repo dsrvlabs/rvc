@@ -19,7 +19,6 @@ use rvc::keymanager_adapters::{
 };
 use rvc::startup;
 use rvc::DutyTrackerServer;
-use timing::SlotClock;
 use tonic::transport::Server;
 use tracing::{error, info, warn};
 
@@ -1245,25 +1244,16 @@ async fn run_validator(
 
         if !validator_index_map.is_empty() {
             let doppelganger_service =
-                builder.build_doppelganger_service(beacon_client.clone(), slashing_db.clone());
+                builder.build_doppelganger_service(beacon_client.clone(), slashing_db.clone())?;
 
             let pubkeys: Vec<String> = pubkey_map.read().keys().cloned().collect();
 
-            let slot_clock = match builder.build_slot_clock() {
-                Ok(clock) => clock,
-                Err(e) => {
-                    error!("Failed to create slot clock: {}", e);
-                    return Err(e.into());
-                }
-            };
-
-            let current_epoch = match slot_clock.current_slot() {
-                Ok(slot) => slot / timing::SLOTS_PER_EPOCH,
-                Err(e) => {
-                    error!(error = %e, "Cannot determine current epoch; refusing to skip doppelganger detection");
-                    return Err(anyhow::anyhow!("slot clock failure during doppelganger check"));
-                }
-            };
+            // M-7 (ISSUE-3.6): use the doppelganger service's monotonic clock,
+            // not the wall-clock slot_clock. The slot clock is wall-clock-derived
+            // and an NTP step can advance current_epoch enough to compress the
+            // doppelganger monitoring window. doppelganger_service.current_epoch()
+            // is anchored on a monotonic Instant captured at startup.
+            let current_epoch = doppelganger_service.current_epoch();
 
             if current_epoch > 0 {
                 match startup::run_doppelganger_detection(
