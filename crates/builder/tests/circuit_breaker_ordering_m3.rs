@@ -9,19 +9,22 @@
 // *unfixed* Relaxed code on x86. The semantic bug (stale reads) would manifest
 // on ARM/RISC-V weak-memory-order architectures.
 //
-// The `Barrier` used below internally relies on `Mutex`/`Condvar`, which
-// establish a happens-before edge through the barrier rendezvous. After the
-// writer passes `barrier.wait()`, any subsequent `Acquire` load on the reader
-// side is guaranteed — by the C++ / Rust memory model — to observe all stores
-// the writer performed before its `Release` (or stronger) operation.
+// The `Barrier` used below internally relies on `Mutex`/`Condvar`. The
+// pthread_mutex_lock/unlock implementations these wrap emit a full memory
+// fence (dmb ish on ARM, MFENCE-equivalent on x86) at every wait/release.
+// That fence drains the writer's store buffer and makes its prior atomic
+// stores visible to the reader — independently of whether a per-atomic
+// release-acquire chain has been formed (the barrier mutex is a different
+// object from the counters, so a strict C++/Rust memory-model release-
+// acquire pair would not technically chain through it; the fence is what
+// actually saves us).
 //
-// With `AcqRel` on `fetch_add` (writer) and `Acquire` on `load` (reader), the
-// pair forms a release-acquire chain:
+// In addition, switching the counter atomics to `AcqRel`/`Acquire`/`Release`
+// (rather than `Relaxed`) is what enforces visibility on ARM in the absence
+// of the barrier — i.e. in real production use where there is no rendezvous.
+// The barrier here is a test scaffolding device; the ordering upgrade is the
+// production fix.
 //
-//   writer:  record_miss [AcqRel fetch_add] → barrier.wait()
-//   reader:  barrier.wait() → is_tripped [Acquire load]
-//
-// This guarantees the reader sees the writer's mutation on **all** platforms.
 // A `loom`-based test would provide exhaustive model-checked verification;
 // `loom` is not currently a workspace dev-dep (see Cargo.toml).
 

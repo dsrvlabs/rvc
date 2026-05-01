@@ -58,9 +58,10 @@ impl CircuitBreakerState {
 
     /// Reset at epoch boundary. Zeroes both counters.
     pub fn reset_epoch(&self, new_epoch: u64) {
-        // AcqRel on the swap: the Release half ensures the subsequent stores are
-        // not reordered before the swap on weak-memory-order CPUs; the Acquire
-        // half lets us observe prior writes from other threads.
+        // AcqRel on the swap: the Acquire half prevents the subsequent counter
+        // stores from being reordered before the swap on weak-memory-order CPUs;
+        // the Release half publishes any prior writes to threads that
+        // subsequently load `current_epoch` with Acquire.
         let prev = self.current_epoch.swap(new_epoch, Ordering::AcqRel);
         if new_epoch != prev {
             // Release: zeroing is visible to any thread that later does an
