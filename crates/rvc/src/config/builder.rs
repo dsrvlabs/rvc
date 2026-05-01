@@ -157,10 +157,11 @@ impl ServiceBuilder {
         beacon: Arc<BeaconClient>,
         slashing_db: Arc<SlashingDb>,
     ) -> DoppelgangerService {
+        let genesis_time = self.config.effective_genesis_time().unwrap_or(0);
         let liveness_checker = Arc::new(BeaconLivenessAdapter::new(beacon));
         let slashing_reader = Arc::new(SlashingDbReaderAdapter::new(slashing_db));
-        let service = DoppelgangerService::new(liveness_checker, slashing_reader);
-        info!("Created doppelganger detection service");
+        let service = DoppelgangerService::new(liveness_checker, slashing_reader, genesis_time);
+        info!(genesis_time, "Created doppelganger detection service");
         service
     }
 
