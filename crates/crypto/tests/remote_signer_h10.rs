@@ -1,9 +1,10 @@
 //! H-10 regression tests: RemoteSigner (Web3Signer HTTP client) plaintext URL
 //! gating.
 //!
-//! Per ISSUE-2.12: `http://` URLs must be gated by `InsecureGate`.
-//! `https://` URLs always pass. In `Warn` mode the gate returns `Ok`; in
-//! `Refuse` mode it returns `Err` unless the operator has set the env var.
+//! Per ISSUE-2.12 (updated for ISSUE-3.13 GA): `http://` URLs must be gated
+//! by `InsecureGate`.  `https://` URLs always pass.  GA default is `Refuse`
+//! mode (NFR-10): `http://` without env var hard-fails.  `Warn` mode tests
+//! document the legacy Phase-2 gate behaviour — not the production default.
 //!
 //! # Env-var isolation
 //!
@@ -78,7 +79,7 @@ fn test_http_url_allowed_with_env_var_in_refuse_mode() {
     });
 }
 
-// ─── http:// URLs in Warn mode (Phase 2 production behaviour) ───────────────
+// ─── http:// URLs in Warn mode (legacy Phase-2 behaviour; not the GA default) ─
 
 #[test]
 fn test_http_url_warns_with_env_var() {

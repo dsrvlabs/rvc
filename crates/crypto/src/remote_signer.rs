@@ -85,9 +85,9 @@ impl RemoteSigner {
     ) -> Result<Self, SigningError> {
         let url = config.url.trim_end_matches('/').to_string();
 
-        // Gate plaintext URLs. Phase 2: Warn mode logs an error but allows
-        // startup to continue. Phase 3 (ISSUE-3.13) flips to Refuse.
-        check_remote_signer_url(&url, InsecureMode::Warn)?;
+        // Gate plaintext URLs. Per NFR-10 / ISSUE-3.13 (GA) the gate refuses
+        // http:// URLs unless RVC_REMOTE_SIGNER_ALLOW_INSECURE=true is set.
+        check_remote_signer_url(&url, InsecureMode::Refuse)?;
 
         let client = Client::builder()
             .timeout(config.timeout)
@@ -99,6 +99,21 @@ impl RemoteSigner {
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Creates a `RemoteSigner` without running the insecure-URL gate check.
+    ///
+    /// **For unit tests only.**  Production callers must use [`Self::new`],
+    /// which enforces the `InsecureMode::Refuse` gate (ISSUE-3.13 / NFR-10).
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(
+        config: RemoteSignerConfig,
+        pubkeys: Vec<[u8; PUBLIC_KEY_BYTES_LEN]>,
+    ) -> Self {
+        let url = config.url.trim_end_matches('/').to_string();
+        let client =
+            Client::builder().timeout(config.timeout).build().expect("test http client build");
+        Self { client, url, pubkeys }
     }
 }
 
@@ -213,7 +228,7 @@ mod tests {
     async fn test_remote_signer_public_keys_returns_configured_keys() {
         let pk = [0xaa; PUBLIC_KEY_BYTES_LEN];
         let config = RemoteSignerConfig::new("http://localhost:9000");
-        let signer = RemoteSigner::new(config, vec![pk]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk]);
 
         let keys = signer.public_keys();
 
@@ -241,7 +256,7 @@ mod tests {
             .await;
 
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let result = signer.sign(&signing_root, &pk_bytes).await;
         assert!(result.is_ok());
@@ -263,7 +278,7 @@ mod tests {
 
         let pk_bytes = [0xaa; PUBLIC_KEY_BYTES_LEN];
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let result = signer.sign(&[0xab; 32], &pk_bytes).await;
         assert!(result.is_err());
@@ -289,7 +304,7 @@ mod tests {
 
         let pk_bytes = [0xaa; PUBLIC_KEY_BYTES_LEN];
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let result = signer.sign(&[0xab; 32], &pk_bytes).await;
         assert!(result.is_err());
@@ -315,7 +330,7 @@ mod tests {
 
         let pk_bytes = [0xaa; PUBLIC_KEY_BYTES_LEN];
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let result = signer.sign(&[0xab; 32], &pk_bytes).await;
         assert!(result.is_err());
@@ -331,7 +346,7 @@ mod tests {
     async fn test_remote_signer_sign_connection_refused() {
         let pk_bytes = [0xaa; PUBLIC_KEY_BYTES_LEN];
         let config = RemoteSignerConfig::new("http://127.0.0.1:1");
-        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let result = signer.sign(&[0xab; 32], &pk_bytes).await;
         assert!(result.is_err());
@@ -348,7 +363,7 @@ mod tests {
         let pk_bytes = [0xaa; PUBLIC_KEY_BYTES_LEN];
         let unknown_pk = [0xbb; PUBLIC_KEY_BYTES_LEN];
         let config = RemoteSignerConfig::new("http://localhost:9000");
-        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let result = signer.sign(&[0xab; 32], &unknown_pk).await;
         assert!(result.is_err());
@@ -379,7 +394,7 @@ mod tests {
             .await;
 
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let signer: Box<dyn Signer> = Box::new(RemoteSigner::new(config, vec![pk_bytes]).unwrap());
+        let signer: Box<dyn Signer> = Box::new(RemoteSigner::new_unchecked(config, vec![pk_bytes]));
 
         let sig = signer.sign(&signing_root, &pk_bytes).await.unwrap();
         assert_eq!(sig.to_bytes().len(), 96);
@@ -389,14 +404,14 @@ mod tests {
     #[tokio::test]
     async fn test_remote_signer_strips_trailing_slash_from_url() {
         let config = RemoteSignerConfig::new("http://localhost:9000/");
-        let signer = RemoteSigner::new(config, vec![]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![]);
         assert_eq!(signer.url(), "http://localhost:9000");
     }
 
     #[tokio::test]
     async fn test_remote_signer_empty_public_keys() {
         let config = RemoteSignerConfig::new("http://localhost:9000");
-        let signer = RemoteSigner::new(config, vec![]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![]);
         assert!(signer.public_keys().is_empty());
     }
 
@@ -438,7 +453,7 @@ mod tests {
             .await;
 
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let spans = Arc::new(Mutex::new(Vec::new()));
         let layer = SpanCapture { spans: spans.clone() };
@@ -520,7 +535,7 @@ mod tests {
             .await;
 
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let fields = Arc::new(Mutex::new(Vec::new()));
         let layer = FieldCapture { fields: fields.clone() };
@@ -561,7 +576,7 @@ mod tests {
 
         let pk_bytes = [0xaa; PUBLIC_KEY_BYTES_LEN];
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let fields = Arc::new(Mutex::new(Vec::new()));
         let layer = FieldCapture { fields: fields.clone() };
@@ -602,7 +617,7 @@ mod tests {
         // We test the redact_url function directly since wiremock uses http://127.0.0.1:PORT
         let url_with_creds = "http://user:secret@signer.example.com:9000";
         let config = RemoteSignerConfig::new(url_with_creds);
-        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let fields = Arc::new(Mutex::new(Vec::new()));
         let layer = FieldCapture { fields: fields.clone() };
@@ -645,13 +660,17 @@ mod tests {
         assert_eq!(redacted, "not-a-url");
     }
 
+    /// GA regression: `http://` without env var must be refused (ISSUE-3.13 / NFR-10).
+    ///
+    /// In Phase 2 this returned `Ok` with a log warning.  At GA it must `Err`.
     #[test]
-    fn test_remote_signer_warns_on_http_url() {
+    fn test_remote_signer_refuses_http_url_without_env_var() {
+        // Ensure the env var is not set so the gate is in full-Refuse path.
+        unsafe { std::env::remove_var(REMOTE_SIGNER_INSECURE_ENV_VAR) };
         let pk = [0xaa; PUBLIC_KEY_BYTES_LEN];
         let config = RemoteSignerConfig::new("http://signer.example.com:9000");
-        // Should not error — just warn
-        let signer = RemoteSigner::new(config, vec![pk]);
-        assert!(signer.is_ok());
+        let result = RemoteSigner::new(config, vec![pk]);
+        assert!(result.is_err(), "http:// without env var must fail in GA (Refuse mode)");
     }
 
     #[test]
@@ -684,7 +703,7 @@ mod tests {
             .await;
 
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let result = signer.sign(&signing_root, &pk_bytes).await;
         assert!(result.is_ok());
@@ -711,7 +730,7 @@ mod tests {
             .await;
 
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let result = signer.sign(&signing_root, &pk_bytes).await;
         assert!(result.is_err());
@@ -740,7 +759,7 @@ mod tests {
             .await;
 
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let result = signer.sign(&signing_root, &pk_bytes).await;
         assert!(result.is_ok());
@@ -767,7 +786,7 @@ mod tests {
             .await;
 
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let result = signer.sign(&signing_root, &pk_bytes).await;
         assert!(result.is_err());

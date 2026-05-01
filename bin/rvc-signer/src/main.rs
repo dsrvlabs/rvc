@@ -432,15 +432,14 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         // ── H-9: env-var double-confirm + loopback gate ───────────────────
         //
         // `--insecure` requires BOTH `RVC_SIGNER_ALLOW_INSECURE=true` in the
-        // environment AND a loopback bind address.  In Phase 2 the gate runs in
-        // Warn mode (logs an error but does not block startup); Phase 3
-        // ISSUE-3.13 flips the default to Refuse.
-        insecure_startup::check_insecure_startup(true, addr, crypto::InsecureMode::Warn).map_err(
-            |e| {
+        // environment AND a loopback bind address.  Per NFR-10 / ISSUE-3.13
+        // (GA tag) the gate now runs in Refuse mode: startup hard-fails when
+        // the opt-in conditions are not fully met.
+        insecure_startup::check_insecure_startup(true, addr, crypto::InsecureMode::Refuse)
+            .map_err(|e| {
                 error!(error = %e, "insecure startup refused by gate");
                 e
-            },
-        )?;
+            })?;
         tracing::warn!("TLS disabled via --insecure flag. Do NOT use in production!");
     } else {
         return Err("TLS is required. Provide --tls-cert, --tls-key, and --tls-ca-cert, \

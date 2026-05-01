@@ -40,19 +40,30 @@ use thiserror::Error;
 
 /// Mode controlling what happens when an insecure code path is attempted.
 ///
-/// Per NFR-10 the default in the Phase 2 release tag is [`InsecureMode::Warn`].
-/// The flip to [`InsecureMode::Refuse`] lands in Phase 3 ISSUE-3.13 (GA tag).
+/// Per NFR-10 the default at the Mainnet GA tag (Phase 3 ISSUE-3.13) is
+/// [`InsecureMode::Refuse`].  Operators who still need the Phase-2 warn-only
+/// behaviour must set the appropriate env var and use a loopback bind address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsecureMode {
     /// Emit an `error!`-level log and allow the operation to continue.
     ///
-    /// This is the Phase-2 default: operators who haven't updated their
-    /// configuration get a loud warning but are not broken.
+    /// Phase-2 legacy: operators who hadn't updated their configuration
+    /// received a loud warning but were not blocked.  **Not the GA default.**
     Warn,
     /// Return [`InsecureGateError`] with an actionable message.
     ///
-    /// This will become the default at the mainnet GA tag (Phase 3 ISSUE-3.13).
+    /// This is the GA default (Phase 3 ISSUE-3.13 / NFR-10).
     Refuse,
+}
+
+impl Default for InsecureMode {
+    /// Returns [`InsecureMode::Refuse`] — the GA default per NFR-10.
+    ///
+    /// Call sites that were `Warn` in Phase 2 (H-9, H-10) all flip to this
+    /// default at the ISSUE-3.13 GA tag.
+    fn default() -> Self {
+        InsecureMode::Refuse
+    }
 }
 
 /// Error returned by [`InsecureGate::check`] in [`InsecureMode::Refuse`] mode.

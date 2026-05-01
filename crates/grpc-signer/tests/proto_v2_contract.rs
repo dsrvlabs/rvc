@@ -45,8 +45,32 @@ use rvc_grpc_signer::{
     },
     GrpcRemoteSigner, GrpcRemoteSignerConfig,
 };
+use std::sync::OnceLock;
 use tokio::net::TcpListener;
 use tonic::{Request, Response, Status};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test helpers: insecure plaintext config
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Sets `RVC_REMOTE_SIGNER_ALLOW_INSECURE=true` once for the entire test binary.
+///
+/// All tests here use plaintext gRPC (we're testing the v2 protocol contract,
+/// not the TLS gate).  At GA (ISSUE-3.13) the gate defaults to Refuse; this
+/// sets the operator opt-in so the in-process test server can be reached.
+fn allow_insecure_for_tests() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| unsafe {
+        std::env::set_var(rvc_grpc_signer::REMOTE_SIGNER_INSECURE_ENV_VAR, "true");
+    });
+}
+
+/// Returns a `GrpcRemoteSignerConfig` for a plaintext test server and ensures
+/// the insecure opt-in env var is set for this test binary.
+fn insecure_grpc_config(addr: SocketAddr) -> GrpcRemoteSignerConfig {
+    allow_insecure_for_tests();
+    GrpcRemoteSignerConfig::new(format!("http://{addr}"))
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Mock v2 SignerService backed by a real BLS key
@@ -361,9 +385,7 @@ async fn test_typed_block_round_trip() {
     let pk = sk.public_key();
     let (addr, _handle) = start_v2_server(sk).await;
 
-    let signer = GrpcRemoteSigner::connect(GrpcRemoteSignerConfig::new(format!("http://{addr}")))
-        .await
-        .unwrap();
+    let signer = GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await.unwrap();
 
     let block = BeaconBlock {
         slot: 100,
@@ -391,9 +413,7 @@ async fn test_typed_blinded_block_round_trip() {
     let pk = sk.public_key();
     let (addr, _handle) = start_v2_server(sk).await;
 
-    let signer = GrpcRemoteSigner::connect(GrpcRemoteSignerConfig::new(format!("http://{addr}")))
-        .await
-        .unwrap();
+    let signer = GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await.unwrap();
 
     let block = BlindedBeaconBlock {
         slot: 200,
@@ -421,9 +441,7 @@ async fn test_typed_attestation_round_trip() {
     let pk = sk.public_key();
     let (addr, _handle) = start_v2_server(sk).await;
 
-    let signer = GrpcRemoteSigner::connect(GrpcRemoteSignerConfig::new(format!("http://{addr}")))
-        .await
-        .unwrap();
+    let signer = GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await.unwrap();
 
     let data = AttestationData {
         slot: 100,
@@ -451,9 +469,7 @@ async fn test_typed_aggregate_round_trip() {
     let pk = sk.public_key();
     let (addr, _handle) = start_v2_server(sk).await;
 
-    let signer = GrpcRemoteSigner::connect(GrpcRemoteSignerConfig::new(format!("http://{addr}")))
-        .await
-        .unwrap();
+    let signer = GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await.unwrap();
 
     let agg = AggregateAndProof {
         aggregator_index: 42,
@@ -489,9 +505,7 @@ async fn test_typed_sync_message_round_trip() {
     let pk = sk.public_key();
     let (addr, _handle) = start_v2_server(sk).await;
 
-    let signer = GrpcRemoteSigner::connect(GrpcRemoteSignerConfig::new(format!("http://{addr}")))
-        .await
-        .unwrap();
+    let signer = GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await.unwrap();
 
     let slot = 500u64;
     let beacon_block_root = [0x88u8; 32];
@@ -516,9 +530,7 @@ async fn test_typed_sync_aggregator_round_trip() {
     let pk = sk.public_key();
     let (addr, _handle) = start_v2_server(sk).await;
 
-    let signer = GrpcRemoteSigner::connect(GrpcRemoteSignerConfig::new(format!("http://{addr}")))
-        .await
-        .unwrap();
+    let signer = GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await.unwrap();
 
     let slot = 600u64;
     let subcommittee_index = 3u64;
@@ -547,9 +559,7 @@ async fn test_typed_contribution_round_trip() {
     let pk = sk.public_key();
     let (addr, _handle) = start_v2_server(sk).await;
 
-    let signer = GrpcRemoteSigner::connect(GrpcRemoteSignerConfig::new(format!("http://{addr}")))
-        .await
-        .unwrap();
+    let signer = GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await.unwrap();
 
     let c = ContributionAndProof {
         aggregator_index: 7,
@@ -581,9 +591,7 @@ async fn test_typed_builder_registration_round_trip() {
     let pk = sk.public_key();
     let (addr, _handle) = start_v2_server(sk).await;
 
-    let signer = GrpcRemoteSigner::connect(GrpcRemoteSignerConfig::new(format!("http://{addr}")))
-        .await
-        .unwrap();
+    let signer = GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await.unwrap();
 
     let genesis_fork_version = [0u8; 4];
     let reg = ValidatorRegistrationV1 {
@@ -610,9 +618,7 @@ async fn test_typed_randao_round_trip() {
     let pk = sk.public_key();
     let (addr, _handle) = start_v2_server(sk).await;
 
-    let signer = GrpcRemoteSigner::connect(GrpcRemoteSignerConfig::new(format!("http://{addr}")))
-        .await
-        .unwrap();
+    let signer = GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await.unwrap();
 
     let epoch = 42u64;
 
@@ -634,9 +640,7 @@ async fn test_typed_voluntary_exit_round_trip() {
     let pk = sk.public_key();
     let (addr, _handle) = start_v2_server(sk).await;
 
-    let signer = GrpcRemoteSigner::connect(GrpcRemoteSignerConfig::new(format!("http://{addr}")))
-        .await
-        .unwrap();
+    let signer = GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await.unwrap();
 
     let exit = VoluntaryExit { epoch: 200, validator_index: 99 };
 
@@ -708,9 +712,7 @@ async fn test_refuses_v1_signer_at_typed_rpc_time() {
     let (addr, _handle) = start_v1_only_server(sk).await;
 
     // connect() succeeds because the v1 server has ListPublicKeys
-    let signer = GrpcRemoteSigner::connect(GrpcRemoteSignerConfig::new(format!("http://{addr}")))
-        .await
-        .unwrap();
+    let signer = GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await.unwrap();
 
     // But calling a typed v2 RPC fails — the v1 server doesn't implement it.
     let block = BeaconBlock {

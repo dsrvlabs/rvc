@@ -5,16 +5,12 @@
 //! to a loopback address.  The check uses [`InsecureGate`] from the `crypto`
 //! crate, which provides the shared gating logic for all insecure code paths.
 //!
-//! ## Phase 2 behaviour (current)
+//! ## GA behaviour (Phase 3 ISSUE-3.13 / current)
 //!
-//! The default mode is [`InsecureMode::Warn`]: the gate logs an `error!`-level
-//! warning but allows startup to continue.  This prevents breaking existing
-//! operators who have not yet updated their configuration.
-//!
-//! ## Phase 3 behaviour (ISSUE-3.13)
-//!
-//! The mode will flip to [`InsecureMode::Refuse`], hard-failing on any
-//! non-loopback bind or missing env var.
+//! The default mode is [`InsecureMode::Refuse`]: the gate hard-fails on any
+//! non-loopback bind address or missing env var.  Operators who depended on the
+//! Phase-2 warn-only behaviour must now set `RVC_SIGNER_ALLOW_INSECURE=true`
+//! AND use a loopback bind address, or switch to TLS.
 
 use std::net::SocketAddr;
 
@@ -34,13 +30,13 @@ pub const INSECURE_ENV_VAR: &str = "RVC_SIGNER_ALLOW_INSECURE";
 ///
 /// - `insecure`: the value of the `--insecure` CLI flag.
 /// - `bind_addr`: the address the server will bind to.
-/// - `mode`: [`InsecureMode::Warn`] for Phase 2; flip to [`InsecureMode::Refuse`]
-///   in Phase 3 (ISSUE-3.13).
+/// - `mode`: the gate mode.  Pass [`InsecureMode::Refuse`] (GA default per
+///   NFR-10); [`InsecureMode::Warn`] is available for testing.
 ///
 /// # Returns
 ///
-/// - `Ok(())` when the gate permits startup (always in Warn mode; only when
-///   fully opted-in in Refuse mode).
+/// - `Ok(())` when the gate permits startup (fully opted-in in Refuse mode; or
+///   always in Warn mode — for tests only).
 /// - `Err(`[`InsecureGateError`]`)` when `mode` is [`InsecureMode::Refuse`] and
 ///   the opt-in conditions are not met.
 ///
@@ -52,8 +48,8 @@ pub const INSECURE_ENV_VAR: &str = "RVC_SIGNER_ALLOW_INSECURE";
 /// use rvc_signer_bin::insecure_startup::check_insecure_startup;
 ///
 /// let addr: SocketAddr = "127.0.0.1:50052".parse().unwrap();
-/// // Phase 2 default — Warn mode, always succeeds but may log.
-/// check_insecure_startup(true, addr, InsecureMode::Warn).expect("Warn is non-fatal");
+/// // GA default — Refuse mode; requires env var + loopback.
+/// check_insecure_startup(true, addr, InsecureMode::Refuse).expect("fully opted-in");
 /// ```
 pub fn check_insecure_startup(
     insecure: bool,

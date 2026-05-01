@@ -1,9 +1,10 @@
 //! H-9 regression tests: `--insecure` flag requires env-var double-confirm + loopback gate.
 //!
-//! Acceptance criteria (ISSUE-2.11):
+//! Acceptance criteria (ISSUE-2.11 / updated for ISSUE-3.13 GA):
 //! - Gate uses `RVC_SIGNER_ALLOW_INSECURE=true` as the opt-in env var.
+//! - GA default is `Refuse` mode (per NFR-10 / ISSUE-3.13).
 //! - In `Refuse` mode: non-loopback bind without env var → `Err`.
-//! - In `Warn` mode: any bind with any env state → `Ok` (but error log emitted).
+//! - In `Warn` mode (legacy, not the production default): any bind → `Ok` (but error log emitted).
 //! - Loopback + env var → silent `Ok` (fully opted-in).
 
 use std::net::SocketAddr;

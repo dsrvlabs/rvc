@@ -235,7 +235,7 @@ mod tests {
             .await;
 
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let remote_signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let remote_signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let composite = CompositeSigner::new(create_empty_local_signer());
         composite.add_remote_key(pk_bytes, remote_signer);
@@ -269,7 +269,7 @@ mod tests {
 
         let mock_server = MockServer::start().await;
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let remote_signer = RemoteSigner::new(config, vec![pk2]).unwrap();
+        let remote_signer = RemoteSigner::new_unchecked(config, vec![pk2]);
 
         let composite = CompositeSigner::new(create_local_signer_with_key(sk1));
         composite.add_remote_key(pk2, remote_signer);
@@ -302,7 +302,7 @@ mod tests {
         let pk = [0xaa; PUBLIC_KEY_BYTES_LEN];
         let mock_server = MockServer::start().await;
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let remote_signer = RemoteSigner::new(config, vec![pk]).unwrap();
+        let remote_signer = RemoteSigner::new_unchecked(config, vec![pk]);
 
         let composite = CompositeSigner::new(create_empty_local_signer());
         composite.add_remote_key(pk, remote_signer);
@@ -356,7 +356,7 @@ mod tests {
             .await;
 
         let config = RemoteSignerConfig::new(mock_server.uri());
-        let remote_signer = RemoteSigner::new(config, vec![pk_bytes]).unwrap();
+        let remote_signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         // Same key in both local and remote
         let composite = CompositeSigner::new(create_local_signer_with_key(sk));

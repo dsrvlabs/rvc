@@ -418,6 +418,11 @@ async fn test_composite_signer_grpc_remote_takes_priority_over_local_in_key_list
 
 #[tokio::test]
 async fn test_e2e_plaintext_connect_lists_keys() {
+    // Set the insecure env var to permit plaintext (http://) connections for this
+    // test.  At GA (ISSUE-3.13) the default mode is Refuse; the operator must
+    // explicitly opt in.
+    unsafe { std::env::set_var(rvc_grpc_signer::REMOTE_SIGNER_INSECURE_ENV_VAR, "true") };
+
     let sk = SecretKey::generate();
     let pk_bytes = sk.public_key().to_bytes();
 
@@ -425,6 +430,8 @@ async fn test_e2e_plaintext_connect_lists_keys() {
 
     let config = GrpcRemoteSignerConfig::new(format!("http://{addr}"));
     let signer = GrpcRemoteSigner::connect(config).await.unwrap();
+
+    unsafe { std::env::remove_var(rvc_grpc_signer::REMOTE_SIGNER_INSECURE_ENV_VAR) };
 
     // GrpcRemoteSigner has ListPublicKeys working
     assert_eq!(signer.public_keys().len(), 1);

@@ -107,9 +107,9 @@ pub struct GrpcRemoteSigner {
 impl GrpcRemoteSigner {
     #[tracing::instrument(name = "rvc.grpc_signer.connect", skip_all)]
     pub async fn connect(config: GrpcRemoteSignerConfig) -> Result<Self, SigningError> {
-        // Gate plaintext URLs. Phase 2: Warn mode logs an error but allows
-        // the connection to proceed. Phase 3 (ISSUE-3.13) flips to Refuse.
-        config.check_url_security(InsecureMode::Warn)?;
+        // Gate plaintext URLs. Per NFR-10 / ISSUE-3.13 (GA) the gate refuses
+        // http:// URLs unless RVC_REMOTE_SIGNER_ALLOW_INSECURE=true is set.
+        config.check_url_security(InsecureMode::Refuse)?;
 
         let url = config.url.trim_end_matches('/').to_string();
         let tls_enabled = config.tls_cert.is_some();
