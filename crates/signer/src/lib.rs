@@ -114,6 +114,19 @@ impl SignerService {
     }
 
     /// Signs an attestation after checking slashing protection.
+    ///
+    /// # Stage + commit on success (M-1 fix, architecture A15)
+    ///
+    /// The slashing-DB row is staged (checked but not yet written) before the
+    /// sign call.  On signer success the row is committed; on signer failure
+    /// `discard()` rolls the transaction back so no phantom row is left.
+    ///
+    /// `StagedAttestation<'_>` holds a `parking_lot::MutexGuard` (`!Send`).
+    /// We run the stage → sign → commit triple inside `spawn_blocking` so the
+    /// guard never crosses an `.await` boundary.  The async sign call is driven
+    /// to completion via `Handle::current().block_on()` on the same blocking
+    /// thread, which is the documented pattern for calling async code from a
+    /// `spawn_blocking` closure.
     #[tracing::instrument(name = "rvc.sign.attestation", skip_all, fields(rvc.operation = "attestation", rvc.slashing.result))]
     pub async fn sign_attestation(
         &self,
@@ -135,10 +148,6 @@ impl SignerService {
             signing_type = "attestation",
             "Signing attestation"
         );
-
-        // Acquire per-validator lock to serialize check-record-sign for the same validator.
-        let lock = self.validator_locks.get(&pubkey_bytes);
-        let _guard = lock.lock().await;
 
         let source_epoch = attestation_data.source.epoch;
         let target_epoch = attestation_data.target.epoch;
@@ -174,53 +183,100 @@ impl SignerService {
             "Computed attestation signing root"
         );
 
-        let slashing_check_result = {
-            let _span = tracing::info_span!("rvc.slashing.check").entered();
-            self.slashing_db.check_and_record_attestation(
-                "local-vc",
-                &pubkey_hex,
-                source_epoch,
-                target_epoch,
-                Some(signing_root_hex),
-                genesis_validators_root,
-            )
-        };
+        // Acquire per-validator lock (owned variant so it can move into spawn_blocking).
+        let lock = self.validator_locks.get(&pubkey_bytes);
+        let _guard = lock.lock_owned().await;
 
-        if let Err(e) = slashing_check_result {
-            tracing::Span::current().record("rvc.slashing.result", "blocked");
+        // Emit the `rvc.slashing.check` span on the async task so that
+        // tracing subscribers (including tests) can observe it.  The actual
+        // SQLite work happens inside `spawn_blocking` below.
+        let _slashing_span = tracing::info_span!("rvc.slashing.check").entered();
+        drop(_slashing_span);
+
+        // Clone the Arc handles needed inside the blocking closure.
+        let db = Arc::clone(&self.slashing_db);
+        let signer = Arc::clone(&self.signer);
+        let handle = tokio::runtime::Handle::current();
+        let pubkey_hex_clone = pubkey_hex.clone();
+        let slot_for_log = attestation_data.slot;
+        let gvr = *genesis_validators_root;
+
+        // Run the stage → sign → commit triple on a dedicated blocking thread.
+        //
+        // `StagedAttestation<'_>` holds a `parking_lot::MutexGuard` which is
+        // `!Send`.  Putting everything inside `spawn_blocking` keeps the guard
+        // on a single OS thread; `handle.block_on(signer.sign(...))` drives the
+        // async sign call to completion without crossing `.await` on the calling
+        // task.  On signer failure `staged.discard()` rolls back the SQLite
+        // transaction so no phantom row is committed (M-1 fix, architecture A15).
+        let outcome = tokio::task::spawn_blocking(move || -> Result<Signature, SignerError> {
+            let staged = db
+                .stage_attestation(
+                    "local-vc",
+                    &pubkey_hex_clone,
+                    source_epoch,
+                    target_epoch,
+                    Some(signing_root_hex),
+                    &gvr,
+                )
+                .map_err(|e| {
+                    error!(
+                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                        slot = slot_for_log,
+                        source_epoch = source_epoch,
+                        target_epoch = target_epoch,
+                        rejection_reason = %e,
+                        "Slashing protection rejected attestation"
+                    );
+                    RVC_SLASHING_PROTECTION_CHECKS_TOTAL
+                        .with_label_values(&[slashing_result::BLOCKED])
+                        .inc();
+                    RVC_ATTESTATIONS_TOTAL.with_label_values(&["failed"]).inc();
+                    SignerError::SlashingProtectionBlocked(e)
+                })?;
+
+            RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
+
+            let sign_result = handle.block_on(signer.sign(&signing_root, &pubkey_bytes));
+
+            match sign_result {
+                Ok(sig) => {
+                    if let Err(e) = staged.commit() {
+                        error!(
+                            pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                            slot = slot_for_log,
+                            error = %e,
+                            "Failed to commit attestation to slashing DB after successful sign"
+                        );
+                        return Err(SignerError::SlashingProtectionBlocked(e));
+                    }
+                    Ok(sig)
+                }
+                Err(e) => {
+                    // Signer failed — discard the staged transaction so no phantom row
+                    // remains in the DB (M-1 fix).
+                    staged.discard();
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                        error = %e,
+                        signing_type = "attestation",
+                        "Signing failed; staged slashing-DB row discarded (no phantom row)"
+                    );
+                    Err(e.into())
+                }
+            }
+        })
+        .await
+        .map_err(|join_err| {
             error!(
                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                slot = attestation_data.slot,
-                source_epoch = source_epoch,
-                target_epoch = target_epoch,
-                rejection_reason = %e,
-                "Slashing protection rejected attestation"
+                error = %join_err,
+                "sign_attestation blocking task panicked"
             );
-            RVC_SLASHING_PROTECTION_CHECKS_TOTAL
-                .with_label_values(&[slashing_result::BLOCKED])
-                .inc();
-            RVC_ATTESTATIONS_TOTAL.with_label_values(&["failed"]).inc();
-            return Err(SignerError::SlashingProtectionBlocked(e));
-        }
+            SignerError::SigningFailed(format!("sign_attestation task panicked: {join_err}"))
+        })??;
 
         tracing::Span::current().record("rvc.slashing.result", "safe");
-        RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
-
-        let signature = match self.signer.sign(&signing_root, &pubkey_bytes).await {
-            Ok(sig) => sig,
-            Err(e) => {
-                // Phantom entry: record exists but signing failed. This is safe per spec —
-                // missing a duty is far less harmful than double-signing.
-                warn!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    error = %e,
-                    signing_type = "attestation",
-                    "Signing failed"
-                );
-                return Err(e.into());
-            }
-        };
-
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
         RVC_ATTESTATIONS_TOTAL.with_label_values(&["success"]).inc();
@@ -231,10 +287,14 @@ impl SignerService {
             "Signing completed"
         );
 
-        Ok(signature)
+        Ok(outcome)
     }
 
     /// Signs a block after checking slashing protection.
+    ///
+    /// Uses the same stage + commit-on-success pattern as `sign_attestation`
+    /// (M-1 fix, architecture A15).  See `sign_attestation` for the full
+    /// rationale on `spawn_blocking` + `Handle::block_on`.
     #[tracing::instrument(name = "rvc.sign.block", skip_all, fields(rvc.operation = "block", rvc.slashing.result))]
     pub async fn sign_block(
         &self,
@@ -255,10 +315,6 @@ impl SignerService {
             "Signing block"
         );
 
-        // Acquire per-validator lock to serialize check-record-sign for the same validator.
-        let lock = self.validator_locks.get(&pubkey_bytes);
-        let _guard = lock.lock().await;
-
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
@@ -270,48 +326,73 @@ impl SignerService {
         let signing_root = crypto::compute_signing_root(block_root, domain);
         let signing_root_hex = hex::encode(signing_root);
 
-        let slashing_check_result = {
-            let _span = tracing::info_span!("rvc.slashing.check").entered();
-            self.slashing_db.check_and_record_block(
-                "local-vc",
-                &pubkey_hex,
-                slot,
-                Some(signing_root_hex),
-                genesis_validators_root,
-            )
-        };
+        // Acquire per-validator lock (owned so it can move into spawn_blocking).
+        let lock = self.validator_locks.get(&pubkey_bytes);
+        let _guard = lock.lock_owned().await;
 
-        if let Err(e) = slashing_check_result {
-            tracing::Span::current().record("rvc.slashing.result", "blocked");
+        let db = Arc::clone(&self.slashing_db);
+        let signer = Arc::clone(&self.signer);
+        let handle = tokio::runtime::Handle::current();
+        let pubkey_hex_clone = pubkey_hex.clone();
+        let gvr = *genesis_validators_root;
+
+        let outcome = tokio::task::spawn_blocking(move || -> Result<Signature, SignerError> {
+            let staged = db
+                .stage_block("local-vc", &pubkey_hex_clone, slot, Some(signing_root_hex), &gvr)
+                .map_err(|e| {
+                    error!(
+                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                        slot = slot,
+                        rejection_reason = %e,
+                        "Slashing protection rejected block proposal"
+                    );
+                    RVC_SLASHING_PROTECTION_CHECKS_TOTAL
+                        .with_label_values(&[slashing_result::BLOCKED])
+                        .inc();
+                    SignerError::SlashingProtectionBlocked(e)
+                })?;
+
+            RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
+
+            let sign_result = handle.block_on(signer.sign(&signing_root, &pubkey_bytes));
+
+            match sign_result {
+                Ok(sig) => {
+                    if let Err(e) = staged.commit() {
+                        error!(
+                            pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                            slot = slot,
+                            error = %e,
+                            "Failed to commit block to slashing DB after successful sign"
+                        );
+                        return Err(SignerError::SlashingProtectionBlocked(e));
+                    }
+                    Ok(sig)
+                }
+                Err(e) => {
+                    // Signer failed — discard the staged transaction (M-1 fix).
+                    staged.discard();
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                        error = %e,
+                        signing_type = "block",
+                        "Signing failed; staged slashing-DB row discarded (no phantom row)"
+                    );
+                    Err(e.into())
+                }
+            }
+        })
+        .await
+        .map_err(|join_err| {
             error!(
                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                slot = slot,
-                rejection_reason = %e,
-                "Slashing protection rejected block proposal"
+                error = %join_err,
+                "sign_block blocking task panicked"
             );
-            RVC_SLASHING_PROTECTION_CHECKS_TOTAL
-                .with_label_values(&[slashing_result::BLOCKED])
-                .inc();
-            return Err(SignerError::SlashingProtectionBlocked(e));
-        }
+            SignerError::SigningFailed(format!("sign_block task panicked: {join_err}"))
+        })??;
 
         tracing::Span::current().record("rvc.slashing.result", "safe");
-        RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
-
-        let signature = match self.signer.sign(&signing_root, &pubkey_bytes).await {
-            Ok(sig) => sig,
-            Err(e) => {
-                // Phantom entry: record exists but signing failed. Safe per spec.
-                warn!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    error = %e,
-                    signing_type = "block",
-                    "Signing failed"
-                );
-                return Err(e.into());
-            }
-        };
-
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
 
@@ -321,7 +402,7 @@ impl SignerService {
             "Signing completed"
         );
 
-        Ok(signature)
+        Ok(outcome)
     }
 
     /// Signs a RANDAO reveal for the given epoch.
@@ -2064,12 +2145,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_signing_failure_after_recording_warns_phantom() {
-        // Use a signer with no keys to cause a signing failure after slashing check passes
+    async fn test_signing_failure_does_not_commit_phantom_row() {
+        // M-1 fix: when signing fails, the staged slashing-DB row must be rolled back
+        // so no phantom entry remains.  Before the fix, this test would find a row.
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
 
-        // Register the validator in slashing DB but DON'T add the key to the signer
+        // Signer with no keys — signing will fail with KeyNotFound.
         let empty_signer = create_empty_composite_signer();
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
         let service = SignerService::new(empty_signer, slashing_db.clone());
@@ -2078,22 +2160,21 @@ mod tests {
 
         let data = create_test_attestation_data(59, 60);
         let result = service.sign_attestation(&data, &pubkey, &fork_schedule, &genesis_root).await;
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected signing failure when key is absent");
 
-        // Verify the phantom entry exists in slashing DB — the signing failed,
-        // but the record was committed. This is the spec-mandated behavior.
         match result.err().unwrap() {
             SignerError::KeyNotFound(_) | SignerError::SigningFailed(_) => {}
             other => panic!("expected signing failure, got: {other}"),
         }
 
-        // Query the DB to verify the phantom record was actually written
+        // M-1 fix: the staged row must have been rolled back — DB must be empty.
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let attestations =
             slashing_db.get_attestations(&pubkey_hex).expect("failed to query slashing db");
-        assert_eq!(attestations.len(), 1, "phantom entry must exist after signing failure");
-        assert_eq!(attestations[0].source_epoch, 59);
-        assert_eq!(attestations[0].target_epoch, 60);
+        assert!(
+            attestations.is_empty(),
+            "M-1 fix: no phantom row must be committed after signing failure; found: {attestations:?}"
+        );
     }
 
     #[tokio::test]
