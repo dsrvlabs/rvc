@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crypto::{KeyManager, LocalSigner, SecretKey};
 use eth_types::{AttestationData, Checkpoint, ForkSchedule, Root};
-use metrics::definitions::RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS;
+use metrics::definitions::{tx_hold_kind, RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS};
 use rvc_signer::SignerService;
 use slashing::SlashingDb;
 
@@ -64,10 +64,10 @@ async fn test_metric_recorded_on_stage_commit() {
 
     // Snapshot before
     let count_before = RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
-        .with_label_values(&["attestation"])
+        .with_label_values(&[tx_hold_kind::ATTESTATION])
         .get_sample_count();
     let sum_before = RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
-        .with_label_values(&["attestation"])
+        .with_label_values(&[tx_hold_kind::ATTESTATION])
         .get_sample_sum();
 
     let result = service.sign_attestation(&data, &pubkey, &fs, &GVR).await;
@@ -75,10 +75,10 @@ async fn test_metric_recorded_on_stage_commit() {
 
     // Assert: exactly one new observation was added for kind=attestation
     let count_after = RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
-        .with_label_values(&["attestation"])
+        .with_label_values(&[tx_hold_kind::ATTESTATION])
         .get_sample_count();
     let sum_after = RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
-        .with_label_values(&["attestation"])
+        .with_label_values(&[tx_hold_kind::ATTESTATION])
         .get_sample_sum();
 
     assert!(
@@ -112,18 +112,73 @@ async fn test_metric_recorded_on_stage_discard() {
     let fs = make_fork_schedule();
 
     // Snapshot before
-    let count_before =
-        RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS.with_label_values(&["block"]).get_sample_count();
+    let count_before = RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+        .with_label_values(&[tx_hold_kind::BLOCK])
+        .get_sample_count();
 
     let result = service.sign_block(&block_root, slot, &pubkey, &fs, &GVR).await;
     assert!(result.is_err(), "sign_block must fail when key is absent");
 
     // Assert: histogram was still observed for kind=block despite the discard
-    let count_after =
-        RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS.with_label_values(&["block"]).get_sample_count();
+    let count_after = RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+        .with_label_values(&[tx_hold_kind::BLOCK])
+        .get_sample_count();
 
     assert!(
         count_after > count_before,
         "histogram must be observed on discard too; before={count_before}, after={count_after}"
+    );
+}
+
+// ── Test: histogram observed on stage → slashing-rejection (review MF-1) ─────
+
+/// ISSUE-3.12 review MF-1: when `stage_attestation` is rejected by slashing
+/// protection (the second sign attempt against the same source/target with a
+/// different signing root looks like a DoubleVote), the histogram must STILL
+/// be observed — the staging attempt held the SQLite transaction for real
+/// wall-clock time even though the row was never written.
+///
+/// Before MF-1, the `?` operator returned from the closure before the
+/// post-stage observe() ran, silently dropping every slashing rejection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_metric_recorded_on_stage_slashing_rejected() {
+    let sk = SecretKey::generate();
+    let pubkey = sk.public_key();
+
+    let mut manager = KeyManager::new();
+    manager.insert(sk);
+    let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(manager)));
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
+    let service = SignerService::new(signer, db);
+
+    let fs = make_fork_schedule();
+
+    // First call: source=10, target=11 — succeeds, writes a row.
+    let first = make_attestation_data(10, 11);
+    service.sign_attestation(&first, &pubkey, &fs, &GVR).await.expect("first must succeed");
+
+    // Snapshot AFTER the first (successful) sign so we measure only the
+    // contribution of the rejection path.
+    let count_before = RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+        .with_label_values(&[tx_hold_kind::ATTESTATION])
+        .get_sample_count();
+
+    // Second call: same (source, target) but with a different beacon_block_root
+    // (which changes the signing_root). slashing-DB sees a DoubleVote and
+    // rejects at stage_attestation time.
+    let mut second = make_attestation_data(10, 11);
+    second.beacon_block_root = [0xcc; 32];
+    let result = service.sign_attestation(&second, &pubkey, &fs, &GVR).await;
+    assert!(result.is_err(), "second sign must be rejected as DoubleVote");
+
+    // The rejection path must still observe the histogram.
+    let count_after = RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+        .with_label_values(&[tx_hold_kind::ATTESTATION])
+        .get_sample_count();
+
+    assert!(
+        count_after > count_before,
+        "histogram must be observed on slashing-rejection path; \
+         before={count_before}, after={count_after}"
     );
 }

@@ -235,6 +235,14 @@ impl SignerService {
                             .with_label_values(&[slashing_result::BLOCKED])
                             .inc();
                         RVC_ATTESTATIONS_TOTAL.with_label_values(&["failed"]).inc();
+                        // Slashing rejection IS a rollback — record real wall-clock
+                        // hold per spec (ISSUE-3.12 review MF-1).  Without this,
+                        // every double-vote/surround rejection silently bypasses
+                        // the histogram (the `?` returns before the post-stage
+                        // observe).
+                        RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                            .with_label_values(&[tx_hold_kind::ATTESTATION])
+                            .observe(tx_start.elapsed().as_secs_f64() * 1000.0);
                         SignerError::SlashingProtectionBlocked(e)
                     })?;
 
@@ -244,7 +252,10 @@ impl SignerService {
 
                 let sign_result = handle.block_on(signer.sign(&signing_root, &pubkey_bytes));
                 // Measure hold duration before commit/discard (ISSUE-3.12).
-                let tx_hold_ms = tx_start.elapsed().as_millis() as f64;
+                // Use as_secs_f64 * 1000.0 to preserve sub-millisecond precision —
+                // in-memory SQLite typically commits in < 1 ms; as_millis truncates
+                // those observations to 0.0 (review N-1).
+                let tx_hold_ms = tx_start.elapsed().as_secs_f64() * 1000.0;
 
                 match sign_result {
                     Ok(sig) => {
@@ -378,6 +389,10 @@ impl SignerService {
                         RVC_SLASHING_PROTECTION_CHECKS_TOTAL
                             .with_label_values(&[slashing_result::BLOCKED])
                             .inc();
+                        // Slashing rejection IS a rollback (ISSUE-3.12 review MF-1).
+                        RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                            .with_label_values(&[tx_hold_kind::BLOCK])
+                            .observe(tx_start.elapsed().as_secs_f64() * 1000.0);
                         SignerError::SlashingProtectionBlocked(e)
                     })?;
 
@@ -387,7 +402,8 @@ impl SignerService {
 
                 let sign_result = handle.block_on(signer.sign(&signing_root, &pubkey_bytes));
                 // Measure hold duration before commit/discard (ISSUE-3.12).
-                let tx_hold_ms = tx_start.elapsed().as_millis() as f64;
+                // Use as_secs_f64 * 1000.0 for sub-millisecond precision.
+                let tx_hold_ms = tx_start.elapsed().as_secs_f64() * 1000.0;
 
                 match sign_result {
                     Ok(sig) => {
