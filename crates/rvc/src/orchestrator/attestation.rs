@@ -14,6 +14,7 @@ use metrics::definitions::{
 use propagator::{AttestationSubmitter, Propagator};
 use signer::SignerService;
 use timing::{SlotClock, SLOTS_PER_EPOCH};
+use validator_store::ValidatorStore;
 
 use super::coordinator::{AttestationResult, OrchestratorConfig, PubkeyMap};
 use super::error::OrchestratorError;
@@ -32,6 +33,12 @@ where
     duty_tracker: Arc<DutyTracker>,
     pubkey_map: PubkeyMap,
     config: OrchestratorConfig,
+    /// M-12 (Critical #1): per-validator enabled flag.  Duties for validators
+    /// that are still inside the post-import doppelganger window
+    /// (`enabled = false`) are skipped so that a freshly imported key does
+    /// not attest until the window has elapsed and the background task flips
+    /// the flag to `true`.
+    validator_store: Arc<ValidatorStore>,
 }
 
 impl<C, S> AttestationService<C, S>
@@ -39,6 +46,7 @@ where
     C: SlotClock + 'static,
     S: AttestationSubmitter + 'static,
 {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         clock: Arc<C>,
         signer: Arc<SignerService>,
@@ -47,8 +55,18 @@ where
         duty_tracker: Arc<DutyTracker>,
         pubkey_map: PubkeyMap,
         config: OrchestratorConfig,
+        validator_store: Arc<ValidatorStore>,
     ) -> Self {
-        Self { clock, signer, propagator, beacon, duty_tracker, pubkey_map, config }
+        Self {
+            clock,
+            signer,
+            propagator,
+            beacon,
+            duty_tracker,
+            pubkey_map,
+            config,
+            validator_store,
+        }
     }
 
     /// Processes all attestation duties for a given slot.
@@ -74,7 +92,37 @@ where
             return Err(OrchestratorError::SlotMissed { slot, current_slot });
         }
 
-        let duties = utils::get_duties_for_slot(&self.pubkey_map, &self.duty_tracker, slot).await?;
+        let raw_duties =
+            utils::get_duties_for_slot(&self.pubkey_map, &self.duty_tracker, slot).await?;
+
+        // M-12 (Critical #1): skip duties for validators still inside their
+        // post-import doppelganger window.  The ValidatorStore enabled flag is
+        // set to `false` when a key is imported via the Keymanager API and
+        // flipped to `true` once the background task's window elapses.  Keys
+        // that were never added via the API (i.e. loaded at startup) default
+        // to `enabled = true` and pass through unimpeded.
+        let duties: Vec<AttesterDuty> = raw_duties
+            .into_iter()
+            .filter(|duty| {
+                let hex = duty.pubkey.strip_prefix("0x").unwrap_or(&duty.pubkey);
+                if let Ok(bytes) = hex::decode(hex) {
+                    if bytes.len() == 48 {
+                        let mut pk = [0u8; 48];
+                        pk.copy_from_slice(&bytes);
+                        if !self.validator_store.is_attesting_enabled(&pk) {
+                            warn!(
+                                pubkey = %duty.pubkey,
+                                slot,
+                                "Skipping attestation duty: validator is inside the \
+                                 post-import doppelganger window (M-12)"
+                            );
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+            .collect();
 
         if duties.is_empty() {
             debug!(slot = slot, "No attestation duties for this slot");

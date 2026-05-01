@@ -130,6 +130,7 @@ fn make_state() -> Arc<AppState> {
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         last_set_attesting_enabled: Mutex::new(None),
         doppelganger_window: std::time::Duration::ZERO,
+        cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
     })
 }
 

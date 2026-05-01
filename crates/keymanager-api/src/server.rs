@@ -61,6 +61,7 @@ impl KeymanagerServer {
                 attesting_enabled,
                 last_set_attesting_enabled: std::sync::Mutex::new(None),
                 doppelganger_window,
+                cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             }),
             token: Arc::new(Zeroizing::new(token)),
             addr,

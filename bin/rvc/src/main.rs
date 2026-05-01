@@ -1443,6 +1443,18 @@ async fn run_validator(
         };
         let doppelganger_mon =
             std::sync::Arc::new(keymanager_api::gate::DoppelgangerGate::new(doppelganger_window));
+
+        // M-12 (Critical #2): after a restart, re-arm the gate for any key
+        // whose import-time sidecar shows the doppelganger window has not yet
+        // elapsed.  This prevents keys from bypassing the window on restart.
+        if !doppelganger_window.is_zero() {
+            rvc::keymanager_adapters::scan_and_rearm_gate(
+                &config.keystore_path,
+                doppelganger_mon.as_ref(),
+                doppelganger_window.as_secs(),
+            );
+        }
+
         let remote_key_mgr = std::sync::Arc::new(RemoteKeyManagerAdapter::new(
             km_composite,
             config.remote_signer_allowed_hosts.clone(),

@@ -17,8 +17,9 @@
 //! for this delay.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Duration;
+
+use parking_lot::Mutex;
 
 use crate::traits::{DoppelgangerMonitor, Pubkey};
 
@@ -63,12 +64,12 @@ impl DoppelgangerMonitor for DoppelgangerGate {
     /// Record the start of the doppelganger window for `pubkey`.
     fn start_monitoring(&self, pubkey: Pubkey) {
         let now = tokio::time::Instant::now();
-        self.pending.lock().expect("doppelganger gate mutex poisoned").insert(pubkey, now);
+        self.pending.lock().insert(pubkey, now);
     }
 
     /// Remove `pubkey` from active monitoring (e.g. on key deletion).
     fn stop_monitoring(&self, pubkey: &Pubkey) {
-        self.pending.lock().expect("doppelganger gate mutex poisoned").remove(pubkey);
+        self.pending.lock().remove(pubkey);
     }
 
     /// Returns `true` once the doppelganger window has elapsed for `pubkey`.
@@ -76,7 +77,7 @@ impl DoppelgangerMonitor for DoppelgangerGate {
     /// Keys not under active monitoring (started before this gate was created,
     /// or never imported via the API) return `true` immediately.
     fn is_doppelganger_safe(&self, pubkey: &Pubkey) -> bool {
-        let map = self.pending.lock().expect("doppelganger gate mutex poisoned");
+        let map = self.pending.lock();
         match map.get(pubkey) {
             None => true, // not monitored → safe by default
             Some(started_at) => started_at.elapsed() >= self.window,
@@ -134,8 +135,9 @@ mod tests {
         assert!(!gate.is_doppelganger_safe(&test_pubkey(4)));
     }
 
-    #[test]
-    fn test_zero_window_is_immediately_safe() {
+    #[tokio::test]
+    async fn test_zero_window_is_immediately_safe() {
+        tokio::time::pause();
         // A zero-length window means doppelganger detection is disabled
         let gate = DoppelgangerGate::new(Duration::ZERO);
         gate.start_monitoring(test_pubkey(5));

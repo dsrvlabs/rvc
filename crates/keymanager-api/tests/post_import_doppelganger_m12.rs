@@ -206,6 +206,7 @@ fn make_state(
         attesting_enabled: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         last_set_attesting_enabled: std::sync::Mutex::new(None),
         doppelganger_window: window,
+        cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
     })
 }
 

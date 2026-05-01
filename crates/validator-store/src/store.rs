@@ -201,6 +201,17 @@ impl ValidatorStore {
         self.validators.read().values().filter(|c| c.enabled).map(|c| c.pubkey).collect()
     }
 
+    /// Returns `true` if this validator is permitted to attest.
+    ///
+    /// Keys that are not tracked by the store (e.g. loaded at startup before
+    /// the M-12 gate existed) default to `true` so they are never silently
+    /// blocked.  Only keys explicitly added as `enabled = false` (i.e. freshly
+    /// imported via the Keymanager API while inside the doppelganger window)
+    /// return `false`.
+    pub fn is_attesting_enabled(&self, pubkey: &[u8; 48]) -> bool {
+        self.validators.read().get(pubkey).map(|c| c.enabled).unwrap_or(true)
+    }
+
     pub fn add_validator(&self, config: ValidatorConfig) {
         self.validators.write().insert(config.pubkey, config);
     }
@@ -1541,5 +1552,51 @@ block_selection_mode = "builder-only"
         let pk = test_pubkey(1);
         let config = store.get_config(&pk).unwrap();
         assert_eq!(config.block_selection_mode, Some(BlockSelectionMode::BuilderOnly));
+    }
+
+    // ── M-12 (Critical #1): is_attesting_enabled ─────────────────────────
+
+    /// Unknown pubkeys (not in the store) default to enabled=true so that
+    /// validators loaded at startup without an explicit config still attest.
+    #[test]
+    fn test_is_attesting_enabled_unknown_pubkey_defaults_to_true() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        assert!(store.is_attesting_enabled(&test_pubkey(99)));
+    }
+
+    /// A validator explicitly added with enabled=true is attestable.
+    #[test]
+    fn test_is_attesting_enabled_explicit_true() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+        store.add_validator(ValidatorConfig::new(pk)); // default enabled=true
+        assert!(store.is_attesting_enabled(&pk));
+    }
+
+    /// A validator explicitly added with enabled=false is NOT attestable
+    /// (post-import doppelganger window scenario).
+    #[test]
+    fn test_is_attesting_enabled_explicit_false() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(2);
+        let mut config = ValidatorConfig::new(pk);
+        config.enabled = false;
+        store.add_validator(config);
+        assert!(!store.is_attesting_enabled(&pk));
+    }
+
+    /// After set_enabled flips the flag to true, is_attesting_enabled must
+    /// return true (simulates the doppelganger window expiring).
+    #[test]
+    fn test_is_attesting_enabled_flips_after_set_enabled() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(3);
+        let mut config = ValidatorConfig::new(pk);
+        config.enabled = false;
+        store.add_validator(config);
+        assert!(!store.is_attesting_enabled(&pk), "must be disabled before flip");
+
+        store.set_enabled(&pk, true);
+        assert!(store.is_attesting_enabled(&pk), "must be enabled after flip");
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -6,6 +7,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use crypto::logging::{RedactedUrl, TruncatedPubkey};
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -44,6 +46,13 @@ pub struct AppState {
     /// implementation.  `Duration::ZERO` disables the gate (keys are enabled
     /// immediately, equivalent to turning off doppelganger detection).
     pub doppelganger_window: std::time::Duration,
+    /// Per-key cancellation handles for doppelganger background tasks (SF-3).
+    ///
+    /// When a key is deleted before its window elapses, the associated
+    /// `CancellationToken` is cancelled so the stale background task does not
+    /// prematurely flip `enabled = true` on a re-imported key that has begun
+    /// a fresh doppelganger window.
+    pub cancel_tokens: Mutex<HashMap<Pubkey, CancellationToken>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,8 +138,16 @@ pub async fn import_keystores(
                 state.validator_manager.add_validator(pubkey, false);
                 state.doppelganger_monitor.start_monitoring(pubkey);
 
+                // SF-3: create a cancellation token so that a delete + re-import
+                // within the window can cancel the stale task before it fires.
+                // SF-4: the task calls stop_monitoring after enabling so the
+                //       pending map is pruned and memory does not grow unboundedly.
+                let cancel_token = CancellationToken::new();
+                state.cancel_tokens.lock().unwrap().insert(pubkey, cancel_token.clone());
+
                 {
                     let vm = Arc::clone(&state.validator_manager);
+                    let dm = Arc::clone(&state.doppelganger_monitor);
                     let window = state.doppelganger_window;
                     let pk_hex = pubkey_hex.clone();
                     // Capture the deadline NOW (before spawn) so that
@@ -140,12 +157,25 @@ pub async fn import_keystores(
                     // first-poll time.
                     let deadline = tokio::time::Instant::now() + window;
                     tokio::spawn(async move {
-                        tokio::time::sleep_until(deadline).await;
-                        vm.set_validator_enabled(&pubkey, true);
-                        info!(
-                            pubkey = %TruncatedPubkey::new(&pk_hex),
-                            "Doppelganger window elapsed; enabling validator for attestation"
-                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(deadline) => {
+                                vm.set_validator_enabled(&pubkey, true);
+                                dm.stop_monitoring(&pubkey); // SF-4: prune pending entry
+                                info!(
+                                    pubkey = %TruncatedPubkey::new(&pk_hex),
+                                    "Doppelganger window elapsed; enabling validator for attestation"
+                                );
+                            }
+                            _ = cancel_token.cancelled() => {
+                                // Key was deleted (or re-imported) before the window elapsed.
+                                // Do not enable: a fresh window is already running or the
+                                // key has been removed entirely.
+                                info!(
+                                    pubkey = %TruncatedPubkey::new(&pk_hex),
+                                    "Doppelganger background task cancelled (key deleted or re-imported)"
+                                );
+                            }
+                        }
                     });
                 }
 
@@ -220,6 +250,11 @@ pub async fn delete_keystores(
                     );
                     state.validator_manager.remove_validator(pubkey);
                     state.doppelganger_monitor.stop_monitoring(pubkey);
+                    // SF-3: cancel any in-flight doppelganger background task so a
+                    // stale task cannot prematurely enable a re-imported key.
+                    if let Some(token) = state.cancel_tokens.lock().unwrap().remove(pubkey) {
+                        token.cancel();
+                    }
                     results.push(DeleteKeystoreResult {
                         status: DeleteStatus::Deleted,
                         message: String::new(),
@@ -1149,6 +1184,7 @@ mod tests {
                 attesting_enabled: Arc::new(AtomicBool::new(true)),
                 last_set_attesting_enabled: std::sync::Mutex::new(None),
                 doppelganger_window: std::time::Duration::ZERO,
+                cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
             Router::new()
                 .route(
@@ -2495,6 +2531,7 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         let router = Router::new()
@@ -2543,6 +2580,7 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         let router = Router::new()
@@ -2591,6 +2629,7 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         let router = Router::new()
@@ -2682,6 +2721,7 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         Router::new()
             .route(
@@ -3101,6 +3141,7 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         Router::new()
             .route(
@@ -3236,6 +3277,7 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
         Router::new()
             .route("/rvc/v1/validator/:pubkey/prepare_exit", axum::routing::post(prepare_exit))
@@ -3348,6 +3390,7 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         let api = Router::new()

@@ -60,6 +60,114 @@ impl KeystoreManagerAdapter {
     }
 }
 
+/// Returns the path for the M-12 import-time metadata sidecar for `pubkey`.
+///
+/// Format: `<keystore_dir>/0x<hex_pubkey>.import_meta.json`
+fn import_meta_path(keystore_dir: &std::path::Path, pubkey: &Pubkey) -> std::path::PathBuf {
+    keystore_dir.join(format!("0x{}.import_meta.json", hex::encode(pubkey)))
+}
+
+/// Scan `keystore_dir` for `*.import_meta.json` sidecars and re-arm the
+/// doppelganger `gate` for any key whose import timestamp is recent enough
+/// that the doppelganger window (`window_secs`) has not yet elapsed.
+///
+/// Called once at startup after the `DoppelgangerGate` is created to restore
+/// in-memory monitoring state that was lost when the process was restarted.
+///
+/// # Safety guarantee
+/// If the `now - imported_unix < window_secs` check passes, the key is added
+/// to the gate's `pending` map with the *current* instant so the residual
+/// window is honoured.  This means the gate will still block attestation for
+/// the full configured window from the perspective of the restarted process,
+/// which is slightly more conservative than replaying the exact residual but
+/// is safe.
+pub fn scan_and_rearm_gate(
+    keystore_dir: &std::path::Path,
+    gate: &dyn DoppelgangerMonitor,
+    window_secs: u64,
+) {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let entries = match std::fs::read_dir(keystore_dir) {
+        Ok(e) => e,
+        Err(err) => {
+            warn!(
+                error = %err,
+                dir = %keystore_dir.display(),
+                "Could not read keystore directory when scanning import-meta sidecars"
+            );
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_owned(),
+            None => continue,
+        };
+
+        if !name.ends_with(".import_meta.json") {
+            continue;
+        }
+
+        // Parse the pubkey hex from the filename: `0x<hex>.import_meta.json`
+        let hex_part =
+            name.strip_prefix("0x").and_then(|s| s.strip_suffix(".import_meta.json")).unwrap_or("");
+
+        let pubkey_bytes = match hex::decode(hex_part) {
+            Ok(b) if b.len() == 48 => {
+                let mut pk = [0u8; 48];
+                pk.copy_from_slice(&b);
+                pk
+            }
+            _ => continue,
+        };
+
+        // Read the sidecar JSON
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "Failed to read import_meta sidecar; skipping"
+                );
+                continue;
+            }
+        };
+
+        let imported_unix: u64 = match serde_json::from_str::<serde_json::Value>(&content)
+            .ok()
+            .and_then(|v| v["imported_unix_seconds"].as_u64())
+        {
+            Some(t) => t,
+            None => {
+                warn!(
+                    path = %path.display(),
+                    "import_meta sidecar has unexpected format; skipping"
+                );
+                continue;
+            }
+        };
+
+        let elapsed = now_unix.saturating_sub(imported_unix);
+        if elapsed < window_secs {
+            let residual = window_secs - elapsed;
+            warn!(
+                pubkey = %hex::encode(pubkey_bytes),
+                residual_secs = residual,
+                "Key was imported {elapsed}s ago; doppelganger window has {residual}s remaining \
+                 — re-arming gate after restart"
+            );
+            gate.start_monitoring(pubkey_bytes);
+        }
+    }
+}
+
 impl KeystoreManager for KeystoreManagerAdapter {
     fn list_keys(&self) -> Vec<Pubkey> {
         self.tracked_keys.lock().clone()
@@ -116,6 +224,38 @@ impl KeystoreManager for KeystoreManagerAdapter {
                 .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
         }
 
+        // M-12 (Critical #2): persist the import timestamp so that after a
+        // restart the doppelganger gate can detect keys whose window is still
+        // active and re-arm monitoring rather than treating them as safe.
+        let meta_path = import_meta_path(&self.keystore_dir, &pubkey_bytes);
+        let now_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let meta_json = format!("{{\"imported_unix_seconds\":{}}}", now_unix);
+
+        #[cfg(unix)]
+        {
+            use std::fs::OpenOptions;
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            if let Ok(mut f) = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&meta_path)
+            {
+                let _ = f.write_all(meta_json.as_bytes());
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = std::fs::write(&meta_path, meta_json.as_bytes());
+        }
+
         // Add to composite signer for signing
         let public_key = secret_key.public_key();
         self.composite_signer.add_local_key(secret_key);
@@ -150,6 +290,11 @@ impl KeystoreManager for KeystoreManagerAdapter {
                 }
                 Err(e) => return Err(DeleteKeystoreError::Io(e.to_string())),
             }
+
+            // M-12 (Critical #2): remove the import-time sidecar so a
+            // subsequent re-import starts with a clean timestamp.
+            let meta_path = import_meta_path(&self.keystore_dir, pubkey);
+            let _ = std::fs::remove_file(&meta_path);
 
             // Only remove from memory after file delete succeeds
             keys.remove(pos);
@@ -1880,5 +2025,131 @@ mod tests {
             let gl = reloaded.effective_gas_limit(&pk);
             assert_eq!(gl, 30_000_000 + i as u64 * 1_000_000);
         }
+    }
+
+    // ── M-12 Critical #2: import_meta sidecar persistence ────────────────
+
+    /// Importing a keystore must write a `0x<pubkey>.import_meta.json` sidecar
+    /// with the current Unix timestamp.
+    #[test]
+    fn test_import_keystore_writes_import_meta_sidecar() {
+        let composite = create_empty_composite_signer();
+        let dir = TempDir::new().unwrap();
+        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone());
+
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+        let password = b"testpass";
+        let keystore = crypto::Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            crypto::EncryptionKdf::Pbkdf2,
+        )
+        .expect("encrypt");
+        let keystore_json = serde_json::to_string(&keystore).unwrap();
+
+        let before =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+
+        adapter.import_keystore(&keystore_json, "testpass").unwrap();
+
+        let after =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+
+        // The sidecar must exist
+        let meta_path = import_meta_path(dir.path(), &pk_bytes);
+        assert!(meta_path.exists(), "import_meta sidecar must be written on import");
+
+        // The sidecar must contain a valid timestamp
+        let content = std::fs::read_to_string(&meta_path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let ts = v["imported_unix_seconds"].as_u64().expect("timestamp missing");
+        assert!(
+            ts >= before && ts <= after,
+            "sidecar timestamp must be within the import window: before={before} ts={ts} after={after}"
+        );
+    }
+
+    /// Deleting a keystore must remove the corresponding sidecar.
+    #[test]
+    fn test_delete_keystore_removes_import_meta_sidecar() {
+        let composite = create_empty_composite_signer();
+        let dir = TempDir::new().unwrap();
+        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone());
+
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+        let password = b"testpass";
+        let keystore = crypto::Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            crypto::EncryptionKdf::Pbkdf2,
+        )
+        .expect("encrypt");
+        let keystore_json = serde_json::to_string(&keystore).unwrap();
+        adapter.import_keystore(&keystore_json, "testpass").unwrap();
+
+        let meta_path = import_meta_path(dir.path(), &pk_bytes);
+        assert!(meta_path.exists(), "sidecar should exist after import");
+
+        adapter.delete_keystore(&pk_bytes).unwrap();
+        assert!(!meta_path.exists(), "sidecar must be removed after delete");
+    }
+
+    /// `scan_and_rearm_gate` must call `start_monitoring` for any key whose
+    /// sidecar shows an import timestamp within the configured window.
+    #[test]
+    fn test_scan_and_rearm_gate_rearms_recent_keys() {
+        use keymanager_api::gate::DoppelgangerGate;
+        use keymanager_api::traits::DoppelgangerMonitor;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let pk: Pubkey = [0xABu8; 48];
+
+        // Write a sidecar with import time = now (very recent → still in window)
+        let now_unix =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let meta_path = import_meta_path(dir.path(), &pk);
+        std::fs::write(&meta_path, format!("{{\"imported_unix_seconds\":{}}}", now_unix)).unwrap();
+
+        let window_secs = 768u64; // 2 epochs on mainnet
+        let gate = DoppelgangerGate::new(Duration::from_secs(window_secs));
+
+        // Before rearm: key is not monitored → safe by default
+        assert!(gate.is_doppelganger_safe(&pk), "key must be safe before monitoring starts");
+
+        scan_and_rearm_gate(dir.path(), &gate, window_secs);
+
+        // After rearm: key is monitored → not safe yet (just started)
+        assert!(!gate.is_doppelganger_safe(&pk), "key must be blocked after gate is re-armed");
+    }
+
+    /// `scan_and_rearm_gate` must NOT re-arm keys whose window has already elapsed.
+    #[test]
+    fn test_scan_and_rearm_gate_skips_expired_keys() {
+        use keymanager_api::gate::DoppelgangerGate;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let pk: Pubkey = [0xCDu8; 48];
+        let window_secs = 768u64;
+
+        // Write a sidecar with import time = now - window - 100s (already expired)
+        let old_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(window_secs + 100);
+        let meta_path = import_meta_path(dir.path(), &pk);
+        std::fs::write(&meta_path, format!("{{\"imported_unix_seconds\":{}}}", old_unix)).unwrap();
+
+        let gate = DoppelgangerGate::new(Duration::from_secs(window_secs));
+        scan_and_rearm_gate(dir.path(), &gate, window_secs);
+
+        // Key should NOT be re-armed because window has expired
+        assert!(gate.is_doppelganger_safe(&pk), "expired key must remain safe (not re-armed)");
     }
 }
