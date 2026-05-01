@@ -167,13 +167,20 @@ async fn test_pubkey_truncated_in_basic_backend_log() {
         output
     );
 
-    // The full 96-char hex must NOT appear as the `pubkey` field value.
-    // We check for `pubkey=<full>` explicitly (the path field may still carry
-    // the hex as a filename, so we scope the check to the field name prefix).
-    let full_pubkey_field = format!("pubkey={}", full_hex);
+    // The full 96-char hex must NOT appear as the `pubkey` field value, in
+    // either the no-prefix or 0x-prefixed form. We check both explicitly so a
+    // future regression that writes `pubkey = %format!("0x{}", hex::encode(…))`
+    // would also fail this test.
+    let full_pubkey_field_no_prefix = format!("pubkey={}", full_hex);
+    let full_pubkey_field_0x = format!("pubkey=0x{}", full_hex);
     assert!(
-        !output.contains(&full_pubkey_field),
-        "full pubkey as 'pubkey=' field must not appear in load log, got:\n{}",
+        !output.contains(&full_pubkey_field_no_prefix),
+        "full pubkey (no 0x) as 'pubkey=' field must not appear in load log, got:\n{}",
+        output
+    );
+    assert!(
+        !output.contains(&full_pubkey_field_0x),
+        "full pubkey (0x-prefixed) as 'pubkey=' field must not appear in load log, got:\n{}",
         output
     );
 }

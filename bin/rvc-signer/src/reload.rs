@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crypto::logging::TruncatedPubkey;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
@@ -77,18 +78,28 @@ impl KeystoreReloader {
                 // Try to find by scanning (filename might not match pubkey)
                 if let Some(sk) = self.try_load_pubkey(pubkey) {
                     self.backend.add_key(*pubkey, sk).await;
-                    info!(pubkey = %hex::encode(pubkey), "Keystore added via reload");
+                    info!(
+                        pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                        "Keystore added via reload"
+                    );
                     added += 1;
                 }
             } else {
                 match load_keystore_from_file(&path, &self.password) {
                     Ok((sk, _)) => {
                         self.backend.add_key(*pubkey, sk).await;
-                        info!(pubkey = %hex::encode(pubkey), "Keystore added via reload");
+                        info!(
+                            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                            "Keystore added via reload"
+                        );
                         added += 1;
                     }
                     Err(e) => {
-                        warn!(pubkey = %hex::encode(pubkey), error = %e, "Failed to load new keystore");
+                        warn!(
+                            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                            error = %e,
+                            "Failed to load new keystore"
+                        );
                     }
                 }
             }
@@ -96,7 +107,10 @@ impl KeystoreReloader {
 
         for pubkey in &to_remove {
             self.backend.remove_key(pubkey).await;
-            info!(pubkey = %hex::encode(pubkey), "Keystore removed via reload");
+            info!(
+                pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                "Keystore removed via reload"
+            );
             removed += 1;
         }
 

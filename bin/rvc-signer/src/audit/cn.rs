@@ -34,7 +34,17 @@ pub fn extract_client_cn<T>(request: &tonic::Request<T>) -> String {
 
     // The first certificate in the chain is the leaf (client) certificate.
     let der: &[u8] = &certs[0];
-    extract_cn_from_der(der).unwrap_or_else(|| "unknown".to_string())
+    extract_cn_from_der(der).unwrap_or_else(|| {
+        // Operators must be able to detect misconfigured certs that fall back
+        // to the shared "unknown" namespace — co-mingling slashing-protection
+        // records is a serious safety issue.
+        tracing::warn!(
+            "TLS client certificate has no parseable CN; using 'unknown' \
+             namespace — slashing-protection records will be co-mingled with \
+             other unparseable-CN clients"
+        );
+        "unknown".to_string()
+    })
 }
 
 /// Extract the CN from a DER-encoded X.509 certificate using `x509-parser`.
