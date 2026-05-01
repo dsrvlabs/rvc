@@ -64,7 +64,18 @@ pub fn check_insecure_startup(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
     use super::*;
+
+    /// Serialise tests in this module that mutate `RVC_SIGNER_ALLOW_INSECURE`.
+    /// Without this lock, parallel cargo-test execution can race and flip the
+    /// env var out from under another test (review MF-2: same pattern as
+    /// `bin/rvc-signer/tests/insecure_flag_h9.rs::env_lock`).
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn loopback() -> SocketAddr {
         "127.0.0.1:9000".parse().unwrap()
@@ -77,12 +88,14 @@ mod tests {
     #[test]
     fn test_not_insecure_is_always_ok() {
         // insecure=false → gate not consulted → Ok regardless of bind addr
+        // (no env-var reads — no lock needed)
         assert!(check_insecure_startup(false, non_loopback(), InsecureMode::Refuse).is_ok());
         assert!(check_insecure_startup(false, loopback(), InsecureMode::Refuse).is_ok());
     }
 
     #[test]
     fn test_warn_mode_always_returns_ok() {
+        let _lock = env_lock();
         unsafe { std::env::remove_var(INSECURE_ENV_VAR) };
         assert!(check_insecure_startup(true, non_loopback(), InsecureMode::Warn).is_ok());
         assert!(check_insecure_startup(true, loopback(), InsecureMode::Warn).is_ok());
@@ -90,18 +103,21 @@ mod tests {
 
     #[test]
     fn test_refuse_non_loopback_no_env_returns_err() {
+        let _lock = env_lock();
         unsafe { std::env::remove_var(INSECURE_ENV_VAR) };
         assert!(check_insecure_startup(true, non_loopback(), InsecureMode::Refuse).is_err());
     }
 
     #[test]
     fn test_refuse_loopback_no_env_returns_err() {
+        let _lock = env_lock();
         unsafe { std::env::remove_var(INSECURE_ENV_VAR) };
         assert!(check_insecure_startup(true, loopback(), InsecureMode::Refuse).is_err());
     }
 
     #[test]
     fn test_refuse_non_loopback_with_env_returns_err() {
+        let _lock = env_lock();
         unsafe { std::env::set_var(INSECURE_ENV_VAR, "true") };
         let result = check_insecure_startup(true, non_loopback(), InsecureMode::Refuse);
         unsafe { std::env::remove_var(INSECURE_ENV_VAR) };
@@ -110,6 +126,7 @@ mod tests {
 
     #[test]
     fn test_refuse_loopback_with_env_returns_ok() {
+        let _lock = env_lock();
         unsafe { std::env::set_var(INSECURE_ENV_VAR, "true") };
         let result = check_insecure_startup(true, loopback(), InsecureMode::Refuse);
         unsafe { std::env::remove_var(INSECURE_ENV_VAR) };
@@ -118,6 +135,7 @@ mod tests {
 
     #[test]
     fn test_error_message_contains_env_var_name() {
+        let _lock = env_lock();
         unsafe { std::env::remove_var(INSECURE_ENV_VAR) };
         let err = check_insecure_startup(true, non_loopback(), InsecureMode::Refuse).unwrap_err();
         assert!(err.to_string().contains(INSECURE_ENV_VAR), "got: {err}");

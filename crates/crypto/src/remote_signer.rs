@@ -205,10 +205,22 @@ impl Signer for RemoteSigner {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
     use super::*;
     use crate::SecretKey;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Serialise tests in this module that read or mutate
+    /// `RVC_REMOTE_SIGNER_ALLOW_INSECURE`.  Without this lock, parallel
+    /// cargo-test execution can race a sibling test setting the var while
+    /// `test_remote_signer_refuses_http_url_without_env_var` is running and
+    /// silently weaken the GA Refuse contract guard (review MF-3).
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn test_remote_signer_config_defaults() {
@@ -415,7 +427,7 @@ mod tests {
         assert!(signer.public_keys().is_empty());
     }
 
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use tracing_subscriber::layer::SubscriberExt;
 
     struct SpanCapture {
@@ -665,6 +677,7 @@ mod tests {
     /// In Phase 2 this returned `Ok` with a log warning.  At GA it must `Err`.
     #[test]
     fn test_remote_signer_refuses_http_url_without_env_var() {
+        let _lock = env_lock();
         // Ensure the env var is not set so the gate is in full-Refuse path.
         unsafe { std::env::remove_var(REMOTE_SIGNER_INSECURE_ENV_VAR) };
         let pk = [0xaa; PUBLIC_KEY_BYTES_LEN];

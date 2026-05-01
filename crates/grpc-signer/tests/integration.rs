@@ -416,12 +416,26 @@ async fn test_composite_signer_grpc_remote_takes_priority_over_local_in_key_list
 // Additional: plaintext E2E (no TLS) to verify basic wiring
 // ---------------------------------------------------------------------------
 
+/// Idempotent process-lifetime opt-in to the insecure remote-signer env var.
+/// Used by the plaintext E2E test below.  Panic-safe: a panic during
+/// `connect()` cannot leave the var set "leaked" because there is no paired
+/// remove (this binary has no Refuse-path tests, so the var staying set for
+/// the binary lifetime is the desired behavior — see review note).
+fn allow_insecure_for_tests() {
+    use std::sync::OnceLock;
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        unsafe { std::env::set_var(rvc_grpc_signer::REMOTE_SIGNER_INSECURE_ENV_VAR, "true") };
+    });
+}
+
 #[tokio::test]
 async fn test_e2e_plaintext_connect_lists_keys() {
-    // Set the insecure env var to permit plaintext (http://) connections for this
-    // test.  At GA (ISSUE-3.13) the default mode is Refuse; the operator must
-    // explicitly opt in.
-    unsafe { std::env::set_var(rvc_grpc_signer::REMOTE_SIGNER_INSECURE_ENV_VAR, "true") };
+    // GA (ISSUE-3.13) default mode is Refuse; we explicitly opt in for the
+    // plaintext path.  Use the OnceLock helper instead of a raw set/remove
+    // sandwich so a panic in `connect()` cannot leave the gate disabled for
+    // siblings (review MF-1: panic-unsafe set_var/remove_var).
+    allow_insecure_for_tests();
 
     let sk = SecretKey::generate();
     let pk_bytes = sk.public_key().to_bytes();
@@ -430,8 +444,6 @@ async fn test_e2e_plaintext_connect_lists_keys() {
 
     let config = GrpcRemoteSignerConfig::new(format!("http://{addr}"));
     let signer = GrpcRemoteSigner::connect(config).await.unwrap();
-
-    unsafe { std::env::remove_var(rvc_grpc_signer::REMOTE_SIGNER_INSECURE_ENV_VAR) };
 
     // GrpcRemoteSigner has ListPublicKeys working
     assert_eq!(signer.public_keys().len(), 1);
