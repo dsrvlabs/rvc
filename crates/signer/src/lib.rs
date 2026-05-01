@@ -25,8 +25,8 @@ use eth_types::{
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SLOTS_PER_EPOCH,
 };
 use metrics::definitions::{
-    slashing_result, RVC_ATTESTATIONS_TOTAL, RVC_SIGNING_DURATION_SECONDS,
-    RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
+    slashing_result, tx_hold_kind, RVC_ATTESTATIONS_TOTAL, RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS,
+    RVC_SIGNING_DURATION_SECONDS, RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
 };
 use slashing::{SlashingDb, SlashingError};
 
@@ -211,6 +211,8 @@ impl SignerService {
         // transaction so no phantom row is committed (M-1 fix, architecture A15).
         let inner_result =
             tokio::task::spawn_blocking(move || -> Result<Signature, SignerError> {
+                // Capture the start of the SQLite transaction hold (ISSUE-3.12).
+                let tx_start = Instant::now();
                 let staged = db
                     .stage_attestation(
                         "local-vc",
@@ -241,6 +243,8 @@ impl SignerService {
                     .inc();
 
                 let sign_result = handle.block_on(signer.sign(&signing_root, &pubkey_bytes));
+                // Measure hold duration before commit/discard (ISSUE-3.12).
+                let tx_hold_ms = tx_start.elapsed().as_millis() as f64;
 
                 match sign_result {
                     Ok(sig) => {
@@ -251,14 +255,23 @@ impl SignerService {
                                 error = %e,
                                 "Failed to commit attestation to slashing DB after successful sign"
                             );
+                            RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                                .with_label_values(&[tx_hold_kind::ATTESTATION])
+                                .observe(tx_hold_ms);
                             return Err(SignerError::SlashingProtectionBlocked(e));
                         }
+                        RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                            .with_label_values(&[tx_hold_kind::ATTESTATION])
+                            .observe(tx_hold_ms);
                         Ok(sig)
                     }
                     Err(e) => {
                         // Signer failed — discard the staged transaction so no phantom row
                         // remains in the DB (M-1 fix).
                         staged.discard();
+                        RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                            .with_label_values(&[tx_hold_kind::ATTESTATION])
+                            .observe(tx_hold_ms);
                         warn!(
                             pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
                             error = %e,
@@ -351,6 +364,8 @@ impl SignerService {
 
         let inner_result =
             tokio::task::spawn_blocking(move || -> Result<Signature, SignerError> {
+                // Capture the start of the SQLite transaction hold (ISSUE-3.12).
+                let tx_start = Instant::now();
                 let staged = db
                     .stage_block("local-vc", &pubkey_hex_clone, slot, Some(signing_root_hex), &gvr)
                     .map_err(|e| {
@@ -371,6 +386,8 @@ impl SignerService {
                     .inc();
 
                 let sign_result = handle.block_on(signer.sign(&signing_root, &pubkey_bytes));
+                // Measure hold duration before commit/discard (ISSUE-3.12).
+                let tx_hold_ms = tx_start.elapsed().as_millis() as f64;
 
                 match sign_result {
                     Ok(sig) => {
@@ -381,13 +398,22 @@ impl SignerService {
                                 error = %e,
                                 "Failed to commit block to slashing DB after successful sign"
                             );
+                            RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                                .with_label_values(&[tx_hold_kind::BLOCK])
+                                .observe(tx_hold_ms);
                             return Err(SignerError::SlashingProtectionBlocked(e));
                         }
+                        RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                            .with_label_values(&[tx_hold_kind::BLOCK])
+                            .observe(tx_hold_ms);
                         Ok(sig)
                     }
                     Err(e) => {
                         // Signer failed — discard the staged transaction (M-1 fix).
                         staged.discard();
+                        RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                            .with_label_values(&[tx_hold_kind::BLOCK])
+                            .observe(tx_hold_ms);
                         warn!(
                             pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
                             error = %e,

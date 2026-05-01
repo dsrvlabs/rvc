@@ -304,6 +304,26 @@ lazy_static! {
         gauge
     };
 
+    /// Histogram for slashing-DB transaction hold duration in milliseconds.
+    ///
+    /// Measures the wall-clock time from immediately before `stage_attestation` /
+    /// `stage_block` until the corresponding `commit()` or `discard()` call.
+    /// A high p99 indicates SQLite write latency under load.
+    ///
+    /// Labels: `kind` — either `"attestation"` or `"block"`.
+    /// Buckets: 1 ms … 5 s (11 buckets).
+    pub static ref RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS: HistogramVec = {
+        let opts = HistogramOpts::new(
+            "rvc_signer_slashing_tx_hold_duration_ms",
+            "Duration (ms) that the slashing-DB transaction is held per stage→commit/discard cycle"
+        ).buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0]);
+        let histogram = HistogramVec::new(opts, &["kind"])
+            .expect("Failed to create rvc_signer_slashing_tx_hold_duration_ms metric");
+        REGISTRY.register(Box::new(histogram.clone()))
+            .expect("Failed to register rvc_signer_slashing_tx_hold_duration_ms metric");
+        histogram
+    };
+
 }
 
 /// Initializes all core metrics by accessing the lazy_static variables.
@@ -332,6 +352,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL);
     lazy_static::initialize(&RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL);
     lazy_static::initialize(&RVC_BN_HEALTH_TIER);
+    lazy_static::initialize(&RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS);
 }
 
 /// Attestation status label values.
@@ -356,6 +377,12 @@ pub mod orchestrator_result {
 
 /// Slashing DB prune type label values.
 pub mod prune_type {
+    pub const ATTESTATION: &str = "attestation";
+    pub const BLOCK: &str = "block";
+}
+
+/// `kind` label values for `rvc_signer_slashing_tx_hold_duration_ms`.
+pub mod tx_hold_kind {
     pub const ATTESTATION: &str = "attestation";
     pub const BLOCK: &str = "block";
 }
