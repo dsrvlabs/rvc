@@ -322,6 +322,7 @@ where
             tracing::error!(
                 error = %e,
                 validator = %validator_index,
+                pubkey = %crypto::logging::TruncatedPubkey::new(&duty.pubkey),
                 slot,
                 "AttestationData failed sanity check (M-2); dropping duty"
             );

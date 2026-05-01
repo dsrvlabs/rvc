@@ -6,11 +6,15 @@
 //!
 //! # Checks (M-2)
 //!
-//! 1. `target.epoch == data.slot / SLOTS_PER_EPOCH` — the target epoch must be
-//!    consistent with the slot.
-//! 2. `source.epoch <= target.epoch` — the source checkpoint cannot be after
+//! 1. `data.slot == expected_slot` — the BN must return data for the slot the
+//!    duty asked about; otherwise a confused/malicious BN can substitute a
+//!    neighbouring slot still inside the ±2-slot clock window.
+//! 2. `target.epoch == data.slot / SLOTS_PER_EPOCH` — the target epoch must be
+//!    internally consistent with `data.slot` (with check 1 enforced this is
+//!    equivalent to `expected_slot / SLOTS_PER_EPOCH`).
+//! 3. `source.epoch <= target.epoch` — the source checkpoint cannot be after
 //!    the target.
-//! 3. `data.slot` is within ±2 slots of `current_clock_slot` — guards against
+//! 4. `data.slot` is within ±2 slots of `current_clock_slot` — guards against
 //!    far-future or far-past attestation data caused by BN clock skew or a
 //!    malicious BN.
 
@@ -20,6 +24,9 @@ use thiserror::Error;
 /// Errors emitted by [`validate_attestation_data`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum AttestationServiceError {
+    #[error("attestation data slot {got} does not match expected duty slot {expected}")]
+    SlotMismatch { expected: Slot, got: Slot },
+
     #[error(
         "target epoch mismatch: slot {slot} is in epoch {expected_epoch}, \
          but target.epoch = {got_epoch}"
@@ -56,10 +63,21 @@ pub fn validate_attestation_data(
     expected_slot: Slot,
     current_clock_slot: Slot,
 ) -> Result<(), AttestationServiceError> {
-    // Check 1: target.epoch must equal data.slot / SLOTS_PER_EPOCH.
-    // We derive the expected epoch from the duty slot, not from data.slot, so
-    // a BN that returns an inconsistent (slot, target.epoch) pair is rejected.
-    let expected_target_epoch = expected_slot / SLOTS_PER_EPOCH;
+    // Check 1: data.slot must match the slot the duty asked about. Without
+    // this, a BN can substitute a neighbouring slot still inside the ±2-slot
+    // clock window (epoch boundary worst-case: expected=31 vs returned=32
+    // are both valid clock-window-wise but live in different epochs).
+    if data.slot != expected_slot {
+        return Err(AttestationServiceError::SlotMismatch {
+            expected: expected_slot,
+            got: data.slot,
+        });
+    }
+
+    // Check 2: target.epoch must equal data.slot / SLOTS_PER_EPOCH. Anchored
+    // on data.slot — with check 1 enforced, this is equivalent to
+    // expected_slot / SLOTS_PER_EPOCH.
+    let expected_target_epoch = data.slot / SLOTS_PER_EPOCH;
     if data.target.epoch != expected_target_epoch {
         return Err(AttestationServiceError::TargetEpochMismatch {
             slot: data.slot,
@@ -110,7 +128,35 @@ mod tests {
         make_data(slot, epoch, source)
     }
 
-    // ── Check 1: target.epoch == expected_slot / SLOTS_PER_EPOCH ─────────────
+    // ── Check 1: data.slot == expected_slot ──────────────────────────────────
+
+    #[test]
+    fn test_data_slot_mismatch_rejected() {
+        // BN returns slot=65 inside the clock window for an expected_slot=64
+        // duty. Must reject — different slot would produce an attestation for
+        // a neighbour, with all the consequences that carries (wrong head root,
+        // potentially wrong target epoch at boundary, slashing-DB row burn).
+        let data = valid(65);
+        assert!(matches!(
+            validate_attestation_data(&data, 64, 64),
+            Err(AttestationServiceError::SlotMismatch { expected: 64, got: 65 })
+        ));
+    }
+
+    #[test]
+    fn test_data_slot_epoch_boundary_substitution_rejected() {
+        // expected_slot=31 (last slot of epoch 0); BN returns slot=32 (first
+        // slot of epoch 1). Both inside the ±2 clock window.
+        // Must reject before the target_epoch check anchored on data.slot
+        // would otherwise let the (mismatched) pair pass.
+        let data = valid(32);
+        assert!(matches!(
+            validate_attestation_data(&data, 31, 31),
+            Err(AttestationServiceError::SlotMismatch { expected: 31, got: 32 })
+        ));
+    }
+
+    // ── Check 2: target.epoch == data.slot / SLOTS_PER_EPOCH ─────────────────
 
     #[test]
     fn test_target_epoch_mismatch_rejected() {
