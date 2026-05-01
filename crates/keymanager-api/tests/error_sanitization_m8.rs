@@ -211,6 +211,7 @@ async fn test_internal_error_sanitized() {
         exit_manager: None,
         allow_insecure_remote_signer: true,
         attesting_enabled: Arc::new(AtomicBool::new(true)),
+        last_set_attesting_enabled: std::sync::Mutex::new(None),
     });
 
     let slashing_data = r#"{"metadata":{"interchange_format_version":"5","genesis_validators_root":"0x0000000000000000000000000000000000000000000000000000000000000000"},"data":[]}"#;
@@ -260,6 +261,7 @@ async fn test_keystore_import_item_error_sanitized() {
         exit_manager: None,
         allow_insecure_remote_signer: true,
         attesting_enabled: Arc::new(AtomicBool::new(true)),
+        last_set_attesting_enabled: std::sync::Mutex::new(None),
     });
 
     let body = serde_json::json!({
@@ -311,6 +313,7 @@ async fn test_remote_key_import_item_error_sanitized() {
         exit_manager: None,
         allow_insecure_remote_signer: true,
         attesting_enabled: Arc::new(AtomicBool::new(true)),
+        last_set_attesting_enabled: std::sync::Mutex::new(None),
     });
 
     let pubkey_str = format!("0x{}", pubkey_hex(3));

@@ -31,5 +31,6 @@ parking_lot.workspace = true
 http-body-util = "0.1"
 hyper = "1"
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
 tower = { workspace = true, features = ["util"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

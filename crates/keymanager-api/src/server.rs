@@ -58,6 +58,7 @@ impl KeymanagerServer {
                 exit_manager,
                 allow_insecure_remote_signer,
                 attesting_enabled,
+                last_set_attesting_enabled: std::sync::Mutex::new(None),
             }),
             token: Arc::new(Zeroizing::new(token)),
             addr,

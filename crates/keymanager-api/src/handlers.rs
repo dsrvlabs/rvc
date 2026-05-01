@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use crypto::logging::{RedactedUrl, TruncatedPubkey};
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,8 @@ pub struct AppState {
     pub exit_manager: Option<Arc<dyn VoluntaryExitManager>>,
     pub allow_insecure_remote_signer: bool,
     pub attesting_enabled: Arc<AtomicBool>,
+    /// Last time `set_attesting_enabled` was accepted; used for rate limiting.
+    pub last_set_attesting_enabled: Mutex<Option<tokio::time::Instant>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -620,10 +622,43 @@ pub(crate) fn format_pubkey(pubkey: &[u8; 48]) -> String {
     format!("0x{}", hex::encode(pubkey))
 }
 
+/// Rate-limit window for `set_attesting_enabled`: 1 call per 60 seconds.
+const ATTESTING_RATE_LIMIT_SECS: u64 = 60;
+
 pub async fn set_attesting_enabled(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<SetAttestingRequest>,
-) -> Json<SetAttestingResponse> {
+) -> Result<Json<SetAttestingResponse>, crate::error::ApiError> {
+    // ── Rate limiting ────────────────────────────────────────────────────────
+    {
+        let mut last = state.last_set_attesting_enabled.lock().expect("rate-limit mutex poisoned");
+        let now = tokio::time::Instant::now();
+        if let Some(prev) = *last {
+            let elapsed = now.duration_since(prev).as_secs();
+            if elapsed < ATTESTING_RATE_LIMIT_SECS {
+                let retry_after = ATTESTING_RATE_LIMIT_SECS - elapsed;
+                return Err(crate::error::ApiError::RateLimited { retry_after_secs: retry_after });
+            }
+        }
+        *last = Some(now);
+    }
+
+    // ── Audit log ────────────────────────────────────────────────────────────
+    let caller_prefix = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t.chars().take(8).collect::<String>())
+        .unwrap_or_else(|| "<none>".to_string());
+
+    info!(
+        caller = %caller_prefix,
+        requested = request.enabled,
+        "set_attesting_enabled audit"
+    );
+
+    // ── Apply the change ─────────────────────────────────────────────────────
     let previous = state.attesting_enabled.swap(request.enabled, Ordering::Relaxed);
     let current = request.enabled;
 
@@ -635,7 +670,7 @@ pub async fn set_attesting_enabled(
 
     metrics::definitions::RVC_ATTESTING_ENABLED.set(if current { 1.0 } else { 0.0 });
 
-    Json(SetAttestingResponse { enabled: current })
+    Ok(Json(SetAttestingResponse { enabled: current }))
 }
 
 #[cfg(test)]
@@ -1061,6 +1096,7 @@ mod tests {
                 exit_manager: None,
                 allow_insecure_remote_signer: true,
                 attesting_enabled: Arc::new(AtomicBool::new(true)),
+                last_set_attesting_enabled: std::sync::Mutex::new(None),
             });
             Router::new()
                 .route(
@@ -2400,6 +2436,7 @@ mod tests {
             exit_manager: None,
             allow_insecure_remote_signer: false,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
         });
 
         let router = Router::new()
@@ -2446,6 +2483,7 @@ mod tests {
             exit_manager: None,
             allow_insecure_remote_signer: false,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
         });
 
         let router = Router::new()
@@ -2492,6 +2530,7 @@ mod tests {
             exit_manager: None,
             allow_insecure_remote_signer: false,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
         });
 
         let router = Router::new()
@@ -2581,6 +2620,7 @@ mod tests {
             exit_manager: None,
             allow_insecure_remote_signer: true,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
         });
         Router::new()
             .route(
@@ -2998,6 +3038,7 @@ mod tests {
             exit_manager,
             allow_insecure_remote_signer: true,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
         });
         Router::new()
             .route(
@@ -3131,6 +3172,7 @@ mod tests {
             exit_manager,
             allow_insecure_remote_signer: true,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
         });
         Router::new()
             .route("/rvc/v1/validator/:pubkey/prepare_exit", axum::routing::post(prepare_exit))
@@ -3241,6 +3283,7 @@ mod tests {
             exit_manager,
             allow_insecure_remote_signer: true,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
         });
 
         let api = Router::new()
