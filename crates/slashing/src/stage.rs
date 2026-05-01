@@ -84,6 +84,8 @@ struct BlockRow {
     pubkey: String,
     slot: Slot,
     signing_root: Option<String>,
+    /// Hex-encoded genesis validators root to write into the per-row column.
+    gvr_hex: String,
     /// When `true` the row already exists in the DB (idempotent re-sign).
     /// `commit()` skips the INSERT and issues `COMMIT` to close the transaction.
     is_resign: bool,
@@ -98,6 +100,8 @@ struct AttestationRow {
     source_epoch: Epoch,
     target_epoch: Epoch,
     signing_root: Option<String>,
+    /// Hex-encoded genesis validators root to write into the per-row column.
+    gvr_hex: String,
     is_duplicate: bool,
 }
 
@@ -149,8 +153,16 @@ impl<'db> StagedBlock<'db> {
 
         if !self.row.is_resign {
             guard.execute(
-                "INSERT INTO blocks (client_cn, pubkey, slot, signing_root) VALUES (?1, ?2, ?3, ?4)",
-                (&self.row.client_cn, &self.row.pubkey, self.row.slot as i64, &self.row.signing_root),
+                "INSERT INTO blocks
+                 (client_cn, pubkey, slot, signing_root, genesis_validators_root)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                (
+                    &self.row.client_cn,
+                    &self.row.pubkey,
+                    self.row.slot as i64,
+                    &self.row.signing_root,
+                    &self.row.gvr_hex,
+                ),
             )?;
         }
 
@@ -216,14 +228,15 @@ impl<'db> StagedAttestation<'db> {
         if !self.row.is_duplicate {
             guard.execute(
                 "INSERT INTO attestations \
-                 (client_cn, pubkey, source_epoch, target_epoch, signing_root) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 (
                     &self.row.client_cn,
                     &self.row.pubkey,
                     self.row.source_epoch as i64,
                     self.row.target_epoch as i64,
                     &self.row.signing_root,
+                    &self.row.gvr_hex,
                 ),
             )?;
         }
@@ -272,11 +285,13 @@ impl SlashingDb {
     /// - `pubkey_hex`: Validator public key as a hex string.
     /// - `slot`: Beacon chain slot being proposed.
     /// - `signing_root_hex`: Optional signing root.
-    /// - `gvr`: Genesis validators root.  **Not yet enforced** (M-6 / ISSUE-3.5);
-    ///   accepted for API consistency.
+    /// - `gvr`: Genesis validators root.  Compared against
+    ///   `metadata.genesis_validators_root` (M-6 / ISSUE-3.5).  On mismatch,
+    ///   returns `Err(SlashingError::GenesisRootMismatch)` before acquiring the lock.
     ///
     /// # Errors
-    /// Returns `SlashingError::SlashableBlock` (specifically
+    /// Returns `SlashingError::GenesisRootMismatch` if `gvr` does not match the
+    /// pinned metadata value.  Returns `SlashingError::SlashableBlock` (specifically
     /// `BlockSlashingViolation::DoubleBlockProposal`) if a different signing
     /// root has already been committed for `(client_cn, pubkey, slot)`.
     ///
@@ -291,8 +306,21 @@ impl SlashingDb {
         pubkey_hex: &str,
         slot: Slot,
         signing_root_hex: Option<String>,
-        _gvr: &Root,
+        gvr: &Root,
     ) -> Result<StagedBlock<'db>, SlashingError> {
+        // M-6: GVR check before acquiring the main mutex to avoid nested-lock deadlock.
+        // pinned_gvr() may itself briefly acquire the mutex on a cold cache, then release it.
+        if let Some(pinned) = self.pinned_gvr()? {
+            if pinned != *gvr {
+                tracing::error!(
+                    rejection_reason = "genesis_root_mismatch",
+                    "stage_block rejected: genesis root mismatch"
+                );
+                return Err(SlashingError::GenesisRootMismatch { expected: pinned, got: *gvr });
+            }
+        }
+
+        let gvr_hex = crate::db::SlashingDb::root_to_hex(gvr);
         let pubkey = crate::db::normalize_pubkey(pubkey_hex);
         let guard = self.conn.lock();
 
@@ -390,6 +418,7 @@ impl SlashingDb {
                 pubkey,
                 slot,
                 signing_root: signing_root_hex,
+                gvr_hex,
                 is_resign: matches!(outcome, BlockStageOutcome::Resign),
             },
             committed: false,
@@ -402,9 +431,10 @@ impl SlashingDb {
     /// See [`stage_block`](SlashingDb::stage_block) for the general contract.
     ///
     /// # Errors
-    /// Returns `SlashingError::SlashableAttestation` (double vote, surrounding,
-    /// or surrounded) if the new `(source, target)` pair conflicts with any
-    /// existing attestation in `(client_cn, pubkey)` scope.
+    /// Returns `SlashingError::GenesisRootMismatch` if `gvr` does not match the
+    /// pinned metadata value.  Returns `SlashingError::SlashableAttestation` (double
+    /// vote, surrounding, or surrounded) if the new `(source, target)` pair conflicts
+    /// with any existing attestation in `(client_cn, pubkey)` scope.
     pub fn stage_attestation<'db>(
         &'db self,
         client_cn: &str,
@@ -412,8 +442,20 @@ impl SlashingDb {
         source_epoch: Epoch,
         target_epoch: Epoch,
         signing_root_hex: Option<String>,
-        _gvr: &Root,
+        gvr: &Root,
     ) -> Result<StagedAttestation<'db>, SlashingError> {
+        // M-6: GVR check before acquiring the main mutex.
+        if let Some(pinned) = self.pinned_gvr()? {
+            if pinned != *gvr {
+                tracing::error!(
+                    rejection_reason = "genesis_root_mismatch",
+                    "stage_attestation rejected: genesis root mismatch"
+                );
+                return Err(SlashingError::GenesisRootMismatch { expected: pinned, got: *gvr });
+            }
+        }
+
+        let gvr_hex = crate::db::SlashingDb::root_to_hex(gvr);
         let pubkey = crate::db::normalize_pubkey(pubkey_hex);
         let guard = self.conn.lock();
 
@@ -578,6 +620,7 @@ impl SlashingDb {
                 source_epoch,
                 target_epoch,
                 signing_root: signing_root_hex,
+                gvr_hex,
                 is_duplicate,
             },
             committed: false,

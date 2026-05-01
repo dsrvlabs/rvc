@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use eth_types::{Epoch, Slot};
+use eth_types::{Epoch, Root, Slot};
 
 /// Errors that can occur during slashing protection operations.
 #[derive(Debug, Error)]
@@ -24,6 +24,15 @@ pub enum SlashingError {
 
     #[error("genesis validators root mismatch: expected {expected}, got {actual}")]
     GenesisValidatorsRootMismatch { expected: String, actual: String },
+
+    /// Per-call genesis validators root check failed (M-6 / ISSUE-3.5).
+    ///
+    /// Returned when the caller-supplied `gvr` does not match the value pinned
+    /// in `metadata.genesis_validators_root`.  A mismatch indicates that the
+    /// validator client is pointing at a different chain's beacon node than the
+    /// one it was originally configured for (i.e. a chain swap).
+    #[error("genesis root mismatch: expected {}, got {}", hex::encode(expected), hex::encode(got))]
+    GenesisRootMismatch { expected: Root, got: Root },
 
     #[error("invalid interchange format: {0}")]
     InvalidInterchangeFormat(String),

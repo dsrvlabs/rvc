@@ -22,6 +22,7 @@
 use parking_lot::Mutex;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
@@ -46,6 +47,17 @@ pub struct SlashingDb {
     pub(crate) conn: Mutex<Connection>,
     path: Option<PathBuf>,
     pub(crate) strict_semantics: AtomicBool,
+    /// One-time cache for `metadata.genesis_validators_root`.
+    ///
+    /// `None` means "no GVR pinned in metadata" (backward-compat: skip the per-call check).
+    /// `Some(root)` means the pinned value has been loaded and every caller-supplied `gvr`
+    /// will be compared against it.
+    ///
+    /// Populated on the first call to `pinned_gvr()`.  Never reset within a process lifetime
+    /// because the metadata GVR is immutable once set.  A race between two threads both
+    /// writing to the `OnceLock` is harmless: both writers compute the same value (they both
+    /// read the same DB row), and `OnceLock::set` silently discards the losing write.
+    gvr_cache: OnceLock<Option<Root>>,
 }
 
 impl SlashingDb {
@@ -80,6 +92,7 @@ impl SlashingDb {
             conn: Mutex::new(conn),
             path: Some(path.to_path_buf()),
             strict_semantics: AtomicBool::new(false),
+            gvr_cache: OnceLock::new(),
         };
 
         // `migrate()` creates tables if they don't exist (v2-native CREATE TABLE).
@@ -153,8 +166,12 @@ impl SlashingDb {
     #[doc(hidden)]
     pub fn open_with_conn_for_testing(conn: Connection) -> Result<Self, SlashingError> {
         Self::configure_pragmas(&conn)?;
-        let db =
-            Self { conn: Mutex::new(conn), path: None, strict_semantics: AtomicBool::new(false) };
+        let db = Self {
+            conn: Mutex::new(conn),
+            path: None,
+            strict_semantics: AtomicBool::new(false),
+            gvr_cache: OnceLock::new(),
+        };
         db.migrate()?;
         {
             let mut conn = db.conn.lock();
@@ -169,8 +186,12 @@ impl SlashingDb {
     /// Creates the full v2 schema directly (no backup needed — there is no file).
     pub fn open_in_memory() -> Result<Self, SlashingError> {
         let conn = Connection::open_in_memory()?;
-        let db =
-            Self { conn: Mutex::new(conn), path: None, strict_semantics: AtomicBool::new(false) };
+        let db = Self {
+            conn: Mutex::new(conn),
+            path: None,
+            strict_semantics: AtomicBool::new(false),
+            gvr_cache: OnceLock::new(),
+        };
         // Create tables (v2-native layout).
         db.migrate()?;
         // Create CN-scoped unique indexes and set schema_version = 2.
@@ -190,6 +211,71 @@ impl SlashingDb {
     /// Default is `false` (lenient: treats `None == None` as a re-sign).
     pub fn set_strict_semantics(&self, strict: bool) {
         self.strict_semantics.store(strict, Ordering::Relaxed);
+    }
+
+    // ── GVR per-call re-check helpers (M-6 / ISSUE-3.5) ─────────────────────
+
+    /// Encode a `Root` ([u8; 32]) as a lowercase `0x`-prefixed hex string for DB storage.
+    pub(crate) fn root_to_hex(root: &Root) -> String {
+        format!("0x{}", hex::encode(root))
+    }
+
+    /// Parse a hex string (with or without `0x` prefix) into a `Root`.
+    ///
+    /// Returns `SlashingError::InvalidInterchangeFormat` if the string is not
+    /// valid hex or not exactly 32 bytes.
+    fn parse_gvr_hex(s: &str) -> Result<Root, SlashingError> {
+        let stripped = s.strip_prefix("0x").unwrap_or(s);
+        let bytes = hex::decode(stripped).map_err(|e| {
+            SlashingError::InvalidInterchangeFormat(format!(
+                "genesis_validators_root is not valid hex: {e}"
+            ))
+        })?;
+        bytes.try_into().map_err(|_| {
+            SlashingError::InvalidInterchangeFormat(
+                "genesis_validators_root must be exactly 32 bytes".to_string(),
+            )
+        })
+    }
+
+    /// Read `metadata.genesis_validators_root` from the DB (acquires the mutex).
+    ///
+    /// Returns `Ok(None)` if no row is present (backward compat: skip the check).
+    /// Returns `Ok(Some(root))` if the row is present and parseable.
+    fn read_metadata_gvr(&self) -> Result<Option<Root>, SlashingError> {
+        let conn = self.conn.lock();
+        let hex_str: Option<String> = conn
+            .query_row(
+                "SELECT value FROM metadata WHERE key = 'genesis_validators_root'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match hex_str {
+            None => Ok(None),
+            Some(s) => Ok(Some(Self::parse_gvr_hex(&s)?)),
+        }
+    }
+
+    /// Return the metadata-pinned GVR, using the cache to avoid repeated DB reads.
+    ///
+    /// On the first call, reads from `metadata.genesis_validators_root` and populates
+    /// the `gvr_cache`.  Subsequent calls return the cached value directly.
+    ///
+    /// Returns `Ok(None)` if no GVR is set in metadata (backward compat: the per-call
+    /// check is skipped).  Returns `Ok(Some(root))` once GVR is pinned.
+    ///
+    /// Race safety: if two threads call this simultaneously on a cold cache, both read
+    /// the same DB row and compute the same value.  `OnceLock::set` silently discards
+    /// the losing write — both outcomes are identical.
+    pub(crate) fn pinned_gvr(&self) -> Result<Option<Root>, SlashingError> {
+        if let Some(cached) = self.gvr_cache.get() {
+            return Ok(*cached);
+        }
+        let gvr = self.read_metadata_gvr()?;
+        // Race-OK: if another thread wins the set, both wrote the same value.
+        let _ = self.gvr_cache.set(gvr);
+        Ok(gvr)
     }
 
     /// Create the initial database schema.
@@ -927,9 +1013,9 @@ impl SlashingDb {
     /// # Arguments
     /// - `client_cn`: Per-client namespace. Use `"local-vc"` for VC-side writes.
     ///   `"__legacy__"` is reserved for pre-migration rows only.
-    /// - `gvr`: Genesis validators root for this signing operation.
-    ///   **Not yet enforced** (enforcement lands in ISSUE-3.5 for M-6). Stored
-    ///   as a per-row value for future use.
+    /// - `gvr`: Genesis validators root for this signing operation.  Compared
+    ///   against `metadata.genesis_validators_root` (M-6 / ISSUE-3.5).
+    ///   On mismatch, `Err(SlashingError::GenesisRootMismatch)` is returned.
     #[tracing::instrument(name = "rvc.slashing.db.block", skip_all, fields(rvc.slashing.result))]
     pub fn check_and_record_block(
         &self,
@@ -937,8 +1023,22 @@ impl SlashingDb {
         pubkey: &str,
         slot: Slot,
         signing_root: Option<String>,
-        _gvr: &Root,
+        gvr: &Root,
     ) -> Result<(), SlashingError> {
+        // M-6: compare caller-supplied gvr against the metadata-pinned value.
+        // This check is performed *before* acquiring the main mutex to avoid
+        // a nested-lock pattern (pinned_gvr() may itself briefly take the lock).
+        if let Some(pinned) = self.pinned_gvr()? {
+            if pinned != *gvr {
+                tracing::error!(
+                    rejection_reason = "genesis_root_mismatch",
+                    "block proposal rejected: genesis root mismatch"
+                );
+                return Err(SlashingError::GenesisRootMismatch { expected: pinned, got: *gvr });
+            }
+        }
+
+        let gvr_hex = Self::root_to_hex(gvr);
         let pubkey = normalize_pubkey(pubkey);
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1031,8 +1131,9 @@ impl SlashingDb {
         }
 
         tx.execute(
-            "INSERT INTO blocks (client_cn, pubkey, slot, signing_root) VALUES (?1, ?2, ?3, ?4)",
-            (client_cn, &pubkey, slot as i64, &signing_root),
+            "INSERT INTO blocks (client_cn, pubkey, slot, signing_root, genesis_validators_root)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (client_cn, &pubkey, slot as i64, &signing_root, &gvr_hex),
         )?;
 
         tx.commit()?;
@@ -1073,9 +1174,9 @@ impl SlashingDb {
     /// # Arguments
     /// - `client_cn`: Per-client namespace. Use `"local-vc"` for VC-side writes.
     ///   `"__legacy__"` is reserved for pre-migration rows only.
-    /// - `gvr`: Genesis validators root for this signing operation.
-    ///   **Not yet enforced** (enforcement lands in ISSUE-3.5 for M-6). Stored
-    ///   as a per-row value for future use.
+    /// - `gvr`: Genesis validators root for this signing operation.  Compared
+    ///   against `metadata.genesis_validators_root` (M-6 / ISSUE-3.5).
+    ///   On mismatch, `Err(SlashingError::GenesisRootMismatch)` is returned.
     ///
     /// ## Edge Case Decisions (FU-32, FU-33)
     ///
@@ -1103,8 +1204,20 @@ impl SlashingDb {
         source_epoch: Epoch,
         target_epoch: Epoch,
         signing_root: Option<String>,
-        _gvr: &Root,
+        gvr: &Root,
     ) -> Result<(), SlashingError> {
+        // M-6: compare caller-supplied gvr against the metadata-pinned value.
+        if let Some(pinned) = self.pinned_gvr()? {
+            if pinned != *gvr {
+                tracing::error!(
+                    rejection_reason = "genesis_root_mismatch",
+                    "attestation rejected: genesis root mismatch"
+                );
+                return Err(SlashingError::GenesisRootMismatch { expected: pinned, got: *gvr });
+            }
+        }
+
+        let gvr_hex = Self::root_to_hex(gvr);
         let pubkey = normalize_pubkey(pubkey);
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1277,9 +1390,10 @@ impl SlashingDb {
             }
 
             tx.execute(
-                "INSERT INTO attestations (client_cn, pubkey, source_epoch, target_epoch, signing_root)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                (client_cn, &pubkey, source_epoch as i64, target_epoch as i64, &signing_root),
+                "INSERT INTO attestations
+                 (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (client_cn, &pubkey, source_epoch as i64, target_epoch as i64, &signing_root, &gvr_hex),
             )?;
         }
 
