@@ -282,26 +282,36 @@ async fn test_audit_entry_emitted() {
     let state = make_state();
     let app = make_router(state);
 
+    // Snapshot the buffer length BEFORE making the call so we only assert on
+    // events emitted by *this* test's call — sibling tests sharing the same
+    // process-wide buffer (e.g. test_rate_limit_429's first successful call)
+    // would otherwise satisfy the assertions even if the audit log was
+    // accidentally removed from the handler. (Review M-9 SF-1.)
+    let before_len = lines.lock().unwrap().len();
+
     let resp = app.oneshot(attesting_request(false)).await.unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::OK, "call should succeed");
 
-    // Give other parallel tests a moment to avoid flaky races on the buffer,
-    // then snapshot the captured lines for assertions.
     let captured = lines.lock().unwrap();
-    let all_events = captured.join("\n");
+    assert!(
+        captured.len() > before_len,
+        "no new tracing events captured after this test's call (expected the \
+         audit log line). buffer len: before={before_len} after={}",
+        captured.len()
+    );
+    let new_events = captured[before_len..].join("\n");
 
     assert!(
-        all_events.contains("set_attesting_enabled audit"),
-        "audit log entry not found. Captured events:\n{all_events}"
+        new_events.contains("set_attesting_enabled audit"),
+        "audit log entry not found in events emitted by this test. Captured (new only):\n{new_events}"
     );
     assert!(
-        all_events.contains("abcdef12"),
-        "token prefix (first 8 chars of bearer token) not found. Captured:\n{all_events}"
+        new_events.contains("abcdef12"),
+        "token prefix (first 8 chars of bearer token) not found. Captured (new only):\n{new_events}"
     );
-    // `requested=false` is emitted by this test and also by test_rate_limit_429's
-    // first call — either way, the field must appear in at least one event.
     assert!(
-        all_events.contains("requested=false") || all_events.contains("requested=true"),
-        "requested field not found. Captured:\n{all_events}"
+        new_events.contains("requested=false"),
+        "expected `requested=false` field (this test calls with enabled=false). \
+         Captured (new only):\n{new_events}"
     );
 }

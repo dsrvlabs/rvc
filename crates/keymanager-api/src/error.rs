@@ -16,6 +16,9 @@ pub enum ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        // Flat exhaustive match (review M-9 SF-2): avoids the previous nested
+        // match's `unreachable!()` arm — a future refactor adding a variant
+        // would now be a compile error rather than a runtime panic.
         match self {
             ApiError::RateLimited { retry_after_secs } => {
                 let body = serde_json::json!({ "code": 429, "message": "rate limited" });
@@ -26,16 +29,19 @@ impl IntoResponse for ApiError {
                 }
                 response
             }
-            other => {
-                let (status, message) = match &other {
-                    ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
-                    ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
-                    ApiError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
-                    ApiError::RateLimited { .. } => unreachable!(),
-                };
-                let body = serde_json::json!({ "message": message });
-                (status, axum::Json(body)).into_response()
+            ApiError::BadRequest(msg) => {
+                (StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({ "message": msg })))
+                    .into_response()
             }
+            ApiError::NotFound(msg) => {
+                (StatusCode::NOT_FOUND, axum::Json(serde_json::json!({ "message": msg })))
+                    .into_response()
+            }
+            ApiError::Internal(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({ "message": msg })),
+            )
+                .into_response(),
         }
     }
 }
