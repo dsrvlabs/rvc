@@ -3,6 +3,7 @@ use std::fmt;
 use std::path::Path;
 
 use async_trait::async_trait;
+use crypto::logging::TruncatedPubkey;
 use crypto::{Keystore, SecretKey};
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
@@ -71,7 +72,8 @@ impl BasicSigner {
             })?;
 
             let pubkey = secret_key.public_key().to_bytes();
-            info!(pubkey = %hex::encode(pubkey), path = %path.display(), "Loaded keystore");
+            let pubkey_hex = hex::encode(pubkey);
+            info!(pubkey = %TruncatedPubkey::new(&pubkey_hex), path = %path.display(), "Loaded keystore");
             keys.insert(pubkey, (secret_key, Mutex::new(())));
         }
 

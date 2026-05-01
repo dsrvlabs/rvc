@@ -31,12 +31,13 @@ pub struct AuditEntry {
 /// Success entries are logged at `info` level; errors at `warn`.
 pub fn log_audit(entry: &AuditEntry) {
     let rpc = entry.rpc.as_deref().unwrap_or("sign");
+    let truncated_pubkey = TruncatedPubkey::new(&entry.pubkey_hex);
     if entry.result == "success" {
         tracing::info!(
             audit = true,
             rpc = %rpc,
             timestamp = %entry.timestamp,
-            pubkey = %entry.pubkey_hex,
+            pubkey = %truncated_pubkey,
             client_cn = %entry.client_cn,
             backend = %entry.backend,
             result = %entry.result,
@@ -48,7 +49,7 @@ pub fn log_audit(entry: &AuditEntry) {
             audit = true,
             rpc = %rpc,
             timestamp = %entry.timestamp,
-            pubkey = %entry.pubkey_hex,
+            pubkey = %truncated_pubkey,
             client_cn = %entry.client_cn,
             backend = %entry.backend,
             result = %entry.result,

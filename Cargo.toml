@@ -114,6 +114,9 @@ logroller = "0.1"
 tracing-appender = "0.2"
 flate2 = "1"
 
+# X.509 parsing (pinned; used by rvc-signer audit/cn.rs — M-4 fix)
+x509-parser = "0.16"
+
 # Dev dependencies
 tempfile = "3"
 wiremock = "0.6"

@@ -39,6 +39,8 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 zeroize.workspace = true
 
+x509-parser.workspace = true
+
 # DVT (optional)
 vsss-rs = { workspace = true, optional = true }
 bls12_381_plus = { workspace = true, optional = true }
