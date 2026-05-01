@@ -195,19 +195,17 @@ pub async fn delete_keystores(
                     });
                 }
                 Err(e) => {
-                    warn!(
-                        pubkey = %TruncatedPubkey::new(pubkey_hex),
-                        status = "error",
-                        error = %e,
-                        "Keystore delete result"
-                    );
-                    results.push(DeleteKeystoreResult {
-                        status: DeleteStatus::Error,
-                        message: e.to_string(),
-                    });
+                    // M-8: sanitize underlying error (paths, errno, etc.) before
+                    // returning to the client. The full chain is logged inside
+                    // sanitize_item_err with a request_id correlator.
+                    let message = sanitize_item_err(&e, "keystore delete failed");
+                    results.push(DeleteKeystoreResult { status: DeleteStatus::Error, message });
                 }
             },
             Err(e) => {
+                // Pubkey-parse error — the value of `e` here is generated
+                // server-side from caller input (parse_pubkey), so it is
+                // BadRequest-class and safe to echo as-is.
                 warn!(
                     pubkey = %TruncatedPubkey::new(pubkey_hex),
                     status = "error",
@@ -364,15 +362,13 @@ pub async fn delete_remote_keys(
                     });
                 }
                 Err(e) => {
-                    warn!(
-                        pubkey = %TruncatedPubkey::new(pubkey_str),
-                        status = "error",
-                        error = %e,
-                        "Remote key delete result"
-                    );
+                    // M-8: DeleteRemoteKeyError::Other is `#[error("{0}")]`
+                    // — passes through whatever the backend put in the inner
+                    // String (DB sockets, internal service names). Sanitize.
+                    let message = sanitize_item_err(&e, "remote key delete failed");
                     results.push(DeleteRemoteKeyResult {
                         status: DeleteRemoteKeyStatus::Error,
-                        message: e.to_string(),
+                        message,
                     });
                 }
             },
@@ -555,11 +551,29 @@ pub async fn prepare_exit(
     Ok(Json(VoluntaryExitResponse { data: signed_exit }))
 }
 
+/// Escape ASCII control characters in `s` (notably `\n`, `\r`) to their
+/// `\xHH` form so that an attacker cannot smuggle a forged log line through
+/// a user-controllable error string when the tracing-subscriber formatter is
+/// in text mode (CWE-117 / OWASP A09:2021).  Defense-in-depth in addition
+/// to the JSON-mode formatter recommended in the deployment guide.
+fn escape_log_control_chars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_control() {
+            out.push_str(&format!("\\x{:02x}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Logs `err` at `error!` level with a fresh request ID and returns a generic
 /// `ApiError::Internal` whose message is safe to send to API clients.
 fn sanitize_internal<E: std::fmt::Display>(err: E, ctx: &str) -> ApiError {
     let req_id = Uuid::new_v4();
-    error!(request_id = %req_id, error = %err, "{ctx}");
+    let safe = escape_log_control_chars(&err.to_string());
+    error!(request_id = %req_id, error = %safe, "{ctx}");
     ApiError::Internal(format!("internal error (request_id={req_id})"))
 }
 
@@ -567,7 +581,8 @@ fn sanitize_internal<E: std::fmt::Display>(err: E, ctx: &str) -> ApiError {
 /// string suitable for the per-item `message` field in bulk-operation responses.
 fn sanitize_item_err<E: std::fmt::Display>(err: E, ctx: &str) -> String {
     let req_id = Uuid::new_v4();
-    error!(request_id = %req_id, error = %err, "{ctx}");
+    let safe = escape_log_control_chars(&err.to_string());
+    error!(request_id = %req_id, error = %safe, "{ctx}");
     format!("key error (request_id={req_id})")
 }
 

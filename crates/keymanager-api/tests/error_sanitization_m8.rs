@@ -285,6 +285,14 @@ async fn test_keystore_import_item_error_sanitized() {
         !msg.is_empty(),
         "spot 2: error result must have a non-empty message for clients to surface"
     );
+    // The request_id is the sole correlation primitive between this client
+    // message and the server's error log chain — without it operators cannot
+    // map a user complaint back to a specific failure.
+    assert!(
+        msg.contains("request_id="),
+        "spot 2: request_id correlator missing from client message — got: {msg}"
+    );
+    assert!(msg.contains("key error"), "spot 2: expected generic 'key error' prefix — got: {msg}");
 }
 
 // ── Spot 3: remote-key import per-item error ───────────────────────────────
@@ -331,4 +339,9 @@ async fn test_remote_key_import_item_error_sanitized() {
         !msg.is_empty(),
         "spot 3: error result must have a non-empty message for clients to surface"
     );
+    assert!(
+        msg.contains("request_id="),
+        "spot 3: request_id correlator missing from client message — got: {msg}"
+    );
+    assert!(msg.contains("key error"), "spot 3: expected generic 'key error' prefix — got: {msg}");
 }
