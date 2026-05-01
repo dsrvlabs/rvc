@@ -340,3 +340,34 @@ fn test_gvr_cache_populated_after_first_check() {
         "expected GenesisRootMismatch, got: {err:?}"
     );
 }
+
+// ── GVR cache: absence is NOT cached (review fix MF-1) ─────────────────────
+
+/// Critical regression: if a signing call observes "no pinned gvr" before
+/// `set_genesis_validators_root` is called, the cache must NOT permanently
+/// disable the chain-swap check. Subsequent calls after pinning must enforce it.
+#[test]
+fn test_gvr_cache_none_not_poisoned_after_set() {
+    let db = SlashingDb::open_in_memory().expect("open");
+
+    // First call: no pinned GVR → check is skipped (returns Ok).
+    db.check_and_record_block(CN, PUBKEY, 100, Some("0xfirst".into()), R1)
+        .expect("no pinned gvr: skipped → must succeed");
+
+    // Now pin GVR R1.
+    db.set_genesis_validators_root(&format!("0x{}", hex::encode(R1))).expect("set should succeed");
+
+    // Next call with a DIFFERENT gvr must now be rejected — the cache must
+    // have re-read from DB rather than use the stale "no pinned gvr → skip".
+    let err = db
+        .check_and_record_block(CN, PUBKEY, 101, Some("0xsecond".into()), R2)
+        .expect_err("after pinning, mismatch must be rejected");
+    assert!(
+        matches!(err, SlashingError::GenesisRootMismatch { .. }),
+        "expected GenesisRootMismatch after pinning, got: {err:?}"
+    );
+
+    // Same call with the matching gvr must succeed (and the cache is now sealed).
+    db.check_and_record_block(CN, PUBKEY, 102, Some("0xthird".into()), R1)
+        .expect("matching gvr after pinning must succeed");
+}

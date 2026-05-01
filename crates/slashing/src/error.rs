@@ -31,7 +31,11 @@ pub enum SlashingError {
     /// in `metadata.genesis_validators_root`.  A mismatch indicates that the
     /// validator client is pointing at a different chain's beacon node than the
     /// one it was originally configured for (i.e. a chain swap).
-    #[error("genesis root mismatch: expected {}, got {}", hex::encode(expected), hex::encode(got))]
+    #[error(
+        "genesis root mismatch: expected 0x{}, got 0x{}",
+        hex::encode(expected),
+        hex::encode(got)
+    )]
     GenesisRootMismatch { expected: Root, got: Root },
 
     #[error("invalid interchange format: {0}")]

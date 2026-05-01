@@ -53,11 +53,19 @@ pub struct SlashingDb {
     /// `Some(root)` means the pinned value has been loaded and every caller-supplied `gvr`
     /// will be compared against it.
     ///
-    /// Populated on the first call to `pinned_gvr()`.  Never reset within a process lifetime
+    /// Populated only once a real `Root` is read from the metadata row.  Absence (no row
+    /// pinned yet) is **not** cached — otherwise an early signing call could permanently
+    /// disable the chain-swap check for a process whose GVR is pinned later (e.g. when
+    /// `import()` opens the DB before startup pins the GVR).  Reset never happens within a
+    /// process lifetime
     /// because the metadata GVR is immutable once set.  A race between two threads both
     /// writing to the `OnceLock` is harmless: both writers compute the same value (they both
     /// read the same DB row), and `OnceLock::set` silently discards the losing write.
-    gvr_cache: OnceLock<Option<Root>>,
+    gvr_cache: OnceLock<Root>,
+    /// Logged-once flag: emit an `error!` warning the first time a signing-path entry
+    /// observes "no GVR pinned in metadata" so operators can detect a degraded
+    /// chain-swap-protection state.
+    gvr_skip_warned: OnceLock<()>,
 }
 
 impl SlashingDb {
@@ -93,6 +101,7 @@ impl SlashingDb {
             path: Some(path.to_path_buf()),
             strict_semantics: AtomicBool::new(false),
             gvr_cache: OnceLock::new(),
+            gvr_skip_warned: OnceLock::new(),
         };
 
         // `migrate()` creates tables if they don't exist (v2-native CREATE TABLE).
@@ -171,6 +180,7 @@ impl SlashingDb {
             path: None,
             strict_semantics: AtomicBool::new(false),
             gvr_cache: OnceLock::new(),
+            gvr_skip_warned: OnceLock::new(),
         };
         db.migrate()?;
         {
@@ -191,6 +201,7 @@ impl SlashingDb {
             path: None,
             strict_semantics: AtomicBool::new(false),
             gvr_cache: OnceLock::new(),
+            gvr_skip_warned: OnceLock::new(),
         };
         // Create tables (v2-native layout).
         db.migrate()?;
@@ -231,11 +242,19 @@ impl SlashingDb {
                 "genesis_validators_root is not valid hex: {e}"
             ))
         })?;
-        bytes.try_into().map_err(|_| {
+        let root: Root = bytes.try_into().map_err(|_| {
             SlashingError::InvalidInterchangeFormat(
                 "genesis_validators_root must be exactly 32 bytes".to_string(),
             )
-        })
+        })?;
+        // All-zeros is the builder-registration sentinel and never a real chain
+        // identifier. Reject it to catch operator misconfiguration.
+        if root == [0u8; 32] {
+            return Err(SlashingError::InvalidInterchangeFormat(
+                "genesis_validators_root must not be all zeros".to_string(),
+            ));
+        }
+        Ok(root)
     }
 
     /// Read `metadata.genesis_validators_root` from the DB (acquires the mutex).
@@ -270,12 +289,28 @@ impl SlashingDb {
     /// the losing write — both outcomes are identical.
     pub(crate) fn pinned_gvr(&self) -> Result<Option<Root>, SlashingError> {
         if let Some(cached) = self.gvr_cache.get() {
-            return Ok(*cached);
+            return Ok(Some(*cached));
         }
-        let gvr = self.read_metadata_gvr()?;
-        // Race-OK: if another thread wins the set, both wrote the same value.
-        let _ = self.gvr_cache.set(gvr);
-        Ok(gvr)
+        match self.read_metadata_gvr()? {
+            Some(root) => {
+                // Race-OK: if another thread wins the set, both wrote the same value.
+                let _ = self.gvr_cache.set(root);
+                Ok(Some(root))
+            }
+            None => {
+                // Do NOT cache absence — the GVR may be pinned later (e.g. by
+                // startup after an import() flow opened the DB).  Caching None
+                // would permanently disable the chain-swap check.
+                if self.gvr_skip_warned.set(()).is_ok() {
+                    tracing::error!(
+                        "genesis_validators_root not pinned in metadata; per-call \
+                         chain-swap protection is disabled until set_genesis_validators_root \
+                         is called.  This warning is emitted once per SlashingDb instance."
+                    );
+                }
+                Ok(None)
+            }
+        }
     }
 
     /// Create the initial database schema.
