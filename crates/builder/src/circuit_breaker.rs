@@ -33,38 +33,52 @@ impl CircuitBreakerState {
         if self.consecutive_limit == 0 && self.epoch_limit == 0 {
             return false;
         }
-        let consec = self.consecutive_misses.load(Ordering::Relaxed);
-        let epoch = self.epoch_misses.load(Ordering::Relaxed);
+        // Acquire: pairs with the Release/AcqRel stores in record_miss,
+        // record_success, and reset_epoch, ensuring we observe their writes on
+        // all platforms (including ARM weak-memory-order targets).
+        let consec = self.consecutive_misses.load(Ordering::Acquire);
+        let epoch = self.epoch_misses.load(Ordering::Acquire);
         (self.consecutive_limit > 0 && consec >= self.consecutive_limit)
             || (self.epoch_limit > 0 && epoch >= self.epoch_limit)
     }
 
     /// Record a builder miss (failed or empty response).
     pub fn record_miss(&self) {
-        self.consecutive_misses.fetch_add(1, Ordering::Relaxed);
-        self.epoch_misses.fetch_add(1, Ordering::Relaxed);
+        // AcqRel: the Release half makes the incremented value visible to any
+        // subsequent Acquire load on other threads.
+        self.consecutive_misses.fetch_add(1, Ordering::AcqRel);
+        self.epoch_misses.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Record a builder success. Resets consecutive counter only.
     pub fn record_success(&self) {
-        self.consecutive_misses.store(0, Ordering::Relaxed);
+        // Release: pairs with Acquire loads in is_tripped / consecutive_misses.
+        self.consecutive_misses.store(0, Ordering::Release);
     }
 
     /// Reset at epoch boundary. Zeroes both counters.
     pub fn reset_epoch(&self, new_epoch: u64) {
-        let prev = self.current_epoch.swap(new_epoch, Ordering::Relaxed);
+        // AcqRel on the swap: the Release half ensures the subsequent stores are
+        // not reordered before the swap on weak-memory-order CPUs; the Acquire
+        // half lets us observe prior writes from other threads.
+        let prev = self.current_epoch.swap(new_epoch, Ordering::AcqRel);
         if new_epoch != prev {
-            self.consecutive_misses.store(0, Ordering::Relaxed);
-            self.epoch_misses.store(0, Ordering::Relaxed);
+            // Release: zeroing is visible to any thread that later does an
+            // Acquire load on these counters.
+            self.consecutive_misses.store(0, Ordering::Release);
+            self.epoch_misses.store(0, Ordering::Release);
         }
     }
 
     pub fn consecutive_misses(&self) -> u32 {
-        self.consecutive_misses.load(Ordering::Relaxed)
+        // Acquire: pairs with Release/AcqRel stores so the returned value
+        // reflects the latest write from any thread.
+        self.consecutive_misses.load(Ordering::Acquire)
     }
 
     pub fn epoch_misses(&self) -> u32 {
-        self.epoch_misses.load(Ordering::Relaxed)
+        // Acquire: see consecutive_misses() above.
+        self.epoch_misses.load(Ordering::Acquire)
     }
 }
 
