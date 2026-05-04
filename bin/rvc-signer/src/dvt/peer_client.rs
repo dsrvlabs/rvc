@@ -6,6 +6,7 @@ use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, warn};
 
 use crate::backend::dvt::{PeerRequestError, PeerRequester};
+use crate::dvt::allow_list::AllowedPeers;
 use crate::proto::signer::peer_signer_service_client::PeerSignerServiceClient;
 use crate::proto::signer::PartialSignRequest;
 use crate::tls::TlsConfig;
@@ -50,6 +51,57 @@ pub struct PeerConnectInfo {
     /// `"peer-a.cluster.local"`).  Leave empty when TLS is disabled or when
     /// SNI pinning should be skipped for a peer (a warning is logged).
     pub sni_cn: String,
+}
+
+/// Build the per-peer connection info list, deriving SNI from the allow-list.
+///
+/// # Security invariant (ISSUE-4.1 / L-1)
+///
+/// When TLS is enabled:
+/// - An allow-list **must** be provided; `None` is a startup error.
+/// - Every address in `peer_addrs` must have a matching `[[peer]]` entry with
+///   `addr =` set; missing entries are startup errors.
+///
+/// Both conditions are hard failures so there is **no silent fallback** to
+/// un-pinned TLS.  An allow-list entry without an `addr` field that happens
+/// to be absent from the addr lookup fails loudly rather than connecting
+/// without hostname verification.
+///
+/// When TLS is disabled, SNI is not applicable; `sni_cn` is set to the empty
+/// string and no allow-list lookup is performed.
+pub fn build_peer_connect_infos(
+    peer_addrs: &[String],
+    allow_list: Option<&AllowedPeers>,
+    tls_enabled: bool,
+) -> Result<Vec<PeerConnectInfo>, String> {
+    if !tls_enabled {
+        return Ok(peer_addrs
+            .iter()
+            .map(|addr| PeerConnectInfo { addr: addr.clone(), sni_cn: String::new() })
+            .collect());
+    }
+
+    let al = allow_list.ok_or_else(|| {
+        "DVT with TLS requires --dvt-allowed-peers for per-peer SNI pinning \
+         (ISSUE-4.1 / L-1). Provide a dvt-allowed-peers.toml with an `addr` \
+         field for each peer."
+            .to_string()
+    })?;
+
+    peer_addrs
+        .iter()
+        .map(|addr| {
+            let peer = al.lookup_by_addr(addr).ok_or_else(|| {
+                format!(
+                    "DVT peer '{addr}' has no matching `addr = \"{addr}\"` entry in \
+                     dvt-allowed-peers.toml; refusing to connect without SNI pinning \
+                     (ISSUE-4.1 / L-1). Add the `addr` field to the [[peer]] entry \
+                     that corresponds to this address."
+                )
+            })?;
+            Ok(PeerConnectInfo { addr: addr.clone(), sni_cn: peer.peer_cn.clone() })
+        })
+        .collect()
 }
 
 /// gRPC-based peer requester that connects to DVT peers.
@@ -103,18 +155,20 @@ impl GrpcPeerRequester {
                 // the server certificate is issued for this specific peer's
                 // expected hostname.  Without this, any cert valid under the
                 // shared CA passes for any peer — a silent impersonation path.
-                let pinned_tls = if peer.sni_cn.is_empty() {
-                    warn!(
-                        addr = %peer.addr,
-                        "DVT peer has no SNI configured; TLS cert hostname will not be pinned. \
-                         Add 'addr' to the [[peer]] entry in dvt-allowed-peers.toml to enable \
-                         per-peer SNI pinning (ISSUE-4.1 / L-1)."
-                    );
-                    tls.clone()
-                } else {
-                    debug!(addr = %peer.addr, sni = %peer.sni_cn, "SNI pinned for DVT peer");
-                    tls.clone().domain_name(&peer.sni_cn)
-                };
+                //
+                // Empty sni_cn is a hard error here: callers MUST go through
+                // `build_peer_connect_infos` which enforces allow-list coverage
+                // before any TLS handshake is attempted.
+                if peer.sni_cn.is_empty() {
+                    return Err(PeerClientError::Tls(format!(
+                        "peer '{}' has no SNI hostname; refusing TLS handshake without \
+                         certificate hostname pinning (ISSUE-4.1 / L-1). Call \
+                         build_peer_connect_infos() to derive SNI from the allow-list.",
+                        peer.addr
+                    )));
+                }
+                debug!(addr = %peer.addr, sni = %peer.sni_cn, "SNI pinned for DVT peer");
+                let pinned_tls = tls.clone().domain_name(&peer.sni_cn);
                 endpoint = endpoint
                     .tls_config(pinned_tls)
                     .map_err(|e| PeerClientError::Connect { addr: peer.addr.clone(), source: e })?;

@@ -242,8 +242,19 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Build the signing backend and optional share-map for the PeerSignerService.
     // The PeerSignerService is constructed later (after the slashing DB is opened),
     // so build_dvt_backend returns the raw share_map rather than a complete service.
+    //
+    // The allow-list is loaded ONCE here (DVT arm only) and shared between the
+    // client-side SNI derivation (build_dvt_backend) and the server-side
+    // PeerSignerService (constructed below).  This avoids a TOCTOU double-read
+    // and ensures both paths see the same allow-list snapshot (ISSUE-4.1 / L-1).
     #[cfg(feature = "dvt")]
     type ShareMap = Arc<std::collections::HashMap<[u8; 48], dvt::types::ShareInfo>>;
+
+    // Separate variable to capture the allow-list from the DVT arm without
+    // pushing the match binding into clippy::type_complexity territory.
+    #[cfg(feature = "dvt")]
+    let mut dvt_allow_list_opt: Option<Arc<dvt::allow_list::AllowedPeers>> = None;
+
     #[cfg(feature = "dvt")]
     let (signing_backend, dvt_share_map_opt, basic_signer_ref): (
         Arc<dyn backend::SigningBackend>,
@@ -256,14 +267,31 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             (Arc::clone(&signer) as Arc<dyn backend::SigningBackend>, None, Some(signer))
         }
         Backend::Dvt => {
+            // Load allow-list once; shared by client SNI pinning + server peer service.
+            let allow_list: Option<Arc<dvt::allow_list::AllowedPeers>> =
+                if let Some(path) = args.dvt_allowed_peers.as_deref() {
+                    let al = dvt::allow_list::AllowedPeers::load_from_path(path)
+                        .map_err(|e| format!("failed to load DVT allow-list: {e}"))?;
+                    info!(
+                        path = %path.display(),
+                        peer_count = al.peers.len(),
+                        "Loaded DVT allow-list"
+                    );
+                    Some(Arc::new(al))
+                } else {
+                    None
+                };
+
             let (backend, share_map) = build_dvt_backend(
                 &resolved,
                 &password,
                 tls_config.as_ref(),
                 Arc::new(signer_metrics.dvt.clone()),
-                args.dvt_allowed_peers.as_deref(),
+                allow_list.clone(),
             )
             .await?;
+
+            dvt_allow_list_opt = allow_list;
             (backend, Some(share_map), None)
         }
     };
@@ -385,23 +413,16 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     let svc_v2 = make_svc(slashing_db_opt.as_ref());
 
     // Build the PeerSignerService (DVT) now that we have the slashing DB.
-    // allow-list loading: mandatory when DVT is enabled (backend=dvt).
+    // The allow-list was already loaded and validated above (hoisted from here
+    // to avoid a double file-read — ISSUE-4.1 / L-1 DRY fix).
     #[cfg(feature = "dvt")]
     let peer_signer_service: Option<dvt::peer_service::PeerSignerServiceImpl> =
         if let Some(share_map) = dvt_share_map_opt {
-            // Load the allow-list (required for DVT).
-            let allow_list_path = args.dvt_allowed_peers.as_deref().ok_or(
+            // Reuse the Arc loaded in the Backend::Dvt arm above.
+            let allow_list = dvt_allow_list_opt.ok_or(
                 "DVT is enabled but --dvt-allowed-peers was not provided. \
                  Create a dvt-allowed-peers.toml file and pass its path via --dvt-allowed-peers.",
             )?;
-            let allow_list = dvt::allow_list::AllowedPeers::load_from_path(allow_list_path)
-                .map_err(|e| format!("failed to load DVT allow-list: {e}"))?;
-            info!(
-                path = %allow_list_path.display(),
-                peer_count = allow_list.peers.len(),
-                "Loaded DVT allow-list"
-            );
-            let allow_list = std::sync::Arc::new(allow_list);
             let peer_svc = dvt::peer_service::PeerSignerServiceImpl::new(
                 share_map,
                 allow_list,
@@ -480,16 +501,17 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// The share map is returned separately so the caller can build `PeerSignerServiceImpl`
 /// AFTER the slashing DB is opened (allowing CN-scoped slashing for DVT peers).
 ///
-/// `dvt_allowed_peers_path`: optional path to `dvt-allowed-peers.toml`.  When
-/// TLS is enabled and this path is provided, the allow-list is loaded to derive
-/// the SNI hostname for each peer address (ISSUE-4.1 / L-1 fix).
+/// `allow_list`: the pre-loaded allow-list (hoisted from `run_serve` to avoid a
+/// double file-read).  When TLS is enabled, `build_peer_connect_infos` requires
+/// this to be `Some` and every `dvt_peers` address to have a matching entry —
+/// any gap is a startup error (ISSUE-4.1 / L-1: no silent SNI bypass).
 #[cfg(feature = "dvt")]
 async fn build_dvt_backend(
     resolved: &config::ResolvedConfig,
     password: &Zeroizing<String>,
     tls_config: Option<&rvc_signer_bin::tls::TlsConfig>,
     dvt_metrics: Arc<metrics::DvtMetrics>,
-    dvt_allowed_peers_path: Option<&std::path::Path>,
+    allow_list: Option<Arc<dvt::allow_list::AllowedPeers>>,
 ) -> Result<
     (
         Arc<dyn backend::SigningBackend>,
@@ -524,38 +546,17 @@ async fn build_dvt_backend(
 
     // ── L-1 SNI pinning: build per-peer connection info ──────────────────────
     //
-    // When TLS is enabled and the allow-list path is provided, we load the
-    // allow-list to look up each peer's `peer_cn` by its TCP address.
-    // That CN is set as `domain_name` on the per-peer `ClientTlsConfig` in
-    // `GrpcPeerRequester::connect`, so rustls verifies the server certificate
-    // against the expected peer hostname rather than accepting any cert valid
-    // under the shared CA.
-    let peer_infos: Vec<dvt::peer_client::PeerConnectInfo> = {
-        // Load allow-list for SNI derivation only when TLS + path are both available.
-        let allow_list_opt = if tls_config.is_some() {
-            dvt_allowed_peers_path
-                .map(|path| {
-                    dvt::allow_list::AllowedPeers::load_from_path(path)
-                        .map_err(|e| format!("failed to load DVT allow-list for SNI: {e}"))
-                })
-                .transpose()?
-        } else {
-            None
-        };
-
-        resolved
-            .dvt_peers
-            .iter()
-            .map(|addr| {
-                let sni_cn = allow_list_opt
-                    .as_ref()
-                    .and_then(|al| al.lookup_by_addr(addr))
-                    .map(|p| p.peer_cn.clone())
-                    .unwrap_or_default();
-                dvt::peer_client::PeerConnectInfo { addr: addr.clone(), sni_cn }
-            })
-            .collect()
-    };
+    // `build_peer_connect_infos` enforces a hard invariant: when TLS is active,
+    // every dvt_peers address must have a matching `addr=` entry in the
+    // allow-list.  Missing entries are startup errors — there is no silent
+    // fallback to un-pinned TLS (ISSUE-4.1 / L-1 review fix).
+    let peer_infos: Vec<dvt::peer_client::PeerConnectInfo> =
+        dvt::peer_client::build_peer_connect_infos(
+            &resolved.dvt_peers,
+            allow_list.as_deref(),
+            tls_config.is_some(),
+        )
+        .map_err(|e| format!("DVT peer SNI configuration error: {e}"))?;
 
     let peer_requester = if !peer_infos.is_empty() {
         let requester =

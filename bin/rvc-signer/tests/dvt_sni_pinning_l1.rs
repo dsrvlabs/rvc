@@ -39,7 +39,9 @@ use tempfile::TempDir;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 use rvc_signer_bin::dvt::allow_list::{AllowedPeer, AllowedPeers};
-use rvc_signer_bin::dvt::peer_client::{GrpcPeerRequester, PeerConnectInfo};
+use rvc_signer_bin::dvt::peer_client::{
+    build_peer_connect_infos, GrpcPeerRequester, PeerConnectInfo,
+};
 use rvc_signer_bin::dvt::peer_service::PeerSignerServiceImpl;
 use rvc_signer_bin::dvt::types::ShareInfo;
 use rvc_signer_bin::tls::TlsConfig;
@@ -76,8 +78,20 @@ fn generate_test_certs(sni_name: &str) -> TestCerts {
     let ca_cert = ca_params.self_signed(&ca_key).unwrap();
     let ca_pem = ca_cert.pem().into_bytes();
 
-    // Server cert: DNS SAN = sni_name only (no IP SAN → IP-based URIs won't match)
-    let server_params = CertificateParams::new(vec![sni_name.to_string()]).unwrap();
+    // Server cert: DNS SAN = sni_name + IP SAN = 127.0.0.1.
+    //
+    // The IP SAN is critical for making the test a genuine RED→GREEN.  Without
+    // it, tonic falls back to verifying the URI host (`127.0.0.1`) against the
+    // cert, which fails for missing IP SAN on BOTH old code (no domain_name)
+    // AND new code — making the assertion vacuously true.
+    //
+    // With the IP SAN present:
+    //   - Old code (no domain_name): URI host `127.0.0.1` → cert has IP SAN →
+    //     connection SUCCEEDS → `test_wrong_peer_cert_refused` FAILS (RED).
+    //   - New code (domain_name("peer-b.local")): cert has `peer-a.local` SAN,
+    //     NOT `peer-b.local` → rustls rejects → FAILS → assertion passes (GREEN).
+    let server_params =
+        CertificateParams::new(vec![sni_name.to_string(), "127.0.0.1".to_string()]).unwrap();
     let server_key = KeyPair::generate().unwrap();
     let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
     let server_cert_pem = server_cert.pem().into_bytes();
@@ -273,4 +287,102 @@ fn test_lookup_by_addr_no_addr_field() {
 
     // Should not match anything if addr is None
     assert!(peers.lookup_by_addr("127.0.0.1:50051").is_none());
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 6 (RED → GREEN): startup fails when peer addr not in allow-list
+//
+// Verifies Must-Fix #1: `build_peer_connect_infos` with TLS enabled must
+// return an error when a dvt_peer address has no matching `addr=` entry in
+// the allow-list, rather than silently falling back to no-SNI pinning.
+//
+// RED before fix: `build_peer_connect_infos` did not exist.
+// GREEN after fix: returns Err with a clear message; L-1 bypass closed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_dvt_startup_fails_when_peer_addr_missing_from_allowlist() {
+    // Allow-list covers peer-a only; peer-b has no `addr=` entry.
+    let allow_list = AllowedPeers {
+        peers: vec![AllowedPeer {
+            peer_cn: "peer-a.local".to_string(),
+            share_index: 1,
+            addr: Some("peer-a.local:50051".to_string()),
+        }],
+    };
+
+    let peer_addrs = vec![
+        "peer-a.local:50051".to_string(),
+        "peer-b.local:50052".to_string(), /* no entry */
+    ];
+
+    let result = build_peer_connect_infos(&peer_addrs, Some(&allow_list), true /* TLS on */);
+
+    assert!(
+        result.is_err(),
+        "startup must fail when a DVT peer addr is missing from the allow-list under TLS"
+    );
+    let msg = result.unwrap_err();
+    assert!(
+        msg.contains("peer-b.local:50052"),
+        "error message must name the offending peer; got: {msg}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 7: build_peer_connect_infos — no allow-list with TLS fails at startup
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_dvt_startup_fails_without_allowlist_when_tls_enabled() {
+    let peer_addrs = vec!["peer-a.local:50051".to_string()];
+    let result =
+        build_peer_connect_infos(&peer_addrs, None /* no allow-list */, true /* TLS */);
+    assert!(result.is_err(), "startup must fail when TLS is enabled and no allow-list is provided");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 8: build_peer_connect_infos — no TLS, any addr is accepted without SNI
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_dvt_no_tls_accepts_any_addr() {
+    let peer_addrs = vec!["peer-a.local:50051".to_string(), "peer-b.local:50052".to_string()];
+    let result = build_peer_connect_infos(&peer_addrs, None, false /* TLS off */);
+    assert!(result.is_ok());
+    let infos = result.unwrap();
+    assert_eq!(infos.len(), 2);
+    // sni_cn should be empty when TLS is disabled
+    assert!(infos.iter().all(|p| p.sni_cn.is_empty()));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test 9: build_peer_connect_infos — happy path with full allow-list match
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_dvt_startup_succeeds_when_all_addrs_in_allowlist() {
+    let allow_list = AllowedPeers {
+        peers: vec![
+            AllowedPeer {
+                peer_cn: "peer-a.local".to_string(),
+                share_index: 1,
+                addr: Some("peer-a.local:50051".to_string()),
+            },
+            AllowedPeer {
+                peer_cn: "peer-b.local".to_string(),
+                share_index: 2,
+                addr: Some("peer-b.local:50052".to_string()),
+            },
+        ],
+    };
+
+    let peer_addrs = vec!["peer-a.local:50051".to_string(), "peer-b.local:50052".to_string()];
+
+    let result = build_peer_connect_infos(&peer_addrs, Some(&allow_list), true);
+    assert!(result.is_ok(), "all addrs covered → must succeed; err: {:?}", result.err());
+
+    let infos = result.unwrap();
+    assert_eq!(infos[0].sni_cn, "peer-a.local");
+    assert_eq!(infos[1].sni_cn, "peer-b.local");
 }
