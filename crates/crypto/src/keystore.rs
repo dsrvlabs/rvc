@@ -43,10 +43,35 @@ const MAX_SCRYPT_R: u32 = 16;
 const MAX_SCRYPT_P: u32 = 16;
 const MAX_SCRYPT_DKLEN: u32 = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum EncryptionKdf {
+    /// Production scrypt params (n = 2^18). EIP-2335 default.
     Scrypt,
+    /// Production PBKDF2 params (c = 2^18). EIP-2335 default.
     Pbkdf2,
+    /// Caller-supplied scrypt params. Use `scrypt_cheap_for_tests()` to
+    /// construct fast test fixtures. NEVER use n < 2^17 in production.
+    ScryptWith { n: u32, r: u32, p: u32, dklen: u32 },
+    /// Caller-supplied PBKDF2 params. Use `pbkdf2_cheap_for_tests()` to
+    /// construct fast test fixtures. The validator still enforces
+    /// `c >= MIN_PBKDF2_C` (10_000) at decrypt time.
+    Pbkdf2With { c: u32, dklen: u32 },
+}
+
+impl EncryptionKdf {
+    /// Cheap scrypt params for unit tests only (n = 2). Provides essentially
+    /// no key stretching — never use this in production code paths.
+    pub fn scrypt_cheap_for_tests() -> Self {
+        Self::ScryptWith { n: 2, r: 1, p: 1, dklen: DEFAULT_SCRYPT_DKLEN }
+    }
+
+    /// Cheap PBKDF2 params for unit tests only (c = MIN_PBKDF2_C = 10_000,
+    /// the floor the decrypt validator enforces). Prefer
+    /// `scrypt_cheap_for_tests()` when the test does not specifically
+    /// exercise the PBKDF2 path — scrypt-cheap is ~10× faster.
+    pub fn pbkdf2_cheap_for_tests() -> Self {
+        Self::Pbkdf2With { c: MIN_PBKDF2_C, dklen: DEFAULT_PBKDF2_DKLEN }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,6 +362,25 @@ impl Keystore {
                 KdfParams::Pbkdf2(Pbkdf2Params {
                     dklen: DEFAULT_PBKDF2_DKLEN,
                     c: DEFAULT_PBKDF2_C,
+                    prf: DEFAULT_PBKDF2_PRF.to_string(),
+                    salt: hex::encode(salt),
+                }),
+            ),
+            EncryptionKdf::ScryptWith { n, r, p, dklen } => (
+                KDF_SCRYPT.to_string(),
+                KdfParams::Scrypt(ScryptParams {
+                    dklen,
+                    n,
+                    r,
+                    p,
+                    salt: hex::encode(salt),
+                }),
+            ),
+            EncryptionKdf::Pbkdf2With { c, dklen } => (
+                KDF_PBKDF2.to_string(),
+                KdfParams::Pbkdf2(Pbkdf2Params {
+                    dklen,
+                    c,
                     prf: DEFAULT_PBKDF2_PRF.to_string(),
                     salt: hex::encode(salt),
                 }),
@@ -1408,5 +1452,53 @@ mod tests {
         let signature = decrypted.sign(message);
         let public_key = decrypted.public_key();
         assert!(signature.verify(&public_key, message).is_ok());
+    }
+
+    #[test]
+    fn test_encryption_kdf_cheap_constructors_decrypt_roundtrip() {
+        let sk = SecretKey::generate();
+        let password = b"cheap-test";
+
+        let cheap_scrypt = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("cheap-scrypt encrypt should succeed");
+        let recovered = cheap_scrypt.decrypt(password).expect("cheap-scrypt decrypt should succeed");
+        assert_eq!(recovered.to_bytes(), sk.to_bytes());
+
+        let cheap_pbkdf2 = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::pbkdf2_cheap_for_tests(),
+        )
+        .expect("cheap-pbkdf2 encrypt should succeed");
+        let recovered =
+            cheap_pbkdf2.decrypt(password).expect("cheap-pbkdf2 decrypt should succeed");
+        assert_eq!(recovered.to_bytes(), sk.to_bytes());
+    }
+
+    #[test]
+    fn test_encryption_kdf_cheap_scrypt_uses_low_n() {
+        let sk = SecretKey::generate();
+        let password = b"cheap";
+        let ks = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .unwrap();
+        match &ks.crypto.kdf.params {
+            KdfParams::Scrypt(p) => {
+                assert_eq!(p.n, 2, "cheap scrypt should use n=2");
+                assert_eq!(p.r, 1);
+                assert_eq!(p.p, 1);
+            }
+            _ => panic!("expected scrypt params"),
+        }
     }
 }
