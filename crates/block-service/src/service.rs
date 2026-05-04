@@ -338,6 +338,18 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     e
                 })?;
             }
+            // ISSUE-4.3 (L-3) defense-in-depth: log canonical KZG commitment root.
+            // For Deneb+ BlockContents payloads the body includes blob_kzg_commitments;
+            // this root is a structured canonical binding separate from the signing scope.
+            if format == beacon::ssz_deser::SszBlockFormat::BlockContents {
+                let commitment_root = block.kzg_commitment_root();
+                debug!(
+                    slot = slot,
+                    kzg_count = block.blob_kzg_count(),
+                    commitment_root = %format!("0x{}", hex::encode(commitment_root)),
+                    "SSZ BlockContents: canonical KZG commitment binding (ISSUE-4.3)"
+                );
+            }
             (compute_block_root(&block), offset)
         };
 
@@ -397,6 +409,34 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 error!(slot = slot, error = %e, "BN block response validation failed — dropping duty");
                 e
             })?;
+        }
+
+        // ISSUE-4.3 (L-3) defense-in-depth: bind blob KZG commitments canonically.
+        //
+        // The signing scope (block_root) already opaquely covers the body bytes
+        // that contain blob_kzg_commitments. Here we additionally parse the
+        // commitments, compute a canonical SSZ list root, and verify that the
+        // commitment count in the body matches the number of blob sidecars.
+        // This does NOT change the BN-facing signing scope; it is a rvc-internal
+        // consistency check performed before the signature is created.
+        if let eth_types::BlockContents::BlockAndBlobs { ref blob_sidecars, .. } = block_contents {
+            let kzg_commitments = block_contents.blob_kzg_commitments();
+            let commitment_root = block_contents.kzg_commitment_root();
+            debug!(
+                slot = slot,
+                blob_sidecars = blob_sidecars.len(),
+                kzg_in_body = kzg_commitments.len(),
+                commitment_root = %format!("0x{}", hex::encode(commitment_root)),
+                "BlockAndBlobs: canonical KZG commitment binding (ISSUE-4.3)"
+            );
+            if kzg_commitments.len() != blob_sidecars.len() {
+                warn!(
+                    slot = slot,
+                    kzg_in_body = kzg_commitments.len(),
+                    sidecars = blob_sidecars.len(),
+                    "blob KZG commitment count mismatch — body inconsistent with sidecars"
+                );
+            }
         }
 
         let block_root = compute_block_root(&block);
@@ -3202,6 +3242,184 @@ mod tests {
         assert!(
             matches!(err, BlockServiceError::BuilderFailure(_)),
             "MaxProfit BN error with non-zero boost must be BuilderFailure, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ISSUE-4.3 (L-3): canonical blob KZG commitment binding — regression tests
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal Deneb `BeaconBlockBody` SSZ byte sequence that places
+    /// `commitments` at the correct offset (bytes 388–391 → byte 392).
+    fn deneb_body_with_kzg_commitments_for_test(commitments: &[[u8; 48]]) -> Vec<u8> {
+        const FIXED_LEN: usize = 392;
+        let mut body = vec![0u8; FIXED_LEN];
+        let kzg_offset = FIXED_LEN as u32;
+        body[388..392].copy_from_slice(&kzg_offset.to_le_bytes());
+        for c in commitments {
+            body.extend_from_slice(c.as_slice());
+        }
+        body
+    }
+
+    /// Build a mock `ProduceBlockResponse` for a Deneb `BlockAndBlobs` payload
+    /// where the body contains `commitments` at the correct SSZ offset and the
+    /// `blob_sidecars` has one entry per commitment.
+    fn block_and_blobs_response(slot: Slot, commitments: &[[u8; 48]]) -> ProduceBlockResponse {
+        let body = deneb_body_with_kzg_commitments_for_test(commitments);
+        let body_hex = format!("0x{}", hex::encode(&body));
+        let blob_sidecars: Vec<serde_json::Value> = commitments
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                serde_json::json!({
+                    "index": i.to_string(),
+                    "blob": format!("0x{}", hex::encode([0u8; 64])),
+                })
+            })
+            .collect();
+        let data = serde_json::json!({
+            "block": {
+                "slot": slot.to_string(),
+                "proposer_index": "42",
+                "parent_root": format!("0x{}", hex::encode([0x11u8; 32])),
+                "state_root": format!("0x{}", hex::encode([0x22u8; 32])),
+                "body": body_hex,
+            },
+            "blob_sidecars": blob_sidecars,
+        });
+        ProduceBlockResponse {
+            data,
+            is_blinded: false,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: Some("12345".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
+        }
+    }
+
+    /// L-3 (ISSUE-4.3): canonical commitment root must be nonzero for a block
+    /// with two distinct blob KZG commitments.
+    #[test]
+    fn test_l3_kzg_commitment_root_nonzero_for_block_and_blobs() {
+        let slot = 1000;
+        let commitments = [[0xaa; 48], [0xbb; 48]];
+        let response = block_and_blobs_response(slot, &commitments);
+        let contents = response.parse_full_block().unwrap();
+        let root = contents.kzg_commitment_root();
+        assert_ne!(root, [0u8; 32], "commitment root must be nonzero for non-empty blobs");
+    }
+
+    /// L-3 (ISSUE-4.3): the canonical commitment root must change when any single
+    /// byte in any blob KZG commitment in the body is mutated.
+    #[test]
+    fn test_l3_kzg_root_changes_on_any_commitment_mutation() {
+        let slot = 1000;
+        let original_commits = [[0xcc; 48], [0xdd; 48]];
+        let base_root = {
+            let response = block_and_blobs_response(slot, &original_commits);
+            response.parse_full_block().unwrap().kzg_commitment_root()
+        };
+
+        // Mutate one byte in each commitment and verify the root changes.
+        for ci in 0..original_commits.len() {
+            let mut mutated = original_commits;
+            mutated[ci][0] ^= 0x01;
+            let mutated_root = {
+                let response = block_and_blobs_response(slot, &mutated);
+                response.parse_full_block().unwrap().kzg_commitment_root()
+            };
+            assert_ne!(
+                base_root, mutated_root,
+                "mutation of commitment[{ci}] must change the canonical root"
+            );
+        }
+    }
+
+    /// L-3 (ISSUE-4.3): the full propose_block pipeline with a BlockAndBlobs
+    /// response that has valid kzg_commitments must succeed (the defense-in-depth
+    /// check is a warning, not a hard error).
+    #[tokio::test]
+    async fn test_l3_propose_block_and_blobs_succeeds_with_matching_commitment_count() {
+        let pubkey = test_pubkey();
+        let slot = 1000;
+        let commitments = [[0xee; 48], [0xff; 48]];
+
+        let response = block_and_blobs_response(slot, &commitments);
+        let beacon = MockBeaconClient {
+            produce_response: Some(response),
+            fail_produce: false,
+            fail_publish: false,
+            publish_calls: Mutex::new(Vec::new()),
+            publish_blinded_calls: Mutex::new(Vec::new()),
+            publish_ssz_calls: Mutex::new(Vec::new()),
+            produce_full_calls: Mutex::new(Vec::new()),
+            publish_full_calls: Mutex::new(Vec::new()),
+            publish_blinded_full_calls: Mutex::new(Vec::new()),
+        };
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(
+            result.is_ok(),
+            "propose_block with valid BlockAndBlobs must succeed, got: {result:?}"
+        );
+    }
+
+    /// L-3 (ISSUE-4.3): a mismatch between commitment count in the body and the
+    /// number of blob sidecars must only warn (not abort signing).
+    #[tokio::test]
+    async fn test_l3_propose_block_and_blobs_warns_on_commitment_count_mismatch() {
+        let pubkey = test_pubkey();
+        let slot = 2000;
+
+        // Body has 2 commitments but blob_sidecars will have 1 entry (mismatch).
+        let two_commits = [[0x11; 48], [0x22; 48]];
+        let body = deneb_body_with_kzg_commitments_for_test(&two_commits);
+        let body_hex = format!("0x{}", hex::encode(&body));
+
+        // Only one sidecar despite two commitments in the body.
+        let data = serde_json::json!({
+            "block": {
+                "slot": slot.to_string(),
+                "proposer_index": "42",
+                "parent_root": format!("0x{}", hex::encode([0x11u8; 32])),
+                "state_root": format!("0x{}", hex::encode([0x22u8; 32])),
+                "body": body_hex,
+            },
+            "blob_sidecars": [
+                { "index": "0", "blob": format!("0x{}", hex::encode([0u8; 64])) },
+            ],
+        });
+        let response = ProduceBlockResponse {
+            data,
+            is_blinded: false,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: Some("99".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
+        };
+
+        let beacon = MockBeaconClient {
+            produce_response: Some(response),
+            fail_produce: false,
+            fail_publish: false,
+            publish_calls: Mutex::new(Vec::new()),
+            publish_blinded_calls: Mutex::new(Vec::new()),
+            publish_ssz_calls: Mutex::new(Vec::new()),
+            produce_full_calls: Mutex::new(Vec::new()),
+            publish_full_calls: Mutex::new(Vec::new()),
+            publish_blinded_full_calls: Mutex::new(Vec::new()),
+        };
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        // Signing must NOT fail — the count mismatch is a warn, not an error.
+        let result = service.propose_block(slot, &pubkey).await;
+        assert!(
+            result.is_ok(),
+            "commitment count mismatch must not abort signing, got: {result:?}"
         );
     }
 }
