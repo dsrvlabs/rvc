@@ -123,6 +123,15 @@ pub fn warn_if_insecure_permissions(path: &std::path::Path) -> bool {
     }
 }
 
+/// Maximum bearer-token length the comparator will inspect.
+///
+/// `validate_token` enforces 64 hex chars in production; this cap is a
+/// defense-in-depth bound on attacker-controlled candidate length so that
+/// a malicious oversized `Authorization: Bearer …` header cannot force a
+/// large heap allocation or a long bytewise compare on every auth probe
+/// (ISSUE-4.2 / L-2 follow-up).
+const MAX_BEARER_TOKEN_BYTES: usize = 256;
+
 /// Constant-time bearer-token comparison that does not leak the expected
 /// token length via timing.
 ///
@@ -135,20 +144,39 @@ pub fn warn_if_insecure_permissions(path: &std::path::Path) -> bool {
 /// expected token, narrowing brute-force to a single length class
 /// (ISSUE-4.2 / L-2 fix).
 ///
-/// The fix pads both inputs to the larger of the two lengths, runs
-/// `ct_eq` on equal-length buffers (no length-based short-circuit), then
-/// folds in a constant-time length-equality check. The final answer is
+/// The fix copies both inputs into fixed-size [`MAX_BEARER_TOKEN_BYTES`]
+/// stack buffers, runs `ct_eq` on equal-length buffers (no length-based
+/// short-circuit), then folds in a constant-time length-equality check
+/// against the *original, unclamped* lengths. The final answer is
 /// `content_eq AND length_eq`, computed without branching on either
-/// length.
+/// length. The stack buffers also avoid heap-allocation timing
+/// side-channels and avoid leaving secret bytes on the heap freelist.
+///
+/// An empty `expected` token short-circuits to `false`. `validate_token`
+/// already prevents an empty token from being persisted, but the explicit
+/// guard makes `ct_token_match` safe as a standalone primitive — a future
+/// caller that bypasses `validate_token` cannot accidentally
+/// authenticate an empty bearer.
 fn ct_token_match(candidate: &[u8], expected: &[u8]) -> bool {
-    let max_len = candidate.len().max(expected.len());
-    let mut padded_candidate = vec![0u8; max_len];
-    let mut padded_expected = vec![0u8; max_len];
-    padded_candidate[..candidate.len()].copy_from_slice(candidate);
-    padded_expected[..expected.len()].copy_from_slice(expected);
+    if expected.is_empty() {
+        return false;
+    }
 
-    let content_eq = padded_candidate.ct_eq(&padded_expected);
+    let mut padded_candidate = Zeroizing::new([0u8; MAX_BEARER_TOKEN_BYTES]);
+    let mut padded_expected = Zeroizing::new([0u8; MAX_BEARER_TOKEN_BYTES]);
+    let cand_clamped = candidate.len().min(MAX_BEARER_TOKEN_BYTES);
+    let exp_clamped = expected.len().min(MAX_BEARER_TOKEN_BYTES);
+    padded_candidate[..cand_clamped].copy_from_slice(&candidate[..cand_clamped]);
+    padded_expected[..exp_clamped].copy_from_slice(&expected[..exp_clamped]);
+
+    let content_eq = padded_candidate.ct_eq(padded_expected.as_ref());
+    // `length_eq` uses the *original* lengths, so a clamped-but-too-long
+    // candidate fails here even if its first MAX_BEARER_TOKEN_BYTES bytes
+    // happened to match.
     let length_eq = (candidate.len() as u64).ct_eq(&(expected.len() as u64));
+    // Safety: this `== 1` branches on the publicly observable auth decision
+    // (200 vs 401); it is not a secret-leaking branch. Do not copy this
+    // idiom to a context where the bool feeds non-public control flow.
     (content_eq & length_eq).unwrap_u8() == 1
 }
 
@@ -223,8 +251,7 @@ mod tests {
     #[test]
     fn test_ct_token_match_long_candidate_fails() {
         let expected = b"abcdef0123456789";
-        let candidate =
-            b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let candidate = b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         assert!(!ct_token_match(candidate, expected));
     }
 
@@ -232,6 +259,38 @@ mod tests {
     fn test_ct_token_match_empty_candidate_fails() {
         let expected = b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         assert!(!ct_token_match(b"", expected));
+    }
+
+    #[test]
+    fn test_ct_token_match_empty_expected_never_authenticates() {
+        // validate_token forbids an empty token in production, but the helper
+        // must be safe as a standalone primitive.  Both empty-vs-empty and
+        // any-vs-empty must fail.
+        assert!(!ct_token_match(b"", b""));
+        assert!(!ct_token_match(b"anything", b""));
+        assert!(!ct_token_match(
+            b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+            b""
+        ));
+    }
+
+    #[test]
+    fn test_ct_token_match_trailing_null_byte_fails() {
+        // Without `length_eq`, this would alias: zero-padding extends the
+        // shorter input with `\x00`, matching the candidate's trailing null.
+        // `length_eq` blocks it.
+        let expected = b"token";
+        assert!(!ct_token_match(b"token\x00", expected));
+        assert!(!ct_token_match(b"toke", expected));
+    }
+
+    #[test]
+    fn test_ct_token_match_oversized_candidate_fails_no_panic() {
+        // Defense-in-depth length cap: a 4 KiB candidate must not panic and
+        // must return false (length_eq fails before content_eq matters).
+        let expected = b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let oversized = vec![b'a'; 4096];
+        assert!(!ct_token_match(&oversized, expected));
     }
 
     #[test]
