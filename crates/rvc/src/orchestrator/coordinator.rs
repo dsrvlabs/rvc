@@ -752,18 +752,18 @@ mod tests {
     const TEST_GENESIS_TIME: u64 = 1606824023;
 
     fn fast_timeouts() -> OperationTimeouts {
-        let mut t = OperationTimeouts::default();
-        t.duty_fetch = Duration::from_millis(200);
-        t.block_production = Duration::from_millis(200);
-        t.block_publication = Duration::from_millis(200);
-        t.attestation_fetch = Duration::from_millis(200);
-        t.attestation_submit = Duration::from_millis(200);
-        t.aggregate_fetch = Duration::from_millis(200);
-        t.aggregate_submit = Duration::from_millis(200);
-        t.sync_message = Duration::from_millis(200);
-        t.sync_contribution = Duration::from_millis(200);
-        t.preparation = Duration::from_millis(200);
-        t
+        OperationTimeouts {
+            duty_fetch: Duration::from_millis(200),
+            block_production: Duration::from_millis(200),
+            block_publication: Duration::from_millis(200),
+            attestation_fetch: Duration::from_millis(200),
+            attestation_submit: Duration::from_millis(200),
+            aggregate_fetch: Duration::from_millis(200),
+            aggregate_submit: Duration::from_millis(200),
+            sync_message: Duration::from_millis(200),
+            sync_contribution: Duration::from_millis(200),
+            preparation: Duration::from_millis(200),
+        }
     }
 
     fn create_test_fork_schedule() -> Arc<ForkSchedule> {

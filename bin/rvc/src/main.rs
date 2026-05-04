@@ -1795,9 +1795,17 @@ async fn finalize_health_status(health_status: &SharedHealthStatus) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serialize all tests in this module that read or write OTEL env vars.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn test_build_tracing_config_no_endpoint_returns_none() {
+        let _guard = env_lock();
         // Clear env vars that could interfere
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
@@ -1808,6 +1816,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_with_endpoint_returns_some() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1823,6 +1832,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_env_var_fallback() {
+        let _guard = env_lock();
         std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://env-collector:4318");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1835,6 +1845,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_cli_overrides_env() {
+        let _guard = env_lock();
         std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://env-collector:4318");
 
         let config = Config {
@@ -1849,6 +1860,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_sample_rate_env_fallback() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.5");
 
@@ -1865,6 +1877,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_explicit_sample_rate_overrides_env() {
+        let _guard = env_lock();
         std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.5");
 
         let config = Config {
@@ -1880,6 +1893,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_sample_rate_clamped() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1894,6 +1908,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_negative_sample_rate_clamped() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1908,6 +1923,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_network_propagated() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1922,6 +1938,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_unknown_exporter_defaults_to_otlp() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1936,6 +1953,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_batch_fields_passthrough() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1952,6 +1970,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_batch_fields_none_by_default() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1982,6 +2001,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_creates_valid_telemetry_config() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 

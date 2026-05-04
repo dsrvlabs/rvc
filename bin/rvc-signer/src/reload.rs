@@ -184,8 +184,13 @@ mod tests {
     fn create_test_keystore(dir: &std::path::Path, password: &str) -> ([u8; 48], SecretKey) {
         let sk = SecretKey::generate();
         let pubkey = sk.public_key().to_bytes();
-        let ks = Keystore::encrypt(&sk, password.as_bytes(), "", EncryptionKdf::scrypt_cheap_for_tests())
-            .expect("encrypt");
+        let ks = Keystore::encrypt(
+            &sk,
+            password.as_bytes(),
+            "",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("encrypt");
         let filename = format!("{}.json", hex::encode(pubkey));
         fs::write(dir.join(&filename), ks.to_json().unwrap()).unwrap();
         (pubkey, sk)
