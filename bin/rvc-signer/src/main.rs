@@ -261,6 +261,7 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 &password,
                 tls_config.as_ref(),
                 Arc::new(signer_metrics.dvt.clone()),
+                args.dvt_allowed_peers.as_deref(),
             )
             .await?;
             (backend, Some(share_map), None)
@@ -478,12 +479,17 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 /// Returns the DVT signing backend AND the share map (for `PeerSignerService`).
 /// The share map is returned separately so the caller can build `PeerSignerServiceImpl`
 /// AFTER the slashing DB is opened (allowing CN-scoped slashing for DVT peers).
+///
+/// `dvt_allowed_peers_path`: optional path to `dvt-allowed-peers.toml`.  When
+/// TLS is enabled and this path is provided, the allow-list is loaded to derive
+/// the SNI hostname for each peer address (ISSUE-4.1 / L-1 fix).
 #[cfg(feature = "dvt")]
 async fn build_dvt_backend(
     resolved: &config::ResolvedConfig,
     password: &Zeroizing<String>,
     tls_config: Option<&rvc_signer_bin::tls::TlsConfig>,
     dvt_metrics: Arc<metrics::DvtMetrics>,
+    dvt_allowed_peers_path: Option<&std::path::Path>,
 ) -> Result<
     (
         Arc<dyn backend::SigningBackend>,
@@ -516,9 +522,44 @@ async fn build_dvt_backend(
         shares.iter().map(|s| (s.aggregate_pubkey, s.clone())).collect();
     let share_map = Arc::new(share_map);
 
-    let peer_requester = if !resolved.dvt_peers.is_empty() {
+    // ── L-1 SNI pinning: build per-peer connection info ──────────────────────
+    //
+    // When TLS is enabled and the allow-list path is provided, we load the
+    // allow-list to look up each peer's `peer_cn` by its TCP address.
+    // That CN is set as `domain_name` on the per-peer `ClientTlsConfig` in
+    // `GrpcPeerRequester::connect`, so rustls verifies the server certificate
+    // against the expected peer hostname rather than accepting any cert valid
+    // under the shared CA.
+    let peer_infos: Vec<dvt::peer_client::PeerConnectInfo> = {
+        // Load allow-list for SNI derivation only when TLS + path are both available.
+        let allow_list_opt = if tls_config.is_some() {
+            dvt_allowed_peers_path
+                .map(|path| {
+                    dvt::allow_list::AllowedPeers::load_from_path(path)
+                        .map_err(|e| format!("failed to load DVT allow-list for SNI: {e}"))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+
+        resolved
+            .dvt_peers
+            .iter()
+            .map(|addr| {
+                let sni_cn = allow_list_opt
+                    .as_ref()
+                    .and_then(|al| al.lookup_by_addr(addr))
+                    .map(|p| p.peer_cn.clone())
+                    .unwrap_or_default();
+                dvt::peer_client::PeerConnectInfo { addr: addr.clone(), sni_cn }
+            })
+            .collect()
+    };
+
+    let peer_requester = if !peer_infos.is_empty() {
         let requester =
-            dvt::peer_client::GrpcPeerRequester::connect(&resolved.dvt_peers, tls_config, timeout)
+            dvt::peer_client::GrpcPeerRequester::connect(&peer_infos, tls_config, timeout)
                 .await
                 .map_err(|e| format!("failed to connect to DVT peers: {}", e))?;
 

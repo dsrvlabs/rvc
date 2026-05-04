@@ -37,8 +37,14 @@ share_index = 2
     let allowed = AllowedPeers::load_from_path(f.path()).unwrap();
     assert_eq!(allowed.peers.len(), 2);
 
-    assert_eq!(allowed.peers[0], AllowedPeer { peer_cn: "peer-A".to_string(), share_index: 1 });
-    assert_eq!(allowed.peers[1], AllowedPeer { peer_cn: "peer-B".to_string(), share_index: 2 });
+    assert_eq!(
+        allowed.peers[0],
+        AllowedPeer { peer_cn: "peer-A".to_string(), share_index: 1, addr: None }
+    );
+    assert_eq!(
+        allowed.peers[1],
+        AllowedPeer { peer_cn: "peer-B".to_string(), share_index: 2, addr: None }
+    );
 }
 
 // --------------------------------------------------------------------------

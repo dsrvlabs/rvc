@@ -517,7 +517,11 @@ mod tests {
         Arc::new(AllowedPeers {
             peers: entries
                 .into_iter()
-                .map(|(cn, idx)| AllowedPeer { peer_cn: cn.to_string(), share_index: idx })
+                .map(|(cn, idx)| AllowedPeer {
+                    peer_cn: cn.to_string(),
+                    share_index: idx,
+                    addr: None,
+                })
                 .collect(),
         })
     }

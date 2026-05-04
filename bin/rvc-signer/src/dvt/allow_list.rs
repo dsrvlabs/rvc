@@ -9,13 +9,21 @@
 //!
 //! ```toml
 //! [[peer]]
-//! peer_cn = "peer-A"
+//! peer_cn = "peer-a.cluster.local"
 //! share_index = 1
+//! addr = "peer-a.cluster.local:50051"   # optional; enables client-side SNI pinning
 //!
 //! [[peer]]
-//! peer_cn = "peer-B"
+//! peer_cn = "peer-b.cluster.local"
 //! share_index = 2
+//! addr = "peer-b.cluster.local:50052"
 //! ```
+//!
+//! The `addr` field is optional.  When present, the DVT client sets
+//! `domain_name(peer_cn)` on the per-peer `ClientTlsConfig` before dialling,
+//! preventing a certificate valid for one peer from being accepted for another
+//! (ISSUE-4.1 / L-1 fix).  When absent, SNI pinning is skipped for that peer
+//! and a warning is emitted at connect time.
 //!
 //! # Startup gate
 //!
@@ -52,9 +60,21 @@ pub enum AllowListError {
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct AllowedPeer {
     /// The mTLS Common Name of the peer.
+    ///
+    /// Must be a valid DNS name (e.g. `"peer-a.cluster.local"`).
+    /// Used as both the allow-list identity and the TLS SNI hostname when
+    /// `addr` is set (ISSUE-4.1 / L-1 SNI pinning fix).
     pub peer_cn: String,
     /// The Shamir share index assigned to this peer.
     pub share_index: u64,
+    /// Optional TCP address of this peer (e.g. `"peer-a.cluster.local:50051"`).
+    ///
+    /// When set, `GrpcPeerRequester::connect` looks up this address in the
+    /// allow-list and pins the TLS SNI to `peer_cn` before dialling.
+    /// Without this field, SNI is not pinned for the peer and a warning is
+    /// logged.
+    #[serde(default)]
+    pub addr: Option<String>,
 }
 
 /// Raw deserialization target — `peer` key is optional so that missing/empty
@@ -98,6 +118,17 @@ impl AllowedPeers {
     /// Returns `None` if no entry with the given CN exists.
     pub fn lookup_by_cn(&self, peer_cn: &str) -> Option<&AllowedPeer> {
         self.peers.iter().find(|p| p.peer_cn == peer_cn)
+    }
+
+    /// Look up a peer by its TCP address.
+    ///
+    /// Returns `None` if no entry has `addr` matching the given string.
+    /// Entries whose `addr` field is `None` are never matched.
+    ///
+    /// Used by `GrpcPeerRequester::connect` to derive the SNI hostname for
+    /// each outbound DVT peer connection (ISSUE-4.1 / L-1 fix).
+    pub fn lookup_by_addr(&self, addr: &str) -> Option<&AllowedPeer> {
+        self.peers.iter().find(|p| p.addr.as_deref() == Some(addr))
     }
 }
 
@@ -180,8 +211,8 @@ name = "test"
     fn test_lookup_by_cn_found() {
         let allowed = AllowedPeers {
             peers: vec![
-                AllowedPeer { peer_cn: "peer-A".to_string(), share_index: 1 },
-                AllowedPeer { peer_cn: "peer-B".to_string(), share_index: 2 },
+                AllowedPeer { peer_cn: "peer-A".to_string(), share_index: 1, addr: None },
+                AllowedPeer { peer_cn: "peer-B".to_string(), share_index: 2, addr: None },
             ],
         };
         let peer = allowed.lookup_by_cn("peer-A").unwrap();
@@ -191,7 +222,7 @@ name = "test"
     #[test]
     fn test_lookup_by_cn_not_found_returns_none() {
         let allowed = AllowedPeers {
-            peers: vec![AllowedPeer { peer_cn: "peer-A".to_string(), share_index: 1 }],
+            peers: vec![AllowedPeer { peer_cn: "peer-A".to_string(), share_index: 1, addr: None }],
         };
         assert!(allowed.lookup_by_cn("peer-X").is_none());
     }
@@ -199,9 +230,80 @@ name = "test"
     #[test]
     fn test_lookup_by_cn_case_sensitive() {
         let allowed = AllowedPeers {
-            peers: vec![AllowedPeer { peer_cn: "Peer-A".to_string(), share_index: 1 }],
+            peers: vec![AllowedPeer { peer_cn: "Peer-A".to_string(), share_index: 1, addr: None }],
         };
         assert!(allowed.lookup_by_cn("peer-a").is_none());
         assert!(allowed.lookup_by_cn("Peer-A").is_some());
+    }
+
+    // ── lookup_by_addr tests ────────────────────────────���─────────────────────
+
+    #[test]
+    fn test_lookup_by_addr_found() {
+        let allowed = AllowedPeers {
+            peers: vec![
+                AllowedPeer {
+                    peer_cn: "peer-a.local".to_string(),
+                    share_index: 1,
+                    addr: Some("peer-a.local:50051".to_string()),
+                },
+                AllowedPeer {
+                    peer_cn: "peer-b.local".to_string(),
+                    share_index: 2,
+                    addr: Some("peer-b.local:50052".to_string()),
+                },
+            ],
+        };
+        let hit = allowed.lookup_by_addr("peer-a.local:50051").unwrap();
+        assert_eq!(hit.peer_cn, "peer-a.local");
+        assert_eq!(hit.share_index, 1);
+    }
+
+    #[test]
+    fn test_lookup_by_addr_not_found() {
+        let allowed = AllowedPeers {
+            peers: vec![AllowedPeer {
+                peer_cn: "peer-a.local".to_string(),
+                share_index: 1,
+                addr: Some("peer-a.local:50051".to_string()),
+            }],
+        };
+        assert!(allowed.lookup_by_addr("peer-x.local:50051").is_none());
+    }
+
+    #[test]
+    fn test_lookup_by_addr_none_field_not_matched() {
+        let allowed = AllowedPeers {
+            peers: vec![AllowedPeer {
+                peer_cn: "peer-a.local".to_string(),
+                share_index: 1,
+                addr: None,
+            }],
+        };
+        // Entries without addr can never be matched by address.
+        assert!(allowed.lookup_by_addr("peer-a.local:50051").is_none());
+    }
+
+    // ── addr field TOML round-trip ────────────────────────────��───────────────
+
+    #[test]
+    fn test_load_with_addr_field() {
+        let f = write_toml(
+            r#"
+[[peer]]
+peer_cn = "peer-a.cluster.local"
+share_index = 1
+addr = "peer-a.cluster.local:50051"
+
+[[peer]]
+peer_cn = "peer-b.cluster.local"
+share_index = 2
+"#,
+        );
+
+        let allowed = AllowedPeers::load_from_path(f.path()).unwrap();
+        assert_eq!(allowed.peers[0].addr, Some("peer-a.cluster.local:50051".to_string()));
+        // addr is optional; second peer has no addr
+        assert_eq!(allowed.peers[1].addr, None);
     }
 }

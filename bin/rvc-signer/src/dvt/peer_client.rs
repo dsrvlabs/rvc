@@ -3,7 +3,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::backend::dvt::{PeerRequestError, PeerRequester};
 use crate::proto::signer::peer_signer_service_client::PeerSignerServiceClient;
@@ -28,6 +28,30 @@ pub enum PeerClientError {
     PeerNotFound(String),
 }
 
+/// Per-peer connection parameters for DVT gRPC connections.
+///
+/// Carries the TCP address **and** the TLS SNI hostname to pin.
+///
+/// # SNI pinning (ISSUE-4.1 / L-1 fix)
+///
+/// `sni_cn` is set as `domain_name` on the per-peer `ClientTlsConfig` clone
+/// before dialling.  rustls then refuses any server certificate that is not
+/// valid for `sni_cn`, preventing a certificate issued for peer-A from being
+/// silently accepted when the client intended to connect to peer-B.
+///
+/// When TLS is disabled (insecure mode) `sni_cn` is ignored.
+#[derive(Debug, Clone)]
+pub struct PeerConnectInfo {
+    /// TCP address of the peer (e.g. `"peer-a.cluster.local:50051"`).
+    pub addr: String,
+    /// Expected TLS SNI hostname — the peer's `peer_cn` from the allow-list.
+    ///
+    /// Must be a valid DNS name accepted by rustls `ServerName` (e.g.
+    /// `"peer-a.cluster.local"`).  Leave empty when TLS is disabled or when
+    /// SNI pinning should be skipped for a peer (a warning is logged).
+    pub sni_cn: String,
+}
+
 /// gRPC-based peer requester that connects to DVT peers.
 pub struct GrpcPeerRequester {
     peers: Vec<(String, PeerSignerServiceClient<Channel>)>,
@@ -35,11 +59,26 @@ pub struct GrpcPeerRequester {
 }
 
 impl GrpcPeerRequester {
-    /// Connect to a list of peer addresses.
+    /// Connect to a list of peers, pinning SNI per peer.
     ///
-    /// If `tls_config` is provided, mTLS is used for all connections.
+    /// If `tls_config` is provided, mTLS is used.  For each peer, the
+    /// `domain_name` on the `ClientTlsConfig` is set to `peer.sni_cn` before
+    /// dialling, so rustls verifies the server certificate against the
+    /// peer-specific hostname.
+    ///
+    /// # SNI pinning (ISSUE-4.1 / L-1 fix)
+    ///
+    /// Without this pinning, any certificate valid under the shared CA would
+    /// be accepted regardless of which peer it was issued to.  By setting
+    /// `domain_name(sni_cn)` per peer, rustls refuses certificates that are
+    /// not issued for the expected peer hostname.
+    ///
+    /// If `peer.sni_cn` is empty and TLS is active, pinning is skipped for
+    /// that peer and a warning is logged.  Operators should add an `addr`
+    /// field to the corresponding `[[peer]]` entry in `dvt-allowed-peers.toml`
+    /// to enable SNI pinning.
     pub async fn connect(
-        peers: &[String],
+        peers: &[PeerConnectInfo],
         tls_config: Option<&TlsConfig>,
         timeout: Duration,
     ) -> Result<Self, PeerClientError> {
@@ -52,25 +91,41 @@ impl GrpcPeerRequester {
 
         let mut connected = Vec::with_capacity(peers.len());
 
-        for addr in peers {
+        for peer in peers {
             let scheme = if client_tls.is_some() { "https" } else { "http" };
-            let uri = format!("{}://{}", scheme, addr);
+            let uri = format!("{}://{}", scheme, peer.addr);
             let mut endpoint = Endpoint::from_shared(uri)
-                .map_err(|e| PeerClientError::Connect { addr: addr.clone(), source: e })?
+                .map_err(|e| PeerClientError::Connect { addr: peer.addr.clone(), source: e })?
                 .timeout(timeout);
 
             if let Some(ref tls) = client_tls {
+                // L-1 SNI pinning: set domain_name per peer so rustls verifies
+                // the server certificate is issued for this specific peer's
+                // expected hostname.  Without this, any cert valid under the
+                // shared CA passes for any peer — a silent impersonation path.
+                let pinned_tls = if peer.sni_cn.is_empty() {
+                    warn!(
+                        addr = %peer.addr,
+                        "DVT peer has no SNI configured; TLS cert hostname will not be pinned. \
+                         Add 'addr' to the [[peer]] entry in dvt-allowed-peers.toml to enable \
+                         per-peer SNI pinning (ISSUE-4.1 / L-1)."
+                    );
+                    tls.clone()
+                } else {
+                    debug!(addr = %peer.addr, sni = %peer.sni_cn, "SNI pinned for DVT peer");
+                    tls.clone().domain_name(&peer.sni_cn)
+                };
                 endpoint = endpoint
-                    .tls_config(tls.clone())
-                    .map_err(|e| PeerClientError::Connect { addr: addr.clone(), source: e })?;
+                    .tls_config(pinned_tls)
+                    .map_err(|e| PeerClientError::Connect { addr: peer.addr.clone(), source: e })?;
             }
 
             let channel = endpoint
                 .connect()
                 .await
-                .map_err(|e| PeerClientError::Connect { addr: addr.clone(), source: e })?;
+                .map_err(|e| PeerClientError::Connect { addr: peer.addr.clone(), source: e })?;
 
-            connected.push((addr.clone(), PeerSignerServiceClient::new(channel)));
+            connected.push((peer.addr.clone(), PeerSignerServiceClient::new(channel)));
         }
 
         Ok(Self { peers: connected, timeout })
