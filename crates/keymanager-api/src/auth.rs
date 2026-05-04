@@ -158,7 +158,13 @@ const MAX_BEARER_TOKEN_BYTES: usize = 256;
 /// caller that bypasses `validate_token` cannot accidentally
 /// authenticate an empty bearer.
 fn ct_token_match(candidate: &[u8], expected: &[u8]) -> bool {
-    if expected.is_empty() {
+    // Reject empty or oversized expected tokens.  validate_token enforces
+    // 64 hex chars for persisted tokens; this guard makes ct_token_match
+    // safe as a standalone primitive (a future caller bypassing
+    // validate_token cannot accidentally authenticate against an empty
+    // bearer, nor cause silent truncation of an over-long server token
+    // past MAX_BEARER_TOKEN_BYTES).
+    if expected.is_empty() || expected.len() > MAX_BEARER_TOKEN_BYTES {
         return false;
     }
 
@@ -291,6 +297,16 @@ mod tests {
         let expected = b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         let oversized = vec![b'a'; 4096];
         assert!(!ct_token_match(&oversized, expected));
+    }
+
+    #[test]
+    fn test_ct_token_match_oversized_expected_rejected() {
+        // validate_token forbids this in production, but the standalone
+        // primitive must reject expected lengths past MAX_BEARER_TOKEN_BYTES
+        // to prevent silent truncation that could alias two distinct server
+        // tokens sharing a 256-byte prefix.
+        let expected = vec![b'x'; MAX_BEARER_TOKEN_BYTES + 1];
+        assert!(!ct_token_match(&expected, &expected));
     }
 
     #[test]
