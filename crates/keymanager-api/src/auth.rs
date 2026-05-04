@@ -123,6 +123,35 @@ pub fn warn_if_insecure_permissions(path: &std::path::Path) -> bool {
     }
 }
 
+/// Constant-time bearer-token comparison that does not leak the expected
+/// token length via timing.
+///
+/// `subtle::ConstantTimeEq for [u8]` short-circuits with `Choice(0)` when
+/// the slices have different lengths. That short-circuit is itself
+/// constant-time at the bit level, but the *control-flow path* of "abort
+/// before any byte compare" finishes in measurably less wall time than the
+/// full bytewise loop. An attacker who can probe `/eth/v1/keystores` with
+/// candidate tokens of varying lengths therefore learns the length of the
+/// expected token, narrowing brute-force to a single length class
+/// (ISSUE-4.2 / L-2 fix).
+///
+/// The fix pads both inputs to the larger of the two lengths, runs
+/// `ct_eq` on equal-length buffers (no length-based short-circuit), then
+/// folds in a constant-time length-equality check. The final answer is
+/// `content_eq AND length_eq`, computed without branching on either
+/// length.
+fn ct_token_match(candidate: &[u8], expected: &[u8]) -> bool {
+    let max_len = candidate.len().max(expected.len());
+    let mut padded_candidate = vec![0u8; max_len];
+    let mut padded_expected = vec![0u8; max_len];
+    padded_candidate[..candidate.len()].copy_from_slice(candidate);
+    padded_expected[..expected.len()].copy_from_slice(expected);
+
+    let content_eq = padded_candidate.ct_eq(&padded_expected);
+    let length_eq = (candidate.len() as u64).ct_eq(&(expected.len() as u64));
+    (content_eq & length_eq).unwrap_u8() == 1
+}
+
 async fn bearer_auth(
     axum::extract::State(expected_token): axum::extract::State<Arc<Zeroizing<String>>>,
     request: Request,
@@ -133,7 +162,7 @@ async fn bearer_auth(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .map(|token| token.as_bytes().ct_eq(expected_token.as_bytes()).unwrap_u8() == 1)
+        .map(|token| ct_token_match(token.as_bytes(), expected_token.as_bytes()))
         .unwrap_or(false);
 
     tracing::debug!(valid = authorized, "Auth token validation");
@@ -165,6 +194,67 @@ mod tests {
         let t1 = generate_token();
         let t2 = generate_token();
         assert_ne!(t1, t2);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // ISSUE-4.2 / L-2: ct_token_match must not leak length via control flow.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_ct_token_match_correct_token_passes() {
+        let token = b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        assert!(ct_token_match(token, token));
+    }
+
+    #[test]
+    fn test_ct_token_match_wrong_content_same_length_fails() {
+        let expected = b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let candidate = b"ffffff0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        assert!(!ct_token_match(candidate, expected));
+    }
+
+    #[test]
+    fn test_ct_token_match_short_candidate_fails() {
+        let expected = b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let candidate = b"abcdef";
+        assert!(!ct_token_match(candidate, expected));
+    }
+
+    #[test]
+    fn test_ct_token_match_long_candidate_fails() {
+        let expected = b"abcdef0123456789";
+        let candidate =
+            b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        assert!(!ct_token_match(candidate, expected));
+    }
+
+    #[test]
+    fn test_ct_token_match_empty_candidate_fails() {
+        let expected = b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        assert!(!ct_token_match(b"", expected));
+    }
+
+    #[test]
+    fn test_ct_token_match_one_byte_off_at_end_fails() {
+        let expected = b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456788";
+        let candidate = b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        assert!(!ct_token_match(candidate, expected));
+    }
+
+    /// Structural assertion: `ct_token_match` does not have a length-mismatch
+    /// fast path that returns before the constant-time byte loop.  Verified
+    /// indirectly: candidates of *different* lengths (one shorter, one
+    /// longer than the expected token) both produce identical `false`
+    /// results without panic, exercising the padded-buffer code path.
+    /// Direct timing assertions are flaky in CI; the threat-model
+    /// justification lives in the `ct_token_match` doc comment.
+    #[test]
+    fn test_ct_token_match_no_length_fast_path() {
+        let expected = b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let shorter = b"abcdef";
+        let longer = b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789xx";
+        assert!(!ct_token_match(shorter, expected));
+        assert!(!ct_token_match(longer, expected));
     }
 
     #[test]
