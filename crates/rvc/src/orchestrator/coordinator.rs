@@ -751,6 +751,21 @@ mod tests {
 
     const TEST_GENESIS_TIME: u64 = 1606824023;
 
+    fn fast_timeouts() -> OperationTimeouts {
+        let mut t = OperationTimeouts::default();
+        t.duty_fetch = Duration::from_millis(200);
+        t.block_production = Duration::from_millis(200);
+        t.block_publication = Duration::from_millis(200);
+        t.attestation_fetch = Duration::from_millis(200);
+        t.attestation_submit = Duration::from_millis(200);
+        t.aggregate_fetch = Duration::from_millis(200);
+        t.aggregate_submit = Duration::from_millis(200);
+        t.sync_message = Duration::from_millis(200);
+        t.sync_contribution = Duration::from_millis(200);
+        t.preparation = Duration::from_millis(200);
+        t
+    }
+
     fn create_test_fork_schedule() -> Arc<ForkSchedule> {
         Arc::new(ForkSchedule {
             genesis_fork_version: [0, 0, 0, 1],
@@ -1480,10 +1495,10 @@ mod tests {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let timeouts = OperationTimeouts::default();
+        let timeouts = fast_timeouts();
         let mock_server = MockServer::start().await;
 
-        // Mock attester duties endpoint with a 15s delay (exceeds duty_fetch of 10s)
+        // Mock attester duties endpoint with a delay that exceeds duty_fetch (200ms)
         Mock::given(method("POST"))
             .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
             .respond_with(
@@ -1492,7 +1507,7 @@ mod tests {
                         "data": [],
                         "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
                     }))
-                    .set_delay(timeouts.duty_fetch + Duration::from_secs(5)),
+                    .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
             )
             .mount(&mock_server)
             .await;
@@ -2505,15 +2520,15 @@ mod tests {
             "execution_optimistic": false
         });
 
-        let timeouts = OperationTimeouts::default();
+        let timeouts = fast_timeouts();
 
-        // Respond slower than duty_fetch timeout (10s)
+        // Respond slower than duty_fetch timeout (200ms)
         Mock::given(method("POST"))
             .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(&slow_response)
-                    .set_delay(timeouts.duty_fetch + Duration::from_secs(5)),
+                    .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
             )
             .mount(&mock_server)
             .await;
@@ -2523,7 +2538,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(&slow_response)
-                    .set_delay(timeouts.duty_fetch + Duration::from_secs(5)),
+                    .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
             )
             .mount(&mock_server)
             .await;
@@ -2543,7 +2558,7 @@ mod tests {
         let signer = Arc::new(SignerService::new(composite, slashing_db));
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
-        let config = create_test_config();
+        let config = create_test_config().with_timeouts(timeouts.clone());
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
@@ -2563,9 +2578,9 @@ mod tests {
         orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
         let elapsed = start.elapsed();
 
-        // 4 calls each bounded by duty_fetch timeout (10s).
-        // Without timeout wrapping this would take 4 * 15s = 60s.
-        // With timeouts: 4 * 10s = 40s + margin.
+        // 4 calls each bounded by duty_fetch timeout (200ms).
+        // Without timeout wrapping this would take 4 * 700ms ≈ 2.8s.
+        // With timeouts: 4 * 200ms = 800ms + margin.
         assert!(
             elapsed < timeouts.duty_fetch * 5,
             "Reorg check took {:?}, expected < {:?} (4 timeouts + margin)",
