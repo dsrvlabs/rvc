@@ -48,8 +48,10 @@ pub struct PeerConnectInfo {
     /// Expected TLS SNI hostname — the peer's `peer_cn` from the allow-list.
     ///
     /// Must be a valid DNS name accepted by rustls `ServerName` (e.g.
-    /// `"peer-a.cluster.local"`).  Leave empty when TLS is disabled or when
-    /// SNI pinning should be skipped for a peer (a warning is logged).
+    /// `"peer-a.cluster.local"`).  Leave empty only when TLS is disabled —
+    /// under TLS, an empty `sni_cn` is rejected at startup by
+    /// [`build_peer_connect_infos`] and at connect time by
+    /// [`GrpcPeerRequester::connect`] (ISSUE-4.1 / L-1).
     pub sni_cn: String,
 }
 
@@ -125,10 +127,9 @@ impl GrpcPeerRequester {
     /// `domain_name(sni_cn)` per peer, rustls refuses certificates that are
     /// not issued for the expected peer hostname.
     ///
-    /// If `peer.sni_cn` is empty and TLS is active, pinning is skipped for
-    /// that peer and a warning is logged.  Operators should add an `addr`
-    /// field to the corresponding `[[peer]]` entry in `dvt-allowed-peers.toml`
-    /// to enable SNI pinning.
+    /// If `peer.sni_cn` is empty and TLS is active, `connect` returns
+    /// `Err(PeerClientError::Tls)`.  Callers must go through
+    /// [`build_peer_connect_infos`] to guarantee `sni_cn` is populated.
     pub async fn connect(
         peers: &[PeerConnectInfo],
         tls_config: Option<&TlsConfig>,

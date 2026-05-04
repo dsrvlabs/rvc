@@ -19,11 +19,13 @@
 //! addr = "peer-b.cluster.local:50052"
 //! ```
 //!
-//! The `addr` field is optional.  When present, the DVT client sets
-//! `domain_name(peer_cn)` on the per-peer `ClientTlsConfig` before dialling,
-//! preventing a certificate valid for one peer from being accepted for another
-//! (ISSUE-4.1 / L-1 fix).  When absent, SNI pinning is skipped for that peer
-//! and a warning is emitted at connect time.
+//! The `addr` field is required for any peer the local node will dial when
+//! TLS is enabled.  When set, the DVT client sets `domain_name(peer_cn)` on
+//! the per-peer `ClientTlsConfig` before dialling, preventing a certificate
+//! valid for one peer from being accepted for another (ISSUE-4.1 / L-1 fix).
+//! When absent, [`super::peer_client::build_peer_connect_infos`] fails
+//! startup for any DVT peer addr that lacks a matching `[[peer]]` entry —
+//! there is no silent fallback to un-pinned TLS.
 //!
 //! # Startup gate
 //!
@@ -71,8 +73,8 @@ pub struct AllowedPeer {
     ///
     /// When set, `GrpcPeerRequester::connect` looks up this address in the
     /// allow-list and pins the TLS SNI to `peer_cn` before dialling.
-    /// Without this field, SNI is not pinned for the peer and a warning is
-    /// logged.
+    /// When TLS is enabled and a configured DVT peer addr has no matching
+    /// `[[peer]]` entry with this field, startup fails (ISSUE-4.1 / L-1).
     #[serde(default)]
     pub addr: Option<String>,
 }

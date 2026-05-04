@@ -68,9 +68,10 @@ struct TestCerts {
 
 /// Generate CA → server cert (DNS SAN = `sni_name`) → client cert.
 ///
-/// The server cert intentionally has **only** the DNS SAN `sni_name` (no IP
-/// SAN).  This means rustls will reject the cert when the client's expected
-/// hostname is anything other than `sni_name`.
+/// The server cert has DNS SAN = `sni_name` and IP SAN = `127.0.0.1`.
+/// The IP SAN is required to make `test_wrong_peer_cert_refused` a genuine
+/// RED→GREEN regression test (see the inline comment in the function body
+/// for the full reasoning).
 fn generate_test_certs(sni_name: &str) -> TestCerts {
     // CA
     let ca_params = CertificateParams::new(vec!["test-ca.internal".to_string()]).unwrap();
