@@ -179,8 +179,13 @@ mod tests {
         let sk = SecretKey::generate();
         let pubkey = sk.public_key().to_bytes();
 
-        let keystore = CryptoKeystore::encrypt(&sk, password.as_bytes(), "", EncryptionKdf::Pbkdf2)
-            .expect("encryption should succeed");
+        let keystore = CryptoKeystore::encrypt(
+            &sk,
+            password.as_bytes(),
+            "",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("encryption should succeed");
 
         let json = keystore.to_json().expect("serialize");
         let filename = format!("{}.json", hex::encode(pubkey));

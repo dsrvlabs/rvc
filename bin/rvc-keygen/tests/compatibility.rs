@@ -263,7 +263,7 @@ fn test_keystore_eip2335_structure() {
     let password = b"compatibility-test-password-123";
 
     let keystore =
-        Keystore::encrypt(&signing_key, password, SIGNING_PATH, EncryptionKdf::Pbkdf2).unwrap();
+        Keystore::encrypt(&signing_key, password, SIGNING_PATH, EncryptionKdf::scrypt_cheap_for_tests()).unwrap();
     let json_str = keystore.to_json().unwrap();
     let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
 
@@ -303,7 +303,7 @@ fn test_keystore_pubkey_matches_derived_key() {
     let expected_pubkey = hex::encode(signing_key.public_key().to_bytes());
 
     let keystore =
-        Keystore::encrypt(&signing_key, password, SIGNING_PATH, EncryptionKdf::Pbkdf2).unwrap();
+        Keystore::encrypt(&signing_key, password, SIGNING_PATH, EncryptionKdf::scrypt_cheap_for_tests()).unwrap();
 
     assert_eq!(
         keystore.pubkey.as_deref(),

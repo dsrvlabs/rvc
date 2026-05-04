@@ -1519,7 +1519,7 @@ mod tests {
             &sk,
             password,
             "m/12381/3600/0/0/0",
-            crypto::EncryptionKdf::Pbkdf2,
+            crypto::EncryptionKdf::scrypt_cheap_for_tests(),
         )
         .expect("encrypt");
         let keystore_json = serde_json::to_string(&keystore).unwrap();
@@ -1558,7 +1558,7 @@ mod tests {
             &sk,
             password,
             "m/12381/3600/0/0/0",
-            crypto::EncryptionKdf::Pbkdf2,
+            crypto::EncryptionKdf::scrypt_cheap_for_tests(),
         )
         .expect("encrypt");
         let keystore_json = serde_json::to_string(&keystore).unwrap();
@@ -2044,7 +2044,7 @@ mod tests {
             &sk,
             password,
             "m/12381/3600/0/0/0",
-            crypto::EncryptionKdf::Pbkdf2,
+            crypto::EncryptionKdf::scrypt_cheap_for_tests(),
         )
         .expect("encrypt");
         let keystore_json = serde_json::to_string(&keystore).unwrap();
@@ -2085,7 +2085,7 @@ mod tests {
             &sk,
             password,
             "m/12381/3600/0/0/0",
-            crypto::EncryptionKdf::Pbkdf2,
+            crypto::EncryptionKdf::scrypt_cheap_for_tests(),
         )
         .expect("encrypt");
         let keystore_json = serde_json::to_string(&keystore).unwrap();

@@ -1014,7 +1014,7 @@ mod tests {
             &sk,
             password.as_bytes(),
             "m/12381/3600/0/0/0",
-            EncryptionKdf::Pbkdf2,
+            EncryptionKdf::scrypt_cheap_for_tests(),
         )
         .expect("should encrypt");
         let pubkey_hex = keystore.pubkey.clone().unwrap();

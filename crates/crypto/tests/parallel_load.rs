@@ -25,7 +25,7 @@ fn create_keystore(dir: &TempDir, index: usize, password: &[u8]) -> (SecretKey, 
     let sk = SecretKey::generate();
     let pubkey_hex = hex::encode(sk.public_key().to_bytes());
     let path = format!("m/12381/3600/{}/0/0", index);
-    let keystore = Keystore::encrypt(&sk, password, &path, EncryptionKdf::Pbkdf2)
+    let keystore = Keystore::encrypt(&sk, password, &path, EncryptionKdf::scrypt_cheap_for_tests())
         .expect("encryption should succeed");
     let filename = format!("keystore-{}.json", index);
     keystore.to_file(dir.path().join(&filename)).expect("write should succeed");

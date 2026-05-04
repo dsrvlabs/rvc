@@ -43,7 +43,7 @@ const MAX_SCRYPT_R: u32 = 16;
 const MAX_SCRYPT_P: u32 = 16;
 const MAX_SCRYPT_DKLEN: u32 = 64;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum EncryptionKdf {
     /// Production scrypt params (n = 2^18). EIP-2335 default.
     Scrypt,
