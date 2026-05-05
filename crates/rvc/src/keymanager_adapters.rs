@@ -1128,10 +1128,13 @@ mod tests {
         // 1. Import a remote key
         let pk = test_pubkey(42);
         let pk_hex = format!("0x{}", hex::encode(pk));
+        // ISSUE-4.9 / L-9: import_remote_keys re-resolves the host via DNS
+        // and validates against the private/reserved deny-list. Use a public
+        // IP literal so this test does not depend on a CI DNS resolver.
         let import_body = serde_json::json!({
             "remote_keys": [{
                 "pubkey": pk_hex,
-                "url": "https://signer.example.com"
+                "url": "https://8.8.8.8:9000"
             }]
         });
 
