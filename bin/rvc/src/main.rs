@@ -1587,10 +1587,33 @@ async fn run_validator(
             shutdown_signal().await;
         });
 
+    // ISSUE-4.10 / L-10: refuse non-loopback metrics binds unless explicitly
+    // opted in via `RVC_METRICS_ALLOW_NON_LOOPBACK=true`. Loopback binds pass
+    // silently. Reuses the InsecureGate helper from ISSUE-2.10 (in Refuse mode
+    // after Phase 3 ISSUE-3.13 / NFR-10).
     if !metrics_address.is_loopback() {
+        // The predicate is constant-true here: the bind is already known to
+        // be non-loopback, so the env var alone determines the outcome (the
+        // InsecureGate `new()` constructor would set predicate=is_loopback,
+        // which is false at this point and would refuse even with the env
+        // var set; with_predicate keeps the env-var-only contract).
+        let metrics_gate = crypto::insecure::InsecureGate::with_predicate(
+            "RVC_METRICS_ALLOW_NON_LOOPBACK",
+            crypto::insecure::InsecureMode::default(),
+            || true,
+        );
+        if let Err(e) = metrics_gate.check() {
+            error!(
+                addr = %metrics_address,
+                error = %e,
+                "Refusing to start metrics server on non-loopback address (ISSUE-4.10 / L-10)"
+            );
+            return Err(e.into());
+        }
         warn!(
             addr = %metrics_address,
-            "Metrics server is bound to a non-loopback address; this exposes metrics over the network"
+            "Metrics server is bound to a non-loopback address (RVC_METRICS_ALLOW_NON_LOOPBACK=true); \
+             this exposes metrics over the network"
         );
     }
 
