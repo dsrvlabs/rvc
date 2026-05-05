@@ -4363,6 +4363,7 @@ dependencies = [
  "blst",
  "clap",
  "hex",
+ "libc",
  "parking_lot",
  "prometheus",
  "proptest",

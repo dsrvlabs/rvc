@@ -119,7 +119,19 @@ struct ServeArgs {
     #[arg(long, default_value = "127.0.0.1:9101")]
     metrics_address: String,
 
-    /// Keystore reload interval in seconds (0 to disable)
+    /// Enable keystore hot-reload (ISSUE-4.6 / L-6).
+    ///
+    /// Disabled by default. When enabled, the signer periodically rescans
+    /// `keystore_dir` and reconciles the loaded set with files on disk —
+    /// a key-injection vector if the directory is writable by anyone other
+    /// than the signer UID. Requires the directory to be 0o700 and owned
+    /// by the signer UID at every reload pass; otherwise the reload is
+    /// skipped with a warn log.
+    #[arg(long, default_value_t = false)]
+    enable_hot_reload: bool,
+
+    /// Keystore hot-reload interval in seconds (only honoured when
+    /// `--enable-hot-reload` is set).
     #[arg(long, default_value = "30")]
     reload_interval: u64,
 
@@ -334,9 +346,13 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // Start keystore hot-reload if using basic backend and interval > 0
+    // ISSUE-4.6 / L-6: keystore hot-reload is opt-in.  The reloader is only
+    // spawned when `--enable-hot-reload` is set (or the equivalent TOML key
+    // is true) AND `reload_interval_secs > 0`.  Each reload pass also
+    // enforces a strict 0o700 / signer-UID-owned directory check before
+    // touching keys (see `reload.rs::scan_and_reload`).
     if let Some(ref basic_signer) = basic_signer_ref {
-        if resolved.reload_interval_secs > 0 {
+        if resolved.enable_hot_reload && resolved.reload_interval_secs > 0 {
             let reloader = reload::KeystoreReloader::new(
                 resolved.keystore_dir.clone(),
                 password.clone(),
@@ -350,7 +366,18 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 reloader.run(cancel_clone).await;
             });
 
-            info!(interval_secs = resolved.reload_interval_secs, "Keystore hot-reload enabled");
+            info!(
+                interval_secs = resolved.reload_interval_secs,
+                "Keystore hot-reload enabled (--enable-hot-reload)"
+            );
+        } else if resolved.reload_interval_secs > 0 {
+            // Operators upgrading from a previous release where the reloader
+            // ran by default with a 30s interval will see this notice once
+            // at startup if they had a non-zero interval configured.
+            info!(
+                "Keystore hot-reload disabled (set --enable-hot-reload to opt in; \
+                 ISSUE-4.6 / L-6)"
+            );
         }
     }
 
@@ -625,6 +652,7 @@ fn resolve_config(args: &ServeArgs) -> Result<config::ResolvedConfig, Box<dyn st
         tls_ca_cert: args.tls_ca_cert.as_deref(),
         reload_interval: args.reload_interval,
         reload_interval_is_default,
+        enable_hot_reload: args.enable_hot_reload,
         dvt_peers,
         dvt_threshold,
         dvt_index,

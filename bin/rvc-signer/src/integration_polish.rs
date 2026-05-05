@@ -71,6 +71,7 @@ mod tests {
             tls_ca_cert: None,
             reload_interval: 30,
             reload_interval_is_default: true,
+            enable_hot_reload: false,
             dvt_peers: &[],
             dvt_threshold: None,
             dvt_index: None,
@@ -187,6 +188,13 @@ reload_interval_secs = 60
     #[tokio::test]
     async fn test_hot_reload_new_key_available() {
         let dir = TempDir::new().unwrap();
+        // ISSUE-4.6: tighten test dir to 0o700 so the L-6 perm-check passes.
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let password = Zeroizing::new("test-password".to_string());
 
         let signer = Arc::new(BasicSigner::load(dir.path(), &password).unwrap());
@@ -234,6 +242,12 @@ reload_interval_secs = 60
     #[tokio::test]
     async fn test_hot_reload_multiple_keys_added_incrementally() {
         let dir = TempDir::new().unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let password = Zeroizing::new("test-password".to_string());
 
         let signer = Arc::new(BasicSigner::load(dir.path(), &password).unwrap());
