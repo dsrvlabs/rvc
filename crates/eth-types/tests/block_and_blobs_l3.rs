@@ -3,7 +3,7 @@
 /// These tests verify that `BlockContents::BlockAndBlobs` exposes blob KZG
 /// commitments parsed from the block body SSZ and that the canonical commitment
 /// root is sensitive to any single-byte mutation.
-use rvc_eth_types::{BeaconBlock, BlockContents};
+use rvc_eth_types::{BeaconBlock, BlockContents, BodyForkLayout};
 
 /// Build a minimal `BeaconBlockBody` SSZ payload that contains `commitments`
 /// at the correct Deneb fixed-portion offset (bytes 388–391).
@@ -45,7 +45,7 @@ fn test_blob_commitments_extracted_from_body() {
     let c0 = [0xaa; 48];
     let c1 = [0xbb; 48];
     let contents = block_and_blobs(&[c0, c1]);
-    let parsed = contents.blob_kzg_commitments();
+    let parsed = contents.blob_kzg_commitments(BodyForkLayout::Deneb);
     assert_eq!(parsed.len(), 2);
     assert_eq!(parsed[0], c0);
     assert_eq!(parsed[1], c1);
@@ -54,7 +54,7 @@ fn test_blob_commitments_extracted_from_body() {
 #[test]
 fn test_blob_commitments_empty_when_no_blobs() {
     let contents = block_and_blobs(&[]);
-    assert_eq!(contents.blob_kzg_commitments(), Vec::<[u8; 48]>::new());
+    assert_eq!(contents.blob_kzg_commitments(BodyForkLayout::Deneb), Vec::<[u8; 48]>::new());
 }
 
 #[test]
@@ -67,7 +67,7 @@ fn test_blob_commitments_empty_for_block_variant() {
         body: body_with_commitments(&[[0xcc; 48]]),
     });
     assert_eq!(
-        contents.blob_kzg_commitments(),
+        contents.blob_kzg_commitments(BodyForkLayout::Deneb),
         Vec::<[u8; 48]>::new(),
         "Block variant has no blob commitments"
     );
@@ -80,7 +80,7 @@ fn test_blob_commitments_empty_for_block_variant() {
 fn test_blob_commitments_bound_in_signing_scope() {
     let commitments = vec![[0x42; 48], [0x24; 48], [0x77; 48]];
     let contents = block_and_blobs(&commitments);
-    let root = contents.kzg_commitment_root();
+    let root = contents.kzg_commitment_root(BodyForkLayout::Deneb);
     assert_ne!(root, [0u8; 32], "canonical commitment root must be nonzero");
 }
 
@@ -88,13 +88,13 @@ fn test_blob_commitments_bound_in_signing_scope() {
 #[test]
 fn test_signing_scope_changes_with_blob_commitments() {
     let original = vec![[0xde; 48], [0xad; 48]];
-    let base_root = block_and_blobs(&original).kzg_commitment_root();
+    let base_root = block_and_blobs(&original).kzg_commitment_root(BodyForkLayout::Deneb);
 
     for commit_idx in 0..original.len() {
         for byte_idx in 0..48 {
             let mut mutated = original.clone();
             mutated[commit_idx][byte_idx] ^= 0x01;
-            let mutated_root = block_and_blobs(&mutated).kzg_commitment_root();
+            let mutated_root = block_and_blobs(&mutated).kzg_commitment_root(BodyForkLayout::Deneb);
             assert_ne!(
                 base_root, mutated_root,
                 "commitment[{}][{}] mutation did not change root",
@@ -108,10 +108,10 @@ fn test_signing_scope_changes_with_blob_commitments() {
 #[test]
 fn test_commitment_root_empty_for_no_blobs() {
     let empty_contents = block_and_blobs(&[]);
-    let root = empty_contents.kzg_commitment_root();
+    let root = empty_contents.kzg_commitment_root(BodyForkLayout::Deneb);
     // Must be the canonical root of an empty list — deterministic and not [0;32]
     // for non-empty, but for empty it should be the empty-tree root.
-    let same_root = empty_contents.kzg_commitment_root();
+    let same_root = empty_contents.kzg_commitment_root(BodyForkLayout::Deneb);
     assert_eq!(root, same_root, "empty root is deterministic");
 }
 
@@ -119,8 +119,8 @@ fn test_commitment_root_empty_for_no_blobs() {
 #[test]
 fn test_commitment_root_length_sensitive() {
     let c = [0xff; 48];
-    let root_1 = block_and_blobs(&[c]).kzg_commitment_root();
-    let root_2 = block_and_blobs(&[c, c]).kzg_commitment_root();
+    let root_1 = block_and_blobs(&[c]).kzg_commitment_root(BodyForkLayout::Deneb);
+    let root_2 = block_and_blobs(&[c, c]).kzg_commitment_root(BodyForkLayout::Deneb);
     assert_ne!(root_1, root_2, "commitment root must be length-sensitive");
 }
 
@@ -137,7 +137,7 @@ fn test_short_body_yields_empty_commitments() {
         },
         blob_sidecars: vec![],
     };
-    assert_eq!(contents.blob_kzg_commitments(), Vec::<[u8; 48]>::new());
+    assert_eq!(contents.blob_kzg_commitments(BodyForkLayout::Deneb), Vec::<[u8; 48]>::new());
 }
 
 /// kzg_commitment_root is deterministic (same input → same output).
@@ -145,5 +145,8 @@ fn test_short_body_yields_empty_commitments() {
 fn test_commitment_root_is_deterministic() {
     let commitments = vec![[0xab; 48], [0xcd; 48]];
     let contents = block_and_blobs(&commitments);
-    assert_eq!(contents.kzg_commitment_root(), contents.kzg_commitment_root());
+    assert_eq!(
+        contents.kzg_commitment_root(BodyForkLayout::Deneb),
+        contents.kzg_commitment_root(BodyForkLayout::Deneb)
+    );
 }

@@ -338,17 +338,21 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     e
                 })?;
             }
-            // ISSUE-4.3 (L-3) defense-in-depth: log canonical KZG commitment root.
+            // ISSUE-4.3 (L-3) defense-in-depth: log internal KZG commitment binding.
             // For Deneb+ BlockContents payloads the body includes blob_kzg_commitments;
-            // this root is a structured canonical binding separate from the signing scope.
+            // this fingerprint is an rvc-internal binding (NOT spec-aligned —
+            // see kzg_commitment_list_root doc) separate from the signing scope.
             if format == beacon::ssz_deser::SszBlockFormat::BlockContents {
-                let commitment_root = block.kzg_commitment_root();
-                debug!(
-                    slot = slot,
-                    kzg_count = block.blob_kzg_count(),
-                    commitment_root = %format!("0x{}", hex::encode(commitment_root)),
-                    "SSZ BlockContents: canonical KZG commitment binding (ISSUE-4.3)"
-                );
+                if let Some(layout) = eth_types::body_fork_layout(&response.consensus_version) {
+                    let kzg_count = block.blob_kzg_count(layout);
+                    let commitment_root = block.kzg_commitment_root(layout);
+                    debug!(
+                        slot = slot,
+                        kzg_count = kzg_count,
+                        commitment_root = %format!("0x{}", hex::encode(commitment_root)),
+                        "SSZ BlockContents: internal KZG commitment binding (ISSUE-4.3)"
+                    );
+                }
             }
             (compute_block_root(&block), offset)
         };
@@ -420,22 +424,28 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         // This does NOT change the BN-facing signing scope; it is a rvc-internal
         // consistency check performed before the signature is created.
         if let eth_types::BlockContents::BlockAndBlobs { ref blob_sidecars, .. } = block_contents {
-            let kzg_commitments = block_contents.blob_kzg_commitments();
-            let commitment_root = block_contents.kzg_commitment_root();
-            debug!(
-                slot = slot,
-                blob_sidecars = blob_sidecars.len(),
-                kzg_in_body = kzg_commitments.len(),
-                commitment_root = %format!("0x{}", hex::encode(commitment_root)),
-                "BlockAndBlobs: canonical KZG commitment binding (ISSUE-4.3)"
-            );
-            if kzg_commitments.len() != blob_sidecars.len() {
-                warn!(
+            if let Some(layout) = eth_types::body_fork_layout(&response.consensus_version) {
+                let kzg_commitments = block_contents.blob_kzg_commitments(layout);
+                let commitment_root = eth_types::kzg_commitment_list_root(&kzg_commitments);
+                debug!(
                     slot = slot,
+                    blob_sidecars = blob_sidecars.len(),
                     kzg_in_body = kzg_commitments.len(),
-                    sidecars = blob_sidecars.len(),
-                    "blob KZG commitment count mismatch — body inconsistent with sidecars"
+                    commitment_root = %format!("0x{}", hex::encode(commitment_root)),
+                    "BlockAndBlobs: internal KZG commitment binding (ISSUE-4.3)"
                 );
+                // Intentionally warn-only: the signing scope covers body bytes
+                // (self-consistent). Sidecar propagation is the BN's responsibility.
+                // Aborting here would drop proposals on legitimate BN inconsistencies
+                // during fork transitions.
+                if kzg_commitments.len() != blob_sidecars.len() {
+                    warn!(
+                        slot = slot,
+                        kzg_in_body = kzg_commitments.len(),
+                        sidecars = blob_sidecars.len(),
+                        "blob KZG commitment count mismatch — body inconsistent with sidecars"
+                    );
+                }
             }
         }
 
@@ -3302,11 +3312,12 @@ mod tests {
     /// with two distinct blob KZG commitments.
     #[test]
     fn test_l3_kzg_commitment_root_nonzero_for_block_and_blobs() {
+        use eth_types::BodyForkLayout;
         let slot = 1000;
         let commitments = [[0xaa; 48], [0xbb; 48]];
         let response = block_and_blobs_response(slot, &commitments);
         let contents = response.parse_full_block().unwrap();
-        let root = contents.kzg_commitment_root();
+        let root = contents.kzg_commitment_root(BodyForkLayout::Deneb);
         assert_ne!(root, [0u8; 32], "commitment root must be nonzero for non-empty blobs");
     }
 
@@ -3314,11 +3325,12 @@ mod tests {
     /// byte in any blob KZG commitment in the body is mutated.
     #[test]
     fn test_l3_kzg_root_changes_on_any_commitment_mutation() {
+        use eth_types::BodyForkLayout;
         let slot = 1000;
         let original_commits = [[0xcc; 48], [0xdd; 48]];
         let base_root = {
             let response = block_and_blobs_response(slot, &original_commits);
-            response.parse_full_block().unwrap().kzg_commitment_root()
+            response.parse_full_block().unwrap().kzg_commitment_root(BodyForkLayout::Deneb)
         };
 
         // Mutate one byte in each commitment and verify the root changes.
@@ -3327,7 +3339,7 @@ mod tests {
             mutated[ci][0] ^= 0x01;
             let mutated_root = {
                 let response = block_and_blobs_response(slot, &mutated);
-                response.parse_full_block().unwrap().kzg_commitment_root()
+                response.parse_full_block().unwrap().kzg_commitment_root(BodyForkLayout::Deneb)
             };
             assert_ne!(
                 base_root, mutated_root,

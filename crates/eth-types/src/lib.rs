@@ -21,8 +21,9 @@ pub use aggregation::{
 };
 pub use attestation::SingleAttestation;
 pub use block::{
-    BeaconBlock, BeaconBlockBody, BlindedBeaconBlock, BlindedBeaconBlockBody, BlobSidecar,
-    BlockContents, ProducedBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    body_fork_layout, kzg_commitment_list_root, BeaconBlock, BeaconBlockBody, BlindedBeaconBlock,
+    BlindedBeaconBlockBody, BlobSidecar, BlockContents, BodyForkLayout, ProducedBlock,
+    SignedBeaconBlock, SignedBlindedBeaconBlock,
 };
 pub use builder::{SignedValidatorRegistration, ValidatorRegistrationV1};
 pub use deposit::{BLSToExecutionChange, DepositData, DepositMessage, SignedBLSToExecutionChange};
