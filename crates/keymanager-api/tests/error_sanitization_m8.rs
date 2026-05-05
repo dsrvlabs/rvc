@@ -216,6 +216,7 @@ async fn test_internal_error_sanitized() {
         allow_insecure_remote_signer: true,
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         last_set_attesting_enabled: std::sync::Mutex::new(None),
+        import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
         doppelganger_window: std::time::Duration::ZERO,
         cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
@@ -268,6 +269,7 @@ async fn test_keystore_import_item_error_sanitized() {
         allow_insecure_remote_signer: true,
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         last_set_attesting_enabled: std::sync::Mutex::new(None),
+        import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
         doppelganger_window: std::time::Duration::ZERO,
         cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
     });
@@ -322,6 +324,7 @@ async fn test_remote_key_import_item_error_sanitized() {
         allow_insecure_remote_signer: true,
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         last_set_attesting_enabled: std::sync::Mutex::new(None),
+        import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
         doppelganger_window: std::time::Duration::ZERO,
         cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
     });

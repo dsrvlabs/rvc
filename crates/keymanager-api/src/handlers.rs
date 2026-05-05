@@ -41,6 +41,15 @@ pub struct AppState {
     pub attesting_enabled: Arc<AtomicBool>,
     /// Last time `set_attesting_enabled` was accepted; used for rate limiting.
     pub last_set_attesting_enabled: Mutex<Option<tokio::time::Instant>>,
+    /// ISSUE-4.7 / L-7: per-API-token rate limit on `import_keystores`.
+    ///
+    /// Each entry maps a 32-byte SHA-256 of the bearer token to the timestamps
+    /// of recent `import_keystores` invocations within the rolling
+    /// [`IMPORT_KEYSTORES_WINDOW_SECS`] window.  Excess attempts return
+    /// HTTP 429 with `Retry-After`, preventing thousands of bogus passwords
+    /// from CPU-grinding the host on the keystore decrypt path.
+    pub import_keystores_rate:
+        Mutex<HashMap<[u8; 32], std::collections::VecDeque<tokio::time::Instant>>>,
     /// Duration of the per-key doppelganger window applied to newly imported
     /// keys.  Must match the window configured in the [`DoppelgangerMonitor`]
     /// implementation.  `Duration::ZERO` disables the gate (keys are enabled
@@ -91,6 +100,7 @@ pub async fn list_keystores(State(state): State<Arc<AppState>>) -> Json<ListKeys
 
 pub async fn import_keystores(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<ImportKeystoresRequest>,
 ) -> Result<Json<ImportKeystoresResponse>, ApiError> {
     let span = tracing::info_span!(
@@ -98,6 +108,11 @@ pub async fn import_keystores(
         rvc.keymanager.count = request.keystores.len(),
     );
     let _guard = span.enter();
+
+    // ISSUE-4.7 / L-7: per-API-token rate limit on the decrypt path.
+    // Refused calls return 429 with Retry-After and never reach the
+    // CPU-bound keystore decryption loop.
+    check_import_keystores_rate(&state, &headers)?;
 
     info!(count = request.keystores.len(), "Importing keystores");
 
@@ -706,6 +721,70 @@ pub(crate) fn format_pubkey(pubkey: &[u8; 48]) -> String {
 /// Rate-limit window for `set_attesting_enabled`: 1 call per 60 seconds.
 const ATTESTING_RATE_LIMIT_SECS: u64 = 60;
 
+/// Rate-limit window for `import_keystores` (ISSUE-4.7 / L-7).
+const IMPORT_KEYSTORES_WINDOW_SECS: u64 = 60;
+/// Maximum allowed `import_keystores` calls per API token per window.
+///
+/// Each call may carry multiple keystores; the axum body limit bounds the
+/// per-call decrypt cost, so this gates the per-token call rate.
+const IMPORT_KEYSTORES_MAX_PER_WINDOW: usize = 10;
+
+/// Compute the SHA-256 digest of a bearer token for use as a rate-limiter key.
+///
+/// The hashed digest is stored in `AppState::import_keystores_rate` so the raw
+/// token value never sits in long-lived memory beyond the request scope.
+fn hash_bearer_token(token: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    let out = hasher.finalize();
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&out);
+    buf
+}
+
+/// Check the per-token rate limit for `import_keystores`.
+///
+/// On miss (no Authorization header / no Bearer prefix) the rate limiter is
+/// skipped — auth middleware (`bearer_auth`) is what enforces the bearer
+/// requirement; this check is layered defense, not a primary auth gate.
+fn check_import_keystores_rate(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return Ok(());
+    };
+
+    let key = hash_bearer_token(token);
+    let now = tokio::time::Instant::now();
+    let window = std::time::Duration::from_secs(IMPORT_KEYSTORES_WINDOW_SECS);
+
+    let mut map =
+        state.import_keystores_rate.lock().expect("import_keystores rate-limit mutex poisoned");
+    let history = map.entry(key).or_default();
+
+    // Drop entries older than the window (rolling-window pruning).
+    while let Some(front) = history.front() {
+        if now.duration_since(*front) > window {
+            history.pop_front();
+        } else {
+            break;
+        }
+    }
+
+    if history.len() >= IMPORT_KEYSTORES_MAX_PER_WINDOW {
+        // Retry-After: time until the oldest entry leaves the window.
+        let oldest = history.front().copied().unwrap_or(now);
+        let retry_after_secs = window.saturating_sub(now.duration_since(oldest)).as_secs().max(1);
+        return Err(ApiError::RateLimited { retry_after_secs });
+    }
+
+    history.push_back(now);
+    Ok(())
+}
+
 pub async fn set_attesting_enabled(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -1189,6 +1268,7 @@ mod tests {
                 allow_insecure_remote_signer: true,
                 attesting_enabled: Arc::new(AtomicBool::new(true)),
                 last_set_attesting_enabled: std::sync::Mutex::new(None),
+                import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
                 doppelganger_window: std::time::Duration::ZERO,
                 cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
@@ -1493,6 +1573,98 @@ mod tests {
         let resp: ImportKeystoresResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(resp.data.len(), 1);
         assert_eq!(resp.data[0].status, ImportStatus::Error);
+    }
+
+    // ── ISSUE-4.7 / L-7: per-token rate limit on import_keystores ─────────────
+    //
+    // We exercise the rate-limiter directly via the handler function so the
+    // shared `AppState` (carrying the per-token quota) is preserved across
+    // calls.  The TestApp::router() helper creates a fresh state per call,
+    // which would defeat any rate-limit assertion.
+
+    fn make_shared_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            keystore_manager: Arc::new(MockKeystoreManager::new()),
+            slashing_protection: Arc::new(MockSlashingProtection::new()),
+            validator_manager: Arc::new(MockValidatorManager::new()),
+            doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+            remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+            config_manager: Arc::new(MockValidatorConfigManager::new()),
+            exit_manager: None,
+            allow_insecure_remote_signer: true,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    fn auth_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers
+            .insert(axum::http::header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+
+    fn mk_request() -> ImportKeystoresRequest {
+        ImportKeystoresRequest {
+            keystores: vec![mock_keystore_json(1)],
+            passwords: vec!["pw".to_string()],
+            slashing_protection: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_import_keystores_rate_limit_kicks_in_at_eleventh_call() {
+        let state = make_shared_state();
+        for i in 1..=IMPORT_KEYSTORES_MAX_PER_WINDOW {
+            let r =
+                import_keystores(State(state.clone()), auth_headers("token-A"), Json(mk_request()))
+                    .await;
+            assert!(r.is_ok(), "call #{i} for token-A must be allowed (under quota)");
+        }
+        let r = import_keystores(State(state.clone()), auth_headers("token-A"), Json(mk_request()))
+            .await;
+        match r {
+            Err(ApiError::RateLimited { retry_after_secs }) => {
+                assert!(retry_after_secs >= 1, "Retry-After must be at least 1s");
+                assert!(retry_after_secs <= 60, "Retry-After cannot exceed window");
+            }
+            other => panic!("11th call must be rate-limited, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_import_keystores_rate_limit_isolated_per_token() {
+        let state = make_shared_state();
+        for _ in 0..IMPORT_KEYSTORES_MAX_PER_WINDOW {
+            let r =
+                import_keystores(State(state.clone()), auth_headers("token-A"), Json(mk_request()))
+                    .await;
+            assert!(r.is_ok());
+        }
+        // Token-A is now rate-limited.
+        let r = import_keystores(State(state.clone()), auth_headers("token-A"), Json(mk_request()))
+            .await;
+        assert!(matches!(r, Err(ApiError::RateLimited { .. })));
+
+        // Token-B has its own quota.
+        let r = import_keystores(State(state.clone()), auth_headers("token-B"), Json(mk_request()))
+            .await;
+        assert!(r.is_ok(), "token-B must have an independent quota");
+    }
+
+    #[tokio::test]
+    async fn test_import_keystores_no_auth_header_skips_rate_limit() {
+        // Without a Bearer token the rate-limiter is bypassed; auth
+        // middleware (`bearer_auth`) is the primary gate in production.
+        let state = make_shared_state();
+        for _ in 0..(IMPORT_KEYSTORES_MAX_PER_WINDOW + 5) {
+            let r =
+                import_keystores(State(state.clone()), HeaderMap::new(), Json(mk_request())).await;
+            assert!(r.is_ok(), "no-token requests must not be rate-limited");
+        }
     }
 
     // --- DELETE /eth/v1/keystores tests ---
@@ -2534,6 +2706,7 @@ mod tests {
             allow_insecure_remote_signer: false,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
@@ -2583,6 +2756,7 @@ mod tests {
             allow_insecure_remote_signer: false,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
@@ -2632,6 +2806,7 @@ mod tests {
             allow_insecure_remote_signer: false,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
@@ -2724,6 +2899,7 @@ mod tests {
             allow_insecure_remote_signer: true,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
@@ -3144,6 +3320,7 @@ mod tests {
             allow_insecure_remote_signer: true,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
@@ -3280,6 +3457,7 @@ mod tests {
             allow_insecure_remote_signer: true,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
@@ -3393,6 +3571,7 @@ mod tests {
             allow_insecure_remote_signer: true,
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });

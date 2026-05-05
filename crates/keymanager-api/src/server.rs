@@ -60,6 +60,7 @@ impl KeymanagerServer {
                 allow_insecure_remote_signer,
                 attesting_enabled,
                 last_set_attesting_enabled: std::sync::Mutex::new(None),
+                import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
                 doppelganger_window,
                 cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             }),
