@@ -44,15 +44,28 @@ pub(crate) fn make_aggregation_bits(duty: &AttesterDuty) -> Option<String> {
         }
     };
 
+    // ISSUE-4.4 / L-4: out-of-bounds validator_committee_index returns None.
+    // Previously this fell through to a bitlist with only the sentinel bit
+    // set (validator position not bound), which the BN would silently
+    // accept as a zero-participation attestation.  The caller's `None`
+    // branch already drops the duty.
+    if validator_committee_index >= committee_length {
+        warn!(
+            validator_index = %duty.validator_index,
+            committee_length = committee_length,
+            validator_committee_index = validator_committee_index,
+            "validator_committee_index is out of range, skipping duty (ISSUE-4.4 / L-4)"
+        );
+        return None;
+    }
+
     // SSZ bitlist: ceil((committee_length + 1) / 8) bytes
     // The "+1" is for the length bit at position committee_length
     let byte_count = (committee_length + 8) / 8;
     let mut bits = vec![0u8; byte_count];
 
-    // Set the validator's bit
-    if validator_committee_index < committee_length {
-        bits[validator_committee_index / 8] |= 1 << (validator_committee_index % 8);
-    }
+    // Set the validator's bit (in-range guaranteed by the check above).
+    bits[validator_committee_index / 8] |= 1 << (validator_committee_index % 8);
 
     // Set the length bit (sentinel) at position committee_length
     bits[committee_length / 8] |= 1 << (committee_length % 8);
@@ -287,41 +300,30 @@ mod tests {
         }
     }
 
+    /// ISSUE-4.4 / L-4: validator_committee_index == committee_length must
+    /// return None (previously: Some with only the sentinel bit set).
     #[test]
-    fn test_aggregation_bits_index_equals_length() {
-        // Out-of-bounds: validator_committee_index == committee_length
-        // Current behavior: returns Some with only the sentinel bit set (no validator bit).
-        // The validator's position bit is silently skipped because index < length is false.
+    fn test_aggregation_bits_index_equals_length_returns_none() {
         let duty = make_duty_with_committee("4", "4");
-        let result = make_aggregation_bits(&duty);
-        assert!(result.is_some(), "OOB index produces a bitlist with only the sentinel bit");
-        let bits_hex = result.unwrap();
-
-        // Compare with in-bounds case to show the validator bit is missing
-        let in_bounds_duty = make_duty_with_committee("4", "2");
-        let in_bounds = make_aggregation_bits(&in_bounds_duty).unwrap();
-        assert_ne!(
-            bits_hex, in_bounds,
-            "OOB result must differ from in-bounds (validator bit not set)"
-        );
+        assert!(make_aggregation_bits(&duty).is_none());
     }
 
+    /// ISSUE-4.4 / L-4: a far-out-of-range index also returns None.
     #[test]
-    fn test_aggregation_bits_index_far_exceeds_length() {
-        // Out-of-bounds: validator_committee_index >> committee_length
-        // Same behavior as index == length: sentinel only, no validator bit.
+    fn test_aggregation_bits_index_far_exceeds_length_returns_none() {
         let duty = make_duty_with_committee("4", "100");
-        let result = make_aggregation_bits(&duty);
-        assert!(result.is_some(), "far OOB index still returns a bitlist");
+        assert!(make_aggregation_bits(&duty).is_none());
+    }
 
-        // Verify it matches the index-equals-length case (both produce sentinel-only bitlist)
-        let boundary_duty = make_duty_with_committee("4", "4");
-        let boundary_result = make_aggregation_bits(&boundary_duty).unwrap();
-        assert_eq!(
-            result.unwrap(),
-            boundary_result,
-            "all OOB indices produce the same sentinel-only bitlist"
-        );
+    /// Regression guard: in-range index still returns Some with the
+    /// validator bit set.  Sanity that the L-4 fix did not over-reject.
+    #[test]
+    fn test_aggregation_bits_in_range_index_returns_some() {
+        let duty = make_duty_with_committee("8", "3");
+        let bits_hex = make_aggregation_bits(&duty).expect("in-range must return Some");
+        // Validator bit at position 3 -> 0b00001000, sentinel bit at position 8 -> 0b00000001.
+        // byte_count = (8 + 8) / 8 = 2 bytes.
+        assert_eq!(bits_hex, "0x0801");
     }
 
     #[test]

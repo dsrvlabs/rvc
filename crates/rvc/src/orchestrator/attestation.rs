@@ -460,7 +460,9 @@ where
                         slot,
                         success: false,
                         error: Some(
-                            "committee_length is 0, cannot produce aggregation bits".to_string(),
+                            "could not produce aggregation bits (committee_length=0 \
+                             or validator_committee_index out of range)"
+                                .to_string(),
                         ),
                     };
                 }
