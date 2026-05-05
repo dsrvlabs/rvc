@@ -83,18 +83,10 @@ impl SlashingDb {
 
         Self::configure_pragmas(&conn)?;
 
-        // Set restrictive file permissions (owner-only read/write).
+        // Set restrictive file permissions (owner-only read/write) on the
+        // main DB file before any data is written.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = std::fs::Permissions::from_mode(0o600);
-            std::fs::set_permissions(path, perms).map_err(|e| {
-                SlashingError::UnsafePermissions {
-                    path: path.display().to_string(),
-                    mode: format!("failed to set permissions: {}", e),
-                }
-            })?;
-        }
+        Self::chmod_main_file(path)?;
 
         let db = Self {
             conn: Mutex::new(conn),
@@ -111,8 +103,68 @@ impl SlashingDb {
         db.migrate()?;
         db.migrate_to_v2(path)?;
 
+        // ISSUE-4.8 / L-8: chmod 0o600 on `<path>-wal` / `<path>-shm` sidecars.
+        //
+        // SQLite materialises the -shm when WAL mode is engaged and the -wal
+        // when the first write transaction commits.  Both `migrate()` and
+        // `migrate_to_v2` perform write transactions, so by this point the
+        // sidecars exist.  Without this chmod they inherit the process umask
+        // (typically 0o022), making them group/world-readable — an attacker
+        // with read-only host access could exfiltrate the slashing journal,
+        // defeating the 0o600 protection on the main file.
+        //
+        // SQLite WAL filenames use `-wal` / `-shm` suffixes (no separator dot)
+        // — see https://www.sqlite.org/wal.html § "Activating and Configuring
+        // WAL Mode".  This chmod is best-effort: missing sidecars (e.g. on
+        // a pre-WAL fallback) and chmod errors are warn-logged, not fatal.
+        #[cfg(unix)]
+        Self::chmod_sidecars(path);
+
         tracing::info!(path = %path.display(), "slashing protection database opened");
         Ok(db)
+    }
+
+    /// Set 0o600 on the main slashing-DB file (Unix only). Failure is a
+    /// fatal `SlashingError::UnsafePermissions` — the protection contract
+    /// for the main journal must hold or startup aborts.
+    #[cfg(unix)]
+    fn chmod_main_file(path: &Path) -> Result<(), SlashingError> {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms).map_err(|e| SlashingError::UnsafePermissions {
+            path: path.display().to_string(),
+            mode: format!("failed to set permissions: {}", e),
+        })
+    }
+
+    /// Set 0o600 on the SQLite WAL/SHM sidecars (Unix only;
+    /// ISSUE-4.8 / L-8).
+    ///
+    /// Best-effort: sidecars may not yet exist when this is called (e.g. on
+    /// a pre-WAL fallback opened with `RVC_ALLOW_NON_WAL_SLASHING_DB=true`),
+    /// and on some filesystems chmod is a no-op or unsupported. Missing
+    /// sidecars are skipped silently; chmod errors are `warn!`-logged so
+    /// operators can investigate without blocking startup.
+    #[cfg(unix)]
+    fn chmod_sidecars(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        for suffix in &["-wal", "-shm"] {
+            let sidecar = parent.join(format!("{}{}", stem, suffix));
+            if !sidecar.exists() {
+                continue;
+            }
+            if let Err(e) = std::fs::set_permissions(&sidecar, perms.clone()) {
+                tracing::warn!(
+                    path = %sidecar.display(),
+                    error = %e,
+                    "failed to chmod 0o600 on slashing-db sidecar (ISSUE-4.8 / L-8); \
+                     continuing — sidecar may be group/world-readable"
+                );
+            }
+        }
     }
 
     /// Apply durability pragmas to an open SQLite connection.

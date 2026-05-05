@@ -4395,6 +4395,7 @@ name = "rvc-slashing"
 version = "0.3.0"
 dependencies = [
  "hex",
+ "libc",
  "parking_lot",
  "proptest",
  "rusqlite",
