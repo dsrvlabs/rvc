@@ -330,7 +330,7 @@ async fn test_remote_key_import_item_error_sanitized() {
     let body = serde_json::json!({
         "remote_keys": [{
             "pubkey": pubkey_str,
-            "url": "https://signer.example.com"
+            "url": "https://8.8.8.8:9000"
         }]
     })
     .to_string();
