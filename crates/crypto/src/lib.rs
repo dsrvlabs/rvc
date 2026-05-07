@@ -13,6 +13,7 @@ mod key_manager;
 mod keystore;
 pub mod logging;
 pub mod mnemonic;
+pub mod pubkey;
 mod remote_signer;
 mod signer_trait;
 mod signing;
@@ -36,6 +37,7 @@ pub use eth_types::{DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
 pub use insecure::{InsecureGate, InsecureGateError, InsecureMode};
 pub use key_manager::KeyManager;
 pub use keystore::{EncryptionKdf, KdfParams, Keystore, Pbkdf2Params, ScryptParams};
+pub use pubkey::CanonicalPubkey;
 pub use remote_signer::{
     check_remote_signer_url, RemoteSigner, RemoteSignerConfig, REMOTE_SIGNER_INSECURE_ENV_VAR,
 };
