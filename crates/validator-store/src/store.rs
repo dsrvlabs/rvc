@@ -1,4 +1,4 @@
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -62,6 +62,11 @@ pub struct ValidatorStore {
     defaults: RwLock<ValidatorDefaults>,
     config_path: Option<PathBuf>,
     global_block_selection_mode: RwLock<BlockSelectionMode>,
+    // Serializes `save_config` so that snapshot → tempfile write → atomic
+    // rename happens as a single critical section. Without this, a thread
+    // holding a stale snapshot can `persist` AFTER a thread with newer data,
+    // silently clobbering committed updates.
+    save_lock: Mutex<()>,
 }
 
 impl ValidatorStore {
@@ -75,6 +80,7 @@ impl ValidatorStore {
             }),
             config_path: None,
             global_block_selection_mode: RwLock::new(BlockSelectionMode::default()),
+            save_lock: Mutex::new(()),
         }
     }
 
@@ -120,6 +126,7 @@ impl ValidatorStore {
             }),
             config_path: Some(path.to_path_buf()),
             global_block_selection_mode: RwLock::new(BlockSelectionMode::default()),
+            save_lock: Mutex::new(()),
         })
     }
 
@@ -291,6 +298,11 @@ impl ValidatorStore {
         let config_path = self.config_path.as_ref().ok_or_else(|| {
             ValidatorStoreError::Config("no config path set for save".to_string())
         })?;
+
+        // Serialize the entire snapshot → write → rename sequence so a
+        // concurrent saver with a stale snapshot cannot persist after a
+        // saver with newer data and clobber it.
+        let _save_guard = self.save_lock.lock();
 
         let defaults = self.defaults.read();
         let validators = self.validators.read();
