@@ -5,8 +5,10 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
+use crypto::hex::{strip_prefix_strict, HexError};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use url::Url;
 
@@ -555,7 +557,17 @@ impl Config {
             }
 
             if let Some((pubkey, password)) = line.split_once('=') {
-                let pubkey = pubkey.trim().trim_start_matches("0x");
+                let pubkey_trimmed = pubkey.trim();
+                let pubkey = match strip_prefix_strict(pubkey_trimmed) {
+                    Ok(s) => s,
+                    Err(HexError::DoubleZeroXPrefix) => {
+                        warn!(
+                            pubkey = pubkey_trimmed,
+                            "skipping password entry: double 0x prefix in pubkey"
+                        );
+                        continue;
+                    }
+                };
                 let password = password.trim();
                 passwords.insert(pubkey.to_string(), SecretString::from(password.to_string()));
             }
@@ -2194,5 +2206,29 @@ broadcast = ["blocks", "attestations"]
         assert_eq!(config.proposer_config_refresh_interval, 60);
         assert_eq!(config.proposer_config_url_token, Some("my-token".to_string()));
         assert!(config.proposer_config_url_insecure);
+    }
+
+    // -- CQ-2.5: strip_prefix_strict adoption test --
+
+    /// load_passwords must warn and skip a pubkey entry that carries a double 0x prefix.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_load_passwords_double_0x_prefix_warns_and_skips() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "0x0xabcd1234 = test_value_1").unwrap();
+        // Also write a valid entry so we can confirm only the bad one is skipped
+        writeln!(file, "0xdeadbeef = test_value_2").unwrap();
+
+        let config =
+            Config { password_file: Some(file.path().to_path_buf()), ..Default::default() };
+        let passwords = config.load_passwords().unwrap();
+
+        assert_eq!(passwords.len(), 1, "only the valid entry should be loaded");
+        assert!(!passwords.contains_key("0x0xabcd1234"), "double-0x key must be absent");
+        assert!(
+            passwords.contains_key("deadbeef"),
+            "valid entry must be present (prefix stripped)"
+        );
+        assert!(logs_contain("double 0x prefix"), "expected warn log about double prefix");
     }
 }

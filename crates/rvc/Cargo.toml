@@ -58,4 +58,5 @@ serde_json.workspace = true
 tempfile.workspace = true
 tower = { workspace = true, features = ["util"] }
 tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }
+tracing-test.workspace = true
 wiremock.workspace = true

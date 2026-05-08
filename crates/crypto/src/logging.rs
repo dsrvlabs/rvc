@@ -12,7 +12,20 @@ impl<'a> TruncatedPubkey<'a> {
 
 impl std::fmt::Display for TruncatedPubkey<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let hex = self.0.strip_prefix("0x").unwrap_or(self.0);
+        // Defense-in-depth: strip at most one `0x`/`0X` prefix.
+        // On `DoubleZeroXPrefix` emit a warning and fall back to the raw input
+        // as-is so that the log line is not garbled and no panic occurs.
+        // Callers should supply canonical pubkeys; this path indicates a bug upstream.
+        let hex = match crate::hex::strip_prefix_strict(self.0) {
+            Ok(s) => s,
+            Err(crate::hex::HexError::DoubleZeroXPrefix) => {
+                tracing::warn!(
+                    pubkey = self.0,
+                    "TruncatedPubkey: double 0x prefix detected, falling back to raw input"
+                );
+                return write!(f, "{}", self.0);
+            }
+        };
         if hex.len() > 18 && hex.is_ascii() {
             write!(f, "0x{}...{}", &hex[..10], &hex[hex.len() - 8..])
         } else {
@@ -95,6 +108,20 @@ mod tests {
         let input = "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74à";
         let result = TruncatedPubkey::new(input).to_string();
         assert_eq!(result, "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74à");
+    }
+
+    // -- CQ-2.5: strip_prefix_strict adoption test --
+
+    /// TruncatedPubkey must warn and fall back to the raw input when given a double-0x prefix.
+    /// Behavior: no panic, the raw string is emitted as-is, and a warn! log fires.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_truncated_pubkey_double_0x_prefix_warns_and_falls_back() {
+        let pubkey = "0x0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a";
+        let result = TruncatedPubkey::new(pubkey).to_string();
+        // Must not panic; raw input is emitted as-is
+        assert_eq!(result, pubkey, "double-0x input must be returned verbatim");
+        assert!(logs_contain("double 0x prefix"), "expected warn log about double prefix");
     }
 
     // --- RedactedUrl tests ---

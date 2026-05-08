@@ -45,4 +45,5 @@ proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 tracing-subscriber.workspace = true
+tracing-test.workspace = true
 wiremock.workspace = true

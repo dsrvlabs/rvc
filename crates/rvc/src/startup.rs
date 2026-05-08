@@ -11,6 +11,7 @@ use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 use bn_manager::BeaconNodeClient;
+use crypto::hex::{strip_prefix_strict, HexError};
 use fd_lock::RwLock;
 use slashing::SlashingDb;
 use tracing::{error, info, warn};
@@ -56,6 +57,9 @@ pub enum StartupError {
 
     #[error("startup exit with code {0}")]
     StartupExit(i32),
+
+    #[error("invalid hex input: {0}")]
+    InvalidHexInput(String),
 }
 
 impl StartupError {
@@ -93,8 +97,8 @@ pub async fn validate_genesis_root(
     let genesis_response = beacon.get_genesis().await?;
     let beacon_root = &genesis_response.data.genesis_validators_root;
 
-    let local_normalized = normalize_hex(local_root_hex);
-    let beacon_normalized = normalize_hex(beacon_root);
+    let local_normalized = normalize_hex(local_root_hex)?;
+    let beacon_normalized = normalize_hex(beacon_root)?;
 
     if local_normalized != beacon_normalized {
         error!(
@@ -233,7 +237,13 @@ pub async fn check_fork_compatibility(
 }
 
 fn parse_version_hex(hex_str: &str) -> Result<[u8; 4], StartupError> {
-    let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    let stripped = match strip_prefix_strict(hex_str) {
+        Ok(s) => s,
+        Err(HexError::DoubleZeroXPrefix) => {
+            warn!(hex = hex_str, "rejecting fork-version hex with double 0x prefix");
+            return Err(StartupError::UnsupportedForkVersion { version: hex_str.to_string() });
+        }
+    };
     let bytes = hex::decode(stripped)
         .map_err(|_| StartupError::UnsupportedForkVersion { version: hex_str.to_string() })?;
     if bytes.len() != 4 {
@@ -244,8 +254,15 @@ fn parse_version_hex(hex_str: &str) -> Result<[u8; 4], StartupError> {
     Ok(arr)
 }
 
-fn normalize_hex(s: &str) -> String {
-    s.to_lowercase().trim_start_matches("0x").to_string()
+fn normalize_hex(s: &str) -> Result<String, StartupError> {
+    let lower = s.to_lowercase();
+    match strip_prefix_strict(&lower) {
+        Ok(stripped) => Ok(stripped.to_string()),
+        Err(HexError::DoubleZeroXPrefix) => {
+            warn!(hex = s, "rejecting genesis-root hex with double 0x prefix");
+            Err(StartupError::InvalidHexInput(s.to_string()))
+        }
+    }
 }
 
 /// Acquires an exclusive file lock on the validator data directory.
@@ -553,17 +570,17 @@ mod tests {
 
     #[test]
     fn test_normalize_hex_strips_prefix() {
-        assert_eq!(normalize_hex("0xAbCdEf"), "abcdef");
+        assert_eq!(normalize_hex("0xAbCdEf").unwrap(), "abcdef");
     }
 
     #[test]
     fn test_normalize_hex_lowercases() {
-        assert_eq!(normalize_hex("ABCDEF"), "abcdef");
+        assert_eq!(normalize_hex("ABCDEF").unwrap(), "abcdef");
     }
 
     #[test]
     fn test_normalize_hex_no_prefix() {
-        assert_eq!(normalize_hex("abcdef"), "abcdef");
+        assert_eq!(normalize_hex("abcdef").unwrap(), "abcdef");
     }
 
     #[tokio::test]
@@ -829,5 +846,33 @@ mod tests {
     fn test_acquire_keystore_lock_nonexistent_dir() {
         let result = acquire_keystore_lock(Path::new("/nonexistent/path/that/does/not/exist"));
         assert!(result.is_err());
+    }
+
+    // -- CQ-2.5: strip_prefix_strict adoption tests --
+
+    /// parse_version_hex must warn and return UnsupportedForkVersion on a double-0x input.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_parse_version_hex_double_0x_warns_and_errors() {
+        let result = parse_version_hex("0x0xdeadbeef");
+        assert!(result.is_err(), "double-0x fork version should be rejected");
+        assert!(
+            matches!(result.unwrap_err(), StartupError::UnsupportedForkVersion { .. }),
+            "error variant must be UnsupportedForkVersion"
+        );
+        assert!(logs_contain("double 0x prefix"), "expected warn log about double prefix");
+    }
+
+    /// normalize_hex must warn and return InvalidHexInput on a double-0x input.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_normalize_hex_double_0x_warns_and_errors() {
+        let result = normalize_hex("0x0xabcdef");
+        assert!(result.is_err(), "double-0x genesis root should be rejected");
+        assert!(
+            matches!(result.unwrap_err(), StartupError::InvalidHexInput(_)),
+            "error variant must be InvalidHexInput"
+        );
+        assert!(logs_contain("double 0x prefix"), "expected warn log about double prefix");
     }
 }

@@ -121,6 +121,7 @@ x509-parser = "0.16"
 tempfile = "3"
 wiremock = "0.6"
 proptest = "1"
+tracing-test = "0.2"
 
 [workspace.dependencies.tonic-build]
 version = "0.12"
