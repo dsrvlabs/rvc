@@ -725,6 +725,17 @@ impl SignerService {
     }
 
     /// Signs a voluntary exit with DOMAIN_VOLUNTARY_EXIT.
+    ///
+    /// # Slashing-protection note (C2 invariant)
+    ///
+    /// Voluntary exits are **not slashable** per the Ethereum consensus spec, so
+    /// this function intentionally omits the stage → commit / discard pattern used
+    /// by [`sign_attestation`] and [`sign_block`].  There is no
+    /// `stage_voluntary_exit` API in the slashing crate.
+    ///
+    /// The C2 error-handling invariant is still satisfied here: every signer
+    /// failure is propagated directly to the caller via `Err(e.into())` — no
+    /// error is swallowed or silently converted to `Ok`.
     #[tracing::instrument(name = "rvc.sign.voluntary_exit", skip_all, fields(rvc.operation = "voluntary_exit"))]
     pub async fn sign_voluntary_exit(
         &self,
@@ -759,6 +770,7 @@ impl SignerService {
         );
         let signing_root = crypto::compute_signing_root(voluntary_exit, domain);
 
+        // C2: signer errors are propagated directly — no stage to discard.
         match self.signer.sign(&signing_root, &pubkey_bytes).await {
             Ok(sig) => {
                 debug!(
