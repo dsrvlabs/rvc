@@ -18,6 +18,11 @@ pub(crate) struct BlockResponseValidator {
 
 impl BlockResponseValidator {
     /// Validate an unblinded [`BeaconBlock`] returned from the beacon node.
+    ///
+    /// Validation order (do not reorder without updating per-variant reachability tests):
+    /// 1. slot equality
+    /// 2. proposer_index equality
+    /// 3. parent_root equality (when expected is `Some`)
     pub fn validate_full(&self, block: &BeaconBlock) -> Result<(), BlockServiceError> {
         self.check_slot(block.slot)?;
         self.check_proposer_index(block.proposer_index)?;
@@ -26,6 +31,11 @@ impl BlockResponseValidator {
     }
 
     /// Validate a blinded [`BlindedBeaconBlock`] returned from the beacon node.
+    ///
+    /// Validation order (do not reorder without updating per-variant reachability tests):
+    /// 1. slot equality
+    /// 2. proposer_index equality
+    /// 3. parent_root equality (when expected is `Some`)
     pub fn validate_blinded(&self, block: &BlindedBeaconBlock) -> Result<(), BlockServiceError> {
         self.check_slot(block.slot)?;
         self.check_proposer_index(block.proposer_index)?;
@@ -86,11 +96,13 @@ mod tests {
         BlockResponseValidator { expected_proposer_index, expected_parent_root, expected_slot: 100 }
     }
 
-    // --- Full block tests: slot ---
+    // ── Per-variant reachability: full block (validate_full) ────────────────
+    // One test per BlockServiceError variant reachable from validate_full.
+    // These tests pin reachability, not ordering (see doc comment on validate_full).
 
+    /// Reachability: SlotMismatch — full block with wrong slot.
     #[test]
     fn test_slot_mismatch_rejected() {
-        // validator expects slot 100, block has slot 101
         let v = BlockResponseValidator {
             expected_proposer_index: 42,
             expected_parent_root: None,
@@ -105,22 +117,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_slot_checked_before_proposer_index() {
-        // When both slot and proposer_index are wrong, slot error comes first
-        let v = BlockResponseValidator {
-            expected_proposer_index: 42,
-            expected_parent_root: None,
-            expected_slot: 100,
-        };
-        let mut block = full_block(99, [0u8; 32]); // wrong proposer_index
-        block.slot = 200; // also wrong slot
-        let result = v.validate_full(&block);
-        assert!(matches!(result, Err(BlockServiceError::SlotMismatch { .. })));
-    }
-
-    // --- Full block tests: proposer_index ---
-
+    /// Reachability: ProposerIndexMismatch — full block with wrong proposer_index.
     #[test]
     fn test_proposer_index_mismatch_rejected() {
         let v = validator(42, None);
@@ -132,13 +129,7 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_proposer_index_match_accepted() {
-        let v = validator(42, None);
-        let block = full_block(42, [0u8; 32]);
-        assert!(v.validate_full(&block).is_ok());
-    }
-
+    /// Reachability: ParentRootMismatch — full block with wrong parent_root.
     #[test]
     fn test_parent_root_mismatch_rejected() {
         let expected_root: Root = [1u8; 32];
@@ -153,14 +144,23 @@ mod tests {
         ));
     }
 
+    /// Positive: full block all fields match.
+    #[test]
+    fn test_proposer_index_match_accepted() {
+        let v = validator(42, None);
+        let block = full_block(42, [0u8; 32]);
+        assert!(v.validate_full(&block).is_ok());
+    }
+
+    /// Positive: parent_root check is skipped when expected is `None`.
     #[test]
     fn test_parent_root_none_skips_check() {
         let v = validator(42, None);
-        // Any parent_root is fine when expected is None
         let block = full_block(42, [0xff; 32]);
         assert!(v.validate_full(&block).is_ok());
     }
 
+    /// Positive: parent_root check passes when roots match.
     #[test]
     fn test_parent_root_match_accepted() {
         let root: Root = [5u8; 32];
@@ -169,17 +169,27 @@ mod tests {
         assert!(v.validate_full(&block).is_ok());
     }
 
+    // ── Per-variant reachability: blinded block (validate_blinded) ───────────
+    // One test per BlockServiceError variant reachable from validate_blinded.
+
+    /// Reachability: SlotMismatch — blinded block with wrong slot.
     #[test]
-    fn test_proposer_index_checked_before_parent_root() {
-        // When both are wrong, proposer_index error is returned first
-        let v = validator(42, Some([1u8; 32]));
-        let block = full_block(99, [2u8; 32]);
-        let result = v.validate_full(&block);
-        assert!(matches!(result, Err(BlockServiceError::ProposerIndexMismatch { .. })));
+    fn test_blinded_slot_mismatch_rejected() {
+        let v = BlockResponseValidator {
+            expected_proposer_index: 42,
+            expected_parent_root: None,
+            expected_slot: 100,
+        };
+        let mut block = blinded_block(42, [0u8; 32]);
+        block.slot = 999;
+        let result = v.validate_blinded(&block);
+        assert!(matches!(
+            result,
+            Err(BlockServiceError::SlotMismatch { requested: 100, got: 999 })
+        ));
     }
 
-    // --- Blinded block tests ---
-
+    /// Reachability: ProposerIndexMismatch — blinded block with wrong proposer_index.
     #[test]
     fn test_blinded_validation_symmetric_proposer_mismatch() {
         let v = validator(42, None);
@@ -191,6 +201,7 @@ mod tests {
         ));
     }
 
+    /// Reachability: ParentRootMismatch — blinded block with wrong parent_root.
     #[test]
     fn test_blinded_validation_symmetric_parent_root_mismatch() {
         let expected_root: Root = [1u8; 32];
@@ -205,6 +216,7 @@ mod tests {
         ));
     }
 
+    /// Positive: blinded parent_root check skipped when expected is `None`.
     #[test]
     fn test_blinded_validation_symmetric_none_skips_parent_check() {
         let v = validator(42, None);
@@ -212,6 +224,7 @@ mod tests {
         assert!(v.validate_blinded(&block).is_ok());
     }
 
+    /// Positive: blinded block all fields match.
     #[test]
     fn test_blinded_validation_symmetric_all_match() {
         let root: Root = [7u8; 32];
