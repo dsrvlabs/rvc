@@ -37,9 +37,11 @@ use eth_types::{Epoch, Root, Slot};
 use metrics::definitions as metrics;
 
 /// Normalize a pubkey to lowercase with 0x prefix for consistent DB storage/lookup.
+///
+/// Delegates to [`crypto::pubkey::CanonicalPubkey`] — the single source of
+/// truth for pubkey normalisation across all crates (CQ-2.4 / C1).
 pub(crate) fn normalize_pubkey(pubkey: &str) -> String {
-    let stripped = pubkey.strip_prefix("0x").unwrap_or(pubkey);
-    format!("0x{}", stripped.to_lowercase())
+    pubkey.parse::<crypto::pubkey::CanonicalPubkey>().expect("infallible").to_string()
 }
 
 /// SQLite-backed database for storing slashing protection data.

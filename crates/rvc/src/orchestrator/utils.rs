@@ -107,11 +107,14 @@ pub(crate) fn find_pubkey(pubkey_map: &PubkeyMap, duty_pubkey: &str) -> Option<P
     None
 }
 
-/// Normalizes a pubkey to lowercase without 0x/0X prefix for comparison.
+/// Normalizes a pubkey to `0x`-prefixed lowercase hex for consistent comparison.
+///
+/// Delegates to [`crypto::pubkey::CanonicalPubkey`] — the single source of
+/// truth for pubkey normalisation across all crates (CQ-2.4 / C1).
+/// Output form: `0x`-prefixed lowercase (matches the on-disk slashing-DB key
+/// format, avoiding any schema change).
 pub(crate) fn normalize_pubkey(pubkey: &str) -> String {
-    let without_prefix =
-        pubkey.strip_prefix("0x").or_else(|| pubkey.strip_prefix("0X")).unwrap_or(pubkey);
-    without_prefix.to_lowercase()
+    pubkey.parse::<crypto::pubkey::CanonicalPubkey>().expect("infallible").to_string()
 }
 
 /// Converts BN-supplied attestation data and normalizes it per-fork.
