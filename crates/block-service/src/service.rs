@@ -3434,4 +3434,45 @@ mod tests {
             "commitment count mismatch must not abort signing, got: {result:?}"
         );
     }
+
+    // RED test for ISSUE-CQ-3.2 (C3).
+    //
+    // `propose_block` (L84-91 on `develop`) performs no proposer_index validation.
+    // This test documents the gap: a BN that returns a block with a mismatched
+    // proposer_index is silently accepted, meaning a duty assigned to validator 42
+    // could propose a block attributable to validator 99.
+    //
+    // On `develop` HEAD this test FAILS because `result.is_ok()` (the unvalidated
+    // path never checks proposer_index).  After CQ-3.2 the old unvalidated entry
+    // point is deleted, `propose_block_validated` is renamed to `propose_block`,
+    // and this test is re-pointed at the surviving 4-argument `propose_block` with
+    // `expected_proposer_index = 42` — so the mismatch is detected and the test
+    // goes GREEN.
+    #[tokio::test]
+    async fn test_propose_block_rejects_mismatched_proposer_index() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        // BN returns proposer_index = 99; the duty expects validator 42.
+        let mut block = test_block(slot);
+        block.proposer_index = 99;
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(slot, &pubkey).await;
+
+        // On `develop`: propose_block (unvalidated) accepts any proposer_index → Ok.
+        // After CQ-3.2: the only propose_block validates → Err(ProposerIndexMismatch).
+        assert!(
+            result.is_err(),
+            "expected validation rejection but call succeeded"
+        );
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                BlockServiceError::ProposerIndexMismatch { expected: 42, got: 99 }
+            ),
+            "expected ProposerIndexMismatch {{ expected: 42, got: 99 }}"
+        );
+    }
 }
