@@ -71,6 +71,12 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         }
     }
 
+    /// Propose a block for the given duty slot and validator key.
+    ///
+    /// Validates `proposer_index` against `expected_proposer_index` and, when
+    /// `expected_parent_root` is `Some`, validates `parent_root` against the
+    /// BN-reported head before calling the signer. On validation failure the
+    /// duty is dropped with an `error!` log and no signer call is made (H-4).
     #[tracing::instrument(
         name = "rvc.block.propose",
         skip_all,
@@ -82,21 +88,6 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         )
     )]
     pub async fn propose_block(
-        &self,
-        slot: Slot,
-        pubkey: &PublicKey,
-    ) -> Result<BlockProposalResult, BlockServiceError> {
-        let mode = self.validator_store.effective_block_selection_mode(&pubkey.to_bytes());
-        self.propose_block_with_mode(slot, pubkey, mode).await
-    }
-
-    /// Propose a block with explicit duty validation (H-4).
-    ///
-    /// Validates `proposer_index` against `expected_proposer_index` and, when
-    /// `expected_parent_root` is `Some`, validates `parent_root` against the
-    /// BN-reported head before calling the signer. On validation failure the
-    /// duty is dropped with an `error!` log and no signer call is made.
-    pub async fn propose_block_validated(
         &self,
         slot: Slot,
         pubkey: &PublicKey,
@@ -1144,7 +1135,7 @@ mod tests {
             gvr,
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         let proposal = result.unwrap();
@@ -1180,7 +1171,7 @@ mod tests {
             gvr,
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         let proposal = result.unwrap();
@@ -1204,7 +1195,7 @@ mod tests {
         let signer = MockSigner::new().with_block_error();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1220,7 +1211,7 @@ mod tests {
         let signer = MockSigner::new().with_randao_error();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1241,7 +1232,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1261,7 +1252,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1337,7 +1328,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         // Verify graffiti was passed (hex-encoded "hello" + padding)
@@ -1371,7 +1362,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         assert_eq!(beacon_arc.publish_blinded_calls.lock().unwrap().len(), 1);
@@ -1398,7 +1389,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         assert_eq!(beacon_arc.publish_calls.lock().unwrap().len(), 1);
@@ -1425,7 +1416,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BlockServiceError::Signer(_)));
 
@@ -1443,7 +1434,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BlockServiceError::Beacon(_)));
     }
@@ -1466,7 +1457,7 @@ mod tests {
             Arc::new(test_fork_schedule()),
             [0xaa; 32],
         );
-        let unblinded_result = service.propose_block(slot, &pubkey).await.unwrap();
+        let unblinded_result = service.propose_block(slot, &pubkey, 42, None).await.unwrap();
 
         // Propose blinded block at same slot
         let blinded_block = test_blinded_block(slot);
@@ -1481,7 +1472,7 @@ mod tests {
             Arc::new(test_fork_schedule()),
             [0xaa; 32],
         );
-        let blinded_result = service2.propose_block(slot, &pubkey).await.unwrap();
+        let blinded_result = service2.propose_block(slot, &pubkey, 42, None).await.unwrap();
 
         // Block roots must differ (slashing protection uses these to detect double proposals)
         assert_ne!(
@@ -1508,7 +1499,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         let proposal = result.unwrap();
@@ -1526,7 +1517,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         let proposal = result.unwrap();
@@ -1550,7 +1541,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
@@ -1579,7 +1570,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
@@ -1596,7 +1587,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(requested_slot, &pubkey).await;
+        let result = service.propose_block(requested_slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1613,7 +1604,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1630,7 +1621,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
     }
@@ -1653,7 +1644,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         // Deserialize the SSZ and compute tree_hash_root — SSZ path should match
@@ -1700,7 +1691,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BlockServiceError::Beacon(_)));
@@ -1715,7 +1706,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         let proposal = result.unwrap();
@@ -1731,7 +1722,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         let proposal = result.unwrap();
@@ -1747,7 +1738,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         let proposal = result.unwrap();
@@ -1788,7 +1779,7 @@ mod tests {
         let signer = MockSigner::new().with_block_error();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BlockServiceError::Signer(_)));
@@ -1803,7 +1794,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(requested_slot, &pubkey).await;
+        let result = service.propose_block(requested_slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1822,7 +1813,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(requested_slot, &pubkey).await;
+        let result = service.propose_block(requested_slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1852,7 +1843,7 @@ mod tests {
             gvr,
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         let calls = signer_arc.randao_calls.lock().unwrap();
@@ -1879,7 +1870,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
@@ -1922,7 +1913,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
@@ -1948,7 +1939,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
@@ -2199,7 +2190,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         beacon_arc.assert_last_produce_slot(slot);
@@ -2226,7 +2217,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         beacon_arc.assert_last_published_block(slot, 42);
@@ -2252,7 +2243,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         beacon_arc.assert_last_published_blinded_block(slot, 42);
@@ -2281,7 +2272,7 @@ mod tests {
             gvr,
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         signer_arc.assert_last_sign_block_domain(&fork, &gvr);
@@ -2310,7 +2301,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         beacon_arc.assert_last_produce_slot(slot);
@@ -2334,7 +2325,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         // This should panic: production code sent slot=100, we assert slot+1=101
@@ -2358,7 +2349,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         beacon_arc.assert_last_published_block(slot, 42);
@@ -2382,7 +2373,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         beacon_arc.assert_last_published_block(slot + 1, 42);
@@ -2406,7 +2397,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         beacon_arc.assert_last_published_block(slot, 99);
@@ -2429,7 +2420,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         // Verify signature is non-empty (MockSigner returns 0xbb * 96)
@@ -2455,7 +2446,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         beacon_arc.assert_last_published_blinded_block(slot, 42);
@@ -2481,7 +2472,7 @@ mod tests {
             gvr,
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         signer_arc.assert_last_sign_block_domain(&fork, &gvr);
@@ -2508,7 +2499,7 @@ mod tests {
             gvr,
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         let mut wrong_fork = test_fork_schedule();
@@ -2537,7 +2528,7 @@ mod tests {
             gvr,
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         let wrong_gvr: Root = [0xbb; 32];
@@ -2713,7 +2704,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 1, None).await;
 
         assert!(result.is_ok(), "slot 0 must not underflow: {:?}", result.err());
         let proposal = result.unwrap();
@@ -2749,7 +2740,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 5, None).await;
 
         assert!(result.is_ok(), "epoch boundary slot must work: {:?}", result.err());
         let proposal = result.unwrap();
@@ -2779,7 +2770,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 1, None).await;
 
         assert!(result.is_ok(), "SSZ slot 0 must not underflow: {:?}", result.err());
         let proposal = result.unwrap();
@@ -2950,7 +2941,7 @@ mod tests {
             Arc::new(test_fork_schedule()),
             [0xaa; 32],
         );
-        let result = service.propose_block(slot, &pubkey).await.unwrap();
+        let result = service.propose_block(slot, &pubkey, 42, None).await.unwrap();
         assert_eq!(
             result.block_root, unblinded_root,
             "pipeline must pass tree_hash root to signer"
@@ -3017,12 +3008,12 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Integration tests: propose_block_validated (H-4 wiring)
+    // Integration tests: propose_block H-4 validation wiring
     // -----------------------------------------------------------------------
 
     /// BN returns block with wrong proposer_index — signer must NOT be called.
     #[tokio::test]
-    async fn test_propose_block_validated_proposer_index_mismatch_drops_duty() {
+    async fn test_propose_block_proposer_index_mismatch_drops_duty() {
         let pubkey = test_pubkey();
         let slot = 100;
         // Block has proposer_index = 42; duty expects 99
@@ -3042,7 +3033,7 @@ mod tests {
         );
 
         // Duty says expected_proposer_index = 99, but BN returns 42
-        let result = service.propose_block_validated(slot, &pubkey, 99, None).await;
+        let result = service.propose_block(slot, &pubkey, 99, None).await;
 
         assert!(result.is_err());
         assert!(
@@ -3063,7 +3054,7 @@ mod tests {
 
     /// BN returns block with wrong parent_root — signer must NOT be called.
     #[tokio::test]
-    async fn test_propose_block_validated_parent_root_mismatch_drops_duty() {
+    async fn test_propose_block_parent_root_mismatch_drops_duty() {
         let pubkey = test_pubkey();
         let slot = 100;
         // Block has parent_root = [1u8; 32]; we expect [0xee; 32]
@@ -3083,8 +3074,7 @@ mod tests {
         );
 
         let expected_parent: Root = [0xee; 32];
-        let result =
-            service.propose_block_validated(slot, &pubkey, 42, Some(expected_parent)).await;
+        let result = service.propose_block(slot, &pubkey, 42, Some(expected_parent)).await;
 
         assert!(result.is_err());
         assert!(
@@ -3100,7 +3090,7 @@ mod tests {
 
     /// Correct proposer_index with None parent_root — proposal proceeds.
     #[tokio::test]
-    async fn test_propose_block_validated_correct_proposer_no_parent_root_succeeds() {
+    async fn test_propose_block_correct_proposer_no_parent_root_succeeds() {
         let pubkey = test_pubkey();
         let slot = 100;
         let block = test_block(slot); // proposer_index = 42
@@ -3118,7 +3108,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block_validated(slot, &pubkey, 42, None).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         // Signer WAS called
@@ -3132,7 +3122,7 @@ mod tests {
 
     /// Blinded path: wrong proposer_index — signer must NOT be called.
     #[tokio::test]
-    async fn test_propose_block_validated_blinded_proposer_mismatch_drops_duty() {
+    async fn test_propose_block_blinded_proposer_mismatch_drops_duty() {
         let pubkey = test_pubkey();
         let slot = 200;
         // Blinded block has proposer_index = 42
@@ -3152,7 +3142,7 @@ mod tests {
         );
 
         // Expect proposer 77, BN returns 42
-        let result = service.propose_block_validated(slot, &pubkey, 77, None).await;
+        let result = service.propose_block(slot, &pubkey, 77, None).await;
 
         assert!(result.is_err());
         assert!(
@@ -3167,21 +3157,6 @@ mod tests {
             "signer must not be called when blinded proposer_index validation fails"
         );
         assert!(beacon_arc.publish_blinded_calls.lock().unwrap().is_empty());
-    }
-
-    /// propose_block (unvalidated) still works when proposer_index differs — backward compat.
-    #[tokio::test]
-    async fn test_propose_block_unvalidated_ignores_proposer_index() {
-        let pubkey = test_pubkey();
-        let slot = 100;
-        let block = test_block(slot); // proposer_index = 42
-        let beacon = MockBeaconClient::unblinded(block);
-        let signer = MockSigner::new();
-        let service = build_service(signer, beacon, &pubkey);
-
-        // propose_block does NOT check proposer_index — should succeed regardless
-        let result = service.propose_block(slot, &pubkey).await;
-        assert!(result.is_ok());
     }
 
     // ── H-3: BuilderFailure tagging ──────────────────────────────────────────
@@ -3372,7 +3347,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(
             result.is_ok(),
             "propose_block with valid BlockAndBlobs must succeed, got: {result:?}"
@@ -3428,45 +3403,34 @@ mod tests {
         let service = build_service(signer, beacon, &pubkey);
 
         // Signing must NOT fail — the count mismatch is a warn, not an error.
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(
             result.is_ok(),
             "commitment count mismatch must not abort signing, got: {result:?}"
         );
     }
 
-    // RED test for ISSUE-CQ-3.2 (C3).
+    // GREEN (CQ-3.2): formerly RED test for ISSUE-CQ-3.2 (C3).
     //
-    // `propose_block` (L84-91 on `develop`) performs no proposer_index validation.
-    // This test documents the gap: a BN that returns a block with a mismatched
-    // proposer_index is silently accepted, meaning a duty assigned to validator 42
-    // could propose a block attributable to validator 99.
-    //
-    // On `develop` HEAD this test FAILS because `result.is_ok()` (the unvalidated
-    // path never checks proposer_index).  After CQ-3.2 the old unvalidated entry
-    // point is deleted, `propose_block_validated` is renamed to `propose_block`,
-    // and this test is re-pointed at the surviving 4-argument `propose_block` with
-    // `expected_proposer_index = 42` — so the mismatch is detected and the test
-    // goes GREEN.
+    // Before CQ-3.2, `propose_block` performed no proposer_index validation,
+    // silently accepting a block with any proposer_index.  After CQ-3.2 the
+    // unvalidated entry point is deleted; the surviving `propose_block` requires
+    // `expected_proposer_index` and rejects mismatches before calling the signer.
     #[tokio::test]
     async fn test_propose_block_rejects_mismatched_proposer_index() {
         let pubkey = test_pubkey();
         let slot = 100;
-        // BN returns proposer_index = 99; the duty expects validator 42.
+        // BN returns proposer_index = 99; duty expects validator 42.
         let mut block = test_block(slot);
         block.proposer_index = 99;
         let beacon = MockBeaconClient::unblinded(block);
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        // propose_block now validates: expected = 42, got = 99 → Err.
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
-        // On `develop`: propose_block (unvalidated) accepts any proposer_index → Ok.
-        // After CQ-3.2: the only propose_block validates → Err(ProposerIndexMismatch).
-        assert!(
-            result.is_err(),
-            "expected validation rejection but call succeeded"
-        );
+        assert!(result.is_err(), "expected validation rejection but call succeeded");
         assert!(
             matches!(
                 result.unwrap_err(),

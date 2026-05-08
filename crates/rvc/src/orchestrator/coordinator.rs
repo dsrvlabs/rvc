@@ -615,12 +615,7 @@ where
         // Wrap with combined produce + publish timeout
         match tokio::time::timeout(
             self.config.timeouts.block_production + self.config.timeouts.block_publication,
-            self.block_service.propose_block_validated(
-                slot,
-                &pubkey,
-                expected_proposer_index,
-                ctx.head_root,
-            ),
+            self.block_service.propose_block(slot, &pubkey, expected_proposer_index, ctx.head_root),
         )
         .await
         {
@@ -4716,7 +4711,7 @@ mod tests {
     /// `proposer_index` and proceeds to sign + publish, so `publish_called`
     /// becomes `true` → assertion fails.
     ///
-    /// GREEN after Critical #1: `propose_block_validated` is wired in;
+    /// GREEN after CQ-3.2: the validated `propose_block` is the only entry point;
     /// the mismatch is caught before signing, `publish_called` stays `false`.
     #[tokio::test]
     async fn test_maybe_propose_block_bad_proposer_index_drops_duty() {
