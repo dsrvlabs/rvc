@@ -826,6 +826,15 @@ fn init_logging(
         boxed_layers.push(fl);
     }
 
+    // tracing-subscriber 0.3 `Vec<L: Layer<S>>::register_callsite()` returns
+    // `Interest::never()` when empty. As the outer layer in a `Layered` stack
+    // that short-circuits every callsite via `Layered::pick_interest`, so no
+    // events ever reach `fmt::layer` underneath. Pad with `Identity` (a no-op
+    // that returns `Interest::always()`) when no optional layers are present.
+    if boxed_layers.is_empty() {
+        boxed_layers.push(Box::new(tracing_subscriber::layer::Identity::new()));
+    }
+
     tracing_subscriber::registry()
         .with(boxed_layers)
         .with(tracing_subscriber::fmt::layer())
@@ -2163,5 +2172,67 @@ mod tests {
 
         assert!(config.grpc_signer_url.is_none());
         assert!(config.grpc_signer_tls_cert.is_none());
+    }
+
+    /// Regression guard for the v0.4.0 logging silence bug.
+    ///
+    /// `Vec<L: Layer<S>>::register_callsite()` returns `Interest::never()`
+    /// for an empty Vec (tracing-subscriber 0.3 `layer/mod.rs:1788`). When
+    /// that empty Vec is the outer layer in a `Layered` stack, the
+    /// short-circuit in `Layered::pick_interest` disables every callsite,
+    /// so no events ever reach `fmt::layer` underneath.
+    ///
+    /// This test mirrors `init_logging`'s subscriber composition for the
+    /// no-extras case (no `--tracing-endpoint`, no `--logfile`) and asserts
+    /// that a basic `info!` event reaches the writer.
+    #[test]
+    fn test_init_logging_no_extras_emits_events() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::Layer;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for SharedBuf {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = SharedBuf::default();
+        let filter = tracing_subscriber::EnvFilter::new("info");
+
+        // Match the exact shape `init_logging` builds when both
+        // `tracing_config` and `file_config` are None: a Vec that would have
+        // been empty, padded with `Identity` to avoid the never-Interest poison.
+        let boxed_layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
+            vec![Box::new(tracing_subscriber::layer::Identity::new())];
+
+        let subscriber = tracing_subscriber::registry()
+            .with(boxed_layers)
+            .with(tracing_subscriber::fmt::layer().with_writer(buf.clone()))
+            .with(filter);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("init_logging regression marker");
+        });
+
+        let captured = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("init_logging regression marker"),
+            "init_logging composition silently drops events; captured: {captured:?}"
+        );
     }
 }
