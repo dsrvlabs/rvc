@@ -2,27 +2,13 @@ use std::time::Duration;
 
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use tracing::{debug, warn, Instrument};
-use url::Url;
+use tracing::{debug, error, trace, warn, Instrument};
 
-/// Redact credentials from a URL for safe inclusion in span attributes.
-///
-/// Replaces username and password with `***` if present, leaving the rest
-/// of the URL intact. Returns the original string if parsing fails.
-fn redact_url(url: &str) -> String {
-    if let Ok(mut parsed) = Url::parse(url) {
-        if parsed.password().is_some() || !parsed.username().is_empty() {
-            let _ = parsed.set_username("***");
-            let _ = parsed.set_password(Some("***"));
-        }
-        parsed.to_string()
-    } else {
-        url.to_string()
-    }
-}
+use crypto::logging::RedactedUrl;
 
 use eth_types::{ForkSchedule, SignedValidatorRegistration, SignedVoluntaryExit};
 
+use crate::http_caps::{read_body_capped, read_body_capped_lossy, ResponseCaps};
 use crate::types::{
     parse_fork_schedule, AttestationDataResponse, AttesterDutiesResponse,
     BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, DataResponse,
@@ -51,6 +37,8 @@ pub struct BeaconClientConfig {
     pub timeout: Duration,
     pub max_retries: u32,
     pub initial_backoff: Duration,
+    /// Maximum bytes allowed in a JSON response body (H-12).
+    pub max_body_bytes: usize,
 }
 
 impl BeaconClientConfig {
@@ -60,6 +48,7 @@ impl BeaconClientConfig {
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             max_retries: DEFAULT_MAX_RETRIES,
             initial_backoff: Duration::from_millis(DEFAULT_INITIAL_BACKOFF_MS),
+            max_body_bytes: ResponseCaps::DEFAULT_MAX_BODY_BYTES,
         }
     }
 
@@ -75,6 +64,15 @@ impl BeaconClientConfig {
 
     pub fn with_initial_backoff(mut self, initial_backoff: Duration) -> Self {
         self.initial_backoff = initial_backoff;
+        self
+    }
+
+    /// Set the maximum JSON response body size (H-12 body cap).
+    ///
+    /// Default: 32 MiB.  Raise this if a beacon node legitimately returns
+    /// larger responses (e.g. during initial sync).
+    pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes;
         self
     }
 }
@@ -148,6 +146,15 @@ impl BeaconClient {
         body: &B,
     ) -> Result<T, BeaconError> {
         let url = format!("{}{}", self.config.endpoint, path);
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let body_size = serde_json::to_vec(body).map(|b| b.len()).unwrap_or(0);
+            trace!(
+                method = "POST",
+                endpoint = path,
+                body_size_bytes = body_size,
+                "HTTP request body"
+            );
+        }
         let mut trace_headers = reqwest::header::HeaderMap::new();
         telemetry::inject_trace_context(&mut trace_headers);
         let hdrs = trace_headers.clone();
@@ -379,12 +386,16 @@ impl BeaconClient {
                             req.send().await
                         })
                         .await?;
-                    return Self::parse_produce_block_json(fallback_response).await;
+                    return Self::parse_produce_block_json(
+                        fallback_response,
+                        self.config.max_body_bytes,
+                    )
+                    .await;
                 }
             }
         }
 
-        Self::parse_produce_block_json(response).await
+        Self::parse_produce_block_json(response, self.config.max_body_bytes).await
     }
 
     /// Attempt to read and validate the SSZ body from an HTTP response.
@@ -395,26 +406,16 @@ impl BeaconClient {
         consensus_version: &str,
         execution_payload_value: &Option<String>,
     ) -> Result<ProduceBlockResponse, BeaconError> {
+        // H-12 (SSZ path): cap before allocation — read_body_capped streams in chunks
+        // and returns BodyTooLarge before allocating more than MAX_SSZ_BLOCK_BYTES.
+        // The redundant post-hoc size check is no longer needed.
         const MAX_SSZ_BLOCK_BYTES: usize = 16 * 1024 * 1024;
 
-        let ssz_bytes = response
-            .bytes()
-            .await
-            .map_err(|e| BeaconError::ParseError(format!("failed to read SSZ bytes: {e}")))?;
+        let ssz_bytes = read_body_capped(response, MAX_SSZ_BLOCK_BYTES).await?.to_vec();
 
         if ssz_bytes.is_empty() {
             return Err(BeaconError::ParseError("received empty SSZ body from beacon node".into()));
         }
-
-        if ssz_bytes.len() > MAX_SSZ_BLOCK_BYTES {
-            return Err(BeaconError::ParseError(format!(
-                "SSZ response too large: {} bytes (max {})",
-                ssz_bytes.len(),
-                MAX_SSZ_BLOCK_BYTES
-            )));
-        }
-
-        let ssz_bytes = ssz_bytes.to_vec();
 
         debug!(
             slot = slot,
@@ -434,9 +435,17 @@ impl BeaconClient {
     }
 
     /// Parse a JSON produce-block response (headers + body).
+    ///
+    /// H-12: extracts headers first (before consuming the body), then reads the
+    /// body through `read_body_capped` with the caller-supplied cap.  This
+    /// prevents `response.json().await` from buffering an unbounded body before
+    /// deserialisation.
     async fn parse_produce_block_json(
         response: reqwest::Response,
+        max_body_bytes: usize,
     ) -> Result<ProduceBlockResponse, BeaconError> {
+        // Extract all headers before consuming the body (reqwest moves the
+        // response when reading the body, so we capture metadata first).
         let is_blinded = response
             .headers()
             .get("Eth-Execution-Payload-Blinded")
@@ -457,8 +466,10 @@ impl BeaconClient {
             .and_then(|v| v.to_str().ok())
             .map(|v| v.to_string());
 
+        // H-12: cap the body before deserialising.
+        let bytes = read_body_capped(response, max_body_bytes).await?;
         let body: serde_json::Value =
-            response.json().await.map_err(|e| BeaconError::ParseError(e.to_string()))?;
+            serde_json::from_slice(&bytes).map_err(|e| BeaconError::ParseError(e.to_string()))?;
 
         let data = body.get("data").cloned().ok_or_else(|| {
             BeaconError::ParseError("missing 'data' field in produce block response".into())
@@ -751,7 +762,7 @@ impl BeaconClient {
         let span = tracing::info_span!(
             "rvc.beacon.submit_attestations",
             http.method = "POST",
-            http.url = %redact_url(&url),
+            http.url = %RedactedUrl(&url),
             http.status_code = tracing::field::Empty,
         );
         let mut trace_headers = reqwest::header::HeaderMap::new();
@@ -812,7 +823,7 @@ impl BeaconClient {
                     }
 
                     if status.as_u16() == 400 {
-                        let body = response.text().await.unwrap_or_default();
+                        let body = read_body_capped_lossy(response, 16 * 1024).await;
                         warn!(
                             response_body = %body,
                             "Attestation submission returned 400"
@@ -843,12 +854,12 @@ impl BeaconClient {
                     }
 
                     if status.is_client_error() {
-                        let message = response.text().await.unwrap_or_default();
+                        let message = read_body_capped_lossy(response, 16 * 1024).await;
                         return Err(BeaconError::ApiError { status: status.as_u16(), message });
                     }
 
                     if status.is_server_error() {
-                        let message = response.text().await.unwrap_or_default();
+                        let message = read_body_capped_lossy(response, 16 * 1024).await;
                         last_error =
                             Some(BeaconError::ApiError { status: status.as_u16(), message });
                         warn!(
@@ -859,7 +870,7 @@ impl BeaconClient {
                         continue;
                     }
 
-                    let message = response.text().await.unwrap_or_default();
+                    let message = read_body_capped_lossy(response, 16 * 1024).await;
                     return Err(BeaconError::ApiError { status: status.as_u16(), message });
                 }
                 Err(e) => {
@@ -899,29 +910,48 @@ impl BeaconClient {
         let span = tracing::info_span!(
             "rvc.beacon.http",
             http.method = %http_method,
-            http.url = %redact_url(url),
+            http.url = %RedactedUrl(url),
             http.status_code = tracing::field::Empty,
         );
         let mut last_error = None;
+        let endpoint = url.split('?').next().unwrap_or(url);
 
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
                 let backoff = self.calculate_backoff(attempt - 1);
-                debug!(attempt = attempt, backoff_ms = ?backoff.as_millis(), "Retrying request");
+                debug!(
+                    endpoint = endpoint,
+                    attempt = attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    bn_url = %RedactedUrl(url),
+                    "Retrying HTTP request"
+                );
                 tokio::time::sleep(backoff).await;
             }
 
+            let request_start = std::time::Instant::now();
             match request_fn().await {
                 Ok(response) => {
                     let status = response.status();
                     span.record("http.status_code", status.as_u16());
 
                     if status.is_success() {
-                        let body = response.text().await.map_err(|e| {
-                            BeaconError::ParseError(format!("failed to read response body: {e}"))
-                        })?;
-                        return serde_json::from_str::<T>(&body).map_err(|e| {
-                            let preview = body.get(..1024).unwrap_or(&body);
+                        // H-12: stream body with configurable cap before allocation.
+                        let body = read_body_capped(response, self.config.max_body_bytes).await?;
+                        let latency_ms = request_start.elapsed().as_millis() as u64;
+                        debug!(
+                            method = http_method,
+                            endpoint = endpoint,
+                            bn_url = %RedactedUrl(url),
+                            status_code = status.as_u16(),
+                            latency_ms = latency_ms,
+                            response_size_bytes = body.len(),
+                            "HTTP response received"
+                        );
+                        return serde_json::from_slice::<T>(&body).map_err(|e| {
+                            let preview_end = body.len().min(1024);
+                            let preview =
+                                std::str::from_utf8(&body[..preview_end]).unwrap_or("<non-utf8>");
                             warn!(
                                 error = %e,
                                 body_preview = preview,
@@ -944,12 +974,12 @@ impl BeaconClient {
                     }
 
                     if status.is_client_error() {
-                        let message = response.text().await.unwrap_or_default();
+                        let message = read_body_capped_lossy(response, 16 * 1024).await;
                         return Err(BeaconError::ApiError { status: status.as_u16(), message });
                     }
 
                     if status.is_server_error() {
-                        let message = response.text().await.unwrap_or_default();
+                        let message = read_body_capped_lossy(response, 16 * 1024).await;
                         last_error =
                             Some(BeaconError::ApiError { status: status.as_u16(), message });
                         warn!(
@@ -960,13 +990,18 @@ impl BeaconClient {
                         continue;
                     }
 
-                    let message = response.text().await.unwrap_or_default();
+                    let message = read_body_capped_lossy(response, 16 * 1024).await;
                     return Err(BeaconError::ApiError { status: status.as_u16(), message });
                 }
                 Err(e) => {
                     if e.is_timeout() {
                         last_error = Some(BeaconError::Timeout);
-                        warn!(attempt = attempt, "Request timeout, will retry");
+                        warn!(
+                            endpoint = endpoint,
+                            timeout_ms = self.config.timeout.as_millis() as u64,
+                            attempt = attempt,
+                            "Request timeout, will retry"
+                        );
                         continue;
                     }
 
@@ -982,7 +1017,14 @@ impl BeaconClient {
         }
 
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
-        span.in_scope(|| tracing::error!(error = %err, "Request failed after retries exhausted"));
+        span.in_scope(|| {
+            error!(
+                endpoint = endpoint,
+                total_attempts = self.config.max_retries + 1,
+                last_error = %err,
+                "Request failed after all retries exhausted"
+            )
+        });
         Err(err)
     }
 
@@ -998,18 +1040,25 @@ impl BeaconClient {
         let span = tracing::info_span!(
             "rvc.beacon.http",
             http.method = "POST",
-            http.url = %redact_url(&url),
+            http.url = %RedactedUrl(&url),
             http.status_code = tracing::field::Empty,
         );
         let mut trace_headers = reqwest::header::HeaderMap::new();
         telemetry::inject_trace_context(&mut trace_headers);
 
         let mut last_error = None;
+        let endpoint = url.split('?').next().unwrap_or(&url);
 
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
                 let backoff = self.calculate_backoff(attempt - 1);
-                debug!(attempt = attempt, backoff_ms = ?backoff.as_millis(), "Retrying request");
+                debug!(
+                    endpoint = endpoint,
+                    attempt = attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    bn_url = %RedactedUrl(&url),
+                    "Retrying HTTP request"
+                );
                 tokio::time::sleep(backoff).await;
             }
 
@@ -1021,12 +1070,22 @@ impl BeaconClient {
                 request = request.header(name.clone(), value.clone());
             }
 
+            let request_start = std::time::Instant::now();
             match request.send().await {
                 Ok(response) => {
                     let status = response.status();
+                    let latency_ms = request_start.elapsed().as_millis() as u64;
                     span.record("http.status_code", status.as_u16());
 
                     if status.is_success() {
+                        debug!(
+                            method = "POST",
+                            endpoint = endpoint,
+                            bn_url = %RedactedUrl(&url),
+                            status_code = status.as_u16(),
+                            latency_ms = latency_ms,
+                            "HTTP response received"
+                        );
                         return Ok(());
                     }
 
@@ -1043,12 +1102,12 @@ impl BeaconClient {
                     }
 
                     if status.is_client_error() {
-                        let message = response.text().await.unwrap_or_default();
+                        let message = read_body_capped_lossy(response, 16 * 1024).await;
                         return Err(BeaconError::ApiError { status: status.as_u16(), message });
                     }
 
                     if status.is_server_error() {
-                        let message = response.text().await.unwrap_or_default();
+                        let message = read_body_capped_lossy(response, 16 * 1024).await;
                         last_error =
                             Some(BeaconError::ApiError { status: status.as_u16(), message });
                         warn!(
@@ -1059,13 +1118,18 @@ impl BeaconClient {
                         continue;
                     }
 
-                    let message = response.text().await.unwrap_or_default();
+                    let message = read_body_capped_lossy(response, 16 * 1024).await;
                     return Err(BeaconError::ApiError { status: status.as_u16(), message });
                 }
                 Err(e) => {
                     if e.is_timeout() {
                         last_error = Some(BeaconError::Timeout);
-                        warn!(attempt = attempt, "Request timeout, will retry");
+                        warn!(
+                            endpoint = endpoint,
+                            timeout_ms = self.config.timeout.as_millis() as u64,
+                            attempt = attempt,
+                            "Request timeout, will retry"
+                        );
                         continue;
                     }
 
@@ -1081,7 +1145,14 @@ impl BeaconClient {
         }
 
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
-        span.in_scope(|| tracing::error!(error = %err, "Request failed after retries exhausted"));
+        span.in_scope(|| {
+            error!(
+                endpoint = endpoint,
+                total_attempts = self.config.max_retries + 1,
+                last_error = %err,
+                "Request failed after all retries exhausted"
+            )
+        });
         Err(err)
     }
 
@@ -1099,24 +1170,41 @@ impl BeaconClient {
         let span = tracing::info_span!(
             "rvc.beacon.http",
             http.method = %http_method,
-            http.url = %redact_url(url),
+            http.url = %RedactedUrl(url),
             http.status_code = tracing::field::Empty,
         );
         let mut last_error = None;
+        let endpoint = url.split('?').next().unwrap_or(url);
 
         for attempt in 0..=self.config.max_retries {
             if attempt > 0 {
                 let backoff = self.calculate_backoff(attempt - 1);
-                debug!(attempt = attempt, backoff_ms = ?backoff.as_millis(), "Retrying request");
+                debug!(
+                    endpoint = endpoint,
+                    attempt = attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    bn_url = %RedactedUrl(url),
+                    "Retrying HTTP request"
+                );
                 tokio::time::sleep(backoff).await;
             }
 
+            let request_start = std::time::Instant::now();
             match request_fn().await {
                 Ok(response) => {
                     let status = response.status();
                     span.record("http.status_code", status.as_u16());
 
                     if status.is_success() {
+                        let latency_ms = request_start.elapsed().as_millis() as u64;
+                        debug!(
+                            method = http_method,
+                            endpoint = endpoint,
+                            bn_url = %RedactedUrl(url),
+                            status_code = status.as_u16(),
+                            latency_ms = latency_ms,
+                            "HTTP response received"
+                        );
                         return Ok(response);
                     }
 
@@ -1133,12 +1221,12 @@ impl BeaconClient {
                     }
 
                     if status.is_client_error() {
-                        let message = response.text().await.unwrap_or_default();
+                        let message = read_body_capped_lossy(response, 16 * 1024).await;
                         return Err(BeaconError::ApiError { status: status.as_u16(), message });
                     }
 
                     if status.is_server_error() {
-                        let message = response.text().await.unwrap_or_default();
+                        let message = read_body_capped_lossy(response, 16 * 1024).await;
                         last_error =
                             Some(BeaconError::ApiError { status: status.as_u16(), message });
                         warn!(
@@ -1149,13 +1237,18 @@ impl BeaconClient {
                         continue;
                     }
 
-                    let message = response.text().await.unwrap_or_default();
+                    let message = read_body_capped_lossy(response, 16 * 1024).await;
                     return Err(BeaconError::ApiError { status: status.as_u16(), message });
                 }
                 Err(e) => {
                     if e.is_timeout() {
                         last_error = Some(BeaconError::Timeout);
-                        warn!(attempt = attempt, "Request timeout, will retry");
+                        warn!(
+                            endpoint = endpoint,
+                            timeout_ms = self.config.timeout.as_millis() as u64,
+                            attempt = attempt,
+                            "Request timeout, will retry"
+                        );
                         continue;
                     }
 
@@ -1171,7 +1264,14 @@ impl BeaconClient {
         }
 
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
-        span.in_scope(|| tracing::error!(error = %err, "Request failed after retries exhausted"));
+        span.in_scope(|| {
+            error!(
+                endpoint = endpoint,
+                total_attempts = self.config.max_retries + 1,
+                last_error = %err,
+                "Request failed after all retries exhausted"
+            )
+        });
         Err(err)
     }
 

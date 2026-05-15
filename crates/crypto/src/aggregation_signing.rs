@@ -8,6 +8,12 @@ use eth_types::{
     TARGET_AGGREGATORS_PER_COMMITTEE,
 };
 
+#[tracing::instrument(
+    name = "rvc.crypto.sign_selection_proof",
+    level = "debug",
+    skip_all,
+    fields(rvc.signing_type = "selection_proof"),
+)]
 /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof
 /// for attestation aggregation.
 pub fn sign_selection_proof(
@@ -24,6 +30,12 @@ pub fn sign_selection_proof(
     secret_key.sign(&signing_root)
 }
 
+#[tracing::instrument(
+    name = "rvc.crypto.sign_aggregate_and_proof",
+    level = "debug",
+    skip_all,
+    fields(rvc.signing_type = "aggregate_and_proof"),
+)]
 /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
 pub fn sign_aggregate_and_proof(
     aggregate_and_proof: &AggregateAndProof,
@@ -39,6 +51,12 @@ pub fn sign_aggregate_and_proof(
     secret_key.sign(&signing_root)
 }
 
+#[tracing::instrument(
+    name = "rvc.crypto.sign_electra_aggregate_and_proof",
+    level = "debug",
+    skip_all,
+    fields(rvc.signing_type = "electra_aggregate_and_proof"),
+)]
 /// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
 pub fn sign_electra_aggregate_and_proof(
     aggregate_and_proof: &ElectraAggregateAndProof,
@@ -105,8 +123,9 @@ mod tests {
                     slot,
                     index: 1,
                     beacon_block_root: [1u8; 32],
-                    source: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [2u8; 32] },
-                    target: Checkpoint { epoch: slot / SLOTS_PER_EPOCH + 1, root: [3u8; 32] },
+                    // Source is a prior justified checkpoint; target is the current epoch
+                    source: Checkpoint { epoch: slot / SLOTS_PER_EPOCH - 1, root: [2u8; 32] },
+                    target: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [3u8; 32] },
                 },
                 signature: vec![0xaa; 96],
             },
@@ -238,13 +257,15 @@ mod tests {
     #[test]
     fn test_is_aggregator_modulo_committee_128() {
         // committee_length=128 → modulo = 128/16 = 8
-        // All validators are aggregators with ~12.5% probability
         use eth_types::TARGET_AGGREGATORS_PER_COMMITTEE;
         let modulo = (128u64 / TARGET_AGGREGATORS_PER_COMMITTEE).max(1);
         assert_eq!(modulo, 8);
 
-        // Verify the function runs without error
-        let _ = is_aggregator(128, &[0xaa; 96]);
+        let agg_proof = find_aggregator_proof_for_modulo(modulo);
+        assert!(is_aggregator(128, &agg_proof));
+
+        let non_agg_proof = find_non_aggregator_proof_for_modulo(modulo);
+        assert!(!is_aggregator(128, &non_agg_proof));
     }
 
     #[test]
@@ -274,10 +295,10 @@ mod tests {
 
     #[test]
     fn test_is_aggregator_different_proofs_may_differ() {
-        let proof1 = vec![0x00; 96];
-        let proof2 = vec![0x01; 96];
-        let _ = is_aggregator(128, &proof1);
-        let _ = is_aggregator(128, &proof2);
+        // committee_length=128 → modulo=8
+        let agg_proof = find_aggregator_proof_for_modulo(8);
+        let non_agg_proof = find_non_aggregator_proof_for_modulo(8);
+        assert_ne!(is_aggregator(128, &agg_proof), is_aggregator(128, &non_agg_proof),);
     }
 
     #[test]
@@ -297,12 +318,16 @@ mod tests {
 
     #[test]
     fn test_is_aggregator_large_committee() {
-        // committee_length=256 → 256/16 = 16 → ~6.25% selected
+        // committee_length=256 → 256/16 = 16
         use eth_types::TARGET_AGGREGATORS_PER_COMMITTEE;
         let modulo = (256u64 / TARGET_AGGREGATORS_PER_COMMITTEE).max(1);
         assert_eq!(modulo, 16);
 
-        let _ = is_aggregator(256, &[0xaa; 96]);
+        let agg_proof = find_aggregator_proof_for_modulo(modulo);
+        assert!(is_aggregator(256, &agg_proof));
+
+        let non_agg_proof = find_non_aggregator_proof_for_modulo(modulo);
+        assert!(!is_aggregator(256, &non_agg_proof));
     }
 
     fn sample_electra_aggregate_and_proof(slot: Slot) -> ElectraAggregateAndProof {
@@ -314,8 +339,9 @@ mod tests {
                     slot,
                     index: 0,
                     beacon_block_root: [1u8; 32],
-                    source: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [2u8; 32] },
-                    target: Checkpoint { epoch: slot / SLOTS_PER_EPOCH + 1, root: [3u8; 32] },
+                    // Source is a prior justified checkpoint; target is the current epoch
+                    source: Checkpoint { epoch: slot / SLOTS_PER_EPOCH - 1, root: [2u8; 32] },
+                    target: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [3u8; 32] },
                 },
                 signature: vec![0xaa; 96],
                 committee_bits: vec![0x01, 0, 0, 0, 0, 0, 0, 0],
@@ -382,5 +408,29 @@ mod tests {
             compute_domain(DOMAIN_SELECTION_PROOF, schedule.genesis_fork_version, genesis_root);
         let wrong_signing_root = compute_signing_root(&agg_and_proof, wrong_domain);
         assert!(signature.verify(&public_key, &wrong_signing_root).is_err());
+    }
+
+    fn find_aggregator_proof_for_modulo(modulo: u64) -> Vec<u8> {
+        for i in 0u64.. {
+            let proof = i.to_le_bytes().to_vec();
+            let hash = Sha256::digest(&proof);
+            let value = u64::from_le_bytes(hash[..8].try_into().unwrap());
+            if value % modulo == 0 {
+                return proof;
+            }
+        }
+        unreachable!()
+    }
+
+    fn find_non_aggregator_proof_for_modulo(modulo: u64) -> Vec<u8> {
+        for i in 0u64.. {
+            let proof = i.to_le_bytes().to_vec();
+            let hash = Sha256::digest(&proof);
+            let value = u64::from_le_bytes(hash[..8].try_into().unwrap());
+            if value % modulo != 0 {
+                return proof;
+            }
+        }
+        unreachable!()
     }
 }

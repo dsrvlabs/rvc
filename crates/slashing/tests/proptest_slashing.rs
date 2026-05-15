@@ -46,12 +46,12 @@ proptest! {
 
         if root_a == root_b {
             // Same signing root — both should succeed (idempotent re-signing)
-            prop_assert!(db.check_and_record_block(&pk, slot, root_a.clone()).is_ok());
-            prop_assert!(db.check_and_record_block(&pk, slot, root_b).is_ok());
+            prop_assert!(db.check_and_record_block("local-vc", &pk, slot, root_a.clone(), &[0u8; 32]).is_ok());
+            prop_assert!(db.check_and_record_block("local-vc", &pk, slot, root_b, &[0u8; 32]).is_ok());
         } else {
             // Different signing roots — exactly one should succeed
-            let r1 = db.check_and_record_block(&pk, slot, root_a);
-            let r2 = db.check_and_record_block(&pk, slot, root_b);
+            let r1 = db.check_and_record_block("local-vc", &pk, slot, root_a, &[0u8; 32]);
+            let r2 = db.check_and_record_block("local-vc", &pk, slot, root_b, &[0u8; 32]);
             prop_assert!(r1.is_ok());
             prop_assert!(r2.is_err());
         }
@@ -78,12 +78,12 @@ proptest! {
         let pk = pubkey(1);
 
         // First attestation should always succeed
-        let r1 = db.check_and_record_attestation(&pk, source_a, target, root_a.clone());
+        let r1 = db.check_and_record_attestation("local-vc", &pk, source_a, target, root_a.clone(), &[0u8; 32]);
         prop_assert!(r1.is_ok());
 
         if root_a == root_b {
             // Same signing root — idempotent, should succeed
-            let r2 = db.check_and_record_attestation(&pk, source_b, target, root_b);
+            let r2 = db.check_and_record_attestation("local-vc", &pk, source_b, target, root_b, &[0u8; 32]);
             prop_assert!(r2.is_ok());
 
             // Verify only 1 record exists and original source is preserved
@@ -92,7 +92,7 @@ proptest! {
             prop_assert_eq!(atts[0].source_epoch, source_a, "re-sign must not overwrite source epoch");
         } else {
             // Different signing roots — must be rejected (double vote)
-            let r2 = db.check_and_record_attestation(&pk, source_b, target, root_b);
+            let r2 = db.check_and_record_attestation("local-vc", &pk, source_b, target, root_b, &[0u8; 32]);
             prop_assert!(r2.is_err());
         }
     }
@@ -120,7 +120,7 @@ proptest! {
         for (i, (source, target_offset)) in attestations.iter().enumerate() {
             let target = source + target_offset; // Ensure target > source
             let root = Some(hex_root((i as u8).wrapping_add(1)));
-            let _ = db.check_and_record_attestation(&pk, *source, target, root);
+            let _ = db.check_and_record_attestation("local-vc", &pk, *source, target, root, &[0u8; 32]);
         }
 
         // Query the ACTUAL DB records for the surround invariant check
@@ -164,7 +164,7 @@ proptest! {
 
         for (i, &slot) in slots.iter().enumerate() {
             let root = Some(hex_root(i as u8 + 1));
-            let _ = db.check_and_record_block(&pk, slot, root);
+            let _ = db.check_and_record_block("local-vc", &pk, slot, root, &[0u8; 32]);
 
             let current_max = db.last_signed_block_slot(&pk).unwrap();
             if let Some(prev) = max_slot {
@@ -196,7 +196,7 @@ proptest! {
         for (i, (source, target_offset)) in attestations.iter().enumerate() {
             let target = source + target_offset;
             let root = Some(hex_root(i as u8 + 1));
-            let _ = db.check_and_record_attestation(&pk, *source, target, root);
+            let _ = db.check_and_record_attestation("local-vc", &pk, *source, target, root, &[0u8; 32]);
 
             let current_max = db.last_signed_attestation_epoch(&pk).unwrap();
             if let Some(prev) = max_target {
@@ -232,10 +232,10 @@ proptest! {
         let pk_b = pubkey(2);
 
         // Validator A records a block
-        db.check_and_record_block(&pk_a, slot, root.clone()).unwrap();
+        db.check_and_record_block("local-vc", &pk_a, slot, root.clone(), &[0u8; 32]).unwrap();
 
         // Validator B should still be able to propose at the same slot
-        let result = db.check_and_record_block(&pk_b, slot, root);
+        let result = db.check_and_record_block("local-vc", &pk_b, slot, root, &[0u8; 32]);
         prop_assert!(result.is_ok(), "validator B blocked by validator A's block at slot {}", slot);
     }
 
@@ -250,10 +250,10 @@ proptest! {
         let pk_b = pubkey(2);
 
         // Validator A records an attestation
-        db.check_and_record_attestation(&pk_a, source, target, root.clone()).unwrap();
+        db.check_and_record_attestation("local-vc", &pk_a, source, target, root.clone(), &[0u8; 32]).unwrap();
 
         // Validator B should still be able to attest with the same epochs
-        let result = db.check_and_record_attestation(&pk_b, source, target, root);
+        let result = db.check_and_record_attestation("local-vc", &pk_b, source, target, root, &[0u8; 32]);
         prop_assert!(
             result.is_ok(),
             "validator B blocked by validator A's attestation ({}, {})",
@@ -280,7 +280,7 @@ proptest! {
         let pk = pubkey(1);
 
         for _ in 0..repeat_count {
-            let result = db.check_and_record_block(&pk, slot, root.clone());
+            let result = db.check_and_record_block("local-vc", &pk, slot, root.clone(), &[0u8; 32]);
             prop_assert!(result.is_ok(), "re-signing block at slot {} with same root failed", slot);
         }
 
@@ -300,7 +300,7 @@ proptest! {
         let pk = pubkey(1);
 
         for _ in 0..repeat_count {
-            let result = db.check_and_record_attestation(&pk, source, target, root.clone());
+            let result = db.check_and_record_attestation("local-vc", &pk, source, target, root.clone(), &[0u8; 32]);
             prop_assert!(
                 result.is_ok(),
                 "re-signing attestation ({}, {}) with same root failed",

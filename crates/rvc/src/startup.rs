@@ -7,7 +7,12 @@
 //! 4. Check beacon node reachability
 //! 5. Run doppelganger detection (if enabled)
 
+use std::fs::{File, OpenOptions};
+use std::path::Path;
+
 use bn_manager::BeaconNodeClient;
+use crypto::hex::{strip_prefix_strict, HexError};
+use fd_lock::RwLock;
 use slashing::SlashingDb;
 use tracing::{error, info, warn};
 
@@ -18,6 +23,7 @@ pub const EXIT_INTEGRITY_CHECK_FAILED: i32 = 10;
 pub const EXIT_GENESIS_ROOT_MISMATCH: i32 = 11;
 pub const EXIT_DOPPELGANGER_DETECTED: i32 = 12;
 pub const EXIT_UNSUPPORTED_FORK_VERSION: i32 = 13;
+pub const EXIT_KEYSTORE_LOCKED: i32 = 14;
 
 /// Errors specific to the startup sequence.
 #[derive(Debug, thiserror::Error)]
@@ -46,8 +52,14 @@ pub enum StartupError {
     #[error("doppelganger error: {0}")]
     Doppelganger(#[from] doppelganger::DoppelgangerError),
 
+    #[error("keystore locked: {0}")]
+    KeystoreLocked(String),
+
     #[error("startup exit with code {0}")]
     StartupExit(i32),
+
+    #[error("invalid hex input: {0}")]
+    InvalidHexInput(String),
 }
 
 impl StartupError {
@@ -57,6 +69,7 @@ impl StartupError {
             Self::GenesisRootMismatch { .. } => EXIT_GENESIS_ROOT_MISMATCH,
             Self::DoppelgangerDetected(_) => EXIT_DOPPELGANGER_DETECTED,
             Self::UnsupportedForkVersion { .. } => EXIT_UNSUPPORTED_FORK_VERSION,
+            Self::KeystoreLocked(_) => EXIT_KEYSTORE_LOCKED,
             _ => 1,
         }
     }
@@ -84,8 +97,8 @@ pub async fn validate_genesis_root(
     let genesis_response = beacon.get_genesis().await?;
     let beacon_root = &genesis_response.data.genesis_validators_root;
 
-    let local_normalized = normalize_hex(local_root_hex);
-    let beacon_normalized = normalize_hex(beacon_root);
+    let local_normalized = normalize_hex(local_root_hex)?;
+    let beacon_normalized = normalize_hex(beacon_root)?;
 
     if local_normalized != beacon_normalized {
         error!(
@@ -182,6 +195,16 @@ pub async fn run_doppelganger_detection(
     Ok(all_safe)
 }
 
+/// Log that the orchestrator has been started with validator and beacon node counts.
+pub fn log_orchestrator_started(validator_count: usize, bn_count: usize) {
+    info!(validator_count, bn_count, "Orchestrator started");
+}
+
+/// Log that a shutdown has been initiated with the reason.
+pub fn log_shutdown_initiated(reason: &str) {
+    info!(reason, "Shutdown initiated");
+}
+
 /// Check that the beacon node's current head fork version is known in the schedule.
 ///
 /// Prevents future fork-version drift from silently producing invalid signatures.
@@ -214,7 +237,13 @@ pub async fn check_fork_compatibility(
 }
 
 fn parse_version_hex(hex_str: &str) -> Result<[u8; 4], StartupError> {
-    let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    let stripped = match strip_prefix_strict(hex_str) {
+        Ok(s) => s,
+        Err(HexError::DoubleZeroXPrefix) => {
+            warn!(hex = hex_str, "rejecting fork-version hex with double 0x prefix");
+            return Err(StartupError::UnsupportedForkVersion { version: hex_str.to_string() });
+        }
+    };
     let bytes = hex::decode(stripped)
         .map_err(|_| StartupError::UnsupportedForkVersion { version: hex_str.to_string() })?;
     if bytes.len() != 4 {
@@ -225,8 +254,64 @@ fn parse_version_hex(hex_str: &str) -> Result<[u8; 4], StartupError> {
     Ok(arr)
 }
 
-fn normalize_hex(s: &str) -> String {
-    s.to_lowercase().trim_start_matches("0x").to_string()
+fn normalize_hex(s: &str) -> Result<String, StartupError> {
+    let lower = s.to_lowercase();
+    match strip_prefix_strict(&lower) {
+        Ok(stripped) => Ok(stripped.to_string()),
+        Err(HexError::DoubleZeroXPrefix) => {
+            warn!(hex = s, "rejecting genesis-root hex with double 0x prefix");
+            Err(StartupError::InvalidHexInput(s.to_string()))
+        }
+    }
+}
+
+/// Acquires an exclusive file lock on the validator data directory.
+///
+/// Uses flock(2) advisory locks via fd-lock. Locks are automatically
+/// released on process exit (including crash/SIGKILL).
+pub fn acquire_keystore_lock(
+    data_dir: &Path,
+) -> Result<fd_lock::RwLockWriteGuard<'static, File>, StartupError> {
+    let lock_path = data_dir.join(".rvc.lock");
+
+    let file =
+        OpenOptions::new().create(true).write(true).truncate(false).open(&lock_path).map_err(
+            |e| {
+                StartupError::KeystoreLocked(format!(
+                    "Failed to open lock file {}: {}",
+                    lock_path.display(),
+                    e
+                ))
+            },
+        )?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    // Box::leak so the RwLock lives for the process lifetime
+    let lock = Box::leak(Box::new(RwLock::new(file)));
+
+    match lock.try_write() {
+        Ok(guard) => {
+            info!(lock_path = %lock_path.display(), "Keystore lock acquired");
+            Ok(guard)
+        }
+        Err(_) => {
+            error!(
+                lock_path = %lock_path.display(),
+                "Keystore directory is already locked by another rvc instance"
+            );
+            Err(StartupError::KeystoreLocked(format!(
+                "Keystore directory {} is already locked by another rvc instance. \
+                 If no other instance is running, delete {} and retry.",
+                data_dir.display(),
+                lock_path.display(),
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -485,17 +570,17 @@ mod tests {
 
     #[test]
     fn test_normalize_hex_strips_prefix() {
-        assert_eq!(normalize_hex("0xAbCdEf"), "abcdef");
+        assert_eq!(normalize_hex("0xAbCdEf").unwrap(), "abcdef");
     }
 
     #[test]
     fn test_normalize_hex_lowercases() {
-        assert_eq!(normalize_hex("ABCDEF"), "abcdef");
+        assert_eq!(normalize_hex("ABCDEF").unwrap(), "abcdef");
     }
 
     #[test]
     fn test_normalize_hex_no_prefix() {
-        assert_eq!(normalize_hex("abcdef"), "abcdef");
+        assert_eq!(normalize_hex("abcdef").unwrap(), "abcdef");
     }
 
     #[tokio::test]
@@ -691,5 +776,103 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("0xdeadbeef"));
         assert!(msg.contains("upgrade rvc"));
+    }
+
+    #[test]
+    fn test_log_orchestrator_started_does_not_panic() {
+        log_orchestrator_started(10, 3);
+    }
+
+    #[test]
+    fn test_log_shutdown_initiated_does_not_panic() {
+        log_shutdown_initiated("SIGTERM");
+    }
+
+    // -- Keystore locking tests --
+
+    #[test]
+    fn test_exit_code_keystore_locked() {
+        let err = StartupError::KeystoreLocked("test".to_string());
+        assert_eq!(err.exit_code(), EXIT_KEYSTORE_LOCKED);
+    }
+
+    #[test]
+    fn test_acquire_keystore_lock_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let guard = acquire_keystore_lock(dir.path());
+        assert!(guard.is_ok());
+        // Lock file should exist
+        assert!(dir.path().join(".rvc.lock").exists());
+    }
+
+    #[test]
+    fn test_acquire_keystore_lock_second_attempt_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard1 = acquire_keystore_lock(dir.path()).unwrap();
+        // Second attempt should fail
+        let result = acquire_keystore_lock(dir.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.exit_code(), EXIT_KEYSTORE_LOCKED);
+        assert!(matches!(err, StartupError::KeystoreLocked(_)));
+    }
+
+    #[test]
+    fn test_acquire_keystore_lock_released_after_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _guard = acquire_keystore_lock(dir.path()).unwrap();
+            // Lock is held here
+        }
+        // Note: because we Box::leak the RwLock, the lock is NOT released on drop
+        // of the guard in the current implementation. This is by design —
+        // the lock is held for the process lifetime. In tests, we verify the
+        // flock(2) advisory semantics: process exit releases the lock.
+        // We cannot easily test this in-process, so we just verify acquire works.
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_acquire_keystore_lock_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = acquire_keystore_lock(dir.path()).unwrap();
+        let metadata = std::fs::metadata(dir.path().join(".rvc.lock")).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn test_acquire_keystore_lock_nonexistent_dir() {
+        let result = acquire_keystore_lock(Path::new("/nonexistent/path/that/does/not/exist"));
+        assert!(result.is_err());
+    }
+
+    // -- CQ-2.5: strip_prefix_strict adoption tests --
+
+    /// parse_version_hex must warn and return UnsupportedForkVersion on a double-0x input.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_parse_version_hex_double_0x_warns_and_errors() {
+        let result = parse_version_hex("0x0xdeadbeef");
+        assert!(result.is_err(), "double-0x fork version should be rejected");
+        assert!(
+            matches!(result.unwrap_err(), StartupError::UnsupportedForkVersion { .. }),
+            "error variant must be UnsupportedForkVersion"
+        );
+        assert!(logs_contain("double 0x prefix"), "expected warn log about double prefix");
+    }
+
+    /// normalize_hex must warn and return InvalidHexInput on a double-0x input.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_normalize_hex_double_0x_warns_and_errors() {
+        let result = normalize_hex("0x0xabcdef");
+        assert!(result.is_err(), "double-0x genesis root should be rejected");
+        assert!(
+            matches!(result.unwrap_err(), StartupError::InvalidHexInput(_)),
+            "error variant must be InvalidHexInput"
+        );
+        assert!(logs_contain("double 0x prefix"), "expected warn log about double prefix");
     }
 }

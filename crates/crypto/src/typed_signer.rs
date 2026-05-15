@@ -1,0 +1,689 @@
+//! Typed signing trait and [`SignContext`].
+//!
+//! [`TypedSigner`] exposes one method per Ethereum consensus duty type.
+//! [`LocalSigner`] implements it by computing the signing root and delegating
+//! to [`RawSigner::sign`].
+
+use async_trait::async_trait;
+
+use eth_types::{
+    AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
+    Epoch, ForkInfo, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
+    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+};
+
+use crate::bls::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
+use crate::signer_trait::{LocalSigner, Signer, SigningError};
+use crate::signing::{compute_domain, compute_signing_root};
+use eth_types::{ForkName, ForkSchedule, SyncAggregatorSelectionData};
+
+// ============================================================
+// RawSigner
+// ============================================================
+
+/// Low-level signing trait: signs a 32-byte root with a known keypair.
+///
+/// [`LocalSigner`] and `RemoteSigner` (Web3Signer HTTP) implement this.
+/// `GrpcRemoteSigner` does **not** implement this (it only implements
+/// [`TypedSigner`]) because the v2 gRPC contract has no raw-root RPC.
+#[async_trait]
+pub trait RawSigner: Send + Sync {
+    async fn sign(
+        &self,
+        root: &[u8; 32],
+        pubkey: &[u8; PUBLIC_KEY_BYTES_LEN],
+    ) -> Result<Signature, SigningError>;
+}
+
+// ============================================================
+// SignContext
+// ============================================================
+
+/// Signing context passed to every [`TypedSigner`] method.
+/// Carries the signer's public key and the fork information required for
+/// domain computation.
+pub struct SignContext {
+    pub pubkey: PublicKey,
+    pub fork_info: ForkInfo,
+}
+
+// ============================================================
+// TypedSigner
+// ============================================================
+
+/// High-level signing trait: one method per consensus duty type.
+///
+/// Implementations compute the signing root from the consensus object and
+/// the fork context, then call the underlying key.
+#[async_trait]
+pub trait TypedSigner: Send + Sync {
+    /// Sign a full beacon block (DOMAIN_BEACON_PROPOSER).
+    async fn sign_block(
+        &self,
+        block: &BeaconBlock,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError>;
+
+    /// Sign a blinded beacon block (DOMAIN_BEACON_PROPOSER).
+    async fn sign_blinded_block(
+        &self,
+        block: &BlindedBeaconBlock,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError>;
+
+    /// Sign attestation data (DOMAIN_BEACON_ATTESTER).
+    async fn sign_attestation(
+        &self,
+        data: &AttestationData,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError>;
+
+    /// Sign an aggregate-and-proof (DOMAIN_AGGREGATE_AND_PROOF).
+    async fn sign_aggregate_and_proof(
+        &self,
+        agg: &AggregateAndProof,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError>;
+
+    /// Sign a sync committee message (DOMAIN_SYNC_COMMITTEE).
+    async fn sign_sync_committee_message(
+        &self,
+        slot: Slot,
+        beacon_block_root: Root,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError>;
+
+    /// Sign sync aggregator selection data (DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF).
+    async fn sign_sync_aggregator_selection(
+        &self,
+        slot: Slot,
+        subcommittee_index: u64,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError>;
+
+    /// Sign a contribution-and-proof (DOMAIN_CONTRIBUTION_AND_PROOF).
+    async fn sign_contribution_and_proof(
+        &self,
+        c: &ContributionAndProof,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError>;
+
+    /// Sign a builder registration (DOMAIN_APPLICATION_BUILDER, zero gvr).
+    async fn sign_builder_registration(
+        &self,
+        reg: &ValidatorRegistrationV1,
+        genesis_fork_version: [u8; 4],
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError>;
+
+    /// Sign a RANDAO reveal (DOMAIN_RANDAO).
+    async fn sign_randao_reveal(
+        &self,
+        epoch: Epoch,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError>;
+
+    /// Sign a voluntary exit (DOMAIN_VOLUNTARY_EXIT).
+    ///
+    /// # EIP-7044 caller responsibility
+    ///
+    /// Per EIP-7044, voluntary-exit signatures must use the **Capella fork
+    /// version** for any post-Capella exit so that signatures remain valid
+    /// across hard forks.  This trait does **not** apply that cap internally:
+    /// `ctx.fork_info.current_version` is used as-is.  The caller MUST pass
+    /// a `SignContext` whose `fork_info.current_version` is the Capella-capped
+    /// version when the exit's `epoch` is at or after the Capella fork.
+    ///
+    /// Use [`capella_capped_fork_version`] to compute the correct version
+    /// before constructing the `SignContext`. The server-side dispatch in
+    /// `bin/rvc-signer` (ISSUE-1.6d) is the canonical caller; any new caller
+    /// must mirror that logic to avoid producing signatures the BN will
+    /// reject after a fork transition.
+    async fn sign_voluntary_exit(
+        &self,
+        exit: &VoluntaryExit,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError>;
+}
+
+// ============================================================
+// RawSigner blanket impl for LocalSigner (bridges old + new)
+// ============================================================
+
+#[async_trait]
+impl RawSigner for LocalSigner {
+    async fn sign(
+        &self,
+        root: &[u8; 32],
+        pubkey: &[u8; PUBLIC_KEY_BYTES_LEN],
+    ) -> Result<Signature, SigningError> {
+        Signer::sign(self, root, pubkey).await
+    }
+}
+
+// ============================================================
+// TypedSigner impl for LocalSigner
+// ============================================================
+
+#[async_trait]
+impl TypedSigner for LocalSigner {
+    async fn sign_block(
+        &self,
+        block: &BeaconBlock,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let domain = compute_domain(
+            DOMAIN_BEACON_PROPOSER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(block, domain);
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_blinded_block(
+        &self,
+        block: &BlindedBeaconBlock,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let domain = compute_domain(
+            DOMAIN_BEACON_PROPOSER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(block, domain);
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_attestation(
+        &self,
+        data: &AttestationData,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let domain = compute_domain(
+            DOMAIN_BEACON_ATTESTER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(data, domain);
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_aggregate_and_proof(
+        &self,
+        agg: &AggregateAndProof,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let domain = compute_domain(
+            DOMAIN_AGGREGATE_AND_PROOF,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(agg, domain);
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_sync_committee_message(
+        &self,
+        _slot: Slot,
+        beacon_block_root: Root,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let domain = compute_domain(
+            DOMAIN_SYNC_COMMITTEE,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(&beacon_block_root, domain);
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_sync_aggregator_selection(
+        &self,
+        slot: Slot,
+        subcommittee_index: u64,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let domain = compute_domain(
+            DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let selection_data = SyncAggregatorSelectionData { slot, subcommittee_index };
+        let signing_root = compute_signing_root(&selection_data, domain);
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_contribution_and_proof(
+        &self,
+        c: &ContributionAndProof,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let domain = compute_domain(
+            DOMAIN_CONTRIBUTION_AND_PROOF,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(c, domain);
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_builder_registration(
+        &self,
+        reg: &ValidatorRegistrationV1,
+        genesis_fork_version: [u8; 4],
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        // Per MEV-Boost spec: DOMAIN_APPLICATION_BUILDER + GENESIS_FORK_VERSION + zero gvr
+        let zero_gvr = [0u8; 32];
+        let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_gvr);
+        let signing_root = compute_signing_root(reg, domain);
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_randao_reveal(
+        &self,
+        epoch: Epoch,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let domain = compute_domain(
+            DOMAIN_RANDAO,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(&epoch, domain);
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_voluntary_exit(
+        &self,
+        exit: &VoluntaryExit,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        // EIP-7044: voluntary exit signatures are perpetually valid by capping at Capella.
+        // The fork_info.current_version is passed in — the caller must supply the
+        // Capella-capped version for exits at or after Capella.
+        let domain = compute_domain(
+            DOMAIN_VOLUNTARY_EXIT,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(exit, domain);
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+}
+
+// EIP-7044 helper: resolve the Capella-capped fork version for voluntary exits.
+// Used by tests and callers who don't want to compute it themselves.
+pub fn capella_capped_fork_version(epoch: Epoch, schedule: &ForkSchedule) -> [u8; 4] {
+    let fork_name = ForkName::from_epoch(epoch, schedule);
+    let capped = if fork_name >= ForkName::Capella { ForkName::Capella } else { fork_name };
+    capped.fork_version(schedule)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bls::SecretKey;
+    use crate::key_manager::KeyManager;
+
+    fn make_local_signer(sk: SecretKey) -> LocalSigner {
+        let mut km = KeyManager::new();
+        km.insert(sk);
+        LocalSigner::new(km)
+    }
+
+    fn test_fork_info() -> ForkInfo {
+        ForkInfo {
+            previous_version: [0x00, 0x00, 0x00, 0x00],
+            current_version: [0x04, 0x00, 0x00, 0x00], // Deneb
+            genesis_validators_root: [0xaa; 32],
+        }
+    }
+
+    fn test_ctx(sk: &SecretKey) -> SignContext {
+        SignContext { pubkey: sk.public_key(), fork_info: test_fork_info() }
+    }
+
+    // ---- RawSigner blanket ----
+
+    #[tokio::test]
+    async fn test_raw_signer_bridges_to_signer_trait() {
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+        let root = [0x11u8; 32];
+        let signer = make_local_signer(sk);
+
+        let sig_raw = RawSigner::sign(&signer, &root, &pk_bytes).await.unwrap();
+        let sig_trait = Signer::sign(&signer, &root, &pk_bytes).await.unwrap();
+        assert_eq!(sig_raw.to_bytes(), sig_trait.to_bytes());
+    }
+
+    // ---- TypedSigner::sign_block ----
+
+    #[tokio::test]
+    async fn test_typed_signer_sign_block_verifies() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = test_ctx(&sk);
+        let block = BeaconBlock {
+            slot: 100,
+            proposer_index: 1,
+            parent_root: [0x11; 32],
+            state_root: [0x22; 32],
+            body: vec![0xde, 0xad],
+        };
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_block(&signer, &block, &ctx).await.unwrap();
+
+        let domain = compute_domain(
+            DOMAIN_BEACON_PROPOSER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(&block, domain);
+        assert!(sig.verify(&pk, &signing_root).is_ok());
+    }
+
+    // ---- TypedSigner::sign_blinded_block ----
+
+    #[tokio::test]
+    async fn test_typed_signer_sign_blinded_block_verifies() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = test_ctx(&sk);
+        let block = BlindedBeaconBlock {
+            slot: 200,
+            proposer_index: 2,
+            parent_root: [0x33; 32],
+            state_root: [0x44; 32],
+            body: vec![0xca, 0xfe],
+        };
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_blinded_block(&signer, &block, &ctx).await.unwrap();
+
+        let domain = compute_domain(
+            DOMAIN_BEACON_PROPOSER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(&block, domain);
+        assert!(sig.verify(&pk, &signing_root).is_ok());
+    }
+
+    // ---- TypedSigner::sign_attestation ----
+
+    #[tokio::test]
+    async fn test_typed_signer_sign_attestation_verifies() {
+        use eth_types::Checkpoint;
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = test_ctx(&sk);
+        let data = AttestationData {
+            slot: 100,
+            index: 1,
+            beacon_block_root: [0x55; 32],
+            source: Checkpoint { epoch: 9, root: [0x66; 32] },
+            target: Checkpoint { epoch: 10, root: [0x77; 32] },
+        };
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_attestation(&signer, &data, &ctx).await.unwrap();
+
+        let domain = compute_domain(
+            DOMAIN_BEACON_ATTESTER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(&data, domain);
+        assert!(sig.verify(&pk, &signing_root).is_ok());
+    }
+
+    // ---- TypedSigner::sign_aggregate_and_proof ----
+
+    #[tokio::test]
+    async fn test_typed_signer_sign_aggregate_verifies() {
+        use eth_types::{Attestation, Checkpoint};
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = test_ctx(&sk);
+        let agg = AggregateAndProof {
+            aggregator_index: 42,
+            aggregate: Attestation {
+                aggregation_bits: vec![0xff; 4],
+                data: AttestationData {
+                    slot: 100,
+                    index: 1,
+                    beacon_block_root: [0x11; 32],
+                    source: Checkpoint { epoch: 9, root: [0x22; 32] },
+                    target: Checkpoint { epoch: 10, root: [0x33; 32] },
+                },
+                signature: vec![0xaa; 96],
+            },
+            selection_proof: vec![0xbb; 96],
+        };
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_aggregate_and_proof(&signer, &agg, &ctx).await.unwrap();
+
+        let domain = compute_domain(
+            DOMAIN_AGGREGATE_AND_PROOF,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(&agg, domain);
+        assert!(sig.verify(&pk, &signing_root).is_ok());
+    }
+
+    // ---- TypedSigner::sign_sync_committee_message ----
+
+    #[tokio::test]
+    async fn test_typed_signer_sign_sync_committee_message_verifies() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = test_ctx(&sk);
+        let slot = 500u64;
+        let beacon_block_root = [0x88; 32];
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_sync_committee_message(&signer, slot, beacon_block_root, &ctx)
+            .await
+            .unwrap();
+
+        let domain = compute_domain(
+            DOMAIN_SYNC_COMMITTEE,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(&beacon_block_root, domain);
+        assert!(sig.verify(&pk, &signing_root).is_ok());
+    }
+
+    // ---- TypedSigner::sign_sync_aggregator_selection ----
+
+    #[tokio::test]
+    async fn test_typed_signer_sign_sync_aggregator_selection_verifies() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = test_ctx(&sk);
+        let slot = 600u64;
+        let subcommittee_index = 3u64;
+        let signer = make_local_signer(sk);
+
+        let sig =
+            TypedSigner::sign_sync_aggregator_selection(&signer, slot, subcommittee_index, &ctx)
+                .await
+                .unwrap();
+
+        let domain = compute_domain(
+            DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let selection_data = SyncAggregatorSelectionData { slot, subcommittee_index };
+        let signing_root = compute_signing_root(&selection_data, domain);
+        assert!(sig.verify(&pk, &signing_root).is_ok());
+    }
+
+    // ---- TypedSigner::sign_contribution_and_proof ----
+
+    #[tokio::test]
+    async fn test_typed_signer_sign_contribution_and_proof_verifies() {
+        use eth_types::SyncCommitteeContribution;
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = test_ctx(&sk);
+        let c = ContributionAndProof {
+            aggregator_index: 7,
+            contribution: SyncCommitteeContribution {
+                slot: 400,
+                beacon_block_root: [0x99; 32],
+                subcommittee_index: 1,
+                aggregation_bits: vec![0x03; 16],
+                signature: vec![0xcc; 96],
+            },
+            selection_proof: vec![0xdd; 96],
+        };
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_contribution_and_proof(&signer, &c, &ctx).await.unwrap();
+
+        let domain = compute_domain(
+            DOMAIN_CONTRIBUTION_AND_PROOF,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(&c, domain);
+        assert!(sig.verify(&pk, &signing_root).is_ok());
+    }
+
+    // ---- TypedSigner::sign_builder_registration ----
+
+    #[tokio::test]
+    async fn test_typed_signer_sign_builder_registration_verifies() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = test_ctx(&sk);
+        let genesis_fork_version = [0x00, 0x00, 0x00, 0x00];
+        let reg = ValidatorRegistrationV1 {
+            fee_recipient: [0xab; 20],
+            gas_limit: 30_000_000,
+            timestamp: 1_700_000_000,
+            pubkey: pk.to_bytes(),
+        };
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_builder_registration(&signer, &reg, genesis_fork_version, &ctx)
+            .await
+            .unwrap();
+
+        let zero_gvr = [0u8; 32];
+        let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_gvr);
+        let signing_root = compute_signing_root(&reg, domain);
+        assert!(sig.verify(&pk, &signing_root).is_ok());
+    }
+
+    // ---- TypedSigner::sign_randao_reveal ----
+
+    #[tokio::test]
+    async fn test_typed_signer_sign_randao_reveal_verifies() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = test_ctx(&sk);
+        let epoch = 42u64;
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_randao_reveal(&signer, epoch, &ctx).await.unwrap();
+
+        let domain = compute_domain(
+            DOMAIN_RANDAO,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(&epoch, domain);
+        assert!(sig.verify(&pk, &signing_root).is_ok());
+    }
+
+    // ---- TypedSigner::sign_voluntary_exit ----
+
+    #[tokio::test]
+    async fn test_typed_signer_sign_voluntary_exit_verifies() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        // Capella fork version (EIP-7044 cap)
+        let fork_info = ForkInfo {
+            previous_version: [0x02, 0x00, 0x00, 0x00],
+            current_version: [0x03, 0x00, 0x00, 0x00], // Capella
+            genesis_validators_root: [0xaa; 32],
+        };
+        let ctx = SignContext { pubkey: sk.public_key(), fork_info };
+        let exit = VoluntaryExit { epoch: 200, validator_index: 99 };
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_voluntary_exit(&signer, &exit, &ctx).await.unwrap();
+
+        let capella_version = [0x03, 0x00, 0x00, 0x00];
+        let genesis_root = [0xaa; 32];
+        let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, capella_version, genesis_root);
+        let signing_root = compute_signing_root(&exit, domain);
+        assert!(sig.verify(&pk, &signing_root).is_ok());
+    }
+
+    // ---- capella_capped_fork_version ----
+
+    #[test]
+    fn test_capella_capped_fork_version_pre_capella_returns_original() {
+        let schedule = ForkSchedule {
+            genesis_fork_version: [0, 0, 0, 0],
+            altair_fork_epoch: 10,
+            altair_fork_version: [1, 0, 0, 0],
+            bellatrix_fork_epoch: 20,
+            bellatrix_fork_version: [2, 0, 0, 0],
+            capella_fork_epoch: 30,
+            capella_fork_version: [3, 0, 0, 0],
+            deneb_fork_epoch: 40,
+            deneb_fork_version: [4, 0, 0, 0],
+            electra_fork_epoch: 50,
+            electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: 60,
+            fulu_fork_version: [6, 0, 0, 0],
+        };
+        // Altair epoch — no cap, returns Altair version
+        assert_eq!(capella_capped_fork_version(15, &schedule), [1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_capella_capped_fork_version_post_capella_returns_capella() {
+        let schedule = ForkSchedule {
+            genesis_fork_version: [0, 0, 0, 0],
+            altair_fork_epoch: 10,
+            altair_fork_version: [1, 0, 0, 0],
+            bellatrix_fork_epoch: 20,
+            bellatrix_fork_version: [2, 0, 0, 0],
+            capella_fork_epoch: 30,
+            capella_fork_version: [3, 0, 0, 0],
+            deneb_fork_epoch: 40,
+            deneb_fork_version: [4, 0, 0, 0],
+            electra_fork_epoch: 50,
+            electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: 60,
+            fulu_fork_version: [6, 0, 0, 0],
+        };
+        // Electra epoch — cap at Capella
+        assert_eq!(capella_capped_fork_version(55, &schedule), [3, 0, 0, 0]);
+    }
+}

@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use crypto::logging::TruncatedPubkey;
 use crypto::{KeyManager, Keystore, SecretKey};
-use tracing::{info_span, warn, Instrument};
+use tracing::{info, info_span, warn, Instrument};
 
 use crate::metrics::{
     classify_error, RVC_SECRET_PROVIDER_ERRORS_TOTAL, RVC_SECRET_PROVIDER_KEYS_LOADED,
@@ -104,15 +105,22 @@ impl KeySourceManager {
                 match result {
                     Ok(material) => match convert_key_material(&entry_id, material) {
                         Ok(secret_key) => {
+                            let pubkey_hex =
+                                format!("0x{}", hex::encode(secret_key.public_key().to_bytes()));
+                            info!(
+                                pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                                source = %provider_name,
+                                "New key discovered"
+                            );
                             key_manager.insert(secret_key);
                             provider_summary.loaded += 1;
                         }
                         Err(e) => {
                             warn!(
-                                provider = %provider_name,
                                 key_id = %entry_id,
+                                source = %provider_name,
                                 error = %e,
-                                "Failed to convert key material, skipping"
+                                "Key fetch failure"
                             );
                             RVC_SECRET_PROVIDER_ERRORS_TOTAL
                                 .with_label_values(&[provider_name.as_str(), classify_error(&e)])
@@ -252,7 +260,7 @@ pub mod mock {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     use crypto::SecretKey;
     use tracing_subscriber::layer::SubscriberExt;
@@ -273,7 +281,7 @@ mod tests {
             _id: &tracing::span::Id,
             _ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            self.spans.lock().unwrap().push(attrs.metadata().name().to_string());
+            self.spans.lock().push(attrs.metadata().name().to_string());
         }
     }
 
@@ -311,27 +319,15 @@ mod tests {
 
     impl tracing::field::Visit for FieldVisitor {
         fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-            self.0.lock().unwrap().push((
-                self.1.clone(),
-                field.name().to_string(),
-                format!("{:?}", value),
-            ));
+            self.0.lock().push((self.1.clone(), field.name().to_string(), format!("{:?}", value)));
         }
 
         fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-            self.0.lock().unwrap().push((
-                self.1.clone(),
-                field.name().to_string(),
-                value.to_string(),
-            ));
+            self.0.lock().push((self.1.clone(), field.name().to_string(), value.to_string()));
         }
 
         fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-            self.0.lock().unwrap().push((
-                self.1.clone(),
-                field.name().to_string(),
-                value.to_string(),
-            ));
+            self.0.lock().push((self.1.clone(), field.name().to_string(), value.to_string()));
         }
     }
 
@@ -476,7 +472,7 @@ mod tests {
 
         ksm.load_all(&mut km).await.unwrap();
 
-        let captured = spans.lock().unwrap();
+        let captured = spans.lock();
         assert!(
             captured.contains(&"rvc.secret_provider.load_all".to_string()),
             "Expected rvc.secret_provider.load_all span, got: {:?}",
@@ -504,7 +500,7 @@ mod tests {
 
         ksm.load_all(&mut km).await.unwrap();
 
-        let captured = spans.lock().unwrap();
+        let captured = spans.lock();
         assert!(
             captured.contains(&"rvc.secret_provider.list_keys".to_string()),
             "Expected rvc.secret_provider.list_keys span, got: {:?}",
@@ -532,7 +528,7 @@ mod tests {
 
         ksm.load_all(&mut km).await.unwrap();
 
-        let captured = spans.lock().unwrap();
+        let captured = spans.lock();
         assert!(
             captured.contains(&"rvc.secret_provider.fetch_key".to_string()),
             "Expected rvc.secret_provider.fetch_key span, got: {:?}",
@@ -566,7 +562,7 @@ mod tests {
 
         ksm.load_all(&mut km).await.unwrap();
 
-        let captured = fields.lock().unwrap();
+        let captured = fields.lock();
         assert!(
             captured.iter().any(|(span, field, value)| span == "rvc.secret_provider.load_all"
                 && field == "providers.count"
@@ -599,7 +595,7 @@ mod tests {
 
         ksm.load_all(&mut km).await.unwrap();
 
-        let captured = fields.lock().unwrap();
+        let captured = fields.lock();
         assert!(
             captured.iter().any(|(span, field, value)| span == "rvc.secret_provider.list_keys"
                 && field == "keys.count"
@@ -629,7 +625,7 @@ mod tests {
 
         ksm.load_all(&mut km).await.unwrap();
 
-        let captured = fields.lock().unwrap();
+        let captured = fields.lock();
         assert!(
             captured.iter().any(|(span, field, value)| span == "rvc.secret_provider.fetch_key"
                 && field == "key.id"
@@ -659,7 +655,7 @@ mod tests {
 
         ksm.load_all(&mut km).await.unwrap();
 
-        let captured = fields.lock().unwrap();
+        let captured = fields.lock();
         assert!(
             captured.iter().any(|(span, field, value)| span == "rvc.secret_provider.list_keys"
                 && field == "provider.name"

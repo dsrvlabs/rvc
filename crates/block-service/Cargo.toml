@@ -9,9 +9,11 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 beacon.workspace = true
+builder.workspace = true
 crypto.workspace = true
 eth-types.workspace = true
 hex.workspace = true
+serde = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 signer.workspace = true
 thiserror.workspace = true
@@ -23,3 +25,4 @@ validator-store.workspace = true
 [dev-dependencies]
 crypto = { workspace = true, features = ["test-utils"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
+toml.workspace = true

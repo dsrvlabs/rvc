@@ -11,6 +11,7 @@ use super::bls::{PublicKey, SecretKey, PUBLIC_KEY_BYTES_LEN};
 use super::decryption_tracker::DecryptionAttemptTracker;
 use super::error::KeyManagerError;
 use super::keystore::Keystore;
+use super::logging::TruncatedPubkey;
 
 /// A prepared decryption work item. Produced by Phase 1, consumed by Phase 2.
 struct DecryptionTask<'a> {
@@ -278,13 +279,17 @@ impl KeyManager {
         for outcome in results {
             match outcome {
                 DecryptionOutcome::Success { pubkey_bytes, secret_key, pubkey_hex, file_path } => {
-                    debug!(pubkey = %pubkey_hex, file = ?file_path, "Loaded validator key");
+                    debug!(
+                        pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                        file = ?file_path,
+                        "Loaded validator key"
+                    );
                     keys.insert(pubkey_bytes, secret_key);
                     success_count += 1;
                 }
                 DecryptionOutcome::Failure { pubkey_hex, file_path, error } => {
                     warn!(
-                        pubkey = %pubkey_hex,
+                        pubkey = %TruncatedPubkey::new(&pubkey_hex),
                         file = ?file_path,
                         error = %error,
                         "Failed to decrypt keystore"
@@ -298,6 +303,7 @@ impl KeyManager {
             total = success_count + fail_count,
             loaded = success_count,
             failed = fail_count,
+            key_count = success_count,
             elapsed_ms = elapsed.as_millis(),
             threads = num_threads,
             "Finished loading validator keys"
@@ -443,8 +449,9 @@ impl KeyManager {
     /// and a warning is logged.
     pub fn insert(&mut self, secret_key: SecretKey) {
         let pubkey = secret_key.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
         if self.keys.contains_key(&pubkey.to_bytes()) {
-            warn!(pubkey = %hex::encode(pubkey.to_bytes()), "Inserting key with duplicate public key, overwriting");
+            warn!(pubkey = %TruncatedPubkey::new(&pubkey_hex), "Inserting key with duplicate public key, overwriting");
         }
         self.keys.insert(pubkey.to_bytes(), secret_key);
     }
@@ -1007,7 +1014,7 @@ mod tests {
             &sk,
             password.as_bytes(),
             "m/12381/3600/0/0/0",
-            EncryptionKdf::Pbkdf2,
+            EncryptionKdf::scrypt_cheap_for_tests(),
         )
         .expect("should encrypt");
         let pubkey_hex = keystore.pubkey.clone().unwrap();

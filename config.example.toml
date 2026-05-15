@@ -43,7 +43,7 @@ slashing_db_path = "./slashing_protection.sqlite"
 # Network
 # ---------------------------------------------------------------------------
 
-# Network preset: mainnet, sepolia, holesky, goerli, custom
+# Network preset: mainnet, hoodi, holesky, sepolia, custom
 # Each preset provides genesis_time and genesis_validators_root automatically.
 network = "hoodi"
 

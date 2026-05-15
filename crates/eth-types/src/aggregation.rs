@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tree_hash::{Hash256, MerkleHasher, TreeHash, TreeHashType};
 
-use crate::tree_hash_utils::{bitlist_tree_hash_root, vec_u8_tree_hash_root};
+use crate::tree_hash_utils::{bitlist_tree_hash_root, vec_u8_tree_hash_root, TreeHashError};
 use crate::{AttestationData, Signature};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -11,6 +11,18 @@ pub struct Attestation {
     pub data: AttestationData,
     #[serde(with = "crate::serde_signature")]
     pub signature: Signature,
+}
+
+impl Attestation {
+    pub fn try_tree_hash_root(&self) -> Result<Hash256, TreeHashError> {
+        let mut hasher = MerkleHasher::with_leaves(3);
+        hasher
+            .write(bitlist_tree_hash_root(&self.aggregation_bits)?.as_slice())
+            .expect("valid leaf");
+        hasher.write(self.data.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
+        Ok(hasher.finish().expect("valid root"))
+    }
 }
 
 impl TreeHash for Attestation {
@@ -27,13 +39,7 @@ impl TreeHash for Attestation {
     }
 
     fn tree_hash_root(&self) -> Hash256 {
-        let mut hasher = MerkleHasher::with_leaves(3);
-        hasher
-            .write(bitlist_tree_hash_root(&self.aggregation_bits).as_slice())
-            .expect("valid leaf");
-        hasher.write(self.data.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
-        hasher.finish().expect("valid root")
+        self.try_tree_hash_root().expect("valid aggregation bits")
     }
 }
 
@@ -44,6 +50,16 @@ pub struct AggregateAndProof {
     pub aggregate: Attestation,
     #[serde(with = "crate::serde_signature")]
     pub selection_proof: Signature,
+}
+
+impl AggregateAndProof {
+    pub fn try_tree_hash_root(&self) -> Result<Hash256, TreeHashError> {
+        let mut hasher = MerkleHasher::with_leaves(3);
+        hasher.write(self.aggregator_index.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(self.aggregate.try_tree_hash_root()?.as_slice()).expect("valid leaf");
+        hasher.write(vec_u8_tree_hash_root(&self.selection_proof).as_slice()).expect("valid leaf");
+        Ok(hasher.finish().expect("valid root"))
+    }
 }
 
 impl TreeHash for AggregateAndProof {
@@ -60,11 +76,7 @@ impl TreeHash for AggregateAndProof {
     }
 
     fn tree_hash_root(&self) -> Hash256 {
-        let mut hasher = MerkleHasher::with_leaves(3);
-        hasher.write(self.aggregator_index.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.aggregate.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.selection_proof).as_slice()).expect("valid leaf");
-        hasher.finish().expect("valid root")
+        self.try_tree_hash_root().expect("valid aggregation bits")
     }
 }
 
@@ -86,6 +98,20 @@ pub struct ElectraAttestation {
     pub committee_bits: Vec<u8>,
 }
 
+impl ElectraAttestation {
+    pub fn try_tree_hash_root(&self) -> Result<Hash256, TreeHashError> {
+        let mut hasher = MerkleHasher::with_leaves(4);
+        hasher
+            .write(bitlist_tree_hash_root(&self.aggregation_bits)?.as_slice())
+            .expect("valid leaf");
+        hasher.write(self.data.tree_hash_root().as_slice()).expect("valid leaf");
+        // EIP-7549 spec order: field 2 = committee_bits, field 3 = signature
+        hasher.write(vec_u8_tree_hash_root(&self.committee_bits).as_slice()).expect("valid leaf");
+        hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
+        Ok(hasher.finish().expect("valid root"))
+    }
+}
+
 impl TreeHash for ElectraAttestation {
     fn tree_hash_type() -> TreeHashType {
         TreeHashType::Container
@@ -100,15 +126,7 @@ impl TreeHash for ElectraAttestation {
     }
 
     fn tree_hash_root(&self) -> Hash256 {
-        let mut hasher = MerkleHasher::with_leaves(4);
-        hasher
-            .write(bitlist_tree_hash_root(&self.aggregation_bits).as_slice())
-            .expect("valid leaf");
-        hasher.write(self.data.tree_hash_root().as_slice()).expect("valid leaf");
-        // EIP-7549 spec order: field 2 = committee_bits, field 3 = signature
-        hasher.write(vec_u8_tree_hash_root(&self.committee_bits).as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
-        hasher.finish().expect("valid root")
+        self.try_tree_hash_root().expect("valid aggregation bits")
     }
 }
 
@@ -119,6 +137,16 @@ pub struct ElectraAggregateAndProof {
     pub aggregate: ElectraAttestation,
     #[serde(with = "crate::serde_signature")]
     pub selection_proof: Signature,
+}
+
+impl ElectraAggregateAndProof {
+    pub fn try_tree_hash_root(&self) -> Result<Hash256, TreeHashError> {
+        let mut hasher = MerkleHasher::with_leaves(3);
+        hasher.write(self.aggregator_index.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(self.aggregate.try_tree_hash_root()?.as_slice()).expect("valid leaf");
+        hasher.write(vec_u8_tree_hash_root(&self.selection_proof).as_slice()).expect("valid leaf");
+        Ok(hasher.finish().expect("valid root"))
+    }
 }
 
 impl TreeHash for ElectraAggregateAndProof {
@@ -135,11 +163,7 @@ impl TreeHash for ElectraAggregateAndProof {
     }
 
     fn tree_hash_root(&self) -> Hash256 {
-        let mut hasher = MerkleHasher::with_leaves(3);
-        hasher.write(self.aggregator_index.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.aggregate.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.selection_proof).as_slice()).expect("valid leaf");
-        hasher.finish().expect("valid root")
+        self.try_tree_hash_root().expect("valid aggregation bits")
     }
 }
 
@@ -263,12 +287,27 @@ mod tests {
         assert_ne!(proof1.tree_hash_root(), proof2.tree_hash_root());
     }
 
+    #[test]
+    fn test_attestation_try_tree_hash_root_invalid_bits() {
+        let mut att = sample_attestation();
+        att.aggregation_bits = vec![0x00];
+        assert!(att.try_tree_hash_root().is_err());
+    }
+
+    #[test]
+    fn test_aggregate_and_proof_try_tree_hash_root_invalid_bits() {
+        let mut proof = sample_aggregate_and_proof();
+        proof.aggregate.aggregation_bits = vec![0x00];
+        assert!(proof.try_tree_hash_root().is_err());
+    }
+
     fn sample_electra_attestation() -> ElectraAttestation {
         ElectraAttestation {
             aggregation_bits: vec![0xff; 4],
             data: AttestationData {
                 slot: 100,
-                index: 1,
+                // EIP-7549: index must be 0 for Electra attestations
+                index: 0,
                 beacon_block_root: [1u8; 32],
                 source: Checkpoint { epoch: 3, root: [2u8; 32] },
                 target: Checkpoint { epoch: 4, root: [3u8; 32] },
@@ -397,10 +436,10 @@ mod tests {
     fn test_electra_attestation_tree_hash_spec_field_order() {
         let att = sample_electra_attestation();
 
-        // Manually compute expected root using EIP-7549 spec field order:
-        // aggregation_bits (0), data (1), committee_bits (2), signature (3)
         let mut hasher = MerkleHasher::with_leaves(4);
-        hasher.write(bitlist_tree_hash_root(&att.aggregation_bits).as_slice()).expect("leaf");
+        hasher
+            .write(bitlist_tree_hash_root(&att.aggregation_bits).unwrap().as_slice())
+            .expect("leaf");
         hasher.write(att.data.tree_hash_root().as_slice()).expect("leaf");
         hasher.write(vec_u8_tree_hash_root(&att.committee_bits).as_slice()).expect("leaf");
         hasher.write(vec_u8_tree_hash_root(&att.signature).as_slice()).expect("leaf");
@@ -413,9 +452,10 @@ mod tests {
     fn test_electra_attestation_wrong_field_order_differs() {
         let att = sample_electra_attestation();
 
-        // Compute root with WRONG order (signature before committee_bits)
         let mut hasher = MerkleHasher::with_leaves(4);
-        hasher.write(bitlist_tree_hash_root(&att.aggregation_bits).as_slice()).expect("leaf");
+        hasher
+            .write(bitlist_tree_hash_root(&att.aggregation_bits).unwrap().as_slice())
+            .expect("leaf");
         hasher.write(att.data.tree_hash_root().as_slice()).expect("leaf");
         hasher.write(vec_u8_tree_hash_root(&att.signature).as_slice()).expect("leaf");
         hasher.write(vec_u8_tree_hash_root(&att.committee_bits).as_slice()).expect("leaf");
@@ -426,5 +466,122 @@ mod tests {
             wrong_root,
             "tree_hash_root must differ from wrong field order"
         );
+    }
+
+    #[test]
+    fn test_electra_attestation_try_tree_hash_root_invalid_bits() {
+        let mut att = sample_electra_attestation();
+        att.aggregation_bits = vec![0x00];
+        assert!(att.try_tree_hash_root().is_err());
+    }
+
+    mod fuzz {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_attestation_data() -> impl Strategy<Value = AttestationData> {
+            (
+                any::<u64>(),
+                any::<u64>(),
+                any::<[u8; 32]>(),
+                any::<u64>(),
+                any::<[u8; 32]>(),
+                any::<u64>(),
+                any::<[u8; 32]>(),
+            )
+                .prop_map(
+                    |(slot, index, bbr, src_epoch, src_root, tgt_epoch, tgt_root)| {
+                        AttestationData {
+                            slot,
+                            index,
+                            beacon_block_root: bbr,
+                            source: Checkpoint { epoch: src_epoch, root: src_root },
+                            target: Checkpoint { epoch: tgt_epoch, root: tgt_root },
+                        }
+                    },
+                )
+        }
+
+        fn arb_attestation() -> impl Strategy<Value = Attestation> {
+            (
+                proptest::collection::vec(any::<u8>(), 0..128),
+                arb_attestation_data(),
+                proptest::collection::vec(any::<u8>(), 96..=96),
+            )
+                .prop_map(|(bits, data, sig)| Attestation {
+                    aggregation_bits: bits,
+                    data,
+                    signature: sig,
+                })
+        }
+
+        fn arb_electra_attestation() -> impl Strategy<Value = ElectraAttestation> {
+            (
+                proptest::collection::vec(any::<u8>(), 0..128),
+                arb_attestation_data(),
+                proptest::collection::vec(any::<u8>(), 96..=96),
+                proptest::collection::vec(any::<u8>(), 0..64),
+            )
+                .prop_map(|(bits, data, sig, committee)| ElectraAttestation {
+                    aggregation_bits: bits,
+                    data,
+                    signature: sig,
+                    committee_bits: committee,
+                })
+        }
+
+        proptest! {
+            #[test]
+            fn fuzz_attestation_try_tree_hash_root_no_panic(att in arb_attestation()) {
+                let _ = att.try_tree_hash_root();
+            }
+
+            #[test]
+            fn fuzz_electra_attestation_try_tree_hash_root_no_panic(att in arb_electra_attestation()) {
+                let _ = att.try_tree_hash_root();
+            }
+
+            #[test]
+            fn fuzz_attestation_serde_roundtrip(att in arb_attestation()) {
+                let json = serde_json::to_string(&att).unwrap();
+                let deserialized: Attestation = serde_json::from_str(&json).unwrap();
+                prop_assert_eq!(att, deserialized);
+            }
+
+            #[test]
+            fn fuzz_aggregate_and_proof_try_tree_hash_root_no_panic(
+                att in arb_attestation(),
+                idx in any::<u64>(),
+                proof in proptest::collection::vec(any::<u8>(), 96..=96),
+            ) {
+                let agg = AggregateAndProof {
+                    aggregator_index: idx,
+                    aggregate: att,
+                    selection_proof: proof,
+                };
+                let _ = agg.try_tree_hash_root();
+            }
+
+            #[test]
+            fn fuzz_electra_aggregate_and_proof_try_tree_hash_root_no_panic(
+                att in arb_electra_attestation(),
+                idx in any::<u64>(),
+                proof in proptest::collection::vec(any::<u8>(), 96..=96),
+            ) {
+                let agg = ElectraAggregateAndProof {
+                    aggregator_index: idx,
+                    aggregate: att,
+                    selection_proof: proof,
+                };
+                let _ = agg.try_tree_hash_root();
+            }
+        }
+    }
+
+    #[test]
+    fn test_electra_aggregate_and_proof_try_tree_hash_root_invalid_bits() {
+        let mut proof = sample_electra_aggregate_and_proof();
+        proof.aggregate.aggregation_bits = vec![0x00];
+        assert!(proof.try_tree_hash_root().is_err());
     }
 }

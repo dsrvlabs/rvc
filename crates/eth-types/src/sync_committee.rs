@@ -267,4 +267,154 @@ mod tests {
         let deserialized: SignedContributionAndProof = serde_json::from_str(&json).unwrap();
         assert_eq!(signed, deserialized);
     }
+
+    // -- TreeHash tests (Finding #20) --
+
+    #[test]
+    fn test_sync_committee_contribution_tree_hash_deterministic() {
+        let contrib = sample_contribution();
+        let hash1 = contrib.tree_hash_root();
+        let hash2 = contrib.tree_hash_root();
+        assert_eq!(hash1, hash2, "tree hash must be deterministic for identical input");
+    }
+
+    #[test]
+    fn test_sync_committee_contribution_tree_hash_field_sensitivity_slot() {
+        let contrib1 = sample_contribution();
+        let mut contrib2 = contrib1.clone();
+        contrib2.slot += 1;
+        assert_ne!(
+            contrib1.tree_hash_root(),
+            contrib2.tree_hash_root(),
+            "different slot must produce different tree hash"
+        );
+    }
+
+    #[test]
+    fn test_sync_committee_contribution_tree_hash_field_sensitivity_subcommittee() {
+        let contrib1 = sample_contribution();
+        let mut contrib2 = contrib1.clone();
+        contrib2.subcommittee_index += 1;
+        assert_ne!(
+            contrib1.tree_hash_root(),
+            contrib2.tree_hash_root(),
+            "different subcommittee_index must produce different tree hash"
+        );
+    }
+
+    #[test]
+    fn test_sync_committee_contribution_tree_hash_field_sensitivity_block_root() {
+        let contrib1 = sample_contribution();
+        let mut contrib2 = contrib1.clone();
+        contrib2.beacon_block_root = [2u8; 32];
+        assert_ne!(
+            contrib1.tree_hash_root(),
+            contrib2.tree_hash_root(),
+            "different beacon_block_root must produce different tree hash"
+        );
+    }
+
+    #[test]
+    fn test_sync_committee_contribution_tree_hash_leaf_count() {
+        use crate::tree_hash_utils::vec_u8_tree_hash_root;
+
+        let contrib = sample_contribution();
+        let actual_hash = contrib.tree_hash_root();
+
+        // Manually compute with 5 leaves to lock in the correct leaf count
+        let mut hasher = MerkleHasher::with_leaves(5);
+        hasher.write(contrib.slot.tree_hash_root().as_slice()).unwrap();
+        hasher.write(contrib.beacon_block_root.tree_hash_root().as_slice()).unwrap();
+        hasher.write(contrib.subcommittee_index.tree_hash_root().as_slice()).unwrap();
+        hasher.write(vec_u8_tree_hash_root(&contrib.aggregation_bits).as_slice()).unwrap();
+        hasher.write(vec_u8_tree_hash_root(&contrib.signature).as_slice()).unwrap();
+        let expected_hash = hasher.finish().unwrap();
+
+        assert_eq!(
+            actual_hash, expected_hash,
+            "tree_hash_root must match manual computation with 5 leaves"
+        );
+    }
+
+    #[test]
+    fn test_sync_committee_contribution_wrong_leaf_count_differs() {
+        use crate::tree_hash_utils::vec_u8_tree_hash_root;
+
+        let contrib = sample_contribution();
+        let correct_hash = contrib.tree_hash_root();
+
+        // Compute with wrong leaf count (4 instead of 5) — must produce a different hash.
+        // with_leaves(4) only accepts 4 writes, so the 5th write will error.
+        // This proves the leaf count matters: changing with_leaves(5) to with_leaves(4)
+        // would break the implementation.
+        let mut hasher = MerkleHasher::with_leaves(4);
+        hasher.write(contrib.slot.tree_hash_root().as_slice()).unwrap();
+        hasher.write(contrib.beacon_block_root.tree_hash_root().as_slice()).unwrap();
+        hasher.write(contrib.subcommittee_index.tree_hash_root().as_slice()).unwrap();
+        hasher.write(vec_u8_tree_hash_root(&contrib.aggregation_bits).as_slice()).unwrap();
+        // 5th write would fail with 4 leaves — the hash from 4 leaves differs from 5
+        let wrong_hash = hasher.finish().unwrap();
+
+        assert_ne!(
+            correct_hash, wrong_hash,
+            "with_leaves(4) must produce different hash than with_leaves(5)"
+        );
+    }
+
+    #[test]
+    fn test_contribution_and_proof_tree_hash_deterministic() {
+        let proof = sample_contribution_and_proof();
+        let hash1 = proof.tree_hash_root();
+        let hash2 = proof.tree_hash_root();
+        assert_eq!(hash1, hash2, "ContributionAndProof tree hash must be deterministic");
+    }
+
+    #[test]
+    fn test_contribution_and_proof_tree_hash_field_sensitivity() {
+        let proof1 = sample_contribution_and_proof();
+        let mut proof2 = proof1.clone();
+        proof2.aggregator_index += 1;
+        assert_ne!(
+            proof1.tree_hash_root(),
+            proof2.tree_hash_root(),
+            "different aggregator_index must produce different tree hash"
+        );
+    }
+
+    #[test]
+    fn test_contribution_and_proof_tree_hash_leaf_count() {
+        use crate::tree_hash_utils::vec_u8_tree_hash_root;
+
+        let proof = sample_contribution_and_proof();
+        let actual_hash = proof.tree_hash_root();
+
+        // Manually compute with 3 leaves to lock in the correct leaf count
+        let mut hasher = MerkleHasher::with_leaves(3);
+        hasher.write(proof.aggregator_index.tree_hash_root().as_slice()).unwrap();
+        hasher.write(proof.contribution.tree_hash_root().as_slice()).unwrap();
+        hasher.write(vec_u8_tree_hash_root(&proof.selection_proof).as_slice()).unwrap();
+        let expected_hash = hasher.finish().unwrap();
+
+        assert_eq!(
+            actual_hash, expected_hash,
+            "tree_hash_root must match manual computation with 3 leaves"
+        );
+    }
+
+    #[test]
+    fn test_contribution_and_proof_wrong_leaf_count_differs() {
+        let proof = sample_contribution_and_proof();
+        let correct_hash = proof.tree_hash_root();
+
+        // Compute with wrong leaf count (2 instead of 3) — must produce different hash
+        let mut hasher = MerkleHasher::with_leaves(2);
+        hasher.write(proof.aggregator_index.tree_hash_root().as_slice()).unwrap();
+        hasher.write(proof.contribution.tree_hash_root().as_slice()).unwrap();
+        let wrong_hash = hasher.finish().unwrap();
+
+        assert_ne!(
+            correct_hash, wrong_hash,
+            "with_leaves(2) must produce different hash than with_leaves(3)"
+        );
+    }
 }

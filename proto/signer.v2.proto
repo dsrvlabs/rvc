@@ -1,0 +1,166 @@
+syntax = "proto3";
+package signer.v2;
+
+// Common fork inputs (Ethereum signing-domain context). Used by every
+// slashable RPC; required for spec-correct domain computation.
+message ForkInfo {
+  bytes  previous_version        = 1; //  4 bytes
+  bytes  current_version         = 2; //  4 bytes
+  uint64 epoch                   = 3; // fork epoch
+  bytes  genesis_validators_root = 4; // 32 bytes
+}
+
+// === SignerService v2 (typed sign RPCs) ===
+service SignerService {
+  rpc SignBeaconBlock                  (SignBeaconBlockRequest)                  returns (SignResponse);
+  rpc SignBlindedBeaconBlock           (SignBlindedBeaconBlockRequest)           returns (SignResponse);
+  rpc SignAttestationData              (SignAttestationDataRequest)              returns (SignResponse);
+  rpc SignAggregateAndProof            (SignAggregateAndProofRequest)            returns (SignResponse);
+  rpc SignSyncCommitteeMessage         (SignSyncCommitteeMessageRequest)         returns (SignResponse);
+  rpc SignSyncAggregatorSelectionData  (SignSyncAggregatorSelectionDataRequest)  returns (SignResponse);
+  rpc SignContributionAndProof         (SignContributionAndProofRequest)         returns (SignResponse);
+  rpc SignBuilderRegistration          (SignBuilderRegistrationRequest)          returns (SignResponse);
+  rpc SignRandaoReveal                 (SignRandaoRevealRequest)                 returns (SignResponse);
+  rpc SignVoluntaryExit                (SignVoluntaryExitRequest)                returns (SignResponse);
+
+  rpc ListPublicKeys (ListPublicKeysRequest) returns (ListPublicKeysResponse);
+  rpc GetStatus      (GetStatusRequest)      returns (GetStatusResponse);
+}
+
+message SignResponse { bytes signature = 1; }   // 96 bytes BLS
+
+// --- BLOCK (slashable) ---
+// fork_id constants: PHASE0=0, ALTAIR=1, BELLATRIX=2, CAPELLA=3, DENEB=4, ELECTRA=5, FULU=6
+message SignBeaconBlockRequest {
+  bytes    pubkey    = 1;   // 48 bytes
+  ForkInfo fork_info = 2;
+  bytes    block_ssz = 3;   // SSZ-encoded BeaconBlock
+  uint32   fork_id   = 4;   // PHASE0 .. FULU enum (see constants above)
+}
+message SignBlindedBeaconBlockRequest {
+  bytes    pubkey    = 1;
+  ForkInfo fork_info = 2;
+  bytes    block_ssz = 3;   // SSZ-encoded BlindedBeaconBlock
+  uint32   fork_id   = 4;   // PHASE0 .. FULU enum (see constants above)
+}
+
+// --- ATTESTATION (slashable) ---
+message Checkpoint { uint64 epoch = 1; bytes root = 2; }
+message AttestationData {
+  uint64     slot              = 1;
+  uint64     index             = 2;  // EIP-7549 (Electra+): client must zero
+  bytes      beacon_block_root = 3;
+  Checkpoint source            = 4;
+  Checkpoint target            = 5;
+}
+message SignAttestationDataRequest {
+  bytes           pubkey    = 1;
+  ForkInfo        fork_info = 2;
+  AttestationData data      = 3;
+  uint32          fork_id   = 4;   // PHASE0 .. FULU enum
+}
+message SignAggregateAndProofRequest {
+  bytes    pubkey           = 1;
+  ForkInfo fork_info        = 2;
+  uint64   aggregator_index = 3;
+  bytes    aggregate_ssz    = 4;   // SSZ-encoded Attestation
+  bytes    selection_proof  = 5;   // 96 bytes BLS
+  uint32   fork_id          = 6;   // PHASE0 .. FULU enum
+}
+
+// --- SYNC ---
+message SignSyncCommitteeMessageRequest {
+  bytes    pubkey            = 1;
+  ForkInfo fork_info         = 2;
+  uint64   slot              = 3;
+  bytes    beacon_block_root = 4;
+  uint32   fork_id           = 5;   // PHASE0 .. FULU enum
+}
+message SignSyncAggregatorSelectionDataRequest {
+  bytes    pubkey             = 1;
+  ForkInfo fork_info          = 2;
+  uint64   slot               = 3;
+  uint64   subcommittee_index = 4;
+  uint32   fork_id            = 5;   // PHASE0 .. FULU enum
+}
+message SignContributionAndProofRequest {
+  bytes    pubkey            = 1;
+  ForkInfo fork_info         = 2;
+  uint64   aggregator_index  = 3;
+  bytes    contribution_ssz  = 4;   // SSZ-encoded SyncCommitteeContribution
+  bytes    selection_proof   = 5;   // 96 bytes BLS
+  uint32   fork_id           = 6;   // PHASE0 .. FULU enum
+}
+
+// --- BUILDER (no fork_info: spec-fixed GENESIS_FORK_VERSION + zero gvr) ---
+message SignBuilderRegistrationRequest {
+  bytes  pubkey         = 1;
+  bytes  fee_recipient  = 2;   // 20 bytes
+  uint64 gas_limit      = 3;
+  uint64 timestamp      = 4;
+  // pubkey duplicated in registration body; signer asserts equality
+}
+
+// --- RANDAO ---
+message SignRandaoRevealRequest {
+  bytes    pubkey    = 1;
+  ForkInfo fork_info = 2;
+  uint64   epoch     = 3;
+  uint32   fork_id   = 4;   // PHASE0 .. FULU enum
+}
+
+// --- VOLUNTARY EXIT ---
+message SignVoluntaryExitRequest {
+  bytes    pubkey          = 1;
+  ForkInfo fork_info       = 2;
+  uint64   epoch           = 3;
+  uint64   validator_index = 4;
+  uint32   fork_id         = 5;   // PHASE0 .. FULU enum
+}
+
+// === ListPublicKeys RPC ===
+message ListPublicKeysRequest {}
+message ListPublicKeysResponse {
+  repeated bytes pubkeys = 1;   // each 48 bytes BLS public key
+}
+
+// === GetStatus RPC ===
+message GetStatusRequest {}
+message GetStatusResponse {
+  bool   ready     = 1;
+  string backend   = 2;
+  uint32 key_count = 3;
+}
+
+// === PeerSignerService v2 (DVT) ===
+service PeerSignerService {
+  rpc PartialSignBeaconBlock      (PartialSignBeaconBlockRequest)      returns (PartialSignResponse);
+  rpc PartialSignAttestationData  (PartialSignAttestationDataRequest)  returns (PartialSignResponse);
+  rpc PartialSignSyncCommittee    (PartialSignSyncCommitteeRequest)    returns (PartialSignResponse);
+}
+message PartialSignBeaconBlockRequest {
+  uint64   requester_index = 1;   // server enforces matches peer cert CN (allow-list)
+  bytes    pubkey          = 2;
+  ForkInfo fork_info       = 3;
+  bytes    block_ssz       = 4;
+  uint32   fork_id         = 5;   // PHASE0 .. FULU enum
+}
+message PartialSignAttestationDataRequest {
+  uint64          requester_index = 1;   // server enforces matches peer cert CN (allow-list)
+  bytes           pubkey          = 2;
+  ForkInfo        fork_info       = 3;
+  AttestationData data            = 4;
+  uint32          fork_id         = 5;   // PHASE0 .. FULU enum
+}
+message PartialSignSyncCommitteeRequest {
+  uint64   requester_index   = 1;   // server enforces matches peer cert CN (allow-list)
+  bytes    pubkey            = 2;
+  ForkInfo fork_info         = 3;
+  uint64   slot              = 4;
+  bytes    beacon_block_root = 5;
+  uint32   fork_id           = 6;   // PHASE0 .. FULU enum
+}
+message PartialSignResponse {
+  bytes  partial_signature = 1;   // 96 bytes BLS share
+  uint64 share_index       = 2;
+}

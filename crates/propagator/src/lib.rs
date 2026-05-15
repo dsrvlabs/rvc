@@ -9,7 +9,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use bn_manager::{BeaconError, BeaconNodeClient, SubmitAttestationResult, VersionedAttestation};
 use metrics::definitions::{attestation_status, RVC_ATTESTATIONS_TOTAL};
@@ -86,6 +86,7 @@ impl<S: AttestationSubmitter> Propagator<S> {
     }
 
     /// Propagates attestations to the beacon node.
+    #[tracing::instrument(name = "rvc.propagator.propagate", skip_all, fields(rvc.count))]
     pub async fn propagate(
         &self,
         attestations: &VersionedAttestation,
@@ -95,18 +96,28 @@ impl<S: AttestationSubmitter> Propagator<S> {
             VersionedAttestation::Electra(a) | VersionedAttestation::Fulu(a) => a.len(),
         };
 
+        tracing::Span::current().record("rvc.count", total);
+
+        let (batch_slot, batch_target_epoch, _batch_committee_index) =
+            extract_attestation_context(attestations);
+
         if total == 0 {
             debug!("No attestations to propagate");
             return Ok(PropagationResult { total: 0, success_count: 0, failure_count: 0 });
         }
 
-        debug!(count = total, "Propagating attestations to beacon node");
+        debug!(count = total, slot = %batch_slot, "Propagating attestations to beacon node");
 
         let result = self.submitter.submit_attestation(attestations).await?;
 
         match result {
             SubmitAttestationResult::Success => {
-                info!(count = total, "Successfully propagated all attestations");
+                info!(
+                    slot = %batch_slot,
+                    count = total,
+                    target_epoch = %batch_target_epoch,
+                    "Attestation submission successful"
+                );
                 RVC_ATTESTATIONS_TOTAL
                     .with_label_values(&[attestation_status::SUCCESS])
                     .inc_by(total as u64);
@@ -118,24 +129,24 @@ impl<S: AttestationSubmitter> Propagator<S> {
                 let success_count = total.saturating_sub(failure_count);
 
                 if failure_count == 0 {
-                    info!(count = total, "Successfully propagated all attestations");
+                    info!(
+                        slot = %batch_slot,
+                        count = total,
+                        target_epoch = %batch_target_epoch,
+                        "Attestation submission successful"
+                    );
                     RVC_ATTESTATIONS_TOTAL
                         .with_label_values(&[attestation_status::SUCCESS])
                         .inc_by(total as u64);
                     return Ok(PropagationResult { total, success_count: total, failure_count: 0 });
                 }
 
-                let (batch_slot, batch_target_epoch, batch_committee_index) =
-                    extract_attestation_context(attestations);
-
                 for failure in &failures {
-                    warn!(
+                    debug!(
                         index = failure.index,
                         message = %failure.message,
                         slot = %batch_slot,
-                        target_epoch = %batch_target_epoch,
-                        committee_index = %batch_committee_index,
-                        "Attestation failed validation"
+                        "Individual attestation submission failed"
                     );
                 }
 
@@ -147,8 +158,21 @@ impl<S: AttestationSubmitter> Propagator<S> {
                     .inc_by(failure_count as u64);
 
                 if success_count == 0 {
+                    error!(
+                        slot = %batch_slot,
+                        failure_count,
+                        target_epoch = %batch_target_epoch,
+                        "Attestation submission complete failure"
+                    );
                     Err(PropagatorError::AllAttestationsFailed)
                 } else {
+                    warn!(
+                        slot = %batch_slot,
+                        success_count,
+                        failure_count,
+                        target_epoch = %batch_target_epoch,
+                        "Attestation submission partial failure"
+                    );
                     Err(PropagatorError::PartialFailure { success_count, failure_count })
                 }
             }
@@ -167,6 +191,7 @@ mod tests {
         result: tokio::sync::Mutex<SubmitAttestationResult>,
         call_count: AtomicUsize,
         should_error: tokio::sync::Mutex<Option<BeaconError>>,
+        last_submitted: tokio::sync::Mutex<Option<VersionedAttestation>>,
     }
 
     impl MockSubmitter {
@@ -175,6 +200,7 @@ mod tests {
                 result: tokio::sync::Mutex::new(result),
                 call_count: AtomicUsize::new(0),
                 should_error: tokio::sync::Mutex::new(None),
+                last_submitted: tokio::sync::Mutex::new(None),
             }
         }
 
@@ -183,22 +209,28 @@ mod tests {
                 result: tokio::sync::Mutex::new(SubmitAttestationResult::Success),
                 call_count: AtomicUsize::new(0),
                 should_error: tokio::sync::Mutex::new(Some(error)),
+                last_submitted: tokio::sync::Mutex::new(None),
             }
         }
 
         fn call_count(&self) -> usize {
             self.call_count.load(Ordering::SeqCst)
         }
+
+        async fn last_submitted(&self) -> Option<VersionedAttestation> {
+            self.last_submitted.lock().await.clone()
+        }
     }
 
     impl AttestationSubmitter for MockSubmitter {
         fn submit_attestation<'a>(
             &'a self,
-            _attestations: &'a VersionedAttestation,
+            attestations: &'a VersionedAttestation,
         ) -> Pin<Box<dyn Future<Output = Result<SubmitAttestationResult, BeaconError>> + Send + 'a>>
         {
             Box::pin(async move {
                 self.call_count.fetch_add(1, Ordering::SeqCst);
+                *self.last_submitted.lock().await = Some(attestations.clone());
 
                 let maybe_error = self.should_error.lock().await;
                 if let Some(ref error) = *maybe_error {
@@ -210,6 +242,7 @@ mod tests {
                         }
                         BeaconError::ParseError(msg) => BeaconError::ParseError(msg.clone()),
                         BeaconError::InvalidUrl(msg) => BeaconError::InvalidUrl(msg.clone()),
+                        other => panic!("Unexpected error variant in test mock: {:?}", other),
                     });
                 }
 
@@ -463,18 +496,16 @@ mod tests {
         assert_eq!(submitter.call_count(), 2);
     }
 
-    #[tokio::test]
-    async fn test_propagate_electra_variant() {
-        use bn_manager::SingleAttestation;
-
-        let submitter = Arc::new(MockSubmitter::new(SubmitAttestationResult::Success));
-        let propagator = Propagator::new(submitter.clone());
-
-        let attestations = VersionedAttestation::Electra(vec![SingleAttestation {
-            committee_index: 0,
-            attester_index: 42,
+    fn create_test_single_attestation(
+        slot: &str,
+        committee_index: u64,
+        attester_index: u64,
+    ) -> bn_manager::SingleAttestation {
+        bn_manager::SingleAttestation {
+            committee_index,
+            attester_index,
             data: AttestationData {
-                slot: "1000".to_string(),
+                slot: slot.to_string(),
                 index: "0".to_string(),
                 beacon_block_root:
                     "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890".to_string(),
@@ -490,7 +521,16 @@ mod tests {
                 },
             },
             signature: "0xsignature".to_string(),
-        }]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_propagate_electra_variant() {
+        let submitter = Arc::new(MockSubmitter::new(SubmitAttestationResult::Success));
+        let propagator = Propagator::new(submitter.clone());
+
+        let attestations =
+            VersionedAttestation::Electra(vec![create_test_single_attestation("1000", 0, 42)]);
 
         let result = propagator.propagate(&attestations).await.unwrap();
 
@@ -498,5 +538,59 @@ mod tests {
         assert_eq!(result.total, 1);
         assert_eq!(result.success_count, 1);
         assert_eq!(submitter.call_count(), 1);
+
+        // Field-level assertions: verify propagated data is not corrupted
+        let submitted = submitter.last_submitted().await.expect("attestation was submitted");
+        match submitted {
+            VersionedAttestation::Electra(atts) => {
+                assert_eq!(atts.len(), 1);
+                let att = &atts[0];
+                assert_eq!(att.committee_index, 0);
+                assert_eq!(att.attester_index, 42);
+                assert_eq!(att.data.slot, "1000");
+                assert_eq!(att.data.index, "0");
+                assert_eq!(
+                    att.data.beacon_block_root,
+                    "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                );
+                assert_eq!(att.data.source.epoch, "100");
+                assert_eq!(att.data.target.epoch, "101");
+                assert_eq!(att.signature, "0xsignature");
+            }
+            other => panic!("Expected Electra variant, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_propagate_fulu_variant() {
+        let submitter = Arc::new(MockSubmitter::new(SubmitAttestationResult::Success));
+        let propagator = Propagator::new(submitter.clone());
+
+        let attestations =
+            VersionedAttestation::Fulu(vec![create_test_single_attestation("2000000", 3, 99)]);
+
+        let result = propagator.propagate(&attestations).await.unwrap();
+
+        assert!(result.is_success());
+        assert_eq!(result.total, 1);
+        assert_eq!(result.success_count, 1);
+        assert_eq!(submitter.call_count(), 1);
+
+        // Field-level assertions: verify Fulu attestation data integrity
+        let submitted = submitter.last_submitted().await.expect("attestation was submitted");
+        match submitted {
+            VersionedAttestation::Fulu(atts) => {
+                assert_eq!(atts.len(), 1);
+                let att = &atts[0];
+                assert_eq!(att.committee_index, 3);
+                assert_eq!(att.attester_index, 99);
+                assert_eq!(att.data.slot, "2000000");
+                assert_eq!(att.data.index, "0");
+                assert_eq!(att.data.source.epoch, "100");
+                assert_eq!(att.data.target.epoch, "101");
+                assert_eq!(att.signature, "0xsignature");
+            }
+            other => panic!("Expected Fulu variant, got {:?}", other),
+        }
     }
 }

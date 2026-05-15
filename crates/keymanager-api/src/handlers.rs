@@ -1,19 +1,31 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
+use crypto::logging::{RedactedUrl, TruncatedPubkey};
+use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::traits::{
     DoppelgangerMonitor, ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey,
-    RemoteKeyManager, SlashingProtection, ValidatorManager,
+    RemoteKeyManager, SlashingProtection, ValidatorConfigManager, ValidatorManager,
+    VoluntaryExitManager,
 };
 use crate::types::{
     DeleteKeystoreResult, DeleteKeystoresRequest, DeleteKeystoresResponse, DeleteRemoteKeyResult,
     DeleteRemoteKeyStatus, DeleteRemoteKeysRequest, DeleteRemoteKeysResponse, DeleteStatus,
-    ImportKeystoreResult, ImportKeystoresRequest, ImportKeystoresResponse, ImportRemoteKeyResult,
-    ImportRemoteKeyStatus, ImportRemoteKeysRequest, ImportRemoteKeysResponse, ImportStatus,
-    KeystoreInfo, ListKeystoresResponse, ListRemoteKeysResponse, RemoteKeyEntry,
+    FeeRecipientData, FeeRecipientResponse, GasLimitData, GasLimitResponse, GraffitiData,
+    GraffitiResponse, ImportKeystoreResult, ImportKeystoresRequest, ImportKeystoresResponse,
+    ImportRemoteKeyResult, ImportRemoteKeyStatus, ImportRemoteKeysRequest,
+    ImportRemoteKeysResponse, ImportStatus, KeystoreInfo, ListKeystoresResponse,
+    ListRemoteKeysResponse, RemoteKeyEntry, SetFeeRecipientRequest, SetGasLimitRequest,
+    SetGraffitiRequest, VoluntaryExitQuery, VoluntaryExitResponse,
 };
 use crate::url_validator;
 
@@ -23,7 +35,43 @@ pub struct AppState {
     pub validator_manager: Arc<dyn ValidatorManager>,
     pub doppelganger_monitor: Arc<dyn DoppelgangerMonitor>,
     pub remote_key_manager: Arc<dyn RemoteKeyManager>,
+    pub config_manager: Arc<dyn ValidatorConfigManager>,
+    pub exit_manager: Option<Arc<dyn VoluntaryExitManager>>,
     pub allow_insecure_remote_signer: bool,
+    pub attesting_enabled: Arc<AtomicBool>,
+    /// Last time `set_attesting_enabled` was accepted; used for rate limiting.
+    pub last_set_attesting_enabled: Mutex<Option<tokio::time::Instant>>,
+    /// ISSUE-4.7 / L-7: per-API-token rate limit on `import_keystores`.
+    ///
+    /// Each entry maps a 32-byte SHA-256 of the bearer token to the timestamps
+    /// of recent `import_keystores` invocations within the rolling
+    /// [`IMPORT_KEYSTORES_WINDOW_SECS`] window.  Excess attempts return
+    /// HTTP 429 with `Retry-After`, preventing thousands of bogus passwords
+    /// from CPU-grinding the host on the keystore decrypt path.
+    pub import_keystores_rate:
+        Mutex<HashMap<[u8; 32], std::collections::VecDeque<tokio::time::Instant>>>,
+    /// Duration of the per-key doppelganger window applied to newly imported
+    /// keys.  Must match the window configured in the [`DoppelgangerMonitor`]
+    /// implementation.  `Duration::ZERO` disables the gate (keys are enabled
+    /// immediately, equivalent to turning off doppelganger detection).
+    pub doppelganger_window: std::time::Duration,
+    /// Per-key cancellation handles for doppelganger background tasks (SF-3).
+    ///
+    /// When a key is deleted before its window elapses, the associated
+    /// `CancellationToken` is cancelled so the stale background task does not
+    /// prematurely flip `enabled = true` on a re-imported key that has begun
+    /// a fresh doppelganger window.
+    pub cancel_tokens: Mutex<HashMap<Pubkey, CancellationToken>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetAttestingRequest {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SetAttestingResponse {
+    pub enabled: bool,
 }
 
 pub async fn list_keystores(State(state): State<Arc<AppState>>) -> Json<ListKeystoresResponse> {
@@ -33,18 +81,26 @@ pub async fn list_keystores(State(state): State<Arc<AppState>>) -> Json<ListKeys
 
     let data: Vec<KeystoreInfo> = local_keys
         .into_iter()
-        .map(|pk| KeystoreInfo {
-            validating_pubkey: format!("0x{}", hex::encode(pk)),
-            derivation_path: None,
-            readonly: false,
+        .map(|pk| {
+            // M-12: expose whether this key has passed the doppelganger window.
+            let doppelganger_safe = state.doppelganger_monitor.is_doppelganger_safe(&pk);
+            KeystoreInfo {
+                validating_pubkey: format!("0x{}", hex::encode(pk)),
+                derivation_path: None,
+                readonly: false,
+                doppelganger_safe,
+            }
         })
         .collect();
+
+    info!(count = data.len(), "Listed local keystores");
 
     Json(ListKeystoresResponse { data })
 }
 
 pub async fn import_keystores(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(request): Json<ImportKeystoresRequest>,
 ) -> Result<Json<ImportKeystoresResponse>, ApiError> {
     let span = tracing::info_span!(
@@ -52,6 +108,13 @@ pub async fn import_keystores(
         rvc.keymanager.count = request.keystores.len(),
     );
     let _guard = span.enter();
+
+    // ISSUE-4.7 / L-7: per-API-token rate limit on the decrypt path.
+    // Refused calls return 429 with Retry-After and never reach the
+    // CPU-bound keystore decryption loop.
+    check_import_keystores_rate(&state, &headers)?;
+
+    info!(count = request.keystores.len(), "Importing keystores");
 
     if request.keystores.len() != request.passwords.len() {
         return Err(ApiError::BadRequest(
@@ -63,7 +126,7 @@ pub async fn import_keystores(
     // This prevents a window where signing keys exist without slashing records.
     if let Some(ref slashing_json) = request.slashing_protection {
         if let Err(e) = state.slashing_protection.import_interchange(slashing_json) {
-            return Err(ApiError::Internal(format!("failed to import slashing protection: {e}")));
+            return Err(sanitize_internal(e, "slashing protection import failed"));
         }
     }
 
@@ -72,14 +135,72 @@ pub async fn import_keystores(
     for (keystore_json, password) in request.keystores.iter().zip(request.passwords.iter()) {
         match state.keystore_manager.import_keystore(keystore_json, password) {
             Ok(pubkey) => {
+                let pubkey_hex = format!("0x{}", hex::encode(pubkey));
+                info!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    status = "imported",
+                    "Keystore import result"
+                );
+                // M-12: add the validator as disabled and start doppelganger
+                // monitoring. A background task flips it to attesting-enabled
+                // once the window elapses.
+                //
+                // BEHAVIOR CHANGE (GA release): imported keys are no longer
+                // immediately active. They are held in the doppelganger window
+                // (default 2 epochs ≈ 768 s on mainnet) before attestation is
+                // enabled. Operators who relied on instant activation must
+                // account for this delay.
                 state.validator_manager.add_validator(pubkey, false);
                 state.doppelganger_monitor.start_monitoring(pubkey);
+
+                // SF-3: create a cancellation token so that a delete + re-import
+                // within the window can cancel the stale task before it fires.
+                // SF-4: the task calls stop_monitoring after enabling so the
+                //       pending map is pruned and memory does not grow unboundedly.
+                let cancel_token = CancellationToken::new();
+                state.cancel_tokens.lock().unwrap().insert(pubkey, cancel_token.clone());
+
+                {
+                    let vm = Arc::clone(&state.validator_manager);
+                    let dm = Arc::clone(&state.doppelganger_monitor);
+                    let window = state.doppelganger_window;
+                    let pk_hex = pubkey_hex.clone();
+                    // Capture the deadline NOW (before spawn) so that
+                    // `sleep_until(deadline)` resolves correctly even when the
+                    // tokio mock clock is paused in tests: the deadline is a
+                    // fixed instant, not a relative duration computed at
+                    // first-poll time.
+                    let deadline = tokio::time::Instant::now() + window;
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = tokio::time::sleep_until(deadline) => {
+                                vm.set_validator_enabled(&pubkey, true);
+                                dm.stop_monitoring(&pubkey); // SF-4: prune pending entry
+                                info!(
+                                    pubkey = %TruncatedPubkey::new(&pk_hex),
+                                    "Doppelganger window elapsed; enabling validator for attestation"
+                                );
+                            }
+                            _ = cancel_token.cancelled() => {
+                                // Key was deleted (or re-imported) before the window elapsed.
+                                // Do not enable: a fresh window is already running or the
+                                // key has been removed entirely.
+                                info!(
+                                    pubkey = %TruncatedPubkey::new(&pk_hex),
+                                    "Doppelganger background task cancelled (key deleted or re-imported)"
+                                );
+                            }
+                        }
+                    });
+                }
+
                 results.push(ImportKeystoreResult {
                     status: ImportStatus::Imported,
                     message: String::new(),
                 });
             }
             Err(ImportKeystoreError::Duplicate) => {
+                info!(status = "duplicate", "Keystore import result");
                 results.push(ImportKeystoreResult {
                     status: ImportStatus::Duplicate,
                     message: "key already exists".into(),
@@ -88,7 +209,7 @@ pub async fn import_keystores(
             Err(e) => {
                 results.push(ImportKeystoreResult {
                     status: ImportStatus::Error,
-                    message: e.to_string(),
+                    message: sanitize_item_err(e, "keystore import failed"),
                 });
             }
         }
@@ -106,6 +227,8 @@ pub async fn delete_keystores(
         rvc.keymanager.count = request.pubkeys.len(),
     );
     let _guard = span.enter();
+
+    warn!(count = request.pubkeys.len(), "Deleting keystores");
 
     // Parse all pubkeys and identify which ones exist for slashing export
     let parsed: Vec<Result<Pubkey, String>> =
@@ -130,31 +253,57 @@ pub async fn delete_keystores(
 
     // Now process deletions
     let mut results = Vec::with_capacity(request.pubkeys.len());
-    for parse_result in &parsed {
+    for (i, parse_result) in parsed.iter().enumerate() {
+        let pubkey_hex = &request.pubkeys[i];
         match parse_result {
             Ok(pubkey) => match state.keystore_manager.delete_keystore(pubkey) {
                 Ok(true) => {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(pubkey_hex),
+                        status = "deleted",
+                        "Keystore delete result"
+                    );
                     state.validator_manager.remove_validator(pubkey);
                     state.doppelganger_monitor.stop_monitoring(pubkey);
+                    // SF-3: cancel any in-flight doppelganger background task so a
+                    // stale task cannot prematurely enable a re-imported key.
+                    if let Some(token) = state.cancel_tokens.lock().unwrap().remove(pubkey) {
+                        token.cancel();
+                    }
                     results.push(DeleteKeystoreResult {
                         status: DeleteStatus::Deleted,
                         message: String::new(),
                     });
                 }
                 Ok(false) => {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(pubkey_hex),
+                        status = "not_found",
+                        "Keystore delete result"
+                    );
                     results.push(DeleteKeystoreResult {
                         status: DeleteStatus::NotFound,
                         message: String::new(),
                     });
                 }
                 Err(e) => {
-                    results.push(DeleteKeystoreResult {
-                        status: DeleteStatus::Error,
-                        message: e.to_string(),
-                    });
+                    // M-8: sanitize underlying error (paths, errno, etc.) before
+                    // returning to the client. The full chain is logged inside
+                    // sanitize_item_err with a request_id correlator.
+                    let message = sanitize_item_err(&e, "keystore delete failed");
+                    results.push(DeleteKeystoreResult { status: DeleteStatus::Error, message });
                 }
             },
             Err(e) => {
+                // Pubkey-parse error — the value of `e` here is generated
+                // server-side from caller input (parse_pubkey), so it is
+                // BadRequest-class and safe to echo as-is.
+                warn!(
+                    pubkey = %TruncatedPubkey::new(pubkey_hex),
+                    status = "error",
+                    error = %e,
+                    "Keystore delete result"
+                );
                 results
                     .push(DeleteKeystoreResult { status: DeleteStatus::Error, message: e.clone() });
             }
@@ -168,7 +317,7 @@ pub async fn delete_keystores(
 
 pub async fn list_remote_keys(State(state): State<Arc<AppState>>) -> Json<ListRemoteKeysResponse> {
     let keys = state.remote_key_manager.list_remote_keys();
-    let data = keys
+    let data: Vec<RemoteKeyEntry> = keys
         .into_iter()
         .map(|(pk, url)| RemoteKeyEntry {
             pubkey: format!("0x{}", hex::encode(pk)),
@@ -176,6 +325,9 @@ pub async fn list_remote_keys(State(state): State<Arc<AppState>>) -> Json<ListRe
             readonly: false,
         })
         .collect();
+
+    info!(count = data.len(), "Listed remote keys");
+
     Json(ListRemoteKeysResponse { data })
 }
 
@@ -189,15 +341,29 @@ pub async fn import_remote_keys(
     );
     let _guard = span.enter();
 
+    info!(count = request.remote_keys.len(), "Importing remote keys");
+
     let mut results = Vec::with_capacity(request.remote_keys.len());
 
     for key_import in &request.remote_keys {
         match parse_pubkey(&key_import.pubkey) {
             Ok(pubkey) => {
-                if let Err(e) = url_validator::validate_remote_signer_url(
+                // ISSUE-4.9 / L-9: re-resolve hostnames at request time and
+                // validate against the private/reserved deny-list, defending
+                // against DNS-rebinding attacks where the host passes startup
+                // validation but resolves to a private IP at import time.
+                if let Err(e) = url_validator::validate_remote_signer_url_runtime(
                     &key_import.url,
                     state.allow_insecure_remote_signer,
-                ) {
+                )
+                .await
+                {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(&key_import.pubkey),
+                        status = "error",
+                        error = %e,
+                        "Remote key import result"
+                    );
                     results.push(ImportRemoteKeyResult {
                         status: ImportRemoteKeyStatus::Error,
                         message: e,
@@ -206,12 +372,23 @@ pub async fn import_remote_keys(
                 }
                 match state.remote_key_manager.import_remote_key(pubkey, key_import.url.clone()) {
                     Ok(()) => {
+                        info!(
+                            pubkey = %TruncatedPubkey::new(&key_import.pubkey),
+                            url = %RedactedUrl(&key_import.url),
+                            status = "imported",
+                            "Remote key import result"
+                        );
                         results.push(ImportRemoteKeyResult {
                             status: ImportRemoteKeyStatus::Imported,
                             message: String::new(),
                         });
                     }
                     Err(ImportRemoteKeyError::Duplicate) => {
+                        info!(
+                            pubkey = %TruncatedPubkey::new(&key_import.pubkey),
+                            status = "duplicate",
+                            "Remote key import result"
+                        );
                         results.push(ImportRemoteKeyResult {
                             status: ImportRemoteKeyStatus::Duplicate,
                             message: "key already exists".into(),
@@ -220,12 +397,18 @@ pub async fn import_remote_keys(
                     Err(e) => {
                         results.push(ImportRemoteKeyResult {
                             status: ImportRemoteKeyStatus::Error,
-                            message: e.to_string(),
+                            message: sanitize_item_err(e, "remote key import failed"),
                         });
                     }
                 }
             }
             Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&key_import.pubkey),
+                    status = "error",
+                    error = %e,
+                    "Remote key import result"
+                );
                 results.push(ImportRemoteKeyResult {
                     status: ImportRemoteKeyStatus::Error,
                     message: e,
@@ -247,31 +430,53 @@ pub async fn delete_remote_keys(
     );
     let _guard = span.enter();
 
+    warn!(count = request.pubkeys.len(), "Deleting remote keys");
+
     let mut results = Vec::with_capacity(request.pubkeys.len());
 
     for pubkey_str in &request.pubkeys {
         match parse_pubkey(pubkey_str) {
             Ok(pubkey) => match state.remote_key_manager.delete_remote_key(&pubkey) {
                 Ok(true) => {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(pubkey_str),
+                        status = "deleted",
+                        "Remote key delete result"
+                    );
                     results.push(DeleteRemoteKeyResult {
                         status: DeleteRemoteKeyStatus::Deleted,
                         message: String::new(),
                     });
                 }
                 Ok(false) => {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(pubkey_str),
+                        status = "not_found",
+                        "Remote key delete result"
+                    );
                     results.push(DeleteRemoteKeyResult {
                         status: DeleteRemoteKeyStatus::NotFound,
                         message: String::new(),
                     });
                 }
                 Err(e) => {
+                    // M-8: DeleteRemoteKeyError::Other is `#[error("{0}")]`
+                    // — passes through whatever the backend put in the inner
+                    // String (DB sockets, internal service names). Sanitize.
+                    let message = sanitize_item_err(&e, "remote key delete failed");
                     results.push(DeleteRemoteKeyResult {
                         status: DeleteRemoteKeyStatus::Error,
-                        message: e.to_string(),
+                        message,
                     });
                 }
             },
             Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(pubkey_str),
+                    status = "error",
+                    error = %e,
+                    "Remote key delete result"
+                );
                 results.push(DeleteRemoteKeyResult {
                     status: DeleteRemoteKeyStatus::Error,
                     message: e,
@@ -281,6 +486,202 @@ pub async fn delete_remote_keys(
     }
 
     Json(DeleteRemoteKeysResponse { data: results })
+}
+
+// --- Fee Recipient ---
+
+pub async fn get_fee_recipient(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+) -> Result<Json<FeeRecipientResponse>, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    let addr = state.config_manager.get_fee_recipient(&pubkey)?;
+    Ok(Json(FeeRecipientResponse {
+        data: FeeRecipientData {
+            pubkey: format_pubkey(&pubkey),
+            ethaddress: format!("0x{}", hex::encode(addr)),
+        },
+    }))
+}
+
+pub async fn set_fee_recipient(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+    Json(request): Json<SetFeeRecipientRequest>,
+) -> Result<StatusCode, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    let addr = parse_eth_address(&request.ethaddress)?;
+    if addr == [0u8; 20] {
+        return Err(ApiError::BadRequest("fee recipient cannot be zero address".into()));
+    }
+    state.config_manager.set_fee_recipient(&pubkey, addr)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+pub async fn delete_fee_recipient(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    state.config_manager.delete_fee_recipient(&pubkey)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Gas Limit ---
+
+pub async fn get_gas_limit(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+) -> Result<Json<GasLimitResponse>, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    let gas_limit = state.config_manager.get_gas_limit(&pubkey)?;
+    Ok(Json(GasLimitResponse {
+        data: GasLimitData { pubkey: format_pubkey(&pubkey), gas_limit: gas_limit.to_string() },
+    }))
+}
+
+pub async fn set_gas_limit(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+    Json(request): Json<SetGasLimitRequest>,
+) -> Result<StatusCode, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    let limit = request
+        .gas_limit
+        .parse::<u64>()
+        .map_err(|_| ApiError::BadRequest("invalid gas_limit: must be a numeric string".into()))?;
+    state.config_manager.set_gas_limit(&pubkey, limit)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+pub async fn delete_gas_limit(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    state.config_manager.delete_gas_limit(&pubkey)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Graffiti ---
+
+pub async fn get_graffiti(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+) -> Result<Json<GraffitiResponse>, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    let graffiti = state.config_manager.get_graffiti(&pubkey)?;
+    Ok(Json(GraffitiResponse { data: GraffitiData { pubkey: format_pubkey(&pubkey), graffiti } }))
+}
+
+pub async fn set_graffiti(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+    Json(request): Json<SetGraffitiRequest>,
+) -> Result<StatusCode, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    if request.graffiti.len() > 32 {
+        return Err(ApiError::BadRequest("graffiti must be 32 bytes or less".into()));
+    }
+    state.config_manager.set_graffiti(&pubkey, &request.graffiti)?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+pub async fn delete_graffiti(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+    state.config_manager.delete_graffiti(&pubkey)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// --- Voluntary Exit ---
+
+pub async fn sign_voluntary_exit(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+    Query(query): Query<VoluntaryExitQuery>,
+) -> Result<Json<VoluntaryExitResponse>, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+
+    let epoch = query
+        .epoch
+        .map(|e| e.parse::<u64>())
+        .transpose()
+        .map_err(|_| ApiError::BadRequest("invalid epoch".into()))?;
+
+    let exit_manager = state.exit_manager.as_ref().ok_or_else(|| {
+        ApiError::Internal("voluntary exit not available: beacon node not configured".into())
+    })?;
+
+    warn!(pubkey = %pubkey_hex, epoch = ?epoch, "Voluntary exit requested — THIS IS IRREVERSIBLE");
+
+    let signed_exit = exit_manager.sign_voluntary_exit(&pubkey, epoch).await?;
+
+    Ok(Json(VoluntaryExitResponse { data: signed_exit }))
+}
+
+/// Pre-signed exit: signs the voluntary exit and returns it without submitting.
+///
+/// `POST /rvc/v1/validator/:pubkey/prepare_exit`
+pub async fn prepare_exit(
+    State(state): State<Arc<AppState>>,
+    Path(pubkey_hex): Path<String>,
+    Query(query): Query<VoluntaryExitQuery>,
+) -> Result<Json<VoluntaryExitResponse>, ApiError> {
+    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
+
+    let epoch = query
+        .epoch
+        .map(|e| e.parse::<u64>())
+        .transpose()
+        .map_err(|_| ApiError::BadRequest("invalid epoch".into()))?;
+
+    let exit_manager = state.exit_manager.as_ref().ok_or_else(|| {
+        ApiError::Internal("voluntary exit not available: beacon node not configured".into())
+    })?;
+
+    info!(pubkey = %pubkey_hex, epoch = ?epoch, "Preparing pre-signed voluntary exit (not submitting)");
+
+    let signed_exit = exit_manager.sign_voluntary_exit(&pubkey, epoch).await?;
+
+    Ok(Json(VoluntaryExitResponse { data: signed_exit }))
+}
+
+/// Escape ASCII control characters in `s` (notably `\n`, `\r`) to their
+/// `\xHH` form so that an attacker cannot smuggle a forged log line through
+/// a user-controllable error string when the tracing-subscriber formatter is
+/// in text mode (CWE-117 / OWASP A09:2021).  Defense-in-depth in addition
+/// to the JSON-mode formatter recommended in the deployment guide.
+fn escape_log_control_chars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_control() {
+            out.push_str(&format!("\\x{:02x}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// Logs `err` at `error!` level with a fresh request ID and returns a generic
+/// `ApiError::Internal` whose message is safe to send to API clients.
+fn sanitize_internal<E: std::fmt::Display>(err: E, ctx: &str) -> ApiError {
+    let req_id = Uuid::new_v4();
+    let safe = escape_log_control_chars(&err.to_string());
+    error!(request_id = %req_id, error = %safe, "{ctx}");
+    ApiError::Internal(format!("internal error (request_id={req_id})"))
+}
+
+/// Logs `err` at `error!` level with a fresh request ID and returns a generic
+/// string suitable for the per-item `message` field in bulk-operation responses.
+fn sanitize_item_err<E: std::fmt::Display>(err: E, ctx: &str) -> String {
+    let req_id = Uuid::new_v4();
+    let safe = escape_log_control_chars(&err.to_string());
+    error!(request_id = %req_id, error = %safe, "{ctx}");
+    format!("key error (request_id={req_id})")
 }
 
 fn parse_pubkey(s: &str) -> Result<Pubkey, String> {
@@ -305,6 +706,133 @@ fn empty_interchange() -> String {
     .to_string()
 }
 
+pub(crate) fn parse_eth_address(s: &str) -> Result<[u8; 20], ApiError> {
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    let bytes = hex::decode(s).map_err(|e| ApiError::BadRequest(format!("invalid hex: {e}")))?;
+    let addr: [u8; 20] =
+        bytes.try_into().map_err(|_| ApiError::BadRequest("address must be 20 bytes".into()))?;
+    Ok(addr)
+}
+
+pub(crate) fn format_pubkey(pubkey: &[u8; 48]) -> String {
+    format!("0x{}", hex::encode(pubkey))
+}
+
+/// Rate-limit window for `set_attesting_enabled`: 1 call per 60 seconds.
+const ATTESTING_RATE_LIMIT_SECS: u64 = 60;
+
+/// Rate-limit window for `import_keystores` (ISSUE-4.7 / L-7).
+const IMPORT_KEYSTORES_WINDOW_SECS: u64 = 60;
+/// Maximum allowed `import_keystores` calls per API token per window.
+///
+/// Each call may carry multiple keystores; the axum body limit bounds the
+/// per-call decrypt cost, so this gates the per-token call rate.
+const IMPORT_KEYSTORES_MAX_PER_WINDOW: usize = 10;
+
+/// Compute the SHA-256 digest of a bearer token for use as a rate-limiter key.
+///
+/// The hashed digest is stored in `AppState::import_keystores_rate` so the raw
+/// token value never sits in long-lived memory beyond the request scope.
+fn hash_bearer_token(token: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    let out = hasher.finalize();
+    let mut buf = [0u8; 32];
+    buf.copy_from_slice(&out);
+    buf
+}
+
+/// Check the per-token rate limit for `import_keystores`.
+///
+/// On miss (no Authorization header / no Bearer prefix) the rate limiter is
+/// skipped — auth middleware (`bearer_auth`) is what enforces the bearer
+/// requirement; this check is layered defense, not a primary auth gate.
+fn check_import_keystores_rate(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(token) = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+    else {
+        return Ok(());
+    };
+
+    let key = hash_bearer_token(token);
+    let now = tokio::time::Instant::now();
+    let window = std::time::Duration::from_secs(IMPORT_KEYSTORES_WINDOW_SECS);
+
+    let mut map =
+        state.import_keystores_rate.lock().expect("import_keystores rate-limit mutex poisoned");
+    let history = map.entry(key).or_default();
+
+    // Drop entries older than the window (rolling-window pruning).
+    while let Some(front) = history.front() {
+        if now.duration_since(*front) > window {
+            history.pop_front();
+        } else {
+            break;
+        }
+    }
+
+    if history.len() >= IMPORT_KEYSTORES_MAX_PER_WINDOW {
+        // Retry-After: time until the oldest entry leaves the window.
+        let oldest = history.front().copied().unwrap_or(now);
+        let retry_after_secs = window.saturating_sub(now.duration_since(oldest)).as_secs().max(1);
+        return Err(ApiError::RateLimited { retry_after_secs });
+    }
+
+    history.push_back(now);
+    Ok(())
+}
+
+pub async fn set_attesting_enabled(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(request): Json<SetAttestingRequest>,
+) -> Result<Json<SetAttestingResponse>, crate::error::ApiError> {
+    // ── Rate limiting ────────────────────────────────────────────────────────
+    {
+        let mut last = state.last_set_attesting_enabled.lock().expect("rate-limit mutex poisoned");
+        let now = tokio::time::Instant::now();
+        if let Some(prev) = *last {
+            let elapsed = now.duration_since(prev).as_secs();
+            if elapsed < ATTESTING_RATE_LIMIT_SECS {
+                let retry_after = ATTESTING_RATE_LIMIT_SECS - elapsed;
+                return Err(crate::error::ApiError::RateLimited { retry_after_secs: retry_after });
+            }
+        }
+        *last = Some(now);
+    }
+
+    // ── Audit log ────────────────────────────────────────────────────────────
+    let caller_prefix = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|t| t.chars().take(8).collect::<String>())
+        .unwrap_or_else(|| "<none>".to_string());
+
+    info!(
+        caller = %caller_prefix,
+        requested = request.enabled,
+        "set_attesting_enabled audit"
+    );
+
+    // ── Apply the change ─────────────────────────────────────────────────────
+    let previous = state.attesting_enabled.swap(request.enabled, Ordering::Relaxed);
+    let current = request.enabled;
+
+    if previous && !current {
+        warn!("Attestation duties disabled via API");
+    } else if !previous && current {
+        info!("Attestation duties re-enabled via API");
+    }
+
+    metrics::definitions::RVC_ATTESTING_ENABLED.set(if current { 1.0 } else { 0.0 });
+
+    Ok(Json(SetAttestingResponse { enabled: current }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,7 +847,7 @@ mod tests {
     use axum::routing::get;
     use axum::Router;
     use http_body_util::BodyExt;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
     use tower::ServiceExt;
     use zeroize::Zeroizing;
 
@@ -341,11 +869,11 @@ mod tests {
 
     impl KeystoreManager for MockKeystoreManager {
         fn list_keys(&self) -> Vec<Pubkey> {
-            self.keys.lock().unwrap().clone()
+            self.keys.lock().clone()
         }
 
         fn has_key(&self, pubkey: &Pubkey) -> bool {
-            self.keys.lock().unwrap().contains(pubkey)
+            self.keys.lock().contains(pubkey)
         }
 
         fn import_keystore(
@@ -366,7 +894,7 @@ mod tests {
             let mut pubkey = [0u8; 48];
             pubkey.copy_from_slice(&bytes);
 
-            let mut keys = self.keys.lock().unwrap();
+            let mut keys = self.keys.lock();
             if keys.contains(&pubkey) {
                 return Err(ImportKeystoreError::Duplicate);
             }
@@ -375,7 +903,7 @@ mod tests {
         }
 
         fn delete_keystore(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError> {
-            let mut keys = self.keys.lock().unwrap();
+            let mut keys = self.keys.lock();
             if let Some(pos) = keys.iter().position(|k| k == pubkey) {
                 keys.remove(pos);
                 Ok(true)
@@ -397,7 +925,7 @@ mod tests {
 
     impl SlashingProtection for MockSlashingProtection {
         fn import_interchange(&self, interchange_json: &str) -> Result<(), String> {
-            self.imported.lock().unwrap().push(interchange_json.to_string());
+            self.imported.lock().push(interchange_json.to_string());
             Ok(())
         }
 
@@ -435,16 +963,23 @@ mod tests {
 
     impl ValidatorManager for MockValidatorManager {
         fn add_validator(&self, pubkey: Pubkey, enabled: bool) {
-            self.validators.lock().unwrap().push((pubkey, enabled));
+            self.validators.lock().push((pubkey, enabled));
         }
 
         fn remove_validator(&self, pubkey: &Pubkey) -> bool {
-            let mut validators = self.validators.lock().unwrap();
+            let mut validators = self.validators.lock();
             if let Some(pos) = validators.iter().position(|(pk, _)| pk == pubkey) {
                 validators.remove(pos);
                 true
             } else {
                 false
+            }
+        }
+
+        fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) {
+            let mut validators = self.validators.lock();
+            if let Some((_, e)) = validators.iter_mut().find(|(pk, _)| pk == pubkey) {
+                *e = enabled;
             }
         }
     }
@@ -461,14 +996,18 @@ mod tests {
 
     impl DoppelgangerMonitor for MockDoppelgangerMonitor {
         fn start_monitoring(&self, pubkey: Pubkey) {
-            self.monitored.lock().unwrap().push(pubkey);
+            self.monitored.lock().push(pubkey);
         }
 
         fn stop_monitoring(&self, pubkey: &Pubkey) {
-            let mut monitored = self.monitored.lock().unwrap();
+            let mut monitored = self.monitored.lock();
             if let Some(pos) = monitored.iter().position(|pk| pk == pubkey) {
                 monitored.remove(pos);
             }
+        }
+
+        fn is_doppelganger_safe(&self, _pubkey: &Pubkey) -> bool {
+            true
         }
     }
 
@@ -488,11 +1027,11 @@ mod tests {
 
     impl RemoteKeyManager for MockRemoteKeyManager {
         fn list_remote_keys(&self) -> Vec<(Pubkey, String)> {
-            self.keys.lock().unwrap().clone()
+            self.keys.lock().clone()
         }
 
         fn has_remote_key(&self, pubkey: &Pubkey) -> bool {
-            self.keys.lock().unwrap().iter().any(|(pk, _)| pk == pubkey)
+            self.keys.lock().iter().any(|(pk, _)| pk == pubkey)
         }
 
         fn import_remote_key(
@@ -500,7 +1039,7 @@ mod tests {
             pubkey: Pubkey,
             url: String,
         ) -> Result<(), ImportRemoteKeyError> {
-            let mut keys = self.keys.lock().unwrap();
+            let mut keys = self.keys.lock();
             if keys.iter().any(|(pk, _)| *pk == pubkey) {
                 return Err(ImportRemoteKeyError::Duplicate);
             }
@@ -509,13 +1048,116 @@ mod tests {
         }
 
         fn delete_remote_key(&self, pubkey: &Pubkey) -> Result<bool, DeleteRemoteKeyError> {
-            let mut keys = self.keys.lock().unwrap();
+            let mut keys = self.keys.lock();
             if let Some(pos) = keys.iter().position(|(pk, _)| pk == pubkey) {
                 keys.remove(pos);
                 Ok(true)
             } else {
                 Ok(false)
             }
+        }
+    }
+
+    struct MockValidatorConfigManager {
+        fee_recipients: Mutex<std::collections::HashMap<Pubkey, [u8; 20]>>,
+        gas_limits: Mutex<std::collections::HashMap<Pubkey, u64>>,
+        graffiti: Mutex<std::collections::HashMap<Pubkey, String>>,
+        known_pubkeys: Mutex<Vec<Pubkey>>,
+    }
+
+    impl MockValidatorConfigManager {
+        fn new() -> Self {
+            Self {
+                fee_recipients: Mutex::new(std::collections::HashMap::new()),
+                gas_limits: Mutex::new(std::collections::HashMap::new()),
+                graffiti: Mutex::new(std::collections::HashMap::new()),
+                known_pubkeys: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_validator(pubkey: Pubkey) -> Self {
+            let m = Self::new();
+            m.known_pubkeys.lock().push(pubkey);
+            m
+        }
+    }
+
+    impl ValidatorConfigManager for MockValidatorConfigManager {
+        fn get_fee_recipient(&self, pubkey: &Pubkey) -> Result<[u8; 20], ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.fee_recipients
+                .lock()
+                .get(pubkey)
+                .copied()
+                .ok_or_else(|| ApiError::NotFound("fee recipient not set".into()))
+        }
+
+        fn set_fee_recipient(&self, pubkey: &Pubkey, address: [u8; 20]) -> Result<(), ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.fee_recipients.lock().insert(*pubkey, address);
+            Ok(())
+        }
+
+        fn delete_fee_recipient(&self, pubkey: &Pubkey) -> Result<(), ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.fee_recipients.lock().remove(pubkey);
+            Ok(())
+        }
+
+        fn get_gas_limit(&self, pubkey: &Pubkey) -> Result<u64, ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.gas_limits
+                .lock()
+                .get(pubkey)
+                .copied()
+                .ok_or_else(|| ApiError::NotFound("gas limit not set".into()))
+        }
+
+        fn set_gas_limit(&self, pubkey: &Pubkey, limit: u64) -> Result<(), ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.gas_limits.lock().insert(*pubkey, limit);
+            Ok(())
+        }
+
+        fn delete_gas_limit(&self, pubkey: &Pubkey) -> Result<(), ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.gas_limits.lock().remove(pubkey);
+            Ok(())
+        }
+
+        fn get_graffiti(&self, pubkey: &Pubkey) -> Result<String, ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            Ok(self.graffiti.lock().get(pubkey).cloned().unwrap_or_default())
+        }
+
+        fn set_graffiti(&self, pubkey: &Pubkey, graffiti: &str) -> Result<(), ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.graffiti.lock().insert(*pubkey, graffiti.to_string());
+            Ok(())
+        }
+
+        fn delete_graffiti(&self, pubkey: &Pubkey) -> Result<(), ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound("validator not found".into()));
+            }
+            self.graffiti.lock().remove(pubkey);
+            Ok(())
         }
     }
 
@@ -541,6 +1183,7 @@ mod tests {
         validator_manager: Arc<MockValidatorManager>,
         doppelganger_monitor: Arc<MockDoppelgangerMonitor>,
         remote_key_manager: Arc<MockRemoteKeyManager>,
+        config_manager: Arc<MockValidatorConfigManager>,
     }
 
     impl TestApp {
@@ -551,6 +1194,7 @@ mod tests {
                 validator_manager: Arc::new(MockValidatorManager::new()),
                 doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
                 remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+                config_manager: Arc::new(MockValidatorConfigManager::new()),
             }
         }
 
@@ -561,6 +1205,7 @@ mod tests {
                 validator_manager: Arc::new(MockValidatorManager::new()),
                 doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
                 remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+                config_manager: Arc::new(MockValidatorConfigManager::new()),
             }
         }
 
@@ -571,6 +1216,7 @@ mod tests {
                 validator_manager: Arc::new(MockValidatorManager::new()),
                 doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
                 remote_key_manager: Arc::new(MockRemoteKeyManager::with_keys(keys)),
+                config_manager: Arc::new(MockValidatorConfigManager::new()),
             }
         }
 
@@ -581,6 +1227,7 @@ mod tests {
                 validator_manager: Arc::new(MockValidatorManager::new()),
                 doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
                 remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+                config_manager: Arc::new(MockValidatorConfigManager::new()),
             }
         }
 
@@ -594,6 +1241,18 @@ mod tests {
                 validator_manager: Arc::new(MockValidatorManager::new()),
                 doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
                 remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+                config_manager: Arc::new(MockValidatorConfigManager::new()),
+            }
+        }
+
+        fn with_config_manager(config_manager: MockValidatorConfigManager) -> Self {
+            Self {
+                keystore_manager: Arc::new(MockKeystoreManager::new()),
+                slashing_protection: Arc::new(MockSlashingProtection::new()),
+                validator_manager: Arc::new(MockValidatorManager::new()),
+                doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+                remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+                config_manager: Arc::new(config_manager),
             }
         }
 
@@ -604,7 +1263,14 @@ mod tests {
                 validator_manager: self.validator_manager.clone(),
                 doppelganger_monitor: self.doppelganger_monitor.clone(),
                 remote_key_manager: self.remote_key_manager.clone(),
+                config_manager: self.config_manager.clone(),
+                exit_manager: None,
                 allow_insecure_remote_signer: true,
+                attesting_enabled: Arc::new(AtomicBool::new(true)),
+                last_set_attesting_enabled: std::sync::Mutex::new(None),
+                import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
+                doppelganger_window: std::time::Duration::ZERO,
+                cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             });
             Router::new()
                 .route(
@@ -748,11 +1414,11 @@ mod tests {
 
         assert!(app.keystore_manager.has_key(&test_pubkey(1)));
 
-        let validators = app.validator_manager.validators.lock().unwrap();
+        let validators = app.validator_manager.validators.lock();
         assert_eq!(validators.len(), 1);
         assert!(!validators[0].1); // disabled for doppelganger
 
-        let monitored = app.doppelganger_monitor.monitored.lock().unwrap();
+        let monitored = app.doppelganger_monitor.monitored.lock();
         assert_eq!(monitored.len(), 1);
     }
 
@@ -822,6 +1488,7 @@ mod tests {
             validator_manager: Arc::new(MockValidatorManager::new()),
             doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
             remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+            config_manager: Arc::new(MockValidatorConfigManager::new()),
         };
         let slashing_data = serde_json::json!({
             "metadata": {
@@ -852,7 +1519,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), axum::http::StatusCode::OK);
-        let imported = mock_slashing.imported.lock().unwrap();
+        let imported = mock_slashing.imported.lock();
         assert_eq!(imported.len(), 1);
     }
 
@@ -906,6 +1573,98 @@ mod tests {
         let resp: ImportKeystoresResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(resp.data.len(), 1);
         assert_eq!(resp.data[0].status, ImportStatus::Error);
+    }
+
+    // ── ISSUE-4.7 / L-7: per-token rate limit on import_keystores ─────────────
+    //
+    // We exercise the rate-limiter directly via the handler function so the
+    // shared `AppState` (carrying the per-token quota) is preserved across
+    // calls.  The TestApp::router() helper creates a fresh state per call,
+    // which would defeat any rate-limit assertion.
+
+    fn make_shared_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            keystore_manager: Arc::new(MockKeystoreManager::new()),
+            slashing_protection: Arc::new(MockSlashingProtection::new()),
+            validator_manager: Arc::new(MockValidatorManager::new()),
+            doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+            remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+            config_manager: Arc::new(MockValidatorConfigManager::new()),
+            exit_manager: None,
+            allow_insecure_remote_signer: true,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    fn auth_headers(token: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers
+            .insert(axum::http::header::AUTHORIZATION, format!("Bearer {token}").parse().unwrap());
+        headers
+    }
+
+    fn mk_request() -> ImportKeystoresRequest {
+        ImportKeystoresRequest {
+            keystores: vec![mock_keystore_json(1)],
+            passwords: vec!["pw".to_string()],
+            slashing_protection: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_import_keystores_rate_limit_kicks_in_at_eleventh_call() {
+        let state = make_shared_state();
+        for i in 1..=IMPORT_KEYSTORES_MAX_PER_WINDOW {
+            let r =
+                import_keystores(State(state.clone()), auth_headers("token-A"), Json(mk_request()))
+                    .await;
+            assert!(r.is_ok(), "call #{i} for token-A must be allowed (under quota)");
+        }
+        let r = import_keystores(State(state.clone()), auth_headers("token-A"), Json(mk_request()))
+            .await;
+        match r {
+            Err(ApiError::RateLimited { retry_after_secs }) => {
+                assert!(retry_after_secs >= 1, "Retry-After must be at least 1s");
+                assert!(retry_after_secs <= 60, "Retry-After cannot exceed window");
+            }
+            other => panic!("11th call must be rate-limited, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_import_keystores_rate_limit_isolated_per_token() {
+        let state = make_shared_state();
+        for _ in 0..IMPORT_KEYSTORES_MAX_PER_WINDOW {
+            let r =
+                import_keystores(State(state.clone()), auth_headers("token-A"), Json(mk_request()))
+                    .await;
+            assert!(r.is_ok());
+        }
+        // Token-A is now rate-limited.
+        let r = import_keystores(State(state.clone()), auth_headers("token-A"), Json(mk_request()))
+            .await;
+        assert!(matches!(r, Err(ApiError::RateLimited { .. })));
+
+        // Token-B has its own quota.
+        let r = import_keystores(State(state.clone()), auth_headers("token-B"), Json(mk_request()))
+            .await;
+        assert!(r.is_ok(), "token-B must have an independent quota");
+    }
+
+    #[tokio::test]
+    async fn test_import_keystores_no_auth_header_skips_rate_limit() {
+        // Without a Bearer token the rate-limiter is bypassed; auth
+        // middleware (`bearer_auth`) is the primary gate in production.
+        let state = make_shared_state();
+        for _ in 0..(IMPORT_KEYSTORES_MAX_PER_WINDOW + 5) {
+            let r =
+                import_keystores(State(state.clone()), HeaderMap::new(), Json(mk_request())).await;
+            assert!(r.is_ok(), "no-token requests must not be rate-limited");
+        }
     }
 
     // --- DELETE /eth/v1/keystores tests ---
@@ -1171,11 +1930,11 @@ mod tests {
         assert!(!app.keystore_manager.has_key(&test_pubkey(1)));
 
         // No validators should have been added
-        let validators = app.validator_manager.validators.lock().unwrap();
+        let validators = app.validator_manager.validators.lock();
         assert!(validators.is_empty());
 
         // No doppelganger monitoring started
-        let monitored = app.doppelganger_monitor.monitored.lock().unwrap();
+        let monitored = app.doppelganger_monitor.monitored.lock();
         assert!(monitored.is_empty());
     }
 
@@ -1309,7 +2068,7 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::OK);
 
         // Key 1 should no longer be monitored, key 2 should remain
-        let monitored = app.doppelganger_monitor.monitored.lock().unwrap();
+        let monitored = app.doppelganger_monitor.monitored.lock();
         assert_eq!(monitored.len(), 1);
         assert_eq!(monitored[0], test_pubkey(2));
     }
@@ -1339,8 +2098,8 @@ mod tests {
     #[tokio::test]
     async fn test_list_remote_keys_with_entries() {
         let app = TestApp::with_remote_keys(vec![
-            (test_pubkey(1), "https://signer1.example.com".into()),
-            (test_pubkey(2), "https://signer2.example.com".into()),
+            (test_pubkey(1), "https://8.8.8.8:9001".into()),
+            (test_pubkey(2), "https://8.8.8.8:9002".into()),
         ]);
 
         let response = app
@@ -1359,10 +2118,10 @@ mod tests {
         let resp: ListRemoteKeysResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(resp.data.len(), 2);
         assert_eq!(resp.data[0].pubkey, format!("0x{}", test_pubkey_hex(1)));
-        assert_eq!(resp.data[0].url, "https://signer1.example.com");
+        assert_eq!(resp.data[0].url, "https://8.8.8.8:9001");
         assert!(!resp.data[0].readonly);
         assert_eq!(resp.data[1].pubkey, format!("0x{}", test_pubkey_hex(2)));
-        assert_eq!(resp.data[1].url, "https://signer2.example.com");
+        assert_eq!(resp.data[1].url, "https://8.8.8.8:9002");
     }
 
     // --- POST /eth/v1/remotekeys tests ---
@@ -1373,7 +2132,7 @@ mod tests {
         let request_body = serde_json::json!({
             "remote_keys": [{
                 "pubkey": format!("0x{}", test_pubkey_hex(1)),
-                "url": "https://signer.example.com"
+                "url": "https://8.8.8.8:9000"
             }]
         });
 
@@ -1404,8 +2163,8 @@ mod tests {
         let app = TestApp::new();
         let request_body = serde_json::json!({
             "remote_keys": [
-                {"pubkey": format!("0x{}", test_pubkey_hex(1)), "url": "https://signer1.example.com"},
-                {"pubkey": format!("0x{}", test_pubkey_hex(2)), "url": "https://signer2.example.com"}
+                {"pubkey": format!("0x{}", test_pubkey_hex(1)), "url": "https://8.8.8.8:9001"},
+                {"pubkey": format!("0x{}", test_pubkey_hex(2)), "url": "https://8.8.8.8:9002"}
             ]
         });
 
@@ -1432,12 +2191,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_import_duplicate_remote_key() {
-        let app =
-            TestApp::with_remote_keys(vec![(test_pubkey(1), "https://signer.example.com".into())]);
+        let app = TestApp::with_remote_keys(vec![(test_pubkey(1), "https://8.8.8.8:9000".into())]);
         let request_body = serde_json::json!({
             "remote_keys": [{
                 "pubkey": format!("0x{}", test_pubkey_hex(1)),
-                "url": "https://signer.example.com"
+                "url": "https://8.8.8.8:9000"
             }]
         });
 
@@ -1467,7 +2225,7 @@ mod tests {
         let request_body = serde_json::json!({
             "remote_keys": [{
                 "pubkey": "not_valid_hex!",
-                "url": "https://signer.example.com"
+                "url": "https://8.8.8.8:9000"
             }]
         });
 
@@ -1495,8 +2253,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_delete_existing_remote_key() {
-        let app =
-            TestApp::with_remote_keys(vec![(test_pubkey(1), "https://signer.example.com".into())]);
+        let app = TestApp::with_remote_keys(vec![(test_pubkey(1), "https://8.8.8.8:9000".into())]);
         let request_body = serde_json::json!({
             "pubkeys": [format!("0x{}", test_pubkey_hex(1))]
         });
@@ -1587,8 +2344,9 @@ mod tests {
             doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
             remote_key_manager: Arc::new(MockRemoteKeyManager::with_keys(vec![(
                 test_pubkey(2),
-                "https://signer.example.com".into(),
+                "https://8.8.8.8:9000".into(),
             )])),
+            config_manager: Arc::new(MockValidatorConfigManager::new()),
         };
 
         let response = app
@@ -1734,11 +2492,15 @@ mod tests {
             app.validator_manager.clone(),
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
+            app.config_manager.clone(),
+            None,
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec![],
             1024, // 1 KB limit
             true,
+            Arc::new(AtomicBool::new(true)),
+            std::time::Duration::ZERO,
         );
 
         let big_body = "x".repeat(2048); // 2 KB > 1 KB limit
@@ -1770,11 +2532,15 @@ mod tests {
             app.validator_manager.clone(),
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
+            app.config_manager.clone(),
+            None,
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec![],
             10 * 1024 * 1024, // 10 MB
             true,
+            Arc::new(AtomicBool::new(true)),
+            std::time::Duration::ZERO,
         );
 
         let body = serde_json::json!({
@@ -1813,11 +2579,15 @@ mod tests {
             app.validator_manager.clone(),
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
+            app.config_manager.clone(),
+            None,
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec![],
             10 * 1024 * 1024,
             true,
+            Arc::new(AtomicBool::new(true)),
+            std::time::Duration::ZERO,
         );
 
         let response = server
@@ -1850,11 +2620,15 @@ mod tests {
             app.validator_manager.clone(),
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
+            app.config_manager.clone(),
+            None,
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec!["http://localhost:3000".to_string()],
             10 * 1024 * 1024,
             true,
+            Arc::new(AtomicBool::new(true)),
+            std::time::Duration::ZERO,
         );
 
         let response = server
@@ -1887,11 +2661,15 @@ mod tests {
             app.validator_manager.clone(),
             app.doppelganger_monitor.clone(),
             app.remote_key_manager.clone(),
+            app.config_manager.clone(),
+            None,
             "test_token".to_string(),
             "127.0.0.1:0".parse().unwrap(),
             vec!["http://localhost:3000".to_string()],
             10 * 1024 * 1024,
             true,
+            Arc::new(AtomicBool::new(true)),
+            std::time::Duration::ZERO,
         );
 
         let response = server
@@ -1923,7 +2701,14 @@ mod tests {
             validator_manager: app.validator_manager.clone(),
             doppelganger_monitor: app.doppelganger_monitor.clone(),
             remote_key_manager: app.remote_key_manager.clone(),
+            config_manager: app.config_manager.clone(),
+            exit_manager: None,
             allow_insecure_remote_signer: false,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         let router = Router::new()
@@ -1966,7 +2751,14 @@ mod tests {
             validator_manager: app.validator_manager.clone(),
             doppelganger_monitor: app.doppelganger_monitor.clone(),
             remote_key_manager: app.remote_key_manager.clone(),
+            config_manager: app.config_manager.clone(),
+            exit_manager: None,
             allow_insecure_remote_signer: false,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         let router = Router::new()
@@ -2009,7 +2801,14 @@ mod tests {
             validator_manager: app.validator_manager.clone(),
             doppelganger_monitor: app.doppelganger_monitor.clone(),
             remote_key_manager: app.remote_key_manager.clone(),
+            config_manager: app.config_manager.clone(),
+            exit_manager: None,
             allow_insecure_remote_signer: false,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         });
 
         let router = Router::new()
@@ -2041,5 +2840,1189 @@ mod tests {
         let resp: ImportRemoteKeysResponse = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(resp.data[0].status, ImportRemoteKeyStatus::Error);
         assert!(resp.data[0].message.contains("Private/reserved IP"));
+    }
+
+    // --- parse_eth_address tests ---
+
+    #[test]
+    fn test_parse_eth_address_valid_with_prefix() {
+        let addr = parse_eth_address("0xAbcF8e0d4e9587369b2301D0790347320302cc09").unwrap();
+        assert_eq!(addr.len(), 20);
+        assert_eq!(hex::encode(addr), "abcf8e0d4e9587369b2301d0790347320302cc09");
+    }
+
+    #[test]
+    fn test_parse_eth_address_valid_without_prefix() {
+        let addr = parse_eth_address("AbcF8e0d4e9587369b2301D0790347320302cc09").unwrap();
+        assert_eq!(hex::encode(addr), "abcf8e0d4e9587369b2301d0790347320302cc09");
+    }
+
+    #[test]
+    fn test_parse_eth_address_invalid_hex() {
+        let result = parse_eth_address("0xZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_eth_address_wrong_length() {
+        let result = parse_eth_address("0xabcdef");
+        assert!(result.is_err());
+    }
+
+    // --- format_pubkey tests ---
+
+    #[test]
+    fn test_format_pubkey() {
+        let mut pubkey = [0u8; 48];
+        pubkey[0] = 0x93;
+        pubkey[1] = 0x24;
+        pubkey[47] = 0x4a;
+        let formatted = format_pubkey(&pubkey);
+        assert!(formatted.starts_with("0x"));
+        assert_eq!(formatted.len(), 98); // 0x + 96 hex chars
+        assert_eq!(&formatted[..6], "0x9324");
+        assert!(formatted.ends_with("4a"));
+    }
+
+    // --- Fee recipient handler tests ---
+
+    fn config_router(config_manager: MockValidatorConfigManager) -> Router {
+        let app = TestApp::with_config_manager(config_manager);
+        let state = Arc::new(AppState {
+            keystore_manager: app.keystore_manager.clone(),
+            slashing_protection: app.slashing_protection.clone(),
+            validator_manager: app.validator_manager.clone(),
+            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            remote_key_manager: app.remote_key_manager.clone(),
+            config_manager: app.config_manager.clone(),
+            exit_manager: None,
+            allow_insecure_remote_signer: true,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        Router::new()
+            .route(
+                "/eth/v1/validator/:pubkey/feerecipient",
+                get(get_fee_recipient).post(set_fee_recipient).delete(delete_fee_recipient),
+            )
+            .route(
+                "/eth/v1/validator/:pubkey/gas_limit",
+                get(get_gas_limit).post(set_gas_limit).delete(delete_gas_limit),
+            )
+            .route(
+                "/eth/v1/validator/:pubkey/graffiti",
+                get(get_graffiti).post(set_graffiti).delete(delete_graffiti),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_get_fee_recipient_returns_value() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let addr = [0xABu8; 20];
+        mock.fee_recipients.lock().insert(pk, addr);
+
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/feerecipient", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["ethaddress"], format!("0x{}", hex::encode(addr)));
+    }
+
+    #[tokio::test]
+    async fn test_get_fee_recipient_unknown_pubkey_404() {
+        let mock = MockValidatorConfigManager::new();
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/feerecipient", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_set_fee_recipient_valid_202() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/feerecipient", test_pubkey_hex(1));
+        let body = serde_json::json!({"ethaddress": "0xAbcF8e0d4e9587369b2301D0790347320302cc09"});
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_set_fee_recipient_zero_address_400() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/feerecipient", test_pubkey_hex(1));
+        let body = serde_json::json!({"ethaddress": "0x0000000000000000000000000000000000000000"});
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_delete_fee_recipient_204() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/feerecipient", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_fee_recipient_unknown_pubkey_404() {
+        let mock = MockValidatorConfigManager::new();
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/feerecipient", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- Gas limit handler tests ---
+
+    #[tokio::test]
+    async fn test_get_gas_limit_returns_value() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        mock.gas_limits.lock().insert(pk, 30_000_000);
+
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/gas_limit", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["gas_limit"], "30000000");
+    }
+
+    #[tokio::test]
+    async fn test_get_gas_limit_unknown_pubkey_404() {
+        let mock = MockValidatorConfigManager::new();
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/gas_limit", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_set_gas_limit_valid_202() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/gas_limit", test_pubkey_hex(1));
+        let body = serde_json::json!({"gas_limit": "30000000"});
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_set_gas_limit_non_numeric_400() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/gas_limit", test_pubkey_hex(1));
+        let body = serde_json::json!({"gas_limit": "not_a_number"});
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_delete_gas_limit_204() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/gas_limit", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_gas_limit_unknown_pubkey_404() {
+        let mock = MockValidatorConfigManager::new();
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/gas_limit", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- Graffiti handler tests ---
+
+    #[tokio::test]
+    async fn test_get_graffiti_returns_value() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        mock.graffiti.lock().insert(pk, "hello world".to_string());
+
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/graffiti", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["graffiti"], "hello world");
+    }
+
+    #[tokio::test]
+    async fn test_get_graffiti_unknown_pubkey_404() {
+        let mock = MockValidatorConfigManager::new();
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/graffiti", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder().uri(&uri).body(axum::body::Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_set_graffiti_valid_202() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/graffiti", test_pubkey_hex(1));
+        let body = serde_json::json!({"graffiti": "my graffiti"});
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_set_graffiti_too_long_400() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/graffiti", test_pubkey_hex(1));
+        let body = serde_json::json!({"graffiti": "a]".repeat(17)}); // 34 bytes > 32
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .header("Content-Type", "application/json")
+                    .body(axum::body::Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_delete_graffiti_204() {
+        let pk = test_pubkey(1);
+        let mock = MockValidatorConfigManager::with_validator(pk);
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/graffiti", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_delete_graffiti_unknown_pubkey_404() {
+        let mock = MockValidatorConfigManager::new();
+        let router = config_router(mock);
+        let uri = format!("/eth/v1/validator/0x{}/graffiti", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("DELETE")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- Voluntary exit handler tests ---
+
+    use crate::types::VoluntaryExitResponse;
+
+    struct MockVoluntaryExitManager {
+        known_pubkeys: Mutex<Vec<Pubkey>>,
+    }
+
+    impl MockVoluntaryExitManager {
+        fn new() -> Self {
+            Self { known_pubkeys: Mutex::new(Vec::new()) }
+        }
+
+        fn with_validator(pubkey: Pubkey) -> Self {
+            let m = Self::new();
+            m.known_pubkeys.lock().push(pubkey);
+            m
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl VoluntaryExitManager for MockVoluntaryExitManager {
+        async fn sign_voluntary_exit(
+            &self,
+            pubkey: &Pubkey,
+            epoch: Option<u64>,
+        ) -> Result<eth_types::SignedVoluntaryExit, ApiError> {
+            if !self.known_pubkeys.lock().contains(pubkey) {
+                return Err(ApiError::NotFound(format!(
+                    "validator 0x{} not found",
+                    hex::encode(pubkey)
+                )));
+            }
+            let epoch = epoch.unwrap_or(100);
+            Ok(eth_types::SignedVoluntaryExit {
+                message: eth_types::VoluntaryExit { epoch, validator_index: 42 },
+                signature: vec![0xaa; 96],
+            })
+        }
+    }
+
+    fn exit_router(exit_manager: Option<Arc<dyn VoluntaryExitManager>>) -> Router {
+        let app = TestApp::new();
+        let state = Arc::new(AppState {
+            keystore_manager: app.keystore_manager.clone(),
+            slashing_protection: app.slashing_protection.clone(),
+            validator_manager: app.validator_manager.clone(),
+            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            remote_key_manager: app.remote_key_manager.clone(),
+            config_manager: app.config_manager.clone(),
+            exit_manager,
+            allow_insecure_remote_signer: true,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        Router::new()
+            .route(
+                "/eth/v1/validator/:pubkey/voluntary_exit",
+                axum::routing::post(sign_voluntary_exit),
+            )
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_with_explicit_epoch() {
+        let pk = test_pubkey(1);
+        let mock = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let router = exit_router(Some(mock));
+
+        let uri = format!("/eth/v1/validator/0x{}/voluntary_exit?epoch=300000", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let resp: VoluntaryExitResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(resp.data.message.epoch, 300000);
+        assert_eq!(resp.data.message.validator_index, 42);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_without_epoch_auto_detect() {
+        let pk = test_pubkey(1);
+        let mock = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let router = exit_router(Some(mock));
+
+        let uri = format!("/eth/v1/validator/0x{}/voluntary_exit", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let resp: VoluntaryExitResponse = serde_json::from_slice(&body_bytes).unwrap();
+        // Mock returns epoch=100 when None is passed
+        assert_eq!(resp.data.message.epoch, 100);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_invalid_epoch_400() {
+        let pk = test_pubkey(1);
+        let mock = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let router = exit_router(Some(mock));
+
+        let uri = format!("/eth/v1/validator/0x{}/voluntary_exit?epoch=abc", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_unknown_pubkey_404() {
+        let mock = Arc::new(MockVoluntaryExitManager::new());
+        let router = exit_router(Some(mock));
+
+        let uri = format!("/eth/v1/validator/0x{}/voluntary_exit", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_no_exit_manager_500() {
+        let router = exit_router(None);
+
+        let uri = format!("/eth/v1/validator/0x{}/voluntary_exit", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // --- prepare_exit handler tests ---
+
+    fn prepare_exit_router(exit_manager: Option<Arc<dyn VoluntaryExitManager>>) -> Router {
+        let app = TestApp::new();
+        let state = Arc::new(AppState {
+            keystore_manager: app.keystore_manager.clone(),
+            slashing_protection: app.slashing_protection.clone(),
+            validator_manager: app.validator_manager.clone(),
+            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            remote_key_manager: app.remote_key_manager.clone(),
+            config_manager: app.config_manager.clone(),
+            exit_manager,
+            allow_insecure_remote_signer: true,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        Router::new()
+            .route("/rvc/v1/validator/:pubkey/prepare_exit", axum::routing::post(prepare_exit))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_prepare_exit_returns_signed_exit() {
+        let pk = test_pubkey(1);
+        let mock = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let router = prepare_exit_router(Some(mock));
+
+        let uri = format!("/rvc/v1/validator/0x{}/prepare_exit?epoch=300000", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body_bytes = BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        let resp: VoluntaryExitResponse = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(resp.data.message.epoch, 300000);
+        assert_eq!(resp.data.message.validator_index, 42);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_exit_unknown_pubkey_404() {
+        let mock = Arc::new(MockVoluntaryExitManager::new());
+        let router = prepare_exit_router(Some(mock));
+
+        let uri = format!("/rvc/v1/validator/0x{}/prepare_exit", test_pubkey_hex(99));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_exit_no_exit_manager_500() {
+        let router = prepare_exit_router(None);
+
+        let uri = format!("/rvc/v1/validator/0x{}/prepare_exit", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_prepare_exit_invalid_epoch_400() {
+        let pk = test_pubkey(1);
+        let mock = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let router = prepare_exit_router(Some(mock));
+
+        let uri = format!("/rvc/v1/validator/0x{}/prepare_exit?epoch=abc", test_pubkey_hex(1));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ================================================================
+    // Integration tests: full HTTP round-trip with auth (Issues 4.1–4.3)
+    // ================================================================
+
+    fn full_authed_router(
+        config_manager: MockValidatorConfigManager,
+        exit_manager: Option<Arc<dyn VoluntaryExitManager>>,
+    ) -> (Router, String) {
+        let token = "test_integration_token_1234567890abcdef".to_string();
+        let state = Arc::new(AppState {
+            keystore_manager: Arc::new(MockKeystoreManager::new()),
+            slashing_protection: Arc::new(MockSlashingProtection::new()),
+            validator_manager: Arc::new(MockValidatorManager::new()),
+            doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+            remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
+            config_manager: Arc::new(config_manager),
+            exit_manager,
+            allow_insecure_remote_signer: true,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_window: std::time::Duration::ZERO,
+            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+
+        let api = Router::new()
+            .route(
+                "/eth/v1/validator/:pubkey/feerecipient",
+                get(get_fee_recipient).post(set_fee_recipient).delete(delete_fee_recipient),
+            )
+            .route(
+                "/eth/v1/validator/:pubkey/gas_limit",
+                get(get_gas_limit).post(set_gas_limit).delete(delete_gas_limit),
+            )
+            .route(
+                "/eth/v1/validator/:pubkey/graffiti",
+                get(get_graffiti).post(set_graffiti).delete(delete_graffiti),
+            )
+            .route(
+                "/eth/v1/validator/:pubkey/voluntary_exit",
+                axum::routing::post(sign_voluntary_exit),
+            )
+            .with_state(state);
+
+        let router = auth::with_auth(api, Arc::new(Zeroizing::new(token.clone())));
+        (router, token)
+    }
+
+    fn authed_get(token: &str, uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    fn authed_post(token: &str, uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    fn authed_post_json(
+        token: &str,
+        uri: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn authed_delete(token: &str, uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method("DELETE")
+            .uri(uri)
+            .header("Authorization", format!("Bearer {token}"))
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    fn unauthenticated_request(method: &str, uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .unwrap()
+    }
+
+    // --- Issue 4.1: Fee recipient integration tests ---
+
+    #[tokio::test]
+    async fn test_fee_recipient_lifecycle() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/feerecipient");
+        let eth_addr = "0xAbcF8e0d4e9587369b2301D0790347320302cc09";
+
+        // POST: set fee recipient → 202
+        let resp = router
+            .clone()
+            .oneshot(authed_post_json(&token, &uri, serde_json::json!({ "ethaddress": eth_addr })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // GET: verify it was set → 200
+        let resp = router.clone().oneshot(authed_get(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["data"]["ethaddress"].as_str().unwrap().to_lowercase(),
+            eth_addr.to_lowercase()
+        );
+
+        // DELETE: remove fee recipient → 204
+        let resp = router.clone().oneshot(authed_delete(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // GET: verify it returns 404 after deletion
+        let resp = router.clone().oneshot(authed_get(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_fee_recipient_auth_required() {
+        let pk = test_pubkey(1);
+        let (router, _token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/feerecipient");
+
+        let resp = router.oneshot(unauthenticated_request("GET", &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_fee_recipient_unknown_pubkey() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let unknown_hex = format!("0x{}", test_pubkey_hex(99));
+        let uri = format!("/eth/v1/validator/{unknown_hex}/feerecipient");
+
+        let resp = router.oneshot(authed_get(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_fee_recipient_invalid_address() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/feerecipient");
+
+        let resp = router
+            .oneshot(authed_post_json(
+                &token,
+                &uri,
+                serde_json::json!({ "ethaddress": "0xinvalid" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_fee_recipient_zero_address() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/feerecipient");
+
+        let resp = router
+            .oneshot(authed_post_json(
+                &token,
+                &uri,
+                serde_json::json!({ "ethaddress": "0x0000000000000000000000000000000000000000" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // --- Issue 4.2: Gas limit + graffiti integration tests ---
+
+    #[tokio::test]
+    async fn test_gas_limit_lifecycle() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/gas_limit");
+
+        // POST: set gas limit → 202
+        let resp = router
+            .clone()
+            .oneshot(authed_post_json(&token, &uri, serde_json::json!({ "gas_limit": "30000000" })))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // GET: verify → 200
+        let resp = router.clone().oneshot(authed_get(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["gas_limit"], "30000000");
+
+        // DELETE → 204
+        let resp = router.clone().oneshot(authed_delete(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // GET: verify 404 after deletion
+        let resp = router.clone().oneshot(authed_get(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_gas_limit_string_encoding() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/gas_limit");
+
+        router
+            .clone()
+            .oneshot(authed_post_json(&token, &uri, serde_json::json!({ "gas_limit": "30000000" })))
+            .await
+            .unwrap();
+
+        let resp = router.oneshot(authed_get(&token, &uri)).await.unwrap();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            json["data"]["gas_limit"].is_string(),
+            "gas_limit must be a JSON string, not number"
+        );
+        assert_eq!(json["data"]["gas_limit"].as_str().unwrap(), "30000000");
+    }
+
+    #[tokio::test]
+    async fn test_gas_limit_invalid_value() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/gas_limit");
+
+        let resp = router
+            .oneshot(authed_post_json(
+                &token,
+                &uri,
+                serde_json::json!({ "gas_limit": "not_a_number" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_graffiti_lifecycle() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/graffiti");
+
+        // POST: set graffiti → 202
+        let resp = router
+            .clone()
+            .oneshot(authed_post_json(
+                &token,
+                &uri,
+                serde_json::json!({ "graffiti": "hello world" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+        // GET: verify → 200
+        let resp = router.clone().oneshot(authed_get(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["graffiti"], "hello world");
+
+        // DELETE → 204
+        let resp = router.clone().oneshot(authed_delete(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // GET: after delete returns empty default
+        let resp = router.clone().oneshot(authed_get(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["graffiti"], "");
+    }
+
+    #[tokio::test]
+    async fn test_graffiti_max_length() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/graffiti");
+
+        // 33 bytes → 400
+        let resp = router
+            .clone()
+            .oneshot(authed_post_json(
+                &token,
+                &uri,
+                serde_json::json!({ "graffiti": "a".repeat(33) }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // 32 bytes → 202
+        let resp = router
+            .oneshot(authed_post_json(
+                &token,
+                &uri,
+                serde_json::json!({ "graffiti": "a".repeat(32) }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn test_graffiti_auth_required() {
+        let pk = test_pubkey(1);
+        let (router, _token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/graffiti");
+
+        let resp = router.oneshot(unauthenticated_request("GET", &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // --- Issue 4.3: Voluntary exit integration tests ---
+
+    #[tokio::test]
+    async fn test_voluntary_exit_with_epoch_integration() {
+        let pk = test_pubkey(1);
+        let exit_mgr = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), Some(exit_mgr));
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/voluntary_exit?epoch=300000");
+
+        let resp = router.oneshot(authed_post(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["data"]["message"]["epoch"], "300000");
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_auto_epoch_integration() {
+        let pk = test_pubkey(1);
+        let exit_mgr = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), Some(exit_mgr));
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/voluntary_exit");
+
+        let resp = router.oneshot(authed_post(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        // Mock defaults to epoch 100 when not specified
+        assert_eq!(json["data"]["message"]["epoch"], "100");
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_invalid_epoch_integration() {
+        let pk = test_pubkey(1);
+        let exit_mgr = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), Some(exit_mgr));
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/voluntary_exit?epoch=abc");
+
+        let resp = router.oneshot(authed_post(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_unknown_pubkey_integration() {
+        let pk = test_pubkey(1);
+        let exit_mgr = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), Some(exit_mgr));
+        let unknown_hex = format!("0x{}", test_pubkey_hex(99));
+        let uri = format!("/eth/v1/validator/{unknown_hex}/voluntary_exit");
+
+        let resp = router.oneshot(authed_post(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_no_manager_integration() {
+        let pk = test_pubkey(1);
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), None);
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/voluntary_exit");
+
+        let resp = router.oneshot(authed_post(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_auth_required_integration() {
+        let pk = test_pubkey(1);
+        let exit_mgr = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let (router, _token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), Some(exit_mgr));
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/voluntary_exit");
+
+        let resp = router.oneshot(unauthenticated_request("POST", &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_voluntary_exit_response_schema() {
+        let pk = test_pubkey(1);
+        let exit_mgr = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let (router, token) =
+            full_authed_router(MockValidatorConfigManager::with_validator(pk), Some(exit_mgr));
+        let pubkey_hex = format!("0x{}", test_pubkey_hex(1));
+        let uri = format!("/eth/v1/validator/{pubkey_hex}/voluntary_exit?epoch=300000");
+
+        let resp = router.oneshot(authed_post(&token, &uri)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // epoch and validator_index must be strings per Eth2 spec
+        assert!(json["data"]["message"]["epoch"].is_string(), "epoch must be a string");
+        assert!(
+            json["data"]["message"]["validator_index"].is_string(),
+            "validator_index must be a string"
+        );
+
+        // signature must be 0x-prefixed hex
+        let sig = json["data"]["signature"].as_str().expect("signature must be a string");
+        assert!(sig.starts_with("0x"), "signature must start with 0x");
+        assert!(
+            hex::decode(sig.strip_prefix("0x").unwrap()).is_ok(),
+            "signature must be valid hex"
+        );
     }
 }

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crypto::logging::TruncatedPubkey;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use zeroize::Zeroizing;
@@ -47,6 +48,22 @@ impl KeystoreReloader {
     }
 
     async fn scan_and_reload(&self) {
+        // ISSUE-4.6 / L-6: refuse to reload from a permissive keystore
+        // directory.  The reloader runs as the signer process and reads
+        // any *.json file it finds, so if the directory is writable by
+        // anyone other than the signer UID a local attacker can inject
+        // a new key file and have it loaded automatically.  Strictly
+        // require 0o700 mode AND owner == signer UID (Unix).
+        #[cfg(unix)]
+        if let Err(e) = check_keystore_dir_perms(&self.dir) {
+            warn!(
+                dir = %self.dir.display(),
+                reason = %e,
+                "Skipping keystore reload pass: directory permissions not strict (ISSUE-4.6 / L-6)"
+            );
+            return;
+        }
+
         let disk_pubkeys = match self.scan_directory() {
             Ok(keys) => keys,
             Err(e) => {
@@ -77,18 +94,28 @@ impl KeystoreReloader {
                 // Try to find by scanning (filename might not match pubkey)
                 if let Some(sk) = self.try_load_pubkey(pubkey) {
                     self.backend.add_key(*pubkey, sk).await;
-                    info!(pubkey = %hex::encode(pubkey), "Keystore added via reload");
+                    info!(
+                        pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                        "Keystore added via reload"
+                    );
                     added += 1;
                 }
             } else {
                 match load_keystore_from_file(&path, &self.password) {
                     Ok((sk, _)) => {
                         self.backend.add_key(*pubkey, sk).await;
-                        info!(pubkey = %hex::encode(pubkey), "Keystore added via reload");
+                        info!(
+                            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                            "Keystore added via reload"
+                        );
                         added += 1;
                     }
                     Err(e) => {
-                        warn!(pubkey = %hex::encode(pubkey), error = %e, "Failed to load new keystore");
+                        warn!(
+                            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                            error = %e,
+                            "Failed to load new keystore"
+                        );
                     }
                 }
             }
@@ -96,7 +123,10 @@ impl KeystoreReloader {
 
         for pubkey in &to_remove {
             self.backend.remove_key(pubkey).await;
-            info!(pubkey = %hex::encode(pubkey), "Keystore removed via reload");
+            info!(
+                pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                "Keystore removed via reload"
+            );
             removed += 1;
         }
 
@@ -159,6 +189,48 @@ impl KeystoreReloader {
     }
 }
 
+/// Verify the keystore directory is owner-only readable AND owned by the
+/// current process UID (ISSUE-4.6 / L-6).
+///
+/// The reloader will load any `*.json` file found in this directory, so a
+/// permissive mode would allow a local attacker to inject a key.  Strictly
+/// require:
+///
+/// - mode `0o700` (owner-only read/write/execute) — group/other must be
+///   completely empty.
+/// - `metadata.uid() == effective_uid()` — the directory owner is the
+///   signer process owner.
+///
+/// Returns `Ok(())` on success or a human-readable explanation on
+/// failure; the caller logs and skips the pass.
+#[cfg(unix)]
+fn check_keystore_dir_perms(dir: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta =
+        std::fs::metadata(dir).map_err(|e| format!("cannot stat {}: {}", dir.display(), e))?;
+    if !meta.is_dir() {
+        return Err(format!("{} is not a directory", dir.display()));
+    }
+
+    let mode = meta.mode() & 0o777;
+    if mode != 0o700 {
+        return Err(format!("expected mode 0o700 on keystore dir, got 0o{:o}", mode));
+    }
+
+    // SAFETY: `geteuid` is always-safe (read-only access to a process attribute).
+    let euid = unsafe { libc::geteuid() };
+    if meta.uid() != euid {
+        return Err(format!(
+            "keystore dir owner uid={} does not match signer uid={}",
+            meta.uid(),
+            euid
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,11 +239,28 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// Tighten the test tempdir to 0o700 so the L-6 perm-check passes.
+    /// `tempfile::TempDir` on macOS creates dirs with broader perms than
+    /// the strict 0o700 we now require for hot-reload (ISSUE-4.6).
+    #[cfg(unix)]
+    fn make_strict(dir: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod test dir to 0o700");
+    }
+    #[cfg(not(unix))]
+    fn make_strict(_dir: &std::path::Path) {}
+
     fn create_test_keystore(dir: &std::path::Path, password: &str) -> ([u8; 48], SecretKey) {
         let sk = SecretKey::generate();
         let pubkey = sk.public_key().to_bytes();
-        let ks = Keystore::encrypt(&sk, password.as_bytes(), "", EncryptionKdf::Pbkdf2)
-            .expect("encrypt");
+        let ks = Keystore::encrypt(
+            &sk,
+            password.as_bytes(),
+            "",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("encrypt");
         let filename = format!("{}.json", hex::encode(pubkey));
         fs::write(dir.join(&filename), ks.to_json().unwrap()).unwrap();
         (pubkey, sk)
@@ -180,6 +269,7 @@ mod tests {
     #[tokio::test]
     async fn test_reloader_detects_new_keystore() {
         let dir = TempDir::new().unwrap();
+        make_strict(dir.path());
         let password = Zeroizing::new("test-password".to_string());
 
         // Start with empty signer
@@ -211,6 +301,7 @@ mod tests {
     #[tokio::test]
     async fn test_reloader_detects_removed_keystore() {
         let dir = TempDir::new().unwrap();
+        make_strict(dir.path());
         let password = Zeroizing::new("test-password".to_string());
 
         // Start with one key
@@ -240,6 +331,7 @@ mod tests {
     #[tokio::test]
     async fn test_reloader_no_changes_is_noop() {
         let dir = TempDir::new().unwrap();
+        make_strict(dir.path());
         let password = Zeroizing::new("test-password".to_string());
 
         let (pubkey, _sk) = create_test_keystore(dir.path(), &password);
@@ -263,6 +355,7 @@ mod tests {
     #[tokio::test]
     async fn test_reloader_run_with_cancellation() {
         let dir = TempDir::new().unwrap();
+        make_strict(dir.path());
         let password = Zeroizing::new("test-password".to_string());
 
         let signer = BasicSigner::load(dir.path(), &password).unwrap();
@@ -293,6 +386,7 @@ mod tests {
     #[tokio::test]
     async fn test_reloader_add_and_remove_multiple() {
         let dir = TempDir::new().unwrap();
+        make_strict(dir.path());
         let password = Zeroizing::new("test-password".to_string());
 
         let signer = BasicSigner::load(dir.path(), &password).unwrap();
@@ -327,6 +421,7 @@ mod tests {
     #[tokio::test]
     async fn test_reloader_concurrent_sign_during_reload() {
         let dir = TempDir::new().unwrap();
+        make_strict(dir.path());
         let password = Zeroizing::new("test-password".to_string());
 
         let (pubkey, _sk) = create_test_keystore(dir.path(), &password);

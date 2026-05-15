@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -14,8 +16,17 @@ pub enum BeaconError {
     #[error("Request timeout")]
     Timeout,
 
+    #[error("{operation} timed out after {timeout:?}")]
+    OperationTimeout { operation: String, timeout: Duration },
+
     #[error("Invalid endpoint URL: {0}")]
     InvalidUrl(String),
+
+    /// Response body exceeds the configured cap (H-12).
+    #[error(
+        "response body too large: expected \u{2264} {expected} bytes, received {got_so_far} bytes"
+    )]
+    BodyTooLarge { expected: usize, got_so_far: usize },
 }
 
 #[cfg(test)]
@@ -50,5 +61,14 @@ mod tests {
     fn test_invalid_url_error_display() {
         let err = BeaconError::InvalidUrl("not a valid url".to_string());
         assert_eq!(err.to_string(), "Invalid endpoint URL: not a valid url");
+    }
+
+    #[test]
+    fn test_operation_timeout_error_display() {
+        let err = BeaconError::OperationTimeout {
+            operation: "produce_block_v3".to_string(),
+            timeout: Duration::from_secs(3),
+        };
+        assert_eq!(err.to_string(), "produce_block_v3 timed out after 3s");
     }
 }

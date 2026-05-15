@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 
 use tracing::warn;
 
+use super::logging::TruncatedPubkey;
+
 /// Tracks decryption attempts per public key to detect and rate-limit potential brute-force attacks.
 ///
 /// While offline attacks cannot be fully prevented when an attacker has access to keystore files,
@@ -37,8 +39,8 @@ impl DecryptionAttemptTracker {
 
         if attempts.len() >= self.max_attempts {
             warn!(
-                pubkey = %pubkey,
-                attempts = attempts.len(),
+                pubkey = %TruncatedPubkey::new(pubkey),
+                attempt_count = attempts.len(),
                 "Rate limit exceeded for keystore decryption"
             );
             return false;
@@ -50,8 +52,10 @@ impl DecryptionAttemptTracker {
 
     /// Records a failed decryption attempt and logs a warning.
     pub fn record_failure(&mut self, pubkey: &str) {
+        let attempt_count = self.attempt_count(pubkey);
         warn!(
-            pubkey = %pubkey,
+            pubkey = %TruncatedPubkey::new(pubkey),
+            attempt_count = attempt_count,
             "Failed decryption attempt for keystore"
         );
     }

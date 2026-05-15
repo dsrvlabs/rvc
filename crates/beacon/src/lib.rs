@@ -4,11 +4,13 @@
 
 mod client;
 mod error;
+pub(crate) mod http_caps;
 pub mod ssz_deser;
 mod types;
 
 pub use client::{BeaconClient, BeaconClientConfig};
 pub use error::BeaconError;
+pub use http_caps::ResponseCaps;
 pub use types::{
     parse_fork_schedule, AttestationData, AttestationDataResponse, AttesterDutiesResponse,
     AttesterDuty, BeaconBlockHeader, BeaconCommitteeSubscription, BlockRootData, BlockRootResponse,

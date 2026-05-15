@@ -38,8 +38,13 @@ mod tests {
         use crypto::{EncryptionKdf, Keystore, SecretKey};
         let sk = SecretKey::generate();
         let pubkey = sk.public_key().to_bytes();
-        let ks = Keystore::encrypt(&sk, password.as_bytes(), "", EncryptionKdf::Pbkdf2)
-            .expect("encrypt");
+        let ks = Keystore::encrypt(
+            &sk,
+            password.as_bytes(),
+            "",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("encrypt");
         let filename = format!("{}.json", hex::encode(pubkey));
         std::fs::write(dir.join(&filename), ks.to_json().unwrap()).unwrap();
         pubkey
@@ -66,6 +71,7 @@ mod tests {
             tls_ca_cert: None,
             reload_interval: 30,
             reload_interval_is_default: true,
+            enable_hot_reload: false,
             dvt_peers: &[],
             dvt_threshold: None,
             dvt_index: None,
@@ -182,6 +188,13 @@ reload_interval_secs = 60
     #[tokio::test]
     async fn test_hot_reload_new_key_available() {
         let dir = TempDir::new().unwrap();
+        // ISSUE-4.6: tighten test dir to 0o700 so the L-6 perm-check passes.
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let password = Zeroizing::new("test-password".to_string());
 
         let signer = Arc::new(BasicSigner::load(dir.path(), &password).unwrap());
@@ -229,6 +242,12 @@ reload_interval_secs = 60
     #[tokio::test]
     async fn test_hot_reload_multiple_keys_added_incrementally() {
         let dir = TempDir::new().unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            dir.path(),
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o700),
+        )
+        .unwrap();
         let password = Zeroizing::new("test-password".to_string());
 
         let signer = Arc::new(BasicSigner::load(dir.path(), &password).unwrap());
@@ -482,6 +501,7 @@ keystore_dir = "{}"
             backend: "basic".to_string(),
             result: "success".to_string(),
             duration_ms: 42,
+            rpc: None,
         };
 
         assert!(!entry.timestamp.is_empty());
@@ -493,54 +513,14 @@ keystore_dir = "{}"
         assert_eq!(entry.duration_ms, 42);
     }
 
+    // `tracing-test` installs a single process-global subscriber and scopes
+    // captures per test via a span attached by `#[traced_test]`. Replaces
+    // a prior `set_default`-based capture which silently lost the event
+    // when sibling tests in the same binary primed the tracing callsite
+    // interest cache.
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn test_audit_log_emitted_on_sign_request() {
-        use std::sync::Mutex;
-        use tracing_subscriber::layer::SubscriberExt;
-
-        // Capture log events to verify audit entry
-        struct AuditCapture {
-            events: Arc<Mutex<Vec<String>>>,
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AuditCapture {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let mut visitor = MessageVisitor(String::new());
-                event.record(&mut visitor);
-                self.events.lock().unwrap().push(visitor.0);
-            }
-        }
-
-        struct MessageVisitor(String);
-
-        impl tracing::field::Visit for MessageVisitor {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.0 = format!("{:?}", value);
-                }
-            }
-
-            fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-                if field.name() == "audit" && value {
-                    self.0.push_str("[AUDIT]");
-                }
-            }
-
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                if field.name() == "message" {
-                    self.0 = value.to_string();
-                }
-            }
-        }
-
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let layer = AuditCapture { events: events.clone() };
-        let subscriber = tracing_subscriber::registry().with(layer);
-
         let dir = TempDir::new().unwrap();
         let password = Zeroizing::new("test-password".to_string());
         let pubkey = create_test_keystore(dir.path(), &password);
@@ -551,22 +531,13 @@ keystore_dir = "{}"
             "basic".to_string(),
         );
 
-        let _guard = tracing::subscriber::set_default(subscriber);
-
         let req = tonic::Request::new(crate::SignRequest {
             signing_root: vec![0u8; 32],
             pubkey: pubkey.to_vec(),
         });
         svc.sign(req).await.unwrap();
 
-        let captured = events.lock().unwrap();
-        assert!(
-            captured
-                .iter()
-                .any(|msg| msg.contains("sign request audit") || msg.contains("[AUDIT]")),
-            "audit log entry should be emitted on sign, captured: {:?}",
-            *captured,
-        );
+        assert!(logs_contain("sign request audit"), "audit log entry should be emitted on sign",);
     }
 
     #[test]
@@ -586,7 +557,7 @@ keystore_dir = "{}"
         let key = rcgen::KeyPair::generate().unwrap();
         let cert = params.self_signed(&key).unwrap();
 
-        let cn = crate::audit::extract_cn_from_der(cert.der().as_ref());
+        let cn = crate::audit::cn::extract_cn_from_der(cert.der().as_ref());
         assert_eq!(cn, Some("integration-test-client".to_string()));
     }
 

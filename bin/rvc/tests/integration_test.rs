@@ -8,12 +8,18 @@ use tempfile::{NamedTempFile, TempDir};
 const BINARY_NAME: &str = "rvc";
 
 fn build_binary() {
-    let status = Command::new("cargo")
-        .args(["build", "--package", "rvc-bin"])
-        .status()
-        .expect("Failed to build binary");
+    use std::sync::OnceLock;
+    static BUILD_OK: OnceLock<bool> = OnceLock::new();
 
-    assert!(status.success(), "Failed to build rvc binary");
+    let ok = *BUILD_OK.get_or_init(|| {
+        Command::new("cargo")
+            .args(["build", "--package", "rvc-bin"])
+            .status()
+            .expect("Failed to build binary")
+            .success()
+    });
+
+    assert!(ok, "Failed to build rvc binary");
 }
 
 fn get_binary_path() -> std::path::PathBuf {

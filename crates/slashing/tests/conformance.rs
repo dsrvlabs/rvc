@@ -2,7 +2,8 @@
 //!
 //! Integrates all 38 test cases from the official
 //! `eth-clients/slashing-protection-interchange-tests` repository.
-//! Tests both "complete" and "minimal" import strategies.
+//! Tests "complete", "minimal conservative" (HashMap-based), and
+//! "real watermarks" (SlashingDb watermark API) import strategies.
 
 use std::collections::HashMap;
 
@@ -100,7 +101,13 @@ fn run_complete(test: &TestCase) {
         // Run block checks
         for (i, block) in step.blocks.iter().enumerate() {
             let slot: u64 = block.slot.parse().unwrap();
-            let result = db.check_and_record_block(&block.pubkey, slot, block.signing_root.clone());
+            let result = db.check_and_record_block(
+                "local-vc",
+                &block.pubkey,
+                slot,
+                block.signing_root.clone(),
+                &[0u8; 32],
+            );
 
             if block.should_succeed_complete {
                 assert!(
@@ -125,10 +132,12 @@ fn run_complete(test: &TestCase) {
             let source: u64 = att.source_epoch.parse().unwrap();
             let target: u64 = att.target_epoch.parse().unwrap();
             let result = db.check_and_record_attestation(
+                "local-vc",
                 &att.pubkey,
                 source,
                 target,
                 att.signing_root.clone(),
+                &[0u8; 32],
             );
 
             if att.should_succeed_complete {
@@ -152,10 +161,10 @@ fn run_complete(test: &TestCase) {
 }
 
 // ---------------------------------------------------------------------------
-// Minimal strategy runner (watermark-based)
+// Minimal conservative strategy runner (HashMap-based watermarks)
 // ---------------------------------------------------------------------------
 
-fn run_minimal(test: &TestCase) {
+fn run_minimal_conservative(test: &TestCase) {
     let gvr = &test.genesis_validators_root;
 
     // Track per-validator watermarks
@@ -255,6 +264,110 @@ fn run_minimal(test: &TestCase) {
 }
 
 // ---------------------------------------------------------------------------
+// Real watermarks strategy runner (SlashingDb watermark API)
+// ---------------------------------------------------------------------------
+
+fn run_with_real_watermarks(test: &TestCase) {
+    let db = SlashingDb::open_in_memory().expect("failed to open db");
+    let gvr = &test.genesis_validators_root;
+
+    for (step_idx, step) in test.steps.iter().enumerate() {
+        // GVR mismatch check
+        if step.interchange.metadata.genesis_validators_root != *gvr {
+            assert!(
+                !step.should_succeed,
+                "[real_wm] {}: step {step_idx}: GVR mismatch but should_succeed is true",
+                test.name
+            );
+            continue;
+        }
+
+        // Import: update watermarks from interchange data using real SlashingDb API
+        for validator in &step.interchange.data {
+            let max_slot =
+                validator.signed_blocks.iter().map(|b| b.slot.parse::<u64>().unwrap()).max();
+            if let Some(slot) = max_slot {
+                let current = db.get_block_watermark(&validator.pubkey).unwrap().unwrap_or(0);
+                db.set_block_watermark(&validator.pubkey, slot.max(current)).unwrap();
+            }
+
+            let max_source = validator
+                .signed_attestations
+                .iter()
+                .map(|a| a.source_epoch.parse::<u64>().unwrap())
+                .max();
+            let max_target = validator
+                .signed_attestations
+                .iter()
+                .map(|a| a.target_epoch.parse::<u64>().unwrap())
+                .max();
+            if let (Some(source), Some(target)) = (max_source, max_target) {
+                let (cur_source, cur_target) =
+                    db.get_attestation_watermark(&validator.pubkey).unwrap().unwrap_or((0, 0));
+                db.set_attestation_watermark(
+                    &validator.pubkey,
+                    source.max(cur_source),
+                    target.max(cur_target),
+                )
+                .unwrap();
+            }
+        }
+
+        // Block checks using real SlashingDb watermark API
+        for (i, block) in step.blocks.iter().enumerate() {
+            let slot: u64 = block.slot.parse().unwrap();
+            let watermark = db.get_block_watermark(&block.pubkey).unwrap();
+            let success = match watermark {
+                Some(wm) => slot > wm,
+                None => true,
+            };
+
+            if success {
+                let current = db.get_block_watermark(&block.pubkey).unwrap().unwrap_or(0);
+                db.set_block_watermark(&block.pubkey, slot.max(current)).unwrap();
+            }
+
+            assert_eq!(
+                success, block.should_succeed,
+                "[real_wm] {}: step {step_idx}, block {i} (slot={slot}): \
+                 expected should_succeed={}, got {success}",
+                test.name, block.should_succeed
+            );
+        }
+
+        // Attestation checks using real SlashingDb watermark API
+        for (i, att) in step.attestations.iter().enumerate() {
+            let source: u64 = att.source_epoch.parse().unwrap();
+            let target: u64 = att.target_epoch.parse().unwrap();
+
+            let watermark = db.get_attestation_watermark(&att.pubkey).unwrap();
+            let success = match watermark {
+                Some((wm_source, wm_target)) => source >= wm_source && target > wm_target,
+                None => true,
+            };
+
+            if success {
+                let (cur_source, cur_target) =
+                    db.get_attestation_watermark(&att.pubkey).unwrap().unwrap_or((0, 0));
+                db.set_attestation_watermark(
+                    &att.pubkey,
+                    source.max(cur_source),
+                    target.max(cur_target),
+                )
+                .unwrap();
+            }
+
+            assert_eq!(
+                success, att.should_succeed,
+                "[real_wm] {}: step {step_idx}, attestation {i} \
+                 (src={source}, tgt={target}): expected should_succeed={}, got {success}",
+                test.name, att.should_succeed
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Macro to generate test functions for all 38 test cases
 // ---------------------------------------------------------------------------
 
@@ -270,9 +383,15 @@ macro_rules! conformance_test {
             }
 
             #[test]
-            fn minimal() {
+            fn minimal_conservative() {
                 let test = load_test_case(stringify!($name));
-                run_minimal(&test);
+                run_minimal_conservative(&test);
+            }
+
+            #[test]
+            fn real_watermarks() {
+                let test = load_test_case(stringify!($name));
+                run_with_real_watermarks(&test);
             }
         }
     };

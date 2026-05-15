@@ -8,6 +8,8 @@ pub enum Network {
     #[default]
     Mainnet,
     Hoodi,
+    Holesky,
+    Sepolia,
     Custom,
 }
 
@@ -16,6 +18,8 @@ impl Network {
         match self {
             Network::Mainnet => Some(1606824023),
             Network::Hoodi => Some(1742213400),
+            Network::Holesky => Some(1695902400),
+            Network::Sepolia => Some(1655733600),
             Network::Custom => None,
         }
     }
@@ -27,6 +31,12 @@ impl Network {
             }
             Network::Hoodi => {
                 Some("0x212f13fc4df078b6cb7db228f1c8307566dcecf900867401a92023d7ba99cb5f")
+            }
+            Network::Holesky => {
+                Some("0x9143aa7c615a7f7115e2b6aac319c03529df8242ae705fba9df39b79c59fa8b1")
+            }
+            Network::Sepolia => {
+                Some("0xd8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078")
             }
             Network::Custom => None,
         }
@@ -48,6 +58,8 @@ impl std::str::FromStr for Network {
         match s.to_lowercase().as_str() {
             "mainnet" => Ok(Network::Mainnet),
             "hoodi" => Ok(Network::Hoodi),
+            "holesky" => Ok(Network::Holesky),
+            "sepolia" => Ok(Network::Sepolia),
             "custom" => Ok(Network::Custom),
             _ => Err(format!("unknown network: {}", s)),
         }
@@ -59,6 +71,8 @@ impl std::fmt::Display for Network {
         match self {
             Network::Mainnet => write!(f, "mainnet"),
             Network::Hoodi => write!(f, "hoodi"),
+            Network::Holesky => write!(f, "holesky"),
+            Network::Sepolia => write!(f, "sepolia"),
             Network::Custom => write!(f, "custom"),
         }
     }
@@ -98,8 +112,14 @@ mod tests {
     #[test]
     fn test_network_from_str_deprecated_networks_rejected() {
         assert!("goerli".parse::<Network>().is_err());
-        assert!("sepolia".parse::<Network>().is_err());
-        assert!("holesky".parse::<Network>().is_err());
+    }
+
+    #[test]
+    fn test_network_from_str_testnets_accepted() {
+        assert_eq!("holesky".parse::<Network>().unwrap(), Network::Holesky);
+        assert_eq!("HOLESKY".parse::<Network>().unwrap(), Network::Holesky);
+        assert_eq!("sepolia".parse::<Network>().unwrap(), Network::Sepolia);
+        assert_eq!("SEPOLIA".parse::<Network>().unwrap(), Network::Sepolia);
     }
 
     #[test]
@@ -132,8 +152,39 @@ mod tests {
     #[test]
     fn test_network_serde_deprecated_networks_rejected() {
         assert!(serde_json::from_str::<Network>("\"goerli\"").is_err());
-        assert!(serde_json::from_str::<Network>("\"sepolia\"").is_err());
-        assert!(serde_json::from_str::<Network>("\"holesky\"").is_err());
+    }
+
+    #[test]
+    fn test_network_serde_testnets() {
+        let holesky = Network::Holesky;
+        let json = serde_json::to_string(&holesky).unwrap();
+        assert_eq!(json, "\"holesky\"");
+        let parsed: Network = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, Network::Holesky);
+
+        let sepolia = Network::Sepolia;
+        let json = serde_json::to_string(&sepolia).unwrap();
+        assert_eq!(json, "\"sepolia\"");
+        let parsed: Network = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, Network::Sepolia);
+    }
+
+    #[test]
+    fn test_network_genesis_constants_holesky() {
+        assert_eq!(Network::Holesky.genesis_time(), Some(1695902400));
+        assert_eq!(
+            Network::Holesky.genesis_validators_root(),
+            Some("0x9143aa7c615a7f7115e2b6aac319c03529df8242ae705fba9df39b79c59fa8b1")
+        );
+    }
+
+    #[test]
+    fn test_network_genesis_constants_sepolia() {
+        assert_eq!(Network::Sepolia.genesis_time(), Some(1655733600));
+        assert_eq!(
+            Network::Sepolia.genesis_validators_root(),
+            Some("0xd8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078")
+        );
     }
 
     #[test]

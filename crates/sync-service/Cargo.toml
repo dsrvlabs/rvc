@@ -14,4 +14,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
+eth-types = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

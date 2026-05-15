@@ -1,0 +1,48 @@
+# Build artifacts
+target/
+
+# Version control
+.git/
+.gitignore
+
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation
+docs/
+plan/
+README.md
+LICENSE*
+CHANGELOG*
+CLAUDE.md
+ARCHITECTURE.md
+CODE_REVIEW_REPORT.md
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Docker (avoid recursive context)
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Secrets and local config
+*.pem
+*.key
+*.crt
+.env
+.env.*
+*.env
+keystores/
+secrets/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Test fixtures
+tests/fixtures/

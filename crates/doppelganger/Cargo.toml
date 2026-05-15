@@ -10,6 +10,7 @@ keywords = ["ethereum", "validator", "doppelganger", "safety"]
 categories = ["cryptography::cryptocurrencies"]
 
 [dependencies]
+crypto = { workspace = true }
 eth-types = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }

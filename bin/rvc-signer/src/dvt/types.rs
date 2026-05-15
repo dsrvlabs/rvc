@@ -40,7 +40,11 @@ pub struct ShareMetadata {
 }
 
 /// A loaded Shamir secret share with its associated metadata.
-#[derive(Debug)]
+///
+/// `Clone` is derived so shares can be extracted from a `HashMap` by value.
+/// The scalar bytes are wrapped in `Zeroizing` to ensure they are zeroed on
+/// drop even after cloning.
+#[derive(Debug, Clone)]
 pub struct ShareInfo {
     pub index: u64,
     pub threshold: u64,

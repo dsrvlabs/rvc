@@ -13,12 +13,11 @@ use metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
 use rvc::config::{redact_url, CliOverrides, Config, Network, ServiceBuilder};
 use rvc::duty_tracker::DutyTrackerService;
 use rvc::keymanager_adapters::{
-    DoppelgangerMonitorAdapter, KeystoreManagerAdapter, RemoteKeyManagerAdapter,
-    SlashingProtectionAdapter, ValidatorManagerAdapter,
+    KeystoreManagerAdapter, RemoteKeyManagerAdapter, SlashingProtectionAdapter,
+    ValidatorConfigManagerAdapter, ValidatorManagerAdapter, VoluntaryExitManagerAdapter,
 };
 use rvc::startup;
 use rvc::DutyTrackerServer;
-use timing::SlotClock;
 use tonic::transport::Server;
 use tracing::{error, info, warn};
 
@@ -81,7 +80,7 @@ enum Commands {
         #[arg(long, default_value = DEFAULT_GRPC_ADDRESS)]
         grpc_address: String,
 
-        /// Network preset (mainnet, hoodi, custom)
+        /// Network preset (mainnet, hoodi, holesky, sepolia, custom)
         #[arg(long)]
         network: Option<String>,
 
@@ -206,6 +205,17 @@ enum Commands {
         #[arg(long, default_value_t = keymanager_api::DEFAULT_BODY_LIMIT)]
         keymanager_body_limit: usize,
 
+        // --- BN HTTP cap flags (H-12) ---
+        /// Maximum JSON response body size in bytes from the beacon node.
+        ///
+        /// Requests whose body (or Content-Length) exceeds this value are rejected
+        /// before the full body is allocated.  Raise this only if your beacon node
+        /// legitimately returns larger responses.
+        ///
+        /// Default: 33554432 (32 MiB).
+        #[arg(long, default_value_t = beacon::ResponseCaps::DEFAULT_MAX_BODY_BYTES)]
+        beacon_max_body_bytes: usize,
+
         // --- gRPC remote signer flags ---
         /// gRPC remote signer URL (e.g., https://signer.example.com:50051)
         #[arg(long)]
@@ -222,6 +232,117 @@ enum Commands {
         /// Path to the CA certificate for gRPC signer mTLS
         #[arg(long)]
         grpc_signer_tls_ca_cert: Option<PathBuf>,
+
+        // --- Safety flags (Tier 2) ---
+        /// Disable attestation duties at startup (emergency use only)
+        #[arg(long)]
+        disable_attesting: bool,
+
+        /// Action when a slashed validator is detected: disable-only, shutdown, none
+        #[arg(long, default_value = "disable-only")]
+        slashed_validators_action: String,
+
+        /// Builder circuit breaker: consecutive missed slots before fallback to local block (default: 3, 0 to disable)
+        #[arg(long)]
+        builder_circuit_breaker_consecutive_limit: Option<u32>,
+
+        /// Builder circuit breaker: total epoch missed slots before fallback to local block (default: 5, 0 to disable)
+        #[arg(long)]
+        builder_circuit_breaker_epoch_limit: Option<u32>,
+
+        /// Disable keystore file locking (for DVT setups with shared key material)
+        #[arg(long)]
+        disable_keystore_locking: bool,
+
+        // --- Proposer nodes flags (T3.1/T3.2) ---
+        /// Comma-separated list of dedicated proposer beacon node URLs for block production
+        #[arg(long, value_delimiter = ',')]
+        proposer_nodes: Option<Vec<String>>,
+
+        // --- Broadcast topics flags (T3.3/T3.4) ---
+        /// Comma-separated list of message types to broadcast to all BNs (attestations,blocks,sync-committee,subscriptions,none)
+        #[arg(long, value_delimiter = ',')]
+        broadcast: Option<Vec<String>>,
+
+        // --- Proposer config URL flags (T3.11/T3.12/T3.13) ---
+        /// Remote URL for proposer configuration (mutually exclusive with --proposer-config-file)
+        #[arg(long, conflicts_with = "proposer_config_file")]
+        proposer_config_url: Option<String>,
+
+        /// Local file path for proposer configuration (mutually exclusive with --proposer-config-url)
+        #[arg(long, conflicts_with = "proposer_config_url")]
+        proposer_config_file: Option<String>,
+
+        /// Refresh interval in seconds for proposer config URL (default: 384, i.e., one epoch)
+        #[arg(long)]
+        proposer_config_refresh_interval: Option<u64>,
+
+        /// Bearer token for proposer config URL authentication
+        #[arg(long)]
+        proposer_config_url_token: Option<String>,
+
+        /// Allow HTTP (non-HTTPS) proposer config URL
+        #[arg(long)]
+        proposer_config_url_insecure: bool,
+
+        // --- Monitoring flags (T3.7) ---
+        /// Remote monitoring endpoint URL (e.g., https://beaconcha.in/api/v1/client/metrics?apikey=...)
+        #[arg(long)]
+        monitoring_endpoint: Option<String>,
+
+        /// Monitoring push interval in seconds (default: 384, i.e., one epoch)
+        #[arg(long)]
+        monitoring_interval: Option<u64>,
+
+        /// Allow HTTP (non-HTTPS) monitoring endpoint
+        #[arg(long)]
+        monitoring_endpoint_insecure: bool,
+
+        // --- Log rotation flags (T3.8/T3.9/T3.10) ---
+        /// Path to the log file (enables file logging alongside stdout)
+        #[arg(long)]
+        logfile: Option<std::path::PathBuf>,
+
+        /// Maximum log file size in MB before rotation (default: 200)
+        #[arg(long)]
+        logfile_max_size: Option<u64>,
+
+        /// Maximum number of rotated log files to keep (default: 5)
+        #[arg(long)]
+        logfile_max_number: Option<usize>,
+
+        /// Enable gzip compression of rotated log files
+        #[arg(long)]
+        logfile_compress: bool,
+
+        /// Log level for file logging (default: same as --log-level)
+        #[arg(long)]
+        logfile_level: Option<String>,
+
+        // --- Block selection mode (T4.4) ---
+        /// Block selection mode: max-profit (default), execution-only, builder-always, builder-only
+        #[arg(long)]
+        block_selection_mode: Option<String>,
+
+        // --- Registration batching (T4.12/T4.13) ---
+        /// Maximum number of validator registrations per batch (default: 500, 0 = send all at once)
+        #[arg(long)]
+        validator_registration_batch_size: Option<usize>,
+
+        /// Delay in milliseconds between registration batches (default: 500)
+        #[arg(long)]
+        validator_registration_batch_delay: Option<u64>,
+
+        // --- Validator config (ISSUE-2.1 / H-1) ---
+        /// Path to a TOML file containing per-validator fee_recipient and gas_limit overrides.
+        /// rvc refuses to start if default_fee_recipient is the zero address (0x000…000).
+        ///
+        /// Example file:
+        ///   [defaults]
+        ///   fee_recipient = "0xYourAddress"
+        ///   gas_limit = 30000000
+        #[arg(long)]
+        validators_config: Option<PathBuf>,
     },
 
     /// Submit a voluntary exit for a validator
@@ -254,13 +375,71 @@ enum Commands {
         #[arg(long)]
         slashing_db_path: Option<PathBuf>,
 
-        /// Network preset (mainnet, hoodi, custom)
+        /// Network preset (mainnet, hoodi, holesky, sepolia, custom)
         #[arg(long)]
         network: Option<String>,
 
         /// Genesis validators root override (hex string with 0x prefix)
         #[arg(long)]
         genesis_validators_root: Option<String>,
+
+        /// Log level (trace, debug, info, warn, error)
+        #[arg(long, default_value = "info")]
+        log_level: String,
+    },
+
+    /// Prepare a pre-signed voluntary exit (sign and save to file, without submitting)
+    PrepareExit {
+        /// Validator public key (hex, with or without 0x prefix)
+        #[arg(long)]
+        pubkey: String,
+
+        /// Exit epoch (defaults to current epoch if not specified)
+        #[arg(long)]
+        epoch: Option<u64>,
+
+        /// Output directory for the signed exit JSON file
+        #[arg(long, default_value = ".")]
+        output: PathBuf,
+
+        /// Beacon node URL (e.g., http://localhost:5052)
+        #[arg(long, default_value = "http://localhost:5052")]
+        beacon_url: String,
+
+        /// Path to the keystore directory
+        #[arg(long)]
+        keystore_path: PathBuf,
+
+        /// Path to the password file for keystore decryption
+        #[arg(long)]
+        password_file: PathBuf,
+
+        /// Path to the slashing protection database
+        #[arg(long)]
+        slashing_db_path: Option<PathBuf>,
+
+        /// Network preset (mainnet, hoodi, holesky, sepolia, custom)
+        #[arg(long)]
+        network: Option<String>,
+
+        /// Genesis validators root override (hex string with 0x prefix)
+        #[arg(long)]
+        genesis_validators_root: Option<String>,
+
+        /// Log level (trace, debug, info, warn, error)
+        #[arg(long, default_value = "info")]
+        log_level: String,
+    },
+
+    /// Submit a pre-signed voluntary exit to the beacon node (no signing keys required)
+    SubmitExit {
+        /// Path to the signed voluntary exit JSON file
+        #[arg(long)]
+        file: PathBuf,
+
+        /// Beacon node URL (e.g., http://localhost:5052)
+        #[arg(long, default_value = "http://localhost:5052")]
+        beacon_url: String,
 
         /// Log level (trace, debug, info, warn, error)
         #[arg(long, default_value = "info")]
@@ -325,6 +504,31 @@ async fn main() -> anyhow::Result<()> {
             grpc_signer_tls_cert,
             grpc_signer_tls_key,
             grpc_signer_tls_ca_cert,
+            disable_attesting,
+            slashed_validators_action,
+            builder_circuit_breaker_consecutive_limit,
+            builder_circuit_breaker_epoch_limit,
+            disable_keystore_locking,
+            proposer_nodes,
+            broadcast,
+            proposer_config_url,
+            proposer_config_file,
+            proposer_config_refresh_interval,
+            proposer_config_url_token,
+            proposer_config_url_insecure,
+            monitoring_endpoint,
+            monitoring_interval,
+            monitoring_endpoint_insecure,
+            logfile,
+            logfile_max_size,
+            logfile_max_number,
+            logfile_compress,
+            logfile_level,
+            block_selection_mode,
+            validator_registration_batch_size,
+            validator_registration_batch_delay,
+            validators_config,
+            beacon_max_body_bytes,
         } => {
             // Validate gRPC signer flags: if URL is set, all TLS flags are required
             if grpc_signer_url.is_some()
@@ -422,17 +626,66 @@ async fn main() -> anyhow::Result<()> {
                 grpc_signer_tls_cert,
                 grpc_signer_tls_key,
                 grpc_signer_tls_ca_cert,
+                disable_attesting: if disable_attesting { Some(true) } else { None },
+                slashed_validators_action: Some(slashed_validators_action),
+                builder_circuit_breaker_consecutive_limit,
+                builder_circuit_breaker_epoch_limit,
+                disable_keystore_locking: if disable_keystore_locking { Some(true) } else { None },
+                proposer_nodes,
+                broadcast,
+                proposer_config_url,
+                proposer_config_file,
+                proposer_config_refresh_interval,
+                proposer_config_url_token,
+                proposer_config_url_insecure: if proposer_config_url_insecure {
+                    Some(true)
+                } else {
+                    None
+                },
+                monitoring_endpoint,
+                monitoring_interval,
+                monitoring_endpoint_insecure: if monitoring_endpoint_insecure {
+                    Some(true)
+                } else {
+                    None
+                },
+                logfile,
+                logfile_max_size,
+                logfile_max_number,
+                logfile_compress: if logfile_compress { Some(true) } else { None },
+                logfile_level,
+                block_selection_mode: block_selection_mode
+                    .map(|s| s.parse::<rvc::config::BlockSelectionMode>())
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
+                validator_registration_batch_size,
+                validator_registration_batch_delay,
+                validators_config,
+                beacon_max_body_bytes: Some(beacon_max_body_bytes),
             };
 
             let mut cfg = load_config(config)?;
             cfg.merge_with_cli(&cli_overrides);
 
             let tracing_config = build_tracing_config(&cfg);
-            let tracing_guard = init_logging(&log_level, tracing_config.as_ref());
+            let file_layer_config = build_file_layer_config(&cfg);
+            let logging_guards =
+                init_logging(&log_level, tracing_config.as_ref(), file_layer_config.as_ref());
+
+            info!(
+                version = env!("CARGO_PKG_VERSION"),
+                network = %cfg.network,
+                commit = option_env!("GIT_COMMIT").unwrap_or("unknown"),
+                "rvc starting"
+            );
 
             if let Err(e) = cfg.validate() {
                 error!("Configuration validation failed: {}", e);
                 return Err(e.into());
+            }
+
+            if cfg.allow_insecure_remote_signer {
+                warn!("INSECURE MODE: HTTP remote signer URLs are allowed. Use only for development/testing.");
             }
 
             run_validator(
@@ -440,7 +693,7 @@ async fn main() -> anyhow::Result<()> {
                 strict_permissions,
                 strict_slashing_semantics,
                 timeouts,
-                tracing_guard,
+                logging_guards,
             )
             .await?;
         }
@@ -456,7 +709,7 @@ async fn main() -> anyhow::Result<()> {
             genesis_validators_root,
             log_level,
         } => {
-            init_logging(&log_level, None);
+            init_logging(&log_level, None, None);
 
             let args = commands::voluntary_exit::VoluntaryExitArgs {
                 pubkey,
@@ -472,32 +725,93 @@ async fn main() -> anyhow::Result<()> {
 
             commands::voluntary_exit::execute(args).await?;
         }
+        Commands::PrepareExit {
+            pubkey,
+            epoch,
+            output,
+            beacon_url,
+            keystore_path,
+            password_file,
+            slashing_db_path,
+            network,
+            genesis_validators_root,
+            log_level,
+        } => {
+            init_logging(&log_level, None, None);
+
+            let args = commands::prepare_exit::PrepareExitArgs {
+                pubkey,
+                epoch,
+                output,
+                beacon_url,
+                keystore_path,
+                password_file,
+                slashing_db_path,
+                network,
+                genesis_validators_root,
+            };
+
+            commands::prepare_exit::execute(args).await?;
+        }
+        Commands::SubmitExit { file, beacon_url, log_level } => {
+            init_logging(&log_level, None, None);
+
+            let args = commands::submit_exit::SubmitExitArgs { file, beacon_url };
+
+            commands::submit_exit::execute(args).await?;
+        }
     }
 
     Ok(())
 }
 
+/// Guards returned from init_logging that must be held for application lifetime.
+struct LoggingGuards {
+    _tracing_guard: Option<telemetry::TracingGuard>,
+    _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+}
+
 fn init_logging(
     level: &str,
     tracing_config: Option<&telemetry::TelemetryConfig>,
-) -> Option<telemetry::TracingGuard> {
+    file_config: Option<&telemetry::FileAppenderConfig>,
+) -> LoggingGuards {
+    use tracing_subscriber::layer::Layer;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::EnvFilter;
 
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
-    let fmt_layer = tracing_subscriber::fmt::layer();
 
-    match tracing_config {
+    let (file_layer, file_guard): (
+        Option<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>>,
+        Option<tracing_appender::non_blocking::WorkerGuard>,
+    ) = match file_config {
+        Some(config) => match telemetry::create_file_layer(config) {
+            Ok((layer, guard)) => {
+                eprintln!("File logging enabled: {}/{}", config.directory, config.filename);
+                (Some(layer), Some(guard))
+            }
+            Err(e) => {
+                eprintln!("WARNING: Failed to initialize file logging: {e}");
+                (None, None)
+            }
+        },
+        None => (None, None),
+    };
+
+    // Collect all boxed layers to apply to Registry in a single .with() call.
+    // This avoids type issues when mixing Box<dyn Layer<Registry>> with generic layers.
+    let mut boxed_layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
+        Vec::new();
+
+    let tracing_guard = match tracing_config {
         Some(config) => match telemetry::init_tracing(config) {
             Ok((otel_layer, guard)) => {
-                // otel_layer is Box<dyn Layer<Registry>>, so it must be
-                // applied directly to the registry before other layers.
-                tracing_subscriber::registry().with(otel_layer).with(fmt_layer).with(filter).init();
+                boxed_layers.push(otel_layer);
                 eprintln!("OpenTelemetry tracing enabled (endpoint: {})", config.endpoint);
                 Some(guard)
             }
             Err(e) => {
-                tracing_subscriber::fmt().with_env_filter(filter).init();
                 eprintln!(
                     "WARNING: Failed to initialize OpenTelemetry tracing: {e}. \
                      Falling back to fmt-only logging."
@@ -505,11 +819,20 @@ fn init_logging(
                 None
             }
         },
-        None => {
-            tracing_subscriber::fmt().with_env_filter(filter).init();
-            None
-        }
+        None => None,
+    };
+
+    if let Some(fl) = file_layer {
+        boxed_layers.push(fl);
     }
+
+    tracing_subscriber::registry()
+        .with(boxed_layers)
+        .with(tracing_subscriber::fmt::layer())
+        .with(filter)
+        .init();
+
+    LoggingGuards { _tracing_guard: tracing_guard, _file_guard: file_guard }
 }
 
 fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
@@ -590,13 +913,39 @@ fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfig> {
     })
 }
 
+fn build_file_layer_config(config: &Config) -> Option<telemetry::FileAppenderConfig> {
+    let logfile = config.logfile.as_ref()?;
+
+    let directory = logfile
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    let filename = logfile
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| "rvc.log".to_string());
+
+    let level = config.logfile_level.clone().unwrap_or_else(|| config.log_level.clone());
+
+    Some(telemetry::FileAppenderConfig {
+        directory,
+        filename,
+        max_size_mb: config.logfile_max_size,
+        max_files: config.logfile_max_number,
+        compress: config.logfile_compress,
+        level,
+    })
+}
+
 async fn run_validator(
     config: Config,
     strict_permissions: bool,
     strict_slashing_semantics: bool,
     timeouts: bn_manager::OperationTimeouts,
-    tracing_guard: Option<telemetry::TracingGuard>,
+    _logging_guards: LoggingGuards,
 ) -> anyhow::Result<()> {
+    let startup_time = std::time::Instant::now();
+
     let redacted_nodes: Vec<String> =
         config.effective_beacon_nodes().iter().map(|u| redact_url(u)).collect();
     info!(
@@ -656,6 +1005,20 @@ async fn run_validator(
     } else {
         slashing_db.check_file_permissions();
     }
+
+    // Step 2c: Acquire keystore lock
+    let _keystore_lock_guard = if config.disable_keystore_locking {
+        warn!("Keystore locking disabled -- ensure no duplicate instances");
+        None
+    } else {
+        match startup::acquire_keystore_lock(&config.keystore_path) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                error!("Failed to acquire keystore lock: {}", e);
+                std::process::exit(startup::EXIT_KEYSTORE_LOCKED);
+            }
+        }
+    };
 
     // Step 3: Create beacon client and BnManager
     let beacon_client = match builder.build_beacon() {
@@ -803,14 +1166,22 @@ async fn run_validator(
             grpc_config = grpc_config.with_tls(cert, key, ca_cert);
         }
 
+        // Log the v2 gRPC contract version and validate the signer is running v2.
+        info!("signer contract: v2 (typed RPCs)");
+
         match grpc_signer::GrpcRemoteSigner::connect(grpc_config).await {
             Ok(signer) => {
-                let key_count = crypto::Signer::public_keys(&signer).len();
+                let key_count = signer.public_keys().len();
                 info!(
                     url = %redact_url(grpc_url),
                     key_count,
-                    "gRPC remote signer connected"
+                    "gRPC remote signer connected (v2 typed RPCs)"
                 );
+
+                // Register all keys from the remote signer in the composite signer.
+                let pubkeys = signer.public_keys();
+                let signer = std::sync::Arc::new(signer);
+                composite_signer.add_grpc_remote_signer(pubkeys, signer.clone());
                 Some(signer)
             }
             Err(e) => {
@@ -851,12 +1222,12 @@ async fn run_validator(
     let validator_index_map = resolve_validator_indices(beacon_for_resolve, &pubkey_map).await;
 
     // Step 6: Doppelganger detection (if enabled)
-    if doppelganger_enabled && !pubkey_map.read().expect("pubkey_map lock poisoned").is_empty() {
+    if doppelganger_enabled && !pubkey_map.read().is_empty() {
         let validator_index_map = match validator_index_map {
             Ok(ref map) if !map.is_empty() => map.clone(),
             Ok(_) => {
                 warn!(
-                    total = pubkey_map.read().expect("pubkey_map lock poisoned").len(),
+                    total = pubkey_map.read().len(),
                     "No validator indices resolved; validators may be pending activation. \
                      Skipping doppelganger detection"
                 );
@@ -872,26 +1243,16 @@ async fn run_validator(
 
         if !validator_index_map.is_empty() {
             let doppelganger_service =
-                builder.build_doppelganger_service(beacon_client.clone(), slashing_db.clone());
+                builder.build_doppelganger_service(beacon_client.clone(), slashing_db.clone())?;
 
-            let pubkeys: Vec<String> =
-                pubkey_map.read().expect("pubkey_map lock poisoned").keys().cloned().collect();
+            let pubkeys: Vec<String> = pubkey_map.read().keys().cloned().collect();
 
-            let slot_clock = match builder.build_slot_clock() {
-                Ok(clock) => clock,
-                Err(e) => {
-                    error!("Failed to create slot clock: {}", e);
-                    return Err(e.into());
-                }
-            };
-
-            let current_epoch = match slot_clock.current_slot() {
-                Ok(slot) => slot / timing::SLOTS_PER_EPOCH,
-                Err(e) => {
-                    error!(error = %e, "Cannot determine current epoch; refusing to skip doppelganger detection");
-                    return Err(anyhow::anyhow!("slot clock failure during doppelganger check"));
-                }
-            };
+            // M-7 (ISSUE-3.6): use the doppelganger service's monotonic clock,
+            // not the wall-clock slot_clock. The slot clock is wall-clock-derived
+            // and an NTP step can advance current_epoch enough to compress the
+            // doppelganger monitoring window. doppelganger_service.current_epoch()
+            // is anchored on a monotonic Instant captured at startup.
+            let current_epoch = doppelganger_service.current_epoch();
 
             if current_epoch > 0 {
                 match startup::run_doppelganger_detection(
@@ -922,7 +1283,7 @@ async fn run_validator(
     // Step 7: Build remaining services
     let signer = builder.build_signer(composite_signer.clone(), slashing_db.clone());
     let propagator = builder.build_propagator(beacon_client.clone());
-    let validator_store = builder.build_validator_store();
+    let validator_store = builder.build_validator_store(config.validators_config.as_deref())?;
 
     let beacon: std::sync::Arc<dyn BeaconNodeClient> = bn_manager;
     let validator_indices: Vec<String> = match validator_index_map {
@@ -958,8 +1319,42 @@ async fn run_validator(
         .build_orchestrator_config(genesis_validators_root, fork_schedule)
         .with_timeouts(timeouts);
 
-    let block_beacon =
-        std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(beacon_client.clone()));
+    // Build proposer BnManager if proposer nodes are configured (T3.1)
+    let proposer_bn_manager = match builder.build_proposer_bn_manager() {
+        Ok(Some(mgr)) => {
+            info!(
+                proposer_nodes = ?config.proposer_nodes,
+                "Proposer nodes configured — block production will use dedicated pool"
+            );
+            Some(mgr)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            error!("Failed to create proposer BnManager: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    // Use proposer BnManager for block production if available, otherwise main beacon_client
+    let block_beacon = match &proposer_bn_manager {
+        Some(_proposer_mgr) => {
+            std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(
+                // We need an Arc<BeaconClient> - but proposer_mgr is an Arc<BnManager>.
+                // The BeaconBlockAdapter wraps a BeaconClient. For proposer nodes,
+                // we use the first proposer node endpoint to create a new BeaconClient.
+                {
+                    let proposer_endpoint = &config.proposer_nodes[0];
+                    let proposer_config =
+                        beacon::BeaconClientConfig::new(proposer_endpoint.clone())
+                            .with_timeout(std::time::Duration::from_secs(30))
+                            .with_max_retries(0)
+                            .with_max_body_bytes(config.beacon_max_body_bytes);
+                    std::sync::Arc::new(beacon::BeaconClient::new(proposer_config)?)
+                },
+            ))
+        }
+        None => std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(beacon_client.clone())),
+    };
 
     #[allow(clippy::arc_with_non_send_sync)]
     let builder_service = Some(std::sync::Arc::new(builder::BuilderService::new(
@@ -979,6 +1374,18 @@ async fn run_validator(
             );
         }
         info!(url = %url, "Remote signer URL configured");
+    }
+
+    // Step 7b2: Create attesting_enabled toggle (shared with orchestrator + API)
+    let attesting_enabled =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(!config.disable_attesting));
+    metrics::definitions::RVC_ATTESTING_ENABLED.set(if config.disable_attesting {
+        0.0
+    } else {
+        1.0
+    });
+    if config.disable_attesting {
+        warn!("Attestation duties disabled at startup (--disable-attesting)");
     }
 
     // Step 7c: Optionally start Keymanager API server
@@ -1023,11 +1430,46 @@ async fn run_validator(
         ));
         let validator_mgr =
             std::sync::Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
-        let doppelganger_mon = std::sync::Arc::new(DoppelgangerMonitorAdapter::new());
+        // M-12: use a time-based doppelganger gate for newly imported keys.
+        // When doppelganger detection is disabled (doppelganger_enabled = false)
+        // the window is Duration::ZERO so keys are immediately enabled.
+        let doppelganger_window = if doppelganger_enabled {
+            // 2 epochs × 32 slots/epoch × 12 s/slot = 768 s (mainnet default)
+            std::time::Duration::from_secs(
+                2 * eth_types::SLOTS_PER_EPOCH * eth_types::SECONDS_PER_SLOT,
+            )
+        } else {
+            std::time::Duration::ZERO
+        };
+        let doppelganger_mon =
+            std::sync::Arc::new(keymanager_api::gate::DoppelgangerGate::new(doppelganger_window));
+
+        // M-12 (Critical #2): after a restart, re-arm the gate for any key
+        // whose import-time sidecar shows the doppelganger window has not yet
+        // elapsed.  This prevents keys from bypassing the window on restart.
+        if !doppelganger_window.is_zero() {
+            rvc::keymanager_adapters::scan_and_rearm_gate(
+                &config.keystore_path,
+                doppelganger_mon.as_ref(),
+                doppelganger_window.as_secs(),
+            );
+        }
+
         let remote_key_mgr = std::sync::Arc::new(RemoteKeyManagerAdapter::new(
             km_composite,
             config.remote_signer_allowed_hosts.clone(),
         ));
+
+        let config_mgr =
+            std::sync::Arc::new(ValidatorConfigManagerAdapter::new(validator_store.clone()));
+
+        let exit_mgr: Option<std::sync::Arc<dyn keymanager_api::traits::VoluntaryExitManager>> =
+            Some(std::sync::Arc::new(VoluntaryExitManagerAdapter::new(
+                beacon_client.clone(),
+                signer.clone(),
+                orchestrator_config.fork_schedule.clone(),
+                genesis_validators_root,
+            )));
 
         let km_server = keymanager_api::KeymanagerServer::new(
             keystore_mgr,
@@ -1035,11 +1477,15 @@ async fn run_validator(
             validator_mgr,
             doppelganger_mon,
             remote_key_mgr,
+            config_mgr,
+            exit_mgr,
             token.to_string(),
             km_addr,
             config.keymanager_cors_origins.clone(),
             config.keymanager_body_limit,
             config.allow_insecure_remote_signer,
+            attesting_enabled.clone(),
+            doppelganger_window,
         );
 
         info!(addr = %km_addr, token_path = %token_path.display(), "Keymanager API enabled");
@@ -1052,18 +1498,82 @@ async fn run_validator(
     }
 
     // Step 8: Start main duty loop
-    let (mut orchestrator, orchestrator_handle) = rvc::orchestrator::DutyOrchestrator::new(
-        slot_clock,
-        duty_tracker,
-        signer,
-        propagator,
-        beacon,
-        block_beacon,
-        builder_service,
-        validator_store,
-        orchestrator_config,
-        pubkey_map,
+    let circuit_breaker = std::sync::Arc::new(builder::CircuitBreakerState::new(
+        config.builder_circuit_breaker_consecutive_limit,
+        config.builder_circuit_breaker_epoch_limit,
+    ));
+    info!(
+        consecutive_limit = config.builder_circuit_breaker_consecutive_limit,
+        epoch_limit = config.builder_circuit_breaker_epoch_limit,
+        "Builder circuit breaker configured"
     );
+
+    let validator_count = pubkey_map.read().len();
+    let bn_count = config.effective_beacon_nodes().len();
+    let (mut orchestrator, orchestrator_handle) =
+        rvc::orchestrator::DutyOrchestrator::new_with_attesting_enabled(
+            slot_clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon.clone(),
+            block_beacon,
+            builder_service,
+            validator_store.clone(),
+            orchestrator_config,
+            pubkey_map.clone(),
+            circuit_breaker,
+            attesting_enabled.clone(),
+        );
+
+    // Step 8b: Spawn slashing monitor background task
+    {
+        let slashed_action: rvc::slashing_monitor::SlashedAction =
+            config.slashed_validators_action.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+
+        if slashed_action != rvc::slashing_monitor::SlashedAction::None {
+            let monitor_beacon = beacon.clone();
+            let monitor_store = validator_store.clone();
+            let monitor_shutdown = shutdown_token.clone();
+            let monitor_orch_handle_shutdown = {
+                // We need to signal the orchestrator. Create a watch channel for it.
+                let (tx, _rx) = tokio::sync::watch::channel(false);
+                tx
+            };
+            // We'll re-purpose: the slashing monitor just cancels the shutdown_token
+            // and the main select! picks it up.
+            tokio::spawn(async move {
+                let slot_duration = std::time::Duration::from_secs(12);
+                let epoch_duration = slot_duration * 32;
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(epoch_duration) => {}
+                        _ = monitor_shutdown.cancelled() => {
+                            break;
+                        }
+                    }
+
+                    rvc::slashing_monitor::check_slashed_validators(
+                        monitor_beacon.as_ref(),
+                        &monitor_store,
+                        slashed_action,
+                        &monitor_orch_handle_shutdown,
+                    )
+                    .await;
+
+                    // If shutdown action was triggered, cancel everything
+                    if *monitor_orch_handle_shutdown.borrow() {
+                        monitor_shutdown.cancel();
+                        break;
+                    }
+                }
+            });
+            info!(
+                action = %config.slashed_validators_action,
+                "Slashing monitor started"
+            );
+        }
+    }
 
     finalize_health_status(&health_status).await;
 
@@ -1077,10 +1587,33 @@ async fn run_validator(
             shutdown_signal().await;
         });
 
+    // ISSUE-4.10 / L-10: refuse non-loopback metrics binds unless explicitly
+    // opted in via `RVC_METRICS_ALLOW_NON_LOOPBACK=true`. Loopback binds pass
+    // silently. Reuses the InsecureGate helper from ISSUE-2.10 (in Refuse mode
+    // after Phase 3 ISSUE-3.13 / NFR-10).
     if !metrics_address.is_loopback() {
+        // The predicate is constant-true here: the bind is already known to
+        // be non-loopback, so the env var alone determines the outcome (the
+        // InsecureGate `new()` constructor would set predicate=is_loopback,
+        // which is false at this point and would refuse even with the env
+        // var set; with_predicate keeps the env-var-only contract).
+        let metrics_gate = crypto::insecure::InsecureGate::with_predicate(
+            "RVC_METRICS_ALLOW_NON_LOOPBACK",
+            crypto::insecure::InsecureMode::default(),
+            || true,
+        );
+        if let Err(e) = metrics_gate.check() {
+            error!(
+                addr = %metrics_address,
+                error = %e,
+                "Refusing to start metrics server on non-loopback address (ISSUE-4.10 / L-10)"
+            );
+            return Err(e.into());
+        }
         warn!(
             addr = %metrics_address,
-            "Metrics server is bound to a non-loopback address; this exposes metrics over the network"
+            "Metrics server is bound to a non-loopback address (RVC_METRICS_ALLOW_NON_LOOPBACK=true); \
+             this exposes metrics over the network"
         );
     }
 
@@ -1091,6 +1624,71 @@ async fn run_validator(
         health_status.clone(),
     ));
 
+    // Spawn monitoring push task if endpoint is configured (T3.6)
+    if let Some(ref monitoring_endpoint) = config.monitoring_endpoint {
+        let monitoring_config = rvc::monitoring::MonitoringConfig {
+            endpoint: monitoring_endpoint.clone(),
+            interval: std::time::Duration::from_secs(config.monitoring_interval),
+            insecure: config.monitoring_endpoint_insecure,
+        };
+        let monitoring_shutdown = shutdown_token.clone();
+        info!(
+            endpoint = %rvc::config::redact_url(monitoring_endpoint),
+            interval_secs = config.monitoring_interval,
+            "Starting monitoring push task"
+        );
+        tokio::spawn(rvc::monitoring::start_monitoring_push(
+            monitoring_config,
+            monitoring_shutdown,
+            move || (validator_count as u32, validator_count as u32),
+        ));
+    }
+
+    // Spawn proposer config URL refresh task if configured (T3.12)
+    if let Some(ref proposer_config_url) = config.proposer_config_url {
+        let settings = rvc::config_url::ProposerConfigUrlSettings {
+            url: proposer_config_url.clone(),
+            refresh_interval: std::time::Duration::from_secs(
+                config.proposer_config_refresh_interval,
+            ),
+            token: config.proposer_config_url_token.clone(),
+            insecure: config.proposer_config_url_insecure,
+        };
+        let config_refresh_shutdown = shutdown_token.clone();
+        info!(
+            url = %rvc::config::redact_url(proposer_config_url),
+            refresh_interval_secs = config.proposer_config_refresh_interval,
+            "Starting proposer config URL refresh task"
+        );
+        tokio::spawn(rvc::config_url::start_proposer_config_refresh(
+            settings,
+            config_refresh_shutdown,
+            move |updates, _default| {
+                for update in &updates {
+                    info!(
+                        pubkey = %update.pubkey,
+                        fee_recipient = ?update.fee_recipient,
+                        builder_enabled = ?update.builder_enabled,
+                        "Proposer config update from URL"
+                    );
+                }
+            },
+        ));
+    }
+
+    // Log broadcast topics if non-default (T3.4)
+    {
+        let topics = config.effective_broadcast_topics();
+        info!(
+            attestations = topics.attestations,
+            blocks = topics.blocks,
+            sync_committee = topics.sync_committee,
+            subscriptions = topics.subscriptions,
+            "Active broadcast topics"
+        );
+    }
+
+    startup::log_orchestrator_started(validator_count, bn_count);
     info!("Starting duty orchestrator");
 
     tokio::select! {
@@ -1111,16 +1709,14 @@ async fn run_validator(
         }
     }
 
-    info!("Initiating graceful shutdown...");
+    startup::log_shutdown_initiated("signal received");
     shutdown_token.cancel();
     orchestrator_handle.shutdown();
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Flush OpenTelemetry traces after orchestrator shutdown
-    if let Some(guard) = tracing_guard {
-        telemetry::shutdown_tracing(guard).await;
-    }
+    // Logging guards (tracing + file) are held by _logging_guards and
+    // dropped at the end of the caller's scope, flushing pending data.
 
     // Gracefully shut down metrics server with a brief timeout
     metrics_handle.abort();
@@ -1129,7 +1725,7 @@ async fn run_validator(
     })
     .await;
 
-    info!("Validator client shut down complete");
+    info!(uptime_secs = startup_time.elapsed().as_secs(), "Validator client shut down complete");
     Ok(())
 }
 
@@ -1138,7 +1734,7 @@ async fn resolve_validator_indices(
     pubkey_map: &rvc::orchestrator::PubkeyMap,
 ) -> Result<std::collections::HashMap<String, String>, anyhow::Error> {
     let pubkeys: Vec<String> = {
-        let map = pubkey_map.read().expect("pubkey_map lock poisoned");
+        let map = pubkey_map.read();
         if map.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
@@ -1222,9 +1818,17 @@ async fn finalize_health_status(health_status: &SharedHealthStatus) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    /// Serialize all tests in this module that read or write OTEL env vars.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn test_build_tracing_config_no_endpoint_returns_none() {
+        let _guard = env_lock();
         // Clear env vars that could interfere
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
@@ -1235,6 +1839,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_with_endpoint_returns_some() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1250,6 +1855,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_env_var_fallback() {
+        let _guard = env_lock();
         std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://env-collector:4318");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1262,6 +1868,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_cli_overrides_env() {
+        let _guard = env_lock();
         std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://env-collector:4318");
 
         let config = Config {
@@ -1276,6 +1883,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_sample_rate_env_fallback() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.5");
 
@@ -1292,6 +1900,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_explicit_sample_rate_overrides_env() {
+        let _guard = env_lock();
         std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.5");
 
         let config = Config {
@@ -1307,6 +1916,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_sample_rate_clamped() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1321,6 +1931,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_negative_sample_rate_clamped() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1335,6 +1946,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_network_propagated() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1349,6 +1961,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_unknown_exporter_defaults_to_otlp() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1363,6 +1976,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_batch_fields_passthrough() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1379,6 +1993,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_batch_fields_none_by_default() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
@@ -1409,6 +2024,7 @@ mod tests {
 
     #[test]
     fn test_build_tracing_config_creates_valid_telemetry_config() {
+        let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 

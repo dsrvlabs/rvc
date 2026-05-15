@@ -447,9 +447,9 @@ mod tests {
             let own_idx = shares[0].0;
 
             let mut peer_partials = HashMap::new();
-            for i in 1..=2 {
-                let partial = partial_sign(&shares[i].1, &signing_root);
-                peer_partials.insert(format!("peer{}:5000", i), (shares[i].0, partial));
+            for (i, share) in shares[1..=2].iter().enumerate() {
+                let partial = partial_sign(&share.1, &signing_root);
+                peer_partials.insert(format!("peer{}:5000", i + 1), (share.0, partial));
             }
 
             let requester = Arc::new(MockPeerRequester { partials: peer_partials });

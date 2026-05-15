@@ -56,4 +56,36 @@ pub enum ConfigError {
 
     #[error("secret provider error: {0}")]
     SecretProviderError(String),
+
+    #[error(
+        "--allow-insecure-remote-signer requires RVC_ALLOW_INSECURE=true environment variable"
+    )]
+    InsecureFlagRequiresEnvVar,
+
+    /// Returned when the effective default fee recipient is the zero address.
+    ///
+    /// All EL fees and MEV rewards would be silently routed to the burn
+    /// address.  Operators must set a non-zero address in their validators
+    /// config file:
+    ///
+    /// ```toml
+    /// [defaults]
+    /// fee_recipient = "0x<your-fee-address>"
+    /// ```
+    #[error(
+        "default_fee_recipient is the zero address \
+         (0x0000000000000000000000000000000000000000), which routes all EL \
+         fees and MEV rewards to the burn address.\n\
+         Set a non-zero fee_recipient in your validators config file:\n\
+         \n\
+         [defaults]\n\
+         fee_recipient = \"0x<your-fee-address>\"\n\
+         \n\
+         Pass the file with --validators-config <path>."
+    )]
+    ZeroFeeRecipient,
+
+    /// Wraps a `ValidatorStoreError` that occurs during validator store construction.
+    #[error("validator store error: {0}")]
+    ValidatorStoreError(String),
 }

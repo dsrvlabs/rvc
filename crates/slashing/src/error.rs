@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use eth_types::{Epoch, Slot};
+use eth_types::{Epoch, Root, Slot};
 
 /// Errors that can occur during slashing protection operations.
 #[derive(Debug, Error)]
@@ -13,6 +13,9 @@ pub enum SlashingError {
     #[error("migration error: {0}")]
     MigrationError(String),
 
+    #[error("schema migration failed: {0}")]
+    MigrationFailed(String),
+
     #[error("attestation slashable: {0}")]
     SlashableAttestation(#[from] AttestationSlashingViolation),
 
@@ -21,6 +24,19 @@ pub enum SlashingError {
 
     #[error("genesis validators root mismatch: expected {expected}, got {actual}")]
     GenesisValidatorsRootMismatch { expected: String, actual: String },
+
+    /// Per-call genesis validators root check failed (M-6 / ISSUE-3.5).
+    ///
+    /// Returned when the caller-supplied `gvr` does not match the value pinned
+    /// in `metadata.genesis_validators_root`.  A mismatch indicates that the
+    /// validator client is pointing at a different chain's beacon node than the
+    /// one it was originally configured for (i.e. a chain swap).
+    #[error(
+        "genesis root mismatch: expected 0x{}, got 0x{}",
+        hex::encode(expected),
+        hex::encode(got)
+    )]
+    GenesisRootMismatch { expected: Root, got: Root },
 
     #[error("invalid interchange format: {0}")]
     InvalidInterchangeFormat(String),
@@ -45,6 +61,9 @@ pub enum SlashingError {
 
     #[error("unsafe file permissions on {path} (mode {mode}): group or world accessible")]
     UnsafePermissions { path: String, mode: String },
+
+    #[error("Slashing DB refused to open with non-WAL journal mode: actual={actual}. {hint}")]
+    JournalMode { actual: String, hint: String },
 }
 
 /// Specific types of attestation slashing violations per EIP-3076.

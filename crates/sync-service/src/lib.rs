@@ -4,10 +4,11 @@ mod error;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use eth_types::{
     ContributionAndProof, ForkSchedule, Root, SignedContributionAndProof, Slot,
@@ -128,6 +129,7 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
             return Ok(SyncMessagesResult { count: 0 });
         }
 
+        let signing_start = Instant::now();
         let mut messages = Vec::new();
         for (duty, pubkey) in duties.iter().zip(pubkeys.iter()) {
             let sig = match self
@@ -143,7 +145,7 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
             {
                 Ok(sig) => sig,
                 Err(e) => {
-                    tracing::warn!(
+                    warn!(
                         validator_index = duty.validator_index,
                         error = %e,
                         "Failed to sign sync committee message, skipping validator"
@@ -159,15 +161,29 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
                 signature: sig,
             });
         }
+        let signing_duration_ms = signing_start.elapsed().as_millis() as u64;
+        debug!(
+            slot,
+            count = messages.len(),
+            duration_ms = signing_duration_ms,
+            "Sync message signing batch complete"
+        );
 
         if messages.is_empty() {
             debug!(slot, "No sync committee messages to submit after signing failures");
             return Ok(SyncMessagesResult { count: 0 });
         }
 
-        debug!(count = messages.len(), slot, "Submitting sync committee messages");
-        self.beacon.submit_sync_committee_messages(&messages).await?;
-        info!(count = messages.len(), slot, "Submitted sync committee messages");
+        let count = messages.len();
+        match self.beacon.submit_sync_committee_messages(&messages).await {
+            Ok(()) => {
+                info!(slot, count, "Sync committee messages submitted successfully");
+            }
+            Err(e) => {
+                warn!(slot, count, error = %e, "Failed to submit sync committee messages");
+                return Err(e);
+            }
+        }
 
         Ok(SyncMessagesResult { count: messages.len() })
     }
@@ -196,7 +212,7 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
                 .collect();
 
             for subcommittee_index in subcommittee_indices {
-                let selection_proof = self
+                let selection_proof = match self
                     .signer
                     .sign_selection_proof(
                         slot,
@@ -205,7 +221,19 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
                         &self.fork_schedule,
                         &self.genesis_validators_root,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(proof) => proof,
+                    Err(e) => {
+                        warn!(
+                            validator_index = duty.validator_index,
+                            subcommittee_index,
+                            error = %e,
+                            "Failed to sign selection proof, skipping validator subcommittee"
+                        );
+                        continue;
+                    }
+                };
 
                 if !is_sync_committee_aggregator(&selection_proof) {
                     debug!(
@@ -231,7 +259,7 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
                     selection_proof: selection_proof.clone(),
                 };
 
-                let sig = self
+                let sig = match self
                     .signer
                     .sign_contribution_and_proof(
                         &proof,
@@ -239,18 +267,37 @@ impl<S: SyncSigner, B: SyncBeaconClient> SyncService<S, B> {
                         &self.fork_schedule,
                         &self.genesis_validators_root,
                     )
-                    .await?;
+                    .await
+                {
+                    Ok(sig) => sig,
+                    Err(e) => {
+                        warn!(
+                            validator_index = duty.validator_index,
+                            subcommittee_index,
+                            error = %e,
+                            "Failed to sign contribution and proof, skipping validator subcommittee"
+                        );
+                        continue;
+                    }
+                };
 
                 signed_proofs.push(SignedContributionAndProof { message: proof, signature: sig });
             }
         }
 
         if !signed_proofs.is_empty() {
-            debug!(count = signed_proofs.len(), slot, "Submitting contribution and proofs");
-            self.beacon.submit_contribution_and_proofs(&signed_proofs).await?;
-            info!(count = signed_proofs.len(), slot, "Submitted contribution and proofs");
+            let count = signed_proofs.len();
+            match self.beacon.submit_contribution_and_proofs(&signed_proofs).await {
+                Ok(()) => {
+                    info!(slot, count, "Sync committee contributions submitted successfully");
+                }
+                Err(e) => {
+                    warn!(slot, count, error = %e, "Failed to submit sync committee contributions");
+                    return Err(e);
+                }
+            }
         } else {
-            debug!(slot, "No validators selected as sync committee aggregator");
+            debug!(slot, "Contribution production skipped, no aggregators selected");
         }
 
         Ok(ContributionsResult { count: signed_proofs.len() })
@@ -470,7 +517,21 @@ mod tests {
     }
 
     fn sample_pubkeys(count: usize) -> Vec<PublicKey> {
-        (0..count).map(|i| vec![i as u8; 48]).collect()
+        (0..count)
+            .map(|i| {
+                let mut key = vec![0u8; 48];
+                key[0] = (i & 0xFF) as u8;
+                key[1] = ((i >> 8) & 0xFF) as u8;
+                key
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_sample_pubkeys_512_unique() {
+        let keys = sample_pubkeys(512);
+        let unique: std::collections::HashSet<Vec<u8>> = keys.into_iter().collect();
+        assert_eq!(unique.len(), 512);
     }
 
     /// Find a selection proof that passes the aggregator check.
@@ -695,6 +756,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_produce_contributions_selection_signing_failure() {
+        // H-6 fix: a selection-proof signing failure must be isolated — the function must
+        // return Ok with count=0 rather than propagating the error.
         let signer = MockSigner::new()
             .with_selection_error(SyncServiceError::Signer("signing failed".into()));
         let beacon = MockBeacon::new();
@@ -710,8 +773,9 @@ mod tests {
 
         let result = service.produce_contributions(100, &duties, &head_root, &pubkeys).await;
 
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SyncServiceError::Signer(_)));
+        assert!(result.is_ok(), "signing failure must not abort the slot loop");
+        assert_eq!(result.unwrap().count, 0);
+        assert_eq!(service.beacon.submit_proofs_call_count.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

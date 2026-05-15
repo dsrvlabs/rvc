@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
@@ -16,28 +17,21 @@ use eth_types::{
 };
 use futures::future::join_all;
 use tracing::Instrument;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 use url::Url;
 
-/// Redact credentials from a URL for safe inclusion in tracing spans.
-fn redact_url(url: &str) -> String {
-    if let Ok(mut parsed) = Url::parse(url) {
-        if parsed.password().is_some() || !parsed.username().is_empty() {
-            let _ = parsed.set_username("***");
-            let _ = parsed.set_password(Some("***"));
-        }
-        parsed.to_string()
-    } else {
-        url.to_string()
-    }
-}
+use crypto::logging::RedactedUrl;
 
+use crate::sync_status::BnSyncStatus;
+
+use crate::broadcast::{BnOutcome, BroadcastResult};
 use crate::health::{new_shared_health_trackers, SharedHealthTrackers};
 use crate::sse::{self, SseConfig, SseEvent};
 use crate::sync_status::{
     check_all_sync_statuses, new_shared_sync_statuses, start_sync_monitor, SharedSyncStatuses,
 };
-use crate::traits::{BeaconNodeClient, BnHealthScore, BnManagerConfig};
+use crate::traits::{BeaconNodeClient, BnHealthScore, BnManagerConfig, OperationTimeouts};
+use crate::types::{BnRole, HealthTier, TierThresholds};
 use crate::BnManagerError;
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, BeaconError>> + Send + 'a>>;
@@ -60,7 +54,10 @@ pub struct BnManager {
     clients: Vec<BeaconClient>,
     sync_statuses: SharedSyncStatuses,
     health_trackers: SharedHealthTrackers,
-    overall_timeout: Option<Duration>,
+    operation_timeouts: Option<OperationTimeouts>,
+    broadcast_topics: crate::traits::BroadcastTopics,
+    roles: Vec<HashSet<BnRole>>,
+    tier_thresholds: TierThresholds,
 }
 
 impl BnManager {
@@ -101,15 +98,38 @@ impl BnManager {
 
             let client_config = beacon::BeaconClientConfig::new(endpoint.clone())
                 .with_timeout(config.timeout)
-                .with_max_retries(0);
+                .with_max_retries(0)
+                .with_max_body_bytes(config.max_body_bytes);
             let client = BeaconClient::new(client_config)?;
             clients.push(client);
         }
 
+        let broadcast_topics = config.broadcast_topics.clone();
+        let roles = if config.roles.len() == clients.len() {
+            config.roles.clone()
+        } else {
+            vec![
+                {
+                    let mut s = HashSet::new();
+                    s.insert(BnRole::All);
+                    s
+                };
+                clients.len()
+            ]
+        };
+        let tier_thresholds = config.tier_thresholds.clone();
         let sync_statuses = new_shared_sync_statuses(clients.len());
         let endpoints: Vec<String> = clients.iter().map(|c| c.endpoint().to_string()).collect();
         let health_trackers = new_shared_health_trackers(&endpoints);
-        Ok(Self { clients, sync_statuses, health_trackers, overall_timeout: None })
+        Ok(Self {
+            clients,
+            sync_statuses,
+            health_trackers,
+            operation_timeouts: None,
+            broadcast_topics,
+            roles,
+            tier_thresholds,
+        })
     }
 
     /// Returns the shared sync status tracker.
@@ -122,32 +142,55 @@ impl BnManager {
         &self.health_trackers
     }
 
-    /// Sets an overall deadline for multi-BN operations (`query_best`, `broadcast`).
+    /// Sets per-operation timeouts for BN API calls.
     ///
-    /// When set, the entire operation (including all BN queries and fallbacks)
-    /// is wrapped in `tokio::time::timeout`. If the deadline expires before any
-    /// BN responds, a timeout error is returned.
-    pub fn with_overall_timeout(mut self, timeout: Duration) -> Self {
-        self.overall_timeout = Some(timeout);
+    /// When set, each BN operation is wrapped in `tokio::time::timeout` using the
+    /// corresponding field from `OperationTimeouts`. If an operation exceeds its
+    /// timeout, `BeaconError::OperationTimeout` is returned.
+    pub fn with_operation_timeouts(mut self, timeouts: OperationTimeouts) -> Self {
+        self.operation_timeouts = Some(timeouts);
         self
+    }
+
+    /// Wraps a future with an optional per-operation timeout.
+    async fn with_op_timeout<T>(
+        &self,
+        op_name: &str,
+        timeout: Option<Duration>,
+        fut: impl Future<Output = Result<T, BeaconError>>,
+    ) -> Result<T, BeaconError> {
+        match timeout {
+            Some(d) => tokio::time::timeout(d, fut).await.map_err(|_| {
+                warn!(op = op_name, timeout_ms = d.as_millis() as u64, "operation timed out");
+                BeaconError::OperationTimeout { operation: op_name.to_string(), timeout: d }
+            })?,
+            None => fut.await,
+        }
+    }
+
+    /// Returns the per-operation timeout for a given field selector.
+    fn op_timeout(&self, f: impl FnOnce(&OperationTimeouts) -> Duration) -> Option<Duration> {
+        self.operation_timeouts.as_ref().map(f)
     }
 
     /// Returns current health scores for all BNs.
     #[tracing::instrument(name = "rvc.bn_manager.health_scores", skip_all)]
     pub async fn health_scores(&self) -> Vec<BnHealthScore> {
-        use crate::sync_status::BnSyncStatus;
-
         let health_guard = self.health_trackers.read().await;
         let sync_guard = self.sync_statuses.read().await;
         health_guard
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                let sync_status = sync_guard.get(i).copied().unwrap_or(BnSyncStatus::Unknown);
+                let detail = sync_guard
+                    .get(i)
+                    .cloned()
+                    .unwrap_or_else(crate::sync_status::BnSyncDetail::unknown);
                 BnHealthScore {
                     endpoint: t.endpoint().to_string(),
-                    is_reachable: !matches!(sync_status, BnSyncStatus::Unreachable),
-                    is_synced: matches!(sync_status, BnSyncStatus::Synced),
+                    is_reachable: !matches!(detail.status, BnSyncStatus::Unreachable),
+                    is_synced: matches!(detail.status, BnSyncStatus::Synced),
+                    is_el_offline: matches!(detail.status, BnSyncStatus::ElOffline),
                     head_slot: None,
                     latency: t.latency_ema_ms().map(|ms| Duration::from_secs_f64(ms / 1000.0)),
                     latency_ms: t.latency_ema_ms().unwrap_or(0.0),
@@ -201,35 +244,109 @@ impl BnManager {
         })
     }
 
-    /// Returns indices of synced+healthy BNs, ordered by health score (highest first).
-    /// Falls back to all BNs if none are synced (single-BN mode logs a warning).
-    #[tracing::instrument(name = "rvc.bn_manager.synced_indices", skip_all)]
-    async fn synced_indices(&self) -> Vec<usize> {
+    /// Returns indices of BNs matching the given role and meeting the minimum health tier,
+    /// ordered by health score (highest first).
+    ///
+    /// Filtering order: role → tier → health score.
+    ///
+    /// Fallback chain:
+    /// 1. If no BNs match the role, fall back to `All`-role BNs with WARN
+    /// 2. If no BNs meet the tier, try the next lower tier with WARN
+    /// 3. If still empty, fall back to all BNs
+    #[tracing::instrument(name = "rvc.bn_manager.synced_indices", skip_all, fields(role = %role, min_tier = %min_tier))]
+    async fn synced_indices(&self, role: BnRole, min_tier: HealthTier) -> Vec<usize> {
         let sync_guard = self.sync_statuses.read().await;
         let health_guard = self.health_trackers.read().await;
 
-        let mut synced: Vec<usize> =
-            sync_guard.iter().enumerate().filter(|(_, s)| s.is_usable()).map(|(i, _)| i).collect();
+        let healthy_count = health_guard.iter().filter(|t| t.is_healthy()).count();
+        debug!(bn_count = self.clients.len(), healthy_count = healthy_count, "Health check cycle");
 
-        if synced.is_empty() {
+        // Step 1: Filter by role
+        let role_indices: Vec<usize> =
+            (0..self.clients.len()).filter(|&i| BnRole::matches(&self.roles[i], role)).collect();
+
+        // Cross-role fallback: if no BNs for the role, use All-role BNs
+        let role_indices = if role_indices.is_empty() {
+            warn!(
+                role = %role,
+                "no BNs assigned for role, falling back to all-role BNs"
+            );
+            (0..self.clients.len())
+                .filter(|&i| {
+                    BnRole::matches(&self.roles[i], BnRole::All)
+                        || self.roles[i].contains(&BnRole::All)
+                })
+                .collect::<Vec<usize>>()
+        } else {
+            role_indices
+        };
+
+        // If still empty after role fallback, use all BNs
+        let role_indices = if role_indices.is_empty() {
+            warn!("no BNs with All role either, falling back to all BNs");
+            (0..self.clients.len()).collect()
+        } else {
+            role_indices
+        };
+
+        // Step 2: Filter by tier
+        let mut tier_filtered: Vec<usize> = role_indices
+            .iter()
+            .copied()
+            .filter(|&i| sync_guard[i].tier(&self.tier_thresholds) <= min_tier)
+            .collect();
+
+        // Tier fallback: progressively relax tier requirement
+        if tier_filtered.is_empty() {
+            let fallback_tiers = match min_tier {
+                HealthTier::Synced => {
+                    vec![HealthTier::SmallLag, HealthTier::LargeLag, HealthTier::Unsynced]
+                }
+                HealthTier::SmallLag => vec![HealthTier::LargeLag, HealthTier::Unsynced],
+                HealthTier::LargeLag => vec![HealthTier::Unsynced],
+                HealthTier::Unsynced => vec![],
+            };
+
+            for fallback_tier in fallback_tiers {
+                tier_filtered = role_indices
+                    .iter()
+                    .copied()
+                    .filter(|&i| sync_guard[i].tier(&self.tier_thresholds) <= fallback_tier)
+                    .collect();
+                if !tier_filtered.is_empty() {
+                    warn!(
+                        requested_tier = %min_tier,
+                        actual_tier = %fallback_tier,
+                        "no BNs at requested tier, falling back to lower tier"
+                    );
+                    break;
+                }
+            }
+        }
+
+        // Last resort: use all role-matching BNs regardless of tier
+        if tier_filtered.is_empty() {
             if self.clients.len() == 1 {
                 warn!(
-                    endpoint = self.clients[0].endpoint(),
+                    endpoint = %RedactedUrl(self.clients[0].endpoint()),
                     "single BN is not synced, continuing with degraded service"
                 );
             } else {
-                warn!("no synced BNs available, falling back to all BNs");
+                warn!("no BNs meet tier requirements, falling back to all role-matching BNs");
             }
-            synced = (0..self.clients.len()).collect();
+            tier_filtered = role_indices;
         }
 
-        // Filter out unhealthy BNs (unless it would leave none)
+        // Step 3: Filter out unhealthy BNs (unless it would leave none)
         let healthy: Vec<usize> =
-            synced.iter().copied().filter(|&i| health_guard[i].is_healthy()).collect();
+            tier_filtered.iter().copied().filter(|&i| health_guard[i].is_healthy()).collect();
 
         let mut result = if healthy.is_empty() {
-            warn!("all synced BNs are unhealthy, using all synced BNs");
-            synced
+            error!(
+                bn_count = tier_filtered.len(),
+                "All BNs unhealthy, using all tier-matching BNs"
+            );
+            tier_filtered
         } else {
             healthy
         };
@@ -246,7 +363,13 @@ impl BnManager {
     }
 
     /// Query using the `First` strategy: try synced BNs in order, fail over on error.
-    async fn query_first<'s, T, F>(&'s self, op_name: &str, op: F) -> Result<T, BeaconError>
+    async fn query_first<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        role: BnRole,
+        min_tier: HealthTier,
+        op: F,
+    ) -> Result<T, BeaconError>
     where
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
@@ -256,40 +379,31 @@ impl BnManager {
             rvc.bn.strategy = "first",
             rvc.bn.tried = tracing::field::Empty,
         );
-        if let Some(deadline) = self.overall_timeout {
-            match tokio::time::timeout(
-                deadline,
-                self.query_first_inner(op_name, &op).instrument(strategy_span),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(BeaconError::HttpError(format!(
-                    "{op_name}: overall deadline of {}s exceeded",
-                    deadline.as_secs()
-                ))),
-            }
-        } else {
-            self.query_first_inner(op_name, &op).instrument(strategy_span).await
-        }
+        self.query_first_inner(op_name, role, min_tier, &op).instrument(strategy_span).await
     }
 
-    async fn query_first_inner<'s, T, F>(&'s self, op_name: &str, op: &F) -> Result<T, BeaconError>
+    async fn query_first_inner<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        role: BnRole,
+        min_tier: HealthTier,
+        op: &F,
+    ) -> Result<T, BeaconError>
     where
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        let indices = self.synced_indices().await;
+        let indices = self.synced_indices(role, min_tier).await;
         let mut last_err = None;
         let mut tried: usize = 0;
         let mut failed_indices: Vec<usize> = Vec::new();
 
-        for i in indices {
+        for (pos, i) in indices.iter().copied().enumerate() {
             let client = &self.clients[i];
             tried += 1;
             let attempt_span = tracing::info_span!(
                 "rvc.bn.attempt",
-                rvc.bn.url = %redact_url(client.endpoint()),
+                rvc.bn.url = %RedactedUrl(client.endpoint()),
             );
             let start = tokio::time::Instant::now();
             match op(client).instrument(attempt_span).await {
@@ -306,7 +420,7 @@ impl BnManager {
                     debug!(
                         op = op_name,
                         bn_index = i,
-                        endpoint = client.endpoint(),
+                        endpoint = %RedactedUrl(client.endpoint()),
                         latency_ms = elapsed.as_millis() as u64,
                         "query succeeded"
                     );
@@ -315,13 +429,23 @@ impl BnManager {
                 }
                 Err(e) => {
                     failed_indices.push(i);
-                    warn!(
-                        op = op_name,
-                        bn_index = i,
-                        endpoint = client.endpoint(),
-                        error = %e,
-                        "BN query failed, trying next"
-                    );
+                    if let Some(&next_i) = indices.get(pos + 1) {
+                        let next_client = &self.clients[next_i];
+                        warn!(
+                            failed_bn = %RedactedUrl(client.endpoint()),
+                            selected_bn = %RedactedUrl(next_client.endpoint()),
+                            reason = %e,
+                            "BN failover triggered"
+                        );
+                    } else {
+                        warn!(
+                            op = op_name,
+                            bn_index = i,
+                            endpoint = %RedactedUrl(client.endpoint()),
+                            error = %e,
+                            "BN query failed, no more BNs to try"
+                        );
+                    }
                     last_err = Some(e);
                 }
             }
@@ -347,6 +471,8 @@ impl BnManager {
     async fn query_best<'s, T, F>(
         &'s self,
         op_name: &str,
+        role: BnRole,
+        min_tier: HealthTier,
         op: F,
         pick_best: fn(&T, &T) -> bool,
     ) -> Result<T, BeaconError>
@@ -359,28 +485,16 @@ impl BnManager {
             rvc.bn.strategy = "best",
             rvc.bn.tried = tracing::field::Empty,
         );
-        if let Some(deadline) = self.overall_timeout {
-            match tokio::time::timeout(
-                deadline,
-                self.query_best_inner(op_name, &op, pick_best).instrument(strategy_span),
-            )
+        self.query_best_inner(op_name, role, min_tier, &op, pick_best)
+            .instrument(strategy_span)
             .await
-            {
-                Ok(result) => return result,
-                Err(_) => {
-                    return Err(BeaconError::HttpError(format!(
-                        "{op_name}: overall deadline of {}s exceeded",
-                        deadline.as_secs()
-                    )))
-                }
-            }
-        }
-        self.query_best_inner(op_name, &op, pick_best).instrument(strategy_span).await
     }
 
     async fn query_best_inner<'s, T, F>(
         &'s self,
         op_name: &str,
+        role: BnRole,
+        min_tier: HealthTier,
         op: &F,
         pick_best: fn(&T, &T) -> bool,
     ) -> Result<T, BeaconError>
@@ -388,7 +502,7 @@ impl BnManager {
         T: Send + 'static,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        let indices = self.synced_indices().await;
+        let indices = self.synced_indices(role, min_tier).await;
         tracing::Span::current().record("rvc.bn.tried", indices.len());
 
         if indices.len() == 1 {
@@ -396,7 +510,7 @@ impl BnManager {
             let i = indices[0];
             let attempt_span = tracing::info_span!(
                 "rvc.bn.attempt",
-                rvc.bn.url = %redact_url(client.endpoint()),
+                rvc.bn.url = %RedactedUrl(client.endpoint()),
             );
             let start = tokio::time::Instant::now();
             match op(client).instrument(attempt_span).await {
@@ -405,7 +519,7 @@ impl BnManager {
                     debug!(
                         op = op_name,
                         bn_index = i,
-                        endpoint = client.endpoint(),
+                        endpoint = %RedactedUrl(client.endpoint()),
                         "query succeeded (single synced BN)"
                     );
                     return Ok(result);
@@ -415,7 +529,7 @@ impl BnManager {
                     warn!(
                         op = op_name,
                         bn_index = i,
-                        endpoint = client.endpoint(),
+                        endpoint = %RedactedUrl(client.endpoint()),
                         error = %e,
                         "BN query failed, trying unsynced BNs"
                     );
@@ -433,7 +547,7 @@ impl BnManager {
             let fut = op(client);
             let attempt_span = tracing::info_span!(
                 "rvc.bn.attempt",
-                rvc.bn.url = %redact_url(client.endpoint()),
+                rvc.bn.url = %RedactedUrl(client.endpoint()),
             );
             futs.push(Box::pin(
                 async move {
@@ -470,7 +584,7 @@ impl BnManager {
                     warn!(
                         op = op_name,
                         bn_index = i,
-                        endpoint = endpoint,
+                        endpoint = %RedactedUrl(&endpoint),
                         error = %e,
                         "BN query failed in best-selection"
                     );
@@ -483,7 +597,7 @@ impl BnManager {
                 debug!(
                     op = op_name,
                     bn_index = i,
-                    endpoint = self.clients[i].endpoint(),
+                    endpoint = %RedactedUrl(self.clients[i].endpoint()),
                     "best-selection picked BN"
                 );
                 Ok(value)
@@ -527,7 +641,7 @@ impl BnManager {
                     warn!(
                         op = op_name,
                         bn_index = i,
-                        endpoint = client.endpoint(),
+                        endpoint = %RedactedUrl(client.endpoint()),
                         latency_ms = elapsed.as_millis() as u64,
                         "query succeeded on unsynced BN (degraded)"
                     );
@@ -538,7 +652,7 @@ impl BnManager {
                     warn!(
                         op = op_name,
                         bn_index = i,
-                        endpoint = client.endpoint(),
+                        endpoint = %RedactedUrl(client.endpoint()),
                         error = %e,
                         "unsynced BN fallback also failed"
                     );
@@ -550,7 +664,7 @@ impl BnManager {
     }
 
     /// Broadcast an operation to all BNs (regardless of sync status). Returns first success.
-    /// If all fail, returns the last error.
+    /// If all fail, returns the last error. Logs partial failures at warn level.
     async fn broadcast<'s, F>(&'s self, op_name: &str, op: F) -> Result<(), BeaconError>
     where
         F: Fn(&'s BeaconClient) -> BoxFut<'s, ()>,
@@ -560,37 +674,28 @@ impl BnManager {
             rvc.bn.strategy = "broadcast",
             rvc.bn.tried = self.clients.len(),
         );
-        if let Some(deadline) = self.overall_timeout {
-            match tokio::time::timeout(
-                deadline,
-                self.broadcast_inner(op_name, &op).instrument(strategy_span),
-            )
-            .await
-            {
-                Ok(result) => return result,
-                Err(_) => {
-                    return Err(BeaconError::HttpError(format!(
-                        "{op_name}: overall deadline of {}s exceeded",
-                        deadline.as_secs()
-                    )))
-                }
-            }
+        async {
+            let broadcast = self.broadcast_inner(op_name, &op).await;
+            Self::log_partial_failure(op_name, &broadcast);
+            broadcast.into_result()
         }
-        self.broadcast_inner(op_name, &op).instrument(strategy_span).await
+        .instrument(strategy_span)
+        .await
     }
 
-    async fn broadcast_inner<'s, F>(&'s self, op_name: &str, op: &F) -> Result<(), BeaconError>
+    async fn broadcast_inner<'s, T, F>(&'s self, op_name: &str, op: &F) -> BroadcastResult<T>
     where
-        F: Fn(&'s BeaconClient) -> BoxFut<'s, ()>,
+        T: Send + 'static,
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        let mut futs: Vec<IndexedTimedResultFut<'_, ()>> = Vec::with_capacity(self.clients.len());
+        let mut futs: Vec<IndexedTimedResultFut<'_, T>> = Vec::with_capacity(self.clients.len());
 
         for (i, client) in self.clients.iter().enumerate() {
             let endpoint = client.endpoint().to_string();
             let fut = op(client);
             let attempt_span = tracing::info_span!(
                 "rvc.bn.attempt",
-                rvc.bn.url = %redact_url(client.endpoint()),
+                rvc.bn.url = %RedactedUrl(client.endpoint()),
             );
             futs.push(Box::pin(
                 async move {
@@ -605,47 +710,51 @@ impl BnManager {
 
         let results = join_all(futs).await;
 
-        // Record health for ALL BNs first, then determine the result.
-        let mut first_ok = false;
-        let mut last_err = None;
+        let mut outcomes = Vec::with_capacity(results.len());
         {
             let mut guard = self.health_trackers.write().await;
-            for (i, endpoint, result, elapsed) in &results {
-                match result {
-                    Ok(()) => {
-                        guard[*i].record_success(*elapsed);
+            for (i, endpoint, result, elapsed) in results {
+                match &result {
+                    Ok(_) => {
+                        guard[i].record_success(elapsed);
                         debug!(
                             op = op_name,
                             bn_index = i,
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(&endpoint),
                             "broadcast succeeded on BN"
                         );
-                        first_ok = true;
                     }
                     Err(e) => {
-                        guard[*i].record_error();
+                        guard[i].record_error();
                         warn!(
                             op = op_name,
                             bn_index = i,
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(&endpoint),
                             error = %e,
                             "broadcast failed on BN"
                         );
                     }
                 }
+                outcomes.push(BnOutcome { endpoint, result, latency: elapsed });
             }
         }
 
-        if first_ok {
-            return Ok(());
-        }
+        BroadcastResult { outcomes }
+    }
 
-        for (_, _, result, _) in results {
-            if let Err(e) = result {
-                last_err = Some(e);
-            }
+    fn log_partial_failure<T>(op_name: &str, broadcast: &BroadcastResult<T>) {
+        if broadcast.any_success() && !broadcast.all_success() {
+            let (ok, fail) = broadcast.counts();
+            let failed_endpoints: Vec<&str> =
+                broadcast.failures().iter().map(|(e, _)| *e).collect();
+            warn!(
+                op = op_name,
+                successes = ok,
+                failures = fail,
+                failed_endpoints = ?failed_endpoints,
+                "partial broadcast failure"
+            );
         }
-        Err(last_err.expect("at least one client exists"))
     }
 
     /// Broadcast an operation that returns a non-unit result.
@@ -664,93 +773,13 @@ impl BnManager {
             rvc.bn.strategy = "broadcast",
             rvc.bn.tried = self.clients.len(),
         );
-        if let Some(deadline) = self.overall_timeout {
-            match tokio::time::timeout(
-                deadline,
-                self.broadcast_with_result_inner(op_name, &op).instrument(strategy_span),
-            )
-            .await
-            {
-                Ok(result) => return result,
-                Err(_) => {
-                    return Err(BeaconError::HttpError(format!(
-                        "{op_name}: overall deadline of {}s exceeded",
-                        deadline.as_secs()
-                    )))
-                }
-            }
+        async {
+            let broadcast = self.broadcast_inner(op_name, &op).await;
+            Self::log_partial_failure(op_name, &broadcast);
+            broadcast.into_result()
         }
-        self.broadcast_with_result_inner(op_name, &op).instrument(strategy_span).await
-    }
-
-    async fn broadcast_with_result_inner<'s, T, F>(
-        &'s self,
-        op_name: &str,
-        op: &F,
-    ) -> Result<T, BeaconError>
-    where
-        T: Send + 'static,
-        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
-    {
-        let mut futs: Vec<IndexedTimedResultFut<'_, T>> = Vec::with_capacity(self.clients.len());
-
-        for (i, client) in self.clients.iter().enumerate() {
-            let endpoint = client.endpoint().to_string();
-            let fut = op(client);
-            let attempt_span = tracing::info_span!(
-                "rvc.bn.attempt",
-                rvc.bn.url = %redact_url(client.endpoint()),
-            );
-            futs.push(Box::pin(
-                async move {
-                    let start = tokio::time::Instant::now();
-                    let result = fut.await;
-                    let elapsed = start.elapsed();
-                    (i, endpoint, result, elapsed)
-                }
-                .instrument(attempt_span),
-            ));
-        }
-
-        let results = join_all(futs).await;
-
-        // Record health for ALL BNs first.
-        {
-            let mut guard = self.health_trackers.write().await;
-            for (i, endpoint, result, elapsed) in &results {
-                match result {
-                    Ok(_) => {
-                        guard[*i].record_success(*elapsed);
-                        debug!(
-                            op = op_name,
-                            bn_index = i,
-                            endpoint = endpoint,
-                            "broadcast succeeded on BN"
-                        );
-                    }
-                    Err(e) => {
-                        guard[*i].record_error();
-                        warn!(
-                            op = op_name,
-                            bn_index = i,
-                            endpoint = endpoint,
-                            error = %e,
-                            "broadcast failed on BN"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Return first success or last error.
-        let mut last_err = None;
-        for (_, _, result, _) in results {
-            match result {
-                Ok(v) => return Ok(v),
-                Err(e) => last_err = Some(e),
-            }
-        }
-        Err(last_err.expect("at least one client exists"))
+        .instrument(strategy_span)
+        .await
     }
 }
 
@@ -766,43 +795,72 @@ fn is_better_block(a: &ProduceBlockResponse, b: &ProduceBlockResponse) -> bool {
 
 #[async_trait]
 impl BeaconNodeClient for BnManager {
-    // -- State / Config: query(First) --
+    // -- State / Config: query(First), any role, accept SmallLag --
 
     async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-        self.query_first("get_genesis", |c| Box::pin(c.get_genesis())).await
+        self.query_first("get_genesis", BnRole::All, HealthTier::SmallLag, |c| {
+            Box::pin(c.get_genesis())
+        })
+        .await
     }
 
     async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-        self.query_first("get_config_spec", |c| Box::pin(c.get_config_spec())).await
+        self.query_first("get_config_spec", BnRole::All, HealthTier::SmallLag, |c| {
+            Box::pin(c.get_config_spec())
+        })
+        .await
     }
 
     async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-        self.query_first("get_fork_schedule", |c| Box::pin(c.get_fork_schedule())).await
+        self.query_first("get_fork_schedule", BnRole::All, HealthTier::SmallLag, |c| {
+            Box::pin(c.get_fork_schedule())
+        })
+        .await
     }
 
     async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError> {
-        self.query_first("get_fork", |c| Box::pin(c.get_fork(state_id))).await
+        self.query_first("get_fork", BnRole::All, HealthTier::SmallLag, |c| {
+            Box::pin(c.get_fork(state_id))
+        })
+        .await
     }
 
     async fn get_validators(&self, pubkeys: &[String]) -> Result<ValidatorsResponse, BeaconError> {
-        self.query_first("get_validators", |c| Box::pin(c.get_validators(pubkeys))).await
+        self.query_first("get_validators", BnRole::All, HealthTier::SmallLag, |c| {
+            Box::pin(c.get_validators(pubkeys))
+        })
+        .await
     }
 
-    // -- Duties: query(First) --
+    // -- Duties: query(First) + duty_fetch timeout, accept SmallLag --
 
     async fn get_attester_duties(
         &self,
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<AttesterDutiesResponse, BeaconError> {
-        self.query_first("get_attester_duties", |c| {
-            Box::pin(c.get_attester_duties(epoch, validator_indices))
-        })
+        self.with_op_timeout(
+            "get_attester_duties",
+            self.op_timeout(|t| t.duty_fetch),
+            self.query_first(
+                "get_attester_duties",
+                BnRole::Attestation,
+                HealthTier::SmallLag,
+                |c| Box::pin(c.get_attester_duties(epoch, validator_indices)),
+            ),
+        )
         .await
     }
 
     async fn get_proposer_duties(&self, epoch: u64) -> Result<ProposerDutiesResponse, BeaconError> {
-        self.query_first("get_proposer_duties", |c| Box::pin(c.get_proposer_duties(epoch))).await
+        self.with_op_timeout(
+            "get_proposer_duties",
+            self.op_timeout(|t| t.duty_fetch),
+            self.query_first("get_proposer_duties", BnRole::Proposal, HealthTier::Synced, |c| {
+                Box::pin(c.get_proposer_duties(epoch))
+            }),
+        )
+        .await
     }
 
     async fn post_sync_committee_duties(
@@ -810,13 +868,20 @@ impl BeaconNodeClient for BnManager {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-        self.query_first("post_sync_committee_duties", |c| {
-            Box::pin(c.post_sync_committee_duties(epoch, validator_indices))
-        })
+        self.with_op_timeout(
+            "post_sync_committee_duties",
+            self.op_timeout(|t| t.duty_fetch),
+            self.query_first(
+                "post_sync_committee_duties",
+                BnRole::SyncCommittee,
+                HealthTier::SmallLag,
+                |c| Box::pin(c.post_sync_committee_duties(epoch, validator_indices)),
+            ),
+        )
         .await
     }
 
-    // -- Block production: query(Best) --
+    // -- Block production: query(Best), Proposal role, require Synced --
 
     async fn produce_block_v3(
         &self,
@@ -825,25 +890,53 @@ impl BeaconNodeClient for BnManager {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, BeaconError> {
-        self.query_best(
+        self.with_op_timeout(
             "produce_block_v3",
-            |c| Box::pin(c.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor)),
-            is_better_block,
+            self.op_timeout(|t| t.block_production),
+            self.query_best(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                |c| {
+                    Box::pin(c.produce_block_v3(
+                        slot,
+                        randao_reveal,
+                        graffiti,
+                        builder_boost_factor,
+                    ))
+                },
+                is_better_block,
+            ),
         )
         .await
     }
 
-    // -- Submissions: broadcast --
+    // -- Submissions: broadcast + block_publication timeout, accept LargeLag --
 
     async fn publish_block(
         &self,
         signed_block: &SignedBeaconBlock,
         consensus_version: &str,
     ) -> Result<(), BeaconError> {
-        self.broadcast("publish_block", |c| {
-            Box::pin(c.publish_block(signed_block, consensus_version))
-        })
-        .await
+        if self.broadcast_topics.blocks {
+            self.with_op_timeout(
+                "publish_block",
+                self.op_timeout(|t| t.block_publication),
+                self.broadcast("publish_block", |c| {
+                    Box::pin(c.publish_block(signed_block, consensus_version))
+                }),
+            )
+            .await
+        } else {
+            self.with_op_timeout(
+                "publish_block",
+                self.op_timeout(|t| t.block_publication),
+                self.query_first("publish_block", BnRole::Submission, HealthTier::LargeLag, |c| {
+                    Box::pin(c.publish_block(signed_block, consensus_version))
+                }),
+            )
+            .await
+        }
     }
 
     async fn publish_blinded_block(
@@ -851,38 +944,81 @@ impl BeaconNodeClient for BnManager {
         signed_blinded_block: &SignedBlindedBeaconBlock,
         consensus_version: &str,
     ) -> Result<(), BeaconError> {
-        self.broadcast("publish_blinded_block", |c| {
-            Box::pin(c.publish_blinded_block(signed_blinded_block, consensus_version))
-        })
-        .await
+        if self.broadcast_topics.blocks {
+            self.with_op_timeout(
+                "publish_blinded_block",
+                self.op_timeout(|t| t.block_publication),
+                self.broadcast("publish_blinded_block", |c| {
+                    Box::pin(c.publish_blinded_block(signed_blinded_block, consensus_version))
+                }),
+            )
+            .await
+        } else {
+            self.with_op_timeout(
+                "publish_blinded_block",
+                self.op_timeout(|t| t.block_publication),
+                self.query_first(
+                    "publish_blinded_block",
+                    BnRole::Submission,
+                    HealthTier::LargeLag,
+                    |c| Box::pin(c.publish_blinded_block(signed_blinded_block, consensus_version)),
+                ),
+            )
+            .await
+        }
     }
 
-    // -- Attestation data: query(First) --
+    // -- Attestation data: query(First), Attestation role, accept SmallLag --
 
     async fn get_attestation_data(
         &self,
         slot: u64,
         committee_index: u64,
     ) -> Result<AttestationDataResponse, BeaconError> {
-        self.query_first("get_attestation_data", |c| {
-            Box::pin(c.get_attestation_data(slot, committee_index))
-        })
+        self.with_op_timeout(
+            "get_attestation_data",
+            self.op_timeout(|t| t.attestation_fetch),
+            self.query_first(
+                "get_attestation_data",
+                BnRole::Attestation,
+                HealthTier::SmallLag,
+                |c| Box::pin(c.get_attestation_data(slot, committee_index)),
+            ),
+        )
         .await
     }
 
-    // -- Attestation submission: broadcast --
+    // -- Attestation submission: broadcast or Submission role, accept LargeLag --
 
     async fn submit_attestation(
         &self,
         attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError> {
-        self.broadcast_with_result("submit_attestation", |c| {
-            Box::pin(c.submit_attestation(attestations))
-        })
-        .await
+        if self.broadcast_topics.attestations {
+            self.with_op_timeout(
+                "submit_attestation",
+                self.op_timeout(|t| t.attestation_submit),
+                self.broadcast_with_result("submit_attestation", |c| {
+                    Box::pin(c.submit_attestation(attestations))
+                }),
+            )
+            .await
+        } else {
+            self.with_op_timeout(
+                "submit_attestation",
+                self.op_timeout(|t| t.attestation_submit),
+                self.query_first(
+                    "submit_attestation",
+                    BnRole::Submission,
+                    HealthTier::LargeLag,
+                    |c| Box::pin(c.submit_attestation(attestations)),
+                ),
+            )
+            .await
+        }
     }
 
-    // -- Aggregation: query(First) for fetching, broadcast for submitting --
+    // -- Aggregation: Aggregation role, accept SmallLag for fetch; broadcast for submit --
 
     async fn get_aggregate_attestation(
         &self,
@@ -890,9 +1026,22 @@ impl BeaconNodeClient for BnManager {
         attestation_data_root: &str,
         committee_index: Option<u64>,
     ) -> Result<VersionedAggregateAttestation, BeaconError> {
-        self.query_first("get_aggregate_attestation", |c| {
-            Box::pin(c.get_aggregate_attestation(slot, attestation_data_root, committee_index))
-        })
+        self.with_op_timeout(
+            "get_aggregate_attestation",
+            self.op_timeout(|t| t.aggregate_fetch),
+            self.query_first(
+                "get_aggregate_attestation",
+                BnRole::Aggregation,
+                HealthTier::SmallLag,
+                |c| {
+                    Box::pin(c.get_aggregate_attestation(
+                        slot,
+                        attestation_data_root,
+                        committee_index,
+                    ))
+                },
+            ),
+        )
         .await
     }
 
@@ -900,22 +1049,44 @@ impl BeaconNodeClient for BnManager {
         &self,
         proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError> {
-        self.broadcast("submit_aggregate_and_proofs", |c| {
-            Box::pin(c.submit_aggregate_and_proofs(proofs))
-        })
+        self.with_op_timeout(
+            "submit_aggregate_and_proofs",
+            self.op_timeout(|t| t.aggregate_submit),
+            self.broadcast("submit_aggregate_and_proofs", |c| {
+                Box::pin(c.submit_aggregate_and_proofs(proofs))
+            }),
+        )
         .await
     }
 
-    // -- Sync committee: broadcast for submissions, query(First) for fetching --
+    // -- Sync committee: SyncCommittee role, accept SmallLag --
 
     async fn submit_sync_committee_messages(
         &self,
         messages: &[SyncCommitteeMessage],
     ) -> Result<(), BeaconError> {
-        self.broadcast("submit_sync_committee_messages", |c| {
-            Box::pin(c.submit_sync_committee_messages(messages))
-        })
-        .await
+        if self.broadcast_topics.sync_committee {
+            self.with_op_timeout(
+                "submit_sync_committee_messages",
+                self.op_timeout(|t| t.sync_message),
+                self.broadcast("submit_sync_committee_messages", |c| {
+                    Box::pin(c.submit_sync_committee_messages(messages))
+                }),
+            )
+            .await
+        } else {
+            self.with_op_timeout(
+                "submit_sync_committee_messages",
+                self.op_timeout(|t| t.sync_message),
+                self.query_first(
+                    "submit_sync_committee_messages",
+                    BnRole::SyncCommittee,
+                    HealthTier::SmallLag,
+                    |c| Box::pin(c.submit_sync_committee_messages(messages)),
+                ),
+            )
+            .await
+        }
     }
 
     async fn get_sync_committee_contribution(
@@ -924,9 +1095,22 @@ impl BeaconNodeClient for BnManager {
         subcommittee_index: u64,
         beacon_block_root: &str,
     ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-        self.query_first("get_sync_committee_contribution", |c| {
-            Box::pin(c.get_sync_committee_contribution(slot, subcommittee_index, beacon_block_root))
-        })
+        self.with_op_timeout(
+            "get_sync_committee_contribution",
+            self.op_timeout(|t| t.sync_contribution),
+            self.query_first(
+                "get_sync_committee_contribution",
+                BnRole::SyncCommittee,
+                HealthTier::SmallLag,
+                |c| {
+                    Box::pin(c.get_sync_committee_contribution(
+                        slot,
+                        subcommittee_index,
+                        beacon_block_root,
+                    ))
+                },
+            ),
+        )
         .await
     }
 
@@ -934,16 +1118,23 @@ impl BeaconNodeClient for BnManager {
         &self,
         proofs: &[SignedContributionAndProof],
     ) -> Result<(), BeaconError> {
-        self.broadcast("submit_contribution_and_proofs", |c| {
-            Box::pin(c.submit_contribution_and_proofs(proofs))
-        })
+        self.with_op_timeout(
+            "submit_contribution_and_proofs",
+            self.op_timeout(|t| t.sync_contribution),
+            self.broadcast("submit_contribution_and_proofs", |c| {
+                Box::pin(c.submit_contribution_and_proofs(proofs))
+            }),
+        )
         .await
     }
 
     // -- Blocks --
 
     async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-        self.query_first("get_block_root", |c| Box::pin(c.get_block_root(block_id))).await
+        self.query_first("get_block_root", BnRole::All, HealthTier::SmallLag, |c| {
+            Box::pin(c.get_block_root(block_id))
+        })
+        .await
     }
 
     // -- Proposer preparation: broadcast --
@@ -952,22 +1143,44 @@ impl BeaconNodeClient for BnManager {
         &self,
         preparations: &[ProposerPreparation],
     ) -> Result<(), BeaconError> {
-        self.broadcast("prepare_beacon_proposer", |c| {
-            Box::pin(c.prepare_beacon_proposer(preparations))
-        })
+        self.with_op_timeout(
+            "prepare_beacon_proposer",
+            self.op_timeout(|t| t.preparation),
+            self.broadcast("prepare_beacon_proposer", |c| {
+                Box::pin(c.prepare_beacon_proposer(preparations))
+            }),
+        )
         .await
     }
 
-    // -- Committee subscriptions: broadcast --
+    // -- Committee subscriptions: broadcast or Submission role --
 
     async fn submit_beacon_committee_subscriptions(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
-        self.broadcast("submit_beacon_committee_subscriptions", |c| {
-            Box::pin(c.submit_beacon_committee_subscriptions(subscriptions))
-        })
-        .await
+        if self.broadcast_topics.subscriptions {
+            self.with_op_timeout(
+                "submit_beacon_committee_subscriptions",
+                self.op_timeout(|t| t.preparation),
+                self.broadcast("submit_beacon_committee_subscriptions", |c| {
+                    Box::pin(c.submit_beacon_committee_subscriptions(subscriptions))
+                }),
+            )
+            .await
+        } else {
+            self.with_op_timeout(
+                "submit_beacon_committee_subscriptions",
+                self.op_timeout(|t| t.preparation),
+                self.query_first(
+                    "submit_beacon_committee_subscriptions",
+                    BnRole::Submission,
+                    HealthTier::LargeLag,
+                    |c| Box::pin(c.submit_beacon_committee_subscriptions(subscriptions)),
+                ),
+            )
+            .await
+        }
     }
 
     // -- Builder: broadcast --
@@ -976,18 +1189,30 @@ impl BeaconNodeClient for BnManager {
         &self,
         registrations: &[SignedValidatorRegistration],
     ) -> Result<(), BeaconError> {
-        self.broadcast("register_validators", |c| Box::pin(c.register_validators(registrations)))
-            .await
+        self.with_op_timeout(
+            "register_validators",
+            self.op_timeout(|t| t.preparation),
+            self.broadcast("register_validators", |c| {
+                Box::pin(c.register_validators(registrations))
+            }),
+        )
+        .await
     }
 
-    // -- Node status: query(First) --
+    // -- Node status: query(First), any role --
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-        self.query_first("get_node_syncing", |c| Box::pin(c.get_node_syncing())).await
+        self.query_first("get_node_syncing", BnRole::All, HealthTier::Unsynced, |c| {
+            Box::pin(c.get_node_syncing())
+        })
+        .await
     }
 
     async fn get_node_version(&self) -> Result<String, BeaconError> {
-        self.query_first("get_node_version", |c| Box::pin(c.get_node_version())).await
+        self.query_first("get_node_version", BnRole::All, HealthTier::Unsynced, |c| {
+            Box::pin(c.get_node_version())
+        })
+        .await
     }
 }
 
@@ -1158,7 +1383,7 @@ mod tests {
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    use crate::sync_status::BnSyncStatus;
+    use crate::sync_status::{BnSyncDetail, BnSyncStatus};
 
     use super::*;
 
@@ -2157,6 +2382,7 @@ mod tests {
 
     const SYNCED_RESPONSE: &str = r#"{"data":{"head_slot":"1000","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}"#;
     const SYNCING_SYNCING_RESPONSE: &str = r#"{"data":{"head_slot":"500","sync_distance":"500","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#;
+    const EL_OFFLINE_RESPONSE: &str = r#"{"data":{"head_slot":"1000","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":true}}"#;
 
     #[tokio::test]
     async fn test_sync_check_sync_status_marks_synced() {
@@ -2172,7 +2398,7 @@ mod tests {
         manager.check_sync_status().await;
 
         let guard = manager.sync_statuses().read().await;
-        assert_eq!(guard[0], BnSyncStatus::Synced);
+        assert_eq!(guard[0].status, BnSyncStatus::Synced);
     }
 
     #[tokio::test]
@@ -2189,7 +2415,7 @@ mod tests {
         manager.check_sync_status().await;
 
         let guard = manager.sync_statuses().read().await;
-        assert_eq!(guard[0], BnSyncStatus::Syncing);
+        assert_eq!(guard[0].status, BnSyncStatus::Syncing);
     }
 
     #[tokio::test]
@@ -2206,7 +2432,7 @@ mod tests {
         manager.check_sync_status().await;
 
         let guard = manager.sync_statuses().read().await;
-        assert_eq!(guard[0], BnSyncStatus::Unreachable);
+        assert_eq!(guard[0].status, BnSyncStatus::Unreachable);
     }
 
     #[tokio::test]
@@ -2384,7 +2610,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         let guard = manager.sync_statuses().read().await;
-        assert_eq!(guard[0], BnSyncStatus::Synced);
+        assert_eq!(guard[0].status, BnSyncStatus::Synced);
         drop(guard);
 
         shutdown_tx.send(true).unwrap();
@@ -2492,7 +2718,7 @@ mod tests {
         let manager = make_manager(&server.uri());
 
         let guard = manager.sync_statuses().read().await;
-        assert_eq!(guard[0], BnSyncStatus::Unknown);
+        assert_eq!(guard[0].status, BnSyncStatus::Unknown);
         drop(guard);
 
         // Without calling check_sync_status, BN should still be tried via fallback
@@ -2934,92 +3160,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_overall_deadline_fires_when_all_bns_slow() {
-        let server = MockServer::start().await;
-
-        // Both syncing + version respond normally for setup
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/node/syncing"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "head_slot": "100", "sync_distance": "0", "is_syncing": false, "is_optimistic": false, "el_offline": false }
-            })))
-            .mount(&server)
-            .await;
-
-        // Genesis responds slowly — longer than deadline
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/beacon/genesis"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({
-                        "data": {
-                            "genesis_time": "1606824023",
-                            "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                            "genesis_fork_version": "0x00000000"
-                        }
-                    }))
-                    .set_delay(Duration::from_secs(5)),
-            )
-            .mount(&server)
-            .await;
-
-        let config = BnManagerConfig::new(vec![server.uri()]);
-        let manager =
-            BnManager::new(config).unwrap().with_overall_timeout(Duration::from_millis(200));
-
-        // Mark BN as synced so query_first is used
-        {
-            let mut statuses = manager.sync_statuses().write().await;
-            statuses[0] = BnSyncStatus::Synced;
-        }
-
-        let result = manager.get_genesis().await;
-        assert!(result.is_err(), "Should timeout when BN is slower than overall deadline");
-        let err_msg = format!("{}", result.unwrap_err());
-        assert!(
-            err_msg.contains("deadline") || err_msg.contains("timed out"),
-            "Error should mention deadline/timeout, got: {err_msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_no_overall_deadline_by_default() {
-        let server = MockServer::start().await;
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/node/syncing"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "head_slot": "100", "sync_distance": "0", "is_syncing": false, "is_optimistic": false, "el_offline": false }
-            })))
-            .mount(&server)
-            .await;
-
-        Mock::given(method("GET"))
-            .and(path("/eth/v1/beacon/genesis"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": {
-                    "genesis_time": "1606824023",
-                    "genesis_validators_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                    "genesis_fork_version": "0x00000000"
-                }
-            })))
-            .mount(&server)
-            .await;
-
-        let config = BnManagerConfig::new(vec![server.uri()]);
-        let manager = BnManager::new(config).unwrap();
-
-        // No overall_timeout set — should default to None
-        {
-            let mut statuses = manager.sync_statuses().write().await;
-            statuses[0] = BnSyncStatus::Synced;
-        }
-
-        let result = manager.get_genesis().await;
-        assert!(result.is_ok(), "Should succeed without overall deadline");
-    }
-
-    #[tokio::test]
     async fn test_health_scores_reflect_sync_status_synced() {
         let server = MockServer::start().await;
 
@@ -3034,7 +3174,12 @@ mod tests {
         // Set sync status to Synced
         {
             let mut statuses = manager.sync_statuses().write().await;
-            statuses[0] = BnSyncStatus::Synced;
+            statuses[0] = BnSyncDetail {
+                status: BnSyncStatus::Synced,
+                sync_distance: Some(0),
+                is_optimistic: false,
+                el_offline: false,
+            };
         }
 
         let scores = manager.health_scores().await;
@@ -3058,7 +3203,12 @@ mod tests {
         // Set sync status to Syncing
         {
             let mut statuses = manager.sync_statuses().write().await;
-            statuses[0] = BnSyncStatus::Syncing;
+            statuses[0] = BnSyncDetail {
+                status: BnSyncStatus::Syncing,
+                sync_distance: Some(100),
+                is_optimistic: false,
+                el_offline: false,
+            };
         }
 
         let scores = manager.health_scores().await;
@@ -3081,7 +3231,12 @@ mod tests {
         // Set sync status to Unreachable
         {
             let mut statuses = manager.sync_statuses().write().await;
-            statuses[0] = BnSyncStatus::Unreachable;
+            statuses[0] = BnSyncDetail {
+                status: BnSyncStatus::Unreachable,
+                sync_distance: None,
+                is_optimistic: false,
+                el_offline: false,
+            };
         }
 
         let scores = manager.health_scores().await;
@@ -3106,5 +3261,350 @@ mod tests {
         // Unknown is not unreachable (we don't know), but not synced either
         assert!(scores[0].is_reachable);
         assert!(!scores[0].is_synced);
+    }
+
+    // -- Per-operation timeout tests --
+
+    #[tokio::test]
+    async fn test_operation_timeout_fires_on_slow_bn() {
+        let server = MockServer::start().await;
+
+        // Simulate a slow BN: 10s delay on attestation data endpoint
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        r#"{"data":{"slot":"1","index":"0","beacon_block_root":"0x0000000000000000000000000000000000000000000000000000000000000000","source":{"epoch":"0","root":"0x0000000000000000000000000000000000000000000000000000000000000000"},"target":{"epoch":"0","root":"0x0000000000000000000000000000000000000000000000000000000000000000"}}}"#,
+                    )
+                    .set_delay(Duration::from_secs(10)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = BnManagerConfig::new(vec![server.uri()]);
+        let manager = BnManager::new(config).unwrap().with_operation_timeouts(OperationTimeouts {
+            attestation_fetch: Duration::from_millis(100),
+            ..OperationTimeouts::default()
+        });
+
+        let start = tokio::time::Instant::now();
+        let result = manager.get_attestation_data(1, 0).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, BeaconError::OperationTimeout { operation, timeout }
+                if operation == "get_attestation_data" && *timeout == Duration::from_millis(100)),
+            "expected OperationTimeout, got: {err}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "should have timed out quickly, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_no_operation_timeout_completes_normally() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"data":{"slot":"1","index":"0","beacon_block_root":"0x0000000000000000000000000000000000000000000000000000000000000000","source":{"epoch":"0","root":"0x0000000000000000000000000000000000000000000000000000000000000000"},"target":{"epoch":"0","root":"0x0000000000000000000000000000000000000000000000000000000000000000"}}}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+
+        // No operation_timeouts set
+        let manager = make_manager(&server.uri());
+
+        let result = manager.get_attestation_data(1, 0).await;
+        assert!(result.is_ok(), "should succeed without per-op timeout: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    async fn test_operation_timeout_on_block_production() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        r#"{"version":"deneb","execution_payload_blinded":false,"execution_payload_value":"0","consensus_block_value":"0","data":{}}"#,
+                    )
+                    .set_delay(Duration::from_secs(10)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = BnManagerConfig::new(vec![server.uri()]);
+        let manager = BnManager::new(config).unwrap().with_operation_timeouts(OperationTimeouts {
+            block_production: Duration::from_millis(100),
+            ..OperationTimeouts::default()
+        });
+
+        let result = manager.produce_block_v3(1, "0xabc", None, None).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), BeaconError::OperationTimeout { operation, .. } if operation == "produce_block_v3"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_operation_timeout_on_duty_fetch() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/duties/proposer/1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        r#"{"dependent_root":"0x0000000000000000000000000000000000000000000000000000000000000000","execution_optimistic":false,"data":[]}"#,
+                    )
+                    .set_delay(Duration::from_secs(10)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = BnManagerConfig::new(vec![server.uri()]);
+        let manager = BnManager::new(config).unwrap().with_operation_timeouts(OperationTimeouts {
+            duty_fetch: Duration::from_millis(100),
+            ..OperationTimeouts::default()
+        });
+
+        let result = manager.get_proposer_duties(1).await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), BeaconError::OperationTimeout { operation, .. } if operation == "get_proposer_duties"),
+        );
+    }
+
+    // ===================================================================
+    // EL-offline sync status integration tests
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_el_offline_bn_marks_el_offline_status() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(EL_OFFLINE_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let manager = make_manager(&server.uri());
+        manager.check_sync_status().await;
+
+        let guard = manager.sync_statuses().read().await;
+        assert_eq!(guard[0].status, BnSyncStatus::ElOffline);
+    }
+
+    #[tokio::test]
+    async fn test_el_offline_bn_used_for_non_el_operations() {
+        let el_offline_bn = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(EL_OFFLINE_RESPONSE))
+            .mount(&el_offline_bn)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(1)
+            .mount(&el_offline_bn)
+            .await;
+
+        let manager = make_manager(&el_offline_bn.uri());
+        manager.check_sync_status().await;
+
+        // get_genesis is non-EL, so ElOffline BN should be used
+        let result = manager.get_genesis().await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().data.genesis_time, "1606824023");
+    }
+
+    #[tokio::test]
+    async fn test_el_offline_bn_skipped_for_block_production() {
+        let el_offline_bn = MockServer::start().await;
+        let synced_bn = MockServer::start().await;
+
+        // BN1: EL offline
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(EL_OFFLINE_RESPONSE))
+            .mount(&el_offline_bn)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Execution-Payload-Value", "9999")
+                .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+            .expect(0) // Should NOT be called — EL offline
+            .mount(&el_offline_bn)
+            .await;
+
+        // BN2: synced
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&synced_bn)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Execution-Payload-Value", "5000")
+                .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+            .expect(1)
+            .mount(&synced_bn)
+            .await;
+
+        let manager = make_multi_manager(&[&el_offline_bn.uri(), &synced_bn.uri()]);
+        manager.check_sync_status().await;
+
+        // produce_block_v3 is EL-dependent, so ElOffline BN should be skipped
+        let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().execution_payload_value, Some("5000".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_el_offline_bn_preferred_over_syncing_for_duties() {
+        let el_offline_bn = MockServer::start().await;
+        let syncing_bn = MockServer::start().await;
+
+        // BN1: EL offline (CL is synced)
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(EL_OFFLINE_RESPONSE))
+            .mount(&el_offline_bn)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(1)
+            .mount(&el_offline_bn)
+            .await;
+
+        // BN2: syncing
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
+            .mount(&syncing_bn)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+            .expect(0) // Should NOT be called — syncing BN is less preferred
+            .mount(&syncing_bn)
+            .await;
+
+        let manager = make_multi_manager(&[&el_offline_bn.uri(), &syncing_bn.uri()]);
+        manager.check_sync_status().await;
+
+        // get_genesis is non-EL: ElOffline BN should be used, Syncing BN should be skipped
+        let result = manager.get_genesis().await;
+        assert!(result.is_ok());
+    }
+
+    // ===================================================================
+    // Broadcast partial failure tests
+    // ===================================================================
+
+    #[tokio::test]
+    async fn test_broadcast_partial_failure_still_succeeds() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // BN1: returns 400 for prepare_beacon_proposer
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .expect(1)
+            .mount(&bn1)
+            .await;
+
+        // BN2: returns 200
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+
+        // Overall result should be Ok despite BN1 failing
+        let result = manager.prepare_beacon_proposer(&[]).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_all_fail_returns_error() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // Both BNs return 500
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(1)
+            .mount(&bn1)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("internal error"))
+            .expect(1)
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+
+        let result = manager.prepare_beacon_proposer(&[]).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_partial_failure_records_health() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+
+        // BN1: returns 400
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .mount(&bn1)
+            .await;
+
+        // BN2: returns 200
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&bn2)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+
+        let _ = manager.prepare_beacon_proposer(&[]).await;
+
+        // BN1 should have error recorded, BN2 should have success
+        let health = manager.health_trackers().read().await;
+        assert!(health[0].score() < health[1].score());
     }
 }

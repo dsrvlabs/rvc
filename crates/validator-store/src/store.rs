@@ -1,13 +1,16 @@
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 
-use serde::Deserialize;
+use crypto::logging::TruncatedPubkey;
+use serde::{Deserialize, Serialize};
+use tracing::{info, trace, warn};
 
+use crate::block_selection::BlockSelectionMode;
 use crate::config::{ValidatorConfig, ValidatorConfigUpdate};
 use crate::error::ValidatorStoreError;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct TomlConfig {
     #[serde(default)]
     defaults: Option<TomlDefaults>,
@@ -15,22 +18,30 @@ struct TomlConfig {
     validators: Vec<TomlValidator>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct TomlDefaults {
     fee_recipient: Option<String>,
     gas_limit: Option<u64>,
     graffiti: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct TomlValidator {
     pubkey: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     fee_recipient: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     gas_limit: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     builder_proposals: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     builder_boost_factor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     graffiti: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_selection_mode: Option<BlockSelectionMode>,
 }
 
 fn parse_hex_bytes<const N: usize>(s: &str) -> Result<[u8; N], ValidatorStoreError> {
@@ -39,22 +50,37 @@ fn parse_hex_bytes<const N: usize>(s: &str) -> Result<[u8; N], ValidatorStoreErr
     bytes.try_into().map_err(|_| ValidatorStoreError::Config(format!("expected {N} bytes")))
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ValidatorDefaults {
+    pub fee_recipient: [u8; 20],
+    pub gas_limit: u64,
+    pub graffiti: Option<[u8; 32]>,
+}
+
 pub struct ValidatorStore {
     validators: RwLock<HashMap<[u8; 48], ValidatorConfig>>,
-    default_fee_recipient: RwLock<[u8; 20]>,
-    default_gas_limit: RwLock<u64>,
-    default_graffiti: RwLock<Option<[u8; 32]>>,
+    defaults: RwLock<ValidatorDefaults>,
     config_path: Option<PathBuf>,
+    global_block_selection_mode: RwLock<BlockSelectionMode>,
+    // Serializes `save_config` so that snapshot → tempfile write → atomic
+    // rename happens as a single critical section. Without this, a thread
+    // holding a stale snapshot can `persist` AFTER a thread with newer data,
+    // silently clobbering committed updates.
+    save_lock: Mutex<()>,
 }
 
 impl ValidatorStore {
     pub fn new(default_fee_recipient: [u8; 20], default_gas_limit: u64) -> Self {
         Self {
             validators: RwLock::new(HashMap::new()),
-            default_fee_recipient: RwLock::new(default_fee_recipient),
-            default_gas_limit: RwLock::new(default_gas_limit),
-            default_graffiti: RwLock::new(None),
+            defaults: RwLock::new(ValidatorDefaults {
+                fee_recipient: default_fee_recipient,
+                gas_limit: default_gas_limit,
+                graffiti: None,
+            }),
             config_path: None,
+            global_block_selection_mode: RwLock::new(BlockSelectionMode::default()),
+            save_lock: Mutex::new(()),
         }
     }
 
@@ -85,92 +111,156 @@ impl ValidatorStore {
             validators.insert(config.pubkey, config);
         }
 
+        info!(
+            validator_count = validators.len(),
+            path = %path.display(),
+            "validator config loaded"
+        );
+
         Ok(Self {
             validators: RwLock::new(validators),
-            default_fee_recipient: RwLock::new(default_fee_recipient),
-            default_gas_limit: RwLock::new(default_gas_limit),
-            default_graffiti: RwLock::new(default_graffiti),
+            defaults: RwLock::new(ValidatorDefaults {
+                fee_recipient: default_fee_recipient,
+                gas_limit: default_gas_limit,
+                graffiti: default_graffiti,
+            }),
             config_path: Some(path.to_path_buf()),
+            global_block_selection_mode: RwLock::new(BlockSelectionMode::default()),
+            save_lock: Mutex::new(()),
         })
     }
 
+    /// Returns the default fee recipient address applied to any validator
+    /// that does not have a per-validator override.
+    pub fn default_fee_recipient(&self) -> [u8; 20] {
+        self.defaults.read().fee_recipient
+    }
+
+    /// Returns the default gas limit applied to any validator that does not
+    /// have a per-validator override.
+    pub fn default_gas_limit(&self) -> u64 {
+        self.defaults.read().gas_limit
+    }
+
     pub fn get_config(&self, pubkey: &[u8; 48]) -> Option<ValidatorConfig> {
-        self.validators.read().expect("validators lock poisoned").get(pubkey).cloned()
+        self.validators.read().get(pubkey).cloned()
+    }
+
+    pub fn effective_config(&self, pubkey: &[u8; 48]) -> ValidatorDefaults {
+        let validators = self.validators.read();
+        let defaults = self.defaults.read();
+        let validator = validators.get(pubkey);
+        ValidatorDefaults {
+            fee_recipient: validator
+                .and_then(|c| c.fee_recipient)
+                .unwrap_or(defaults.fee_recipient),
+            gas_limit: validator.and_then(|c| c.gas_limit).unwrap_or(defaults.gas_limit),
+            graffiti: validator.and_then(|c| c.graffiti).or(defaults.graffiti),
+        }
     }
 
     pub fn effective_fee_recipient(&self, pubkey: &[u8; 48]) -> [u8; 20] {
-        self.validators.read().unwrap().get(pubkey).and_then(|c| c.fee_recipient).unwrap_or(
-            *self.default_fee_recipient.read().expect("default_fee_recipient lock poisoned"),
-        )
+        let result = self.effective_config(pubkey).fee_recipient;
+        trace!(
+            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+            "fee recipient lookup"
+        );
+        result
     }
 
     pub fn effective_gas_limit(&self, pubkey: &[u8; 48]) -> u64 {
-        self.validators
-            .read()
-            .unwrap()
-            .get(pubkey)
-            .and_then(|c| c.gas_limit)
-            .unwrap_or(*self.default_gas_limit.read().expect("default_gas_limit lock poisoned"))
+        self.effective_config(pubkey).gas_limit
     }
 
     pub fn effective_graffiti(&self, pubkey: &[u8; 48]) -> Option<[u8; 32]> {
-        self.validators
-            .read()
-            .unwrap()
-            .get(pubkey)
-            .and_then(|c| c.graffiti)
-            .or(*self.default_graffiti.read().expect("default_graffiti lock poisoned"))
+        self.effective_config(pubkey).graffiti
     }
 
     pub fn is_builder_enabled(&self, pubkey: &[u8; 48]) -> bool {
-        self.validators
-            .read()
-            .expect("validators lock poisoned")
-            .get(pubkey)
-            .map(|c| c.builder_proposals)
-            .unwrap_or(false)
+        let enabled =
+            self.validators.read().get(pubkey).map(|c| c.builder_proposals).unwrap_or(false);
+        trace!(
+            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+            is_builder_enabled = enabled,
+            "builder status lookup"
+        );
+        enabled
     }
 
     pub fn builder_boost_factor(&self, pubkey: &[u8; 48]) -> u64 {
+        self.validators.read().get(pubkey).map(|c| c.builder_boost_factor).unwrap_or(100)
+    }
+
+    pub fn effective_block_selection_mode(&self, pubkey: &[u8; 48]) -> BlockSelectionMode {
         self.validators
             .read()
-            .expect("validators lock poisoned")
             .get(pubkey)
-            .map(|c| c.builder_boost_factor)
-            .unwrap_or(100)
+            .and_then(|c| c.block_selection_mode)
+            .unwrap_or(*self.global_block_selection_mode.read())
+    }
+
+    pub fn set_global_block_selection_mode(&self, mode: BlockSelectionMode) {
+        *self.global_block_selection_mode.write() = mode;
     }
 
     #[tracing::instrument(name = "rvc.validator_store.list_enabled_pubkeys", skip_all)]
     pub fn list_enabled_pubkeys(&self) -> Vec<[u8; 48]> {
-        self.validators
-            .read()
-            .expect("validators lock poisoned")
-            .values()
-            .filter(|c| c.enabled)
-            .map(|c| c.pubkey)
-            .collect()
+        self.validators.read().values().filter(|c| c.enabled).map(|c| c.pubkey).collect()
+    }
+
+    /// Returns `true` if this validator is permitted to attest.
+    ///
+    /// Keys that are not tracked by the store (e.g. loaded at startup before
+    /// the M-12 gate existed) default to `true` so they are never silently
+    /// blocked.  Only keys explicitly added as `enabled = false` (i.e. freshly
+    /// imported via the Keymanager API while inside the doppelganger window)
+    /// return `false`.
+    pub fn is_attesting_enabled(&self, pubkey: &[u8; 48]) -> bool {
+        self.validators.read().get(pubkey).map(|c| c.enabled).unwrap_or(true)
     }
 
     pub fn add_validator(&self, config: ValidatorConfig) {
-        self.validators.write().expect("validators lock poisoned").insert(config.pubkey, config);
+        self.validators.write().insert(config.pubkey, config);
     }
 
     pub fn remove_validator(&self, pubkey: &[u8; 48]) -> Option<ValidatorConfig> {
-        self.validators.write().expect("validators lock poisoned").remove(pubkey)
+        self.validators.write().remove(pubkey)
     }
 
     pub fn set_enabled(&self, pubkey: &[u8; 48], enabled: bool) {
-        if let Some(config) =
-            self.validators.write().expect("validators lock poisoned").get_mut(pubkey)
-        {
+        if let Some(config) = self.validators.write().get_mut(pubkey) {
             config.enabled = enabled;
+            let pk_hex = hex::encode(pubkey);
+            if enabled {
+                info!(pubkey = %TruncatedPubkey::new(&pk_hex), "validator enabled");
+            } else {
+                warn!(pubkey = %TruncatedPubkey::new(&pk_hex), "validator disabled");
+            }
         }
     }
 
     pub fn update_config(&self, pubkey: &[u8; 48], update: ValidatorConfigUpdate) {
-        if let Some(config) =
-            self.validators.write().expect("validators lock poisoned").get_mut(pubkey)
-        {
+        let mut changed_fields = Vec::new();
+        if update.fee_recipient.is_some() {
+            changed_fields.push("fee_recipient");
+        }
+        if update.gas_limit.is_some() {
+            changed_fields.push("gas_limit");
+        }
+        if update.graffiti.is_some() {
+            changed_fields.push("graffiti");
+        }
+        if update.builder_proposals.is_some() {
+            changed_fields.push("builder_proposals");
+        }
+        if update.builder_boost_factor.is_some() {
+            changed_fields.push("builder_boost_factor");
+        }
+        if update.block_selection_mode.is_some() {
+            changed_fields.push("block_selection_mode");
+        }
+
+        if let Some(config) = self.validators.write().get_mut(pubkey) {
             if let Some(fr) = update.fee_recipient {
                 config.fee_recipient = fr;
             }
@@ -186,7 +276,77 @@ impl ValidatorStore {
             if let Some(bbf) = update.builder_boost_factor {
                 config.builder_boost_factor = bbf;
             }
+            if let Some(bsm) = update.block_selection_mode {
+                config.block_selection_mode = bsm;
+            }
+
+            let pk_hex = hex::encode(pubkey);
+            info!(
+                pubkey = %TruncatedPubkey::new(&pk_hex),
+                changed_fields = changed_fields.join(","),
+                "validator config updated"
+            );
         }
+    }
+
+    pub fn has_validator(&self, pubkey: &[u8; 48]) -> bool {
+        self.validators.read().contains_key(pubkey)
+    }
+
+    #[tracing::instrument(name = "rvc.validator_store.save_config", skip_all)]
+    pub fn save_config(&self) -> Result<(), ValidatorStoreError> {
+        let config_path = self.config_path.as_ref().ok_or_else(|| {
+            ValidatorStoreError::Config("no config path set for save".to_string())
+        })?;
+
+        // Serialize the entire snapshot → write → rename sequence so a
+        // concurrent saver with a stale snapshot cannot persist after a
+        // saver with newer data and clobber it.
+        let _save_guard = self.save_lock.lock();
+
+        let defaults = self.defaults.read();
+        let validators = self.validators.read();
+
+        let toml_defaults = TomlDefaults {
+            fee_recipient: Some(format!("0x{}", hex::encode(defaults.fee_recipient))),
+            gas_limit: Some(defaults.gas_limit),
+            graffiti: defaults.graffiti.map(|g| graffiti_to_string(&g)),
+        };
+
+        let toml_validators: Vec<TomlValidator> = validators
+            .values()
+            .map(|v| TomlValidator {
+                pubkey: format!("0x{}", hex::encode(v.pubkey)),
+                fee_recipient: v.fee_recipient.map(|fr| format!("0x{}", hex::encode(fr))),
+                gas_limit: v.gas_limit,
+                builder_proposals: Some(v.builder_proposals),
+                builder_boost_factor: Some(v.builder_boost_factor),
+                graffiti: v.graffiti.map(|g| graffiti_to_string(&g)),
+                enabled: Some(v.enabled),
+                block_selection_mode: v.block_selection_mode,
+            })
+            .collect();
+
+        // Release locks before I/O
+        drop(defaults);
+        drop(validators);
+
+        let toml_config = TomlConfig { defaults: Some(toml_defaults), validators: toml_validators };
+
+        let toml_string = toml::to_string(&toml_config)
+            .map_err(|e| ValidatorStoreError::Config(e.to_string()))?;
+
+        let parent = config_path.parent().ok_or_else(|| {
+            ValidatorStoreError::Config("config path has no parent directory".to_string())
+        })?;
+
+        let tmp = tempfile::NamedTempFile::new_in(parent)?;
+        std::io::Write::write_all(&mut &tmp, toml_string.as_bytes())?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(config_path).map_err(|e| ValidatorStoreError::Io(e.error))?;
+
+        info!(path = %config_path.display(), "config saved");
+        Ok(())
     }
 
     #[tracing::instrument(name = "rvc.validator_store.reload_config", skip_all)]
@@ -195,8 +355,14 @@ impl ValidatorStore {
             ValidatorStoreError::Config("no config path set for reload".to_string())
         })?;
 
-        let content = std::fs::read_to_string(path)?;
-        let toml_config: TomlConfig = toml::from_str(&content)?;
+        let content = std::fs::read_to_string(path).map_err(|e| {
+            warn!(path = %path.display(), error = %e, "config parse error");
+            e
+        })?;
+        let toml_config: TomlConfig = toml::from_str(&content).map_err(|e| {
+            warn!(path = %path.display(), error = %e, "config parse error");
+            e
+        })?;
 
         // Parse-first: compute all new values before any mutation.
         let mut new_fee_recipient = [0u8; 20];
@@ -221,15 +387,20 @@ impl ValidatorStore {
         }
 
         // Apply-second: all parsing succeeded, now mutate atomically.
-        *self.default_fee_recipient.write().expect("default_fee_recipient lock poisoned") =
-            new_fee_recipient;
-        *self.default_gas_limit.write().expect("default_gas_limit lock poisoned") = new_gas_limit;
-        *self.default_graffiti.write().expect("default_graffiti lock poisoned") = new_graffiti;
+        *self.defaults.write() = ValidatorDefaults {
+            fee_recipient: new_fee_recipient,
+            gas_limit: new_gas_limit,
+            graffiti: new_graffiti,
+        };
 
-        let mut validators = self.validators.write().expect("validators lock poisoned");
-        for config in parsed_validators {
-            validators.insert(config.pubkey, config);
+        let mut validators = self.validators.write();
+        let existing_count = validators.len();
+        for config in &parsed_validators {
+            validators.insert(config.pubkey, config.clone());
         }
+        let added_count = validators.len().saturating_sub(existing_count);
+
+        info!(added_count = added_count, total_count = validators.len(), "config reloaded");
 
         Ok(())
     }
@@ -248,6 +419,7 @@ fn parse_validator(v: &TomlValidator) -> Result<ValidatorConfig, ValidatorStoreE
         builder_boost_factor: v.builder_boost_factor.unwrap_or(100),
         graffiti,
         enabled: v.enabled.unwrap_or(true),
+        block_selection_mode: v.block_selection_mode,
     })
 }
 
@@ -257,6 +429,11 @@ fn parse_graffiti(s: &str) -> [u8; 32] {
     let len = bytes.len().min(32);
     graffiti[..len].copy_from_slice(&bytes[..len]);
     graffiti
+}
+
+fn graffiti_to_string(graffiti: &[u8; 32]) -> String {
+    let end = graffiti.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    String::from_utf8_lossy(&graffiti[..end]).into_owned()
 }
 
 #[cfg(test)]
@@ -282,9 +459,9 @@ mod tests {
         let store = ValidatorStore::new(fr, 30_000_000);
 
         assert!(store.list_enabled_pubkeys().is_empty());
-        assert_eq!(*store.default_fee_recipient.read().unwrap(), fr);
-        assert_eq!(*store.default_gas_limit.read().unwrap(), 30_000_000);
-        assert!(store.default_graffiti.read().unwrap().is_none());
+        assert_eq!(store.defaults.read().fee_recipient, fr);
+        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
+        assert!(store.defaults.read().graffiti.is_none());
     }
 
     #[test]
@@ -399,7 +576,7 @@ mod tests {
         default_graffiti[..4].copy_from_slice(b"test");
 
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
-        *store.default_graffiti.write().unwrap() = Some(default_graffiti);
+        store.defaults.write().graffiti = Some(default_graffiti);
 
         let pk = test_pubkey(1);
         store.add_validator(ValidatorConfig::new(pk));
@@ -527,6 +704,7 @@ mod tests {
             builder_proposals: Some(true),
             builder_boost_factor: Some(150),
             graffiti: None, // no change
+            block_selection_mode: None,
         };
 
         store.update_config(&pk, update);
@@ -607,8 +785,8 @@ graffiti = "my graffiti"
         assert!(config.graffiti.is_some());
         assert!(config.enabled);
 
-        assert_eq!(*store.default_fee_recipient.read().unwrap(), [0xaau8; 20]);
-        assert_eq!(*store.default_gas_limit.read().unwrap(), 30_000_000);
+        assert_eq!(store.defaults.read().fee_recipient, [0xaau8; 20]);
+        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
     }
 
     #[test]
@@ -663,9 +841,9 @@ pubkey = "{}"
         file.write_all(toml_content.as_bytes()).unwrap();
 
         let store = ValidatorStore::load_from_config(&config_path).unwrap();
-        assert_eq!(*store.default_fee_recipient.read().unwrap(), [0u8; 20]);
-        assert_eq!(*store.default_gas_limit.read().unwrap(), 30_000_000);
-        assert!(store.default_graffiti.read().unwrap().is_none());
+        assert_eq!(store.defaults.read().fee_recipient, [0u8; 20]);
+        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
+        assert!(store.defaults.read().graffiti.is_none());
     }
 
     #[test]
@@ -1015,8 +1193,8 @@ pubkey = "invalid-hex-not-48-bytes"
 
         // CRITICAL: Store must be completely unchanged after failed reload
         // Defaults must not have changed
-        assert_eq!(*store.default_fee_recipient.read().unwrap(), [0xaau8; 20]);
-        assert_eq!(*store.default_gas_limit.read().unwrap(), 30_000_000);
+        assert_eq!(store.defaults.read().fee_recipient, [0xaau8; 20]);
+        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
 
         // No new validators added
         assert!(store.get_config(&[2u8; 48]).is_none());
@@ -1048,9 +1226,9 @@ pubkey = "{}"
         std::fs::write(&config_path, &toml_v1).unwrap();
 
         let store = ValidatorStore::load_from_config(&config_path).unwrap();
-        assert_eq!(*store.default_fee_recipient.read().unwrap(), [0xaau8; 20]);
-        assert_eq!(*store.default_gas_limit.read().unwrap(), 50_000_000);
-        assert!(store.default_graffiti.read().unwrap().is_some());
+        assert_eq!(store.defaults.read().fee_recipient, [0xaau8; 20]);
+        assert_eq!(store.defaults.read().gas_limit, 50_000_000);
+        assert!(store.defaults.read().graffiti.is_some());
 
         // Remove [defaults] section entirely
         let toml_v2 = format!(
@@ -1065,9 +1243,9 @@ pubkey = "{}"
         store.reload_config().unwrap();
 
         // Defaults should reset to hardcoded fallbacks
-        assert_eq!(*store.default_fee_recipient.read().unwrap(), [0u8; 20]);
-        assert_eq!(*store.default_gas_limit.read().unwrap(), 30_000_000);
-        assert!(store.default_graffiti.read().unwrap().is_none());
+        assert_eq!(store.defaults.read().fee_recipient, [0u8; 20]);
+        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
+        assert!(store.defaults.read().graffiti.is_none());
     }
 
     #[test]
@@ -1110,8 +1288,327 @@ pubkey = "{}"
         store.reload_config().unwrap();
 
         // fee_recipient and graffiti should reset to hardcoded fallbacks
-        assert_eq!(*store.default_fee_recipient.read().unwrap(), [0u8; 20]);
-        assert_eq!(*store.default_gas_limit.read().unwrap(), 40_000_000);
-        assert!(store.default_graffiti.read().unwrap().is_none());
+        assert_eq!(store.defaults.read().fee_recipient, [0u8; 20]);
+        assert_eq!(store.defaults.read().gas_limit, 40_000_000);
+        assert!(store.defaults.read().graffiti.is_none());
+    }
+
+    #[test]
+    fn test_effective_config_returns_consistent_snapshot() {
+        let default_fr = [0xaau8; 20];
+        let store = ValidatorStore::new(default_fr, 30_000_000);
+
+        let pk = test_pubkey(1);
+        store.validators.write().insert(
+            pk,
+            ValidatorConfig {
+                pubkey: pk,
+                fee_recipient: Some([0xbbu8; 20]),
+                gas_limit: Some(40_000_000),
+                graffiti: None,
+                builder_proposals: false,
+                builder_boost_factor: 100,
+                enabled: true,
+                block_selection_mode: None,
+            },
+        );
+
+        let config = store.effective_config(&pk);
+        assert_eq!(config.fee_recipient, [0xbbu8; 20]);
+        assert_eq!(config.gas_limit, 40_000_000);
+        assert!(config.graffiti.is_none());
+    }
+
+    #[test]
+    fn test_effective_config_falls_back_to_defaults() {
+        let default_fr = [0xaau8; 20];
+        let store = ValidatorStore::new(default_fr, 30_000_000);
+        let pk = test_pubkey(1);
+
+        let config = store.effective_config(&pk);
+        assert_eq!(config.fee_recipient, default_fr);
+        assert_eq!(config.gas_limit, 30_000_000);
+        assert!(config.graffiti.is_none());
+    }
+
+    #[test]
+    fn test_effective_config_concurrent_reads_consistent() {
+        use std::sync::Arc;
+
+        let default_fr = [0xaau8; 20];
+        let store = Arc::new(ValidatorStore::new(default_fr, 30_000_000));
+
+        let pk = test_pubkey(1);
+        store.validators.write().insert(
+            pk,
+            ValidatorConfig {
+                pubkey: pk,
+                fee_recipient: Some([0xbbu8; 20]),
+                gas_limit: Some(40_000_000),
+                graffiti: None,
+                builder_proposals: false,
+                builder_boost_factor: 100,
+                enabled: true,
+                block_selection_mode: None,
+            },
+        );
+
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let store = store.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let config = store.effective_config(&pk);
+                    // All values must come from the same snapshot
+                    assert_eq!(config.fee_recipient, [0xbbu8; 20]);
+                    assert_eq!(config.gas_limit, 40_000_000);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_has_validator() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+
+        assert!(!store.has_validator(&pk));
+
+        store.add_validator(ValidatorConfig::new(pk));
+        assert!(store.has_validator(&pk));
+
+        assert!(!store.has_validator(&test_pubkey(99)));
+    }
+
+    #[test]
+    fn test_save_config_round_trip() {
+        let pubkey_hex = "0x".to_string() + &hex::encode([1u8; 48]);
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+
+        let toml_content = format!(
+            r#"[defaults]
+fee_recipient = "{}"
+gas_limit = 30000000
+
+[[validators]]
+pubkey = "{}"
+fee_recipient = "{}"
+gas_limit = 35000000
+builder_proposals = true
+builder_boost_factor = 200
+graffiti = "my graffiti"
+"#,
+            "0x".to_string() + &hex::encode([0xaau8; 20]),
+            pubkey_hex,
+            fr_hex,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &toml_content).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+
+        // Update fee_recipient via update_config
+        let pk = [1u8; 48];
+        let new_fr = [0xbbu8; 20];
+        store.update_config(
+            &pk,
+            ValidatorConfigUpdate { fee_recipient: Some(Some(new_fr)), ..Default::default() },
+        );
+
+        // Save and reload
+        store.save_config().unwrap();
+        let reloaded = ValidatorStore::load_from_config(&config_path).unwrap();
+
+        assert_eq!(reloaded.get_config(&pk).unwrap().fee_recipient, Some(new_fr));
+    }
+
+    #[test]
+    fn test_save_config_no_path_returns_error() {
+        let store = ValidatorStore::new([0u8; 20], 30_000_000);
+        let result = store.save_config();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_save_config_preserves_all_fields() {
+        let pubkey_hex = "0x".to_string() + &hex::encode([1u8; 48]);
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+        let default_fr_hex = "0x".to_string() + &hex::encode([0xccu8; 20]);
+
+        let toml_content = format!(
+            r#"[defaults]
+fee_recipient = "{}"
+gas_limit = 25000000
+graffiti = "default graffiti"
+
+[[validators]]
+pubkey = "{}"
+fee_recipient = "{}"
+gas_limit = 35000000
+builder_proposals = true
+builder_boost_factor = 200
+graffiti = "my graffiti"
+enabled = false
+"#,
+            default_fr_hex, pubkey_hex, fr_hex,
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &toml_content).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+        store.save_config().unwrap();
+
+        let reloaded = ValidatorStore::load_from_config(&config_path).unwrap();
+
+        // Check defaults
+        assert_eq!(reloaded.defaults.read().fee_recipient, [0xccu8; 20]);
+        assert_eq!(reloaded.defaults.read().gas_limit, 25_000_000);
+        assert!(reloaded.defaults.read().graffiti.is_some());
+        let graffiti = reloaded.defaults.read().graffiti.unwrap();
+        assert_eq!(&graffiti[..16], b"default graffiti");
+
+        // Check validator
+        let pk = [1u8; 48];
+        let config = reloaded.get_config(&pk).unwrap();
+        assert_eq!(config.fee_recipient, Some([0xaau8; 20]));
+        assert_eq!(config.gas_limit, Some(35_000_000));
+        assert!(config.builder_proposals);
+        assert_eq!(config.builder_boost_factor, 200);
+        assert!(config.graffiti.is_some());
+        assert!(!config.enabled);
+    }
+
+    // --- Block selection mode tests (T4.4) ---
+
+    #[test]
+    fn test_effective_block_selection_mode_default() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+        store.add_validator(ValidatorConfig::new(pk));
+
+        assert_eq!(store.effective_block_selection_mode(&pk), BlockSelectionMode::MaxProfit,);
+    }
+
+    #[test]
+    fn test_effective_block_selection_mode_global_override() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+        store.add_validator(ValidatorConfig::new(pk));
+        store.set_global_block_selection_mode(BlockSelectionMode::ExecutionOnly);
+
+        assert_eq!(store.effective_block_selection_mode(&pk), BlockSelectionMode::ExecutionOnly,);
+    }
+
+    #[test]
+    fn test_effective_block_selection_mode_per_validator_override() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+        let mut config = ValidatorConfig::new(pk);
+        config.block_selection_mode = Some(BlockSelectionMode::BuilderOnly);
+        store.add_validator(config);
+
+        // Global is MaxProfit, but per-validator is BuilderOnly
+        assert_eq!(store.effective_block_selection_mode(&pk), BlockSelectionMode::BuilderOnly,);
+    }
+
+    #[test]
+    fn test_effective_block_selection_mode_per_validator_overrides_global() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+        let mut config = ValidatorConfig::new(pk);
+        config.block_selection_mode = Some(BlockSelectionMode::BuilderAlways);
+        store.add_validator(config);
+        store.set_global_block_selection_mode(BlockSelectionMode::ExecutionOnly);
+
+        // Per-validator (BuilderAlways) takes precedence over global (ExecutionOnly)
+        assert_eq!(store.effective_block_selection_mode(&pk), BlockSelectionMode::BuilderAlways,);
+    }
+
+    #[test]
+    fn test_effective_block_selection_mode_unknown_pubkey_returns_global() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let unknown_pk = test_pubkey(99);
+        store.set_global_block_selection_mode(BlockSelectionMode::BuilderOnly);
+
+        assert_eq!(
+            store.effective_block_selection_mode(&unknown_pk),
+            BlockSelectionMode::BuilderOnly,
+        );
+    }
+
+    #[test]
+    fn test_block_selection_mode_toml_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validators.toml");
+
+        let toml_content = r#"
+[defaults]
+fee_recipient = "0x0000000000000000000000000000000000000001"
+gas_limit = 30000000
+
+[[validators]]
+pubkey = "0x010000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+builder_proposals = true
+block_selection_mode = "builder-only"
+"#;
+        std::fs::write(&path, toml_content).unwrap();
+
+        let store = ValidatorStore::load_from_config(&path).unwrap();
+        let pk = test_pubkey(1);
+        let config = store.get_config(&pk).unwrap();
+        assert_eq!(config.block_selection_mode, Some(BlockSelectionMode::BuilderOnly));
+    }
+
+    // ── M-12 (Critical #1): is_attesting_enabled ─────────────────────────
+
+    /// Unknown pubkeys (not in the store) default to enabled=true so that
+    /// validators loaded at startup without an explicit config still attest.
+    #[test]
+    fn test_is_attesting_enabled_unknown_pubkey_defaults_to_true() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        assert!(store.is_attesting_enabled(&test_pubkey(99)));
+    }
+
+    /// A validator explicitly added with enabled=true is attestable.
+    #[test]
+    fn test_is_attesting_enabled_explicit_true() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+        store.add_validator(ValidatorConfig::new(pk)); // default enabled=true
+        assert!(store.is_attesting_enabled(&pk));
+    }
+
+    /// A validator explicitly added with enabled=false is NOT attestable
+    /// (post-import doppelganger window scenario).
+    #[test]
+    fn test_is_attesting_enabled_explicit_false() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(2);
+        let mut config = ValidatorConfig::new(pk);
+        config.enabled = false;
+        store.add_validator(config);
+        assert!(!store.is_attesting_enabled(&pk));
+    }
+
+    /// After set_enabled flips the flag to true, is_attesting_enabled must
+    /// return true (simulates the doppelganger window expiring).
+    #[test]
+    fn test_is_attesting_enabled_flips_after_set_enabled() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(3);
+        let mut config = ValidatorConfig::new(pk);
+        config.enabled = false;
+        store.add_validator(config);
+        assert!(!store.is_attesting_enabled(&pk), "must be disabled before flip");
+
+        store.set_enabled(&pk, true);
+        assert!(store.is_attesting_enabled(&pk), "must be enabled after flip");
     }
 }

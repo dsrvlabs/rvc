@@ -2,6 +2,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crypto::{EncryptionKdf, Keystore};
@@ -10,6 +11,49 @@ use crate::deposit;
 use crate::network;
 use crate::password;
 use crate::verify;
+
+/// Writes the mnemonic to a backup file with restrictive permissions (0o600).
+/// Returns the SHA-256 hex checksum of the mnemonic string.
+pub fn write_mnemonic_backup(path: &Path, mnemonic: &str) -> Result<String> {
+    let checksum = mnemonic_checksum(mnemonic);
+
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| {
+                format!("Failed to create mnemonic backup (already exists?): {}", path.display())
+            })?;
+        file.write_all(mnemonic.as_bytes())?;
+        file.write_all(b"\n")?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        let mut file =
+            OpenOptions::new().write(true).create_new(true).open(path).with_context(|| {
+                format!("Failed to create mnemonic backup (already exists?): {}", path.display())
+            })?;
+        file.write_all(mnemonic.as_bytes())?;
+        file.write_all(b"\n")?;
+    }
+
+    Ok(checksum)
+}
+
+fn mnemonic_checksum(mnemonic: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(mnemonic.as_bytes());
+    hex::encode(hasher.finalize())
+}
 
 /// Runs the new-mnemonic subcommand with all resolved inputs.
 #[allow(clippy::too_many_arguments)]
@@ -23,6 +67,7 @@ pub fn run(
     pbkdf2: bool,
     keystore_password: &Zeroizing<String>,
     dry_run: bool,
+    backup_file: Option<&Path>,
 ) -> Result<()> {
     let net = network::from_name(network_name)?;
 
@@ -33,9 +78,19 @@ pub fn run(
 
     let mnemonic = crypto::mnemonic::generate_mnemonic();
 
-    eprintln!("\nIMPORTANT: Write down this mnemonic and store it safely.");
-    eprintln!("It is the ONLY way to recover your keys.\n");
-    eprintln!("{}\n", mnemonic);
+    if let Some(path) = backup_file {
+        let mnemonic_str = mnemonic.to_string();
+        let checksum = write_mnemonic_backup(path, &mnemonic_str)?;
+        eprintln!("\nMnemonic backed up to: {}", path.display());
+        eprintln!("SHA-256 checksum: {}\n", checksum);
+    } else {
+        eprintln!(
+            "\nWARNING: No --backup-file specified. The mnemonic will only be shown on screen."
+        );
+        eprintln!("IMPORTANT: Write down this mnemonic and store it safely.");
+        eprintln!("It is the ONLY way to recover your keys.\n");
+        eprintln!("{}\n", mnemonic);
+    }
 
     let seed = crypto::mnemonic::mnemonic_to_seed(&mnemonic, mnemonic_passphrase);
 
@@ -682,6 +737,58 @@ mod tests {
         std::fs::write(&path, "existing content").unwrap();
 
         let result = write_with_permissions(&path, b"new content");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_write_mnemonic_backup_creates_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mnemonic.txt");
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+        let checksum = write_mnemonic_backup(&path, mnemonic).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, format!("{}\n", mnemonic));
+        assert!(!checksum.is_empty());
+        assert_eq!(checksum.len(), 64); // SHA-256 hex
+    }
+
+    #[test]
+    fn test_write_mnemonic_backup_checksum_deterministic() {
+        let mnemonic = "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+        let c1 = mnemonic_checksum(mnemonic);
+        let c2 = mnemonic_checksum(mnemonic);
+        assert_eq!(c1, c2);
+    }
+
+    #[test]
+    fn test_write_mnemonic_backup_different_mnemonics_different_checksums() {
+        let c1 = mnemonic_checksum("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about");
+        let c2 = mnemonic_checksum("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong");
+        assert_ne!(c1, c2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_write_mnemonic_backup_has_0o600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mnemonic_perms.txt");
+        write_mnemonic_backup(&path, "test mnemonic words").unwrap();
+
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn test_write_mnemonic_backup_rejects_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing_backup.txt");
+        std::fs::write(&path, "old").unwrap();
+
+        let result = write_mnemonic_backup(&path, "new mnemonic");
         assert!(result.is_err());
     }
 }

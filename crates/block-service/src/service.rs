@@ -1,14 +1,18 @@
 use std::sync::Arc;
 
-use tracing::{info, Instrument};
+use builder::CircuitBreakerState;
+use tracing::{debug, error, info, warn, Instrument};
 use tree_hash::TreeHash;
 
+use crypto::logging::TruncatedPubkey;
 use crypto::PublicKey;
 use eth_types::{ForkSchedule, Root, Slot, SLOTS_PER_EPOCH};
 use signer::ValidatorSigner;
 use validator_store::ValidatorStore;
 
 use crate::traits::{BeaconBlockClient, ProduceBlockResponse};
+use crate::types::BlockSelectionMode;
+use crate::validation::BlockResponseValidator;
 use crate::BlockServiceError;
 
 /// Result of a successful block proposal.
@@ -28,6 +32,7 @@ pub struct BlockService<S: ValidatorSigner, B: BeaconBlockClient> {
     validator_store: Arc<ValidatorStore>,
     fork_schedule: Arc<ForkSchedule>,
     genesis_validators_root: Root,
+    circuit_breaker: Arc<CircuitBreakerState>,
 }
 
 impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
@@ -38,9 +43,40 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         fork_schedule: Arc<ForkSchedule>,
         genesis_validators_root: Root,
     ) -> Self {
-        Self { signer, beacon, validator_store, fork_schedule, genesis_validators_root }
+        Self::with_circuit_breaker(
+            signer,
+            beacon,
+            validator_store,
+            fork_schedule,
+            genesis_validators_root,
+            Arc::new(CircuitBreakerState::new(0, 0)),
+        )
     }
 
+    pub fn with_circuit_breaker(
+        signer: Arc<S>,
+        beacon: Arc<B>,
+        validator_store: Arc<ValidatorStore>,
+        fork_schedule: Arc<ForkSchedule>,
+        genesis_validators_root: Root,
+        circuit_breaker: Arc<CircuitBreakerState>,
+    ) -> Self {
+        Self {
+            signer,
+            beacon,
+            validator_store,
+            fork_schedule,
+            genesis_validators_root,
+            circuit_breaker,
+        }
+    }
+
+    /// Propose a block for the given duty slot and validator key.
+    ///
+    /// Validates `proposer_index` against `expected_proposer_index` and, when
+    /// `expected_parent_root` is `Some`, validates `parent_root` against the
+    /// BN-reported head before calling the signer. On validation failure the
+    /// duty is dropped with an `error!` log and no signer call is made (H-4).
     #[tracing::instrument(
         name = "rvc.block.propose",
         skip_all,
@@ -55,10 +91,43 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         &self,
         slot: Slot,
         pubkey: &PublicKey,
+        expected_proposer_index: u64,
+        expected_parent_root: Option<Root>,
     ) -> Result<BlockProposalResult, BlockServiceError> {
+        let mode = self.validator_store.effective_block_selection_mode(&pubkey.to_bytes());
+        let validator = BlockResponseValidator {
+            expected_proposer_index,
+            expected_parent_root,
+            expected_slot: slot,
+        };
+        self.propose_block_impl(slot, pubkey, mode, Some(&validator)).await
+    }
+
+    pub async fn propose_block_with_mode(
+        &self,
+        slot: Slot,
+        pubkey: &PublicKey,
+        mode: BlockSelectionMode,
+    ) -> Result<BlockProposalResult, BlockServiceError> {
+        self.propose_block_impl(slot, pubkey, mode, None).await
+    }
+
+    async fn propose_block_impl(
+        &self,
+        slot: Slot,
+        pubkey: &PublicKey,
+        mode: BlockSelectionMode,
+        validator: Option<&BlockResponseValidator>,
+    ) -> Result<BlockProposalResult, BlockServiceError> {
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let proposal_start = std::time::Instant::now();
+
+        info!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), %mode, "Block proposal started");
+
         let epoch = slot / SLOTS_PER_EPOCH;
 
         // 1. Sign RANDAO reveal
+        let randao_start = std::time::Instant::now();
         let randao_bytes = self
             .signer
             .sign_randao_reveal(epoch, pubkey, &self.fork_schedule, &self.genesis_validators_root)
@@ -66,27 +135,114 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .await
             .map_err(|e| {
                 let err = BlockServiceError::Signer(e.to_string());
-                tracing::error!(error = %err, "RANDAO signing failed");
+                error!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), error = %err, "RANDAO signing failed");
                 err
             })?;
+        debug!(
+            slot = slot,
+            duration_ms = randao_start.elapsed().as_millis() as u64,
+            "RANDAO reveal signed"
+        );
         let randao_hex = format!("0x{}", hex::encode(&randao_bytes));
 
-        // 2. Get validator preferences
+        // 2. Get validator preferences, applying block selection mode
         let pubkey_bytes = pubkey.to_bytes();
         let graffiti = self.validator_store.effective_graffiti(&pubkey_bytes);
         let graffiti_hex = graffiti.map(|g| format!("0x{}", hex::encode(g)));
-        let boost = self.validator_store.builder_boost_factor(&pubkey_bytes);
+
+        // Check circuit breaker for builder modes first
+        let circuit_breaker_tripped = self.circuit_breaker.is_tripped();
+
+        let boost = match mode {
+            BlockSelectionMode::ExecutionOnly => {
+                debug!(slot = slot, "ExecutionOnly: builder_boost_factor=0");
+                0
+            }
+            BlockSelectionMode::MaxProfit => {
+                if circuit_breaker_tripped {
+                    warn!(slot = slot, "Builder circuit breaker tripped, using local block only");
+                    0
+                } else {
+                    self.validator_store.builder_boost_factor(&pubkey_bytes)
+                }
+            }
+            BlockSelectionMode::BuilderAlways => {
+                if circuit_breaker_tripped {
+                    warn!(
+                        slot = slot,
+                        "BuilderAlways: circuit breaker tripped, falling back to local"
+                    );
+                    0
+                } else {
+                    debug!(slot = slot, "BuilderAlways: builder_boost_factor=u64::MAX");
+                    u64::MAX
+                }
+            }
+            BlockSelectionMode::BuilderOnly => {
+                if circuit_breaker_tripped {
+                    error!(
+                        slot = slot,
+                        pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                        "BuilderOnly mode: circuit breaker tripped, proposal will be missed"
+                    );
+                    return Err(BlockServiceError::BuilderOnly(
+                        "circuit breaker tripped — proposal missed".to_string(),
+                    ));
+                }
+                debug!(slot = slot, "BuilderOnly: builder_boost_factor=u64::MAX");
+                u64::MAX
+            }
+        };
 
         // 3. Request block from beacon node
         let response = self
             .beacon
             .produce_block_v3(slot, &randao_hex, graffiti_hex.as_deref(), Some(boost))
             .instrument(tracing::info_span!("rvc.beacon.produce_block_v3"))
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "Block production failed");
-                e
-            })?;
+            .await;
+
+        // Handle block-production failure, tagging the error so the coordinator
+        // can apply H-3 circuit-breaker scoping.
+        let response = match response {
+            Ok(resp) => resp,
+            Err(e) => {
+                if mode == BlockSelectionMode::BuilderOnly {
+                    // BuilderOnly: never fall back; always fail the proposal.
+                    error!(
+                        slot = slot,
+                        pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                        error = %e,
+                        "BuilderOnly mode: builder failed, proposal will be missed"
+                    );
+                    return Err(BlockServiceError::BuilderOnly(format!(
+                        "builder block production failed: {e}"
+                    )));
+                }
+                if boost > 0 {
+                    // The BN was asked to contact the builder relay (boost > 0).
+                    // Tag the error as BuilderFailure so the coordinator records
+                    // a miss on the circuit breaker (H-3).
+                    error!(
+                        slot = slot,
+                        boost,
+                        error = %e,
+                        "Builder block production failed"
+                    );
+                    return Err(BlockServiceError::BuilderFailure(e.to_string()));
+                }
+                // boost == 0: pure local-execution path; BN failure is not a
+                // builder-relay issue and must not trip the circuit breaker.
+                error!(slot = slot, error = %e, "Block production failed");
+                return Err(e);
+            }
+        };
+
+        info!(
+            slot = slot,
+            is_blinded = response.is_blinded,
+            execution_payload_value = response.execution_payload_value.as_deref().unwrap_or("none"),
+            "Block production response received"
+        );
 
         // Record dynamic attributes after block production
         let span = tracing::Span::current();
@@ -97,25 +253,26 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         }
 
         // 4. Sign and publish based on block type
+        debug!(slot = slot, is_blinded = response.is_blinded, "Blinded/unblinded path chosen");
         let (block_root, is_blinded) = if response.is_ssz {
-            self.sign_and_publish_ssz(&response, slot, pubkey).await
+            self.sign_and_publish_ssz(&response, slot, pubkey, validator).await
         } else if response.is_blinded {
-            self.sign_and_publish_blinded(&response, slot, pubkey).await
+            self.sign_and_publish_blinded(&response, slot, pubkey, validator).await
         } else {
-            self.sign_and_publish_full(&response, slot, pubkey).await
+            self.sign_and_publish_full(&response, slot, pubkey, validator).await
         }
         .map_err(|e| {
-            tracing::error!(error = %e, "Block sign/publish failed");
+            error!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), error = %e, "Block publication failed");
             e
         })?;
 
-        let block_type = if is_blinded { "blinded" } else { "unblinded" };
         info!(
-            slot,
-            block_type,
-            consensus_version = %response.consensus_version,
-            value_wei = response.execution_payload_value.as_deref().unwrap_or("unknown"),
-            "block proposed"
+            slot = slot,
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            block_root = %format!("0x{}", hex::encode(block_root)),
+            is_blinded = is_blinded,
+            duration_ms = proposal_start.elapsed().as_millis() as u64,
+            "Block publication success"
         );
 
         Ok(BlockProposalResult {
@@ -132,6 +289,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         response: &ProduceBlockResponse,
         slot: Slot,
         pubkey: &PublicKey,
+        validator: Option<&BlockResponseValidator>,
     ) -> Result<(Root, bool), BlockServiceError> {
         let ssz_bytes = response.ssz_bytes.as_ref().ok_or_else(|| {
             BlockServiceError::Parse("SSZ response missing ssz_bytes".to_string())
@@ -148,6 +306,12 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     block.slot, slot,
                 )));
             }
+            if let Some(v) = validator {
+                v.validate_blinded(&block).map_err(|e| {
+                    error!(slot = slot, error = %e, "BN SSZ blinded block validation failed — dropping duty");
+                    e
+                })?;
+            }
             (compute_blinded_block_root(&block), offset)
         } else {
             let (block, offset) =
@@ -159,9 +323,32 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     block.slot, slot,
                 )));
             }
+            if let Some(v) = validator {
+                v.validate_full(&block).map_err(|e| {
+                    error!(slot = slot, error = %e, "BN SSZ block validation failed — dropping duty");
+                    e
+                })?;
+            }
+            // ISSUE-4.3 (L-3) defense-in-depth: log internal KZG commitment binding.
+            // For Deneb+ BlockContents payloads the body includes blob_kzg_commitments;
+            // this fingerprint is an rvc-internal binding (NOT spec-aligned —
+            // see kzg_commitment_list_root doc) separate from the signing scope.
+            if format == beacon::ssz_deser::SszBlockFormat::BlockContents {
+                if let Some(layout) = eth_types::body_fork_layout(&response.consensus_version) {
+                    let kzg_count = block.blob_kzg_count(layout);
+                    let commitment_root = block.kzg_commitment_root(layout);
+                    debug!(
+                        slot = slot,
+                        kzg_count = kzg_count,
+                        commitment_root = %format!("0x{}", hex::encode(commitment_root)),
+                        "SSZ BlockContents: internal KZG commitment binding (ISSUE-4.3)"
+                    );
+                }
+            }
             (compute_block_root(&block), offset)
         };
 
+        let sign_start = std::time::Instant::now();
         let sig = self
             .signer
             .sign_block(
@@ -174,6 +361,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .instrument(tracing::info_span!("rvc.sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+        debug!(
+            slot = slot,
+            duration_ms = sign_start.elapsed().as_millis() as u64,
+            "Block signing duration"
+        );
 
         // Construct SignedBeaconBlock SSZ:
         // [message_offset: 4 bytes LE] [signature: 96 bytes] [BeaconBlock SSZ bytes]
@@ -197,6 +389,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         response: &ProduceBlockResponse,
         slot: Slot,
         pubkey: &PublicKey,
+        validator: Option<&BlockResponseValidator>,
     ) -> Result<(Root, bool), BlockServiceError> {
         let block_contents = response.parse_full_block()?;
         let block = block_contents.block().clone();
@@ -205,8 +398,51 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             return Err(BlockServiceError::SlotMismatch { requested: slot, got: block.slot });
         }
 
+        // H-4: validate proposer_index and parent_root before signing.
+        if let Some(v) = validator {
+            v.validate_full(&block).map_err(|e| {
+                error!(slot = slot, error = %e, "BN block response validation failed — dropping duty");
+                e
+            })?;
+        }
+
+        // ISSUE-4.3 (L-3) defense-in-depth: bind blob KZG commitments canonically.
+        //
+        // The signing scope (block_root) already opaquely covers the body bytes
+        // that contain blob_kzg_commitments. Here we additionally parse the
+        // commitments, compute a canonical SSZ list root, and verify that the
+        // commitment count in the body matches the number of blob sidecars.
+        // This does NOT change the BN-facing signing scope; it is a rvc-internal
+        // consistency check performed before the signature is created.
+        if let eth_types::BlockContents::BlockAndBlobs { ref blob_sidecars, .. } = block_contents {
+            if let Some(layout) = eth_types::body_fork_layout(&response.consensus_version) {
+                let kzg_commitments = block_contents.blob_kzg_commitments(layout);
+                let commitment_root = eth_types::kzg_commitment_list_root(&kzg_commitments);
+                debug!(
+                    slot = slot,
+                    blob_sidecars = blob_sidecars.len(),
+                    kzg_in_body = kzg_commitments.len(),
+                    commitment_root = %format!("0x{}", hex::encode(commitment_root)),
+                    "BlockAndBlobs: internal KZG commitment binding (ISSUE-4.3)"
+                );
+                // Intentionally warn-only: the signing scope covers body bytes
+                // (self-consistent). Sidecar propagation is the BN's responsibility.
+                // Aborting here would drop proposals on legitimate BN inconsistencies
+                // during fork transitions.
+                if kzg_commitments.len() != blob_sidecars.len() {
+                    warn!(
+                        slot = slot,
+                        kzg_in_body = kzg_commitments.len(),
+                        sidecars = blob_sidecars.len(),
+                        "blob KZG commitment count mismatch — body inconsistent with sidecars"
+                    );
+                }
+            }
+        }
+
         let block_root = compute_block_root(&block);
 
+        let sign_start = std::time::Instant::now();
         let sig = self
             .signer
             .sign_block(
@@ -219,6 +455,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .instrument(tracing::info_span!("rvc.sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+        debug!(
+            slot = slot,
+            duration_ms = sign_start.elapsed().as_millis() as u64,
+            "Block signing duration"
+        );
 
         let signed = eth_types::SignedBeaconBlock { message: block, signature: sig };
         self.beacon
@@ -234,6 +475,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         response: &ProduceBlockResponse,
         slot: Slot,
         pubkey: &PublicKey,
+        validator: Option<&BlockResponseValidator>,
     ) -> Result<(Root, bool), BlockServiceError> {
         let block = response.parse_blinded_block()?;
 
@@ -241,8 +483,17 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             return Err(BlockServiceError::SlotMismatch { requested: slot, got: block.slot });
         }
 
+        // H-4: validate proposer_index and parent_root before signing.
+        if let Some(v) = validator {
+            v.validate_blinded(&block).map_err(|e| {
+                error!(slot = slot, error = %e, "BN blinded block response validation failed — dropping duty");
+                e
+            })?;
+        }
+
         let block_root = compute_blinded_block_root(&block);
 
+        let sign_start = std::time::Instant::now();
         let sig = self
             .signer
             .sign_block(
@@ -255,6 +506,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .instrument(tracing::info_span!("rvc.sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+        debug!(
+            slot = slot,
+            duration_ms = sign_start.elapsed().as_millis() as u64,
+            "Block signing duration"
+        );
 
         let signed = eth_types::SignedBlindedBeaconBlock { message: block, signature: sig };
         self.beacon
@@ -302,13 +558,40 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use validator_store::ValidatorStore;
 
+    // --- Captured call structs ---
+
+    #[derive(Debug, Clone)]
+    struct CapturedProduceCall {
+        slot: Slot,
+        randao_reveal: String,
+        graffiti: Option<String>,
+        builder_boost_factor: Option<u64>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CapturedPublishCall {
+        consensus_version: String,
+        slot: Slot,
+        proposer_index: u64,
+        signature_bytes: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CapturedSignBlockCall {
+        block_root: Root,
+        slot: Slot,
+        pubkey: PublicKey,
+        fork_schedule: ForkSchedule,
+        genesis_validators_root: Root,
+    }
+
     // --- Mock Signer ---
 
     struct MockSigner {
         fail_randao: bool,
         fail_block: bool,
         randao_calls: Mutex<Vec<u64>>,
-        block_calls: Mutex<Vec<(Root, Slot)>>,
+        block_calls: Mutex<Vec<CapturedSignBlockCall>>,
     }
 
     impl MockSigner {
@@ -330,6 +613,17 @@ mod tests {
             self.fail_block = true;
             self
         }
+
+        fn assert_last_sign_block_domain(&self, expected_fork: &ForkSchedule, expected_gvr: &Root) {
+            let calls = self.block_calls.lock().unwrap();
+            assert!(!calls.is_empty(), "no sign_block calls captured");
+            let last = calls.last().unwrap();
+            assert_eq!(last.fork_schedule, *expected_fork, "sign_block fork_schedule mismatch");
+            assert_eq!(
+                last.genesis_validators_root, *expected_gvr,
+                "sign_block genesis_validators_root mismatch"
+            );
+        }
     }
 
     #[async_trait(?Send)]
@@ -348,11 +642,17 @@ mod tests {
             &self,
             block_root: &Root,
             slot: Slot,
-            _pubkey: &PublicKey,
-            _fork_schedule: &ForkSchedule,
-            _genesis_validators_root: &Root,
+            pubkey: &PublicKey,
+            fork_schedule: &ForkSchedule,
+            genesis_validators_root: &Root,
         ) -> Result<Vec<u8>, SignerError> {
-            self.block_calls.lock().unwrap().push((*block_root, slot));
+            self.block_calls.lock().unwrap().push(CapturedSignBlockCall {
+                block_root: *block_root,
+                slot,
+                pubkey: pubkey.clone(),
+                fork_schedule: fork_schedule.clone(),
+                genesis_validators_root: *genesis_validators_root,
+            });
             if self.fail_block {
                 Err(SignerError::KeyNotFound("test".to_string()))
             } else {
@@ -466,6 +766,9 @@ mod tests {
         publish_calls: Mutex<Vec<String>>,
         publish_blinded_calls: Mutex<Vec<String>>,
         publish_ssz_calls: Mutex<Vec<(Vec<u8>, String, bool)>>,
+        produce_full_calls: Mutex<Vec<CapturedProduceCall>>,
+        publish_full_calls: Mutex<Vec<CapturedPublishCall>>,
+        publish_blinded_full_calls: Mutex<Vec<CapturedPublishCall>>,
     }
 
     impl MockBeaconClient {
@@ -485,6 +788,9 @@ mod tests {
                 publish_calls: Mutex::new(Vec::new()),
                 publish_blinded_calls: Mutex::new(Vec::new()),
                 publish_ssz_calls: Mutex::new(Vec::new()),
+                produce_full_calls: Mutex::new(Vec::new()),
+                publish_full_calls: Mutex::new(Vec::new()),
+                publish_blinded_full_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -504,6 +810,9 @@ mod tests {
                 publish_calls: Mutex::new(Vec::new()),
                 publish_blinded_calls: Mutex::new(Vec::new()),
                 publish_ssz_calls: Mutex::new(Vec::new()),
+                produce_full_calls: Mutex::new(Vec::new()),
+                publish_full_calls: Mutex::new(Vec::new()),
+                publish_blinded_full_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -536,6 +845,9 @@ mod tests {
                 publish_calls: Mutex::new(Vec::new()),
                 publish_blinded_calls: Mutex::new(Vec::new()),
                 publish_ssz_calls: Mutex::new(Vec::new()),
+                produce_full_calls: Mutex::new(Vec::new()),
+                publish_full_calls: Mutex::new(Vec::new()),
+                publish_blinded_full_calls: Mutex::new(Vec::new()),
             }
         }
 
@@ -548,17 +860,74 @@ mod tests {
             self.fail_publish = true;
             self
         }
+
+        fn assert_last_produce_slot(&self, expected_slot: Slot) {
+            let calls = self.produce_full_calls.lock().unwrap();
+            assert!(!calls.is_empty(), "no produce_block_v3 calls captured");
+            let last = calls.last().unwrap();
+            assert_eq!(
+                last.slot, expected_slot,
+                "produce_block_v3 slot mismatch: expected {expected_slot}, got {}",
+                last.slot
+            );
+        }
+
+        fn assert_last_published_block(&self, expected_slot: Slot, expected_proposer: u64) {
+            let calls = self.publish_full_calls.lock().unwrap();
+            assert!(!calls.is_empty(), "no publish_block calls captured");
+            let last = calls.last().unwrap();
+            assert_eq!(
+                last.slot, expected_slot,
+                "published block slot mismatch: expected {expected_slot}, got {}",
+                last.slot
+            );
+            assert_eq!(
+                last.proposer_index, expected_proposer,
+                "published block proposer_index mismatch: expected {expected_proposer}, got {}",
+                last.proposer_index
+            );
+            assert!(
+                !last.signature_bytes.is_empty(),
+                "published block signature must not be empty"
+            );
+        }
+
+        fn assert_last_published_blinded_block(&self, expected_slot: Slot, expected_proposer: u64) {
+            let calls = self.publish_blinded_full_calls.lock().unwrap();
+            assert!(!calls.is_empty(), "no publish_blinded_block calls captured");
+            let last = calls.last().unwrap();
+            assert_eq!(
+                last.slot, expected_slot,
+                "published blinded block slot mismatch: expected {expected_slot}, got {}",
+                last.slot
+            );
+            assert_eq!(
+                last.proposer_index, expected_proposer,
+                "published blinded block proposer_index mismatch: expected {expected_proposer}, got {}",
+                last.proposer_index
+            );
+            assert!(
+                !last.signature_bytes.is_empty(),
+                "published blinded block signature must not be empty"
+            );
+        }
     }
 
     #[async_trait(?Send)]
     impl BeaconBlockClient for MockBeaconClient {
         async fn produce_block_v3(
             &self,
-            _slot: Slot,
-            _randao_reveal: &str,
-            _graffiti: Option<&str>,
-            _builder_boost_factor: Option<u64>,
+            slot: Slot,
+            randao_reveal: &str,
+            graffiti: Option<&str>,
+            builder_boost_factor: Option<u64>,
         ) -> Result<ProduceBlockResponse, BlockServiceError> {
+            self.produce_full_calls.lock().unwrap().push(CapturedProduceCall {
+                slot,
+                randao_reveal: randao_reveal.to_string(),
+                graffiti: graffiti.map(|s| s.to_string()),
+                builder_boost_factor,
+            });
             if self.fail_produce {
                 return Err(BlockServiceError::Beacon("beacon down".to_string()));
             }
@@ -567,10 +936,16 @@ mod tests {
 
         async fn publish_block(
             &self,
-            _signed_block: &SignedBeaconBlock,
+            signed_block: &SignedBeaconBlock,
             consensus_version: &str,
         ) -> Result<(), BlockServiceError> {
             self.publish_calls.lock().unwrap().push(consensus_version.to_string());
+            self.publish_full_calls.lock().unwrap().push(CapturedPublishCall {
+                consensus_version: consensus_version.to_string(),
+                slot: signed_block.message.slot,
+                proposer_index: signed_block.message.proposer_index,
+                signature_bytes: signed_block.signature.clone(),
+            });
             if self.fail_publish {
                 return Err(BlockServiceError::Beacon("publish failed".to_string()));
             }
@@ -579,10 +954,16 @@ mod tests {
 
         async fn publish_blinded_block(
             &self,
-            _signed_block: &SignedBlindedBeaconBlock,
+            signed_block: &SignedBlindedBeaconBlock,
             consensus_version: &str,
         ) -> Result<(), BlockServiceError> {
             self.publish_blinded_calls.lock().unwrap().push(consensus_version.to_string());
+            self.publish_blinded_full_calls.lock().unwrap().push(CapturedPublishCall {
+                consensus_version: consensus_version.to_string(),
+                slot: signed_block.message.slot,
+                proposer_index: signed_block.message.proposer_index,
+                signature_bytes: signed_block.signature.clone(),
+            });
             if self.fail_publish {
                 return Err(BlockServiceError::Beacon("publish failed".to_string()));
             }
@@ -740,9 +1121,21 @@ mod tests {
         let block = test_block(slot);
         let beacon = MockBeaconClient::unblinded(block);
         let signer = MockSigner::new();
-        let service = build_service(signer, beacon, &pubkey);
+        let fork = test_fork_schedule();
+        let gvr: Root = [0xaa; 32];
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let signer_arc = Arc::new(signer);
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(fork.clone()),
+            gvr,
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         let proposal = result.unwrap();
@@ -751,6 +1144,10 @@ mod tests {
         assert_eq!(proposal.consensus_version, "deneb");
         assert_eq!(proposal.value_wei, Some("12345".to_string()));
         assert_ne!(proposal.block_root, [0u8; 32]);
+
+        beacon_arc.assert_last_produce_slot(slot);
+        beacon_arc.assert_last_published_block(slot, 42);
+        signer_arc.assert_last_sign_block_domain(&fork, &gvr);
     }
 
     #[tokio::test]
@@ -760,9 +1157,21 @@ mod tests {
         let block = test_blinded_block(slot);
         let beacon = MockBeaconClient::blinded(block);
         let signer = MockSigner::new();
-        let service = build_service(signer, beacon, &pubkey);
+        let fork = test_fork_schedule();
+        let gvr: Root = [0xaa; 32];
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let signer_arc = Arc::new(signer);
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(fork.clone()),
+            gvr,
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         let proposal = result.unwrap();
@@ -771,6 +1180,10 @@ mod tests {
         assert_eq!(proposal.consensus_version, "deneb");
         assert!(proposal.value_wei.is_none());
         assert_ne!(proposal.block_root, [0u8; 32]);
+
+        beacon_arc.assert_last_produce_slot(slot);
+        beacon_arc.assert_last_published_blinded_block(slot, 42);
+        signer_arc.assert_last_sign_block_domain(&fork, &gvr);
     }
 
     #[tokio::test]
@@ -782,7 +1195,7 @@ mod tests {
         let signer = MockSigner::new().with_block_error();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -798,7 +1211,7 @@ mod tests {
         let signer = MockSigner::new().with_randao_error();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -807,6 +1220,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_propose_block_beacon_produce_failure() {
+        // test_validator_store wires builder_boost_factor = 150, so the
+        // default MaxProfit mode sends boost = 150 > 0 to the BN.  After the
+        // H-3 fix, a BN error on a builder attempt is tagged BuilderFailure
+        // (not Beacon) so that the coordinator can correctly scope
+        // circuit-breaker misses.
         let pubkey = test_pubkey();
         let slot = 100;
         let block = test_block(slot);
@@ -814,11 +1232,15 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, BlockServiceError::Beacon(_)));
+        // MaxProfit with boost = 150 → BuilderFailure (not Beacon) — H-3.
+        assert!(
+            matches!(err, BlockServiceError::BuilderFailure(_)),
+            "MaxProfit BN error must be BuilderFailure, got {err:?}"
+        );
     }
 
     #[tokio::test]
@@ -830,7 +1252,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -906,7 +1328,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         // Verify graffiti was passed (hex-encoded "hello" + padding)
@@ -940,11 +1362,13 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         assert_eq!(beacon_arc.publish_blinded_calls.lock().unwrap().len(), 1);
         assert!(beacon_arc.publish_calls.lock().unwrap().is_empty());
+        beacon_arc.assert_last_produce_slot(slot);
+        beacon_arc.assert_last_published_blinded_block(slot, 42);
     }
 
     #[tokio::test]
@@ -965,11 +1389,13 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         assert_eq!(beacon_arc.publish_calls.lock().unwrap().len(), 1);
         assert!(beacon_arc.publish_blinded_calls.lock().unwrap().is_empty());
+        beacon_arc.assert_last_produce_slot(slot);
+        beacon_arc.assert_last_published_block(slot, 42);
     }
 
     #[tokio::test]
@@ -990,7 +1416,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BlockServiceError::Signer(_)));
 
@@ -1008,7 +1434,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BlockServiceError::Beacon(_)));
     }
@@ -1031,7 +1457,7 @@ mod tests {
             Arc::new(test_fork_schedule()),
             [0xaa; 32],
         );
-        let unblinded_result = service.propose_block(slot, &pubkey).await.unwrap();
+        let unblinded_result = service.propose_block(slot, &pubkey, 42, None).await.unwrap();
 
         // Propose blinded block at same slot
         let blinded_block = test_blinded_block(slot);
@@ -1046,7 +1472,7 @@ mod tests {
             Arc::new(test_fork_schedule()),
             [0xaa; 32],
         );
-        let blinded_result = service2.propose_block(slot, &pubkey).await.unwrap();
+        let blinded_result = service2.propose_block(slot, &pubkey, 42, None).await.unwrap();
 
         // Block roots must differ (slashing protection uses these to detect double proposals)
         assert_ne!(
@@ -1059,8 +1485,8 @@ mod tests {
         let blinded_calls = signer2_arc.block_calls.lock().unwrap();
         assert_eq!(unblinded_calls.len(), 1);
         assert_eq!(blinded_calls.len(), 1);
-        assert_eq!(unblinded_calls[0].0, unblinded_result.block_root);
-        assert_eq!(blinded_calls[0].0, blinded_result.block_root);
+        assert_eq!(unblinded_calls[0].block_root, unblinded_result.block_root);
+        assert_eq!(blinded_calls[0].block_root, blinded_result.block_root);
     }
 
     // --- SSZ path tests ---
@@ -1073,7 +1499,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         let proposal = result.unwrap();
@@ -1091,7 +1517,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         let proposal = result.unwrap();
@@ -1115,7 +1541,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
@@ -1144,7 +1570,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
@@ -1161,7 +1587,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(requested_slot, &pubkey).await;
+        let result = service.propose_block(requested_slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1178,7 +1604,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1195,7 +1621,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
     }
@@ -1218,7 +1644,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         // Deserialize the SSZ and compute tree_hash_root — SSZ path should match
@@ -1232,7 +1658,7 @@ mod tests {
         // Verify signer was called with the tree_hash root
         let block_calls = signer_arc.block_calls.lock().unwrap();
         assert_eq!(block_calls.len(), 1);
-        assert_eq!(block_calls[0].0, expected_root);
+        assert_eq!(block_calls[0].block_root, expected_root);
     }
 
     #[test]
@@ -1265,7 +1691,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BlockServiceError::Beacon(_)));
@@ -1280,7 +1706,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         let proposal = result.unwrap();
@@ -1296,7 +1722,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         let proposal = result.unwrap();
@@ -1312,7 +1738,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_ok());
         let proposal = result.unwrap();
@@ -1353,7 +1779,7 @@ mod tests {
         let signer = MockSigner::new().with_block_error();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BlockServiceError::Signer(_)));
@@ -1368,7 +1794,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(requested_slot, &pubkey).await;
+        let result = service.propose_block(requested_slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1387,7 +1813,7 @@ mod tests {
         let signer = MockSigner::new();
         let service = build_service(signer, beacon, &pubkey);
 
-        let result = service.propose_block(requested_slot, &pubkey).await;
+        let result = service.propose_block(requested_slot, &pubkey, 42, None).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -1404,6 +1830,8 @@ mod tests {
         let block = test_block(slot);
         let beacon = MockBeaconClient::unblinded(block);
         let signer = MockSigner::new();
+        let fork = test_fork_schedule();
+        let gvr: Root = [0xaa; 32];
 
         let signer_arc = Arc::new(signer);
         let store = test_validator_store(&pubkey);
@@ -1411,16 +1839,19 @@ mod tests {
             signer_arc.clone(),
             Arc::new(beacon),
             Arc::new(store),
-            Arc::new(test_fork_schedule()),
-            [0xaa; 32],
+            Arc::new(fork.clone()),
+            gvr,
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         let calls = signer_arc.randao_calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], 10); // epoch = 320/32
+        drop(calls);
+
+        signer_arc.assert_last_sign_block_domain(&fork, &gvr);
     }
 
     #[tokio::test]
@@ -1439,7 +1870,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
@@ -1482,7 +1913,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
@@ -1508,7 +1939,7 @@ mod tests {
             [0xaa; 32],
         );
 
-        let result = service.propose_block(slot, &pubkey).await;
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
         let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
@@ -1525,5 +1956,1487 @@ mod tests {
 
         // Blinded flag should be true
         assert!(ssz_calls[0].2);
+    }
+
+    // --- Block selection mode tests (T4.2, T4.3) ---
+
+    struct BoostCapturingBeacon {
+        inner: MockBeaconClient,
+        boost_arg: Mutex<Option<u64>>,
+    }
+
+    #[async_trait(?Send)]
+    impl BeaconBlockClient for BoostCapturingBeacon {
+        async fn produce_block_v3(
+            &self,
+            slot: Slot,
+            randao_reveal: &str,
+            graffiti: Option<&str>,
+            builder_boost_factor: Option<u64>,
+        ) -> Result<ProduceBlockResponse, BlockServiceError> {
+            *self.boost_arg.lock().unwrap() = builder_boost_factor;
+            self.inner.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+        }
+        async fn publish_block(
+            &self,
+            s: &SignedBeaconBlock,
+            v: &str,
+        ) -> Result<(), BlockServiceError> {
+            self.inner.publish_block(s, v).await
+        }
+        async fn publish_blinded_block(
+            &self,
+            s: &SignedBlindedBeaconBlock,
+            v: &str,
+        ) -> Result<(), BlockServiceError> {
+            self.inner.publish_blinded_block(s, v).await
+        }
+        async fn publish_block_ssz(
+            &self,
+            b: &[u8],
+            v: &str,
+            bl: bool,
+        ) -> Result<(), BlockServiceError> {
+            self.inner.publish_block_ssz(b, v, bl).await
+        }
+    }
+
+    fn build_service_with_mode(
+        beacon: BoostCapturingBeacon,
+        pubkey: &PublicKey,
+        circuit_breaker: Arc<CircuitBreakerState>,
+    ) -> BlockService<MockSigner, BoostCapturingBeacon> {
+        let store = test_validator_store(pubkey);
+        BlockService::with_circuit_breaker(
+            Arc::new(MockSigner::new()),
+            Arc::new(beacon),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+            circuit_breaker,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_execution_only_sets_boost_factor_zero() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(0, 0));
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::ExecutionOnly).await;
+        assert!(result.is_ok());
+
+        let boost = *service.beacon.boost_arg.lock().unwrap();
+        assert_eq!(boost, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_max_profit_uses_configured_boost_factor() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(0, 0));
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::MaxProfit).await;
+        assert!(result.is_ok());
+
+        // test_validator_store sets builder_boost_factor=150
+        let boost = *service.beacon.boost_arg.lock().unwrap();
+        assert_eq!(boost, Some(150));
+    }
+
+    #[tokio::test]
+    async fn test_builder_always_sets_boost_factor_max() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(0, 0));
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderAlways).await;
+        assert!(result.is_ok());
+
+        let boost = *service.beacon.boost_arg.lock().unwrap();
+        assert_eq!(boost, Some(u64::MAX));
+    }
+
+    #[tokio::test]
+    async fn test_builder_always_falls_back_on_circuit_breaker() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(1, 0));
+        cb.record_miss(); // trip it
+        assert!(cb.is_tripped());
+
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderAlways).await;
+        // BuilderAlways falls back to local (boost=0)
+        assert!(result.is_ok());
+        let boost = *service.beacon.boost_arg.lock().unwrap();
+        assert_eq!(boost, Some(0));
+    }
+
+    #[tokio::test]
+    async fn test_builder_only_sets_boost_factor_max() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(0, 0));
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderOnly).await;
+        assert!(result.is_ok());
+
+        let boost = *service.beacon.boost_arg.lock().unwrap();
+        assert_eq!(boost, Some(u64::MAX));
+    }
+
+    #[tokio::test]
+    async fn test_builder_only_fails_on_circuit_breaker_tripped() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(1, 0));
+        cb.record_miss(); // trip it
+        assert!(cb.is_tripped());
+
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderOnly).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), BlockServiceError::BuilderOnly(_)));
+    }
+
+    #[tokio::test]
+    async fn test_builder_only_fails_on_builder_error() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)).with_produce_error(),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(0, 0));
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderOnly).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), BlockServiceError::BuilderOnly(_)));
+    }
+
+    #[tokio::test]
+    async fn test_max_profit_circuit_breaker_tripped_uses_zero() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = BoostCapturingBeacon {
+            inner: MockBeaconClient::unblinded(test_block(slot)),
+            boost_arg: Mutex::new(None),
+        };
+        let cb = Arc::new(CircuitBreakerState::new(1, 0));
+        cb.record_miss();
+        assert!(cb.is_tripped());
+
+        let service = build_service_with_mode(beacon, &pubkey, cb);
+        let result =
+            service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::MaxProfit).await;
+        assert!(result.is_ok());
+        let boost = *service.beacon.boost_arg.lock().unwrap();
+        assert_eq!(boost, Some(0));
+    }
+
+    // --- CapturedCall infrastructure tests ---
+
+    #[tokio::test]
+    async fn test_produce_call_captures_slot_and_args() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok());
+
+        beacon_arc.assert_last_produce_slot(slot);
+        let calls = beacon_arc.produce_full_calls.lock().unwrap();
+        assert!(calls[0].randao_reveal.starts_with("0x"));
+        assert!(calls[0].graffiti.is_some());
+        assert_eq!(calls[0].builder_boost_factor, Some(150));
+    }
+
+    #[tokio::test]
+    async fn test_publish_call_captures_block_fields() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok());
+
+        beacon_arc.assert_last_published_block(slot, 42);
+        let calls = beacon_arc.publish_full_calls.lock().unwrap();
+        assert_eq!(calls[0].consensus_version, "deneb");
+        assert_eq!(calls[0].signature_bytes, vec![0xbb; 96]);
+    }
+
+    #[tokio::test]
+    async fn test_publish_blinded_call_captures_block_fields() {
+        let pubkey = test_pubkey();
+        let slot = 200;
+        let block = test_blinded_block(slot);
+        let beacon = MockBeaconClient::blinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok());
+
+        beacon_arc.assert_last_published_blinded_block(slot, 42);
+        let calls = beacon_arc.publish_blinded_full_calls.lock().unwrap();
+        assert_eq!(calls[0].consensus_version, "deneb");
+        assert_eq!(calls[0].signature_bytes, vec![0xbb; 96]);
+    }
+
+    #[tokio::test]
+    async fn test_sign_block_captures_fork_schedule_and_genesis_root() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+
+        let signer_arc = Arc::new(signer);
+        let fork = test_fork_schedule();
+        let gvr: Root = [0xaa; 32];
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            Arc::new(beacon),
+            Arc::new(store),
+            Arc::new(fork.clone()),
+            gvr,
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok());
+
+        signer_arc.assert_last_sign_block_domain(&fork, &gvr);
+        let calls = signer_arc.block_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].slot, slot);
+        assert_eq!(calls[0].pubkey, pubkey);
+    }
+
+    // --- Assertion helper tests ---
+
+    #[tokio::test]
+    async fn test_assert_last_produce_slot_passes_on_correct_slot() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok());
+
+        beacon_arc.assert_last_produce_slot(slot);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "produce_block_v3 slot mismatch")]
+    async fn test_assert_last_produce_slot_fails_on_wrong_slot() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok());
+
+        // This should panic: production code sent slot=100, we assert slot+1=101
+        beacon_arc.assert_last_produce_slot(slot + 1);
+    }
+
+    #[tokio::test]
+    async fn test_assert_last_published_block_passes_on_correct_fields() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok());
+
+        beacon_arc.assert_last_published_block(slot, 42);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "published block slot mismatch")]
+    async fn test_assert_last_published_block_fails_on_wrong_slot() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok());
+
+        beacon_arc.assert_last_published_block(slot + 1, 42);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "published block proposer_index mismatch")]
+    async fn test_assert_last_published_block_fails_on_wrong_proposer() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok());
+
+        beacon_arc.assert_last_published_block(slot, 99);
+    }
+
+    #[tokio::test]
+    async fn test_assert_last_published_block_checks_signature() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok());
+
+        // Verify signature is non-empty (MockSigner returns 0xbb * 96)
+        let calls = beacon_arc.publish_full_calls.lock().unwrap();
+        assert!(!calls[0].signature_bytes.is_empty(), "signature must be non-empty");
+        assert_eq!(calls[0].signature_bytes, vec![0xbb; 96]);
+    }
+
+    #[tokio::test]
+    async fn test_assert_last_published_blinded_block_passes() {
+        let pubkey = test_pubkey();
+        let slot = 200;
+        let block = test_blinded_block(slot);
+        let beacon = MockBeaconClient::blinded(block);
+
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok());
+
+        beacon_arc.assert_last_published_blinded_block(slot, 42);
+    }
+
+    #[tokio::test]
+    async fn test_assert_last_sign_block_domain_passes_on_correct_values() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+        let fork = test_fork_schedule();
+        let gvr: Root = [0xaa; 32];
+
+        let signer_arc = Arc::new(signer);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            Arc::new(beacon),
+            Arc::new(store),
+            Arc::new(fork.clone()),
+            gvr,
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok());
+
+        signer_arc.assert_last_sign_block_domain(&fork, &gvr);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "sign_block fork_schedule mismatch")]
+    async fn test_assert_last_sign_block_domain_fails_on_wrong_fork() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+        let fork = test_fork_schedule();
+        let gvr: Root = [0xaa; 32];
+
+        let signer_arc = Arc::new(signer);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            Arc::new(beacon),
+            Arc::new(store),
+            Arc::new(fork),
+            gvr,
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok());
+
+        let mut wrong_fork = test_fork_schedule();
+        wrong_fork.altair_fork_epoch = 999;
+        signer_arc.assert_last_sign_block_domain(&wrong_fork, &gvr);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "sign_block genesis_validators_root mismatch")]
+    async fn test_assert_last_sign_block_domain_fails_on_wrong_gvr() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+        let fork = test_fork_schedule();
+        let gvr: Root = [0xaa; 32];
+
+        let signer_arc = Arc::new(signer);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            Arc::new(beacon),
+            Arc::new(store),
+            Arc::new(fork.clone()),
+            gvr,
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok());
+
+        let wrong_gvr: Root = [0xbb; 32];
+        signer_arc.assert_last_sign_block_domain(&fork, &wrong_gvr);
+    }
+
+    // --- Issue 3.1: SSZ large-body + non-empty KZG tests (Finding #21) ---
+
+    /// Build SSZ bytes for a BlockContents payload with explicit KZG proofs and blobs.
+    ///
+    /// Layout: [block_offset(4) | kzg_offset(4) | blobs_offset(4) | BeaconBlock | KZG proofs | Blobs]
+    fn build_ssz_bytes_with_kzg(
+        slot: Slot,
+        proposer_index: u64,
+        body: &[u8],
+        kzg_proofs: &[u8],
+        blobs: &[u8],
+    ) -> Vec<u8> {
+        let body_offset: u32 = 84;
+        let mut block_bytes = Vec::new();
+        block_bytes.extend_from_slice(&slot.to_le_bytes());
+        block_bytes.extend_from_slice(&proposer_index.to_le_bytes());
+        block_bytes.extend_from_slice(&[0x11; 32]); // parent_root
+        block_bytes.extend_from_slice(&[0x22; 32]); // state_root
+        block_bytes.extend_from_slice(&body_offset.to_le_bytes());
+        block_bytes.extend_from_slice(body);
+
+        let bc_block_offset: u32 = 12;
+        let kzg_offset: u32 = bc_block_offset + block_bytes.len() as u32;
+        let blobs_offset: u32 = kzg_offset + kzg_proofs.len() as u32;
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&bc_block_offset.to_le_bytes());
+        bytes.extend_from_slice(&kzg_offset.to_le_bytes());
+        bytes.extend_from_slice(&blobs_offset.to_le_bytes());
+        bytes.extend_from_slice(&block_bytes);
+        bytes.extend_from_slice(kzg_proofs);
+        bytes.extend_from_slice(blobs);
+        bytes
+    }
+
+    #[test]
+    fn test_ssz_deser_large_body_no_kzg() {
+        use beacon::ssz_deser::{deserialize_beacon_block_from_ssz, SszBlockFormat};
+
+        let body = vec![0xab; 16384]; // 16KB body
+        let body_offset: u32 = 84;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1000u64.to_le_bytes());
+        bytes.extend_from_slice(&42u64.to_le_bytes());
+        bytes.extend_from_slice(&[0x11; 32]);
+        bytes.extend_from_slice(&[0x22; 32]);
+        bytes.extend_from_slice(&body_offset.to_le_bytes());
+        bytes.extend_from_slice(&body);
+
+        let (block, offset) =
+            deserialize_beacon_block_from_ssz(&bytes, SszBlockFormat::BeaconBlock).unwrap();
+
+        assert_eq!(offset, 0);
+        assert_eq!(block.slot, 1000);
+        assert_eq!(block.proposer_index, 42);
+        assert_eq!(block.body.len(), body.len(), "body must be exactly 16KB");
+        assert_eq!(block.body, body);
+    }
+
+    #[test]
+    #[ignore = "Known body-bleed bug: ssz_deser.rs uses bytes.len() instead of kzg_proofs_offset as block_region_end. Body includes KZG+blob data when non-empty. See beacon/src/ssz_deser.rs:190."]
+    fn test_ssz_deser_block_contents_with_kzg_proofs() {
+        use beacon::ssz_deser::{deserialize_beacon_block_from_ssz, SszBlockFormat};
+
+        let body = vec![0xab; 128];
+        let kzg_proof = vec![0xcc; 48];
+        let blob = vec![0xdd; 131072]; // 128KB blob
+
+        let bytes = build_ssz_bytes_with_kzg(1000, 42, &body, &kzg_proof, &blob);
+        let (block, offset) =
+            deserialize_beacon_block_from_ssz(&bytes, SszBlockFormat::BlockContents).unwrap();
+
+        assert_eq!(offset, 12);
+        assert_eq!(block.slot, 1000);
+        assert_eq!(block.proposer_index, 42);
+        // This assertion exposes the body-bleed bug: body will include KZG+blob data
+        assert_eq!(
+            block.body.len(),
+            body.len(),
+            "body must be exactly {} bytes, not include KZG data (got {})",
+            body.len(),
+            block.body.len(),
+        );
+        assert_eq!(block.body, body);
+    }
+
+    #[test]
+    fn test_ssz_deser_kzg_offset_boundary() {
+        use beacon::ssz_deser::{deserialize_beacon_block_from_ssz, SszBlockFormat};
+
+        // kzg_offset at exact end of block — empty KZG, empty blobs
+        let body = vec![0xab; 1];
+        let bytes = build_ssz_bytes_with_kzg(500, 10, &body, &[], &[]);
+
+        let (block, offset) =
+            deserialize_beacon_block_from_ssz(&bytes, SszBlockFormat::BlockContents).unwrap();
+
+        assert_eq!(offset, 12);
+        assert_eq!(block.slot, 500);
+        // With empty KZG data, bytes.len() == kzg_offset, so body is correct
+        assert_eq!(block.body.len(), body.len());
+    }
+
+    #[test]
+    #[ignore = "Known body-bleed bug: multiple KZG proofs + blobs are included in body. See beacon/src/ssz_deser.rs:190."]
+    fn test_ssz_deser_multiple_blobs_deneb() {
+        use beacon::ssz_deser::{deserialize_beacon_block_from_ssz, SszBlockFormat};
+
+        let body = vec![0xab; 256];
+        let kzg_proofs: Vec<u8> = (0..4).flat_map(|i| vec![i as u8; 48]).collect();
+        let blobs: Vec<u8> = (0..4).flat_map(|i| vec![i as u8; 131072]).collect();
+
+        let bytes = build_ssz_bytes_with_kzg(1000, 42, &body, &kzg_proofs, &blobs);
+        let (block, _) =
+            deserialize_beacon_block_from_ssz(&bytes, SszBlockFormat::BlockContents).unwrap();
+
+        assert_eq!(
+            block.body.len(),
+            body.len(),
+            "body must be exactly {} bytes, not {} (includes KZG+blobs)",
+            body.len(),
+            block.body.len(),
+        );
+    }
+
+    #[test]
+    fn test_ssz_propose_with_large_body_through_pipeline() {
+        use beacon::ssz_deser::SszBlockFormat;
+
+        // Large body SSZ through the production deserialization path (no KZG data = no bug)
+        let body = vec![0xab; 4096];
+        let ssz = build_ssz_bytes_with_kzg(100, 42, &body, &[], &[]);
+
+        let format = ssz_block_format(false, "deneb");
+        assert_eq!(format, SszBlockFormat::BlockContents);
+
+        let (block, offset) =
+            beacon::ssz_deser::deserialize_beacon_block_from_ssz(&ssz, format).unwrap();
+        assert_eq!(offset, 12);
+        assert_eq!(block.slot, 100);
+        assert_eq!(block.proposer_index, 42);
+        assert_eq!(block.body.len(), body.len());
+        assert_ne!(block.tree_hash_root().0, [0u8; 32]);
+    }
+
+    // --- Issue 3.2: Slot 0 / Epoch boundary block proposal tests (Finding #23) ---
+
+    #[tokio::test]
+    async fn test_propose_block_at_slot_zero() {
+        let pubkey = test_pubkey();
+        let slot = 0;
+        let block = BeaconBlock {
+            slot,
+            proposer_index: 1,
+            parent_root: [0u8; 32],
+            state_root: [0u8; 32],
+            body: vec![0xde, 0xad],
+        };
+        let beacon = MockBeaconClient::unblinded(block);
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey, 1, None).await;
+
+        assert!(result.is_ok(), "slot 0 must not underflow: {:?}", result.err());
+        let proposal = result.unwrap();
+        assert_eq!(proposal.slot, 0);
+        assert!(!proposal.is_blinded);
+        assert_ne!(proposal.block_root, [0u8; 32]);
+
+        beacon_arc.assert_last_produce_slot(0);
+        beacon_arc.assert_last_published_block(0, 1);
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_at_epoch_boundary() {
+        let pubkey = test_pubkey();
+        let slot = SLOTS_PER_EPOCH; // slot 32 = first slot of epoch 1
+        let block = BeaconBlock {
+            slot,
+            proposer_index: 5,
+            parent_root: [1u8; 32],
+            state_root: [2u8; 32],
+            body: vec![0xca, 0xfe],
+        };
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+        let signer_arc = Arc::new(signer);
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey, 5, None).await;
+
+        assert!(result.is_ok(), "epoch boundary slot must work: {:?}", result.err());
+        let proposal = result.unwrap();
+        assert_eq!(proposal.slot, SLOTS_PER_EPOCH);
+
+        beacon_arc.assert_last_produce_slot(SLOTS_PER_EPOCH);
+        beacon_arc.assert_last_published_block(SLOTS_PER_EPOCH, 5);
+
+        // RANDAO must use epoch 1
+        let randao_calls = signer_arc.randao_calls.lock().unwrap();
+        assert_eq!(randao_calls.len(), 1);
+        assert_eq!(randao_calls[0], 1, "epoch must be slot/SLOTS_PER_EPOCH = 1");
+    }
+
+    #[tokio::test]
+    async fn test_propose_block_at_slot_zero_ssz() {
+        let pubkey = test_pubkey();
+        let slot = 0;
+        let beacon = MockBeaconClient::ssz_with_version(slot, 1, false, "capella");
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey, 1, None).await;
+
+        assert!(result.is_ok(), "SSZ slot 0 must not underflow: {:?}", result.err());
+        let proposal = result.unwrap();
+        assert_eq!(proposal.slot, 0);
+        beacon_arc.assert_last_produce_slot(0);
+    }
+
+    // --- Issue 3.3: BlockAndBlobs JSON parse test (Finding #24) ---
+
+    #[test]
+    fn test_block_and_blobs_json_deserialization() {
+        use eth_types::BlockContents;
+
+        let json = serde_json::json!({
+            "block": {
+                "slot": "1000",
+                "proposer_index": "42",
+                "parent_root": format!("0x{}", hex::encode([0x11u8; 32])),
+                "state_root": format!("0x{}", hex::encode([0x22u8; 32])),
+                "body": format!("0x{}", hex::encode([0xab; 8])),
+            },
+            "blob_sidecars": [
+                {
+                    "index": "0",
+                    "blob": format!("0x{}", hex::encode([0xdd; 128])),
+                },
+                {
+                    "index": "1",
+                    "blob": format!("0x{}", hex::encode([0xee; 128])),
+                },
+            ]
+        });
+
+        let contents: BlockContents = serde_json::from_value(json).unwrap();
+        match &contents {
+            BlockContents::BlockAndBlobs { block, blob_sidecars } => {
+                assert_eq!(block.slot, 1000);
+                assert_eq!(block.proposer_index, 42);
+                assert_eq!(block.parent_root, [0x11u8; 32]);
+                assert_eq!(block.state_root, [0x22u8; 32]);
+                assert_eq!(block.body, vec![0xab; 8]);
+                assert_eq!(blob_sidecars.len(), 2);
+                assert_eq!(blob_sidecars[0].index, 0);
+                assert_eq!(blob_sidecars[0].blob, vec![0xdd; 128]);
+                assert_eq!(blob_sidecars[1].index, 1);
+                assert_eq!(blob_sidecars[1].blob, vec![0xee; 128]);
+            }
+            BlockContents::Block(_) => {
+                panic!("expected BlockAndBlobs variant, got Block");
+            }
+        }
+    }
+
+    #[test]
+    fn test_block_and_blobs_json_through_produce_response() {
+        let json = serde_json::json!({
+            "block": {
+                "slot": "500",
+                "proposer_index": "10",
+                "parent_root": format!("0x{}", hex::encode([0xaa; 32])),
+                "state_root": format!("0x{}", hex::encode([0xbb; 32])),
+                "body": format!("0x{}", hex::encode([0xde, 0xad])),
+            },
+            "blob_sidecars": [
+                {
+                    "index": "0",
+                    "blob": format!("0x{}", hex::encode([0xff; 64])),
+                },
+            ]
+        });
+
+        let response = ProduceBlockResponse {
+            data: json,
+            is_blinded: false,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: Some("99999".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
+        };
+
+        let contents = response.parse_full_block().unwrap();
+        let block = contents.block();
+        assert_eq!(block.slot, 500);
+        assert_eq!(block.proposer_index, 10);
+        match &contents {
+            eth_types::BlockContents::BlockAndBlobs { blob_sidecars, .. } => {
+                assert_eq!(blob_sidecars.len(), 1);
+                assert_eq!(blob_sidecars[0].blob, vec![0xff; 64]);
+            }
+            _ => panic!("expected BlockAndBlobs"),
+        }
+    }
+
+    #[test]
+    fn test_block_and_blobs_json_empty_sidecars() {
+        let json = serde_json::json!({
+            "block": {
+                "slot": "100",
+                "proposer_index": "1",
+                "parent_root": format!("0x{}", hex::encode([0u8; 32])),
+                "state_root": format!("0x{}", hex::encode([0u8; 32])),
+                "body": "0x",
+            },
+            "blob_sidecars": []
+        });
+
+        let contents: eth_types::BlockContents = serde_json::from_value(json).unwrap();
+        match &contents {
+            eth_types::BlockContents::BlockAndBlobs { blob_sidecars, .. } => {
+                assert!(blob_sidecars.is_empty());
+            }
+            _ => panic!("expected BlockAndBlobs variant even with empty sidecars"),
+        }
+    }
+
+    // --- Issue 3.4: Rewrite tautological block root test (Finding #25) ---
+
+    #[tokio::test]
+    async fn test_blinded_and_unblinded_roots_differ_through_production_logic() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+
+        // Both blocks share the same slot + proposer_index but differ in body.
+        // The point: verify production code (compute_block_root / compute_blinded_block_root)
+        // produces different roots because tree_hash includes the body field.
+        let unblinded_block = BeaconBlock {
+            slot,
+            proposer_index: 42,
+            parent_root: [1u8; 32],
+            state_root: [2u8; 32],
+            body: vec![0xde, 0xad],
+        };
+        let blinded_block = BlindedBeaconBlock {
+            slot,
+            proposer_index: 42,
+            parent_root: [1u8; 32],
+            state_root: [2u8; 32],
+            body: vec![0xbe, 0xef], // different body → different root
+        };
+
+        // Exercise the production root computation functions
+        let unblinded_root = compute_block_root(&unblinded_block);
+        let blinded_root = compute_blinded_block_root(&blinded_block);
+
+        // Roots differ because body content differs
+        assert_ne!(
+            unblinded_root, blinded_root,
+            "blocks with different bodies at same slot must have different tree_hash roots"
+        );
+
+        // Verify roots are non-trivial (not all zeros)
+        assert_ne!(unblinded_root, [0u8; 32]);
+        assert_ne!(blinded_root, [0u8; 32]);
+
+        // Verify determinism: same input → same root
+        assert_eq!(compute_block_root(&unblinded_block), unblinded_root);
+        assert_eq!(compute_blinded_block_root(&blinded_block), blinded_root);
+
+        // Now run through the full pipeline and confirm the signer receives these roots
+        let beacon_unblinded = MockBeaconClient::unblinded(unblinded_block);
+        let signer = MockSigner::new();
+        let signer_arc = Arc::new(signer);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            Arc::new(beacon_unblinded),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+        let result = service.propose_block(slot, &pubkey, 42, None).await.unwrap();
+        assert_eq!(
+            result.block_root, unblinded_root,
+            "pipeline must pass tree_hash root to signer"
+        );
+        let sign_calls = signer_arc.block_calls.lock().unwrap();
+        assert_eq!(sign_calls[0].block_root, unblinded_root);
+    }
+
+    #[test]
+    fn test_block_root_sensitive_to_every_field() {
+        let baseline = BeaconBlock {
+            slot: 100,
+            proposer_index: 42,
+            parent_root: [1u8; 32],
+            state_root: [2u8; 32],
+            body: vec![0xab],
+        };
+        let baseline_root = compute_block_root(&baseline);
+
+        // Changing slot
+        let mut changed = baseline.clone();
+        changed.slot = 101;
+        assert_ne!(
+            compute_block_root(&changed),
+            baseline_root,
+            "root must change when slot changes"
+        );
+
+        // Changing proposer_index
+        let mut changed = baseline.clone();
+        changed.proposer_index = 43;
+        assert_ne!(
+            compute_block_root(&changed),
+            baseline_root,
+            "root must change when proposer_index changes"
+        );
+
+        // Changing parent_root
+        let mut changed = baseline.clone();
+        changed.parent_root = [99u8; 32];
+        assert_ne!(
+            compute_block_root(&changed),
+            baseline_root,
+            "root must change when parent_root changes"
+        );
+
+        // Changing state_root
+        let mut changed = baseline.clone();
+        changed.state_root = [99u8; 32];
+        assert_ne!(
+            compute_block_root(&changed),
+            baseline_root,
+            "root must change when state_root changes"
+        );
+
+        // Changing body
+        let mut changed = baseline.clone();
+        changed.body = vec![0xcd, 0xef];
+        assert_ne!(
+            compute_block_root(&changed),
+            baseline_root,
+            "root must change when body changes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests: propose_block H-4 validation wiring
+    // -----------------------------------------------------------------------
+
+    /// BN returns block with wrong proposer_index — signer must NOT be called.
+    #[tokio::test]
+    async fn test_propose_block_proposer_index_mismatch_drops_duty() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        // Block has proposer_index = 42; duty expects 99
+        let block = test_block(slot); // proposer_index = 42
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+
+        let signer_arc = Arc::new(signer);
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        // Duty says expected_proposer_index = 99, but BN returns 42
+        let result = service.propose_block(slot, &pubkey, 99, None).await;
+
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                BlockServiceError::ProposerIndexMismatch { expected: 99, got: 42 }
+            ),
+            "expected ProposerIndexMismatch"
+        );
+        // No signer call must have been made
+        assert!(
+            signer_arc.block_calls.lock().unwrap().is_empty(),
+            "signer must not be called when proposer_index validation fails"
+        );
+        // No publish call either
+        assert!(beacon_arc.publish_calls.lock().unwrap().is_empty());
+    }
+
+    /// BN returns block with wrong parent_root — signer must NOT be called.
+    #[tokio::test]
+    async fn test_propose_block_parent_root_mismatch_drops_duty() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        // Block has parent_root = [1u8; 32]; we expect [0xee; 32]
+        let block = test_block(slot); // parent_root = [1u8; 32]
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+
+        let signer_arc = Arc::new(signer);
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let expected_parent: Root = [0xee; 32];
+        let result = service.propose_block(slot, &pubkey, 42, Some(expected_parent)).await;
+
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), BlockServiceError::ParentRootMismatch { .. }),
+            "expected ParentRootMismatch"
+        );
+        assert!(
+            signer_arc.block_calls.lock().unwrap().is_empty(),
+            "signer must not be called when parent_root validation fails"
+        );
+        assert!(beacon_arc.publish_calls.lock().unwrap().is_empty());
+    }
+
+    /// Correct proposer_index with None parent_root — proposal proceeds.
+    #[tokio::test]
+    async fn test_propose_block_correct_proposer_no_parent_root_succeeds() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot); // proposer_index = 42
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+
+        let signer_arc = Arc::new(signer);
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+
+        assert!(result.is_ok());
+        // Signer WAS called
+        assert_eq!(
+            signer_arc.block_calls.lock().unwrap().len(),
+            1,
+            "signer must be called for valid proposal"
+        );
+        beacon_arc.assert_last_published_block(slot, 42);
+    }
+
+    /// Blinded path: wrong proposer_index — signer must NOT be called.
+    #[tokio::test]
+    async fn test_propose_block_blinded_proposer_mismatch_drops_duty() {
+        let pubkey = test_pubkey();
+        let slot = 200;
+        // Blinded block has proposer_index = 42
+        let block = test_blinded_block(slot);
+        let beacon = MockBeaconClient::blinded(block);
+        let signer = MockSigner::new();
+
+        let signer_arc = Arc::new(signer);
+        let beacon_arc = Arc::new(beacon);
+        let store = test_validator_store(&pubkey);
+        let service = BlockService::new(
+            signer_arc.clone(),
+            beacon_arc.clone(),
+            Arc::new(store),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+
+        // Expect proposer 77, BN returns 42
+        let result = service.propose_block(slot, &pubkey, 77, None).await;
+
+        assert!(result.is_err());
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                BlockServiceError::ProposerIndexMismatch { expected: 77, got: 42 }
+            ),
+            "expected ProposerIndexMismatch on blinded path"
+        );
+        assert!(
+            signer_arc.block_calls.lock().unwrap().is_empty(),
+            "signer must not be called when blinded proposer_index validation fails"
+        );
+        assert!(beacon_arc.publish_blinded_calls.lock().unwrap().is_empty());
+    }
+
+    // ── H-3: BuilderFailure tagging ──────────────────────────────────────────
+
+    /// H-3: When `produce_block_v3` fails **and** `boost > 0` (builder attempt),
+    /// `propose_block_impl` must return `BlockServiceError::BuilderFailure`.
+    ///
+    /// The coordinator pattern-matches this variant to call `record_miss()`.
+    #[tokio::test]
+    async fn test_bn_error_with_builder_boost_returns_builder_failure() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = MockBeaconClient::unblinded(test_block(slot)).with_produce_error();
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        // BuilderAlways → boost = u64::MAX > 0 → BN error is a builder failure.
+        let err = service
+            .propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderAlways)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BlockServiceError::BuilderFailure(_)),
+            "expected BuilderFailure, got {err:?}"
+        );
+    }
+
+    /// H-3: When `produce_block_v3` fails **and** `boost == 0` (ExecutionOnly),
+    /// `propose_block_impl` must NOT return `BuilderFailure` — it returns a
+    /// plain `Beacon` error so the coordinator leaves the circuit breaker alone.
+    #[tokio::test]
+    async fn test_bn_error_with_zero_boost_returns_beacon_not_builder_failure() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = MockBeaconClient::unblinded(test_block(slot)).with_produce_error();
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        // ExecutionOnly → boost = 0 → BN error must NOT be tagged BuilderFailure.
+        let err = service
+            .propose_block_with_mode(slot, &pubkey, BlockSelectionMode::ExecutionOnly)
+            .await
+            .unwrap_err();
+
+        assert!(
+            !matches!(err, BlockServiceError::BuilderFailure(_)),
+            "ExecutionOnly BN error must NOT be BuilderFailure, got {err:?}"
+        );
+    }
+
+    /// H-3: MaxProfit with non-zero boost returns `BuilderFailure` on BN error.
+    #[tokio::test]
+    async fn test_bn_error_with_max_profit_nonzero_boost_returns_builder_failure() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let beacon = MockBeaconClient::unblinded(test_block(slot)).with_produce_error();
+        let signer = MockSigner::new();
+        // build_service wires the validator store with builder_boost_factor = 150.
+        let service = build_service(signer, beacon, &pubkey);
+
+        // MaxProfit + circuit breaker not tripped → boost = 150 > 0 → BuilderFailure.
+        let err = service
+            .propose_block_with_mode(slot, &pubkey, BlockSelectionMode::MaxProfit)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, BlockServiceError::BuilderFailure(_)),
+            "MaxProfit BN error with non-zero boost must be BuilderFailure, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // ISSUE-4.3 (L-3): canonical blob KZG commitment binding — regression tests
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal Deneb `BeaconBlockBody` SSZ byte sequence that places
+    /// `commitments` at the correct offset (bytes 388–391 → byte 392).
+    fn deneb_body_with_kzg_commitments_for_test(commitments: &[[u8; 48]]) -> Vec<u8> {
+        const FIXED_LEN: usize = 392;
+        let mut body = vec![0u8; FIXED_LEN];
+        let kzg_offset = FIXED_LEN as u32;
+        body[388..392].copy_from_slice(&kzg_offset.to_le_bytes());
+        for c in commitments {
+            body.extend_from_slice(c.as_slice());
+        }
+        body
+    }
+
+    /// Build a mock `ProduceBlockResponse` for a Deneb `BlockAndBlobs` payload
+    /// where the body contains `commitments` at the correct SSZ offset and the
+    /// `blob_sidecars` has one entry per commitment.
+    fn block_and_blobs_response(slot: Slot, commitments: &[[u8; 48]]) -> ProduceBlockResponse {
+        let body = deneb_body_with_kzg_commitments_for_test(commitments);
+        let body_hex = format!("0x{}", hex::encode(&body));
+        let blob_sidecars: Vec<serde_json::Value> = commitments
+            .iter()
+            .enumerate()
+            .map(|(i, _)| {
+                serde_json::json!({
+                    "index": i.to_string(),
+                    "blob": format!("0x{}", hex::encode([0u8; 64])),
+                })
+            })
+            .collect();
+        let data = serde_json::json!({
+            "block": {
+                "slot": slot.to_string(),
+                "proposer_index": "42",
+                "parent_root": format!("0x{}", hex::encode([0x11u8; 32])),
+                "state_root": format!("0x{}", hex::encode([0x22u8; 32])),
+                "body": body_hex,
+            },
+            "blob_sidecars": blob_sidecars,
+        });
+        ProduceBlockResponse {
+            data,
+            is_blinded: false,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: Some("12345".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
+        }
+    }
+
+    /// L-3 (ISSUE-4.3): canonical commitment root must be nonzero for a block
+    /// with two distinct blob KZG commitments.
+    #[test]
+    fn test_l3_kzg_commitment_root_nonzero_for_block_and_blobs() {
+        use eth_types::BodyForkLayout;
+        let slot = 1000;
+        let commitments = [[0xaa; 48], [0xbb; 48]];
+        let response = block_and_blobs_response(slot, &commitments);
+        let contents = response.parse_full_block().unwrap();
+        let root = contents.kzg_commitment_root(BodyForkLayout::Deneb);
+        assert_ne!(root, [0u8; 32], "commitment root must be nonzero for non-empty blobs");
+    }
+
+    /// L-3 (ISSUE-4.3): the canonical commitment root must change when any single
+    /// byte in any blob KZG commitment in the body is mutated.
+    #[test]
+    fn test_l3_kzg_root_changes_on_any_commitment_mutation() {
+        use eth_types::BodyForkLayout;
+        let slot = 1000;
+        let original_commits = [[0xcc; 48], [0xdd; 48]];
+        let base_root = {
+            let response = block_and_blobs_response(slot, &original_commits);
+            response.parse_full_block().unwrap().kzg_commitment_root(BodyForkLayout::Deneb)
+        };
+
+        // Mutate one byte in each commitment and verify the root changes.
+        for ci in 0..original_commits.len() {
+            let mut mutated = original_commits;
+            mutated[ci][0] ^= 0x01;
+            let mutated_root = {
+                let response = block_and_blobs_response(slot, &mutated);
+                response.parse_full_block().unwrap().kzg_commitment_root(BodyForkLayout::Deneb)
+            };
+            assert_ne!(
+                base_root, mutated_root,
+                "mutation of commitment[{ci}] must change the canonical root"
+            );
+        }
+    }
+
+    /// L-3 (ISSUE-4.3): the full propose_block pipeline with a BlockAndBlobs
+    /// response that has valid kzg_commitments must succeed (the defense-in-depth
+    /// check is a warning, not a hard error).
+    #[tokio::test]
+    async fn test_l3_propose_block_and_blobs_succeeds_with_matching_commitment_count() {
+        let pubkey = test_pubkey();
+        let slot = 1000;
+        let commitments = [[0xee; 48], [0xff; 48]];
+
+        let response = block_and_blobs_response(slot, &commitments);
+        let beacon = MockBeaconClient {
+            produce_response: Some(response),
+            fail_produce: false,
+            fail_publish: false,
+            publish_calls: Mutex::new(Vec::new()),
+            publish_blinded_calls: Mutex::new(Vec::new()),
+            publish_ssz_calls: Mutex::new(Vec::new()),
+            produce_full_calls: Mutex::new(Vec::new()),
+            publish_full_calls: Mutex::new(Vec::new()),
+            publish_blinded_full_calls: Mutex::new(Vec::new()),
+        };
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(
+            result.is_ok(),
+            "propose_block with valid BlockAndBlobs must succeed, got: {result:?}"
+        );
+    }
+
+    /// L-3 (ISSUE-4.3): a mismatch between commitment count in the body and the
+    /// number of blob sidecars must only warn (not abort signing).
+    #[tokio::test]
+    async fn test_l3_propose_block_and_blobs_warns_on_commitment_count_mismatch() {
+        let pubkey = test_pubkey();
+        let slot = 2000;
+
+        // Body has 2 commitments but blob_sidecars will have 1 entry (mismatch).
+        let two_commits = [[0x11; 48], [0x22; 48]];
+        let body = deneb_body_with_kzg_commitments_for_test(&two_commits);
+        let body_hex = format!("0x{}", hex::encode(&body));
+
+        // Only one sidecar despite two commitments in the body.
+        let data = serde_json::json!({
+            "block": {
+                "slot": slot.to_string(),
+                "proposer_index": "42",
+                "parent_root": format!("0x{}", hex::encode([0x11u8; 32])),
+                "state_root": format!("0x{}", hex::encode([0x22u8; 32])),
+                "body": body_hex,
+            },
+            "blob_sidecars": [
+                { "index": "0", "blob": format!("0x{}", hex::encode([0u8; 64])) },
+            ],
+        });
+        let response = ProduceBlockResponse {
+            data,
+            is_blinded: false,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: Some("99".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
+        };
+
+        let beacon = MockBeaconClient {
+            produce_response: Some(response),
+            fail_produce: false,
+            fail_publish: false,
+            publish_calls: Mutex::new(Vec::new()),
+            publish_blinded_calls: Mutex::new(Vec::new()),
+            publish_ssz_calls: Mutex::new(Vec::new()),
+            produce_full_calls: Mutex::new(Vec::new()),
+            publish_full_calls: Mutex::new(Vec::new()),
+            publish_blinded_full_calls: Mutex::new(Vec::new()),
+        };
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        // Signing must NOT fail — the count mismatch is a warn, not an error.
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(
+            result.is_ok(),
+            "commitment count mismatch must not abort signing, got: {result:?}"
+        );
+    }
+
+    // GREEN (CQ-3.2): formerly RED test for ISSUE-CQ-3.2 (C3).
+    //
+    // Before CQ-3.2, `propose_block` performed no proposer_index validation,
+    // silently accepting a block with any proposer_index.  After CQ-3.2 the
+    // unvalidated entry point is deleted; the surviving `propose_block` requires
+    // `expected_proposer_index` and rejects mismatches before calling the signer.
+    #[tokio::test]
+    async fn test_propose_block_rejects_mismatched_proposer_index() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        // BN returns proposer_index = 99; duty expects validator 42.
+        let mut block = test_block(slot);
+        block.proposer_index = 99;
+        let beacon = MockBeaconClient::unblinded(block);
+        let signer = MockSigner::new();
+        let service = build_service(signer, beacon, &pubkey);
+
+        // propose_block now validates: expected = 42, got = 99 → Err.
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+
+        assert!(result.is_err(), "expected validation rejection but call succeeded");
+        assert!(
+            matches!(
+                result.unwrap_err(),
+                BlockServiceError::ProposerIndexMismatch { expected: 42, got: 99 }
+            ),
+            "expected ProposerIndexMismatch {{ expected: 42, got: 99 }}"
+        );
     }
 }

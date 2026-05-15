@@ -189,6 +189,25 @@ pub enum BnSelectionStrategy {
     Best,
 }
 
+/// Controls which message types are broadcast to all BNs vs sent to the first healthy BN.
+///
+/// When a topic is `true`, the corresponding submission is broadcast to all BNs.
+/// When `false`, only the first healthy BN receives the message (query_first strategy).
+/// Default: all topics enabled (current behavior preserved).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BroadcastTopics {
+    pub attestations: bool,
+    pub blocks: bool,
+    pub sync_committee: bool,
+    pub subscriptions: bool,
+}
+
+impl Default for BroadcastTopics {
+    fn default() -> Self {
+        Self { attestations: true, blocks: true, sync_committee: true, subscriptions: true }
+    }
+}
+
 /// Configuration for the beacon node manager.
 #[derive(Debug, Clone)]
 pub struct BnManagerConfig {
@@ -198,15 +217,44 @@ pub struct BnManagerConfig {
     pub selection_strategy: BnSelectionStrategy,
     /// Per-BN request timeout.
     pub timeout: Duration,
+    /// Which submission types are broadcast to all BNs.
+    pub broadcast_topics: BroadcastTopics,
+    /// Per-BN role assignments (parallel to endpoints). Default: {All} for each.
+    pub roles: Vec<std::collections::HashSet<crate::types::BnRole>>,
+    /// Health tier thresholds for sync distance classification.
+    pub tier_thresholds: crate::types::TierThresholds,
+    /// Maximum bytes allowed in a JSON response body (H-12).
+    ///
+    /// Applied to every `BeaconClient` created by `BnManager::new`.
+    /// Default: 32 MiB (`ResponseCaps::DEFAULT_MAX_BODY_BYTES`).
+    pub max_body_bytes: usize,
 }
 
 impl BnManagerConfig {
     pub fn new(endpoints: Vec<String>) -> Self {
+        let count = endpoints.len();
         Self {
             endpoints,
             selection_strategy: BnSelectionStrategy::First,
             timeout: Duration::from_secs(30),
+            broadcast_topics: BroadcastTopics::default(),
+            roles: vec![
+                {
+                    let mut s = std::collections::HashSet::new();
+                    s.insert(crate::types::BnRole::All);
+                    s
+                };
+                count
+            ],
+            tier_thresholds: crate::types::TierThresholds::default(),
+            max_body_bytes: beacon::ResponseCaps::DEFAULT_MAX_BODY_BYTES,
         }
+    }
+
+    /// Set the maximum JSON response body size for all per-BN clients.
+    pub fn with_max_body_bytes(mut self, max_body_bytes: usize) -> Self {
+        self.max_body_bytes = max_body_bytes;
+        self
     }
 }
 
@@ -219,6 +267,8 @@ pub struct BnHealthScore {
     pub is_reachable: bool,
     /// Whether the node is fully synced.
     pub is_synced: bool,
+    /// Whether the node's execution layer is offline.
+    pub is_el_offline: bool,
     /// Latest observed head slot from the node.
     pub head_slot: Option<u64>,
     /// Response latency for the most recent health check.
@@ -337,6 +387,7 @@ mod tests {
             endpoint: "http://localhost:5052".to_string(),
             is_reachable: true,
             is_synced: true,
+            is_el_offline: false,
             head_slot: Some(1000),
             latency: Some(Duration::from_millis(50)),
             latency_ms: 50.0,
@@ -355,6 +406,7 @@ mod tests {
             endpoint: "http://dead-node:5052".to_string(),
             is_reachable: false,
             is_synced: false,
+            is_el_offline: false,
             head_slot: None,
             latency: None,
             latency_ms: 0.0,
@@ -374,6 +426,7 @@ mod tests {
             endpoint: "http://syncing:5052".to_string(),
             is_reachable: true,
             is_synced: false,
+            is_el_offline: false,
             head_slot: Some(500),
             latency: Some(Duration::from_millis(200)),
             latency_ms: 200.0,
@@ -391,6 +444,7 @@ mod tests {
             endpoint: "http://localhost:5052".to_string(),
             is_reachable: true,
             is_synced: true,
+            is_el_offline: false,
             head_slot: Some(1000),
             latency: Some(Duration::from_millis(50)),
             latency_ms: 50.0,
@@ -407,6 +461,7 @@ mod tests {
             endpoint: "http://localhost:5052".to_string(),
             is_reachable: true,
             is_synced: true,
+            is_el_offline: false,
             head_slot: Some(1000),
             latency: Some(Duration::from_millis(50)),
             latency_ms: 50.0,
@@ -617,5 +672,67 @@ mod tests {
         let mock: Arc<dyn BeaconNodeClient> = Arc::new(MockBeaconNodeClient);
         let result = mock.get_genesis().await;
         assert!(result.is_err());
+    }
+
+    // -- BroadcastTopics --
+
+    #[test]
+    fn test_broadcast_topics_default_all_enabled() {
+        let topics = BroadcastTopics::default();
+        assert!(topics.attestations);
+        assert!(topics.blocks);
+        assert!(topics.sync_committee);
+        assert!(topics.subscriptions);
+    }
+
+    #[test]
+    fn test_broadcast_topics_all_disabled() {
+        let topics = BroadcastTopics {
+            attestations: false,
+            blocks: false,
+            sync_committee: false,
+            subscriptions: false,
+        };
+        assert!(!topics.attestations);
+        assert!(!topics.blocks);
+    }
+
+    #[test]
+    fn test_broadcast_topics_partial() {
+        let topics = BroadcastTopics {
+            attestations: false,
+            blocks: true,
+            sync_committee: false,
+            subscriptions: true,
+        };
+        assert!(!topics.attestations);
+        assert!(topics.blocks);
+        assert!(!topics.sync_committee);
+        assert!(topics.subscriptions);
+    }
+
+    #[test]
+    fn test_broadcast_topics_clone() {
+        let topics = BroadcastTopics {
+            attestations: true,
+            blocks: false,
+            sync_committee: true,
+            subscriptions: false,
+        };
+        let cloned = topics.clone();
+        assert_eq!(topics, cloned);
+    }
+
+    #[test]
+    fn test_broadcast_topics_debug() {
+        let topics = BroadcastTopics::default();
+        let debug = format!("{:?}", topics);
+        assert!(debug.contains("BroadcastTopics"));
+    }
+
+    #[test]
+    fn test_bn_manager_config_includes_broadcast_topics() {
+        let config = BnManagerConfig::new(vec!["http://localhost:5052".to_string()]);
+        assert_eq!(config.broadcast_topics, BroadcastTopics::default());
     }
 }

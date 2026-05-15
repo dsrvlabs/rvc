@@ -5,6 +5,12 @@ use eth_types::{
 use crate::bls::{SecretKey, Signature};
 use crate::signing::{compute_domain, compute_signing_root};
 
+#[tracing::instrument(
+    name = "rvc.crypto.sign_block",
+    level = "debug",
+    skip_all,
+    fields(rvc.signing_type = "block"),
+)]
 /// Sign a beacon block with the correct fork-aware domain.
 ///
 /// `block_root` must be the `hash_tree_root()` of the `BeaconBlock`.
@@ -26,6 +32,12 @@ pub fn sign_block(
     secret_key.sign(&signing_root)
 }
 
+#[tracing::instrument(
+    name = "rvc.crypto.sign_randao",
+    level = "debug",
+    skip_all,
+    fields(rvc.signing_type = "randao"),
+)]
 /// Sign a RANDAO reveal for a given epoch.
 pub fn sign_randao_reveal(
     epoch: Epoch,

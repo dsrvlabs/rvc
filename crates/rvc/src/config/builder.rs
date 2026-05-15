@@ -9,6 +9,8 @@ use std::time::Duration;
 
 use tracing::info;
 
+use crypto::logging::RedactedUrl;
+
 use crate::beacon_adapter::BeaconBlockAdapter;
 use crate::doppelganger_adapter::{BeaconLivenessAdapter, SlashingDbReaderAdapter};
 use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle, PubkeyMap};
@@ -66,36 +68,105 @@ impl ServiceBuilder {
         Self { config }
     }
 
+    pub fn log_effective_config(&self) {
+        let redacted_bns: Vec<String> = self
+            .config
+            .effective_beacon_nodes()
+            .iter()
+            .map(|u| format!("{}", RedactedUrl(u)))
+            .collect();
+
+        info!(
+            bn_urls = ?redacted_bns,
+            key_dir = ?self.config.keystore_path,
+            network = %self.config.network,
+            features = %format!(
+                "doppelganger={}, builder=true, keymanager={}",
+                self.config.doppelganger_detection,
+                self.config.keymanager_enabled
+            ),
+            "Effective configuration"
+        );
+
+        info!(
+            doppelganger_enabled = self.config.doppelganger_detection,
+            builder_enabled = true,
+            keymanager_enabled = self.config.keymanager_enabled,
+            "Feature toggles"
+        );
+    }
+
     pub fn build_beacon(&self) -> Result<Arc<BeaconClient>, ConfigError> {
         let beacon_config = BeaconClientConfig::new(&self.config.beacon_url)
             .with_timeout(Duration::from_secs(30))
-            .with_max_retries(3);
+            .with_max_retries(3)
+            .with_max_body_bytes(self.config.beacon_max_body_bytes);
 
         let client = BeaconClient::new(beacon_config)?;
-        info!(url = %self.config.beacon_url, "Created beacon client");
+        info!(
+            url = %self.config.beacon_url,
+            max_body_bytes = self.config.beacon_max_body_bytes,
+            "Created beacon client"
+        );
         Ok(Arc::new(client))
     }
 
     pub fn build_bn_manager(&self) -> Result<Arc<BnManager>, ConfigError> {
         let endpoints = self.config.effective_beacon_nodes();
-        let config = BnManagerConfig::new(endpoints.clone());
-        let manager = BnManager::new(config).map_err(|e| {
-            ConfigError::InvalidBeaconUrl(format!("failed to create BnManager: {}", e))
-        })?;
-        info!(endpoints = ?endpoints, "Created BnManager with {} beacon nodes", endpoints.len());
+        let broadcast_topics = self.config.effective_broadcast_topics();
+        let mut config = BnManagerConfig::new(endpoints.clone());
+        config.broadcast_topics = broadcast_topics.clone();
+        let manager = BnManager::new(config)
+            .map_err(|e| {
+                ConfigError::InvalidBeaconUrl(format!("failed to create BnManager: {}", e))
+            })?
+            .with_operation_timeouts(bn_manager::OperationTimeouts::default());
+        info!(
+            endpoints = ?endpoints,
+            broadcast_topics = ?broadcast_topics,
+            "Created BnManager with {} beacon nodes",
+            endpoints.len()
+        );
         Ok(Arc::new(manager))
+    }
+
+    /// Builds a separate BnManager for proposer nodes if configured.
+    ///
+    /// Returns `None` if `proposer_nodes` is empty (main pool handles all).
+    pub fn build_proposer_bn_manager(&self) -> Result<Option<Arc<BnManager>>, ConfigError> {
+        if self.config.proposer_nodes.is_empty() {
+            return Ok(None);
+        }
+        let endpoints = self.config.proposer_nodes.clone();
+        let config = BnManagerConfig::new(endpoints.clone());
+        let manager = BnManager::new(config)
+            .map_err(|e| {
+                ConfigError::InvalidBeaconUrl(format!("failed to create proposer BnManager: {}", e))
+            })?
+            .with_operation_timeouts(bn_manager::OperationTimeouts::default());
+        info!(
+            endpoints = ?endpoints,
+            "Created proposer BnManager with {} proposer nodes",
+            endpoints.len()
+        );
+        Ok(Some(Arc::new(manager)))
     }
 
     pub fn build_doppelganger_service(
         &self,
         beacon: Arc<BeaconClient>,
         slashing_db: Arc<SlashingDb>,
-    ) -> DoppelgangerService {
+    ) -> Result<DoppelgangerService, ConfigError> {
+        // M-7 (ISSUE-3.6 review): propagate the genesis_time error rather than
+        // silently defaulting to 0.  A genesis_time of 0 would compute
+        // current_epoch ≈ now_unix / 384 (meaninglessly large) and silently
+        // disable doppelganger monitoring for misconfigured custom networks.
+        let genesis_time = self.config.effective_genesis_time()?;
         let liveness_checker = Arc::new(BeaconLivenessAdapter::new(beacon));
         let slashing_reader = Arc::new(SlashingDbReaderAdapter::new(slashing_db));
-        let service = DoppelgangerService::new(liveness_checker, slashing_reader);
-        info!("Created doppelganger detection service");
-        service
+        let service = DoppelgangerService::new(liveness_checker, slashing_reader, genesis_time);
+        info!(genesis_time, "Created doppelganger detection service");
+        Ok(service)
     }
 
     pub fn build_key_manager(&self) -> Result<Arc<KeyManager>, ConfigError> {
@@ -184,7 +255,7 @@ impl ServiceBuilder {
             map.insert(pubkey_hex, pubkey);
         }
         info!(count = map.len(), "Built public key map");
-        Arc::new(std::sync::RwLock::new(map))
+        Arc::new(parking_lot::RwLock::new(map))
     }
 
     pub fn parse_genesis_validators_root(&self) -> Result<Root, ConfigError> {
@@ -235,10 +306,30 @@ impl ServiceBuilder {
         Ok(Arc::new(schedule))
     }
 
-    pub fn build_validator_store(&self) -> Arc<ValidatorStore> {
-        let store = ValidatorStore::new([0u8; 20], 100);
+    /// Constructs the [`ValidatorStore`], loading defaults from a TOML file if
+    /// one is provided.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::ZeroFeeRecipient`] if the effective default fee
+    /// recipient is the zero address.  Operators must set a non-zero address in
+    /// the validators config file passed via `--validators-config`.
+    pub fn build_validator_store(
+        &self,
+        validators_config: Option<&std::path::Path>,
+    ) -> Result<Arc<ValidatorStore>, ConfigError> {
+        let store = match validators_config {
+            Some(path) => ValidatorStore::load_from_config(path)
+                .map_err(|e| ConfigError::ValidatorStoreError(e.to_string()))?,
+            None => ValidatorStore::new([0u8; 20], 30_000_000),
+        };
+
+        if store.default_fee_recipient() == [0u8; 20] {
+            return Err(ConfigError::ZeroFeeRecipient);
+        }
+
         info!("Created validator store");
-        Arc::new(store)
+        Ok(Arc::new(store))
     }
 
     pub fn build_builder_service(
@@ -345,6 +436,8 @@ impl ServiceBuilder {
         ),
         ConfigError,
     > {
+        self.log_effective_config();
+
         let beacon_client = self.build_beacon()?;
         let key_manager = self.build_key_manager()?;
         let slashing_db = self.build_slashing_db()?;
@@ -358,13 +451,14 @@ impl ServiceBuilder {
         let signer = self.build_signer(composite_signer.clone(), slashing_db.clone());
         let propagator = self.build_propagator(beacon_client.clone());
         let slot_clock = self.build_slot_clock()?;
-        let validator_store = self.build_validator_store();
+        let validator_store =
+            self.build_validator_store(self.config.validators_config.as_deref())?;
 
         let beacon: Arc<dyn BeaconNodeClient> = beacon_client.clone();
         let duty_tracker = self.build_duty_tracker(beacon.clone(), validator_indices);
 
         let doppelganger_service = if self.config.doppelganger_detection {
-            Some(self.build_doppelganger_service(beacon_client.clone(), slashing_db.clone()))
+            Some(self.build_doppelganger_service(beacon_client.clone(), slashing_db.clone())?)
         } else {
             None
         };
@@ -540,7 +634,7 @@ mod tests {
         let key_manager = KeyManager::new();
         let pubkey_map = builder.build_pubkey_map(&key_manager);
 
-        assert!(pubkey_map.read().unwrap().is_empty());
+        assert!(pubkey_map.read().is_empty());
     }
 
     #[test]
@@ -618,7 +712,7 @@ mod tests {
         let builder = ServiceBuilder::new(config);
         let beacon = builder.build_beacon().unwrap();
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let _service = builder.build_doppelganger_service(beacon, slashing_db);
+        let _service = builder.build_doppelganger_service(beacon, slashing_db).unwrap();
     }
 
     #[tokio::test]
@@ -676,9 +770,78 @@ mod tests {
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let signer = builder.build_signer(composite, slashing_db);
-        let validator_store = builder.build_validator_store();
+
+        // Build a temp validators config with a non-zero fee_recipient to satisfy the guard.
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+        std::fs::write(&config_path, format!("[defaults]\nfee_recipient = \"{fr_hex}\"\n"))
+            .unwrap();
+        let validator_store = builder.build_validator_store(Some(&config_path)).unwrap();
 
         let _builder_service =
             builder.build_builder_service(signer, beacon, validator_store, [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_log_effective_config_does_not_panic() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        builder.log_effective_config();
+    }
+
+    // --- ISSUE-2.1: H-1 fee recipient + gas-limit defaults ---
+
+    /// Zero fee recipient must be refused with a loud, actionable error.
+    #[test]
+    fn test_zero_fee_recipient_refused() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        // No config file → default fee recipient is [0u8; 20] → must fail
+        let result = builder.build_validator_store(None);
+        assert!(
+            matches!(result, Err(ConfigError::ZeroFeeRecipient)),
+            "expected ZeroFeeRecipient, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// When the TOML does not specify gas_limit the store must default to 30_000_000.
+    #[test]
+    fn test_default_gas_limit_30m() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+        // TOML with non-zero fee_recipient but no gas_limit field
+        let toml = format!("[defaults]\nfee_recipient = \"{fr_hex}\"\n", fr_hex = fr_hex);
+        std::fs::write(&config_path, toml).unwrap();
+
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let result = builder.build_validator_store(Some(&config_path));
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        let store = result.unwrap();
+        assert_eq!(store.default_gas_limit(), 30_000_000);
+    }
+
+    /// `build_validator_store` must wire `load_from_config` so TOML defaults are reflected.
+    #[test]
+    fn test_from_toml_paths_wired() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let fr_hex = "0x".to_string() + &hex::encode([0xbbu8; 20]);
+        let toml = format!(
+            "[defaults]\nfee_recipient = \"{fr_hex}\"\ngas_limit = 50000000\n",
+            fr_hex = fr_hex
+        );
+        std::fs::write(&config_path, toml).unwrap();
+
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let result = builder.build_validator_store(Some(&config_path));
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        let store = result.unwrap();
+        assert_eq!(store.default_fee_recipient(), [0xbbu8; 20]);
+        assert_eq!(store.default_gas_limit(), 50_000_000);
     }
 }

@@ -5,7 +5,7 @@
 //! and slashing protection.
 
 use lazy_static::lazy_static;
-use prometheus::{Gauge, HistogramOpts, HistogramVec, IntCounterVec, Opts};
+use prometheus::{Gauge, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts};
 
 use crate::REGISTRY;
 
@@ -158,6 +158,172 @@ lazy_static! {
         counter
     };
 
+    /// Gauge for attestation enabled state (1=enabled, 0=disabled).
+    pub static ref RVC_ATTESTING_ENABLED: Gauge = {
+        let opts = Opts::new(
+            "rvc_attesting_enabled",
+            "Whether attestation duties are enabled (1=enabled, 0=disabled)"
+        );
+        let gauge = Gauge::with_opts(opts)
+            .expect("Failed to create rvc_attesting_enabled metric");
+        REGISTRY.register(Box::new(gauge.clone()))
+            .expect("Failed to register rvc_attesting_enabled metric");
+        gauge
+    };
+
+    /// Counter for slashed validators detected.
+    pub static ref RVC_VALIDATORS_SLASHED_TOTAL: IntCounter = {
+        let opts = Opts::new(
+            "rvc_validators_slashed_total",
+            "Total number of slashed validators detected"
+        );
+        let counter = IntCounter::with_opts(opts)
+            .expect("Failed to create rvc_validators_slashed_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_validators_slashed_total metric");
+        counter
+    };
+
+    /// Counter for circuit breaker trip events.
+    pub static ref RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL: IntCounter = {
+        let counter = IntCounter::new(
+            "rvc_builder_circuit_breaker_trips_total",
+            "Total number of times the builder circuit breaker has tripped"
+        ).expect("Failed to create rvc_builder_circuit_breaker_trips_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_builder_circuit_breaker_trips_total metric");
+        counter
+    };
+
+    /// Gauge for current consecutive builder misses.
+    pub static ref RVC_BUILDER_CONSECUTIVE_MISSES: IntGauge = {
+        let gauge = IntGauge::new(
+            "rvc_builder_consecutive_misses",
+            "Current number of consecutive builder misses"
+        ).expect("Failed to create rvc_builder_consecutive_misses metric");
+        REGISTRY.register(Box::new(gauge.clone()))
+            .expect("Failed to register rvc_builder_consecutive_misses metric");
+        gauge
+    };
+
+    /// Gauge for current epoch builder misses.
+    pub static ref RVC_BUILDER_EPOCH_MISSES: IntGauge = {
+        let gauge = IntGauge::new(
+            "rvc_builder_epoch_misses",
+            "Current number of builder misses in the current epoch"
+        ).expect("Failed to create rvc_builder_epoch_misses metric");
+        REGISTRY.register(Box::new(gauge.clone()))
+            .expect("Failed to register rvc_builder_epoch_misses metric");
+        gauge
+    };
+
+    /// Counter for successful monitoring pushes.
+    pub static ref RVC_MONITORING_PUSH_SUCCESS_TOTAL: IntCounter = {
+        let counter = IntCounter::new(
+            "rvc_monitoring_push_success_total",
+            "Total number of successful monitoring metric pushes"
+        ).expect("Failed to create rvc_monitoring_push_success_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_monitoring_push_success_total metric");
+        counter
+    };
+
+    /// Gauge for proposer BN pool health score.
+    /// Labels: endpoint
+    pub static ref RVC_PROPOSER_BN_HEALTH_SCORE: prometheus::GaugeVec = {
+        let opts = Opts::new(
+            "rvc_proposer_bn_health_score",
+            "Health score of proposer beacon nodes"
+        ).const_label("pool", "proposer");
+        let gauge = prometheus::GaugeVec::new(opts, &["endpoint"])
+            .expect("Failed to create rvc_proposer_bn_health_score metric");
+        REGISTRY.register(Box::new(gauge.clone()))
+            .expect("Failed to register rvc_proposer_bn_health_score metric");
+        gauge
+    };
+
+    /// Histogram for proposer BN latency in milliseconds.
+    /// Labels: endpoint
+    pub static ref RVC_PROPOSER_BN_LATENCY_MS: HistogramVec = {
+        let opts = HistogramOpts::new(
+            "rvc_proposer_bn_latency_ms",
+            "Latency of proposer beacon node requests in milliseconds"
+        ).buckets(vec![5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0])
+        .const_label("pool", "proposer");
+        let histogram = HistogramVec::new(opts, &["endpoint"])
+            .expect("Failed to create rvc_proposer_bn_latency_ms metric");
+        REGISTRY.register(Box::new(histogram.clone()))
+            .expect("Failed to register rvc_proposer_bn_latency_ms metric");
+        histogram
+    };
+
+    /// Counter for proposer config URL refresh successes.
+    pub static ref RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL: IntCounter = {
+        let counter = IntCounter::new(
+            "rvc_proposer_config_refresh_success_total",
+            "Total number of successful proposer config URL refreshes"
+        ).expect("Failed to create rvc_proposer_config_refresh_success_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_proposer_config_refresh_success_total metric");
+        counter
+    };
+
+    /// Counter for proposer config URL refresh failures.
+    pub static ref RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL: IntCounter = {
+        let counter = IntCounter::new(
+            "rvc_proposer_config_refresh_failures_total",
+            "Total number of failed proposer config URL refreshes"
+        ).expect("Failed to create rvc_proposer_config_refresh_failures_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_proposer_config_refresh_failures_total metric");
+        counter
+    };
+
+    /// Counter for failed monitoring pushes.
+    pub static ref RVC_MONITORING_PUSH_FAILURES_TOTAL: IntCounter = {
+        let counter = IntCounter::new(
+            "rvc_monitoring_push_failures_total",
+            "Total number of failed monitoring metric pushes"
+        ).expect("Failed to create rvc_monitoring_push_failures_total metric");
+        REGISTRY.register(Box::new(counter.clone()))
+            .expect("Failed to register rvc_monitoring_push_failures_total metric");
+        counter
+    };
+
+    /// Gauge for per-BN health tier (1=Synced, 2=SmallLag, 3=LargeLag, 4=Unsynced).
+    /// Labels: endpoint
+    pub static ref RVC_BN_HEALTH_TIER: prometheus::IntGaugeVec = {
+        let opts = Opts::new(
+            "rvc_bn_health_tier",
+            "Health tier of each beacon node (1=synced, 2=small-lag, 3=large-lag, 4=unsynced)"
+        );
+        let gauge = prometheus::IntGaugeVec::new(opts, &["endpoint"])
+            .expect("Failed to create rvc_bn_health_tier metric");
+        REGISTRY.register(Box::new(gauge.clone()))
+            .expect("Failed to register rvc_bn_health_tier metric");
+        gauge
+    };
+
+    /// Histogram for slashing-DB transaction hold duration in milliseconds.
+    ///
+    /// Measures the wall-clock time from immediately before `stage_attestation` /
+    /// `stage_block` until the corresponding `commit()` or `discard()` call.
+    /// A high p99 indicates SQLite write latency under load.
+    ///
+    /// Labels: `kind` — either `"attestation"` or `"block"`.
+    /// Buckets: 1 ms … 5 s (11 buckets).
+    pub static ref RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS: HistogramVec = {
+        let opts = HistogramOpts::new(
+            "rvc_signer_slashing_tx_hold_duration_ms",
+            "Duration (ms) that the slashing-DB transaction is held per stage→commit/discard cycle"
+        ).buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0]);
+        let histogram = HistogramVec::new(opts, &["kind"])
+            .expect("Failed to create rvc_signer_slashing_tx_hold_duration_ms metric");
+        REGISTRY.register(Box::new(histogram.clone()))
+            .expect("Failed to register rvc_signer_slashing_tx_hold_duration_ms metric");
+        histogram
+    };
+
 }
 
 /// Initializes all core metrics by accessing the lazy_static variables.
@@ -174,6 +340,19 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS);
     lazy_static::initialize(&RVC_SLASHING_DB_PRUNE_TOTAL);
     lazy_static::initialize(&RVC_DUTY_REORG_DETECTED_TOTAL);
+    lazy_static::initialize(&RVC_ATTESTING_ENABLED);
+    lazy_static::initialize(&RVC_VALIDATORS_SLASHED_TOTAL);
+    lazy_static::initialize(&RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL);
+    lazy_static::initialize(&RVC_BUILDER_CONSECUTIVE_MISSES);
+    lazy_static::initialize(&RVC_BUILDER_EPOCH_MISSES);
+    lazy_static::initialize(&RVC_MONITORING_PUSH_SUCCESS_TOTAL);
+    lazy_static::initialize(&RVC_MONITORING_PUSH_FAILURES_TOTAL);
+    lazy_static::initialize(&RVC_PROPOSER_BN_HEALTH_SCORE);
+    lazy_static::initialize(&RVC_PROPOSER_BN_LATENCY_MS);
+    lazy_static::initialize(&RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL);
+    lazy_static::initialize(&RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL);
+    lazy_static::initialize(&RVC_BN_HEALTH_TIER);
+    lazy_static::initialize(&RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS);
 }
 
 /// Attestation status label values.
@@ -198,6 +377,12 @@ pub mod orchestrator_result {
 
 /// Slashing DB prune type label values.
 pub mod prune_type {
+    pub const ATTESTATION: &str = "attestation";
+    pub const BLOCK: &str = "block";
+}
+
+/// `kind` label values for `rvc_signer_slashing_tx_hold_duration_ms`.
+pub mod tx_hold_kind {
     pub const ATTESTATION: &str = "attestation";
     pub const BLOCK: &str = "block";
 }
@@ -291,5 +476,28 @@ mod tests {
             metric_names.contains(&"rvc_slashing_protection_checks_total"),
             "rvc_slashing_protection_checks_total should be registered"
         );
+    }
+
+    #[test]
+    fn test_circuit_breaker_trips_total_increments() {
+        RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.inc();
+        let value = RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.get();
+        assert!(value >= 1, "Circuit breaker trips counter should be at least 1 after increment");
+    }
+
+    #[test]
+    fn test_builder_consecutive_misses_gauge() {
+        RVC_BUILDER_CONSECUTIVE_MISSES.set(3);
+        assert_eq!(RVC_BUILDER_CONSECUTIVE_MISSES.get(), 3);
+        RVC_BUILDER_CONSECUTIVE_MISSES.set(0);
+        assert_eq!(RVC_BUILDER_CONSECUTIVE_MISSES.get(), 0);
+    }
+
+    #[test]
+    fn test_builder_epoch_misses_gauge() {
+        RVC_BUILDER_EPOCH_MISSES.set(5);
+        assert_eq!(RVC_BUILDER_EPOCH_MISSES.get(), 5);
+        RVC_BUILDER_EPOCH_MISSES.set(0);
+        assert_eq!(RVC_BUILDER_EPOCH_MISSES.get(), 0);
     }
 }

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use bn_manager::{
     BeaconError, BeaconNodeClient, ProposerPreparation, SignedValidatorRegistration,
@@ -34,6 +34,8 @@ pub struct BuilderService {
     validator_store: Arc<ValidatorStore>,
     genesis_fork_version: [u8; 4],
     cache: tokio::sync::RwLock<HashMap<[u8; 48], CachedRegistration>>,
+    registration_batch_size: usize,
+    registration_batch_delay_ms: u64,
 }
 
 impl BuilderService {
@@ -43,12 +45,25 @@ impl BuilderService {
         validator_store: Arc<ValidatorStore>,
         genesis_fork_version: [u8; 4],
     ) -> Self {
+        Self::with_batching(signer, bn, validator_store, genesis_fork_version, 0, 0)
+    }
+
+    pub fn with_batching(
+        signer: Arc<dyn ValidatorSigner>,
+        bn: Arc<dyn BeaconNodeClient>,
+        validator_store: Arc<ValidatorStore>,
+        genesis_fork_version: [u8; 4],
+        registration_batch_size: usize,
+        registration_batch_delay_ms: u64,
+    ) -> Self {
         Self {
             signer,
             bn,
             validator_store,
             genesis_fork_version,
             cache: tokio::sync::RwLock::new(HashMap::new()),
+            registration_batch_size,
+            registration_batch_delay_ms,
         }
     }
 
@@ -132,14 +147,75 @@ impl BuilderService {
             return Ok(());
         }
 
-        tracing::Span::current().record("rvc.builder.batch_size", registrations.len());
-        debug!(count = registrations.len(), "submitting builder registrations");
-        self.bn.register_validators(&registrations).await?;
+        let total_count = registrations.len();
+        tracing::Span::current().record("rvc.builder.batch_size", total_count);
 
-        // Update cache after successful submission
+        // Batch size 0 means send all at once (legacy behavior)
+        let effective_batch_size = if self.registration_batch_size == 0 {
+            total_count
+        } else {
+            self.registration_batch_size
+        };
+
+        let mut successful_registrations = Vec::new();
+        let mut batch_failures = 0u64;
+        let chunks: Vec<&[SignedValidatorRegistration]> =
+            registrations.chunks(effective_batch_size).collect();
+        let num_batches = chunks.len();
+
+        debug!(
+            total_count = total_count,
+            batch_size = effective_batch_size,
+            num_batches = num_batches,
+            "submitting builder registrations in batches"
+        );
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            if i > 0 && self.registration_batch_delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    self.registration_batch_delay_ms,
+                ))
+                .await;
+            }
+
+            let start = Instant::now();
+            match self.bn.register_validators(chunk).await {
+                Ok(()) => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    debug!(
+                        batch = i + 1,
+                        of = num_batches,
+                        size = chunk.len(),
+                        duration_ms = duration_ms,
+                        "registration batch sent"
+                    );
+                    successful_registrations.extend_from_slice(chunk);
+                }
+                Err(e) => {
+                    batch_failures += 1;
+                    warn!(
+                        batch = i + 1,
+                        of = num_batches,
+                        size = chunk.len(),
+                        error = %e,
+                        "registration batch failed, continuing with remaining batches"
+                    );
+                    // Don't abort — continue with remaining batches
+                }
+            }
+        }
+
+        info!(
+            total = total_count,
+            successful = successful_registrations.len(),
+            batch_failures = batch_failures,
+            "registration batching complete"
+        );
+
+        // Update cache for successfully submitted registrations
         {
             let mut cache = self.cache.write().await;
-            for reg in &registrations {
+            for reg in &successful_registrations {
                 cache.insert(
                     reg.message.pubkey,
                     CachedRegistration {
@@ -178,8 +254,17 @@ impl BuilderService {
             return Ok(());
         }
 
-        debug!(count = preparations.len(), "submitting proposer preparations");
-        self.bn.prepare_beacon_proposer(&preparations).await?;
+        let count = preparations.len();
+        debug!(count = count, "submitting proposer preparations");
+        match self.bn.prepare_beacon_proposer(&preparations).await {
+            Ok(()) => {
+                info!(count = count, "proposer preparation sent");
+            }
+            Err(e) => {
+                warn!(error = %e, "proposer preparation failure");
+                return Err(e.into());
+            }
+        }
 
         Ok(())
     }
@@ -193,7 +278,7 @@ impl BuilderService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use parking_lot::Mutex;
 
     use async_trait::async_trait;
     use bn_manager::{
@@ -219,6 +304,8 @@ mod tests {
         prepare_calls: Mutex<Vec<Vec<ProposerPreparation>>>,
         fail_register: bool,
         fail_prepare: bool,
+        /// Fail only on these 0-based call indices (e.g. [1] fails the second call).
+        fail_register_on_calls: Vec<usize>,
     }
 
     impl MockBn {
@@ -228,6 +315,7 @@ mod tests {
                 prepare_calls: Mutex::new(Vec::new()),
                 fail_register: false,
                 fail_prepare: false,
+                fail_register_on_calls: Vec::new(),
             }
         }
 
@@ -238,6 +326,11 @@ mod tests {
 
         fn with_prepare_error(mut self) -> Self {
             self.fail_prepare = true;
+            self
+        }
+
+        fn with_register_error_on_calls(mut self, indices: Vec<usize>) -> Self {
+            self.fail_register_on_calls = indices;
             self
         }
     }
@@ -352,7 +445,7 @@ mod tests {
             if self.fail_prepare {
                 return Err(BeaconError::HttpError("mock prepare failure".into()));
             }
-            self.prepare_calls.lock().unwrap().push(preparations.to_vec());
+            self.prepare_calls.lock().push(preparations.to_vec());
             Ok(())
         }
         async fn submit_beacon_committee_subscriptions(
@@ -365,10 +458,13 @@ mod tests {
             &self,
             registrations: &[SignedValidatorRegistration],
         ) -> Result<(), BeaconError> {
-            if self.fail_register {
+            let call_idx = self.register_calls.lock().len();
+            if self.fail_register || self.fail_register_on_calls.contains(&call_idx) {
+                // Still record the call so we can count it
+                self.register_calls.lock().push(registrations.to_vec());
                 return Err(BeaconError::HttpError("mock register failure".into()));
             }
-            self.register_calls.lock().unwrap().push(registrations.to_vec());
+            self.register_calls.lock().push(registrations.to_vec());
             Ok(())
         }
         async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
@@ -482,7 +578,7 @@ mod tests {
             if self.fail_sign {
                 return Err(SignerError::KeyNotFound("mock sign failure".into()));
             }
-            self.sign_calls.lock().unwrap().push(pubkey.to_bytes());
+            self.sign_calls.lock().push(pubkey.to_bytes());
             Ok(vec![0xaa; 96])
         }
         async fn sign_sync_committee_selection_proof(
@@ -542,6 +638,23 @@ mod tests {
         )
     }
 
+    fn build_service_with_batching(
+        signer: Arc<MockSigner>,
+        bn: Arc<MockBn>,
+        store: Arc<ValidatorStore>,
+        batch_size: usize,
+        batch_delay_ms: u64,
+    ) -> BuilderService {
+        BuilderService::with_batching(
+            signer,
+            bn,
+            store,
+            [0x00, 0x00, 0x00, 0x00],
+            batch_size,
+            batch_delay_ms,
+        )
+    }
+
     // --- register_validators tests ---
 
     #[tokio::test]
@@ -554,7 +667,7 @@ mod tests {
         assert!(result.is_ok());
 
         let bn = service.bn.as_ref() as *const dyn BeaconNodeClient as *const MockBn;
-        let calls = unsafe { &*bn }.register_calls.lock().unwrap();
+        let calls = unsafe { &*bn }.register_calls.lock();
         assert!(calls.is_empty());
     }
 
@@ -589,7 +702,7 @@ mod tests {
         let result = service.register_validators().await;
         assert!(result.is_ok());
 
-        let calls = bn.register_calls.lock().unwrap();
+        let calls = bn.register_calls.lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 1);
         assert_eq!(calls[0][0].message.pubkey, pk1);
@@ -597,7 +710,7 @@ mod tests {
         assert_eq!(calls[0][0].message.gas_limit, 35_000_000);
         assert_eq!(calls[0][0].signature, vec![0xaa; 96]);
 
-        let sign_calls = signer.sign_calls.lock().unwrap();
+        let sign_calls = signer.sign_calls.lock();
         assert_eq!(sign_calls.len(), 1);
     }
 
@@ -618,7 +731,7 @@ mod tests {
         let result = service.register_validators().await;
         assert!(result.is_ok());
 
-        let calls = bn.register_calls.lock().unwrap();
+        let calls = bn.register_calls.lock();
         assert_eq!(calls[0][0].message.fee_recipient, default_fr);
         assert_eq!(calls[0][0].message.gas_limit, 25_000_000);
     }
@@ -642,7 +755,7 @@ mod tests {
         let result = service.register_validators().await;
         assert!(result.is_ok());
 
-        let calls = bn.register_calls.lock().unwrap();
+        let calls = bn.register_calls.lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 2);
 
@@ -653,7 +766,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_register_validators_beacon_error_propagates() {
+    async fn test_register_validators_beacon_error_continues() {
         let pk = gen_pubkey_bytes();
         let store = test_store_with_builder_validators(&[(pk, true, None, None)]);
 
@@ -661,9 +774,13 @@ mod tests {
         let signer = Arc::new(MockSigner::new());
         let service = BuilderService::new(signer, bn, Arc::new(store), [0x00, 0x00, 0x00, 0x00]);
 
+        // With batching, failed batches are logged but don't abort — returns Ok
         let result = service.register_validators().await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("beacon node error"));
+        assert!(result.is_ok());
+
+        // Cache should not be updated for failed registrations
+        let cache = service.cache.read().await;
+        assert!(cache.is_empty());
     }
 
     #[tokio::test]
@@ -682,7 +799,7 @@ mod tests {
         assert!(result.is_ok());
 
         // No registrations submitted since signing failed
-        let calls = bn.register_calls.lock().unwrap();
+        let calls = bn.register_calls.lock();
         assert!(calls.is_empty());
     }
 
@@ -700,12 +817,12 @@ mod tests {
         // First call should register
         let result = service.register_validators().await;
         assert!(result.is_ok());
-        assert_eq!(bn.register_calls.lock().unwrap().len(), 1);
+        assert_eq!(bn.register_calls.lock().len(), 1);
 
         // Second call should skip (cached)
         let result = service.register_validators().await;
         assert!(result.is_ok());
-        assert_eq!(bn.register_calls.lock().unwrap().len(), 1); // Still 1, no new call
+        assert_eq!(bn.register_calls.lock().len(), 1); // Still 1, no new call
     }
 
     #[tokio::test]
@@ -728,7 +845,7 @@ mod tests {
 
         // First registration
         service.register_validators().await.unwrap();
-        assert_eq!(bn.register_calls.lock().unwrap().len(), 1);
+        assert_eq!(bn.register_calls.lock().len(), 1);
 
         // Change fee_recipient
         store.update_config(
@@ -741,7 +858,7 @@ mod tests {
 
         // Should re-register
         service.register_validators().await.unwrap();
-        let calls = bn.register_calls.lock().unwrap();
+        let calls = bn.register_calls.lock();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1][0].message.fee_recipient, fr2);
     }
@@ -764,7 +881,7 @@ mod tests {
             BuilderService::new(signer, bn.clone(), store.clone(), [0x00, 0x00, 0x00, 0x00]);
 
         service.register_validators().await.unwrap();
-        assert_eq!(bn.register_calls.lock().unwrap().len(), 1);
+        assert_eq!(bn.register_calls.lock().len(), 1);
 
         // Change gas_limit
         store.update_config(
@@ -776,7 +893,7 @@ mod tests {
         );
 
         service.register_validators().await.unwrap();
-        let calls = bn.register_calls.lock().unwrap();
+        let calls = bn.register_calls.lock();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1][0].message.gas_limit, 50_000_000);
     }
@@ -795,7 +912,7 @@ mod tests {
         service.register_validators().await.unwrap();
         let after = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-        let calls = bn.register_calls.lock().unwrap();
+        let calls = bn.register_calls.lock();
         let timestamp = calls[0][0].message.timestamp;
         assert!(timestamp >= before);
         assert!(timestamp <= after);
@@ -826,7 +943,7 @@ mod tests {
         let result = service.prepare_proposers(&indices).await;
         assert!(result.is_ok());
 
-        let calls = bn.prepare_calls.lock().unwrap();
+        let calls = bn.prepare_calls.lock();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].len(), 2);
 
@@ -854,7 +971,7 @@ mod tests {
 
         service.prepare_proposers(&indices).await.unwrap();
 
-        let calls = bn.prepare_calls.lock().unwrap();
+        let calls = bn.prepare_calls.lock();
         let expected_fr = format!("0x{}", hex::encode(default_fr));
         assert_eq!(calls[0][0].fee_recipient, expected_fr);
         assert_eq!(calls[0][0].validator_index, "42");
@@ -880,7 +997,7 @@ mod tests {
 
         service.prepare_proposers(&indices).await.unwrap();
 
-        let calls = bn.prepare_calls.lock().unwrap();
+        let calls = bn.prepare_calls.lock();
         assert_eq!(calls[0].len(), 1);
         assert_eq!(calls[0][0].validator_index, "100");
     }
@@ -898,7 +1015,7 @@ mod tests {
         let indices = HashMap::new();
         service.prepare_proposers(&indices).await.unwrap();
 
-        let calls = bn.prepare_calls.lock().unwrap();
+        let calls = bn.prepare_calls.lock();
         assert!(calls.is_empty());
     }
 
@@ -954,5 +1071,101 @@ mod tests {
             Arc::new(store),
             [0x01, 0x00, 0x00, 0x00],
         );
+    }
+
+    // --- Batching tests ---
+
+    #[tokio::test]
+    async fn test_batching_splits_into_correct_batch_count() {
+        // 5 validators with batch_size=2 should produce 3 batches (2+2+1)
+        let pks: Vec<[u8; 48]> = (0..5).map(|_| gen_pubkey_bytes()).collect();
+        let validators: Vec<ValidatorEntry> =
+            pks.iter().map(|pk| (*pk, true, None, None)).collect();
+        let store = Arc::new(test_store_with_builder_validators(&validators));
+
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let service = build_service_with_batching(signer, bn.clone(), store, 2, 0);
+
+        service.register_validators().await.unwrap();
+
+        let calls = bn.register_calls.lock();
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].len(), 2);
+        assert_eq!(calls[1].len(), 2);
+        assert_eq!(calls[2].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_batching_zero_sends_all_at_once() {
+        // batch_size=0 (legacy) should submit all in a single call
+        let pks: Vec<[u8; 48]> = (0..5).map(|_| gen_pubkey_bytes()).collect();
+        let validators: Vec<ValidatorEntry> =
+            pks.iter().map(|pk| (*pk, true, None, None)).collect();
+        let store = Arc::new(test_store_with_builder_validators(&validators));
+
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let service = build_service_with_batching(signer, bn.clone(), store, 0, 0);
+
+        service.register_validators().await.unwrap();
+
+        let calls = bn.register_calls.lock();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_batching_partial_failure_continues_remaining() {
+        // Fail batch index 1 (second batch). Batches 0 and 2 should succeed.
+        let pks: Vec<[u8; 48]> = (0..5).map(|_| gen_pubkey_bytes()).collect();
+        let validators: Vec<ValidatorEntry> =
+            pks.iter().map(|pk| (*pk, true, None, None)).collect();
+        let store = Arc::new(test_store_with_builder_validators(&validators));
+
+        let bn = Arc::new(MockBn::new().with_register_error_on_calls(vec![1]));
+        let signer = Arc::new(MockSigner::new());
+        let service = build_service_with_batching(signer, bn.clone(), store, 2, 0);
+
+        let result = service.register_validators().await;
+        assert!(result.is_ok());
+
+        // All 3 batches should have been attempted
+        {
+            let calls = bn.register_calls.lock();
+            assert_eq!(calls.len(), 3);
+        }
+
+        // Cache should only contain validators from successful batches (0 and 2)
+        let cache = service.cache.read().await;
+        assert_eq!(cache.len(), 3); // 2 from batch 0 + 1 from batch 2
+    }
+
+    #[tokio::test]
+    async fn test_batching_with_batching_constructor() {
+        let store = ValidatorStore::new(test_fee_recipient(0xff), 30_000_000);
+        let service = BuilderService::with_batching(
+            Arc::new(MockSigner::new()),
+            Arc::new(MockBn::new()),
+            Arc::new(store),
+            [0x01, 0x00, 0x00, 0x00],
+            100,
+            50,
+        );
+        assert_eq!(service.registration_batch_size, 100);
+        assert_eq!(service.registration_batch_delay_ms, 50);
+    }
+
+    #[tokio::test]
+    async fn test_batching_new_defaults_to_zero() {
+        let store = ValidatorStore::new(test_fee_recipient(0xff), 30_000_000);
+        let service = BuilderService::new(
+            Arc::new(MockSigner::new()),
+            Arc::new(MockBn::new()),
+            Arc::new(store),
+            [0x01, 0x00, 0x00, 0x00],
+        );
+        assert_eq!(service.registration_batch_size, 0);
+        assert_eq!(service.registration_batch_delay_ms, 0);
     }
 }

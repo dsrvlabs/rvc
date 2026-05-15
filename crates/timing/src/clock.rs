@@ -36,6 +36,12 @@ impl SystemSlotClock {
         if slot_duration.as_secs() < 1 {
             return Err(TimingError::InvalidSlotDuration);
         }
+        tracing::debug!(
+            genesis_time,
+            slot_duration_secs = slot_duration.as_secs(),
+            slots_per_epoch,
+            "clock created"
+        );
         Ok(Self { genesis_time, slot_duration, slots_per_epoch })
     }
 
@@ -66,7 +72,12 @@ impl SlotClock for SystemSlotClock {
             });
         }
         let seconds_since_genesis = current_time - self.genesis_time;
-        Ok(seconds_since_genesis / self.slot_duration.as_secs())
+        let slot_duration_secs = self.slot_duration.as_secs();
+        let slot = seconds_since_genesis / slot_duration_secs;
+        let epoch = slot / self.slots_per_epoch;
+        let time_into_slot_ms = (seconds_since_genesis % slot_duration_secs) * 1000;
+        tracing::trace!(slot, epoch, time_into_slot_ms, "slot transition");
+        Ok(slot)
     }
 
     fn slot_start_time(&self, slot: Slot) -> u64 {
@@ -78,7 +89,9 @@ impl SlotClock for SystemSlotClock {
     }
 
     fn attestation_time(&self, slot: Slot) -> u64 {
-        self.slot_start_time(slot) + (self.slot_duration.as_secs() / 3)
+        let slot_start_ms = self.slot_start_time(slot) * 1000;
+        let slot_duration_ms = self.slot_duration.as_millis() as u64;
+        (slot_start_ms + (slot_duration_ms / 3)) / 1000
     }
 
     fn time_until_slot(&self, slot: Slot) -> Result<Duration, TimingError> {
@@ -93,14 +106,22 @@ impl SlotClock for SystemSlotClock {
     }
 
     fn time_until_attestation(&self, slot: Slot) -> Result<Duration, TimingError> {
-        let current_time = self.current_unix_time();
-        let attestation_time = self.attestation_time(slot);
+        // Use millisecond arithmetic to preserve sub-second precision for
+        // non-standard slot durations (e.g. 6 s testnets where 1/3 = 2.000 s
+        // exactly, but 7 s slots would be truncated from 2.333 s to 2 s without
+        // this fix — firing up to ~333 ms early).
+        let current_time_ms =
+            SystemTime::now().duration_since(UNIX_EPOCH).expect("time went backwards").as_millis()
+                as u64;
+        let slot_start_ms = self.slot_start_time(slot) * 1000;
+        let slot_duration_ms = self.slot_duration.as_millis() as u64;
+        let attestation_time_ms = slot_start_ms + (slot_duration_ms / 3);
 
-        if current_time >= attestation_time {
+        if current_time_ms >= attestation_time_ms {
             return Ok(Duration::ZERO);
         }
 
-        Ok(Duration::from_secs(attestation_time - current_time))
+        Ok(Duration::from_millis(attestation_time_ms - current_time_ms))
     }
 
     fn current_time_secs(&self) -> u64 {
@@ -181,7 +202,9 @@ impl SlotClock for MockSlotClock {
     }
 
     fn attestation_time(&self, slot: Slot) -> u64 {
-        self.slot_start_time(slot) + (self.slot_duration.as_secs() / 3)
+        let slot_start_ms = self.slot_start_time(slot) * 1000;
+        let slot_duration_ms = self.slot_duration.as_millis() as u64;
+        (slot_start_ms + (slot_duration_ms / 3)) / 1000
     }
 
     fn time_until_slot(&self, slot: Slot) -> Result<Duration, TimingError> {
@@ -196,14 +219,18 @@ impl SlotClock for MockSlotClock {
     }
 
     fn time_until_attestation(&self, slot: Slot) -> Result<Duration, TimingError> {
-        let current_time = self.get_current_time();
-        let attestation_time = self.attestation_time(slot);
+        // Mirror the millisecond arithmetic used in SystemSlotClock so behaviour
+        // is consistent regardless of which implementation is active.
+        let current_time_ms = self.get_current_time() * 1000;
+        let slot_start_ms = self.slot_start_time(slot) * 1000;
+        let slot_duration_ms = self.slot_duration.as_millis() as u64;
+        let attestation_time_ms = slot_start_ms + (slot_duration_ms / 3);
 
-        if current_time >= attestation_time {
+        if current_time_ms >= attestation_time_ms {
             return Ok(Duration::ZERO);
         }
 
-        Ok(Duration::from_secs(attestation_time - current_time))
+        Ok(Duration::from_millis(attestation_time_ms - current_time_ms))
     }
 
     fn current_time_secs(&self) -> u64 {

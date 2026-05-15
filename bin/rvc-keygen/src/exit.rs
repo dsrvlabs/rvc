@@ -93,10 +93,14 @@ mod tests {
         let public_key = secret_key.public_key();
         let password = b"test-password-123";
 
-        // Encrypt the key into a keystore (use Pbkdf2 for speed in tests)
-        let keystore =
-            Keystore::encrypt(&secret_key, password, "m/12381/3600/0/0/0", EncryptionKdf::Pbkdf2)
-                .unwrap();
+        // Encrypt the key into a keystore
+        let keystore = Keystore::encrypt(
+            &secret_key,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .unwrap();
 
         // Decrypt it back
         let recovered_key = keystore.decrypt(password).unwrap();
@@ -163,9 +167,13 @@ mod tests {
         let secret_key = SecretKey::generate();
         let password = b"test-password-123";
 
-        let keystore =
-            Keystore::encrypt(&secret_key, password, "m/12381/3600/0/0/0", EncryptionKdf::Pbkdf2)
-                .unwrap();
+        let keystore = Keystore::encrypt(
+            &secret_key,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .unwrap();
         let recovered_key = keystore.decrypt(password).unwrap();
 
         let exit = VoluntaryExit { epoch: 100, validator_index: 7 };
@@ -202,9 +210,13 @@ mod tests {
         let secret_key = SecretKey::generate();
         let password = b"test-password-123";
 
-        let keystore =
-            Keystore::encrypt(&secret_key, password, "m/12381/3600/0/0/0", EncryptionKdf::Pbkdf2)
-                .unwrap();
+        let keystore = Keystore::encrypt(
+            &secret_key,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .unwrap();
 
         // Write keystore to temp file
         let dir = tempfile::tempdir().unwrap();
@@ -272,9 +284,13 @@ mod tests {
         let secret_key = SecretKey::generate();
         let password = b"correct-password";
 
-        let keystore =
-            Keystore::encrypt(&secret_key, password, "m/12381/3600/0/0/0", EncryptionKdf::Pbkdf2)
-                .unwrap();
+        let keystore = Keystore::encrypt(
+            &secret_key,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .unwrap();
 
         let result = keystore.decrypt(b"wrong-password!!");
         assert!(result.is_err());

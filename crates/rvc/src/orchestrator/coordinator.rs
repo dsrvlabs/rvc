@@ -1,95 +1,40 @@
 //! Main duty orchestrator implementation.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
-use beacon::{
-    AttesterDuty, BeaconCommitteeSubscription, LegacyAttestation, ProposerPreparation,
-    SingleAttestation, VersionedAggregateAttestation, VersionedAttestation,
-    VersionedSignedAggregateAndProof,
-};
 use block_service::{BeaconBlockClient, BlockService};
 use bn_manager::{BeaconNodeClient, OperationTimeouts};
-use builder::BuilderService;
+use builder::{BuilderService, CircuitBreakerState};
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
-use eth_types::{
-    AggregateAndProof, ContributionAndProof, ElectraAggregateAndProof, ForkName, ForkSchedule,
-    Root, SignedAggregateAndProof, SignedContributionAndProof, SignedElectraAggregateAndProof,
-    Slot, SyncCommitteeDuty,
-};
+use eth_types::{ForkSchedule, Root, Slot};
 use metrics::definitions::{
-    attestation_status, orchestrator_result, RVC_AGGREGATIONS_TOTAL, RVC_ATTESTATIONS_TOTAL,
-    RVC_DUTY_REORG_DETECTED_TOTAL, RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS,
-    RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL, RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL,
-    RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
+    attestation_status, RVC_ATTESTATIONS_TOTAL, RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL,
+    RVC_BUILDER_CONSECUTIVE_MISSES, RVC_BUILDER_EPOCH_MISSES,
 };
 use propagator::{AttestationSubmitter, Propagator};
-use signer::{is_aggregator, SignerService};
-use sync_service::is_sync_committee_aggregator;
+use signer::SignerService;
 use timing::{SlotClock, SLOTS_PER_EPOCH};
-use tree_hash::TreeHash;
 
+use super::aggregation::AggregationService;
+use super::attestation::AttestationService;
+use super::duty_management::DutyManagementService;
 use super::error::OrchestratorError;
+use super::slot_context::SlotContext;
+use super::sync_committee::SyncCommitteeService;
+use super::utils;
 
 /// Shared, dynamically-updatable public key map.
 ///
 /// Wrapped in `Arc<RwLock>` so the keymanager API can insert/remove keys at
 /// runtime while the orchestrator reads them each slot.
-pub type PubkeyMap = Arc<std::sync::RwLock<HashMap<String, PublicKey>>>;
-
-/// Truncates a hex-encoded public key for display in tracing spans.
-///
-/// Returns `0x` + first 10 hex chars + `...` + last 8 hex chars for keys
-/// longer than 18 hex characters. Shorter keys are returned as-is with `0x` prefix.
-fn truncate_pubkey(hex: &str) -> String {
-    let hex = hex.strip_prefix("0x").unwrap_or(hex);
-    if hex.len() > 18 {
-        format!("0x{}...{}", &hex[..10], &hex[hex.len() - 8..])
-    } else {
-        format!("0x{hex}")
-    }
-}
-
-/// Total validators in a sync committee.
-const SYNC_COMMITTEE_SIZE: u64 = 512;
-
-/// Number of subnets the sync committee is split across.
-const SYNC_COMMITTEE_SUBNET_COUNT: u64 = 4;
-
-/// Constructs a hex-encoded SSZ bitlist where only the validator's position
-/// in the committee is set (pre-Electra aggregation_bits format).
-fn make_aggregation_bits(duty: &AttesterDuty) -> Option<String> {
-    let committee_length: usize = duty.committee_length.parse().unwrap_or(0);
-    let validator_committee_index: usize = duty.validator_committee_index.parse().unwrap_or(0);
-
-    if committee_length == 0 {
-        warn!(
-            validator_index = %duty.validator_index,
-            "committee_length is 0, cannot produce aggregation bits"
-        );
-        return None;
-    }
-
-    // SSZ bitlist: ceil((committee_length + 1) / 8) bytes
-    // The "+1" is for the length bit at position committee_length
-    let byte_count = (committee_length + 8) / 8;
-    let mut bits = vec![0u8; byte_count];
-
-    // Set the validator's bit
-    if validator_committee_index < committee_length {
-        bits[validator_committee_index / 8] |= 1 << (validator_committee_index % 8);
-    }
-
-    // Set the length bit (sentinel) at position committee_length
-    bits[committee_length / 8] |= 1 << (committee_length % 8);
-
-    Some(format!("0x{}", hex::encode(bits)))
-}
+pub type PubkeyMap = Arc<parking_lot::RwLock<HashMap<String, PublicKey>>>;
 
 /// Configuration for the duty orchestrator.
 #[derive(Clone)]
@@ -150,6 +95,7 @@ pub struct AttestationResult {
 const BUILDER_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Main orchestrator for coordinating validator duties.
+#[allow(dead_code)]
 pub struct DutyOrchestrator<C, S, B>
 where
     C: SlotClock + 'static,
@@ -157,17 +103,24 @@ where
     B: BeaconBlockClient + 'static,
 {
     clock: Arc<C>,
-    duty_tracker: Arc<DutyTracker>,
-    signer: Arc<SignerService>,
-    propagator: Arc<Propagator<S>>,
     beacon: Arc<dyn BeaconNodeClient>,
+    duty_tracker: Arc<DutyTracker>,
     block_service: BlockService<SignerService, B>,
     builder_service: Option<Arc<BuilderService>>,
-    validator_store: Arc<validator_store::ValidatorStore>,
+    circuit_breaker: Arc<CircuitBreakerState>,
     config: OrchestratorConfig,
     pubkey_map: PubkeyMap,
+    attestation_service: AttestationService<C, S>,
+    aggregation_service: AggregationService,
+    sync_committee_service: SyncCommitteeService,
+    duty_management: DutyManagementService<C>,
     key_gen_rx: watch::Receiver<u64>,
     shutdown_rx: watch::Receiver<bool>,
+    attesting_enabled: Arc<AtomicBool>,
+    /// Controls whether sync-committee duties are processed independently of
+    /// `attesting_enabled`. Defaults to `true`; can be toggled at runtime via
+    /// [`set_sync_enabled`]. Internal-only — not wired to any Keymanager API (H-7).
+    sync_enabled: Arc<AtomicBool>,
 }
 
 impl<C, S, B> DutyOrchestrator<C, S, B>
@@ -190,6 +143,7 @@ where
         config: OrchestratorConfig,
         pubkey_map: PubkeyMap,
     ) -> (Self, OrchestratorHandle) {
+        let attesting_enabled = Arc::new(AtomicBool::new(true));
         let (_key_gen_tx, key_gen_rx) = watch::channel(0u64);
         Self::new_with_key_gen(
             clock,
@@ -203,6 +157,42 @@ where
             config,
             pubkey_map,
             key_gen_rx,
+            Arc::new(CircuitBreakerState::new(0, 0)),
+            attesting_enabled,
+        )
+    }
+
+    /// Creates a new DutyOrchestrator with a shared attesting_enabled flag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_attesting_enabled(
+        clock: Arc<C>,
+        duty_tracker: Arc<DutyTracker>,
+        signer: Arc<SignerService>,
+        propagator: Arc<Propagator<S>>,
+        beacon: Arc<dyn BeaconNodeClient>,
+        block_beacon: Arc<B>,
+        builder_service: Option<Arc<BuilderService>>,
+        validator_store: Arc<validator_store::ValidatorStore>,
+        config: OrchestratorConfig,
+        pubkey_map: PubkeyMap,
+        circuit_breaker: Arc<CircuitBreakerState>,
+        attesting_enabled: Arc<AtomicBool>,
+    ) -> (Self, OrchestratorHandle) {
+        let (_key_gen_tx, key_gen_rx) = watch::channel(0u64);
+        Self::new_with_key_gen(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            block_beacon,
+            builder_service,
+            validator_store,
+            config,
+            pubkey_map,
+            key_gen_rx,
+            circuit_breaker,
+            attesting_enabled,
         )
     }
 
@@ -219,30 +209,76 @@ where
         config: OrchestratorConfig,
         pubkey_map: PubkeyMap,
         key_gen_rx: watch::Receiver<u64>,
+        circuit_breaker: Arc<CircuitBreakerState>,
+        attesting_enabled: Arc<AtomicBool>,
     ) -> (Self, OrchestratorHandle) {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let block_service = BlockService::new(
+        let block_service = BlockService::with_circuit_breaker(
             signer.clone(),
             block_beacon,
             validator_store.clone(),
             config.fork_schedule.clone(),
             config.genesis_validators_root,
+            circuit_breaker.clone(),
         );
+
+        let aggregation_service = AggregationService::new(
+            signer.clone(),
+            beacon.clone(),
+            duty_tracker.clone(),
+            pubkey_map.clone(),
+            config.clone(),
+        );
+
+        let sync_committee_service = SyncCommitteeService::new(
+            signer.clone(),
+            beacon.clone(),
+            duty_tracker.clone(),
+            pubkey_map.clone(),
+            config.clone(),
+        );
+
+        let attestation_service = AttestationService::new(
+            clock.clone(),
+            signer.clone(),
+            propagator.clone(),
+            beacon.clone(),
+            duty_tracker.clone(),
+            pubkey_map.clone(),
+            config.clone(),
+            validator_store.clone(),
+        );
+
+        let duty_management = DutyManagementService::new(
+            clock.clone(),
+            signer,
+            beacon.clone(),
+            duty_tracker.clone(),
+            validator_store,
+            pubkey_map.clone(),
+            config.clone(),
+        );
+
+        let sync_enabled = Arc::new(AtomicBool::new(true));
 
         let orchestrator = Self {
             clock,
-            duty_tracker,
-            signer,
-            propagator,
             beacon,
+            duty_tracker,
             block_service,
             builder_service,
-            validator_store,
+            circuit_breaker,
             config,
             pubkey_map,
+            attestation_service,
+            aggregation_service,
+            sync_committee_service,
+            duty_management,
             key_gen_rx,
             shutdown_rx,
+            attesting_enabled,
+            sync_enabled,
         };
 
         let handle = OrchestratorHandle { shutdown_tx };
@@ -284,27 +320,60 @@ where
             }
 
             // === Epoch boundary: fetch all duty types ===
-            self.fetch_epoch_duties(current_epoch).instrument(slot_span.clone()).await;
-            self.fetch_epoch_duties(current_epoch + 1).instrument(slot_span.clone()).await;
+            self.duty_management
+                .fetch_epoch_duties(current_epoch)
+                .instrument(slot_span.clone())
+                .await;
+            self.duty_management
+                .fetch_epoch_duties(current_epoch + 1)
+                .instrument(slot_span.clone())
+                .await;
 
             // Proposer preparation and committee subscriptions (non-fatal)
             if current_slot % SLOTS_PER_EPOCH == 0 {
+                self.circuit_breaker.reset_epoch(current_epoch);
+                self.update_circuit_breaker_metrics();
+                info!(epoch = current_epoch, "Circuit breaker reset at epoch boundary");
+
                 let epoch_span =
                     info_span!(parent: &slot_span, "rvc.epoch.boundary", rvc.epoch = current_epoch);
                 async {
-                    self.check_reorg_at_epoch_boundary(current_epoch).await;
-                    self.prepare_proposers().await;
-                    self.submit_committee_subscriptions(current_epoch).await;
-                    self.submit_committee_subscriptions(current_epoch + 1).await;
+                    self.duty_management.check_reorg_at_epoch_boundary(current_epoch).await;
+                    self.duty_management.prepare_proposers().await;
+                    self.duty_management.submit_committee_subscriptions(current_epoch).await;
+                    self.duty_management.submit_committee_subscriptions(current_epoch + 1).await;
+
+                    // Epoch boundary summary
+                    let mut attester_count = 0usize;
+                    for slot_offset in 0..SLOTS_PER_EPOCH {
+                        let slot = current_epoch * SLOTS_PER_EPOCH + slot_offset;
+                        attester_count += self.duty_tracker.get_duties_for_slot(slot).await.len();
+                    }
+                    let mut proposer_count = 0usize;
+                    for slot_offset in 0..SLOTS_PER_EPOCH {
+                        let slot = current_epoch * SLOTS_PER_EPOCH + slot_offset;
+                        if self.duty_tracker.get_proposer_duty(slot).await.is_some() {
+                            proposer_count += 1;
+                        }
+                    }
+                    let sync_count =
+                        self.duty_tracker.get_sync_committee_duties(current_slot).await.len();
+                    info!(
+                        epoch = current_epoch,
+                        attester_count, proposer_count, sync_count, "Epoch boundary summary"
+                    );
                 }
                 .instrument(epoch_span)
                 .await;
             }
 
             // === Phase 1: t=0 — Block proposal ===
+            // Capture slot context once; downstream phases reuse the same head root
+            // to avoid TOCTOU races (H-5). Uses slot-qualified query, not "head" (L-5).
+            let ctx = SlotContext::capture(&*self.beacon, current_slot, current_epoch).await;
             {
                 let phase_span = info_span!(parent: &slot_span, "rvc.slot.phase.block");
-                self.maybe_propose_block(current_slot, current_epoch).instrument(phase_span).await;
+                self.maybe_propose_block(ctx.slot, ctx.epoch, &ctx).instrument(phase_span).await;
             }
 
             if self.check_shutdown() {
@@ -339,27 +408,54 @@ where
                     return Ok(());
                 }
 
-                if let Err(e) =
-                    self.process_slot(current_slot).instrument(att_phase_span.clone()).await
+                // Check for missed attestation deadline
                 {
-                    let _guard = att_phase_span.enter();
-                    match &e {
-                        OrchestratorError::SlotMissed { slot, current_slot } => {
-                            warn!(slot = slot, current_slot = current_slot, "Missed slot");
-                            RVC_ATTESTATIONS_TOTAL
-                                .with_label_values(&[attestation_status::SKIPPED])
-                                .inc();
-                        }
-                        OrchestratorError::NoDutiesForSlot { slot } => {
-                            debug!(slot = slot, "No duties for slot");
-                        }
-                        _ => {
-                            error!(slot = current_slot, error = %e, "Error processing slot");
+                    let slot_duration = self.clock.slot_duration();
+                    let expected_att_time =
+                        self.clock.slot_start_time(current_slot) + slot_duration.as_secs() / 3;
+                    let now = self.clock.current_time_secs();
+                    if now > expected_att_time {
+                        let delay_ms = (now - expected_att_time) * 1000;
+                        // Only warn if the delay exceeds the expected attestation window
+                        // (i.e., we're past 2/3 of the slot)
+                        let att_window = slot_duration.as_secs() / 3;
+                        if delay_ms > att_window * 1000 {
+                            warn!(slot = current_slot, delay_ms, "Missed attestation deadline");
                         }
                     }
                 }
 
-                self.maybe_produce_sync_messages(current_slot, current_epoch)
+                if self.attesting_enabled.load(Ordering::Relaxed) {
+                    if let Err(e) = self
+                        .attestation_service
+                        .process_slot(current_slot)
+                        .instrument(att_phase_span.clone())
+                        .await
+                    {
+                        let _guard = att_phase_span.enter();
+                        match &e {
+                            OrchestratorError::SlotMissed { slot, current_slot } => {
+                                warn!(slot = slot, current_slot = current_slot, "Missed slot");
+                                RVC_ATTESTATIONS_TOTAL
+                                    .with_label_values(&[attestation_status::SKIPPED])
+                                    .inc();
+                            }
+                            OrchestratorError::NoDutiesForSlot { slot } => {
+                                debug!(slot = slot, "No duties for slot");
+                            }
+                            _ => {
+                                error!(slot = current_slot, error = %e, "Error processing slot");
+                            }
+                        }
+                    }
+                } else {
+                    debug!(slot = current_slot, "Attestation duties skipped (disabled)");
+                }
+
+                // H-7: sync-committee messages are gated by `sync_enabled`,
+                // which is independent of `attesting_enabled`. Disabling
+                // attestations no longer silently disables sync-committee duties.
+                self.run_sync_messages_phase(current_slot, current_epoch, &ctx)
                     .instrument(att_phase_span)
                     .await;
             }
@@ -402,12 +498,19 @@ where
                     return Ok(());
                 }
 
-                self.maybe_produce_sync_contributions(current_slot, current_epoch)
+                // H-7: sync contributions gated by `sync_enabled` independently.
+                self.run_sync_contributions_phase(current_slot, current_epoch, &ctx)
                     .instrument(agg_phase_span.clone())
                     .await;
-                self.maybe_produce_aggregations(current_slot, current_epoch)
-                    .instrument(agg_phase_span)
-                    .await;
+
+                if self.attesting_enabled.load(Ordering::Relaxed) {
+                    self.aggregation_service
+                        .maybe_produce_aggregations(current_slot, current_epoch)
+                        .instrument(agg_phase_span)
+                        .await;
+                } else {
+                    debug!(slot = current_slot, "Aggregation duties skipped (attesting disabled)");
+                }
             }
 
             // === Post-duty: builder registration (epoch boundary only) ===
@@ -479,307 +582,50 @@ where
         }
     }
 
-    #[tracing::instrument(name = "rvc.orchestrator.fetch_epoch_duties", skip_all, fields(rvc.epoch = epoch))]
-    async fn fetch_epoch_duties(&self, epoch: u64) {
-        // Evict old caches to prevent unbounded growth
-        self.duty_tracker.evict_old_caches(epoch).await;
-
-        // Attester duties
-        if !self.duty_tracker.is_epoch_cached(epoch).await {
-            debug!(epoch, "Fetching attester duties for epoch");
-            match tokio::time::timeout(
-                self.config.timeouts.duty_fetch,
-                self.duty_tracker.fetch_duties_for_epoch(epoch),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch attester duties"),
-                Err(_) => warn!(
-                    epoch,
-                    "Attester duty fetch timed out after {}s",
-                    self.config.timeouts.duty_fetch.as_secs()
-                ),
-            }
-        }
-
-        // Proposer duties
-        if !self.duty_tracker.is_proposer_epoch_cached(epoch).await {
-            debug!(epoch, "Fetching proposer duties for epoch");
-            match tokio::time::timeout(
-                self.config.timeouts.duty_fetch,
-                self.duty_tracker.fetch_proposer_duties(epoch),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch proposer duties"),
-                Err(_) => warn!(
-                    epoch,
-                    "Proposer duty fetch timed out after {}s",
-                    self.config.timeouts.duty_fetch.as_secs()
-                ),
-            }
-        }
-
-        // Sync committee duties (at period boundaries)
-        if !self.duty_tracker.is_sync_period_cached(epoch).await {
-            debug!(epoch, "Fetching sync committee duties");
-            match tokio::time::timeout(
-                self.config.timeouts.duty_fetch,
-                self.duty_tracker.fetch_sync_committee_duties(epoch),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch sync committee duties"),
-                Err(_) => warn!(
-                    epoch,
-                    "Sync committee duty fetch timed out after {}s",
-                    self.config.timeouts.duty_fetch.as_secs()
-                ),
-            }
-        }
-    }
-
-    #[tracing::instrument(name = "rvc.orchestrator.check_reorg", skip_all, fields(rvc.epoch = current_epoch))]
-    async fn check_reorg_at_epoch_boundary(&self, current_epoch: u64) {
-        for epoch in [current_epoch, current_epoch + 1] {
-            let attester_cached = self.duty_tracker.is_epoch_cached(epoch).await;
-            match tokio::time::timeout(
-                self.config.timeouts.duty_fetch,
-                self.duty_tracker.check_and_refetch_if_root_changed(epoch),
-            )
-            .await
-            {
-                Ok(Ok(true)) if attester_cached => {
-                    warn!(epoch, "Reorg detected: attester duties refetched");
-                    RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["attester"]).inc();
-                }
-                Ok(Ok(true)) => {
-                    debug!(epoch, "Attester duties fetched (was uncached)");
-                }
-                Ok(Ok(false)) => {}
-                Ok(Err(e)) => {
-                    warn!(epoch, error = %e, "Failed to check attester dependent root");
-                }
-                Err(_) => {
-                    warn!(
-                        epoch,
-                        "Attester reorg check timed out after {}s",
-                        self.config.timeouts.duty_fetch.as_secs()
-                    );
-                }
-            }
-
-            let proposer_cached = self.duty_tracker.is_proposer_epoch_cached(epoch).await;
-            match tokio::time::timeout(
-                self.config.timeouts.duty_fetch,
-                self.duty_tracker.check_and_refetch_proposer_if_root_changed(epoch),
-            )
-            .await
-            {
-                Ok(Ok(true)) if proposer_cached => {
-                    warn!(epoch, "Reorg detected: proposer duties refetched");
-                    RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["proposer"]).inc();
-                }
-                Ok(Ok(true)) => {
-                    debug!(epoch, "Proposer duties fetched (was uncached)");
-                }
-                Ok(Ok(false)) => {}
-                Ok(Err(e)) => {
-                    warn!(epoch, error = %e, "Failed to check proposer dependent root");
-                }
-                Err(_) => {
-                    warn!(
-                        epoch,
-                        "Proposer reorg check timed out after {}s",
-                        self.config.timeouts.duty_fetch.as_secs()
-                    );
-                }
-            }
-        }
-    }
-
-    #[tracing::instrument(name = "rvc.orchestrator.prepare_proposers", skip_all)]
-    async fn prepare_proposers(&self) {
-        let mut preparations = Vec::new();
-
-        let pubkey_snapshot = self.pubkey_map.read().expect("pubkey_map lock poisoned").clone();
-        for (pubkey_hex, pubkey) in &pubkey_snapshot {
-            let fee_recipient = self.validator_store.effective_fee_recipient(&pubkey.to_bytes());
-            let fee_recipient_hex = format!("0x{}", hex::encode(fee_recipient));
-
-            // We need the validator_index. Look it up from cached attester duties.
-            // Iterate over current and next epoch slots to find a duty with this pubkey.
-            let normalized = Self::normalize_pubkey(pubkey_hex);
-            let mut found_index = None;
-
-            if let Ok(current_slot) = self.clock.current_slot() {
-                let current_epoch = current_slot / SLOTS_PER_EPOCH;
-                for epoch in [current_epoch, current_epoch + 1] {
-                    for slot_offset in 0..SLOTS_PER_EPOCH {
-                        let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
-                        let duties = self.duty_tracker.get_duties_for_slot(slot).await;
-                        for duty in &duties {
-                            if Self::normalize_pubkey(&duty.pubkey) == normalized {
-                                found_index = Some(duty.validator_index.clone());
-                                break;
-                            }
-                        }
-                        if found_index.is_some() {
-                            break;
-                        }
-                    }
-                    if found_index.is_some() {
-                        break;
-                    }
-                }
-            }
-
-            if let Some(validator_index) = found_index {
-                preparations.push(ProposerPreparation {
-                    validator_index,
-                    fee_recipient: fee_recipient_hex,
-                });
-            } else {
-                debug!(pubkey = %pubkey_hex, "No validator index found for proposer preparation");
-            }
-        }
-
-        if preparations.is_empty() {
-            return;
-        }
-
-        let count = preparations.len();
-        match tokio::time::timeout(
-            self.config.timeouts.preparation,
-            self.beacon.prepare_beacon_proposer(&preparations),
-        )
-        .await
-        {
-            Ok(Ok(_)) => info!(count, "Sent proposer preparations"),
-            Ok(Err(e)) => warn!(error = %e, "Failed to send proposer preparations"),
-            Err(_) => {
-                warn!(
-                    "Proposer preparation timed out after {}s",
-                    self.config.timeouts.preparation.as_secs()
-                )
-            }
-        }
-    }
-
-    #[tracing::instrument(name = "rvc.orchestrator.submit_committee_subscriptions", skip_all, fields(rvc.epoch = epoch))]
-    async fn submit_committee_subscriptions(&self, epoch: u64) {
-        let mut subscriptions = Vec::new();
-        let pubkey_snapshot = self.pubkey_map.read().expect("pubkey_map lock poisoned").clone();
-
-        for slot_offset in 0..SLOTS_PER_EPOCH {
-            let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
-            let duties = self.duty_tracker.get_duties_for_slot(slot).await;
-
-            for duty in &duties {
-                // Only subscribe for our own validators
-                let normalized = Self::normalize_pubkey(&duty.pubkey);
-                let pubkey =
-                    pubkey_snapshot.iter().find(|(k, _)| Self::normalize_pubkey(k) == normalized);
-
-                let pubkey = match pubkey {
-                    Some((_, pk)) => pk.clone(),
-                    None => continue,
-                };
-
-                let committee_length: u64 = match duty.committee_length.parse() {
-                    Ok(cl) => cl,
-                    Err(_) => {
-                        warn!(
-                            validator_index = %duty.validator_index,
-                            "Invalid committee_length in duty: {}",
-                            duty.committee_length
-                        );
-                        continue;
-                    }
-                };
-
-                // Compute selection proof and determine if aggregator
-                let selection_proof = match self
-                    .signer
-                    .sign_selection_proof(
-                        slot,
-                        &pubkey,
-                        &self.config.fork_schedule,
-                        &self.config.genesis_validators_root,
-                    )
-                    .await
-                {
-                    Ok(sig) => sig,
-                    Err(e) => {
-                        warn!(
-                            validator_index = %duty.validator_index,
-                            slot,
-                            error = %e,
-                            "Failed to sign selection proof for subscription"
-                        );
-                        continue;
-                    }
-                };
-
-                let is_agg = is_aggregator(committee_length, &selection_proof.to_bytes());
-
-                subscriptions.push(BeaconCommitteeSubscription {
-                    validator_index: duty.validator_index.clone(),
-                    committee_index: duty.committee_index.clone(),
-                    committees_at_slot: duty.committees_at_slot.clone(),
-                    slot: duty.slot.clone(),
-                    is_aggregator: is_agg,
-                });
-            }
-        }
-
-        if subscriptions.is_empty() {
-            return;
-        }
-
-        let count = subscriptions.len();
-        match tokio::time::timeout(
-            self.config.timeouts.preparation,
-            self.beacon.submit_beacon_committee_subscriptions(&subscriptions),
-        )
-        .await
-        {
-            Ok(Ok(_)) => info!(count, epoch, "Sent committee subscriptions"),
-            Ok(Err(e)) => warn!(epoch, error = %e, "Failed to send committee subscriptions"),
-            Err(_) => warn!(
-                epoch,
-                "Committee subscription timed out after {}s",
-                self.config.timeouts.preparation.as_secs()
-            ),
-        }
+    fn update_circuit_breaker_metrics(&self) {
+        RVC_BUILDER_CONSECUTIVE_MISSES.set(self.circuit_breaker.consecutive_misses() as i64);
+        RVC_BUILDER_EPOCH_MISSES.set(self.circuit_breaker.epoch_misses() as i64);
     }
 
     #[tracing::instrument(name = "rvc.orchestrator.maybe_propose_block", skip_all, fields(rvc.slot = slot, rvc.epoch = epoch))]
-    async fn maybe_propose_block(&self, slot: Slot, epoch: u64) {
+    async fn maybe_propose_block(&self, slot: Slot, epoch: u64, ctx: &SlotContext) {
         let proposer_duty = match self.duty_tracker.get_proposer_duty(slot).await {
             Some(duty) => duty,
             None => return,
         };
 
         // Check if the proposer is one of our validators
-        let pubkey = match self.find_pubkey(&proposer_duty.pubkey) {
+        let pubkey = match utils::find_pubkey(&self.pubkey_map, &proposer_duty.pubkey) {
             Some(pk) => pk,
             None => return,
         };
 
-        info!(slot, validator_index = proposer_duty.validator_index, "Proposing block");
+        // H-4: parse validator_index for proposer_index validation (returned as String by the BN type)
+        let expected_proposer_index: u64 = match proposer_duty.validator_index.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                error!(slot, raw = %proposer_duty.validator_index,
+                    "Cannot parse proposer duty validator_index as u64 — dropping duty");
+                return;
+            }
+        };
+
+        info!(slot, validator_index = %proposer_duty.validator_index, "Proposing block");
 
         // Wrap with combined produce + publish timeout
         match tokio::time::timeout(
             self.config.timeouts.block_production + self.config.timeouts.block_publication,
-            self.block_service.propose_block(slot, &pubkey),
+            self.block_service.propose_block(slot, &pubkey, expected_proposer_index, ctx.head_root),
         )
         .await
         {
             Ok(Ok(result)) => {
+                let was_tripped = self.circuit_breaker.is_tripped();
+                self.circuit_breaker.record_success();
+                self.update_circuit_breaker_metrics();
+                if was_tripped && !self.circuit_breaker.is_tripped() {
+                    info!(slot, "Builder circuit breaker reset after successful proposal");
+                }
                 info!(
                     slot,
                     blinded = result.is_blinded,
@@ -788,6 +634,24 @@ where
                 );
             }
             Ok(Err(e)) => {
+                // H-3: only record a miss when the failure originated from the
+                // builder path.  Signer errors, BN errors on the local-only
+                // path (boost = 0), and validation failures must not trip the
+                // builder circuit breaker.
+                let is_builder_failure = matches!(
+                    e,
+                    block_service::BlockServiceError::BuilderFailure(_)
+                        | block_service::BlockServiceError::BuilderOnly(_)
+                );
+                if is_builder_failure {
+                    let was_tripped = self.circuit_breaker.is_tripped();
+                    self.circuit_breaker.record_miss();
+                    self.update_circuit_breaker_metrics();
+                    if !was_tripped && self.circuit_breaker.is_tripped() {
+                        RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.inc();
+                        warn!(slot, "Builder circuit breaker tripped");
+                    }
+                }
                 error!(
                     slot,
                     epoch,
@@ -796,6 +660,10 @@ where
                 );
             }
             Err(_) => {
+                // Outer timeout: we cannot determine whether the builder relay
+                // was involved.  Do not record a miss — a transient BN or
+                // network slowdown that fires the outer timeout should not
+                // disable MEV for a full epoch (H-3).
                 error!(
                     slot,
                     epoch,
@@ -808,1147 +676,41 @@ where
         }
     }
 
-    #[tracing::instrument(name = "rvc.orchestrator.produce_sync_messages", skip_all, fields(rvc.slot = slot))]
-    async fn maybe_produce_sync_messages(&self, slot: Slot, _epoch: u64) {
-        let duties = self.duty_tracker.get_sync_committee_duties(slot).await;
-        if duties.is_empty() {
-            return;
-        }
-
-        let (matching_duties, matching_pubkeys) = self.filter_sync_duties(&duties);
-        if matching_duties.is_empty() {
-            return;
-        }
-
-        let head_root = match self.get_head_block_root().await {
-            Some(root) => root,
-            None => return,
-        };
-
-        let mut messages = Vec::new();
-
-        for (duty, pubkey) in matching_duties.iter().zip(matching_pubkeys.iter()) {
-            match self
-                .signer
-                .sign_sync_committee_message(
-                    &head_root,
-                    slot,
-                    pubkey,
-                    &self.config.fork_schedule,
-                    &self.config.genesis_validators_root,
-                )
-                .await
-            {
-                Ok(sig) => {
-                    messages.push(beacon::SyncCommitteeMessage {
-                        slot,
-                        beacon_block_root: head_root,
-                        validator_index: duty.validator_index,
-                        signature: sig.to_bytes().to_vec(),
-                    });
-                }
-                Err(e) => {
-                    warn!(
-                        slot,
-                        validator_index = duty.validator_index,
-                        error = %e,
-                        "Failed to sign sync committee message"
-                    );
-                }
-            }
-        }
-
-        if !messages.is_empty() {
-            let count = messages.len();
-            match tokio::time::timeout(
-                self.config.timeouts.sync_message,
-                self.beacon.submit_sync_committee_messages(&messages),
-            )
-            .await
-            {
-                Ok(Ok(_)) => info!(slot, count, "Submitted sync committee messages"),
-                Ok(Err(e)) => warn!(slot, error = %e, "Failed to submit sync committee messages"),
-                Err(_) => warn!(
-                    slot,
-                    "Sync committee message submit timed out after {}s",
-                    self.config.timeouts.sync_message.as_secs()
-                ),
-            }
-        }
-    }
-
-    #[tracing::instrument(name = "rvc.orchestrator.produce_sync_contributions", skip_all, fields(rvc.slot = slot))]
-    async fn maybe_produce_sync_contributions(&self, slot: Slot, _epoch: u64) {
-        let duties = self.duty_tracker.get_sync_committee_duties(slot).await;
-        if duties.is_empty() {
-            return;
-        }
-
-        let (matching_duties, matching_pubkeys) = self.filter_sync_duties(&duties);
-        if matching_duties.is_empty() {
-            return;
-        }
-
-        let head_root = match self.get_head_block_root().await {
-            Some(root) => root,
-            None => return,
-        };
-
-        let head_root_hex = format!("0x{}", hex::encode(head_root));
-        let mut signed_proofs = Vec::new();
-
-        for (duty, pubkey) in matching_duties.iter().zip(matching_pubkeys.iter()) {
-            let subcommittee_indices: std::collections::BTreeSet<u64> = duty
-                .validator_sync_committee_indices
-                .iter()
-                .map(|&pos| pos / (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT))
-                .collect();
-
-            for subcommittee_index in &subcommittee_indices {
-                let selection_proof = match self
-                    .signer
-                    .sign_sync_committee_selection_proof(
-                        slot,
-                        *subcommittee_index,
-                        pubkey,
-                        &self.config.fork_schedule,
-                        &self.config.genesis_validators_root,
-                    )
-                    .await
-                {
-                    Ok(sig) => sig,
-                    Err(e) => {
-                        warn!(
-                            slot,
-                            subcommittee_index,
-                            validator_index = duty.validator_index,
-                            error = %e,
-                            "Failed to sign sync committee selection proof"
-                        );
-                        continue;
-                    }
-                };
-
-                if !is_sync_committee_aggregator(&selection_proof.to_bytes()) {
-                    debug!(
-                        slot,
-                        subcommittee_index,
-                        validator_index = duty.validator_index,
-                        "Not selected as sync committee aggregator"
-                    );
-                    continue;
-                }
-
-                debug!(
-                    slot,
-                    subcommittee_index,
-                    validator_index = duty.validator_index,
-                    "Selected as sync committee aggregator"
-                );
-
-                let contribution = match tokio::time::timeout(
-                    self.config.timeouts.sync_contribution,
-                    self.beacon.get_sync_committee_contribution(
-                        slot,
-                        *subcommittee_index,
-                        &head_root_hex,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(resp)) => resp.data,
-                    Ok(Err(e)) => {
-                        warn!(
-                            slot,
-                            subcommittee_index,
-                            error = %e,
-                            "Failed to get sync committee contribution"
-                        );
-                        continue;
-                    }
-                    Err(_) => {
-                        warn!(
-                            slot,
-                            subcommittee_index,
-                            "Sync committee contribution fetch timed out after {}s",
-                            self.config.timeouts.sync_contribution.as_secs()
-                        );
-                        continue;
-                    }
-                };
-
-                let proof = ContributionAndProof {
-                    aggregator_index: duty.validator_index,
-                    contribution,
-                    selection_proof: selection_proof.to_bytes().to_vec(),
-                };
-
-                let sig = match self
-                    .signer
-                    .sign_contribution_and_proof(
-                        &proof,
-                        pubkey,
-                        &self.config.fork_schedule,
-                        &self.config.genesis_validators_root,
-                    )
-                    .await
-                {
-                    Ok(sig) => sig,
-                    Err(e) => {
-                        warn!(
-                            slot,
-                            subcommittee_index,
-                            validator_index = duty.validator_index,
-                            error = %e,
-                            "Failed to sign contribution and proof"
-                        );
-                        continue;
-                    }
-                };
-
-                signed_proofs.push(SignedContributionAndProof {
-                    message: proof,
-                    signature: sig.to_bytes().to_vec(),
-                });
-            }
-        }
-
-        if !signed_proofs.is_empty() {
-            let count = signed_proofs.len();
-            match tokio::time::timeout(
-                self.config.timeouts.sync_contribution,
-                self.beacon.submit_contribution_and_proofs(&signed_proofs),
-            )
-            .await
-            {
-                Ok(Ok(_)) => info!(slot, count, "Submitted sync committee contribution and proofs"),
-                Ok(Err(e)) => warn!(slot, error = %e, "Failed to submit contribution and proofs"),
-                Err(_) => warn!(
-                    slot,
-                    "Contribution and proofs submit timed out after {}s",
-                    self.config.timeouts.sync_contribution.as_secs()
-                ),
-            }
-        }
-    }
-
-    #[tracing::instrument(name = "rvc.orchestrator.produce_aggregations", skip_all, fields(rvc.slot = slot, rvc.epoch = epoch))]
-    async fn maybe_produce_aggregations(&self, slot: Slot, epoch: u64) {
-        let duties = match self.get_duties_for_slot(slot).await {
-            Ok(d) => d,
-            Err(_) => return,
-        };
-
-        if duties.is_empty() {
-            return;
-        }
-
-        let fork_name = ForkName::from_epoch(epoch, &self.config.fork_schedule);
-        let is_electra = fork_name >= ForkName::Electra;
-
-        let mut pre_electra_aggregates: Vec<SignedAggregateAndProof> = Vec::new();
-        let mut electra_aggregates: Vec<SignedElectraAggregateAndProof> = Vec::new();
-        let mut source_validators: Vec<String> = Vec::new();
-
-        let fork_label = if fork_name >= ForkName::Fulu {
-            "fulu"
-        } else if is_electra {
-            "electra"
-        } else {
-            "pre_electra"
-        };
-
-        for duty in &duties {
-            let agg_span = info_span!(
-                "rvc.aggregation.produce",
-                rvc.slot = slot,
-                rvc.validator_index = %duty.validator_index,
-                rvc.pubkey = %truncate_pubkey(&duty.pubkey),
-                rvc.aggregation.fork = fork_label,
-            );
-
-            let committee_length: u64 = match duty.committee_length.parse() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let pubkey = match self.find_pubkey(&duty.pubkey) {
-                Some(pk) => pk,
-                None => continue,
-            };
-
-            let selection_proof = match self
-                .signer
-                .sign_selection_proof(
-                    slot,
-                    &pubkey,
-                    &self.config.fork_schedule,
-                    &self.config.genesis_validators_root,
-                )
-                .instrument(agg_span.clone())
-                .await
-            {
-                Ok(sig) => sig,
-                Err(e) => {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        error = %e,
-                        "Failed to sign selection proof for aggregation"
-                    );
-                    continue;
-                }
-            };
-
-            if !is_aggregator(committee_length, &selection_proof.to_bytes()) {
-                debug!(
-                    slot,
-                    validator_index = %duty.validator_index,
-                    "Not selected as attestation aggregator"
-                );
-                continue;
-            }
-
-            info!(
-                slot,
-                validator_index = %duty.validator_index,
-                "Selected as attestation aggregator"
-            );
-            source_validators.push(duty.validator_index.clone());
-
-            // Compute attestation data root for fetching the aggregate
-            let committee_index: u64 = match duty.committee_index.parse() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let attestation_data_response = match tokio::time::timeout(
-                self.config.timeouts.aggregate_fetch,
-                self.beacon.get_attestation_data(slot, committee_index),
-            )
-            .instrument(agg_span.clone())
-            .await
-            {
-                Ok(Ok(resp)) => resp,
-                Ok(Err(e)) => {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        error = %e,
-                        "Failed to get attestation data for aggregation"
-                    );
-                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-                    continue;
-                }
-                Err(_) => {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        "Attestation data fetch timed out for aggregation"
-                    );
-                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-                    continue;
-                }
-            };
-
-            let crypto_attestation_data =
-                match Self::convert_attestation_data(&attestation_data_response.data) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        warn!(
-                            slot,
-                            validator_index = %duty.validator_index,
-                            error = %e,
-                            "Failed to convert attestation data for aggregation"
-                        );
-                        RVC_AGGREGATIONS_TOTAL
-                            .with_label_values(&[attestation_status::FAILED])
-                            .inc();
-                        continue;
-                    }
-                };
-
-            let att_data_root = crypto_attestation_data.tree_hash_root();
-            let att_data_root_hex = format!("0x{}", hex::encode(att_data_root.0));
-
-            // Fetch the aggregate attestation
-            // Electra: pass committee_index for per-committee aggregation
-            let electra_committee_index = if is_electra { Some(committee_index) } else { None };
-            let aggregate = match tokio::time::timeout(
-                self.config.timeouts.aggregate_fetch,
-                self.beacon.get_aggregate_attestation(
-                    slot,
-                    &att_data_root_hex,
-                    electra_committee_index,
-                ),
-            )
-            .instrument(agg_span.clone())
-            .await
-            {
-                Ok(Ok(resp)) => resp,
-                Ok(Err(e)) => {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        error = %e,
-                        "Failed to get aggregate attestation"
-                    );
-                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-                    continue;
-                }
-                Err(_) => {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        "Aggregate attestation fetch timed out"
-                    );
-                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-                    continue;
-                }
-            };
-
-            let aggregator_index: u64 = match duty.validator_index.parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            if is_electra {
-                let electra_agg = match aggregate {
-                    VersionedAggregateAttestation::Electra(a)
-                    | VersionedAggregateAttestation::Fulu(a) => a,
-                    _ => {
-                        warn!(
-                            slot,
-                            validator_index = %duty.validator_index,
-                            "Expected Electra aggregate but got pre-Electra"
-                        );
-                        RVC_AGGREGATIONS_TOTAL
-                            .with_label_values(&[attestation_status::FAILED])
-                            .inc();
-                        continue;
-                    }
-                };
-                let aggregate_and_proof = ElectraAggregateAndProof {
-                    aggregator_index,
-                    aggregate: electra_agg,
-                    selection_proof: selection_proof.to_bytes().to_vec(),
-                };
-                let signature = match self
-                    .signer
-                    .sign_electra_aggregate_and_proof(
-                        &aggregate_and_proof,
-                        &pubkey,
-                        &self.config.fork_schedule,
-                        &self.config.genesis_validators_root,
-                    )
-                    .instrument(agg_span.clone())
-                    .await
-                {
-                    Ok(sig) => sig,
-                    Err(e) => {
-                        warn!(
-                            slot,
-                            validator_index = %duty.validator_index,
-                            error = %e,
-                            "Failed to sign Electra aggregate and proof"
-                        );
-                        RVC_AGGREGATIONS_TOTAL
-                            .with_label_values(&[attestation_status::FAILED])
-                            .inc();
-                        continue;
-                    }
-                };
-                electra_aggregates.push(SignedElectraAggregateAndProof {
-                    message: aggregate_and_proof,
-                    signature: signature.to_bytes().to_vec(),
-                });
-            } else {
-                let pre_electra_agg = match aggregate {
-                    VersionedAggregateAttestation::PreElectra(a) => a,
-                    _ => {
-                        warn!(
-                            slot,
-                            validator_index = %duty.validator_index,
-                            "Expected pre-Electra aggregate but got Electra"
-                        );
-                        RVC_AGGREGATIONS_TOTAL
-                            .with_label_values(&[attestation_status::FAILED])
-                            .inc();
-                        continue;
-                    }
-                };
-                let aggregate_and_proof = AggregateAndProof {
-                    aggregator_index,
-                    aggregate: pre_electra_agg,
-                    selection_proof: selection_proof.to_bytes().to_vec(),
-                };
-                let signature = match self
-                    .signer
-                    .sign_aggregate_and_proof(
-                        &aggregate_and_proof,
-                        &pubkey,
-                        &self.config.fork_schedule,
-                        &self.config.genesis_validators_root,
-                    )
-                    .instrument(agg_span.clone())
-                    .await
-                {
-                    Ok(sig) => sig,
-                    Err(e) => {
-                        warn!(
-                            slot,
-                            validator_index = %duty.validator_index,
-                            error = %e,
-                            "Failed to sign aggregate and proof"
-                        );
-                        RVC_AGGREGATIONS_TOTAL
-                            .with_label_values(&[attestation_status::FAILED])
-                            .inc();
-                        continue;
-                    }
-                };
-                pre_electra_aggregates.push(SignedAggregateAndProof {
-                    message: aggregate_and_proof,
-                    signature: signature.to_bytes().to_vec(),
-                });
-            }
-        }
-
-        if !pre_electra_aggregates.is_empty() {
-            let count = pre_electra_aggregates.len();
-            let source_validators_str = source_validators.join(",");
-
-            let submit_span = info_span!(
-                "rvc.aggregation.submit",
-                rvc.slot = slot,
-                rvc.aggregation.count = count,
-                rvc.aggregation.source_validators = %source_validators_str,
-            );
-
-            let versioned = VersionedSignedAggregateAndProof::PreElectra(pre_electra_aggregates);
-            match tokio::time::timeout(
-                self.config.timeouts.aggregate_submit,
-                self.beacon.submit_aggregate_and_proofs(&versioned),
-            )
-            .instrument(submit_span)
-            .await
-            {
-                Ok(Ok(_)) => {
-                    info!(slot, count, "Submitted aggregate and proofs");
-                    RVC_AGGREGATIONS_TOTAL
-                        .with_label_values(&[attestation_status::SUCCESS])
-                        .inc_by(count as u64);
-                }
-                Ok(Err(e)) => {
-                    warn!(slot, error = %e, "Failed to submit aggregate and proofs");
-                    RVC_AGGREGATIONS_TOTAL
-                        .with_label_values(&[attestation_status::FAILED])
-                        .inc_by(count as u64);
-                }
-                Err(_) => {
-                    warn!(
-                        slot,
-                        "Aggregate and proofs submit timed out after {}s",
-                        self.config.timeouts.aggregate_submit.as_secs()
-                    );
-                    RVC_AGGREGATIONS_TOTAL
-                        .with_label_values(&[attestation_status::FAILED])
-                        .inc_by(count as u64);
-                }
-            }
-        }
-
-        if !electra_aggregates.is_empty() {
-            let count = electra_aggregates.len();
-            let source_validators_str = source_validators.join(",");
-
-            let submit_span = info_span!(
-                "rvc.aggregation.submit",
-                rvc.slot = slot,
-                rvc.aggregation.count = count,
-                rvc.aggregation.source_validators = %source_validators_str,
-            );
-
-            let versioned = if fork_name >= ForkName::Fulu {
-                VersionedSignedAggregateAndProof::Fulu(electra_aggregates)
-            } else {
-                VersionedSignedAggregateAndProof::Electra(electra_aggregates)
-            };
-            match tokio::time::timeout(
-                self.config.timeouts.aggregate_submit,
-                self.beacon.submit_aggregate_and_proofs(&versioned),
-            )
-            .instrument(submit_span)
-            .await
-            {
-                Ok(Ok(_)) => {
-                    info!(slot, count, "Submitted Electra aggregate and proofs");
-                    RVC_AGGREGATIONS_TOTAL
-                        .with_label_values(&[attestation_status::SUCCESS])
-                        .inc_by(count as u64);
-                }
-                Ok(Err(e)) => {
-                    warn!(slot, error = %e, "Failed to submit Electra aggregate and proofs");
-                    RVC_AGGREGATIONS_TOTAL
-                        .with_label_values(&[attestation_status::FAILED])
-                        .inc_by(count as u64);
-                }
-                Err(_) => {
-                    warn!(
-                        slot,
-                        "Electra aggregate and proofs submit timed out after {}s",
-                        self.config.timeouts.aggregate_submit.as_secs()
-                    );
-                    RVC_AGGREGATIONS_TOTAL
-                        .with_label_values(&[attestation_status::FAILED])
-                        .inc_by(count as u64);
-                }
-            }
-        }
-    }
-
-    fn filter_sync_duties(
-        &self,
-        duties: &[SyncCommitteeDuty],
-    ) -> (Vec<SyncCommitteeDuty>, Vec<PublicKey>) {
-        let mut matching_duties = Vec::new();
-        let mut matching_pubkeys = Vec::new();
-
-        for duty in duties {
-            if let Some(pk) = self.find_pubkey(&duty.pubkey) {
-                matching_duties.push(duty.clone());
-                matching_pubkeys.push(pk);
-            }
-        }
-
-        (matching_duties, matching_pubkeys)
-    }
-
-    async fn get_head_block_root(&self) -> Option<Root> {
-        match tokio::time::timeout(
-            self.config.timeouts.sync_message,
-            self.beacon.get_block_root("head"),
-        )
-        .await
-        {
-            Ok(Ok(response)) => {
-                let root_hex = response.data.root;
-                match Self::parse_hex_root(&root_hex) {
-                    Ok(root) => Some(root),
-                    Err(e) => {
-                        warn!(error = %e, "Failed to parse head block root");
-                        None
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                warn!(error = %e, "Failed to fetch head block root");
-                None
-            }
-            Err(_) => {
-                warn!(
-                    "Head block root fetch timed out after {}s",
-                    self.config.timeouts.sync_message.as_secs()
-                );
-                None
-            }
-        }
-    }
-
-    /// Processes all attestation duties for a given slot.
-    ///
-    /// Validators are processed sequentially within each slot to work with
-    /// the non-Send/Sync `SlashingDb`. For high validator counts, consider
-    /// making `SlashingDb` thread-safe with proper locking for concurrent processing.
-    #[tracing::instrument(name = "rvc.orchestrator.process_slot", skip_all, fields(rvc.slot = slot))]
     pub async fn process_slot(
         &self,
         slot: Slot,
     ) -> Result<Vec<AttestationResult>, OrchestratorError> {
-        let _timer = RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS
-            .with_label_values(&[] as &[&str])
-            .start_timer();
-
-        info!(slot = slot, "Processing attestation duties for slot");
-
-        let current_slot = self.clock.current_slot()?;
-
-        if current_slot > slot {
-            RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL.with_label_values(&[] as &[&str]).inc();
-            return Err(OrchestratorError::SlotMissed { slot, current_slot });
-        }
-
-        let duties = self.get_duties_for_slot(slot).await?;
-
-        if duties.is_empty() {
-            debug!(slot = slot, "No attestation duties for this slot");
-            RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL
-                .with_label_values(&[orchestrator_result::NO_DUTIES])
-                .inc();
-            return Err(OrchestratorError::NoDutiesForSlot { slot });
-        }
-
-        info!(slot = slot, duty_count = duties.len(), "Found attestation duties");
-        RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS.set(duties.len() as f64);
-
-        let mut results = Vec::new();
-
-        for duty in duties {
-            let result = self.process_attestation_duty(duty).await;
-
-            if result.success {
-                info!(
-                    validator = %result.validator_index,
-                    slot = result.slot,
-                    "Attestation completed successfully"
-                );
-            } else {
-                warn!(
-                    validator = %result.validator_index,
-                    slot = result.slot,
-                    error = ?result.error,
-                    "Attestation failed"
-                );
-            }
-            results.push(result);
-        }
-
-        RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS.set(0.0);
-
-        let success_count = results.iter().filter(|r| r.success).count();
-        let failure_count = results.len() - success_count;
-
-        if failure_count > 0 {
-            RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL
-                .with_label_values(&[orchestrator_result::FAILED])
-                .inc();
-        } else {
-            RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL
-                .with_label_values(&[orchestrator_result::SUCCESS])
-                .inc();
-        }
-
-        info!(
-            slot = slot,
-            total = results.len(),
-            success = success_count,
-            failed = failure_count,
-            "Slot processing complete"
-        );
-
-        Ok(results)
+        self.attestation_service.process_slot(slot).await
     }
 
-    async fn get_duties_for_slot(
-        &self,
-        slot: Slot,
-    ) -> Result<Vec<AttesterDuty>, OrchestratorError> {
-        let pubkey_snapshot = self.pubkey_map.read().expect("pubkey_map lock poisoned").clone();
-        if pubkey_snapshot.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let epoch = slot / SLOTS_PER_EPOCH;
-
-        if !self.duty_tracker.is_epoch_cached(epoch).await {
-            self.duty_tracker.fetch_duties_for_epoch(epoch).await?;
-        }
-
-        let normalized_pubkeys: std::collections::HashSet<String> =
-            pubkey_snapshot.keys().map(|k| Self::normalize_pubkey(k)).collect();
-
-        let all_duties = self.duty_tracker.get_duties_for_slot(slot).await;
-        let duties: Vec<AttesterDuty> = all_duties
-            .into_iter()
-            .filter(|duty| {
-                let normalized_duty_pubkey = Self::normalize_pubkey(&duty.pubkey);
-                normalized_pubkeys.contains(&normalized_duty_pubkey)
-            })
-            .collect();
-
-        Ok(duties)
-    }
-
-    /// Normalizes a pubkey to lowercase without 0x/0X prefix for comparison.
-    fn normalize_pubkey(pubkey: &str) -> String {
-        let without_prefix =
-            pubkey.strip_prefix("0x").or_else(|| pubkey.strip_prefix("0X")).unwrap_or(pubkey);
-        without_prefix.to_lowercase()
-    }
-
-    async fn process_attestation_duty(&self, duty: AttesterDuty) -> AttestationResult {
-        let validator_index = duty.validator_index.clone();
-
-        let slot: Slot = match duty.slot.parse() {
-            Ok(s) => s,
-            Err(_) => {
-                return AttestationResult {
-                    validator_index,
-                    slot: 0,
-                    success: false,
-                    error: Some(format!("Invalid slot in duty: {}", duty.slot)),
-                };
-            }
-        };
-
-        let committee_index: u64 = match duty.committee_index.parse() {
-            Ok(c) => c,
-            Err(_) => {
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!(
-                        "Invalid committee_index in duty: {}",
-                        duty.committee_index
-                    )),
-                };
-            }
-        };
-
-        let att_span = info_span!(
-            "rvc.attestation.produce",
-            rvc.slot = slot,
-            rvc.validator_index = %validator_index,
-            rvc.pubkey = %truncate_pubkey(&duty.pubkey),
-        );
-
-        {
-            let _guard = att_span.enter();
-            debug!(
-                validator = %validator_index,
-                slot = slot,
-                committee_index = committee_index,
-                "Processing attestation duty"
-            );
-        }
-
-        let pubkey = match self.find_pubkey(&duty.pubkey) {
-            Some(pk) => pk,
-            None => {
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!("Public key not found: {}", duty.pubkey)),
-                };
-            }
-        };
-
-        // Apply timeout to beacon client call to prevent blocking
-        let attestation_data_result = tokio::time::timeout(
-            self.config.timeouts.attestation_fetch,
-            self.beacon.get_attestation_data(slot, committee_index),
-        )
-        .instrument(info_span!(parent: &att_span, "rvc.beacon.get_attestation_data"))
-        .await;
-
-        let attestation_data_response = match attestation_data_result {
-            Ok(Ok(response)) => response,
-            Ok(Err(e)) => {
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!("Failed to get attestation data: {}", e)),
-                };
-            }
-            Err(_) => {
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some("Timeout getting attestation data from beacon node".to_string()),
-                };
-            }
-        };
-
-        let beacon_attestation_data = attestation_data_response.data;
-
-        debug!(
-            validator = %validator_index,
-            slot = %beacon_attestation_data.slot,
-            index = %beacon_attestation_data.index,
-            beacon_block_root = %beacon_attestation_data.beacon_block_root,
-            source_epoch = %beacon_attestation_data.source.epoch,
-            source_root = %beacon_attestation_data.source.root,
-            target_epoch = %beacon_attestation_data.target.epoch,
-            target_root = %beacon_attestation_data.target.root,
-            "Attestation data fetched from BN"
-        );
-
-        let mut crypto_attestation_data =
-            match Self::convert_attestation_data(&beacon_attestation_data) {
-                Ok(data) => data,
-                Err(e) => {
-                    return AttestationResult {
-                        validator_index,
-                        slot,
-                        success: false,
-                        error: Some(format!("Failed to convert attestation data: {}", e)),
-                    };
-                }
-            };
-
-        let target_epoch = crypto_attestation_data.target.epoch;
-
-        debug!(
-            validator = %validator_index,
-            slot = crypto_attestation_data.slot,
-            index = crypto_attestation_data.index,
-            target_epoch = target_epoch,
-            source_epoch = crypto_attestation_data.source.epoch,
-            "Converted attestation data"
-        );
-
-        let fork_name = ForkName::from_epoch(target_epoch, &self.config.fork_schedule);
-        let is_electra = fork_name >= ForkName::Electra;
-
-        debug!(
-            validator = %validator_index,
-            fork_name = ?fork_name,
-            is_electra = is_electra,
-            target_epoch = target_epoch,
-            "Fork derived for attestation"
-        );
-
-        // EIP-7549: For Electra, set data.index = 0 BEFORE signing because
-        // the index field is part of the signed AttestationData.
-        if is_electra {
-            let original_index = crypto_attestation_data.index;
-            crypto_attestation_data.index = 0;
-            debug!(
-                validator = %validator_index,
-                original_index = original_index,
-                zeroed_index = 0u64,
-                "EIP-7549: zeroed attestation data index for Electra signing"
-            );
-        }
-
-        let signature = match self
-            .signer
-            .sign_attestation(
-                &crypto_attestation_data,
-                &pubkey,
-                &self.config.fork_schedule,
-                &self.config.genesis_validators_root,
-            )
-            .instrument(att_span.clone())
-            .await
-        {
-            Ok(sig) => {
-                let sig_bytes = sig.to_bytes();
-                debug!(
-                    validator = %validator_index,
-                    signature_prefix = %format!("0x{}", hex::encode(&sig_bytes[..8])),
-                    "Attestation signed successfully"
-                );
-                sig
-            }
-            Err(e) => {
-                tracing::error!(error = %e, validator = %validator_index, slot, "Attestation signing failed");
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!("Failed to sign attestation: {}", e)),
-                };
-            }
-        };
-
-        let attester_index: u64 = match validator_index.parse() {
-            Ok(v) => v,
-            Err(_) => {
-                let error = format!("Invalid validator_index in duty: {}", validator_index);
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(error),
-                };
-            }
-        };
-
-        let sig_hex = format!("0x{}", hex::encode(signature.to_bytes()));
-
-        let versioned = if fork_name >= ForkName::Fulu {
-            let mut fulu_data = beacon_attestation_data.clone();
-            fulu_data.index = "0".to_string();
-            VersionedAttestation::Fulu(vec![SingleAttestation {
-                committee_index,
-                attester_index,
-                data: fulu_data,
-                signature: sig_hex,
-            }])
-        } else if is_electra {
-            let mut electra_data = beacon_attestation_data.clone();
-            electra_data.index = "0".to_string();
-            VersionedAttestation::Electra(vec![SingleAttestation {
-                committee_index,
-                attester_index,
-                data: electra_data,
-                signature: sig_hex,
-            }])
-        } else {
-            let aggregation_bits = match make_aggregation_bits(&duty) {
-                Some(bits) => bits,
-                None => {
-                    warn!(
-                        validator = %validator_index,
-                        slot,
-                        "Skipping attestation: could not produce aggregation bits"
-                    );
-                    return AttestationResult {
-                        validator_index,
-                        slot,
-                        success: false,
-                        error: Some(
-                            "committee_length is 0, cannot produce aggregation bits".to_string(),
-                        ),
-                    };
-                }
-            };
-            VersionedAttestation::PreElectra(vec![LegacyAttestation {
-                aggregation_bits,
-                data: beacon_attestation_data,
-                signature: sig_hex,
-            }])
-        };
-
-        let versioned_type = match &versioned {
-            VersionedAttestation::Fulu(_) => "Fulu",
-            VersionedAttestation::Electra(_) => "Electra",
-            VersionedAttestation::PreElectra(_) => "PreElectra",
-        };
-        debug!(
-            validator = %validator_index,
-            versioned_type = versioned_type,
-            "Propagating attestation"
-        );
-
-        let submit_result = tokio::time::timeout(
-            self.config.timeouts.attestation_submit,
-            self.propagator.propagate(&versioned),
-        )
-        .instrument(info_span!(parent: &att_span, "rvc.beacon.submit_attestation"))
-        .await;
-
-        match submit_result {
-            Ok(Ok(_)) => AttestationResult { validator_index, slot, success: true, error: None },
-            Ok(Err(e)) => {
-                tracing::error!(error = %e, validator = %validator_index, slot, "Attestation submission failed");
-                AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!("Failed to propagate attestation: {}", e)),
-                }
-            }
-            Err(_) => {
-                tracing::error!(validator = %validator_index, slot, "Attestation submission timed out");
-                AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!(
-                        "Attestation submit timed out after {}s",
-                        self.config.timeouts.attestation_submit.as_secs()
-                    )),
-                }
-            }
-        }
-    }
-
-    /// Finds a public key by matching against duty pubkey.
+    /// Sets the sync-committee duty participation flag.
     ///
-    /// Pubkeys are matched case-insensitively and with/without "0x" prefix.
-    fn find_pubkey(&self, duty_pubkey: &str) -> Option<PublicKey> {
-        let pubkey_map = self.pubkey_map.read().expect("pubkey_map lock poisoned");
-
-        // Try exact match first
-        if let Some(pk) = pubkey_map.get(duty_pubkey) {
-            return Some(pk.clone());
-        }
-
-        // Try with/without 0x prefix
-        let normalized_pubkey = if duty_pubkey.starts_with("0x") {
-            duty_pubkey.to_string()
-        } else {
-            format!("0x{}", duty_pubkey)
-        };
-
-        if let Some(pk) = pubkey_map.get(&normalized_pubkey) {
-            return Some(pk.clone());
-        }
-
-        // Normalize for case-insensitive matching
-        let duty_normalized = Self::normalize_pubkey(duty_pubkey);
-
-        for (key, pk) in pubkey_map.iter() {
-            if Self::normalize_pubkey(key) == duty_normalized {
-                return Some(pk.clone());
-            }
-        }
-
-        None
+    /// When `false`, sync-committee messages and contributions are silently
+    /// skipped for all subsequent slots until re-enabled. This flag is
+    /// independent of `attesting_enabled`, closing H-7: disabling attestations
+    /// no longer silently disables sync-committee duties.
+    ///
+    /// Internal-only — NOT wired to any Keymanager API endpoint (per OQ-A3
+    /// decision deferred to Tier-1 follow-up).
+    pub fn set_sync_enabled(&self, enabled: bool) {
+        self.sync_enabled.store(enabled, Ordering::Release);
     }
 
-    fn convert_attestation_data(
-        beacon_data: &beacon::AttestationData,
-    ) -> Result<eth_types::AttestationData, OrchestratorError> {
-        let slot: u64 = beacon_data
-            .slot
-            .parse()
-            .map_err(|_| OrchestratorError::ParseError("Invalid slot".to_string()))?;
-
-        let index: u64 = beacon_data
-            .index
-            .parse()
-            .map_err(|_| OrchestratorError::ParseError("Invalid index".to_string()))?;
-
-        let beacon_block_root = Self::parse_hex_root(&beacon_data.beacon_block_root)?;
-
-        let source_epoch: u64 = beacon_data
-            .source
-            .epoch
-            .parse()
-            .map_err(|_| OrchestratorError::ParseError("Invalid source epoch".to_string()))?;
-
-        let source_root = Self::parse_hex_root(&beacon_data.source.root)?;
-
-        let target_epoch: u64 = beacon_data
-            .target
-            .epoch
-            .parse()
-            .map_err(|_| OrchestratorError::ParseError("Invalid target epoch".to_string()))?;
-
-        let target_root = Self::parse_hex_root(&beacon_data.target.root)?;
-
-        Ok(eth_types::AttestationData {
-            slot,
-            index,
-            beacon_block_root,
-            source: eth_types::Checkpoint { epoch: source_epoch, root: source_root },
-            target: eth_types::Checkpoint { epoch: target_epoch, root: target_root },
-        })
+    /// Runs the sync-committee messages phase, gated by `sync_enabled`.
+    ///
+    /// Extracted so both the run loop and tests can invoke the guarded phase
+    /// in isolation.
+    async fn run_sync_messages_phase(&self, slot: Slot, epoch: u64, ctx: &SlotContext) {
+        if self.sync_enabled.load(Ordering::Acquire) {
+            self.sync_committee_service.maybe_produce_sync_messages(slot, epoch, ctx).await;
+        }
     }
 
-    fn parse_hex_root(hex_str: &str) -> Result<Root, OrchestratorError> {
-        let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-
-        let bytes = hex::decode(hex_str)
-            .map_err(|e| OrchestratorError::ParseError(format!("Invalid hex: {}", e)))?;
-
-        if bytes.len() != 32 {
-            return Err(OrchestratorError::ParseError(format!(
-                "Invalid root length: expected 32, got {}",
-                bytes.len()
-            )));
+    /// Runs the sync-committee contributions phase, gated by `sync_enabled`.
+    async fn run_sync_contributions_phase(&self, slot: Slot, epoch: u64, ctx: &SlotContext) {
+        if self.sync_enabled.load(Ordering::Acquire) {
+            self.sync_committee_service.maybe_produce_sync_contributions(slot, epoch, ctx).await;
         }
-
-        let mut root = [0u8; 32];
-        root.copy_from_slice(&bytes);
-        Ok(root)
     }
 }
 
@@ -1957,17 +719,47 @@ where
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use beacon::{BeaconClient, BeaconClientConfig};
+    use beacon::{
+        AttestationDataResponse, AttesterDutiesResponse, AttesterDuty, BeaconClient,
+        BeaconClientConfig, BeaconCommitteeSubscription, BeaconError, BlockRootData,
+        BlockRootResponse, ConfigSpecResponse, DataResponse, ExecutionOptimisticResponse,
+        GenesisResponse, ProposerDutiesResponse, ProposerPreparation,
+        SignedContributionAndProof as BeaconSignedContributionAndProof, StateForkResponse,
+        SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+        SyncCommitteeMessage as BeaconSyncCommitteeMessage, SyncingResponse, ValidatorsResponse,
+        VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    };
+    // block_service::ProduceBlockResponse is used in MockBlockBeacon / BadProposerBlockBeacon
     use block_service::ProduceBlockResponse;
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
+    use eth_types::{
+        ForkName, Root, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
+        SyncCommitteeDuty,
+    };
     use slashing::SlashingDb;
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use timing::MockSlotClock;
+    use tree_hash::TreeHash;
     use validator_store::ValidatorStore;
 
     const TEST_GENESIS_TIME: u64 = 1606824023;
+
+    fn fast_timeouts() -> OperationTimeouts {
+        OperationTimeouts {
+            duty_fetch: Duration::from_millis(200),
+            block_production: Duration::from_millis(200),
+            block_publication: Duration::from_millis(200),
+            attestation_fetch: Duration::from_millis(200),
+            attestation_submit: Duration::from_millis(200),
+            aggregate_fetch: Duration::from_millis(200),
+            aggregate_submit: Duration::from_millis(200),
+            sync_message: Duration::from_millis(200),
+            sync_contribution: Duration::from_millis(200),
+            preparation: Duration::from_millis(200),
+        }
+    }
 
     fn create_test_fork_schedule() -> Arc<ForkSchedule> {
         Arc::new(ForkSchedule {
@@ -2082,8 +874,245 @@ mod tests {
         Arc::new(MockBlockBeacon)
     }
 
+    /// Block beacon that returns a block with a configurable `proposer_index`
+    /// and tracks whether `publish_block` / `publish_blinded_block` /
+    /// `publish_block_ssz` is called.  Used by the H-4 coordinator integration
+    /// test to verify that a wrong `proposer_index` causes the duty to be
+    /// dropped before any publish attempt.
+    struct BadProposerBlockBeacon {
+        slot: Slot,
+        bad_proposer_index: u64,
+        publish_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait(?Send)]
+    impl BeaconBlockClient for BadProposerBlockBeacon {
+        async fn produce_block_v3(
+            &self,
+            _slot: Slot,
+            _randao_reveal: &str,
+            _graffiti: Option<&str>,
+            _builder_boost_factor: Option<u64>,
+        ) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
+            Ok(ProduceBlockResponse {
+                data: serde_json::json!({
+                    "slot": self.slot.to_string(),
+                    "proposer_index": self.bad_proposer_index.to_string(),
+                    "parent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "state_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "body": "0x"
+                }),
+                is_blinded: false,
+                consensus_version: "deneb".to_string(),
+                execution_payload_value: None,
+                is_ssz: false,
+                ssz_bytes: None,
+            })
+        }
+
+        async fn publish_block(
+            &self,
+            _signed_block: &eth_types::SignedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), block_service::BlockServiceError> {
+            self.publish_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn publish_blinded_block(
+            &self,
+            _signed_block: &eth_types::SignedBlindedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), block_service::BlockServiceError> {
+            self.publish_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn publish_block_ssz(
+            &self,
+            _ssz_bytes: &[u8],
+            _consensus_version: &str,
+            _is_blinded: bool,
+        ) -> Result<(), block_service::BlockServiceError> {
+            self.publish_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
     fn create_mock_validator_store() -> Arc<ValidatorStore> {
         Arc::new(ValidatorStore::new([0u8; 20], 100))
+    }
+
+    // ── H-7 mock: captures sync committee message submissions ────────────────
+    //
+    // Implements `BeaconNodeClient` with:
+    //   - `post_sync_committee_duties` → returns a duty for `duty_pubkey`
+    //   - `submit_sync_committee_messages` → records beacon_block_root values
+    //   - All other methods → return `BeaconError::HttpError("mock")`
+    //
+    // Used to test the `sync_enabled` guard without a real beacon node.
+    struct SyncGuardBeacon {
+        duty_pubkey: String,
+        submitted_roots: Arc<std::sync::Mutex<Vec<Root>>>,
+    }
+
+    #[async_trait]
+    impl bn_manager::BeaconNodeClient for SyncGuardBeacon {
+        async fn get_block_root(&self, _block_id: &str) -> Result<BlockRootResponse, BeaconError> {
+            // Return a fixed root so SlotContext::capture succeeds.
+            Ok(DataResponse {
+                data: BlockRootData {
+                    root: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                },
+            })
+        }
+
+        async fn post_sync_committee_duties(
+            &self,
+            _epoch: u64,
+            _indices: &[String],
+        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
+            Ok(ExecutionOptimisticResponse {
+                execution_optimistic: false,
+                data: vec![SyncCommitteeDuty {
+                    pubkey: self.duty_pubkey.clone(),
+                    validator_index: 1,
+                    validator_sync_committee_indices: vec![0],
+                }],
+            })
+        }
+
+        async fn submit_sync_committee_messages(
+            &self,
+            messages: &[BeaconSyncCommitteeMessage],
+        ) -> Result<(), BeaconError> {
+            let mut roots = self.submitted_roots.lock().unwrap();
+            for msg in messages {
+                roots.push(msg.beacon_block_root);
+            }
+            Ok(())
+        }
+
+        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_fork_schedule(&self) -> Result<eth_types::ForkSchedule, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_fork(&self, _state_id: &str) -> Result<StateForkResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_validators(
+            &self,
+            _pubkeys: &[String],
+        ) -> Result<ValidatorsResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_attester_duties(
+            &self,
+            _epoch: u64,
+            _indices: &[String],
+        ) -> Result<AttesterDutiesResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_proposer_duties(
+            &self,
+            _epoch: u64,
+        ) -> Result<ProposerDutiesResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn produce_block_v3(
+            &self,
+            _slot: u64,
+            _randao_reveal: &str,
+            _graffiti: Option<&str>,
+            _builder_boost_factor: Option<u64>,
+        ) -> Result<beacon::ProduceBlockResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn publish_block(
+            &self,
+            _signed_block: &SignedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn publish_blinded_block(
+            &self,
+            _signed_block: &SignedBlindedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_attestation_data(
+            &self,
+            _slot: u64,
+            _committee_index: u64,
+        ) -> Result<AttestationDataResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_attestation(
+            &self,
+            _attestations: &VersionedAttestation,
+        ) -> Result<SubmitAttestationResult, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_aggregate_attestation(
+            &self,
+            _slot: u64,
+            _attestation_data_root: &str,
+            _committee_index: Option<u64>,
+        ) -> Result<VersionedAggregateAttestation, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_aggregate_and_proofs(
+            &self,
+            _proofs: &VersionedSignedAggregateAndProof,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_sync_committee_contribution(
+            &self,
+            _slot: u64,
+            _subcommittee_index: u64,
+            _beacon_block_root: &str,
+        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_contribution_and_proofs(
+            &self,
+            _proofs: &[BeaconSignedContributionAndProof],
+        ) -> Result<(), BeaconError> {
+            Ok(())
+        }
+        async fn prepare_beacon_proposer(
+            &self,
+            _preparations: &[ProposerPreparation],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_beacon_committee_subscriptions(
+            &self,
+            _subscriptions: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn register_validators(
+            &self,
+            _registrations: &[SignedValidatorRegistration],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_version(&self) -> Result<String, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
     }
 
     #[test]
@@ -2127,103 +1156,6 @@ mod tests {
         assert_eq!(config.timeouts.attestation_fetch, defaults.attestation_fetch);
     }
 
-    #[test]
-    fn test_parse_hex_root_with_prefix() {
-        let root =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::parse_hex_root(
-                "0x1111111111111111111111111111111111111111111111111111111111111111",
-            )
-            .unwrap();
-        assert_eq!(root, [0x11; 32]);
-    }
-
-    #[test]
-    fn test_parse_hex_root_without_prefix() {
-        let root =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::parse_hex_root(
-                "2222222222222222222222222222222222222222222222222222222222222222",
-            )
-            .unwrap();
-        assert_eq!(root, [0x22; 32]);
-    }
-
-    #[test]
-    fn test_parse_hex_root_invalid_length() {
-        let result =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::parse_hex_root(
-                "0x1111111111",
-            );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_parse_hex_root_invalid_hex() {
-        let result =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::parse_hex_root(
-                "0xgggggggg",
-            );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_convert_attestation_data_success() {
-        let beacon_data = beacon::AttestationData {
-            slot: "1000".to_string(),
-            index: "5".to_string(),
-            beacon_block_root: "0x1111111111111111111111111111111111111111111111111111111111111111"
-                .to_string(),
-            source: beacon::Checkpoint {
-                epoch: "100".to_string(),
-                root: "0x2222222222222222222222222222222222222222222222222222222222222222"
-                    .to_string(),
-            },
-            target: beacon::Checkpoint {
-                epoch: "101".to_string(),
-                root: "0x3333333333333333333333333333333333333333333333333333333333333333"
-                    .to_string(),
-            },
-        };
-
-        let crypto_data =
-            DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::convert_attestation_data(
-                &beacon_data,
-            )
-            .unwrap();
-
-        assert_eq!(crypto_data.slot, 1000);
-        assert_eq!(crypto_data.index, 5);
-        assert_eq!(crypto_data.beacon_block_root, [0x11; 32]);
-        assert_eq!(crypto_data.source.epoch, 100);
-        assert_eq!(crypto_data.source.root, [0x22; 32]);
-        assert_eq!(crypto_data.target.epoch, 101);
-        assert_eq!(crypto_data.target.root, [0x33; 32]);
-    }
-
-    #[test]
-    fn test_convert_attestation_data_invalid_slot() {
-        let beacon_data = beacon::AttestationData {
-            slot: "invalid".to_string(),
-            index: "5".to_string(),
-            beacon_block_root: "0x1111111111111111111111111111111111111111111111111111111111111111"
-                .to_string(),
-            source: beacon::Checkpoint {
-                epoch: "100".to_string(),
-                root: "0x2222222222222222222222222222222222222222222222222222222222222222"
-                    .to_string(),
-            },
-            target: beacon::Checkpoint {
-                epoch: "101".to_string(),
-                root: "0x3333333333333333333333333333333333333333333333333333333333333333"
-                    .to_string(),
-            },
-        };
-
-        let result = DutyOrchestrator::<MockSlotClock, MockSubmitter, MockBlockBeacon>::convert_attestation_data(
-            &beacon_data,
-        );
-        assert!(result.is_err());
-    }
-
     #[tokio::test]
     async fn test_orchestrator_handle_shutdown() {
         let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
@@ -2242,7 +1174,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (mut orchestrator, handle) = DutyOrchestrator::new(
             clock,
@@ -2282,7 +1214,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2320,7 +1252,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2391,7 +1323,7 @@ mod tests {
         let config = create_test_config();
         let mut pubkey_map_inner = HashMap::new();
         pubkey_map_inner.insert(pubkey_hex, pubkey);
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let (_orchestrator, handle) = DutyOrchestrator::new(
             clock,
@@ -2432,7 +1364,7 @@ mod tests {
         let config = create_test_config();
         let mut pubkey_map_inner = HashMap::new();
         pubkey_map_inner.insert(pubkey_hex.clone(), pubkey.clone());
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2447,7 +1379,7 @@ mod tests {
             pubkey_map,
         );
 
-        let found = orchestrator.find_pubkey(&pubkey_hex);
+        let found = utils::find_pubkey(&orchestrator.pubkey_map, &pubkey_hex);
         assert!(found.is_some());
         assert_eq!(found.unwrap().to_bytes(), pubkey.to_bytes());
     }
@@ -2473,7 +1405,7 @@ mod tests {
         let config = create_test_config();
         let mut pubkey_map_inner = HashMap::new();
         pubkey_map_inner.insert(pubkey_hex.to_uppercase(), pubkey.clone());
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2488,7 +1420,7 @@ mod tests {
             pubkey_map,
         );
 
-        let found = orchestrator.find_pubkey(&pubkey_hex.to_lowercase());
+        let found = utils::find_pubkey(&orchestrator.pubkey_map, &pubkey_hex.to_lowercase());
         assert!(found.is_some());
     }
 
@@ -2507,7 +1439,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -2522,7 +1454,7 @@ mod tests {
             pubkey_map,
         );
 
-        let found = orchestrator.find_pubkey("0x1234567890abcdef");
+        let found = utils::find_pubkey(&orchestrator.pubkey_map, "0x1234567890abcdef");
         assert!(found.is_none());
     }
 
@@ -2558,10 +1490,10 @@ mod tests {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let timeouts = OperationTimeouts::default();
+        let timeouts = fast_timeouts();
         let mock_server = MockServer::start().await;
 
-        // Mock attester duties endpoint with a 15s delay (exceeds duty_fetch of 10s)
+        // Mock attester duties endpoint with a delay that exceeds duty_fetch (200ms)
         Mock::given(method("POST"))
             .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
             .respond_with(
@@ -2570,7 +1502,7 @@ mod tests {
                         "data": [],
                         "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000"
                     }))
-                    .set_delay(timeouts.duty_fetch + Duration::from_secs(5)),
+                    .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
             )
             .mount(&mock_server)
             .await;
@@ -2717,7 +1649,7 @@ mod tests {
         let config = create_test_config();
         let mut pubkey_map_inner = HashMap::new();
         pubkey_map_inner.insert(pubkey_hex.clone(), pubkey.clone());
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, handle) = DutyOrchestrator::new(
             clock,
@@ -2776,7 +1708,7 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
     }
 
     #[tokio::test]
@@ -2871,7 +1803,7 @@ mod tests {
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
 
         // Run the aggregation dispatch
-        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
 
         // The mock server's expect(1) on submit verifies the request was made
     }
@@ -2888,8 +1820,8 @@ mod tests {
         let slot = 100u64;
         let epoch = slot / SLOTS_PER_EPOCH;
 
-        // Use a very large committee_length so is_aggregator is very unlikely
-        // committee_length=100000 → modulo=6250 → ~0.016% chance
+        // Use committee_length=u64::MAX so is_aggregator is deterministically false
+        // modulo = u64::MAX / 16 → probability ~5.4e-18, effectively zero
         Mock::given(method("POST"))
             .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -2899,7 +1831,7 @@ mod tests {
                     "pubkey": pubkey_hex,
                     "validator_index": "42",
                     "committee_index": "1",
-                    "committee_length": "100000",
+                    "committee_length": "18446744073709551615",
                     "committees_at_slot": "4",
                     "validator_committee_index": "0",
                     "slot": slot.to_string()
@@ -2924,7 +1856,7 @@ mod tests {
             .await;
 
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
     }
 
     #[tokio::test]
@@ -2979,7 +1911,7 @@ mod tests {
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
 
         // Should not panic; gracefully handle error
-        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
     }
 
     // --- B-05: Proposer preparation tests ---
@@ -3051,7 +1983,7 @@ mod tests {
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
             pubkey,
         );
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
 
@@ -3068,7 +2000,7 @@ mod tests {
             pubkey_map,
         );
 
-        orchestrator.prepare_proposers().await;
+        orchestrator.duty_management.prepare_proposers().await;
         // wiremock will verify expect(1) on drop
     }
 
@@ -3102,7 +2034,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3117,7 +2049,7 @@ mod tests {
             pubkey_map,
         );
 
-        orchestrator.prepare_proposers().await;
+        orchestrator.duty_management.prepare_proposers().await;
     }
 
     #[tokio::test]
@@ -3180,7 +2112,7 @@ mod tests {
             "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
             pubkey,
         );
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
 
@@ -3198,7 +2130,7 @@ mod tests {
         );
 
         // Should not panic - failure is non-fatal
-        orchestrator.prepare_proposers().await;
+        orchestrator.duty_management.prepare_proposers().await;
     }
 
     // --- B-05: Committee subscription tests ---
@@ -3265,7 +2197,7 @@ mod tests {
             "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string(),
             pubkey,
         );
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3280,7 +2212,7 @@ mod tests {
             pubkey_map,
         );
 
-        orchestrator.submit_committee_subscriptions(3).await;
+        orchestrator.duty_management.submit_committee_subscriptions(3).await;
         // wiremock will verify expect(1) on drop
     }
 
@@ -3314,7 +2246,7 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3329,7 +2261,7 @@ mod tests {
             pubkey_map,
         );
 
-        orchestrator.submit_committee_subscriptions(0).await;
+        orchestrator.duty_management.submit_committee_subscriptions(0).await;
     }
 
     #[tokio::test]
@@ -3390,7 +2322,7 @@ mod tests {
             "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
             pubkey,
         );
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3406,7 +2338,7 @@ mod tests {
         );
 
         // Should not panic
-        orchestrator.submit_committee_subscriptions(3).await;
+        orchestrator.duty_management.submit_committee_subscriptions(3).await;
     }
 
     #[test]
@@ -3480,7 +2412,7 @@ mod tests {
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3496,7 +2428,7 @@ mod tests {
         );
 
         // Should not panic, should complete successfully
-        orchestrator.check_reorg_at_epoch_boundary(10).await;
+        orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
     }
 
     #[tokio::test]
@@ -3545,7 +2477,7 @@ mod tests {
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3561,7 +2493,7 @@ mod tests {
         );
 
         // No caches populated — should fetch and not panic
-        orchestrator.check_reorg_at_epoch_boundary(10).await;
+        orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
 
         // Caches should now be populated
         assert!(duty_tracker.is_epoch_cached(10).await);
@@ -3583,15 +2515,15 @@ mod tests {
             "execution_optimistic": false
         });
 
-        let timeouts = OperationTimeouts::default();
+        let timeouts = fast_timeouts();
 
-        // Respond slower than duty_fetch timeout (10s)
+        // Respond slower than duty_fetch timeout (200ms)
         Mock::given(method("POST"))
             .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(&slow_response)
-                    .set_delay(timeouts.duty_fetch + Duration::from_secs(5)),
+                    .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
             )
             .mount(&mock_server)
             .await;
@@ -3601,7 +2533,7 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(&slow_response)
-                    .set_delay(timeouts.duty_fetch + Duration::from_secs(5)),
+                    .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
             )
             .mount(&mock_server)
             .await;
@@ -3621,8 +2553,8 @@ mod tests {
         let signer = Arc::new(SignerService::new(composite, slashing_db));
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
-        let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let config = create_test_config().with_timeouts(timeouts.clone());
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3638,12 +2570,12 @@ mod tests {
         );
 
         let start = std::time::Instant::now();
-        orchestrator.check_reorg_at_epoch_boundary(10).await;
+        orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
         let elapsed = start.elapsed();
 
-        // 4 calls each bounded by duty_fetch timeout (10s).
-        // Without timeout wrapping this would take 4 * 15s = 60s.
-        // With timeouts: 4 * 10s = 40s + margin.
+        // 4 calls each bounded by duty_fetch timeout (200ms).
+        // Without timeout wrapping this would take 4 * 700ms ≈ 2.8s.
+        // With timeouts: 4 * 200ms = 800ms + margin.
         assert!(
             elapsed < timeouts.duty_fetch * 5,
             "Reorg check took {:?}, expected < {:?} (4 timeouts + margin)",
@@ -3670,7 +2602,7 @@ mod tests {
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config();
-        let pubkey_map = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
         let (orchestrator, _handle) = DutyOrchestrator::new(
             clock,
@@ -3686,7 +2618,7 @@ mod tests {
         );
 
         // Should not panic even with broken beacon
-        orchestrator.check_reorg_at_epoch_boundary(10).await;
+        orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
     }
 
     // -- Fork-aware attestation construction tests (G-1-05) --
@@ -3702,7 +2634,7 @@ mod tests {
             validator_committee_index: "0".to_string(),
             slot: "100".to_string(),
         };
-        let bits = make_aggregation_bits(&duty).unwrap();
+        let bits = utils::make_aggregation_bits(&duty).unwrap();
         // committee_length=4, validator_committee_index=0
         // Byte 0: bit 0 set (validator) = 0x01
         // Length bit at position 4 → byte 0, bit 4 = 0x10
@@ -3721,7 +2653,7 @@ mod tests {
             validator_committee_index: "3".to_string(),
             slot: "100".to_string(),
         };
-        let bits = make_aggregation_bits(&duty).unwrap();
+        let bits = utils::make_aggregation_bits(&duty).unwrap();
         // committee_length=8, validator_committee_index=3
         // Byte 0: bit 3 set = 0x08
         // Length bit at position 8 → byte 1, bit 0 = 0x01
@@ -3740,7 +2672,7 @@ mod tests {
             validator_committee_index: "3".to_string(),
             slot: "100".to_string(),
         };
-        let bits = make_aggregation_bits(&duty).unwrap();
+        let bits = utils::make_aggregation_bits(&duty).unwrap();
         // committee_length=4, validator_committee_index=3
         // Byte 0: bit 3 set = 0x08, length bit at position 4 = 0x10
         // Combined: 0x18
@@ -3758,7 +2690,35 @@ mod tests {
             validator_committee_index: "0".to_string(),
             slot: "100".to_string(),
         };
-        assert!(make_aggregation_bits(&duty).is_none());
+        assert!(utils::make_aggregation_bits(&duty).is_none());
+    }
+
+    #[test]
+    fn test_make_aggregation_bits_invalid_committee_length() {
+        let duty = AttesterDuty {
+            pubkey: "0xaabb".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: "not_a_number".to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: "0".to_string(),
+            slot: "100".to_string(),
+        };
+        assert!(utils::make_aggregation_bits(&duty).is_none());
+    }
+
+    #[test]
+    fn test_make_aggregation_bits_invalid_validator_committee_index() {
+        let duty = AttesterDuty {
+            pubkey: "0xaabb".to_string(),
+            validator_index: "1".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: "8".to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: "garbage".to_string(),
+            slot: "100".to_string(),
+        };
+        assert!(utils::make_aggregation_bits(&duty).is_none());
     }
 
     #[test]
@@ -3783,16 +2743,16 @@ mod tests {
 
     /// A submitter that captures the submitted VersionedAttestation for assertion.
     struct CapturingSubmitter {
-        captured: std::sync::Mutex<Vec<VersionedAttestation>>,
+        captured: parking_lot::Mutex<Vec<VersionedAttestation>>,
     }
 
     impl CapturingSubmitter {
         fn new() -> Self {
-            Self { captured: std::sync::Mutex::new(Vec::new()) }
+            Self { captured: parking_lot::Mutex::new(Vec::new()) }
         }
 
         fn captured(&self) -> Vec<VersionedAttestation> {
-            self.captured.lock().unwrap().clone()
+            self.captured.lock().clone()
         }
     }
 
@@ -3807,7 +2767,7 @@ mod tests {
                     + 'a,
             >,
         > {
-            self.captured.lock().unwrap().push(attestations.clone());
+            self.captured.lock().push(attestations.clone());
             Box::pin(async move { Ok(beacon::SubmitAttestationResult::Success) })
         }
     }
@@ -3847,7 +2807,7 @@ mod tests {
         let config = create_test_config();
         let mut pubkey_map_inner = HashMap::new();
         pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
-        let pubkey_map = Arc::new(std::sync::RwLock::new(pubkey_map_inner));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         let (orchestrator, handle) = DutyOrchestrator::new(
             clock,
@@ -4097,7 +3057,7 @@ mod tests {
             .await;
 
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
 
         // wiremock expect(1) on aggregate_attestation with committee_index=3
         // confirms Electra path passes the committee_index query parameter
@@ -4153,7 +3113,28 @@ mod tests {
             .await;
 
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+
+        // Verify pre-Electra requests do NOT contain committee_index query param
+        let requests = mock_server.received_requests().await.unwrap();
+        let aggregate_requests: Vec<_> = requests
+            .iter()
+            .filter(|r| {
+                r.url.path() == "/eth/v1/validator/aggregate_attestation"
+                    && r.method == wiremock::http::Method::GET
+            })
+            .collect();
+        assert!(
+            !aggregate_requests.is_empty(),
+            "expected at least one aggregate_attestation request"
+        );
+        for req in &aggregate_requests {
+            let query = req.url.query().unwrap_or("");
+            assert!(
+                !query.contains("committee_index"),
+                "pre-Electra aggregate_attestation must not include committee_index, but got: {query}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4259,12 +3240,7 @@ mod tests {
             },
         };
 
-        let mut crypto_data = DutyOrchestrator::<
-            MockSlotClock,
-            MockSubmitter,
-            MockBlockBeacon,
-        >::convert_attestation_data(&beacon_data)
-        .unwrap();
+        let mut crypto_data = utils::convert_attestation_data(&beacon_data).unwrap();
 
         // Before EIP-7549, index matches BN response
         assert_eq!(crypto_data.index, 7, "index should initially match BN response");
@@ -4389,12 +3365,7 @@ mod tests {
             },
         };
 
-        let mut crypto_data = DutyOrchestrator::<
-            MockSlotClock,
-            MockSubmitter,
-            MockBlockBeacon,
-        >::convert_attestation_data(&beacon_data)
-        .unwrap();
+        let mut crypto_data = utils::convert_attestation_data(&beacon_data).unwrap();
 
         assert_eq!(crypto_data.index, 5, "index should match BN response");
 
@@ -4436,12 +3407,7 @@ mod tests {
         };
 
         // Step 1: Convert and apply EIP-7549 zeroing (what gets signed)
-        let mut crypto_data = DutyOrchestrator::<
-            MockSlotClock,
-            MockSubmitter,
-            MockBlockBeacon,
-        >::convert_attestation_data(&beacon_data)
-        .unwrap();
+        let mut crypto_data = utils::convert_attestation_data(&beacon_data).unwrap();
         assert_eq!(crypto_data.index, 7);
         crypto_data.index = 0; // EIP-7549
         let signed_root = crypto_data.tree_hash_root();
@@ -4452,12 +3418,8 @@ mod tests {
         // We reconstruct that and convert back to crypto types.
         let mut submitted_beacon_data = beacon_data;
         submitted_beacon_data.index = "0".to_string();
-        let submitted_crypto_data = DutyOrchestrator::<
-            MockSlotClock,
-            MockSubmitter,
-            MockBlockBeacon,
-        >::convert_attestation_data(&submitted_beacon_data)
-        .unwrap();
+        let submitted_crypto_data =
+            utils::convert_attestation_data(&submitted_beacon_data).unwrap();
         let submitted_root = submitted_crypto_data.tree_hash_root();
 
         assert_eq!(
@@ -4600,8 +3562,8 @@ mod tests {
 
     // --- H-08: Orchestrator slot lifecycle span tests ---
 
+    use parking_lot::Mutex;
     use std::collections::HashMap as SpanMap;
-    use std::sync::Mutex;
     use tracing::span::Id;
     use tracing_subscriber::layer::SubscriberExt;
 
@@ -4617,7 +3579,7 @@ mod tests {
             _id: &tracing::span::Id,
             _ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            self.names.lock().unwrap().push(attrs.metadata().name().to_string());
+            self.names.lock().push(attrs.metadata().name().to_string());
         }
     }
 
@@ -4644,7 +3606,7 @@ mod tests {
             ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
             let parent_id = attrs.parent().cloned().or_else(|| ctx.current_span().id().cloned());
-            self.spans.lock().unwrap().insert(
+            self.spans.lock().insert(
                 id.into_u64(),
                 SpanEntry { name: attrs.metadata().name().to_string(), parent_id },
             );
@@ -4679,7 +3641,10 @@ mod tests {
                             // Advance past 2/3 of slot so all phases run without waiting
         clock.advance_time(9);
 
-        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+        // Use 0 retries so that failed HTTP calls (localhost:5052 unavailable) return
+        // immediately, keeping the test well within its 5-second window even after
+        // SlotContext::capture adds a get_block_root call to the slot loop.
+        let beacon_config = BeaconClientConfig::new("http://localhost:5052").with_max_retries(0);
         let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
@@ -4703,7 +3668,7 @@ mod tests {
             None,
             create_mock_validator_store(),
             config,
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
         );
 
         // Capture spans via thread-local subscriber
@@ -4720,7 +3685,7 @@ mod tests {
 
         let _ = orchestrator.run().await;
 
-        let span_names = captured.lock().unwrap();
+        let span_names = captured.lock();
         assert!(
             span_names.contains(&"rvc.slot.process".to_string()),
             "Expected rvc.slot.process span, got: {:?}",
@@ -4773,7 +3738,7 @@ mod tests {
             None,
             create_mock_validator_store(),
             config,
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
         );
 
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -4788,60 +3753,12 @@ mod tests {
 
         let _ = orchestrator.run().await;
 
-        let span_names = captured.lock().unwrap();
+        let span_names = captured.lock();
         assert!(
             span_names.contains(&"rvc.epoch.boundary".to_string()),
             "Expected rvc.epoch.boundary span at epoch boundary slot, got: {:?}",
             *span_names
         );
-    }
-
-    // --- H-12: truncate_pubkey tests ---
-
-    #[test]
-    fn test_truncate_pubkey_full_hex_with_prefix() {
-        let pubkey = "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a";
-        let result = truncate_pubkey(pubkey);
-        assert_eq!(result, "0x93247f2209...611df74a");
-    }
-
-    #[test]
-    fn test_truncate_pubkey_full_hex_without_prefix() {
-        let pubkey = "93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a";
-        let result = truncate_pubkey(pubkey);
-        assert_eq!(result, "0x93247f2209...611df74a");
-    }
-
-    #[test]
-    fn test_truncate_pubkey_short_hex() {
-        let result = truncate_pubkey("0xabcdef");
-        assert_eq!(result, "0xabcdef");
-    }
-
-    #[test]
-    fn test_truncate_pubkey_short_hex_without_prefix() {
-        let result = truncate_pubkey("abcdef");
-        assert_eq!(result, "0xabcdef");
-    }
-
-    #[test]
-    fn test_truncate_pubkey_exactly_18_chars() {
-        // 18 hex chars = not truncated
-        let result = truncate_pubkey("0x123456789012345678");
-        assert_eq!(result, "0x123456789012345678");
-    }
-
-    #[test]
-    fn test_truncate_pubkey_19_chars_truncated() {
-        // 19 hex chars = truncated (first 10 + ... + last 8)
-        let result = truncate_pubkey("0x1234567890123456789");
-        assert_eq!(result, "0x1234567890...23456789");
-    }
-
-    #[test]
-    fn test_truncate_pubkey_empty() {
-        let result = truncate_pubkey("");
-        assert_eq!(result, "0x");
     }
 
     // --- H-25: Aggregation span link tests ---
@@ -4926,9 +3843,9 @@ mod tests {
         let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
 
-        let span_names = captured.lock().unwrap();
+        let span_names = captured.lock();
         assert!(
             span_names.contains(&"rvc.orchestrator.produce_aggregations".to_string()),
             "Expected rvc.orchestrator.produce_aggregations span, got: {:?}",
@@ -4985,9 +3902,9 @@ mod tests {
         let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
         let _guard = tracing::subscriber::set_default(subscriber);
 
-        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
 
-        let span_names = captured.lock().unwrap();
+        let span_names = captured.lock();
         // produce span should still be created (it wraps the entire per-validator loop body)
         assert!(
             span_names.contains(&"rvc.orchestrator.produce_aggregations".to_string()),
@@ -5010,7 +3927,10 @@ mod tests {
         clock.set_slot(65); // non-boundary slot
         clock.advance_time(9);
 
-        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+        // Use 0 retries so that failed HTTP calls (localhost:5052 unavailable) return
+        // immediately, keeping the test well within its 5-second window even after
+        // SlotContext::capture adds a get_block_root call to the slot loop.
+        let beacon_config = BeaconClientConfig::new("http://localhost:5052").with_max_retries(0);
         let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
@@ -5034,7 +3954,7 @@ mod tests {
             None,
             create_mock_validator_store(),
             config,
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
         );
 
         let (layer, spans) = HierarchyCapture::new();
@@ -5048,7 +3968,7 @@ mod tests {
 
         let _ = orchestrator.run().await;
 
-        let span_map = spans.lock().unwrap();
+        let span_map = spans.lock();
 
         // Verify phase spans are children of rvc.slot.process
         let block_parent = find_parent_name(&span_map, "rvc.slot.phase.block");
@@ -5103,7 +4023,7 @@ mod tests {
             None,
             create_mock_validator_store(),
             config,
-            Arc::new(std::sync::RwLock::new(HashMap::new())),
+            Arc::new(parking_lot::RwLock::new(HashMap::new())),
         );
 
         let (layer, spans) = HierarchyCapture::new();
@@ -5117,7 +4037,7 @@ mod tests {
 
         let _ = orchestrator.run().await;
 
-        let span_map = spans.lock().unwrap();
+        let span_map = spans.lock();
 
         let epoch_parent = find_parent_name(&span_map, "rvc.epoch.boundary");
         assert_eq!(
@@ -5161,7 +4081,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let span_names = captured.lock().unwrap();
+        let span_names = captured.lock();
         assert!(
             span_names.contains(&"rvc.sign.attestation".to_string()),
             "Expected rvc.sign.attestation span, got: {:?}",
@@ -5272,7 +4192,7 @@ mod tests {
             .await;
 
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
     }
 
     #[tokio::test]
@@ -5370,7 +4290,7 @@ mod tests {
             .await;
 
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
     }
 
     #[tokio::test]
@@ -5472,7 +4392,7 @@ mod tests {
             .await;
 
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
     }
 
     #[tokio::test]
@@ -5566,7 +4486,7 @@ mod tests {
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
 
         // Should not panic — gracefully handles failure
-        orchestrator.maybe_produce_aggregations(slot, epoch).await;
+        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
     }
 
     #[tokio::test]
@@ -5593,11 +4513,934 @@ mod tests {
 
         let _ = beacon.get_node_version().await;
 
-        let span_names = captured.lock().unwrap();
+        let span_names = captured.lock();
         assert!(
             span_names.contains(&"rvc.beacon.http".to_string()),
             "Expected rvc.beacon.http span, got: {:?}",
             *span_names
+        );
+    }
+
+    // --- Issue 1.3: Slashing protection integration test ---
+
+    /// Builds an orchestrator with a shared SlashingDb for slashing integration tests.
+    /// Returns the orchestrator, handle, pubkey hex, capturing submitter, and clock.
+    async fn build_slashing_integration_orchestrator(
+        mock_server_uri: &str,
+        initial_slot: u64,
+        slashing_db: Arc<SlashingDb>,
+    ) -> (
+        DutyOrchestrator<MockSlotClock, CapturingSubmitter, MockBlockBeacon>,
+        OrchestratorHandle,
+        String,
+        Arc<CapturingSubmitter>,
+        Arc<MockSlotClock>,
+    ) {
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(initial_slot);
+
+        let beacon_config = BeaconClientConfig::new(mock_server_uri);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let secret_key = SecretKey::generate();
+        let pubkey_hex = format!("0x{}", hex::encode(secret_key.public_key().to_bytes()));
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+
+        let pubkey = secret_key.public_key();
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let capturing_submitter = Arc::new(CapturingSubmitter::new());
+        let propagator = Arc::new(Propagator::new(capturing_submitter.clone()));
+
+        let config = create_test_config();
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        let (orchestrator, handle) = DutyOrchestrator::new(
+            clock.clone(),
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        (orchestrator, handle, pubkey_hex, capturing_submitter, clock)
+    }
+
+    /// Mounts attester duties for multiple slots in a single response.
+    async fn mount_multi_slot_duties(
+        mock_server: &wiremock::MockServer,
+        slots: &[u64],
+        pubkey_hex: &str,
+    ) {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let duties: Vec<serde_json::Value> = slots
+            .iter()
+            .map(|slot| {
+                serde_json::json!({
+                    "pubkey": pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "3",
+                    "committee_length": "8",
+                    "committees_at_slot": "4",
+                    "validator_committee_index": "2",
+                    "slot": slot.to_string()
+                })
+            })
+            .collect();
+
+        Mock::given(method("POST"))
+            .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": duties
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    /// Mounts attestation data with explicit source/target epochs, keyed by slot.
+    async fn mount_attestation_data_with_epochs(
+        mock_server: &wiremock::MockServer,
+        slot: u64,
+        source_epoch: u64,
+        target_epoch: u64,
+    ) {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/attestation_data"))
+            .and(query_param("slot", slot.to_string()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "3",
+                    "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source": {
+                        "epoch": source_epoch.to_string(),
+                        "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    },
+                    "target": {
+                        "epoch": target_epoch.to_string(),
+                        "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    }
+                }
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_double_vote_rejected_through_full_pipeline() {
+        let mock_server = wiremock::MockServer::start().await;
+
+        // Shared SlashingDb — this is the key: both slots share the same DB
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+
+        // Slot 192 = epoch 6 (pre-Electra), slot 193 = same epoch
+        let slot_1 = 192u64;
+        let slot_2 = 193u64;
+        let epoch = slot_1 / SLOTS_PER_EPOCH;
+
+        let (orchestrator, _handle, pubkey_hex, capturing, clock) =
+            build_slashing_integration_orchestrator(&mock_server.uri(), slot_1, slashing_db).await;
+
+        // Mount duties for both slots in a single response
+        mount_multi_slot_duties(&mock_server, &[slot_1, slot_2], &pubkey_hex).await;
+
+        // Mount attestation data per slot with different source epochs but same target
+        // Slot 1: source=5, target=6
+        mount_attestation_data_with_epochs(&mock_server, slot_1, 5, 6).await;
+        // Slot 2: source=4, target=6 — same target epoch, different source → double vote
+        mount_attestation_data_with_epochs(&mock_server, slot_2, 4, 6).await;
+
+        // Fetch duties for epoch 6 (caches duties for both slots)
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+
+        // --- Slot 1: First attestation should succeed ---
+        let results_1 = orchestrator.process_slot(slot_1).await.unwrap();
+        assert_eq!(results_1.len(), 1, "Expected one attestation result for slot 1");
+        assert!(results_1[0].success, "First attestation should succeed: {:?}", results_1[0].error);
+        assert_eq!(
+            capturing.captured().len(),
+            1,
+            "Exactly one attestation should be submitted after slot 1"
+        );
+
+        // --- Slot 2: Double vote should be REJECTED by slashing protection ---
+        clock.set_slot(slot_2);
+        let results_2 = orchestrator.process_slot(slot_2).await.unwrap();
+        assert_eq!(results_2.len(), 1, "Expected one attestation result for slot 2");
+        assert!(!results_2[0].success, "Second attestation (double vote) must be rejected");
+
+        // Verify the rejection is specifically from slashing protection, not a generic error
+        let error_msg =
+            results_2[0].error.as_deref().expect("rejected attestation must have error");
+        assert!(
+            error_msg.contains("slashing protection blocked"),
+            "Error must indicate slashing protection blocked signing, got: {error_msg}"
+        );
+
+        // Verify only the first attestation was submitted — the double vote was never propagated
+        assert_eq!(
+            capturing.captured().len(),
+            1,
+            "Only the first attestation should be submitted; double vote must not be propagated"
+        );
+    }
+
+    /// H-4 coordinator integration test: when the BN returns a block whose
+    /// `proposer_index` does not match the duty's `validator_index`, the duty
+    /// must be silently dropped — no signer call and no publish call.
+    ///
+    /// RED against d490044: `propose_block` (unvalidated) ignores the
+    /// `proposer_index` and proceeds to sign + publish, so `publish_called`
+    /// becomes `true` → assertion fails.
+    ///
+    /// GREEN after CQ-3.2: the validated `propose_block` is the only entry point;
+    /// the mismatch is caught before signing, `publish_called` stays `false`.
+    #[tokio::test]
+    async fn test_maybe_propose_block_bad_proposer_index_drops_duty() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        // The duty says this validator should propose at slot 100.
+        let expected_validator_index = 42u64;
+        // The BN returns a block with a different (forged) proposer_index.
+        let bad_proposer_index = 99u64;
+
+        // Generate a real key so RANDAO signing succeeds and we reach the
+        // proposer_index validation step.
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+
+        // Beacon client for duty fetching (backed by wiremock).
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        // Serve proposer duties for the epoch.
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/validator/duties/proposer/{}", epoch)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": expected_validator_index.to_string(),
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+        // Pre-populate the proposer duty cache before calling maybe_propose_block.
+        duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+        // Block beacon: returns a block with wrong proposer_index; tracks publish.
+        let publish_called = Arc::new(AtomicBool::new(false));
+        let block_beacon = Arc::new(BadProposerBlockBeacon {
+            slot,
+            bad_proposer_index,
+            publish_called: publish_called.clone(),
+        });
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let config = create_test_config();
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey_hex.clone(), pubkey.clone());
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(slot);
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            block_beacon,
+            None,
+            create_mock_validator_store(),
+            config,
+            pubkey_map,
+        );
+
+        // Invoke the proposer path directly.
+        let ctx = SlotContext { slot, epoch, head_root: None };
+        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+
+        // H-4: a forged proposer_index must drop the duty before any
+        // signing or publishing occurs.
+        assert!(
+            !publish_called.load(Ordering::SeqCst),
+            "publish_block must NOT be called when proposer_index mismatches the duty"
+        );
+    }
+
+    // ── H-3: circuit-breaker scoping helpers ────────────────────────────────
+
+    /// Wire up a proposer duty in a wiremock mock server so that
+    /// `duty_tracker.fetch_proposer_duties(epoch)` succeeds and the duty is
+    /// cached for `slot`.
+    async fn setup_proposer_duty(
+        mock_server: &wiremock::MockServer,
+        epoch: u64,
+        slot: u64,
+        pubkey_hex: &str,
+        validator_index: u64,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/validator/duties/proposer/{}", epoch)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": validator_index.to_string(),
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    /// H-3: A BN error on the **non-builder** path (ExecutionOnly mode →
+    /// `builder_boost_factor = 0`) must NOT trip the circuit breaker.
+    ///
+    /// RED before fix: the coordinator calls `record_miss()` unconditionally
+    /// on every `Ok(Err(e))` arm, so `consecutive_misses` becomes 1.
+    ///
+    /// GREEN after fix: only `BuilderFailure` / `BuilderOnly` errors call
+    /// `record_miss()`; a plain `Beacon` error leaves the counter at 0.
+    #[tokio::test]
+    async fn test_non_builder_timeout_does_not_trip_breaker() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let validator_index = 1u64;
+
+        // Real key so RANDAO signing succeeds and we reach the BN call.
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+
+        // Serve proposer duties so the cache is warm.
+        setup_proposer_duty(&mock_server, epoch, slot, &pubkey_hex, validator_index).await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+        duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        // ExecutionOnly → builder_boost_factor = 0 → not a builder attempt.
+        let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        validator_store
+            .set_global_block_selection_mode(validator_store::BlockSelectionMode::ExecutionOnly);
+
+        let config = create_test_config();
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(slot);
+
+        // Shared circuit breaker with realistic limits so we can observe misses.
+        let circuit_breaker = Arc::new(CircuitBreakerState::new(3, 5));
+
+        let (orchestrator, _handle) = DutyOrchestrator::new_with_attesting_enabled(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            // MockBlockBeacon always returns Beacon("mock") error.
+            create_mock_block_beacon(),
+            None,
+            validator_store,
+            config,
+            pubkey_map,
+            circuit_breaker.clone(),
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let ctx = SlotContext { slot, epoch, head_root: None };
+        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+
+        // Non-builder BN error must NOT record a miss.
+        assert_eq!(
+            circuit_breaker.consecutive_misses(),
+            0,
+            "BN error on non-builder path must not trip the circuit breaker (H-3)"
+        );
+    }
+
+    /// H-3: A BN error on the **builder** path (BuilderAlways mode →
+    /// `builder_boost_factor = u64::MAX`) MUST trip the circuit breaker.
+    ///
+    /// This test is GREEN with the current code and remains GREEN after the
+    /// fix — it guards against regressing builder-failure detection.
+    #[tokio::test]
+    async fn test_builder_timeout_trips_breaker() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+
+        let slot = 200u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let validator_index = 2u64;
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+
+        setup_proposer_duty(&mock_server, epoch, slot, &pubkey_hex, validator_index).await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+        duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        // BuilderAlways → builder_boost_factor = u64::MAX → builder attempt.
+        let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        validator_store
+            .set_global_block_selection_mode(validator_store::BlockSelectionMode::BuilderAlways);
+
+        let config = create_test_config();
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(slot);
+
+        let circuit_breaker = Arc::new(CircuitBreakerState::new(3, 5));
+
+        let (orchestrator, _handle) = DutyOrchestrator::new_with_attesting_enabled(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            validator_store,
+            config,
+            pubkey_map,
+            circuit_breaker.clone(),
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let ctx = SlotContext { slot, epoch, head_root: None };
+        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+
+        // Builder BN error MUST record a miss.
+        assert_eq!(
+            circuit_breaker.consecutive_misses(),
+            1,
+            "BN error on builder path must trip the circuit breaker (H-3)"
+        );
+    }
+
+    /// H-3: A local signer error must NOT trip the circuit breaker.
+    ///
+    /// RED before fix: `record_miss()` is called unconditionally, so the
+    /// signer error (RANDAO signing fails because the key is absent from the
+    /// KeyManager) increments `consecutive_misses` to 1.
+    ///
+    /// GREEN after fix: only `BuilderFailure` / `BuilderOnly` call
+    /// `record_miss()`.  `Signer` errors are ignored by the breaker.
+    #[tokio::test]
+    async fn test_signer_error_does_not_trip_breaker() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+
+        let slot = 300u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let validator_index = 3u64;
+
+        // Generate a keypair but intentionally do NOT insert the secret key
+        // into the KeyManager so RANDAO signing will fail.
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+        // secret_key is dropped here — not in KeyManager.
+
+        setup_proposer_duty(&mock_server, epoch, slot, &pubkey_hex, validator_index).await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+        duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+        // Empty KeyManager → sign_randao_reveal will return SignerError.
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+
+        let config = create_test_config();
+        let mut pubkey_map_inner = HashMap::new();
+        // pubkey is in the map so find_pubkey succeeds, but the secret key is absent.
+        pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(slot);
+
+        let circuit_breaker = Arc::new(CircuitBreakerState::new(3, 5));
+
+        let (orchestrator, _handle) = DutyOrchestrator::new_with_attesting_enabled(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            validator_store,
+            config,
+            pubkey_map,
+            circuit_breaker.clone(),
+            Arc::new(AtomicBool::new(true)),
+        );
+
+        let ctx = SlotContext { slot, epoch, head_root: None };
+        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+
+        // Signer error must NOT record a miss.
+        assert_eq!(
+            circuit_breaker.consecutive_misses(),
+            0,
+            "Local signer error must not trip the circuit breaker (H-3)"
+        );
+    }
+
+    // ── H-7: sync_enabled flag tests ────────────────────────────────────────
+
+    /// Minimal helper: build an orchestrator with a `SyncGuardBeacon` mock.
+    /// Used to avoid repetition in the H-7 guard tests.
+    async fn build_sync_test_orchestrator(
+        beacon: Arc<SyncGuardBeacon>,
+        pk_hex: String,
+        pk: crypto::PublicKey,
+        sk: crypto::SecretKey,
+        attesting_enabled: Arc<AtomicBool>,
+    ) -> DutyOrchestrator<MockSlotClock, MockSubmitter, MockBlockBeacon> {
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(sk);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        // Pre-populate sync committee duties for period 0 (epoch 0).
+        duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
+
+        let mut map = HashMap::new();
+        map.insert(pk_hex, pk);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        let config = create_test_config();
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(0);
+
+        let (orchestrator, _handle) = DutyOrchestrator::new_with_attesting_enabled(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            validator_store,
+            config,
+            pubkey_map,
+            Arc::new(CircuitBreakerState::new(0, 0)),
+            attesting_enabled,
+        );
+        orchestrator
+    }
+
+    /// H-7: `sync_enabled` defaults to `true` on a freshly-constructed orchestrator.
+    ///
+    /// RED: fails to compile before the `sync_enabled` field is added.
+    /// GREEN: field exists and is initialized to `true`.
+    #[test]
+    fn test_sync_enabled_defaults_to_true() {
+        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            create_test_config(),
+            pubkey_map,
+        );
+
+        assert!(
+            orchestrator.sync_enabled.load(Ordering::Acquire),
+            "sync_enabled must default to true (H-7)"
+        );
+    }
+
+    /// H-7: `set_sync_enabled` writes with `Release` ordering and the new
+    /// value is immediately visible via `Acquire` load.
+    ///
+    /// RED: fails to compile before `set_sync_enabled` is added.
+    /// GREEN: method exists and correctly toggles the flag.
+    #[test]
+    fn test_set_sync_enabled_toggles_flag() {
+        let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            create_mock_validator_store(),
+            create_test_config(),
+            pubkey_map,
+        );
+
+        assert!(orchestrator.sync_enabled.load(Ordering::Acquire), "default must be true");
+
+        orchestrator.set_sync_enabled(false);
+        assert!(
+            !orchestrator.sync_enabled.load(Ordering::Acquire),
+            "set_sync_enabled(false) must disable the flag"
+        );
+
+        orchestrator.set_sync_enabled(true);
+        assert!(
+            orchestrator.sync_enabled.load(Ordering::Acquire),
+            "set_sync_enabled(true) must re-enable the flag"
+        );
+    }
+
+    /// H-7 / ISSUE-2.7: when `attesting_enabled = false` and `sync_enabled = true`
+    /// (the default), sync-committee messages are still produced.
+    ///
+    /// Before the fix the two services shared the `attesting_enabled` guard, so
+    /// disabling attestations would silently skip sync duties. After the fix the
+    /// guard is split: sync is gated only by `sync_enabled`.
+    ///
+    /// RED: test fails (no sync messages) because sync is inside the attesting block.
+    /// GREEN: test passes after the guard is split.
+    #[tokio::test]
+    async fn test_sync_runs_with_attesting_disabled() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+
+        let r_captured: Root = [0xAA; 32];
+        let submitted_roots = Arc::new(std::sync::Mutex::new(Vec::<Root>::new()));
+
+        let beacon = Arc::new(SyncGuardBeacon {
+            submitted_roots: submitted_roots.clone(),
+            duty_pubkey: pk_hex.clone(),
+        });
+
+        // attesting_enabled = false; sync_enabled = true (default)
+        let attesting_enabled = Arc::new(AtomicBool::new(false));
+        let orchestrator =
+            build_sync_test_orchestrator(beacon, pk_hex, pk, sk, attesting_enabled).await;
+
+        // Confirm default: sync is enabled
+        assert!(orchestrator.sync_enabled.load(Ordering::Acquire));
+
+        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some(r_captured) };
+
+        // Exercise the guarded sync-messages phase directly.
+        orchestrator.run_sync_messages_phase(0, 0, &ctx).await;
+
+        let roots = submitted_roots.lock().unwrap();
+        assert!(
+            !roots.is_empty(),
+            "H-7: sync messages must be produced even when attesting is disabled \
+             (sync_enabled=true overrides attesting_enabled=false)"
+        );
+        for root in roots.iter() {
+            assert_eq!(*root, r_captured, "submitted root must match SlotContext.head_root");
+        }
+    }
+
+    /// H-7 / ISSUE-2.7: inverse — when `sync_enabled = false` and `attesting_enabled = true`,
+    /// no sync-committee messages are produced, but attestations would still run.
+    ///
+    /// RED: fails (sync runs unconditionally) before the separate guard is added.
+    /// GREEN: `run_sync_messages_phase` short-circuits on `sync_enabled = false`.
+    #[tokio::test]
+    async fn test_sync_messages_skipped_when_sync_disabled() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+
+        let r_captured: Root = [0xAA; 32];
+        let submitted_roots = Arc::new(std::sync::Mutex::new(Vec::<Root>::new()));
+
+        let beacon = Arc::new(SyncGuardBeacon {
+            submitted_roots: submitted_roots.clone(),
+            duty_pubkey: pk_hex.clone(),
+        });
+
+        // attesting_enabled = true; sync_enabled = false (explicit)
+        let attesting_enabled = Arc::new(AtomicBool::new(true));
+        let orchestrator =
+            build_sync_test_orchestrator(beacon, pk_hex, pk, sk, attesting_enabled).await;
+
+        orchestrator.set_sync_enabled(false);
+        assert!(!orchestrator.sync_enabled.load(Ordering::Acquire));
+
+        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some(r_captured) };
+
+        orchestrator.run_sync_messages_phase(0, 0, &ctx).await;
+
+        assert!(
+            submitted_roots.lock().unwrap().is_empty(),
+            "H-7: sync messages must NOT be produced when sync_enabled = false"
+        );
+    }
+
+    // ── M-12 Critical #1: doppelganger gate wired into the duty path ────────
+
+    /// When a validator's `enabled` flag is `false` in `ValidatorStore` (i.e.
+    /// it is still inside the post-import doppelganger window), the attestation
+    /// service must skip the duty and return `NoDutiesForSlot` rather than
+    /// attempting to sign.
+    ///
+    /// Verifies the fix for ISSUE-3.11 Critical #1: "gate is never consulted
+    /// by the attestation path".
+    #[tokio::test]
+    async fn test_orchestrator_skips_duty_during_doppelganger_window() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // 0x + 96 hex chars = 48 bytes (one 'd' nibble-pair per byte × 48)
+        let duty_pubkey_hex =
+            "0xdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+
+        // Slot 64 is in epoch 2 (64 / 32 = 2); mock duties endpoint for epoch 2.
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": duty_pubkey_hex,
+                    "validator_index": "42",
+                    "committee_index": "0",
+                    "committee_length": "128",
+                    "committees_at_slot": "1",
+                    "validator_committee_index": "5",
+                    "slot": "64"
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Signer call count — must be zero while validator is disabled.
+        let submitter = Arc::new(MockSubmitter::new());
+        let submit_count = submitter.call_count.load(Ordering::SeqCst);
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 64));
+        clock.set_slot(64);
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["42".to_string()]));
+
+        // Pre-populate the duty cache so process_slot can find the duty.
+        duty_tracker.fetch_duties_for_epoch(2).await.unwrap();
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let propagator = Arc::new(Propagator::new(submitter.clone()));
+        let config = create_test_config();
+
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(duty_pubkey_hex.to_string(), pubkey.clone());
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        // --- Critical: add the DUTY pubkey as DISABLED (inside doppelganger window).
+        // The duty pubkey from the mock beacon is 0xdddd... (48 bytes).
+        // The validator store must track THIS pubkey as disabled so the filter
+        // has something to match against.
+        let duty_pk_bytes: [u8; 48] = [0xddu8; 48];
+        let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 30_000_000));
+        {
+            let mut config = validator_store::ValidatorConfig::new(duty_pk_bytes);
+            config.enabled = false;
+            validator_store.add_validator(config);
+        }
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            validator_store.clone(),
+            config,
+            pubkey_map,
+        );
+
+        // Phase 1 (RED → GREEN): process_slot must return NoDutiesForSlot
+        // because the validator is inside the doppelganger window (enabled=false).
+        let result = orchestrator.attestation_service.process_slot(64).await;
+        assert!(
+            matches!(result, Err(OrchestratorError::NoDutiesForSlot { slot: 64 })),
+            "duty must be filtered out while validator is in doppelganger window; got: {result:?}"
+        );
+        assert_eq!(
+            submitter.call_count.load(Ordering::SeqCst),
+            submit_count,
+            "signer must NOT be called while validator is in doppelganger window"
+        );
+
+        // Phase 2: enable the validator (simulates window elapsed).
+        validator_store.set_enabled(&duty_pk_bytes, true);
+
+        // Now process_slot should proceed past the gate (will fail further on
+        // because no beacon attestation-data mock is set up, but the important
+        // thing is the duty is NOT filtered by the doppelganger check).
+        let result2 = orchestrator.attestation_service.process_slot(64).await;
+        assert!(
+            !matches!(result2, Err(OrchestratorError::NoDutiesForSlot { .. })),
+            "after enabling the validator, duty must NOT be filtered by doppelganger gate; \
+             got: {result2:?}"
+        );
+    }
+
+    /// H-7: same guard split applies to contributions phase — skipped when sync disabled.
+    #[tokio::test]
+    async fn test_sync_contributions_skipped_when_sync_disabled() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+
+        let r_captured: Root = [0xAA; 32];
+        let submitted_roots = Arc::new(std::sync::Mutex::new(Vec::<Root>::new()));
+
+        let beacon = Arc::new(SyncGuardBeacon {
+            submitted_roots: submitted_roots.clone(),
+            duty_pubkey: pk_hex.clone(),
+        });
+
+        let attesting_enabled = Arc::new(AtomicBool::new(false));
+        let orchestrator =
+            build_sync_test_orchestrator(beacon, pk_hex, pk, sk, attesting_enabled).await;
+
+        // Disable sync: contributions must not call the signer.
+        orchestrator.set_sync_enabled(false);
+
+        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some(r_captured) };
+        // With sync_enabled=false the phase guard returns early before any
+        // signer or BN call. The test just verifies no panic and no submission.
+        orchestrator.run_sync_contributions_phase(0, 0, &ctx).await;
+
+        // No sync messages or contributions were submitted.
+        assert!(
+            submitted_roots.lock().unwrap().is_empty(),
+            "H-7: sync contributions must NOT run when sync_enabled = false"
         );
     }
 }

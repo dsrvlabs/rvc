@@ -2,9 +2,11 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use eth_types::Epoch;
-use tracing::{info, warn, Instrument};
+use crypto::logging::TruncatedPubkey;
+use eth_types::{Epoch, SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
+use tracing::{debug, info, warn, Instrument};
 
 use crate::error::DoppelgangerError;
 use crate::traits::{LivenessChecker, SlashingDbReader};
@@ -13,24 +15,85 @@ use crate::{DoppelgangerResult, DoppelgangerStatus};
 const DEFAULT_MONITORING_EPOCHS: u64 = 2;
 
 /// Service for detecting doppelganger validators.
+///
+/// The epoch is computed from a BN-supplied `genesis_time` combined with a
+/// monotonic [`Instant`] captured at construction.  This ensures that NTP
+/// wall-clock steps cannot silently advance (or retract) the epoch window.
 pub struct DoppelgangerService {
     liveness_checker: Arc<dyn LivenessChecker>,
     slashing_db: Arc<dyn SlashingDbReader>,
     monitoring_epochs: u64,
+    /// BN-supplied genesis time (Unix seconds).
+    genesis_time: u64,
+    /// Monotonic instant captured at service creation.
+    service_start_instant: Instant,
+    /// Wall-clock Unix seconds captured once at service creation.
+    /// Combined with `service_start_instant.elapsed()` to produce a
+    /// monotonically-advancing "now" that is immune to NTP steps.
+    start_unix_time: u64,
 }
 
 impl DoppelgangerService {
+    /// Create a new service.
+    ///
+    /// `genesis_time` is the BN-reported genesis Unix timestamp.  It anchors
+    /// the epoch computation so the service is not affected by subsequent NTP
+    /// adjustments.
     pub fn new(
         liveness_checker: Arc<dyn LivenessChecker>,
         slashing_db: Arc<dyn SlashingDbReader>,
+        genesis_time: u64,
     ) -> Self {
-        Self { liveness_checker, slashing_db, monitoring_epochs: DEFAULT_MONITORING_EPOCHS }
+        let start_unix_time =
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        Self {
+            liveness_checker,
+            slashing_db,
+            monitoring_epochs: DEFAULT_MONITORING_EPOCHS,
+            genesis_time,
+            service_start_instant: Instant::now(),
+            start_unix_time,
+        }
     }
 
     pub fn with_monitoring_epochs(mut self, epochs: u64) -> Self {
         assert!(epochs > 0, "monitoring_epochs must be >= 1");
         self.monitoring_epochs = epochs;
         self
+    }
+
+    /// Override the clock anchor — TEST-ONLY (do not call from production).
+    ///
+    /// Replaces the captured `service_start_instant` and `start_unix_time` with
+    /// the supplied values so that `current_epoch()` can be driven with
+    /// deterministic, controlled time values.
+    ///
+    /// **Safety note:** `service_start_instant` MUST be in the past relative
+    /// to the time `current_epoch()` will be called.  A future `Instant` will
+    /// panic inside `current_epoch()` via `Instant::elapsed()` on stable Rust.
+    /// We accept this contract rather than gating the function behind a
+    /// `cfg(test)` flag because the function is required by integration tests
+    /// in `tests/clock_m7.rs` which are compiled as a separate crate.
+    pub fn with_start_time(mut self, service_start_instant: Instant, start_unix_time: u64) -> Self {
+        self.service_start_instant = service_start_instant;
+        self.start_unix_time = start_unix_time;
+        self
+    }
+
+    /// Return the current epoch based on a monotonic clock anchored on `genesis_time`.
+    ///
+    /// ```text
+    /// now_unix       = start_unix_time + service_start_instant.elapsed()
+    /// current_epoch  = (now_unix - genesis_time) / SECONDS_PER_SLOT / SLOTS_PER_EPOCH
+    /// ```
+    ///
+    /// Because `service_start_instant.elapsed()` is derived from a monotonic
+    /// [`Instant`], NTP wall-clock adjustments cannot shift the computed epoch.
+    pub fn current_epoch(&self) -> Epoch {
+        let elapsed_secs = self.service_start_instant.elapsed().as_secs();
+        let now_unix = self.start_unix_time.saturating_add(elapsed_secs);
+        let secs_since_genesis = now_unix.saturating_sub(self.genesis_time);
+        secs_since_genesis / SECONDS_PER_SLOT / SLOTS_PER_EPOCH
     }
 
     /// Check which validators need monitoring vs can be marked safe (restart-aware).
@@ -48,12 +111,27 @@ impl DoppelgangerService {
         let mut results = Vec::with_capacity(pubkeys.len());
 
         for pubkey in pubkeys {
+            info!(
+                pubkey = %TruncatedPubkey::new(pubkey),
+                check_epoch = current_epoch,
+                "doppelganger check start"
+            );
+
             let last_epoch = self.slashing_db.last_signed_attestation_epoch(pubkey)?;
 
             let status = match last_epoch {
-                Some(epoch) if current_epoch.saturating_sub(epoch) <= self.monitoring_epochs => {
+                // Guard `current_epoch > self.monitoring_epochs` prevents the
+                // pre-genesis-clock-skew bypass (M-7 review SF-1): if
+                // `start_unix_time < genesis_time`, `current_epoch()` collapses
+                // to 0, and `0.saturating_sub(N) = 0 <= monitoring_epochs`
+                // would otherwise mark every validator with any history Safe
+                // without completing the monitoring window.
+                Some(epoch)
+                    if current_epoch > self.monitoring_epochs
+                        && current_epoch.saturating_sub(epoch) <= self.monitoring_epochs =>
+                {
                     info!(
-                        pubkey = %pubkey,
+                        pubkey = %TruncatedPubkey::new(pubkey),
                         last_epoch = epoch,
                         current_epoch = current_epoch,
                         "restart detected, skipping doppelganger monitoring"
@@ -62,7 +140,7 @@ impl DoppelgangerService {
                 }
                 _ => {
                     info!(
-                        pubkey = %pubkey,
+                        pubkey = %TruncatedPubkey::new(pubkey),
                         last_epoch = ?last_epoch,
                         current_epoch = current_epoch,
                         "validator needs doppelganger monitoring"
@@ -92,6 +170,7 @@ impl DoppelgangerService {
         current_epoch: Epoch,
     ) -> Result<DoppelgangerResult, DoppelgangerError> {
         if pubkeys_to_monitor.is_empty() {
+            debug!("monitor cycle skipped, no validators to monitor");
             return Ok(DoppelgangerResult { safe_validators: vec![], detected: vec![] });
         }
 
@@ -101,7 +180,7 @@ impl DoppelgangerService {
                 if validator_indices.contains_key(pk.as_str()) {
                     true
                 } else {
-                    warn!(pubkey = %pk, "pubkey has no validator index, skipping liveness check");
+                    warn!(pubkey = %TruncatedPubkey::new(pk), "pubkey has no validator index, skipping liveness check");
                     false
                 }
             })
@@ -148,8 +227,9 @@ impl DoppelgangerService {
 
                         if !we_signed {
                             tracing::error!(
-                                pubkey = %pubkey,
+                                pubkey = %TruncatedPubkey::new(pubkey),
                                 epoch = check_epoch,
+                                observed_activity = "is_live",
                                 "doppelganger detected: validator is live but we did not sign"
                             );
                             if !detected.contains(&pubkey.to_string()) {
@@ -163,6 +243,14 @@ impl DoppelgangerService {
 
         let safe_validators: Vec<String> =
             checked_pubkeys.iter().filter(|pk| !detected.contains(pk)).cloned().cloned().collect();
+
+        for pk in &safe_validators {
+            info!(
+                pubkey = %TruncatedPubkey::new(pk),
+                epochs_checked = self.monitoring_epochs,
+                "doppelganger check clear"
+            );
+        }
 
         tracing::Span::current().record("rvc.doppelganger.detected_count", detected.len() as u64);
 
@@ -265,7 +353,7 @@ mod tests {
     fn test_new_default_monitoring_epochs() {
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
         let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
         assert_eq!(service.monitoring_epochs, DEFAULT_MONITORING_EPOCHS);
     }
 
@@ -273,7 +361,7 @@ mod tests {
     fn test_with_monitoring_epochs() {
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
         let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
-        let service = DoppelgangerService::new(liveness, slashing_db).with_monitoring_epochs(5);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0).with_monitoring_epochs(5);
         assert_eq!(service.monitoring_epochs, 5);
     }
 
@@ -285,7 +373,7 @@ mod tests {
         // 100 - 98 = 2 <= 2, so should be Safe
         let slashing_db = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", Some(98)));
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let result = service.check_validators(&[pk("0xpk1")], 100).expect("should succeed");
         assert_eq!(result.len(), 1);
@@ -299,7 +387,7 @@ mod tests {
         // 100 - 100 = 0 <= 2, safe
         let slashing_db = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", Some(100)));
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let result = service.check_validators(&[pk("0xpk1")], 100).expect("should succeed");
         assert_eq!(result[0].1, DoppelgangerStatus::Safe);
@@ -311,7 +399,7 @@ mod tests {
         // 100 - 95 = 5 > 2, needs monitoring
         let slashing_db = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", Some(95)));
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let result = service.check_validators(&[pk("0xpk1")], 100).expect("should succeed");
         assert_eq!(result[0].1, DoppelgangerStatus::DetectionInProgress);
@@ -322,7 +410,7 @@ mod tests {
         // No attestation history at all — clean start
         let slashing_db = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", None));
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let result = service.check_validators(&[pk("0xpk1")], 100).expect("should succeed");
         assert_eq!(result[0].1, DoppelgangerStatus::DetectionInProgress);
@@ -334,7 +422,7 @@ mod tests {
         let slashing_db =
             Arc::new(MockSlashingDb::new().with_epoch("0xpk1", Some(99)).with_epoch("0xpk2", None));
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let result =
             service.check_validators(&[pk("0xpk1"), pk("0xpk2")], 100).expect("should succeed");
@@ -347,7 +435,7 @@ mod tests {
     fn test_check_validators_empty_list() {
         let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let result = service.check_validators(&[], 100).expect("should succeed");
         assert!(result.is_empty());
@@ -359,7 +447,7 @@ mod tests {
         // 100 - 97 = 3 > 2, needs monitoring
         let slashing_db = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", Some(97)));
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let result = service.check_validators(&[pk("0xpk1")], 100).expect("should succeed");
         assert_eq!(result[0].1, DoppelgangerStatus::DetectionInProgress);
@@ -371,7 +459,7 @@ mod tests {
         // 100 - 98 = 2 <= 2, safe
         let slashing_db = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", Some(98)));
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let result = service.check_validators(&[pk("0xpk1")], 100).expect("should succeed");
         assert_eq!(result[0].1, DoppelgangerStatus::Safe);
@@ -383,7 +471,7 @@ mod tests {
         // 100 - 94 = 6 > 5, needs monitoring
         let slashing_db = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", Some(94)));
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let service = DoppelgangerService::new(liveness, slashing_db).with_monitoring_epochs(5);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0).with_monitoring_epochs(5);
 
         let result = service.check_validators(&[pk("0xpk1")], 100).expect("should succeed");
         assert_eq!(result[0].1, DoppelgangerStatus::DetectionInProgress);
@@ -391,7 +479,8 @@ mod tests {
         // Signed at 95, current 100: 100-95=5 <= 5, safe
         let slashing_db2 = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", Some(95)));
         let liveness2: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let service2 = DoppelgangerService::new(liveness2, slashing_db2).with_monitoring_epochs(5);
+        let service2 =
+            DoppelgangerService::new(liveness2, slashing_db2, 0).with_monitoring_epochs(5);
 
         let result2 = service2.check_validators(&[pk("0xpk1")], 100).expect("should succeed");
         assert_eq!(result2[0].1, DoppelgangerStatus::Safe);
@@ -401,7 +490,7 @@ mod tests {
     fn test_check_validators_slashing_db_error() {
         let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(FailingSlashingDb);
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let result = service.check_validators(&[pk("0xpk1")], 100);
         assert!(result.is_err());
@@ -413,7 +502,7 @@ mod tests {
     async fn test_run_monitoring_empty_pubkeys() {
         let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let result =
             service.run_monitoring(&[], &HashMap::new(), 100).await.expect("should succeed");
@@ -431,7 +520,7 @@ mod tests {
             // epoch current-2
             vec![ValidatorLivenessData { index: "1".to_string(), is_live: false }],
         ]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let mut indices = HashMap::new();
         indices.insert(pk("0xpk1"), "1".to_string());
@@ -452,7 +541,7 @@ mod tests {
             // epoch 98
             vec![ValidatorLivenessData { index: "1".to_string(), is_live: false }],
         ]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let mut indices = HashMap::new();
         indices.insert(pk("0xpk1"), "1".to_string());
@@ -471,7 +560,7 @@ mod tests {
             vec![ValidatorLivenessData { index: "42".to_string(), is_live: false }],
             vec![ValidatorLivenessData { index: "42".to_string(), is_live: false }],
         ]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let mut indices = HashMap::new();
         indices.insert(pk("0xpk1"), "42".to_string());
@@ -499,7 +588,7 @@ mod tests {
                 ValidatorLivenessData { index: "2".to_string(), is_live: false },
             ],
         ]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let mut indices = HashMap::new();
         indices.insert(pk("0xpk1"), "1".to_string());
@@ -523,7 +612,7 @@ mod tests {
             // epoch 98
             vec![ValidatorLivenessData { index: "1".to_string(), is_live: false }],
         ]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let mut indices = HashMap::new();
         indices.insert(pk("0xpk1"), "1".to_string());
@@ -538,7 +627,7 @@ mod tests {
     async fn test_run_monitoring_liveness_check_failure() {
         let slashing_db = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", None));
         let liveness: Arc<dyn LivenessChecker> = Arc::new(FailingLivenessChecker);
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let mut indices = HashMap::new();
         indices.insert(pk("0xpk1"), "1".to_string());
@@ -557,7 +646,7 @@ mod tests {
             // epoch 98: also live
             vec![ValidatorLivenessData { index: "1".to_string(), is_live: true }],
         ]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let mut indices = HashMap::new();
         indices.insert(pk("0xpk1"), "1".to_string());
@@ -573,7 +662,7 @@ mod tests {
         // Current epoch 0, no history
         let slashing_db = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", None));
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let result = service.check_validators(&[pk("0xpk1")], 0).expect("should succeed");
         assert_eq!(result[0].1, DoppelgangerStatus::DetectionInProgress);
@@ -593,7 +682,7 @@ mod tests {
             // epoch 98: pk1 not live
             vec![ValidatorLivenessData { index: "1".to_string(), is_live: false }],
         ]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let mut indices = HashMap::new();
         indices.insert(pk("0xpk1"), "1".to_string());
@@ -625,7 +714,7 @@ mod tests {
             // epoch 98: not live
             vec![ValidatorLivenessData { index: "1".to_string(), is_live: false }],
         ]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let mut indices = HashMap::new();
         indices.insert(pk("0xpk1"), "1".to_string());
@@ -645,7 +734,7 @@ mod tests {
     fn test_with_monitoring_epochs_zero_panics() {
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
         let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
-        DoppelgangerService::new(liveness, slashing_db).with_monitoring_epochs(0);
+        DoppelgangerService::new(liveness, slashing_db, 0).with_monitoring_epochs(0);
     }
 
     // -- Fix 4: low epoch numbers must not produce duplicate epoch checks --
@@ -678,7 +767,7 @@ mod tests {
 
         let liveness: Arc<dyn LivenessChecker> =
             Arc::new(EpochRecordingLiveness { checked: checked_epochs_clone });
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let mut indices = HashMap::new();
         indices.insert(pk("0xpk1"), "1".to_string());
@@ -720,7 +809,7 @@ mod tests {
 
         let liveness: Arc<dyn LivenessChecker> =
             Arc::new(EpochRecordingLiveness2 { checked: checked_epochs_clone });
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let mut indices = HashMap::new();
         indices.insert(pk("0xpk1"), "1".to_string());
@@ -738,14 +827,22 @@ mod tests {
     }
 
     #[test]
-    fn test_check_validators_epoch_zero_with_history() {
-        // Current epoch 0, signed at epoch 0 => 0-0=0 <= 2, safe
+    fn test_check_validators_epoch_zero_with_history_is_not_safe() {
+        // M-7 review SF-1: epoch 0 must NEVER mark a validator Safe via the
+        // restart-skip arm. If start_unix_time < genesis_time, current_epoch()
+        // collapses to 0 and the old condition `0.saturating_sub(N) = 0 <= 2`
+        // would have skipped monitoring for any validator with any history.
+        // The new guard `current_epoch > monitoring_epochs` blocks that path.
         let slashing_db = Arc::new(MockSlashingDb::new().with_epoch("0xpk1", Some(0)));
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let service = DoppelgangerService::new(liveness, slashing_db);
+        let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
         let result = service.check_validators(&[pk("0xpk1")], 0).expect("should succeed");
-        assert_eq!(result[0].1, DoppelgangerStatus::Safe);
+        assert_eq!(
+            result[0].1,
+            DoppelgangerStatus::DetectionInProgress,
+            "epoch 0 must require monitoring even with history (pre-genesis-skew guard)"
+        );
     }
 
     // -- DoppelgangerStatus tests --
@@ -798,6 +895,70 @@ mod tests {
         let s = format!("{:?}", r);
         assert!(s.contains("0xpk1"));
         assert!(s.contains("0xpk2"));
+    }
+
+    // -- current_epoch / BN-derived clock tests (M-7) --
+
+    /// Two services with different genesis_times must differ by
+    /// `(genesis_time_diff / SECONDS_PER_EPOCH)` epochs.
+    #[test]
+    fn test_genesis_time_anchored() {
+        use std::time::Instant;
+
+        const SECONDS_PER_EPOCH: u64 = SECONDS_PER_SLOT * SLOTS_PER_EPOCH;
+
+        let start_instant = Instant::now();
+        let start_unix_time = 2_000_000_u64;
+
+        let genesis1 = 1_000_000_u64;
+        // genesis2 is 1_000 epochs later
+        let genesis2 = genesis1 + SECONDS_PER_EPOCH * 1_000;
+
+        let liveness1: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
+        let slashing1: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
+        let service1 = DoppelgangerService::new(liveness1, slashing1, genesis1)
+            .with_start_time(start_instant, start_unix_time);
+
+        let liveness2: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
+        let slashing2: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
+        let service2 = DoppelgangerService::new(liveness2, slashing2, genesis2)
+            .with_start_time(start_instant, start_unix_time);
+
+        let epoch1 = service1.current_epoch();
+        let epoch2 = service2.current_epoch();
+
+        assert_eq!(
+            epoch1.saturating_sub(epoch2),
+            1_000,
+            "epoch diff must equal genesis_time_diff / SECONDS_PER_EPOCH"
+        );
+    }
+
+    /// current_epoch() matches the manual monotonic formula —
+    /// not `SystemTime::now()`.
+    #[test]
+    fn test_current_epoch_uses_monotonic_formula() {
+        use std::time::Instant;
+
+        const SECONDS_PER_EPOCH: u64 = SECONDS_PER_SLOT * SLOTS_PER_EPOCH;
+
+        let genesis_time = 0_u64;
+        let start_unix = SECONDS_PER_EPOCH * 7; // 7 epochs after genesis
+        let start_instant = Instant::now();
+
+        let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
+        let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
+        let service = DoppelgangerService::new(liveness, slashing_db, genesis_time)
+            .with_start_time(start_instant, start_unix);
+
+        let epoch = service.current_epoch();
+        // elapsed ≈ 0 so epoch ≈ (start_unix + 0 - genesis) / SECONDS_PER_EPOCH = 7
+        assert_eq!(epoch, 7, "epoch must be anchored at 7 when start_unix = 7 * SECONDS_PER_EPOCH");
+
+        // Cross-check against formula:
+        let elapsed = start_instant.elapsed().as_secs();
+        let expected = (start_unix + elapsed - genesis_time) / SECONDS_PER_EPOCH;
+        assert_eq!(service.current_epoch(), expected);
     }
 
     // -- DoppelgangerError tests --

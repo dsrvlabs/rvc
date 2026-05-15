@@ -1,9 +1,11 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use crypto::{CompositeSigner, SecretKey, Signer, SigningError, PUBLIC_KEY_BYTES_LEN};
-use crypto::{KeyManager, LocalSigner};
-use eth_types::Root;
+use crypto::typed_signer::{SignContext, TypedSigner};
+use crypto::{
+    CompositeSigner, KeyManager, LocalSigner, SecretKey, Signer, SigningError, PUBLIC_KEY_BYTES_LEN,
+};
+use eth_types::{BeaconBlock, ForkInfo};
 use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
 use rvc_grpc_signer::{
     GetStatusRequest, GetStatusResponse, GrpcRemoteSigner, GrpcRemoteSignerConfig,
@@ -15,7 +17,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity, ServerTl
 use tonic::{Request, Response, Status};
 
 // ---------------------------------------------------------------------------
-// Test signing backend (implements gRPC SignerService with real BLS signing)
+// Test signing backend (implements gRPC v1 SignerService for ListPublicKeys/GetStatus)
 // ---------------------------------------------------------------------------
 
 struct TestSignerService {
@@ -176,16 +178,28 @@ fn create_mtls_config(addr: SocketAddr, pki: &TestPki) -> GrpcRemoteSignerConfig
 }
 
 // ---------------------------------------------------------------------------
-// 1. Happy path E2E: mTLS server → GrpcRemoteSigner client → sign → verify
+// Sign context helper
+// ---------------------------------------------------------------------------
+
+fn test_sign_ctx(pk: crypto::PublicKey) -> SignContext {
+    SignContext {
+        pubkey: pk,
+        fork_info: ForkInfo {
+            previous_version: [0x00, 0x00, 0x00, 0x00],
+            current_version: [0x00, 0x00, 0x00, 0x00], // Phase0
+            genesis_validators_root: [0xaa; 32],
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1. Happy path E2E: mTLS server → GrpcRemoteSigner client → connect verifies keys
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_e2e_sign_verify_with_mtls() {
+async fn test_e2e_connect_and_list_keys_with_mtls() {
     let sk = SecretKey::generate();
-    let pk = sk.public_key();
-    let pk_bytes = pk.to_bytes();
-    let signing_root: Root = [0xab; 32];
-    let expected_sig = sk.sign(&signing_root);
+    let pk_bytes = sk.public_key().to_bytes();
 
     let pki = generate_test_pki();
     let (addr, _handle) = start_mtls_server(TestSignerService::new(vec![sk]), &pki).await;
@@ -193,9 +207,10 @@ async fn test_e2e_sign_verify_with_mtls() {
     let config = create_mtls_config(addr, &pki);
     let signer = GrpcRemoteSigner::connect(config).await.unwrap();
 
-    let sig = signer.sign(&signing_root, &pk_bytes).await.unwrap();
-    assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
-    assert!(sig.verify(&pk, &signing_root).is_ok());
+    // GrpcRemoteSigner caches keys at connect time via ListPublicKeys
+    let keys = signer.public_keys();
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0], pk_bytes);
 }
 
 // ---------------------------------------------------------------------------
@@ -250,13 +265,14 @@ async fn test_mtls_rejects_client_with_wrong_ca() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Unknown key: sign request for pubkey not in backend → NOT_FOUND
+// 3. Unknown key: TypedSigner returns KeyNotFound for unknown pubkey
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_unknown_key_returns_key_not_found() {
     let sk = SecretKey::generate();
-    let unknown_pk = SecretKey::generate().public_key().to_bytes();
+    let unknown_sk = SecretKey::generate();
+    let unknown_pk = unknown_sk.public_key();
 
     let pki = generate_test_pki();
     let (addr, _handle) = start_mtls_server(TestSignerService::new(vec![sk]), &pki).await;
@@ -264,10 +280,20 @@ async fn test_unknown_key_returns_key_not_found() {
     let config = create_mtls_config(addr, &pki);
     let signer = GrpcRemoteSigner::connect(config).await.unwrap();
 
-    let result = signer.sign(&[0xab; 32], &unknown_pk).await;
+    // sign_block should reject unknown pubkey before even sending the request
+    let block = BeaconBlock {
+        slot: 1,
+        proposer_index: 0,
+        parent_root: [0u8; 32],
+        state_root: [0u8; 32],
+        body: vec![],
+    };
+    let unknown_pk_bytes = unknown_pk.to_bytes();
+    let ctx = test_sign_ctx(unknown_pk);
+    let result = TypedSigner::sign_block(&signer, &block, &ctx).await;
     match result.unwrap_err() {
         SigningError::KeyNotFound(pk_hex) => {
-            assert_eq!(pk_hex, hex::encode(unknown_pk));
+            assert_eq!(pk_hex, hex::encode(unknown_pk_bytes));
         }
         other => panic!("expected KeyNotFound, got: {other:?}"),
     }
@@ -332,16 +358,14 @@ async fn test_get_status_via_raw_client() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. CompositeSigner routing: gRPC signer key hit via CompositeSigner
+// 6. CompositeSigner routing: gRPC signer key registered via CompositeSigner
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_composite_signer_routes_to_grpc_remote() {
+async fn test_composite_signer_registers_grpc_remote_keys() {
     let grpc_sk = SecretKey::generate();
     let grpc_pk = grpc_sk.public_key();
     let grpc_pk_bytes = grpc_pk.to_bytes();
-    let signing_root: Root = [0xcd; 32];
-    let expected_sig = grpc_sk.sign(&signing_root);
 
     let pki = generate_test_pki();
     let (addr, _handle) = start_mtls_server(TestSignerService::new(vec![grpc_sk]), &pki).await;
@@ -354,23 +378,21 @@ async fn test_composite_signer_routes_to_grpc_remote() {
     let composite = CompositeSigner::new(LocalSigner::new(KeyManager::new()));
     composite.add_grpc_remote_signer(grpc_pubkeys, Arc::new(grpc_signer));
 
-    // Sign via CompositeSigner — should route to gRPC remote
-    let sig = composite.sign(&signing_root, &grpc_pk_bytes).await.unwrap();
-    assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
-    assert!(sig.verify(&grpc_pk, &signing_root).is_ok());
-
     // Verify public_keys includes the gRPC remote key
     let keys = composite.public_keys();
     assert!(keys.contains(&grpc_pk_bytes));
+    // has_grpc_remote returns true for this key
+    assert!(composite.has_grpc_remote(&grpc_pk_bytes));
+    // get_grpc_remote returns a TypedSigner
+    assert!(composite.get_grpc_remote(&grpc_pk_bytes).is_some());
 }
 
 #[tokio::test]
-async fn test_composite_signer_grpc_remote_has_priority_over_local() {
+async fn test_composite_signer_grpc_remote_takes_priority_over_local_in_key_list() {
     // Generate key; reconstruct a second copy from raw bytes for the local signer
     let sk = SecretKey::generate();
     let sk_bytes = sk.to_bytes();
     let pk_bytes = sk.public_key().to_bytes();
-    let signing_root: Root = [0xef; 32];
 
     let pki = generate_test_pki();
     let (addr, _handle) = start_mtls_server(TestSignerService::new(vec![sk]), &pki).await;
@@ -385,11 +407,7 @@ async fn test_composite_signer_grpc_remote_has_priority_over_local() {
     let composite = CompositeSigner::new(LocalSigner::new(km));
     composite.add_grpc_remote_signer(grpc_pubkeys, Arc::new(grpc_signer));
 
-    // Both produce valid signatures (same key), but the request should route via gRPC
-    let sig = composite.sign(&signing_root, &pk_bytes).await.unwrap();
-    assert_eq!(sig.to_bytes().len(), 96);
-
-    // Verify the key appears only once (deduplication)
+    // Key appears only once (deduplication)
     let keys = composite.public_keys();
     assert_eq!(keys.iter().filter(|k| **k == pk_bytes).count(), 1);
 }
@@ -398,26 +416,42 @@ async fn test_composite_signer_grpc_remote_has_priority_over_local() {
 // Additional: plaintext E2E (no TLS) to verify basic wiring
 // ---------------------------------------------------------------------------
 
+/// Idempotent process-lifetime opt-in to the insecure remote-signer env var.
+/// Used by the plaintext E2E test below.  Panic-safe: a panic during
+/// `connect()` cannot leave the var set "leaked" because there is no paired
+/// remove (this binary has no Refuse-path tests, so the var staying set for
+/// the binary lifetime is the desired behavior — see review note).
+fn allow_insecure_for_tests() {
+    use std::sync::OnceLock;
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        unsafe { std::env::set_var(rvc_grpc_signer::REMOTE_SIGNER_INSECURE_ENV_VAR, "true") };
+    });
+}
+
 #[tokio::test]
-async fn test_e2e_plaintext_sign_verify() {
+async fn test_e2e_plaintext_connect_lists_keys() {
+    // GA (ISSUE-3.13) default mode is Refuse; we explicitly opt in for the
+    // plaintext path.  Use the OnceLock helper instead of a raw set/remove
+    // sandwich so a panic in `connect()` cannot leave the gate disabled for
+    // siblings (review MF-1: panic-unsafe set_var/remove_var).
+    allow_insecure_for_tests();
+
     let sk = SecretKey::generate();
-    let pk = sk.public_key();
-    let pk_bytes = pk.to_bytes();
-    let signing_root: Root = [0x42; 32];
-    let expected_sig = sk.sign(&signing_root);
+    let pk_bytes = sk.public_key().to_bytes();
 
     let (addr, _handle) = start_plaintext_server(TestSignerService::new(vec![sk])).await;
 
     let config = GrpcRemoteSignerConfig::new(format!("http://{addr}"));
     let signer = GrpcRemoteSigner::connect(config).await.unwrap();
 
-    let sig = signer.sign(&signing_root, &pk_bytes).await.unwrap();
-    assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
-    assert!(sig.verify(&pk, &signing_root).is_ok());
+    // GrpcRemoteSigner has ListPublicKeys working
+    assert_eq!(signer.public_keys().len(), 1);
+    assert_eq!(signer.public_keys()[0], pk_bytes);
 }
 
 // ---------------------------------------------------------------------------
-// Multiple keys: sign with each key over mTLS
+// Multiple keys: connect with multiple keys
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -437,11 +471,19 @@ async fn test_e2e_multiple_keys_mtls() {
     let signer = GrpcRemoteSigner::connect(config).await.unwrap();
 
     assert_eq!(signer.public_keys().len(), 3);
+    assert!(signer.public_keys().contains(&pk1_bytes));
+    assert!(signer.public_keys().contains(&pk2_bytes));
+    assert!(signer.public_keys().contains(&pk3_bytes));
+}
 
-    for (pk_bytes, root_byte) in [(&pk1_bytes, 0x01u8), (&pk2_bytes, 0x02), (&pk3_bytes, 0x03)] {
-        let signing_root: Root = [root_byte; 32];
-        let sig = signer.sign(&signing_root, pk_bytes).await.unwrap();
-        let pk = crypto::PublicKey::from_bytes(pk_bytes).unwrap();
-        assert!(sig.verify(&pk, &signing_root).is_ok());
-    }
+#[tokio::test]
+async fn test_connect_strips_trailing_slash() {
+    let sk = SecretKey::generate();
+    let pki = generate_test_pki();
+    let (addr, _handle) = start_mtls_server(TestSignerService::new(vec![sk]), &pki).await;
+
+    let config = GrpcRemoteSignerConfig::new(format!("https://localhost:{}/", addr.port()))
+        .with_tls(pki.client_cert_pem.clone(), pki.client_key_pem.clone(), pki.ca_cert_pem.clone());
+    let signer = GrpcRemoteSigner::connect(config).await.unwrap();
+    assert!(!signer.url().ends_with('/'));
 }

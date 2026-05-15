@@ -95,6 +95,12 @@ pub const DEFAULT_SSE_TOPICS: &[&str] = &["head", "block", "chain_reorg", "final
 /// Maximum consecutive connection failures before falling back to polling.
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
+/// Bounded channel capacity for the callback dispatch queue (H-11).
+const SSE_CALLBACK_CHANNEL_CAPACITY: usize = 64;
+
+/// Default maximum SSE event payload size in bytes (64 KiB, H-11).
+pub const DEFAULT_MAX_SSE_EVENT_BYTES: usize = 64 * 1024;
+
 /// Configuration for the SSE event subscriber.
 #[derive(Debug, Clone)]
 pub struct SseConfig {
@@ -102,11 +108,20 @@ pub struct SseConfig {
     pub endpoint: String,
     /// Topics to subscribe to.
     pub topics: Vec<String>,
+    /// Maximum bytes allowed in a single SSE event `data` field (H-11).
+    ///
+    /// Events that exceed this threshold are dropped with a `warn!` log.
+    /// Default: 64 KiB.
+    pub max_event_bytes: usize,
 }
 
 impl SseConfig {
     pub fn new(endpoint: String) -> Self {
-        Self { endpoint, topics: DEFAULT_SSE_TOPICS.iter().map(|s| s.to_string()).collect() }
+        Self {
+            endpoint,
+            topics: DEFAULT_SSE_TOPICS.iter().map(|s| s.to_string()).collect(),
+            max_event_bytes: DEFAULT_MAX_SSE_EVENT_BYTES,
+        }
     }
 }
 
@@ -121,6 +136,16 @@ pub enum SseConnectionState {
 
 /// Subscribes to beacon node SSE events. Calls `callback` for each parsed event.
 ///
+/// H-11 hardening applied:
+/// - Per-event size cap: events whose `data` field exceeds `config.max_event_bytes` (default
+///   64 KiB) are dropped with a `warn!` log; the connection continues.
+/// - Content-Type validation: if the server does not respond with `text/event-stream`, the
+///   connection is dropped with a `warn!` log and reconnect is attempted.
+/// - Bounded dispatch: callbacks are dispatched via a bounded
+///   `tokio::sync::mpsc::channel(64)`.  When the channel is full, the event is dropped
+///   with a `warn!` log and the SSE loop continues without blocking.
+///
+/// Other behaviours (unchanged):
 /// - Auto-reconnects on connection drop.
 /// - Supports failover to secondary endpoints when multiple configs are provided.
 /// - Falls back to polling after `MAX_CONSECUTIVE_FAILURES` consecutive connection failures
@@ -133,13 +158,24 @@ pub async fn subscribe_events<F>(
 ) where
     F: Fn(SseEvent) + Send + Sync + 'static,
 {
-    use reqwest_eventsource::{Event, EventSource};
-    use tracing::{debug, info, warn};
+    use crypto::logging::RedactedUrl;
+    use reqwest_eventsource::{Error as EsError, Event, EventSource};
+    use tokio::sync::mpsc::error::TrySendError;
+    use tracing::{debug, info, trace, warn};
 
     if configs.is_empty() {
         warn!("No SSE endpoints configured");
         return;
     }
+
+    // H-11: bounded callback dispatch channel — producer is the event loop,
+    // consumer is a dedicated task so a slow callback never blocks the loop.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<SseEvent>(SSE_CALLBACK_CHANNEL_CAPACITY);
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            callback(event);
+        }
+    });
 
     let mut current_idx = 0;
     let mut consecutive_failures: u32 = 0;
@@ -156,8 +192,8 @@ pub async fn subscribe_events<F>(
             if configs.len() > 1 {
                 let next_idx = (current_idx + 1) % configs.len();
                 warn!(
-                    from = %configs[current_idx].endpoint,
-                    to = %configs[next_idx].endpoint,
+                    from = %RedactedUrl(&configs[current_idx].endpoint),
+                    to = %RedactedUrl(&configs[next_idx].endpoint),
                     "SSE failover to secondary endpoint"
                 );
                 current_idx = next_idx;
@@ -184,11 +220,16 @@ pub async fn subscribe_events<F>(
         }
 
         let config = &configs[current_idx];
+        let max_event_bytes = config.max_event_bytes;
         let topics = config.topics.join(",");
         let url =
             format!("{}/eth/v1/events?topics={}", config.endpoint.trim_end_matches('/'), topics);
 
-        debug!(url = %url, "connecting to SSE stream");
+        debug!(
+            bn_url = %RedactedUrl(&config.endpoint),
+            event_types = %topics,
+            "Connecting to SSE stream"
+        );
 
         let mut es = EventSource::get(&url);
         events_since_reconnect = 0;
@@ -203,11 +244,29 @@ pub async fn subscribe_events<F>(
                 event = futures::StreamExt::next(&mut es) => {
                     match event {
                         Some(Ok(Event::Open)) => {
-                            info!("SSE connection established");
+                            debug!(
+                                bn_url = %RedactedUrl(&config.endpoint),
+                                event_types = %topics,
+                                "SSE connection established"
+                            );
                             // Don't reset consecutive_failures on Open alone;
                             // wait for at least one valid event to confirm BN health
                         }
                         Some(Ok(Event::Message(msg))) => {
+                            // H-11: per-event size cap — drop oversize events without
+                            // closing the connection.
+                            let event_size = msg.data.len();
+                            if event_size > max_event_bytes {
+                                warn!(
+                                    size = event_size,
+                                    cap = max_event_bytes,
+                                    "SSE event size {} exceeds cap {}; dropping",
+                                    event_size,
+                                    max_event_bytes
+                                );
+                                continue;
+                            }
+
                             match parse_sse_event(&msg.event, &msg.data) {
                                 Ok(sse_event) => {
                                     events_since_reconnect += 1;
@@ -218,8 +277,35 @@ pub async fn subscribe_events<F>(
                                         );
                                         consecutive_failures = 0;
                                     }
-                                    debug!(event_type = %msg.event, "SSE event received");
-                                    callback(sse_event);
+                                    let slot = match &sse_event {
+                                        SseEvent::Head(h) => h.slot.as_str(),
+                                        SseEvent::Block(b) => b.slot.as_str(),
+                                        SseEvent::ChainReorg(r) => r.slot.as_str(),
+                                        SseEvent::FinalizedCheckpoint(_) => "",
+                                    };
+                                    trace!(
+                                        event_type = %msg.event,
+                                        slot = slot,
+                                        "SSE event received"
+                                    );
+                                    // H-11: non-blocking dispatch — drop on full channel.
+                                    match tx.try_send(sse_event) {
+                                        Ok(()) => {}
+                                        Err(TrySendError::Full(_)) => {
+                                            warn!("SSE callback channel full; dropping event");
+                                        }
+                                        Err(TrySendError::Closed(_)) => {
+                                            // Consumer task exited — reconnect to re-create
+                                            // the tx/rx pair so events are not silently dropped.
+                                            warn!(
+                                                bn_url = %RedactedUrl(&config.endpoint),
+                                                "SSE callback consumer exited; reconnecting"
+                                            );
+                                            consecutive_failures += 1;
+                                            es.close();
+                                            break;
+                                        }
+                                    }
                                 }
                                 Err(SseError::UnknownEvent(evt)) => {
                                     debug!(event_type = %evt, "ignoring unknown SSE event type");
@@ -229,14 +315,33 @@ pub async fn subscribe_events<F>(
                                 }
                             }
                         }
+                        Some(Err(EsError::InvalidContentType(ct, _))) => {
+                            // H-11: Content-Type must be text/event-stream.
+                            warn!(
+                                content_type = ?ct,
+                                bn_url = %RedactedUrl(&config.endpoint),
+                                "SSE response Content-Type is not text/event-stream; dropping connection"
+                            );
+                            consecutive_failures += 1;
+                            es.close();
+                            break;
+                        }
                         Some(Err(err)) => {
-                            warn!(error = %err, "SSE stream error");
+                            warn!(
+                                bn_url = %RedactedUrl(&config.endpoint),
+                                reason = %err,
+                                "SSE disconnection"
+                            );
                             consecutive_failures += 1;
                             es.close();
                             break;
                         }
                         None => {
-                            warn!("SSE stream ended");
+                            warn!(
+                                bn_url = %RedactedUrl(&config.endpoint),
+                                reason = "stream ended",
+                                "SSE disconnection"
+                            );
                             consecutive_failures += 1;
                             break;
                         }
@@ -246,6 +351,11 @@ pub async fn subscribe_events<F>(
         }
 
         // Brief delay before reconnecting
+        info!(
+            bn_url = %RedactedUrl(&config.endpoint),
+            attempt = consecutive_failures,
+            "SSE reconnecting"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }

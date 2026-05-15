@@ -371,6 +371,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "asn1-rs"
+version = "0.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5493c3bedbacf7fd7382c6346bbd66687d12bbaad3a89a2d2c303ee6cf20b048"
+dependencies = [
+ "asn1-rs-derive",
+ "asn1-rs-impl",
+ "displaydoc",
+ "nom",
+ "num-traits",
+ "rusticata-macros",
+ "thiserror 1.0.69",
+ "time",
+]
+
+[[package]]
+name = "asn1-rs-derive"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "965c2d33e53cb6b267e148a4cb0760bc01f4904c1cd4bb4002a085bb016d1490"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+ "synstructure",
+]
+
+[[package]]
+name = "asn1-rs-impl"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b18050c2cd6fe86c3a76584ef5e0baf286d038cda203eb6223df2cc413565f7"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "assert-json-diff"
 version = "2.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -450,9 +489,9 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "aws-lc-rs"
-version = "1.15.4"
+version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b7b6141e96a8c160799cc2d5adecd5cbbe5054cb8c7c4af53da0f83bb7ad256"
+checksum = "0ec6fb3fe69024a75fa7e1bfb48aa6cf59706a101658ea01bfd33b2b248a038f"
 dependencies = [
  "aws-lc-sys",
  "zeroize",
@@ -460,9 +499,9 @@ dependencies = [
 
 [[package]]
 name = "aws-lc-sys"
-version = "0.37.0"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c34dda4df7017c8db52132f0f8a2e0f8161649d15723ed63fc00c82d0f2081a"
+checksum = "f50037ee5e1e41e7b8f9d161680a725bd1626cb6f8c7e901f91f942850852fe7"
 dependencies = [
  "cc",
  "cmake",
@@ -600,11 +639,13 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beacon"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
+ "bytes",
  "hex",
  "rand 0.8.5",
  "reqwest 0.12.28",
+ "rvc-crypto",
  "rvc-eth-types",
  "rvc-telemetry",
  "serde",
@@ -788,8 +829,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c673075a2e0e5f4a1dde27ce9dee1ea4558c7ffe648f576438a20ca1d2acc4b0"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -976,6 +1019,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-deque"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1120,6 +1172,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "data-encoding"
+version = "2.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
+
+[[package]]
 name = "deadpool"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1145,6 +1203,20 @@ checksum = "e7c1832837b905bbfb5101e07cc24c8deddf52f93225eee6ead5f4d63d53ddcb"
 dependencies = [
  "const-oid",
  "zeroize",
+]
+
+[[package]]
+name = "der-parser"
+version = "9.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cd0a5c643689626bec213c4d8bd4d96acc8ffdb4ad4bb6bc16abf27d5f4b553"
+dependencies = [
+ "asn1-rs",
+ "displaydoc",
+ "nom",
+ "num-bigint",
+ "num-traits",
+ "rusticata-macros",
 ]
 
 [[package]]
@@ -1466,6 +1538,17 @@ dependencies = [
  "arrayvec",
  "auto_impl",
  "bytes",
+]
+
+[[package]]
+name = "fd-lock"
+version = "4.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ce92ff622d6dadf7349484f42c93271a0d49b7cc4d466a936405bacbe10aa78"
+dependencies = [
+ "cfg-if",
+ "rustix",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2577,6 +2660,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "logroller"
+version = "0.1.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83db12bbf439ebe64c0b0e4402f435b6f866db498fc1ae17e1b5d1a01625e2be"
+dependencies = [
+ "chrono",
+ "flate2",
+ "regex",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2781,6 +2876,15 @@ checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
 dependencies = [
  "hermit-abi",
  "libc",
+]
+
+[[package]]
+name = "oid-registry"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a8d8034d9489cdaf79228eb9f6a3b8d7bb32ba00d6645ebd48eef4077ceb5bd9"
+dependencies = [
+ "asn1-rs",
 ]
 
 [[package]]
@@ -3277,9 +3381,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.13"
+version = "0.11.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1906b49b0c3bc04b5fe5d86a77925ae6524a19b816ae38ce1e426255f1d8a31"
+checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -3758,6 +3862,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusticata-macros"
+version = "4.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "faf0c4a6ece9950b9abdb62b1cfcf2a68b3b67a10ba445b3bb85be2a293d0632"
+dependencies = [
+ "nom",
+]
+
+[[package]]
 name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3846,9 +3959,9 @@ checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.9"
+version = "0.103.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7df23109aa6c1567d1c575b9952556388da57401e4ace1d15f79eedad0d8f53"
+checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
 dependencies = [
  "aws-lc-rs",
  "ring",
@@ -3876,14 +3989,18 @@ dependencies = [
 
 [[package]]
 name = "rvc"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
  "beacon",
+ "fd-lock",
  "hex",
  "http-body-util",
+ "libc",
+ "parking_lot",
  "prost 0.13.5",
+ "reqwest 0.12.28",
  "rvc-block-service",
  "rvc-bn-manager",
  "rvc-builder",
@@ -3906,12 +4023,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "toml",
  "tonic 0.12.3",
  "tonic-build",
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "tracing-test",
  "tree_hash",
  "url",
  "wiremock",
@@ -3919,13 +4038,16 @@ dependencies = [
 
 [[package]]
 name = "rvc-bin"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "beacon",
  "clap",
  "hex",
  "libc",
+ "logroller",
+ "parking_lot",
  "reqwest 0.12.28",
  "rustls",
  "rvc",
@@ -3941,42 +4063,51 @@ dependencies = [
  "rvc-slashing",
  "rvc-telemetry",
  "rvc-timing",
+ "rvc-validator-store",
+ "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
  "tonic 0.12.3",
  "tracing",
+ "tracing-appender",
  "tracing-subscriber",
  "url",
+ "wiremock",
 ]
 
 [[package]]
 name = "rvc-block-service"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "beacon",
  "hex",
+ "rvc-builder",
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-signer",
  "rvc-validator-store",
+ "serde",
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tracing",
  "tree_hash",
 ]
 
 [[package]]
 name = "rvc-bn-manager"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "beacon",
  "futures",
  "reqwest-eventsource",
+ "rvc-crypto",
  "rvc-eth-types",
  "serde",
  "serde_json",
@@ -3989,10 +4120,11 @@ dependencies = [
 
 [[package]]
 name = "rvc-builder"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "hex",
+ "parking_lot",
  "rand 0.8.5",
  "rvc-bn-manager",
  "rvc-crypto",
@@ -4006,7 +4138,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-crypto"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "aes",
  "async-trait",
@@ -4018,6 +4150,7 @@ dependencies = [
  "hex",
  "hkdf",
  "num-bigint",
+ "parking_lot",
  "pbkdf2",
  "proptest",
  "rand 0.8.5",
@@ -4035,6 +4168,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "tracing-test",
  "tree_hash",
  "tree_hash_derive",
  "url",
@@ -4045,9 +4179,10 @@ dependencies = [
 
 [[package]]
 name = "rvc-doppelganger"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
+ "rvc-crypto",
  "rvc-eth-types",
  "thiserror 2.0.18",
  "tokio",
@@ -4056,7 +4191,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-duty-tracker"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "beacon",
  "rvc-bn-manager",
@@ -4071,21 +4206,23 @@ dependencies = [
 
 [[package]]
 name = "rvc-eth-types"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "ethereum_serde_utils 0.8.0",
  "ethereum_ssz 0.9.1",
  "ethereum_ssz_derive",
  "hex",
+ "proptest",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
  "tree_hash",
  "tree_hash_derive",
 ]
 
 [[package]]
 name = "rvc-grpc-signer"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -4093,6 +4230,8 @@ dependencies = [
  "rcgen",
  "rvc-crypto",
  "rvc-eth-types",
+ "rvc-slashing",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -4106,7 +4245,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-keygen"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4125,29 +4264,38 @@ dependencies = [
 
 [[package]]
 name = "rvc-keymanager-api"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
+ "async-trait",
  "axum 0.7.9",
  "hex",
  "http-body-util",
  "hyper",
+ "parking_lot",
  "rand 0.8.5",
+ "rvc-crypto",
+ "rvc-eth-types",
+ "rvc-metrics",
  "serde",
  "serde_json",
+ "sha2",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tower 0.5.3",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "url",
+ "uuid",
  "zeroize",
 ]
 
 [[package]]
 name = "rvc-metrics"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "axum 0.7.9",
  "lazy_static",
@@ -4161,7 +4309,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-propagator"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "rvc-bn-manager",
  "rvc-metrics",
@@ -4172,13 +4320,14 @@ dependencies = [
 
 [[package]]
 name = "rvc-secret-provider"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "google-cloud-gax",
  "google-cloud-secretmanager-v1",
  "hex",
  "lazy_static",
+ "parking_lot",
  "prometheus",
  "rvc-crypto",
  "rvc-metrics",
@@ -4193,14 +4342,16 @@ dependencies = [
 
 [[package]]
 name = "rvc-signer"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "hex",
+ "parking_lot",
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-metrics",
  "rvc-slashing",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -4208,20 +4359,24 @@ dependencies = [
 
 [[package]]
 name = "rvc-signer-bin"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bls12_381_plus",
  "blst",
  "clap",
  "hex",
+ "libc",
+ "parking_lot",
  "prometheus",
  "proptest",
  "prost 0.13.5",
  "rand 0.8.5",
  "rcgen",
  "rvc-crypto",
+ "rvc-eth-types",
  "rvc-grpc-signer",
+ "rvc-slashing",
  "serde",
  "serde_json",
  "tempfile",
@@ -4234,17 +4389,22 @@ dependencies = [
  "tonic-build",
  "tracing",
  "tracing-subscriber",
+ "tracing-test",
  "vsss-rs",
+ "x509-parser",
  "zeroize",
 ]
 
 [[package]]
 name = "rvc-slashing"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "hex",
+ "libc",
+ "parking_lot",
  "proptest",
  "rusqlite",
+ "rvc-crypto",
  "rvc-eth-types",
  "rvc-metrics",
  "serde",
@@ -4252,11 +4412,12 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "rvc-sync-service"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "rvc-eth-types",
@@ -4268,23 +4429,26 @@ dependencies = [
 
 [[package]]
 name = "rvc-telemetry"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
+ "logroller",
  "opentelemetry",
  "opentelemetry-gcloud-trace",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "reqwest 0.12.28",
+ "tempfile",
  "tokio",
  "tracing",
+ "tracing-appender",
  "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 
 [[package]]
 name = "rvc-timing"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "lazy_static",
  "prometheus",
@@ -4297,10 +4461,13 @@ dependencies = [
 
 [[package]]
 name = "rvc-validator-store"
-version = "0.1.0"
+version = "0.4.0"
 dependencies = [
  "hex",
+ "parking_lot",
+ "rvc-crypto",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "toml",
@@ -5258,6 +5425,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-appender"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "786d480bce6247ab75f005b14ae1624ad978d3029d9113f0a22fa1ac773faeaf"
+dependencies = [
+ "crossbeam-channel",
+ "thiserror 2.0.18",
+ "time",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tracing-attributes"
 version = "0.1.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5321,6 +5500,27 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "tracing-test"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19a4c448db514d4f24c5ddb9f73f2ee71bfb24c526cf0c570ba142d1119e0051"
+dependencies = [
+ "tracing-core",
+ "tracing-subscriber",
+ "tracing-test-macro",
+]
+
+[[package]]
+name = "tracing-test-macro"
+version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad06847b7afb65c7866a36664b75c40b895e318cea4f71299f013fb22965329d"
+dependencies = [
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -6137,6 +6337,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "05f360fc0b24296329c78fda852a1e9ae82de9cf7b27dae4b7f62f118f77b9ed"
 dependencies = [
  "tap",
+]
+
+[[package]]
+name = "x509-parser"
+version = "0.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fcbc162f30700d6f3f82a24bf7cc62ffe7caea42c0b2cba8bf7f3ae50cf51f69"
+dependencies = [
+ "asn1-rs",
+ "data-encoding",
+ "der-parser",
+ "lazy_static",
+ "nom",
+ "oid-registry",
+ "rusticata-macros",
+ "thiserror 1.0.69",
+ "time",
 ]
 
 [[package]]

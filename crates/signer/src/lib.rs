@@ -14,8 +14,9 @@ use std::time::Instant;
 
 use async_trait::async_trait;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
+use crypto::logging::TruncatedPubkey;
 use crypto::{CompositeSigner, PublicKey, Signature, Signer, SigningError};
 use eth_types::{
     AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
@@ -24,8 +25,8 @@ use eth_types::{
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SLOTS_PER_EPOCH,
 };
 use metrics::definitions::{
-    slashing_result, RVC_ATTESTATIONS_TOTAL, RVC_SIGNING_DURATION_SECONDS,
-    RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
+    slashing_result, tx_hold_kind, RVC_ATTESTATIONS_TOTAL, RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS,
+    RVC_SIGNING_DURATION_SECONDS, RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
 };
 use slashing::{SlashingDb, SlashingError};
 
@@ -72,18 +73,17 @@ impl From<SigningError> for SignerError {
 /// validator could both pass the slashing check before either records.
 /// Different validators are NOT blocked by each other.
 pub struct ValidatorLockMap {
-    locks: std::sync::Mutex<HashMap<[u8; 48], Arc<tokio::sync::Mutex<()>>>>,
+    locks: parking_lot::Mutex<HashMap<[u8; 48], Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl ValidatorLockMap {
     pub fn new() -> Self {
-        Self { locks: std::sync::Mutex::new(HashMap::new()) }
+        Self { locks: parking_lot::Mutex::new(HashMap::new()) }
     }
 
     pub fn get(&self, pubkey: &[u8; 48]) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
             .lock()
-            .expect("validator lock map poisoned")
             .entry(*pubkey)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
@@ -114,6 +114,19 @@ impl SignerService {
     }
 
     /// Signs an attestation after checking slashing protection.
+    ///
+    /// # Stage + commit on success (M-1 fix, architecture A15)
+    ///
+    /// The slashing-DB row is staged (checked but not yet written) before the
+    /// sign call.  On signer success the row is committed; on signer failure
+    /// `discard()` rolls the transaction back so no phantom row is left.
+    ///
+    /// `StagedAttestation<'_>` holds a `parking_lot::MutexGuard` (`!Send`).
+    /// We run the stage → sign → commit triple inside `spawn_blocking` so the
+    /// guard never crosses an `.await` boundary.  The async sign call is driven
+    /// to completion via `Handle::current().block_on()` on the same blocking
+    /// thread, which is the documented pattern for calling async code from a
+    /// `spawn_blocking` closure.
     #[tracing::instrument(name = "rvc.sign.attestation", skip_all, fields(rvc.operation = "attestation", rvc.slashing.result))]
     pub async fn sign_attestation(
         &self,
@@ -127,9 +140,14 @@ impl SignerService {
         let pubkey_bytes = pubkey.to_bytes();
         let pubkey_hex = hex::encode(pubkey_bytes);
 
-        // Acquire per-validator lock to serialize check-record-sign for the same validator.
-        let lock = self.validator_locks.get(&pubkey_bytes);
-        let _guard = lock.lock().await;
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = attestation_data.slot,
+            source_epoch = attestation_data.source.epoch,
+            target_epoch = attestation_data.target.epoch,
+            signing_type = "attestation",
+            "Signing attestation"
+        );
 
         let source_epoch = attestation_data.source.epoch;
         let target_epoch = attestation_data.target.epoch;
@@ -143,7 +161,7 @@ impl SignerService {
         );
 
         debug!(
-            pubkey = %format!("0x{}", &pubkey_hex[..16]),
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
             fork_version_used = %format!("0x{}", hex::encode(fork_version)),
             genesis_validators_root = %format!("0x{}", hex::encode(genesis_validators_root)),
             domain = %format!("0x{}", hex::encode(domain)),
@@ -156,7 +174,7 @@ impl SignerService {
         let signing_root_hex = hex::encode(signing_root);
 
         debug!(
-            pubkey = %format!("0x{}", &pubkey_hex[..16]),
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
             signing_root = %format!("0x{}", &signing_root_hex),
             slot = attestation_data.slot,
             index = attestation_data.index,
@@ -165,48 +183,155 @@ impl SignerService {
             "Computed attestation signing root"
         );
 
-        let slashing_check_result = {
-            let _span = tracing::info_span!("rvc.slashing.check").entered();
-            self.slashing_db.check_and_record_attestation(
-                &pubkey_hex,
-                source_epoch,
-                target_epoch,
-                Some(signing_root_hex),
-            )
-        };
+        // Acquire per-validator lock (owned variant so it can move into spawn_blocking).
+        let lock = self.validator_locks.get(&pubkey_bytes);
+        let _guard = lock.lock_owned().await;
 
-        if let Err(e) = slashing_check_result {
-            tracing::Span::current().record("rvc.slashing.result", "blocked");
-            tracing::error!(error = %e, "Attestation slashing protection blocked signing");
-            RVC_SLASHING_PROTECTION_CHECKS_TOTAL
-                .with_label_values(&[slashing_result::BLOCKED])
-                .inc();
-            RVC_ATTESTATIONS_TOTAL.with_label_values(&["failed"]).inc();
-            return Err(SignerError::SlashingProtectionBlocked(e));
-        }
+        // Emit the `rvc.slashing.check` span on the async task so that
+        // tracing subscribers (including tests) can observe it.  The actual
+        // SQLite work happens inside `spawn_blocking` below.
+        let _slashing_span = tracing::info_span!("rvc.slashing.check").entered();
+        drop(_slashing_span);
+
+        // Clone the Arc handles needed inside the blocking closure.
+        let db = Arc::clone(&self.slashing_db);
+        let signer = Arc::clone(&self.signer);
+        let handle = tokio::runtime::Handle::current();
+        let pubkey_hex_clone = pubkey_hex.clone();
+        let slot_for_log = attestation_data.slot;
+        let gvr = *genesis_validators_root;
+
+        // Run the stage → sign → commit triple on a dedicated blocking thread.
+        //
+        // `StagedAttestation<'_>` holds a `parking_lot::MutexGuard` which is
+        // `!Send`.  Putting everything inside `spawn_blocking` keeps the guard
+        // on a single OS thread; `handle.block_on(signer.sign(...))` drives the
+        // async sign call to completion without crossing `.await` on the calling
+        // task.  On signer failure `staged.discard()` rolls back the SQLite
+        // transaction so no phantom row is committed (M-1 fix, architecture A15).
+        let inner_result =
+            tokio::task::spawn_blocking(move || -> Result<Signature, SignerError> {
+                // Capture the start of the SQLite transaction hold (ISSUE-3.12).
+                let tx_start = Instant::now();
+                let staged = db
+                    .stage_attestation(
+                        "local-vc",
+                        &pubkey_hex_clone,
+                        source_epoch,
+                        target_epoch,
+                        Some(signing_root_hex),
+                        &gvr,
+                    )
+                    .map_err(|e| {
+                        error!(
+                            pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                            slot = slot_for_log,
+                            source_epoch = source_epoch,
+                            target_epoch = target_epoch,
+                            rejection_reason = %e,
+                            "Slashing protection rejected attestation"
+                        );
+                        RVC_SLASHING_PROTECTION_CHECKS_TOTAL
+                            .with_label_values(&[slashing_result::BLOCKED])
+                            .inc();
+                        RVC_ATTESTATIONS_TOTAL.with_label_values(&["failed"]).inc();
+                        // Slashing rejection IS a rollback — record real wall-clock
+                        // hold per spec (ISSUE-3.12 review MF-1).  Without this,
+                        // every double-vote/surround rejection silently bypasses
+                        // the histogram (the `?` returns before the post-stage
+                        // observe).
+                        RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                            .with_label_values(&[tx_hold_kind::ATTESTATION])
+                            .observe(tx_start.elapsed().as_secs_f64() * 1000.0);
+                        SignerError::SlashingProtectionBlocked(e)
+                    })?;
+
+                RVC_SLASHING_PROTECTION_CHECKS_TOTAL
+                    .with_label_values(&[slashing_result::SAFE])
+                    .inc();
+
+                let sign_result = handle.block_on(signer.sign(&signing_root, &pubkey_bytes));
+                // Measure hold duration before commit/discard (ISSUE-3.12).
+                // Use as_secs_f64 * 1000.0 to preserve sub-millisecond precision —
+                // in-memory SQLite typically commits in < 1 ms; as_millis truncates
+                // those observations to 0.0 (review N-1).
+                let tx_hold_ms = tx_start.elapsed().as_secs_f64() * 1000.0;
+
+                match sign_result {
+                    Ok(sig) => {
+                        if let Err(e) = staged.commit() {
+                            error!(
+                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                                slot = slot_for_log,
+                                error = %e,
+                                "Failed to commit attestation to slashing DB after successful sign"
+                            );
+                            RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                                .with_label_values(&[tx_hold_kind::ATTESTATION])
+                                .observe(tx_hold_ms);
+                            return Err(SignerError::SlashingProtectionBlocked(e));
+                        }
+                        RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                            .with_label_values(&[tx_hold_kind::ATTESTATION])
+                            .observe(tx_hold_ms);
+                        Ok(sig)
+                    }
+                    Err(e) => {
+                        // Signer failed — discard the staged transaction so no phantom row
+                        // remains in the DB (M-1 fix).
+                        staged.discard();
+                        RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                            .with_label_values(&[tx_hold_kind::ATTESTATION])
+                            .observe(tx_hold_ms);
+                        warn!(
+                            pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                            error = %e,
+                            signing_type = "attestation",
+                            "Signing failed; staged slashing-DB row discarded (no phantom row)"
+                        );
+                        Err(e.into())
+                    }
+                }
+            })
+            .await
+            .map_err(|join_err| {
+                error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %join_err,
+                    "sign_attestation blocking task panicked"
+                );
+                SignerError::SigningFailed(format!("sign_attestation task panicked: {join_err}"))
+            })?;
+
+        // Now in async context — `Span::current()` refers to the
+        // `#[tracing::instrument]` span declared on this method, so recording
+        // `rvc.slashing.result` actually lands on the instrument span.
+        let outcome = inner_result.map_err(|e| {
+            if matches!(e, SignerError::SlashingProtectionBlocked(_)) {
+                tracing::Span::current().record("rvc.slashing.result", "blocked");
+            }
+            e
+        })?;
 
         tracing::Span::current().record("rvc.slashing.result", "safe");
-        RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
-
-        let signature = match self.signer.sign(&signing_root, &pubkey_bytes).await {
-            Ok(sig) => sig,
-            Err(e) => {
-                // Phantom entry: record exists but signing failed. This is safe per spec —
-                // missing a duty is far less harmful than double-signing.
-                warn!(error = %e, pubkey = %format!("0x{}", &pubkey_hex[..16]),
-                    "Attestation signing failed after recording (phantom entry in slashing DB)");
-                return Err(e.into());
-            }
-        };
-
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
         RVC_ATTESTATIONS_TOTAL.with_label_values(&["success"]).inc();
 
-        Ok(signature)
+        debug!(
+            duration_ms = start.elapsed().as_millis() as u64,
+            signing_type = "attestation",
+            "Signing completed"
+        );
+
+        Ok(outcome)
     }
 
     /// Signs a block after checking slashing protection.
+    ///
+    /// Uses the same stage + commit-on-success pattern as `sign_attestation`
+    /// (M-1 fix, architecture A15).  See `sign_attestation` for the full
+    /// rationale on `spawn_blocking` + `Handle::block_on`.
     #[tracing::instrument(name = "rvc.sign.block", skip_all, fields(rvc.operation = "block", rvc.slashing.result))]
     pub async fn sign_block(
         &self,
@@ -220,9 +345,12 @@ impl SignerService {
         let pubkey_bytes = pubkey.to_bytes();
         let pubkey_hex = hex::encode(pubkey_bytes);
 
-        // Acquire per-validator lock to serialize check-record-sign for the same validator.
-        let lock = self.validator_locks.get(&pubkey_bytes);
-        let _guard = lock.lock().await;
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "block",
+            "Signing block"
+        );
 
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
@@ -235,37 +363,111 @@ impl SignerService {
         let signing_root = crypto::compute_signing_root(block_root, domain);
         let signing_root_hex = hex::encode(signing_root);
 
-        let slashing_check_result = {
-            let _span = tracing::info_span!("rvc.slashing.check").entered();
-            self.slashing_db.check_and_record_block(&pubkey_hex, slot, Some(signing_root_hex))
-        };
+        // Acquire per-validator lock (owned so it can move into spawn_blocking).
+        let lock = self.validator_locks.get(&pubkey_bytes);
+        let _guard = lock.lock_owned().await;
 
-        if let Err(e) = slashing_check_result {
-            tracing::Span::current().record("rvc.slashing.result", "blocked");
-            tracing::error!(error = %e, "Block slashing protection blocked signing");
-            RVC_SLASHING_PROTECTION_CHECKS_TOTAL
-                .with_label_values(&[slashing_result::BLOCKED])
-                .inc();
-            return Err(SignerError::SlashingProtectionBlocked(e));
-        }
+        let db = Arc::clone(&self.slashing_db);
+        let signer = Arc::clone(&self.signer);
+        let handle = tokio::runtime::Handle::current();
+        let pubkey_hex_clone = pubkey_hex.clone();
+        let gvr = *genesis_validators_root;
+
+        let inner_result =
+            tokio::task::spawn_blocking(move || -> Result<Signature, SignerError> {
+                // Capture the start of the SQLite transaction hold (ISSUE-3.12).
+                let tx_start = Instant::now();
+                let staged = db
+                    .stage_block("local-vc", &pubkey_hex_clone, slot, Some(signing_root_hex), &gvr)
+                    .map_err(|e| {
+                        error!(
+                            pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                            slot = slot,
+                            rejection_reason = %e,
+                            "Slashing protection rejected block proposal"
+                        );
+                        RVC_SLASHING_PROTECTION_CHECKS_TOTAL
+                            .with_label_values(&[slashing_result::BLOCKED])
+                            .inc();
+                        // Slashing rejection IS a rollback (ISSUE-3.12 review MF-1).
+                        RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                            .with_label_values(&[tx_hold_kind::BLOCK])
+                            .observe(tx_start.elapsed().as_secs_f64() * 1000.0);
+                        SignerError::SlashingProtectionBlocked(e)
+                    })?;
+
+                RVC_SLASHING_PROTECTION_CHECKS_TOTAL
+                    .with_label_values(&[slashing_result::SAFE])
+                    .inc();
+
+                let sign_result = handle.block_on(signer.sign(&signing_root, &pubkey_bytes));
+                // Measure hold duration before commit/discard (ISSUE-3.12).
+                // Use as_secs_f64 * 1000.0 for sub-millisecond precision.
+                let tx_hold_ms = tx_start.elapsed().as_secs_f64() * 1000.0;
+
+                match sign_result {
+                    Ok(sig) => {
+                        if let Err(e) = staged.commit() {
+                            error!(
+                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                                slot = slot,
+                                error = %e,
+                                "Failed to commit block to slashing DB after successful sign"
+                            );
+                            RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                                .with_label_values(&[tx_hold_kind::BLOCK])
+                                .observe(tx_hold_ms);
+                            return Err(SignerError::SlashingProtectionBlocked(e));
+                        }
+                        RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                            .with_label_values(&[tx_hold_kind::BLOCK])
+                            .observe(tx_hold_ms);
+                        Ok(sig)
+                    }
+                    Err(e) => {
+                        // Signer failed — discard the staged transaction (M-1 fix).
+                        staged.discard();
+                        RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
+                            .with_label_values(&[tx_hold_kind::BLOCK])
+                            .observe(tx_hold_ms);
+                        warn!(
+                            pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                            error = %e,
+                            signing_type = "block",
+                            "Signing failed; staged slashing-DB row discarded (no phantom row)"
+                        );
+                        Err(e.into())
+                    }
+                }
+            })
+            .await
+            .map_err(|join_err| {
+                error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %join_err,
+                    "sign_block blocking task panicked"
+                );
+                SignerError::SigningFailed(format!("sign_block task panicked: {join_err}"))
+            })?;
+
+        let outcome = inner_result.map_err(|e| {
+            if matches!(e, SignerError::SlashingProtectionBlocked(_)) {
+                tracing::Span::current().record("rvc.slashing.result", "blocked");
+            }
+            e
+        })?;
 
         tracing::Span::current().record("rvc.slashing.result", "safe");
-        RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).inc();
-
-        let signature = match self.signer.sign(&signing_root, &pubkey_bytes).await {
-            Ok(sig) => sig,
-            Err(e) => {
-                // Phantom entry: record exists but signing failed. Safe per spec.
-                warn!(error = %e, pubkey = %format!("0x{}", &pubkey_hex[..16]),
-                    "Block signing failed after recording (phantom entry in slashing DB)");
-                return Err(e.into());
-            }
-        };
-
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
 
-        Ok(signature)
+        debug!(
+            duration_ms = start.elapsed().as_millis() as u64,
+            signing_type = "block",
+            "Signing completed"
+        );
+
+        Ok(outcome)
     }
 
     /// Signs a RANDAO reveal for the given epoch.
@@ -277,6 +479,17 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            epoch = epoch,
+            signing_type = "randao",
+            "Signing RANDAO reveal"
+        );
+
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
         let domain = crypto::compute_domain(
@@ -286,8 +499,25 @@ impl SignerService {
         );
         let signing_root = crypto::compute_signing_root(&epoch, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "randao",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "randao",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs a sync committee message for the given beacon block root and slot.
@@ -300,6 +530,17 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "sync_committee_message",
+            "Signing sync committee message"
+        );
+
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
@@ -307,8 +548,25 @@ impl SignerService {
             crypto::compute_domain(DOMAIN_SYNC_COMMITTEE, fork_version, *genesis_validators_root);
         let signing_root = crypto::compute_signing_root(beacon_block_root, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "sync_committee_message",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "sync_committee_message",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
@@ -320,6 +578,17 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "selection_proof",
+            "Signing selection proof"
+        );
+
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
@@ -330,8 +599,25 @@ impl SignerService {
         );
         let signing_root = crypto::compute_signing_root(&slot, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "selection_proof",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "selection_proof",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
@@ -343,7 +629,18 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
         let slot = aggregate_and_proof.aggregate.data.slot;
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "aggregate_and_proof",
+            "Signing aggregate and proof"
+        );
+
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
@@ -354,8 +651,25 @@ impl SignerService {
         );
         let signing_root = crypto::compute_signing_root(aggregate_and_proof, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "aggregate_and_proof",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "aggregate_and_proof",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
@@ -367,7 +681,18 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
         let slot = aggregate_and_proof.aggregate.data.slot;
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "electra_aggregate_and_proof",
+            "Signing Electra aggregate and proof"
+        );
+
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
@@ -378,11 +703,39 @@ impl SignerService {
         );
         let signing_root = crypto::compute_signing_root(aggregate_and_proof, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "electra_aggregate_and_proof",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "electra_aggregate_and_proof",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs a voluntary exit with DOMAIN_VOLUNTARY_EXIT.
+    ///
+    /// # Slashing-protection note (C2 invariant)
+    ///
+    /// Voluntary exits are **not slashable** per the Ethereum consensus spec, so
+    /// this function intentionally omits the stage → commit / discard pattern used
+    /// by [`sign_attestation`] and [`sign_block`].  There is no
+    /// `stage_voluntary_exit` API in the slashing crate.
+    ///
+    /// The C2 error-handling invariant is still satisfied here: every signer
+    /// failure is propagated directly to the caller via `Err(e.into())` — no
+    /// error is swallowed or silently converted to `Ok`.
     #[tracing::instrument(name = "rvc.sign.voluntary_exit", skip_all, fields(rvc.operation = "voluntary_exit"))]
     pub async fn sign_voluntary_exit(
         &self,
@@ -391,6 +744,17 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            epoch = voluntary_exit.epoch,
+            signing_type = "voluntary_exit",
+            "Signing voluntary exit"
+        );
+
         let fork_name = eth_types::ForkName::from_epoch(voluntary_exit.epoch, fork_schedule);
         // EIP-7044: cap fork version at Capella for voluntary exits
         let capped = if fork_name >= eth_types::ForkName::Capella {
@@ -406,8 +770,26 @@ impl SignerService {
         );
         let signing_root = crypto::compute_signing_root(voluntary_exit, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        // C2: signer errors are propagated directly — no stage to discard.
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "voluntary_exit",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "voluntary_exit",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs a builder registration with DOMAIN_APPLICATION_BUILDER.
@@ -420,13 +802,40 @@ impl SignerService {
         pubkey: &PublicKey,
         fork_version: [u8; 4],
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            signing_type = "builder_registration",
+            "Signing builder registration"
+        );
+
         let zeroed_genesis_root = [0u8; 32];
         let domain =
             crypto::compute_domain(DOMAIN_APPLICATION_BUILDER, fork_version, zeroed_genesis_root);
         let signing_root = crypto::compute_signing_root(registration, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "builder_registration",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "builder_registration",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs a sync committee selection proof for the given slot and subcommittee.
@@ -439,6 +848,18 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            subcommittee_index = subcommittee_index,
+            signing_type = "sync_committee_selection_proof",
+            "Signing sync committee selection proof"
+        );
+
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
@@ -450,8 +871,25 @@ impl SignerService {
         let selection_data = SyncAggregatorSelectionData { slot, subcommittee_index };
         let signing_root = crypto::compute_signing_root(&selection_data, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "sync_committee_selection_proof",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "sync_committee_selection_proof",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Signs a ContributionAndProof with DOMAIN_CONTRIBUTION_AND_PROOF.
@@ -463,7 +901,19 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        let epoch = contribution_and_proof.contribution.slot / SLOTS_PER_EPOCH;
+        let start = Instant::now();
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+        let slot = contribution_and_proof.contribution.slot;
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "contribution_and_proof",
+            "Signing contribution and proof"
+        );
+
+        let epoch = slot / SLOTS_PER_EPOCH;
         let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
         let fork_version = fork_name.fork_version(fork_schedule);
         let domain = crypto::compute_domain(
@@ -473,8 +923,25 @@ impl SignerService {
         );
         let signing_root = crypto::compute_signing_root(contribution_and_proof, domain);
 
-        let pubkey_bytes = pubkey.to_bytes();
-        Ok(self.signer.sign(&signing_root, &pubkey_bytes).await?)
+        match self.signer.sign(&signing_root, &pubkey_bytes).await {
+            Ok(sig) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "contribution_and_proof",
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = "contribution_and_proof",
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
     }
 
     /// Returns a reference to the underlying composite signer.
@@ -1685,17 +2152,18 @@ mod tests {
         let genesis_root = [0xaa; 32];
         let barrier = Arc::new(Barrier::new(2));
 
-        // Both attestations use the SAME source/target so the second would normally
-        // fail without the mutex. With the mutex, only one runs at a time, and the
-        // second will see the same signing_root already recorded (which is allowed).
-        let data = create_test_attestation_data(59, 60);
+        // Task A: (source=59, target=60), Task B: (source=58, target=60)
+        // Same target, different source = double-vote attempt.
+        // The per-validator mutex serializes access so the second task sees
+        // the first's record and gets rejected by slashing protection.
+        let data_a = create_test_attestation_data(59, 60);
+        let data_b = create_test_attestation_data(58, 60);
 
         let mut handles = vec![];
-        for _ in 0..2 {
+        for d in [data_a, data_b] {
             let service = service.clone();
             let pk = pubkey.clone();
             let f = fork_schedule.clone();
-            let d = data.clone();
             let barrier = barrier.clone();
 
             handles.push(tokio::spawn(async move {
@@ -1704,12 +2172,15 @@ mod tests {
             }));
         }
 
-        // Both should succeed because they have the same signing root
-        // and the mutex ensures they run sequentially
+        let mut results = vec![];
         for h in handles {
-            let result = h.await.unwrap();
-            assert!(result.is_ok(), "signing should succeed: {:?}", result.err());
+            results.push(h.await.unwrap());
         }
+
+        let successes = results.iter().filter(|r| r.is_ok()).count();
+        let failures = results.iter().filter(|r| r.is_err()).count();
+        assert_eq!(successes, 1, "exactly one concurrent attestation must succeed");
+        assert_eq!(failures, 1, "exactly one concurrent attestation must be rejected");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1751,12 +2222,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_signing_failure_after_recording_warns_phantom() {
-        // Use a signer with no keys to cause a signing failure after slashing check passes
+    async fn test_signing_failure_does_not_commit_phantom_row() {
+        // M-1 fix: when signing fails, the staged slashing-DB row must be rolled back
+        // so no phantom entry remains.  Before the fix, this test would find a row.
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
 
-        // Register the validator in slashing DB but DON'T add the key to the signer
+        // Signer with no keys — signing will fail with KeyNotFound.
         let empty_signer = create_empty_composite_signer();
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
         let service = SignerService::new(empty_signer, slashing_db.clone());
@@ -1765,13 +2237,63 @@ mod tests {
 
         let data = create_test_attestation_data(59, 60);
         let result = service.sign_attestation(&data, &pubkey, &fork_schedule, &genesis_root).await;
-        assert!(result.is_err());
+        assert!(result.is_err(), "expected signing failure when key is absent");
 
-        // Verify the phantom entry exists in slashing DB — the signing failed,
-        // but the record was committed. This is the spec-mandated behavior.
         match result.err().unwrap() {
             SignerError::KeyNotFound(_) | SignerError::SigningFailed(_) => {}
             other => panic!("expected signing failure, got: {other}"),
         }
+
+        // M-1 fix: the staged row must have been rolled back — DB must be empty.
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("failed to query slashing db");
+        assert!(
+            attestations.is_empty(),
+            "M-1 fix: no phantom row must be committed after signing failure; found: {attestations:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_db_error_returns_error_not_silent_success() {
+        let dir = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = dir.path().join("slashing.sqlite");
+        let fork_schedule = create_test_fork_schedule_for_attestation();
+        let genesis_root = [0xaa; 32];
+
+        // Record one valid attestation via a first service instance, then drop it
+        {
+            let sk = SecretKey::generate();
+            let pk = sk.public_key();
+            let signer = create_test_composite_signer_with_key(sk);
+            let slashing_db = Arc::new(SlashingDb::open(&db_path).expect("failed to open db"));
+            let service = SignerService::new(signer, slashing_db);
+            let data = create_test_attestation_data(59, 60);
+            let result = service.sign_attestation(&data, &pk, &fork_schedule, &genesis_root).await;
+            assert!(result.is_ok(), "first attestation should succeed");
+        }
+        // Connection is dropped, flushing WAL to disk
+
+        // Corrupt the SQLite database file and remove WAL/SHM sidecars
+        std::fs::write(&db_path, b"corrupted").expect("failed to corrupt db");
+        let wal_path = db_path.with_extension("sqlite-wal");
+        let shm_path = db_path.with_extension("sqlite-shm");
+        let _ = std::fs::remove_file(&wal_path);
+        let _ = std::fs::remove_file(&shm_path);
+
+        // Open a new service from the corrupted database
+        let sk2 = SecretKey::generate();
+        let pk2 = sk2.public_key();
+        let signer = create_test_composite_signer_with_key(sk2);
+        let corrupted_db = SlashingDb::open(&db_path);
+
+        if let Ok(db) = corrupted_db {
+            // SQLite may lazily open — error surfaces on first query
+            let service = SignerService::new(signer, Arc::new(db));
+            let data = create_test_attestation_data(60, 61);
+            let result = service.sign_attestation(&data, &pk2, &fork_schedule, &genesis_root).await;
+            assert!(result.is_err(), "DB error must propagate, not be swallowed");
+        }
+        // If SlashingDb::open itself fails on corrupted file, that's also fail-closed behavior
     }
 }

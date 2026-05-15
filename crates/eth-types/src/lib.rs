@@ -12,6 +12,7 @@ mod duties;
 mod fork;
 pub(crate) mod hex_fixed;
 pub(crate) mod serde_signature;
+pub mod ssz_helpers;
 mod sync_committee;
 pub(crate) mod tree_hash_utils;
 pub use aggregation::{
@@ -20,8 +21,9 @@ pub use aggregation::{
 };
 pub use attestation::SingleAttestation;
 pub use block::{
-    BeaconBlock, BeaconBlockBody, BlindedBeaconBlock, BlindedBeaconBlockBody, BlobSidecar,
-    BlockContents, ProducedBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    body_fork_layout, kzg_commitment_list_root, BeaconBlock, BeaconBlockBody, BlindedBeaconBlock,
+    BlindedBeaconBlockBody, BlobSidecar, BlockContents, BodyForkLayout, ProducedBlock,
+    SignedBeaconBlock, SignedBlindedBeaconBlock,
 };
 pub use builder::{SignedValidatorRegistration, ValidatorRegistrationV1};
 pub use deposit::{BLSToExecutionChange, DepositData, DepositMessage, SignedBLSToExecutionChange};
@@ -33,10 +35,16 @@ pub use domains::{
 };
 pub use duties::{ProposerDuty, SignedVoluntaryExit, VoluntaryExit};
 pub use fork::{ForkName, ForkSchedule};
+pub use ssz_helpers::{
+    decode_attestation_ssz, decode_beacon_block_ssz, decode_blinded_beacon_block_ssz,
+    decode_sync_committee_contribution_ssz, encode_attestation_ssz, encode_beacon_block_ssz,
+    encode_blinded_beacon_block_ssz, encode_sync_committee_contribution_ssz, SszDecodeError,
+};
 pub use sync_committee::{
     ContributionAndProof, SignedContributionAndProof, SyncAggregatorSelectionData,
     SyncCommitteeContribution, SyncCommitteeDuty, SyncCommitteeMessage,
 };
+pub use tree_hash_utils::TreeHashError;
 
 pub type Slot = u64;
 pub type Epoch = u64;
@@ -101,6 +109,15 @@ pub struct SigningData {
     pub object_root: Root,
     #[serde(with = "hex_fixed::bytes_32_hex")]
     pub domain: Domain,
+}
+
+/// Fork context used for domain computation in signed duties.
+/// Carries both the current fork version and the genesis validators root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkInfo {
+    pub previous_version: Version,
+    pub current_version: Version,
+    pub genesis_validators_root: Root,
 }
 
 #[cfg(test)]

@@ -43,10 +43,35 @@ const MAX_SCRYPT_R: u32 = 16;
 const MAX_SCRYPT_P: u32 = 16;
 const MAX_SCRYPT_DKLEN: u32 = 64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub enum EncryptionKdf {
+    /// Production scrypt params (n = 2^18). EIP-2335 default.
     Scrypt,
+    /// Production PBKDF2 params (c = 2^18). EIP-2335 default.
     Pbkdf2,
+    /// Caller-supplied scrypt params. Use `scrypt_cheap_for_tests()` to
+    /// construct fast test fixtures. NEVER use n < 2^17 in production.
+    ScryptWith { n: u32, r: u32, p: u32, dklen: u32 },
+    /// Caller-supplied PBKDF2 params. Use `pbkdf2_cheap_for_tests()` to
+    /// construct fast test fixtures. The validator still enforces
+    /// `c >= MIN_PBKDF2_C` (10_000) at decrypt time.
+    Pbkdf2With { c: u32, dklen: u32 },
+}
+
+impl EncryptionKdf {
+    /// Cheap scrypt params for unit tests only (n = 2). Provides essentially
+    /// no key stretching — never use this in production code paths.
+    pub fn scrypt_cheap_for_tests() -> Self {
+        Self::ScryptWith { n: 2, r: 1, p: 1, dklen: DEFAULT_SCRYPT_DKLEN }
+    }
+
+    /// Cheap PBKDF2 params for unit tests only (c = MIN_PBKDF2_C = 10_000,
+    /// the floor the decrypt validator enforces). Prefer
+    /// `scrypt_cheap_for_tests()` when the test does not specifically
+    /// exercise the PBKDF2 path — scrypt-cheap is ~10× faster.
+    pub fn pbkdf2_cheap_for_tests() -> Self {
+        Self::Pbkdf2With { c: MIN_PBKDF2_C, dklen: DEFAULT_PBKDF2_DKLEN }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -337,6 +362,19 @@ impl Keystore {
                 KdfParams::Pbkdf2(Pbkdf2Params {
                     dklen: DEFAULT_PBKDF2_DKLEN,
                     c: DEFAULT_PBKDF2_C,
+                    prf: DEFAULT_PBKDF2_PRF.to_string(),
+                    salt: hex::encode(salt),
+                }),
+            ),
+            EncryptionKdf::ScryptWith { n, r, p, dklen } => (
+                KDF_SCRYPT.to_string(),
+                KdfParams::Scrypt(ScryptParams { dklen, n, r, p, salt: hex::encode(salt) }),
+            ),
+            EncryptionKdf::Pbkdf2With { c, dklen } => (
+                KDF_PBKDF2.to_string(),
+                KdfParams::Pbkdf2(Pbkdf2Params {
+                    dklen,
+                    c,
                     prf: DEFAULT_PBKDF2_PRF.to_string(),
                     salt: hex::encode(salt),
                 }),
@@ -1176,9 +1214,13 @@ mod tests {
     fn test_encrypt_scrypt_produces_valid_keystore() {
         let sk = SecretKey::generate();
         let password = b"testpassword";
-        let keystore =
-            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
-                .expect("should encrypt");
+        let keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         assert_eq!(keystore.version, 4);
         assert_eq!(keystore.crypto.kdf.function, "scrypt");
         assert_eq!(keystore.crypto.cipher.function, "aes-128-ctr");
@@ -1189,9 +1231,13 @@ mod tests {
     fn test_encrypt_pbkdf2_produces_valid_keystore() {
         let sk = SecretKey::generate();
         let password = b"testpassword";
-        let keystore =
-            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Pbkdf2)
-                .expect("should encrypt");
+        let keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::pbkdf2_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         assert_eq!(keystore.version, 4);
         assert_eq!(keystore.crypto.kdf.function, "pbkdf2");
         assert_eq!(keystore.crypto.cipher.function, "aes-128-ctr");
@@ -1202,9 +1248,13 @@ mod tests {
     fn test_encrypt_decrypt_roundtrip_scrypt() {
         let sk = SecretKey::generate();
         let password = b"testpassword";
-        let keystore =
-            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
-                .expect("should encrypt");
+        let keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         let decrypted = keystore.decrypt(password).expect("should decrypt");
         assert_eq!(sk.to_bytes(), decrypted.to_bytes());
     }
@@ -1213,9 +1263,13 @@ mod tests {
     fn test_encrypt_decrypt_roundtrip_pbkdf2() {
         let sk = SecretKey::generate();
         let password = b"testpassword";
-        let keystore =
-            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Pbkdf2)
-                .expect("should encrypt");
+        let keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::pbkdf2_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         let decrypted = keystore.decrypt(password).expect("should decrypt");
         assert_eq!(sk.to_bytes(), decrypted.to_bytes());
     }
@@ -1224,9 +1278,13 @@ mod tests {
     fn test_encrypt_pubkey_matches() {
         let sk = SecretKey::generate();
         let password = b"testpassword";
-        let keystore =
-            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
-                .expect("should encrypt");
+        let keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         let expected_pubkey = hex::encode(sk.public_key().to_bytes());
         assert_eq!(keystore.pubkey.as_deref(), Some(expected_pubkey.as_str()));
     }
@@ -1237,7 +1295,8 @@ mod tests {
         let password = b"testpassword";
         let path = "m/12381/3600/42/0/0";
         let keystore =
-            Keystore::encrypt(&sk, password, path, EncryptionKdf::Scrypt).expect("should encrypt");
+            Keystore::encrypt(&sk, password, path, EncryptionKdf::scrypt_cheap_for_tests())
+                .expect("should encrypt");
         assert_eq!(keystore.path, path);
     }
 
@@ -1245,9 +1304,13 @@ mod tests {
     fn test_encrypt_uuid_is_v4() {
         let sk = SecretKey::generate();
         let password = b"testpassword";
-        let keystore =
-            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
-                .expect("should encrypt");
+        let keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         assert_eq!(keystore.uuid.get_version(), Some(uuid::Version::Random));
     }
 
@@ -1255,9 +1318,13 @@ mod tests {
     fn test_encrypt_wrong_password_fails_decrypt() {
         let sk = SecretKey::generate();
         let password = b"correctpassword";
-        let keystore =
-            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
-                .expect("should encrypt");
+        let keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         let result = keystore.decrypt(b"wrongpassword");
         assert!(matches!(result, Err(KeystoreError::ChecksumMismatch)));
     }
@@ -1303,9 +1370,13 @@ mod tests {
     fn test_encrypt_iv_is_32_hex_chars() {
         let sk = SecretKey::generate();
         let password = b"testpassword";
-        let keystore =
-            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
-                .expect("should encrypt");
+        let keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         assert_eq!(keystore.crypto.cipher.params.iv.len(), 32); // 16 bytes hex-encoded
     }
 
@@ -1313,9 +1384,13 @@ mod tests {
     fn test_to_json_produces_valid_json() {
         let sk = SecretKey::generate();
         let password = b"testpassword";
-        let keystore =
-            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
-                .expect("should encrypt");
+        let keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         let json = keystore.to_json().expect("should serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("should be valid JSON");
         assert_eq!(parsed["version"], 4);
@@ -1328,9 +1403,13 @@ mod tests {
     fn test_to_json_then_from_json_roundtrip() {
         let sk = SecretKey::generate();
         let password = b"testpassword";
-        let keystore =
-            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Pbkdf2)
-                .expect("should encrypt");
+        let keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         let json = keystore.to_json().expect("should serialize");
         let reloaded = Keystore::from_json(&json).expect("should parse back");
         let decrypted = reloaded.decrypt(password).expect("should decrypt");
@@ -1341,9 +1420,13 @@ mod tests {
     fn test_to_file_creates_file_and_roundtrips() {
         let sk = SecretKey::generate();
         let password = b"testpassword";
-        let keystore =
-            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
-                .expect("should encrypt");
+        let keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         let dir = tempfile::tempdir().expect("should create temp dir");
         let file_path = dir.path().join("keystore.json");
         keystore.to_file(&file_path).expect("should write to file");
@@ -1360,9 +1443,13 @@ mod tests {
 
         let sk = SecretKey::generate();
         let password = b"testpassword";
-        let keystore =
-            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
-                .expect("should encrypt");
+        let keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         let dir = tempfile::tempdir().expect("should create temp dir");
         let file_path = dir.path().join("keystore.json");
         keystore.to_file(&file_path).expect("should write to file");
@@ -1377,10 +1464,20 @@ mod tests {
         let sk1 = SecretKey::generate();
         let sk2 = SecretKey::generate();
         let password = b"testpassword";
-        let ks1 = Keystore::encrypt(&sk1, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
-            .expect("should encrypt");
-        let ks2 = Keystore::encrypt(&sk2, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
-            .expect("should encrypt");
+        let ks1 = Keystore::encrypt(
+            &sk1,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
+        let ks2 = Keystore::encrypt(
+            &sk2,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         assert_ne!(ks1.crypto.cipher.message, ks2.crypto.cipher.message);
     }
 
@@ -1388,9 +1485,13 @@ mod tests {
     fn test_encrypt_pubkey_no_0x_prefix() {
         let sk = SecretKey::generate();
         let password = b"testpassword";
-        let keystore =
-            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
-                .expect("should encrypt");
+        let keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         let pubkey = keystore.pubkey.as_ref().expect("should have pubkey");
         assert!(!pubkey.starts_with("0x"), "pubkey should not have 0x prefix");
         assert_eq!(pubkey.len(), 96, "pubkey hex should be 96 chars (48 bytes)");
@@ -1400,13 +1501,66 @@ mod tests {
     fn test_decrypted_key_can_sign_after_encrypt() {
         let sk = SecretKey::generate();
         let password = b"testpassword";
-        let keystore =
-            Keystore::encrypt(&sk, password, "m/12381/3600/0/0/0", EncryptionKdf::Scrypt)
-                .expect("should encrypt");
+        let keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
         let decrypted = keystore.decrypt(password).expect("should decrypt");
         let message = b"test message";
         let signature = decrypted.sign(message);
         let public_key = decrypted.public_key();
         assert!(signature.verify(&public_key, message).is_ok());
+    }
+
+    #[test]
+    fn test_encryption_kdf_cheap_constructors_decrypt_roundtrip() {
+        let sk = SecretKey::generate();
+        let password = b"cheap-test";
+
+        let cheap_scrypt = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("cheap-scrypt encrypt should succeed");
+        let recovered =
+            cheap_scrypt.decrypt(password).expect("cheap-scrypt decrypt should succeed");
+        assert_eq!(recovered.to_bytes(), sk.to_bytes());
+
+        let cheap_pbkdf2 = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::pbkdf2_cheap_for_tests(),
+        )
+        .expect("cheap-pbkdf2 encrypt should succeed");
+        let recovered =
+            cheap_pbkdf2.decrypt(password).expect("cheap-pbkdf2 decrypt should succeed");
+        assert_eq!(recovered.to_bytes(), sk.to_bytes());
+    }
+
+    #[test]
+    fn test_encryption_kdf_cheap_scrypt_uses_low_n() {
+        let sk = SecretKey::generate();
+        let password = b"cheap";
+        let ks = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .unwrap();
+        match &ks.crypto.kdf.params {
+            KdfParams::Scrypt(p) => {
+                assert_eq!(p.n, 2, "cheap scrypt should use n=2");
+                assert_eq!(p.r, 1);
+                assert_eq!(p.p, 1);
+            }
+            _ => panic!("expected scrypt params"),
+        }
     }
 }

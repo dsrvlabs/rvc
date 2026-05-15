@@ -5,10 +5,14 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
+use crypto::hex::{strip_prefix_strict, HexError};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 use url::Url;
+
+use beacon::ResponseCaps;
 
 use super::error::ConfigError;
 use super::network::Network;
@@ -105,6 +109,149 @@ pub struct Config {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grpc_signer_tls_ca_cert: Option<PathBuf>,
+
+    #[serde(default)]
+    pub disable_attesting: bool,
+
+    #[serde(default = "default_slashed_validators_action")]
+    pub slashed_validators_action: String,
+
+    #[serde(default = "default_circuit_breaker_consecutive_limit")]
+    pub builder_circuit_breaker_consecutive_limit: u32,
+
+    #[serde(default = "default_circuit_breaker_epoch_limit")]
+    pub builder_circuit_breaker_epoch_limit: u32,
+
+    #[serde(default)]
+    pub disable_keystore_locking: bool,
+
+    // --- Monitoring fields (T3.7) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitoring_endpoint: Option<String>,
+
+    #[serde(default = "default_monitoring_interval")]
+    pub monitoring_interval: u64,
+
+    #[serde(default)]
+    pub monitoring_endpoint_insecure: bool,
+
+    // --- Proposer nodes fields (T3.1/T3.2) ---
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub proposer_nodes: Vec<String>,
+
+    // --- Broadcast topics fields (T3.3/T3.4) ---
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub broadcast: Vec<String>,
+
+    // --- Proposer config URL fields (T3.11/T3.12/T3.13) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposer_config_url: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposer_config_file: Option<String>,
+
+    #[serde(default = "default_proposer_config_refresh_interval")]
+    pub proposer_config_refresh_interval: u64,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proposer_config_url_token: Option<String>,
+
+    #[serde(default)]
+    pub proposer_config_url_insecure: bool,
+
+    // --- Log rotation fields (T3.8/T3.9/T3.10) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logfile: Option<PathBuf>,
+
+    #[serde(default = "default_logfile_max_size")]
+    pub logfile_max_size: u64,
+
+    #[serde(default = "default_logfile_max_number")]
+    pub logfile_max_number: usize,
+
+    #[serde(default)]
+    pub logfile_compress: bool,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logfile_level: Option<String>,
+
+    // --- Health tier fields (T4.5/T4.8) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bn_sync_tolerances: Option<String>,
+
+    // --- Role-based BN fields (T4.9/T4.11) ---
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub beacon_nodes_config: Vec<BeaconNodeEntry>,
+
+    // --- Block selection mode (T4.1/T4.4) ---
+    #[serde(default)]
+    pub block_selection_mode: validator_store::BlockSelectionMode,
+
+    // --- Registration batching (T4.12/T4.13) ---
+    #[serde(default = "default_validator_registration_batch_size")]
+    pub validator_registration_batch_size: usize,
+
+    #[serde(default = "default_validator_registration_batch_delay")]
+    pub validator_registration_batch_delay: u64,
+
+    // --- Validator per-validator config (ISSUE-2.1 / H-1) ---
+    /// Path to a TOML file containing per-validator and default fee_recipient /
+    /// gas_limit overrides.  rvc refuses to start if `default_fee_recipient`
+    /// resolves to the zero address (0x000…000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validators_config: Option<PathBuf>,
+
+    // --- BN HTTP caps (ISSUE-2.13 / H-12) ---
+    /// Maximum JSON response body size in bytes from the beacon node (H-12).
+    ///
+    /// Requests whose body (or `Content-Length`) exceeds this value are rejected before
+    /// the full body is allocated.  Default: 32 MiB.
+    #[serde(default = "default_beacon_max_body_bytes")]
+    pub beacon_max_body_bytes: usize,
+}
+
+fn default_beacon_max_body_bytes() -> usize {
+    ResponseCaps::DEFAULT_MAX_BODY_BYTES
+}
+
+fn default_monitoring_interval() -> u64 {
+    384
+}
+
+fn default_proposer_config_refresh_interval() -> u64 {
+    384
+}
+
+fn default_logfile_max_size() -> u64 {
+    200
+}
+
+fn default_logfile_max_number() -> usize {
+    5
+}
+
+fn default_slashed_validators_action() -> String {
+    "disable-only".to_string()
+}
+
+/// Per-BN configuration entry for `[[beacon_nodes]]` TOML tables.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeaconNodeEntry {
+    pub url: String,
+    #[serde(default = "default_bn_roles")]
+    pub roles: Vec<String>,
+}
+
+fn default_bn_roles() -> Vec<String> {
+    vec!["all".to_string()]
+}
+
+fn default_validator_registration_batch_size() -> usize {
+    500
+}
+
+fn default_validator_registration_batch_delay() -> u64 {
+    500
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -142,6 +289,14 @@ fn default_gcp_secret_prefix() -> String {
 
 fn default_keymanager_body_limit() -> usize {
     10 * 1024 * 1024 // 10 MB
+}
+
+fn default_circuit_breaker_consecutive_limit() -> u32 {
+    3
+}
+
+fn default_circuit_breaker_epoch_limit() -> u32 {
+    5
 }
 
 fn default_tracing_exporter() -> String {
@@ -189,6 +344,33 @@ impl Default for Config {
             grpc_signer_tls_cert: None,
             grpc_signer_tls_key: None,
             grpc_signer_tls_ca_cert: None,
+            disable_attesting: false,
+            slashed_validators_action: default_slashed_validators_action(),
+            builder_circuit_breaker_consecutive_limit: default_circuit_breaker_consecutive_limit(),
+            builder_circuit_breaker_epoch_limit: default_circuit_breaker_epoch_limit(),
+            disable_keystore_locking: false,
+            proposer_nodes: Vec::new(),
+            broadcast: Vec::new(),
+            proposer_config_url: None,
+            proposer_config_file: None,
+            proposer_config_refresh_interval: default_proposer_config_refresh_interval(),
+            proposer_config_url_token: None,
+            proposer_config_url_insecure: false,
+            monitoring_endpoint: None,
+            monitoring_interval: default_monitoring_interval(),
+            monitoring_endpoint_insecure: false,
+            logfile: None,
+            logfile_max_size: default_logfile_max_size(),
+            logfile_max_number: default_logfile_max_number(),
+            logfile_compress: false,
+            logfile_level: None,
+            bn_sync_tolerances: None,
+            beacon_nodes_config: Vec::new(),
+            block_selection_mode: validator_store::BlockSelectionMode::default(),
+            validator_registration_batch_size: default_validator_registration_batch_size(),
+            validator_registration_batch_delay: default_validator_registration_batch_delay(),
+            validators_config: None,
+            beacon_max_body_bytes: default_beacon_max_body_bytes(),
         }
     }
 }
@@ -288,7 +470,68 @@ impl Config {
         self.effective_genesis_time()?;
         self.effective_genesis_validators_root()?;
 
+        if self.allow_insecure_remote_signer {
+            self.validate_insecure_env_var()?;
+        }
+
+        // Validate proposer_config_url and proposer_config_file mutual exclusivity
+        if self.proposer_config_url.is_some() && self.proposer_config_file.is_some() {
+            return Err(ConfigError::MissingField(
+                "--proposer-config-url and --proposer-config-file are mutually exclusive; use only one".to_string(),
+            ));
+        }
+
+        // Validate broadcast topics
+        for topic in &self.broadcast {
+            match topic.as_str() {
+                "attestations" | "blocks" | "sync-committee" | "subscriptions" | "none" => {}
+                other => {
+                    return Err(ConfigError::MissingField(format!(
+                        "invalid broadcast topic '{}': must be one of attestations, blocks, sync-committee, subscriptions, none",
+                        other
+                    )));
+                }
+            }
+        }
+        if self.broadcast.contains(&"none".to_string()) && self.broadcast.len() > 1 {
+            return Err(ConfigError::MissingField(
+                "broadcast topic 'none' cannot be combined with other topics".to_string(),
+            ));
+        }
+
+        // Validate proposer node URLs
+        for node_url in &self.proposer_nodes {
+            if node_url.is_empty() {
+                return Err(ConfigError::InvalidBeaconUrl(
+                    "proposer_nodes entry cannot be empty".to_string(),
+                ));
+            }
+            if !node_url.starts_with("http://") && !node_url.starts_with("https://") {
+                return Err(ConfigError::InvalidBeaconUrl(format!(
+                    "proposer_nodes entry must start with http:// or https://: {}",
+                    node_url
+                )));
+            }
+        }
+
+        match self.slashed_validators_action.as_str() {
+            "disable-only" | "shutdown" | "none" => {}
+            other => {
+                return Err(ConfigError::MissingField(format!(
+                    "invalid --slashed-validators-action '{}': must be one of disable-only, shutdown, none",
+                    other
+                )));
+            }
+        }
+
         Ok(())
+    }
+
+    fn validate_insecure_env_var(&self) -> Result<(), ConfigError> {
+        match std::env::var("RVC_ALLOW_INSECURE") {
+            Ok(val) if val == "true" => Ok(()),
+            _ => Err(ConfigError::InsecureFlagRequiresEnvVar),
+        }
     }
 
     pub fn load_passwords(&self) -> Result<HashMap<String, SecretString>, ConfigError> {
@@ -314,13 +557,47 @@ impl Config {
             }
 
             if let Some((pubkey, password)) = line.split_once('=') {
-                let pubkey = pubkey.trim().trim_start_matches("0x");
+                let pubkey_trimmed = pubkey.trim();
+                let pubkey = match strip_prefix_strict(pubkey_trimmed) {
+                    Ok(s) => s,
+                    Err(HexError::DoubleZeroXPrefix) => {
+                        warn!(
+                            pubkey = pubkey_trimmed,
+                            "skipping password entry: double 0x prefix in pubkey"
+                        );
+                        continue;
+                    }
+                };
                 let password = password.trim();
                 passwords.insert(pubkey.to_string(), SecretString::from(password.to_string()));
             }
         }
 
         Ok(passwords)
+    }
+
+    /// Parses the `broadcast` config field into `BroadcastTopics`.
+    ///
+    /// If empty, returns default (all enabled). If "none", all disabled.
+    /// Otherwise, only listed topics are enabled.
+    pub fn effective_broadcast_topics(&self) -> bn_manager::BroadcastTopics {
+        if self.broadcast.is_empty() {
+            return bn_manager::BroadcastTopics::default();
+        }
+        if self.broadcast.len() == 1 && self.broadcast[0] == "none" {
+            return bn_manager::BroadcastTopics {
+                attestations: false,
+                blocks: false,
+                sync_committee: false,
+                subscriptions: false,
+            };
+        }
+        bn_manager::BroadcastTopics {
+            attestations: self.broadcast.contains(&"attestations".to_string()),
+            blocks: self.broadcast.contains(&"blocks".to_string()),
+            sync_committee: self.broadcast.contains(&"sync-committee".to_string()),
+            subscriptions: self.broadcast.contains(&"subscriptions".to_string()),
+        }
     }
 
     /// Returns the effective list of beacon node endpoints.
@@ -496,6 +773,106 @@ impl Config {
         if let Some(ref path) = cli.grpc_signer_tls_ca_cert {
             self.grpc_signer_tls_ca_cert = Some(path.clone());
         }
+
+        if let Some(disable_attesting) = cli.disable_attesting {
+            self.disable_attesting = disable_attesting;
+        }
+
+        if let Some(ref action) = cli.slashed_validators_action {
+            self.slashed_validators_action = action.clone();
+        }
+
+        if let Some(limit) = cli.builder_circuit_breaker_consecutive_limit {
+            self.builder_circuit_breaker_consecutive_limit = limit;
+        }
+
+        if let Some(limit) = cli.builder_circuit_breaker_epoch_limit {
+            self.builder_circuit_breaker_epoch_limit = limit;
+        }
+
+        if let Some(disable) = cli.disable_keystore_locking {
+            self.disable_keystore_locking = disable;
+        }
+
+        if let Some(ref nodes) = cli.proposer_nodes {
+            self.proposer_nodes = nodes.clone();
+        }
+
+        if let Some(ref topics) = cli.broadcast {
+            self.broadcast = topics.clone();
+        }
+
+        if let Some(ref url) = cli.proposer_config_url {
+            self.proposer_config_url = Some(url.clone());
+        }
+
+        if let Some(ref file) = cli.proposer_config_file {
+            self.proposer_config_file = Some(file.clone());
+        }
+
+        if let Some(interval) = cli.proposer_config_refresh_interval {
+            self.proposer_config_refresh_interval = interval;
+        }
+
+        if let Some(ref token) = cli.proposer_config_url_token {
+            self.proposer_config_url_token = Some(token.clone());
+        }
+
+        if let Some(insecure) = cli.proposer_config_url_insecure {
+            self.proposer_config_url_insecure = insecure;
+        }
+
+        if let Some(ref endpoint) = cli.monitoring_endpoint {
+            self.monitoring_endpoint = Some(endpoint.clone());
+        }
+
+        if let Some(interval) = cli.monitoring_interval {
+            self.monitoring_interval = interval;
+        }
+
+        if let Some(insecure) = cli.monitoring_endpoint_insecure {
+            self.monitoring_endpoint_insecure = insecure;
+        }
+
+        if let Some(ref logfile) = cli.logfile {
+            self.logfile = Some(logfile.clone());
+        }
+
+        if let Some(max_size) = cli.logfile_max_size {
+            self.logfile_max_size = max_size;
+        }
+
+        if let Some(max_number) = cli.logfile_max_number {
+            self.logfile_max_number = max_number;
+        }
+
+        if let Some(compress) = cli.logfile_compress {
+            self.logfile_compress = compress;
+        }
+
+        if let Some(ref level) = cli.logfile_level {
+            self.logfile_level = Some(level.clone());
+        }
+
+        if let Some(mode) = cli.block_selection_mode {
+            self.block_selection_mode = mode;
+        }
+
+        if let Some(size) = cli.validator_registration_batch_size {
+            self.validator_registration_batch_size = size;
+        }
+
+        if let Some(delay) = cli.validator_registration_batch_delay {
+            self.validator_registration_batch_delay = delay;
+        }
+
+        if let Some(ref path) = cli.validators_config {
+            self.validators_config = Some(path.clone());
+        }
+
+        if let Some(v) = cli.beacon_max_body_bytes {
+            self.beacon_max_body_bytes = v;
+        }
     }
 }
 
@@ -555,6 +932,32 @@ pub struct CliOverrides {
     pub grpc_signer_tls_cert: Option<PathBuf>,
     pub grpc_signer_tls_key: Option<PathBuf>,
     pub grpc_signer_tls_ca_cert: Option<PathBuf>,
+    pub disable_attesting: Option<bool>,
+    pub slashed_validators_action: Option<String>,
+    pub builder_circuit_breaker_consecutive_limit: Option<u32>,
+    pub builder_circuit_breaker_epoch_limit: Option<u32>,
+    pub disable_keystore_locking: Option<bool>,
+    pub proposer_nodes: Option<Vec<String>>,
+    pub broadcast: Option<Vec<String>>,
+    pub proposer_config_url: Option<String>,
+    pub proposer_config_file: Option<String>,
+    pub proposer_config_refresh_interval: Option<u64>,
+    pub proposer_config_url_token: Option<String>,
+    pub proposer_config_url_insecure: Option<bool>,
+    pub monitoring_endpoint: Option<String>,
+    pub monitoring_interval: Option<u64>,
+    pub monitoring_endpoint_insecure: Option<bool>,
+    pub logfile: Option<PathBuf>,
+    pub logfile_max_size: Option<u64>,
+    pub logfile_max_number: Option<usize>,
+    pub logfile_compress: Option<bool>,
+    pub logfile_level: Option<String>,
+    pub block_selection_mode: Option<validator_store::BlockSelectionMode>,
+    pub validator_registration_batch_size: Option<usize>,
+    pub validator_registration_batch_delay: Option<u64>,
+    pub validators_config: Option<PathBuf>,
+    /// Maximum JSON response body size from the BN (H-12).
+    pub beacon_max_body_bytes: Option<usize>,
 }
 
 #[cfg(test)]
@@ -1572,5 +1975,260 @@ log_level = "info"
         let cli = CliOverrides::default();
         config.merge_with_cli(&cli);
         assert_eq!(config.secret_provider.refresh_interval, Some(300));
+    }
+
+    #[test]
+    fn test_insecure_flag_env_var_validation() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // Case 1: insecure flag false skips env check
+        std::env::remove_var("RVC_ALLOW_INSECURE");
+        let config = Config::default();
+        assert!(!config.allow_insecure_remote_signer);
+        assert!(config.validate().is_ok(), "Should pass when insecure flag is false");
+
+        // Case 2: insecure flag true without env var fails
+        let config = Config { allow_insecure_remote_signer: true, ..Config::default() };
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("RVC_ALLOW_INSECURE"),
+            "Error should mention RVC_ALLOW_INSECURE, got: {}",
+            err
+        );
+
+        // Case 3: insecure flag true with wrong env var value fails
+        std::env::set_var("RVC_ALLOW_INSECURE", "yes");
+        let config = Config { allow_insecure_remote_signer: true, ..Config::default() };
+        assert!(config.validate().is_err(), "Should fail with RVC_ALLOW_INSECURE=yes (not 'true')");
+
+        // Case 4: insecure flag true with correct env var passes
+        std::env::set_var("RVC_ALLOW_INSECURE", "true");
+        let config = Config { allow_insecure_remote_signer: true, ..Config::default() };
+        assert!(config.validate().is_ok(), "Should pass with RVC_ALLOW_INSECURE=true");
+
+        std::env::remove_var("RVC_ALLOW_INSECURE");
+    }
+
+    #[test]
+    fn test_default_circuit_breaker_limits() {
+        let config = Config::default();
+        assert_eq!(config.builder_circuit_breaker_consecutive_limit, 3);
+        assert_eq!(config.builder_circuit_breaker_epoch_limit, 5);
+    }
+
+    #[test]
+    fn test_default_keystore_locking_enabled() {
+        let config = Config::default();
+        assert!(!config.disable_keystore_locking);
+    }
+
+    #[test]
+    fn test_merge_circuit_breaker_limits() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            builder_circuit_breaker_consecutive_limit: Some(10),
+            builder_circuit_breaker_epoch_limit: Some(20),
+            ..Default::default()
+        };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.builder_circuit_breaker_consecutive_limit, 10);
+        assert_eq!(config.builder_circuit_breaker_epoch_limit, 20);
+    }
+
+    #[test]
+    fn test_merge_disable_keystore_locking() {
+        let mut config = Config::default();
+        let cli = CliOverrides { disable_keystore_locking: Some(true), ..Default::default() };
+        config.merge_with_cli(&cli);
+        assert!(config.disable_keystore_locking);
+    }
+
+    #[test]
+    fn test_circuit_breaker_toml_parsing() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+builder_circuit_breaker_consecutive_limit = 7
+builder_circuit_breaker_epoch_limit = 12
+disable_keystore_locking = true
+"#
+        )
+        .unwrap();
+        let config = Config::from_file(f.path()).unwrap();
+        assert_eq!(config.builder_circuit_breaker_consecutive_limit, 7);
+        assert_eq!(config.builder_circuit_breaker_epoch_limit, 12);
+        assert!(config.disable_keystore_locking);
+    }
+
+    // --- T3.2/T3.4: Proposer nodes and broadcast topics config ---
+
+    #[test]
+    fn test_effective_broadcast_topics_default() {
+        let config = Config::default();
+        let topics = config.effective_broadcast_topics();
+        assert!(topics.attestations);
+        assert!(topics.blocks);
+        assert!(topics.sync_committee);
+        assert!(topics.subscriptions);
+    }
+
+    #[test]
+    fn test_effective_broadcast_topics_none() {
+        let config = Config { broadcast: vec!["none".to_string()], ..Default::default() };
+        let topics = config.effective_broadcast_topics();
+        assert!(!topics.attestations);
+        assert!(!topics.blocks);
+        assert!(!topics.sync_committee);
+        assert!(!topics.subscriptions);
+    }
+
+    #[test]
+    fn test_effective_broadcast_topics_partial() {
+        let config = Config {
+            broadcast: vec!["blocks".to_string(), "attestations".to_string()],
+            ..Default::default()
+        };
+        let topics = config.effective_broadcast_topics();
+        assert!(topics.attestations);
+        assert!(topics.blocks);
+        assert!(!topics.sync_committee);
+        assert!(!topics.subscriptions);
+    }
+
+    #[test]
+    fn test_validate_invalid_broadcast_topic() {
+        let config = Config { broadcast: vec!["invalid-topic".to_string()], ..Default::default() };
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_broadcast_none_with_others_fails() {
+        let config = Config {
+            broadcast: vec!["none".to_string(), "blocks".to_string()],
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_proposer_config_mutual_exclusivity() {
+        let config = Config {
+            proposer_config_url: Some("https://example.com/config".to_string()),
+            proposer_config_file: Some("/path/to/config.json".to_string()),
+            ..Default::default()
+        };
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_proposer_config_url_only() {
+        let config = Config {
+            proposer_config_url: Some("https://example.com/config".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_proposer_config_file_only() {
+        let config = Config {
+            proposer_config_file: Some("/path/to/config.json".to_string()),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_default_config_proposer_fields() {
+        let config = Config::default();
+        assert!(config.proposer_nodes.is_empty());
+        assert!(config.broadcast.is_empty());
+        assert!(config.proposer_config_url.is_none());
+        assert!(config.proposer_config_file.is_none());
+        assert_eq!(config.proposer_config_refresh_interval, 384);
+        assert!(config.proposer_config_url_token.is_none());
+        assert!(!config.proposer_config_url_insecure);
+    }
+
+    #[test]
+    fn test_proposer_nodes_toml_parsing() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+proposer_nodes = ["http://proposer1:5052", "http://proposer2:5052"]
+broadcast = ["blocks", "attestations"]
+"#
+        )
+        .unwrap();
+        let config = Config::from_file(f.path()).unwrap();
+        assert_eq!(config.proposer_nodes.len(), 2);
+        assert_eq!(config.proposer_nodes[0], "http://proposer1:5052");
+        assert_eq!(config.broadcast.len(), 2);
+    }
+
+    #[test]
+    fn test_validate_invalid_proposer_node_url() {
+        let config =
+            Config { proposer_nodes: vec!["ftp://invalid:5052".to_string()], ..Default::default() };
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_merge_with_cli_proposer_fields() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            proposer_nodes: Some(vec!["http://p1:5052".to_string()]),
+            broadcast: Some(vec!["blocks".to_string()]),
+            proposer_config_url: Some("https://example.com/config".to_string()),
+            proposer_config_refresh_interval: Some(60),
+            proposer_config_url_token: Some("my-token".to_string()),
+            proposer_config_url_insecure: Some(true),
+            ..Default::default()
+        };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.proposer_nodes.len(), 1);
+        assert_eq!(config.broadcast, vec!["blocks".to_string()]);
+        assert_eq!(config.proposer_config_url, Some("https://example.com/config".to_string()));
+        assert_eq!(config.proposer_config_refresh_interval, 60);
+        assert_eq!(config.proposer_config_url_token, Some("my-token".to_string()));
+        assert!(config.proposer_config_url_insecure);
+    }
+
+    // -- CQ-2.5: strip_prefix_strict adoption test --
+
+    /// load_passwords must warn and skip a pubkey entry that carries a double 0x prefix.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_load_passwords_double_0x_prefix_warns_and_skips() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "0x0xabcd1234 = test_value_1").unwrap();
+        // Also write a valid entry so we can confirm only the bad one is skipped
+        writeln!(file, "0xdeadbeef = test_value_2").unwrap();
+
+        let config =
+            Config { password_file: Some(file.path().to_path_buf()), ..Default::default() };
+        let passwords = config.load_passwords().unwrap();
+
+        assert_eq!(passwords.len(), 1, "only the valid entry should be loaded");
+        assert!(!passwords.contains_key("0x0xabcd1234"), "double-0x key must be absent");
+        assert!(
+            passwords.contains_key("deadbeef"),
+            "valid entry must be present (prefix stripped)"
+        );
+        assert!(logs_contain("double 0x prefix"), "expected warn log about double prefix");
     }
 }
