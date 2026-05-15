@@ -59,6 +59,7 @@ proptest.workspace = true
 rand.workspace = true
 tokio-stream.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tracing-test.workspace = true
 grpc-signer.workspace = true
 crypto.workspace = true
 eth-types.workspace = true

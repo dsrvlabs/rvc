@@ -164,7 +164,7 @@ mod tests {
         #[test]
         fn prop_idempotent_bare(s in hex96()) {
             let once = parse(&s);
-            let twice = parse(&once.to_string());
+            let twice = parse(once.as_ref());
             prop_assert_eq!(once, twice);
         }
 
@@ -173,7 +173,7 @@ mod tests {
         fn prop_idempotent_prefixed(s in hex96()) {
             let prefixed = format!("0x{s}");
             let once = parse(&prefixed);
-            let twice = parse(&once.to_string());
+            let twice = parse(once.as_ref());
             prop_assert_eq!(once, twice);
         }
 
@@ -182,7 +182,7 @@ mod tests {
         fn prop_idempotent_uppercase_prefix(s in hex96()) {
             let prefixed = format!("0X{s}");
             let once = parse(&prefixed);
-            let twice = parse(&once.to_string());
+            let twice = parse(once.as_ref());
             prop_assert_eq!(once, twice);
         }
     }

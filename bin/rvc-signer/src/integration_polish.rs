@@ -513,54 +513,14 @@ keystore_dir = "{}"
         assert_eq!(entry.duration_ms, 42);
     }
 
+    // `tracing-test` installs a single process-global subscriber and scopes
+    // captures per test via a span attached by `#[traced_test]`. Replaces
+    // a prior `set_default`-based capture which silently lost the event
+    // when sibling tests in the same binary primed the tracing callsite
+    // interest cache.
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn test_audit_log_emitted_on_sign_request() {
-        use parking_lot::Mutex;
-        use tracing_subscriber::layer::SubscriberExt;
-
-        // Capture log events to verify audit entry
-        struct AuditCapture {
-            events: Arc<Mutex<Vec<String>>>,
-        }
-
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for AuditCapture {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                let mut visitor = MessageVisitor(String::new());
-                event.record(&mut visitor);
-                self.events.lock().push(visitor.0);
-            }
-        }
-
-        struct MessageVisitor(String);
-
-        impl tracing::field::Visit for MessageVisitor {
-            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "message" {
-                    self.0 = format!("{:?}", value);
-                }
-            }
-
-            fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-                if field.name() == "audit" && value {
-                    self.0.push_str("[AUDIT]");
-                }
-            }
-
-            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                if field.name() == "message" {
-                    self.0 = value.to_string();
-                }
-            }
-        }
-
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let layer = AuditCapture { events: events.clone() };
-        let subscriber = tracing_subscriber::registry().with(layer);
-
         let dir = TempDir::new().unwrap();
         let password = Zeroizing::new("test-password".to_string());
         let pubkey = create_test_keystore(dir.path(), &password);
@@ -571,22 +531,13 @@ keystore_dir = "{}"
             "basic".to_string(),
         );
 
-        let _guard = tracing::subscriber::set_default(subscriber);
-
         let req = tonic::Request::new(crate::SignRequest {
             signing_root: vec![0u8; 32],
             pubkey: pubkey.to_vec(),
         });
         svc.sign(req).await.unwrap();
 
-        let captured = events.lock();
-        assert!(
-            captured
-                .iter()
-                .any(|msg| msg.contains("sign request audit") || msg.contains("[AUDIT]")),
-            "audit log entry should be emitted on sign, captured: {:?}",
-            *captured,
-        );
+        assert!(logs_contain("sign request audit"), "audit log entry should be emitted on sign",);
     }
 
     #[test]
