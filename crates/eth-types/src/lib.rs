@@ -6,6 +6,7 @@ mod aggregation;
 mod attestation;
 mod block;
 mod builder;
+pub mod canonical;
 mod deposit;
 mod domains;
 mod duties;
