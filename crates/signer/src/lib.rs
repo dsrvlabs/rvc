@@ -219,7 +219,6 @@ impl SignerService {
                 let tx_start = Instant::now();
                 let staged = db
                     .stage_attestation(
-                        "local-vc",
                         &pubkey_hex_clone,
                         source_epoch,
                         target_epoch,
@@ -382,7 +381,7 @@ impl SignerService {
                 // Capture the start of the SQLite transaction hold (ISSUE-3.12).
                 let tx_start = Instant::now();
                 let staged = db
-                    .stage_block("local-vc", &pubkey_hex_clone, slot, Some(signing_root_hex), &gvr)
+                    .stage_block(&pubkey_hex_clone, slot, Some(signing_root_hex), &gvr)
                     .map_err(|e| {
                         error!(
                             pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),

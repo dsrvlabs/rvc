@@ -68,7 +68,7 @@ use tracing::Span;
 use crate::audit;
 use crate::backend::SigningBackend;
 use crate::metrics::SignerMetrics;
-use crate::slashing::ScopedSlashingDb;
+use slashing::PubkeyScopedDb;
 
 // V1 imports (deprecated — kept until ISSUE-1.8)
 use crate::proto::signer::signer_service_server::SignerService;
@@ -294,7 +294,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         let signing_root_hex = Some(root_hex(&signing_root));
 
         let db = self.require_db()?;
-        let scoped = ScopedSlashingDb::new(Arc::clone(db), client_cn.clone(), gvr);
+        let scoped = PubkeyScopedDb::new(Arc::clone(db), client_cn.clone(), gvr);
 
         // Stage → sign → commit, all on one OS thread via spawn_blocking.
         //
@@ -376,7 +376,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         let signing_root_hex = Some(root_hex(&signing_root));
 
         let db = self.require_db()?;
-        let scoped = ScopedSlashingDb::new(Arc::clone(db), client_cn.clone(), gvr);
+        let scoped = PubkeyScopedDb::new(Arc::clone(db), client_cn.clone(), gvr);
 
         // Same stage → sign → commit pattern as sign_beacon_block.
         // See the module-level docstring for the spawn_blocking + block_on rationale.
@@ -546,7 +546,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         let signing_root_hex = Some(root_hex(&signing_root));
 
         let db = self.require_db()?;
-        let scoped = ScopedSlashingDb::new(Arc::clone(db), client_cn.clone(), gvr);
+        let scoped = PubkeyScopedDb::new(Arc::clone(db), client_cn.clone(), gvr);
 
         // Stage → sign → commit pattern (A15).
         // See module-level docstring for the spawn_blocking + block_on rationale.
@@ -634,7 +634,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         let signing_root_hex = Some(root_hex(&signing_root));
 
         let db = self.require_db()?;
-        let scoped = ScopedSlashingDb::new(Arc::clone(db), client_cn.clone(), gvr);
+        let scoped = PubkeyScopedDb::new(Arc::clone(db), client_cn.clone(), gvr);
 
         // Stage → sign → commit pattern (A15).
         // Slashing check uses the inner Attestation's (source_epoch, target_epoch).

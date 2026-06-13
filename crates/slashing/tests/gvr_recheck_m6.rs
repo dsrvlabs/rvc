@@ -140,7 +140,7 @@ fn test_stage_block_chain_swap_rejected() {
     let db = open_memory_db_with_pinned_gvr(R1);
 
     let err = db
-        .stage_block(CN, PUBKEY, 300, Some("0xstage_root".into()), R2)
+        .stage_block(PUBKEY, 300, Some("0xstage_root".into()), R2)
         .expect_err("chain swap must be rejected at stage time");
 
     match err {
@@ -160,7 +160,7 @@ fn test_stage_block_matching_gvr_succeeds_and_writes_row_column() {
     let db_path = dir.path().join("slashing.db");
     let db = open_file_db_with_pinned_gvr(&db_path, R1);
 
-    db.stage_block(CN, PUBKEY, 400, Some("0xstage_ok".into()), R1)
+    db.stage_block(PUBKEY, 400, Some("0xstage_ok".into()), R1)
         .expect("stage must succeed")
         .commit()
         .expect("commit must succeed");
@@ -187,7 +187,7 @@ fn test_stage_attestation_chain_swap_rejected() {
     let db = open_memory_db_with_pinned_gvr(R1);
 
     let err = db
-        .stage_attestation(CN, PUBKEY, 10, 15, Some("0xatt_stage".into()), R2)
+        .stage_attestation(PUBKEY, 10, 15, Some("0xatt_stage".into()), R2)
         .expect_err("chain swap must be rejected at stage time");
 
     match err {
@@ -207,7 +207,7 @@ fn test_stage_attestation_matching_gvr_succeeds_and_writes_row_column() {
     let db_path = dir.path().join("slashing.db");
     let db = open_file_db_with_pinned_gvr(&db_path, R1);
 
-    db.stage_attestation(CN, PUBKEY, 20, 25, Some("0xatt_ok".into()), R1)
+    db.stage_attestation(PUBKEY, 20, 25, Some("0xatt_ok".into()), R1)
         .expect("stage must succeed")
         .commit()
         .expect("commit must succeed");

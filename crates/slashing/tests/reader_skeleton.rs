@@ -10,7 +10,6 @@
 
 use rvc_slashing::{SlashingDb, SlashingDbReader};
 
-const CN: &str = "local-vc";
 const PUBKEY: &str =
     "0xaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd";
 const GVR: &[u8; 32] = &[7u8; 32];
@@ -28,7 +27,7 @@ fn open_db_with_gvr() -> SlashingDb {
 fn test_last_signed_attestation_returns_max_target_epoch() {
     let db = open_db_with_gvr();
 
-    db.stage_attestation(CN, PUBKEY, 4, 5, Some("0xdeadbeef".to_string()), GVR)
+    db.stage_attestation(PUBKEY, 4, 5, Some("0xdeadbeef".to_string()), GVR)
         .expect("stage")
         .commit()
         .expect("commit");
@@ -43,11 +42,8 @@ fn test_last_signed_attestation_returns_max_target_epoch() {
 fn test_last_signed_attestation_returns_highest_of_multiple() {
     let db = open_db_with_gvr();
 
-    db.stage_attestation(CN, PUBKEY, 4, 5, None, GVR).expect("stage 1").commit().expect("commit 1");
-    db.stage_attestation(CN, PUBKEY, 5, 10, None, GVR)
-        .expect("stage 2")
-        .commit()
-        .expect("commit 2");
+    db.stage_attestation(PUBKEY, 4, 5, None, GVR).expect("stage 1").commit().expect("commit 1");
+    db.stage_attestation(PUBKEY, 5, 10, None, GVR).expect("stage 2").commit().expect("commit 2");
 
     let reader: &dyn SlashingDbReader = &db;
     assert_eq!(reader.last_signed_attestation(PUBKEY, GVR), Some(10));
@@ -67,7 +63,7 @@ fn test_last_signed_attestation_unknown_pubkey_returns_none() {
 fn test_last_signed_attestation_wrong_gvr_returns_none() {
     let db = open_db_with_gvr();
 
-    db.stage_attestation(CN, PUBKEY, 4, 5, None, GVR).expect("stage").commit().expect("commit");
+    db.stage_attestation(PUBKEY, 4, 5, None, GVR).expect("stage").commit().expect("commit");
 
     let reader: &dyn SlashingDbReader = &db;
     assert_eq!(
@@ -90,7 +86,7 @@ fn test_last_signed_attestation_no_pinned_gvr_returns_none() {
     // Open without pinning any GVR.
     let db = SlashingDb::open_in_memory().expect("open_in_memory");
 
-    db.stage_attestation(CN, PUBKEY, 4, 5, None, GVR).expect("stage").commit().expect("commit");
+    db.stage_attestation(PUBKEY, 4, 5, None, GVR).expect("stage").commit().expect("commit");
 
     let reader: &dyn SlashingDbReader = &db;
     assert_eq!(

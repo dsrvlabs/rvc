@@ -11,12 +11,13 @@
 //! peer with a valid client certificate could claim any share index,
 //! bypassing the cryptographic binding between identity and share position.
 //!
-//! # CN-scoped slashing (A1)
+//! # Pubkey-scoped slashing (Issue 2.5)
 //!
-//! The `ScopedSlashingDb` is keyed by `client_cn = peer_cn` so every DVT
-//! peer has its own watermark namespace.  A second request from peer-A for
-//! `(pubkey-X, slot=42)` with a different root is rejected; the same request
-//! from peer-B succeeds because it is in a separate namespace.
+//! The `PubkeyScopedDb` is scoped by `(pubkey, genesis_validators_root)` only.
+//! A second request from any peer for `(pubkey-X, slot=42)` with a different root
+//! is rejected (cross-CN double-sign protection).  The peer CN is passed to
+//! `PubkeyScopedDb::new` for audit-log emission only — it does not affect the
+//! slashing check.
 //!
 //! # spawn_blocking + block_on
 //!
@@ -33,7 +34,7 @@ use tracing::Span;
 use crate::audit;
 use crate::dvt::allow_list::AllowedPeers;
 use crate::dvt::types::ShareInfo;
-use crate::slashing::ScopedSlashingDb;
+use slashing::PubkeyScopedDb;
 
 // V2 proto imports
 use crate::proto::signer_v2::peer_signer_service_server::PeerSignerService;
@@ -241,7 +242,7 @@ impl PeerSignerService for PeerSignerServiceImpl {
         drop(shares);
 
         // 5. Stage → sign → commit.
-        let scoped = ScopedSlashingDb::new(db_arc, peer_cn.clone(), gvr);
+        let scoped = PubkeyScopedDb::new(db_arc, peer_cn.clone(), gvr);
         let peer_cn_for_log = peer_cn;
 
         // spawn_blocking is required because StagedBlock holds a !Send MutexGuard.
@@ -374,7 +375,7 @@ impl PeerSignerService for PeerSignerServiceImpl {
         drop(shares);
 
         // 5. Stage → sign → commit.
-        let scoped = ScopedSlashingDb::new(db_arc, peer_cn.clone(), gvr);
+        let scoped = PubkeyScopedDb::new(db_arc, peer_cn.clone(), gvr);
         let peer_cn_for_log = peer_cn;
 
         // spawn_blocking is required because StagedAttestation holds a !Send MutexGuard.

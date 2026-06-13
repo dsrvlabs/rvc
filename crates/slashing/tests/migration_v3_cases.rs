@@ -394,7 +394,7 @@ fn test_v3_migration_invariant_rejections_preserved() {
 
     // A same-slot double-block with a different root must still be rejected.
     let err = db
-        .stage_block("any-cn", PUBKEY, 1000, Some("0xnew_root_different".into()), &gvr)
+        .stage_block(PUBKEY, 1000, Some("0xnew_root_different".into()), &gvr)
         .expect_err("double-block at slot=1000 must be rejected");
     assert!(
         matches!(
@@ -408,8 +408,8 @@ fn test_v3_migration_invariant_rejections_preserved() {
 
     // Cross-CN double-sign at slot=2000 must also be rejected.
     let err2 = db
-        .stage_block("cn-C", PUBKEY, 2000, Some("0xroot_totally_new".into()), &gvr)
-        .expect_err("cross-CN double-block at slot=2000 must be rejected");
+        .stage_block(PUBKEY, 2000, Some("0xroot_totally_new".into()), &gvr)
+        .expect_err("pubkey-scoped double-block at slot=2000 must be rejected");
     assert!(
         matches!(
             err2,
@@ -422,7 +422,7 @@ fn test_v3_migration_invariant_rejections_preserved() {
 
     // A same-target double-vote must be rejected.
     let err3 = db
-        .stage_attestation("any-cn", PUBKEY, 40, 50, Some("0xconflicting_att_root".into()), &gvr)
+        .stage_attestation(PUBKEY, 40, 50, Some("0xconflicting_att_root".into()), &gvr)
         .expect_err("double-vote at target_epoch=50 must be rejected");
     assert!(
         matches!(
@@ -543,14 +543,14 @@ fn test_v3_migration_cross_cn_double_sign_now_rejected() {
     let db = SlashingDb::open(&path).expect("open v3 db");
     let gvr: [u8; 32] = [7u8; 32];
 
-    // cn-A commits slot 9000.
-    db.stage_block("cn-A", PUBKEY, 9000, Some("0xroot_cn_a".into()), &gvr)
-        .expect("cn-A stage")
+    // First call commits slot 9000.
+    db.stage_block(PUBKEY, 9000, Some("0xroot_cn_a".into()), &gvr)
+        .expect("first stage")
         .commit()
-        .expect("cn-A commit");
+        .expect("first commit");
 
-    // cn-B attempts the same slot with a different root — must be rejected.
-    let result = db.stage_block("cn-B", PUBKEY, 9000, Some("0xroot_cn_b".into()), &gvr);
+    // Second call — same slot, different root — must be rejected (pubkey-scoped).
+    let result = db.stage_block(PUBKEY, 9000, Some("0xroot_cn_b".into()), &gvr);
     assert!(
         matches!(
             result,
@@ -558,6 +558,6 @@ fn test_v3_migration_cross_cn_double_sign_now_rejected() {
                 slot: 9000
             }))
         ),
-        "cross-CN double-sign must be rejected after v3 migration: {result:?}"
+        "pubkey-scoped double-sign must be rejected: {result:?}"
     );
 }

@@ -21,7 +21,7 @@ const GVR: &[u8; 32] = &[0u8; 32];
 #[test]
 fn test_stage_block_discard_no_row_committed() {
     let db = SlashingDb::open_in_memory().expect("open");
-    let staged = db.stage_block(CN, PUBKEY, 42, Some("0xroot_a".into()), GVR).expect("stage");
+    let staged = db.stage_block(PUBKEY, 42, Some("0xroot_a".into()), GVR).expect("stage");
     staged.discard();
 
     // The row must NOT appear in the database.
@@ -29,14 +29,14 @@ fn test_stage_block_discard_no_row_committed() {
     assert!(blocks.is_empty(), "discard must not commit any row; got: {blocks:?}");
 }
 
-/// Stage + commit a block; then attempt to stage the same (cn, pubkey, slot) with a
+/// Stage + commit a block; then attempt to stage the same (pubkey, slot) with a
 /// different signing root — the second stage must return `DoubleBlockProposal`.
 #[test]
 fn test_stage_block_commit_then_conflicting_stage_rejected() {
     let db = SlashingDb::open_in_memory().expect("open");
 
     // First stage + commit.
-    db.stage_block(CN, PUBKEY, 100, Some("0xroot_1".into()), GVR)
+    db.stage_block(PUBKEY, 100, Some("0xroot_1".into()), GVR)
         .expect("first stage")
         .commit()
         .expect("first commit");
@@ -46,7 +46,7 @@ fn test_stage_block_commit_then_conflicting_stage_rejected() {
 
     // Second stage with a different root must be rejected immediately.
     let err = db
-        .stage_block(CN, PUBKEY, 100, Some("0xroot_2".into()), GVR)
+        .stage_block(PUBKEY, 100, Some("0xroot_2".into()), GVR)
         .expect_err("second stage must fail");
 
     match err {
@@ -64,8 +64,7 @@ fn test_stage_block_drop_without_commit_rolls_back() {
     let db = SlashingDb::open_in_memory().expect("open");
 
     {
-        let _guard =
-            db.stage_block(CN, PUBKEY, 77, Some("0xroot_drop".into()), GVR).expect("stage");
+        let _guard = db.stage_block(PUBKEY, 77, Some("0xroot_drop".into()), GVR).expect("stage");
         // _guard is dropped here without calling commit() or discard()
     }
 
@@ -78,7 +77,7 @@ fn test_stage_block_drop_without_commit_rolls_back() {
 fn test_stage_block_commit_persists_row() {
     let db = SlashingDb::open_in_memory().expect("open");
 
-    db.stage_block(CN, PUBKEY, 55, Some("0xroot_persist".into()), GVR)
+    db.stage_block(PUBKEY, 55, Some("0xroot_persist".into()), GVR)
         .expect("stage")
         .commit()
         .expect("commit");
@@ -95,7 +94,7 @@ fn test_stage_block_commit_persists_row() {
 fn test_stage_attestation_discard_no_row_committed() {
     let db = SlashingDb::open_in_memory().expect("open");
     let staged =
-        db.stage_attestation(CN, PUBKEY, 1, 5, Some("0xatt_root_a".into()), GVR).expect("stage");
+        db.stage_attestation(PUBKEY, 1, 5, Some("0xatt_root_a".into()), GVR).expect("stage");
     staged.discard();
 
     let atts = db.get_attestations(PUBKEY).expect("get");
@@ -109,14 +108,14 @@ fn test_stage_attestation_commit_then_double_vote_rejected() {
     let db = SlashingDb::open_in_memory().expect("open");
 
     // First stage + commit.
-    db.stage_attestation(CN, PUBKEY, 3, 10, Some("0xatt_root_1".into()), GVR)
+    db.stage_attestation(PUBKEY, 3, 10, Some("0xatt_root_1".into()), GVR)
         .expect("first stage")
         .commit()
         .expect("first commit");
 
     // Second stage: same target_epoch (double vote) with a different root.
     let err = db
-        .stage_attestation(CN, PUBKEY, 3, 10, Some("0xatt_root_2".into()), GVR)
+        .stage_attestation(PUBKEY, 3, 10, Some("0xatt_root_2".into()), GVR)
         .expect_err("second stage must fail");
 
     match err {
@@ -135,9 +134,8 @@ fn test_stage_attestation_drop_without_commit_rolls_back() {
     let db = SlashingDb::open_in_memory().expect("open");
 
     {
-        let _guard = db
-            .stage_attestation(CN, PUBKEY, 2, 8, Some("0xatt_root_drop".into()), GVR)
-            .expect("stage");
+        let _guard =
+            db.stage_attestation(PUBKEY, 2, 8, Some("0xatt_root_drop".into()), GVR).expect("stage");
         // dropped without commit
     }
 
@@ -151,14 +149,14 @@ fn test_stage_attestation_commit_then_surround_vote_rejected() {
     let db = SlashingDb::open_in_memory().expect("open");
 
     // Commit a narrow attestation: source=3, target=7.
-    db.stage_attestation(CN, PUBKEY, 3, 7, Some("0xnarrow".into()), GVR)
+    db.stage_attestation(PUBKEY, 3, 7, Some("0xnarrow".into()), GVR)
         .expect("narrow stage")
         .commit()
         .expect("narrow commit");
 
     // Attempt a surrounding attestation: source=1, target=10 surrounds (3,7).
     let err = db
-        .stage_attestation(CN, PUBKEY, 1, 10, Some("0xsurrounding".into()), GVR)
+        .stage_attestation(PUBKEY, 1, 10, Some("0xsurrounding".into()), GVR)
         .expect_err("surrounding vote must be rejected at stage");
 
     match err {
@@ -181,7 +179,7 @@ fn test_stage_block_keeps_existing_check_and_record_unchanged() {
         .expect("check_and_record_block");
 
     // Stage a different slot — should work fine.
-    db.stage_block(CN, PUBKEY, 201, Some("0xstage_root".into()), GVR)
+    db.stage_block(PUBKEY, 201, Some("0xstage_root".into()), GVR)
         .expect("stage")
         .commit()
         .expect("commit");
@@ -211,7 +209,7 @@ fn test_stage_attestation_keeps_existing_check_and_record_unchanged() {
         .expect("check_and_record_attestation");
 
     // Stage a non-conflicting attestation.
-    db.stage_attestation(CN, PUBKEY2, 16, 20, Some("0xatt_stage".into()), GVR)
+    db.stage_attestation(PUBKEY2, 16, 20, Some("0xatt_stage".into()), GVR)
         .expect("stage")
         .commit()
         .expect("commit");
@@ -234,23 +232,19 @@ fn test_stage_attestation_keeps_existing_check_and_record_unchanged() {
 
 // ── v3 pubkey-scoped test ─────────────────────────────────────────────────────
 
-/// After the v3 migration, cross-CN conflicting blocks for the same (pubkey, slot)
-/// MUST be rejected (DVT-1 / CN-1 fix).  The CN is audit-only; pubkey+slot is
-/// the uniqueness scope.
-///
-/// This test replaces the v2 "different CNs are independent" test.
-/// Updated in Issue 2.4: CN-scoped independence is removed.
+/// After Issue 2.5, `stage_block` takes no CN — the check is purely pubkey+slot scoped.
+/// Conflicting blocks for the same (pubkey, slot) are rejected regardless of origin.
 #[test]
-fn test_stage_block_cn_scoped_different_cns_independent() {
+fn test_stage_block_pubkey_scoped_conflict_rejected() {
     let db = SlashingDb::open_in_memory().expect("open");
 
-    db.stage_block("cn-alpha", PUBKEY, 300, Some("0xroot_alpha".into()), GVR)
-        .expect("stage cn-alpha")
+    db.stage_block(PUBKEY, 300, Some("0xroot_alpha".into()), GVR)
+        .expect("first stage")
         .commit()
-        .expect("commit cn-alpha");
+        .expect("first commit");
 
-    // Different CN, same (pubkey, slot) but DIFFERENT root — must be rejected in v3.
-    let result = db.stage_block("cn-beta", PUBKEY, 300, Some("0xroot_beta".into()), GVR);
+    // Different root for same (pubkey, slot) — must be rejected.
+    let result = db.stage_block(PUBKEY, 300, Some("0xroot_beta".into()), GVR);
     assert!(
         matches!(
             result,
@@ -258,35 +252,35 @@ fn test_stage_block_cn_scoped_different_cns_independent() {
                 slot: 300
             }))
         ),
-        "cross-CN conflicting block must be rejected in v3 pubkey-scoped schema: {result:?}"
+        "conflicting block must be rejected in pubkey-scoped schema: {result:?}"
     );
 
-    // Same root from a different CN is a re-sign (not a violation).
-    db.stage_block("cn-beta", PUBKEY, 300, Some("0xroot_alpha".into()), GVR)
-        .expect("same-root re-sign from different CN must be allowed")
+    // Same root is a re-sign (not a violation).
+    db.stage_block(PUBKEY, 300, Some("0xroot_alpha".into()), GVR)
+        .expect("same-root re-sign must be allowed")
         .commit()
-        .expect("commit cn-beta resign");
+        .expect("re-sign commit");
 
-    // Only one row (the cn-alpha row); the cn-beta re-sign didn't insert a new row.
+    // Only one row (the first commit); the re-sign didn't insert a new row.
     let blocks = db.get_blocks(PUBKEY).expect("get");
     assert_eq!(blocks.len(), 1, "re-sign must not produce a duplicate row");
 }
 
 // ── Re-sign (idempotent) tests ────────────────────────────────────────────────
 
-/// Staging the same (cn, pubkey, slot, root) twice is an idempotent re-sign.
+/// Staging the same (pubkey, slot, root) twice is an idempotent re-sign.
 /// The second stage+commit must succeed and must not produce a duplicate row.
 #[test]
 fn test_stage_block_resign_is_idempotent() {
     let db = SlashingDb::open_in_memory().expect("open");
 
-    db.stage_block(CN, PUBKEY, 400, Some("0xresign_root".into()), GVR)
+    db.stage_block(PUBKEY, 400, Some("0xresign_root".into()), GVR)
         .expect("first stage")
         .commit()
         .expect("first commit");
 
     // Same signing root — should be treated as an idempotent re-sign.
-    db.stage_block(CN, PUBKEY, 400, Some("0xresign_root".into()), GVR)
+    db.stage_block(PUBKEY, 400, Some("0xresign_root".into()), GVR)
         .expect("second stage (re-sign) should succeed")
         .commit()
         .expect("second commit");
@@ -296,18 +290,18 @@ fn test_stage_block_resign_is_idempotent() {
     assert_eq!(blocks.len(), 1, "re-sign must not create a duplicate row");
 }
 
-/// Staging the same (cn, pubkey, target, root) twice is an idempotent re-sign
+/// Staging the same (pubkey, target, root) twice is an idempotent re-sign
 /// for attestations.
 #[test]
 fn test_stage_attestation_resign_is_idempotent() {
     let db = SlashingDb::open_in_memory().expect("open");
 
-    db.stage_attestation(CN, PUBKEY, 5, 20, Some("0xresign_att".into()), GVR)
+    db.stage_attestation(PUBKEY, 5, 20, Some("0xresign_att".into()), GVR)
         .expect("first stage")
         .commit()
         .expect("first commit");
 
-    db.stage_attestation(CN, PUBKEY, 5, 20, Some("0xresign_att".into()), GVR)
+    db.stage_attestation(PUBKEY, 5, 20, Some("0xresign_att".into()), GVR)
         .expect("second stage (re-sign)")
         .commit()
         .expect("second commit");
@@ -318,13 +312,12 @@ fn test_stage_attestation_resign_is_idempotent() {
 
 /// Discarding (or dropping) a re-sign stage must NOT delete the existing
 /// committed row.  The transaction was effectively read-only on the resign
-/// path, so ROLLBACK is a data no-op — but a future refactor could break
-/// this if e.g. the resign path started doing speculative writes.
+/// path, so ROLLBACK is a data no-op.
 #[test]
 fn test_stage_block_resign_discard_keeps_existing_row() {
     let db = SlashingDb::open_in_memory().expect("open");
 
-    db.stage_block(CN, PUBKEY, 500, Some("0xresign_keep".into()), GVR)
+    db.stage_block(PUBKEY, 500, Some("0xresign_keep".into()), GVR)
         .expect("first stage")
         .commit()
         .expect("first commit");
@@ -333,9 +326,7 @@ fn test_stage_block_resign_discard_keeps_existing_row() {
     assert_eq!(before.len(), 1);
 
     // Same signing root — resign path.  Discard instead of commit.
-    db.stage_block(CN, PUBKEY, 500, Some("0xresign_keep".into()), GVR)
-        .expect("resign stage")
-        .discard();
+    db.stage_block(PUBKEY, 500, Some("0xresign_keep".into()), GVR).expect("resign stage").discard();
 
     let after = db.get_blocks(PUBKEY).expect("get after");
     assert_eq!(after.len(), 1, "resign+discard must not delete the existing row");
@@ -344,9 +335,8 @@ fn test_stage_block_resign_discard_keeps_existing_row() {
 
     // Bare drop (no explicit commit/discard) on a resign must also be safe.
     {
-        let _staged = db
-            .stage_block(CN, PUBKEY, 500, Some("0xresign_keep".into()), GVR)
-            .expect("resign stage 2");
+        let _staged =
+            db.stage_block(PUBKEY, 500, Some("0xresign_keep".into()), GVR).expect("resign stage 2");
         // _staged is dropped here without commit/discard.
     }
 
@@ -360,7 +350,7 @@ fn test_stage_block_resign_discard_keeps_existing_row() {
 fn test_stage_attestation_duplicate_discard_keeps_existing_row() {
     let db = SlashingDb::open_in_memory().expect("open");
 
-    db.stage_attestation(CN, PUBKEY, 7, 30, Some("0xdup_keep".into()), GVR)
+    db.stage_attestation(PUBKEY, 7, 30, Some("0xdup_keep".into()), GVR)
         .expect("first stage")
         .commit()
         .expect("first commit");
@@ -368,7 +358,7 @@ fn test_stage_attestation_duplicate_discard_keeps_existing_row() {
     let before = db.get_attestations(PUBKEY).expect("get before");
     assert_eq!(before.len(), 1);
 
-    db.stage_attestation(CN, PUBKEY, 7, 30, Some("0xdup_keep".into()), GVR)
+    db.stage_attestation(PUBKEY, 7, 30, Some("0xdup_keep".into()), GVR)
         .expect("duplicate stage")
         .discard();
 

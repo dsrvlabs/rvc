@@ -1,17 +1,17 @@
-//! Pubkey-scoped view over the shared `SlashingDb` (Issue 2.4).
+//! Pubkey-scoped view over the shared `SlashingDb` (Issue 2.4 / 2.5).
 //!
-//! `PubkeyScopedDb` binds a fixed `genesis_validators_root` and uses a fixed
-//! audit CN (`"local-vc"`).  It exposes no API to key by `client_cn`, enforcing
-//! that all slashing checks are purely pubkey+gvr scoped.
+//! `PubkeyScopedDb` binds a fixed `genesis_validators_root` and records a
+//! `client_cn` for audit-log purposes only.  It exposes no API that lets the
+//! caller key the slashing check by CN — all checks are purely pubkey+gvr scoped.
 //!
 //! This replaces `bin/rvc-signer::ScopedSlashingDb` as the canonical high-level
-//! entry point.  Existing call sites in `bin/rvc-signer` are migrated in Issue 2.5;
-//! `ScopedSlashingDb` is left in place for now.
+//! entry point (Issue 2.5 migration).
 
 use std::sync::Arc;
 
 use eth_types::{Epoch, Root, Slot};
 
+use crate::audit::audit_log;
 use crate::error::SlashingError;
 use crate::stage::{StagedAttestation, StagedBlock};
 use crate::SlashingDb;
@@ -19,8 +19,8 @@ use crate::SlashingDb;
 /// A pubkey-scoped view over the shared `SlashingDb` bound to a specific
 /// `genesis_validators_root`.
 ///
-/// All signing operations use `"local-vc"` as the audit `client_cn`.  There is
-/// no API to vary the CN — pubkey+gvr is the sole uniqueness scope.
+/// Stores `client_cn` for audit-log emission only; it is never used as a
+/// slashing-check discriminator.  pubkey+gvr is the sole uniqueness scope.
 ///
 /// # Example
 /// ```ignore
@@ -29,10 +29,12 @@ use crate::SlashingDb;
 ///
 /// let db = Arc::new(SlashingDb::open_in_memory().unwrap());
 /// let gvr: [u8; 32] = [1u8; 32];
-/// let scoped = PubkeyScopedDb::new(Arc::clone(&db), gvr);
+/// let scoped = PubkeyScopedDb::new(Arc::clone(&db), "local-vc".to_string(), gvr);
 /// ```
 pub struct PubkeyScopedDb {
     db: Arc<SlashingDb>,
+    /// Audit CN — recorded in `audit_log` calls; never used in slashing checks.
+    client_cn: String,
     gvr: Root,
 }
 
@@ -40,15 +42,18 @@ impl PubkeyScopedDb {
     /// Create a new pubkey-scoped view.
     ///
     /// - `db`: Shared database instance.
+    /// - `client_cn`: The client CN to record in audit-log entries.  Has no
+    ///   effect on the slashing check — the check is pubkey+gvr scoped only.
     /// - `gvr`: Genesis validators root for this chain.  Every signing call will
     ///   be validated against the metadata-pinned value via the M-6 GVR check.
-    pub fn new(db: Arc<SlashingDb>, gvr: Root) -> Self {
-        Self { db, gvr }
+    pub fn new(db: Arc<SlashingDb>, client_cn: String, gvr: Root) -> Self {
+        Self { db, client_cn, gvr }
     }
 
     /// Begin an immediate transaction and run the EIP-3076 block-proposal check.
     ///
-    /// Delegates to [`SlashingDb::stage_block`] with a fixed audit CN of `"local-vc"`.
+    /// Delegates to [`SlashingDb::stage_block`].  On success or failure, emits
+    /// an [`audit_log`] event with `self.client_cn` for per-CN operator visibility.
     ///
     /// # Errors
     ///
@@ -60,12 +65,16 @@ impl PubkeyScopedDb {
         slot: Slot,
         signing_root_hex: Option<String>,
     ) -> Result<StagedBlock<'db>, SlashingError> {
-        self.db.stage_block("local-vc", pubkey_hex, slot, signing_root_hex, &self.gvr)
+        let result = self.db.stage_block(pubkey_hex, slot, signing_root_hex, &self.gvr);
+        let outcome = if result.is_ok() { "staged" } else { "rejected" };
+        audit_log(&self.client_cn, pubkey_hex, outcome);
+        result
     }
 
     /// Begin an immediate transaction and run the EIP-3076 attestation check.
     ///
-    /// Delegates to [`SlashingDb::stage_attestation`] with a fixed audit CN of `"local-vc"`.
+    /// Delegates to [`SlashingDb::stage_attestation`].  On success or failure,
+    /// emits an [`audit_log`] event with `self.client_cn` for per-CN operator visibility.
     ///
     /// # Errors
     ///
@@ -78,14 +87,16 @@ impl PubkeyScopedDb {
         target_epoch: Epoch,
         signing_root_hex: Option<String>,
     ) -> Result<StagedAttestation<'db>, SlashingError> {
-        self.db.stage_attestation(
-            "local-vc",
+        let result = self.db.stage_attestation(
             pubkey_hex,
             source_epoch,
             target_epoch,
             signing_root_hex,
             &self.gvr,
-        )
+        );
+        let outcome = if result.is_ok() { "staged" } else { "rejected" };
+        audit_log(&self.client_cn, pubkey_hex, outcome);
+        result
     }
 }
 
@@ -100,7 +111,7 @@ mod tests {
 
     fn open_scoped() -> (Arc<SlashingDb>, PubkeyScopedDb) {
         let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory"));
-        let scoped = PubkeyScopedDb::new(Arc::clone(&db), GVR);
+        let scoped = PubkeyScopedDb::new(Arc::clone(&db), "local-vc".to_string(), GVR);
         (db, scoped)
     }
 
@@ -200,7 +211,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("audit_cn.db");
         let db = Arc::new(SlashingDb::open(&path).expect("open file db"));
-        let scoped = PubkeyScopedDb::new(Arc::clone(&db), GVR);
+        let scoped = PubkeyScopedDb::new(Arc::clone(&db), "local-vc".to_string(), GVR);
 
         scoped
             .stage_block(PUBKEY, 400, Some("0xaudit_root".into()))
@@ -221,5 +232,52 @@ mod tests {
             .expect("block row must exist");
 
         assert_eq!(cn, "local-vc", "audit CN must be 'local-vc'");
+    }
+
+    /// PubkeyScopedDb with a non-local-vc CN emits audit_log with that CN.
+    /// The row in the DB still gets AUDIT_ORIGIN ("local-vc") — the per-CN audit
+    /// is in the tracing event only.
+    #[test]
+    fn test_audit_log_fires_on_stage_block() {
+        // Install a no-op subscriber so the audit_log tracing call does not panic.
+        let subscriber = tracing_subscriber::registry();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory"));
+        let scoped = PubkeyScopedDb::new(Arc::clone(&db), "peer-dvt-1".to_string(), GVR);
+
+        // Happy-path stage: audit_log must fire with outcome "staged" (no panic).
+        scoped
+            .stage_block(PUBKEY, 500, Some("0xaudit_fire_root".into()))
+            .expect("stage must succeed")
+            .commit()
+            .expect("commit must succeed");
+
+        // Rejection path: audit_log must fire with outcome "rejected" (no panic).
+        let _err = scoped
+            .stage_block(PUBKEY, 500, Some("0xaudit_conflict_root".into()))
+            .expect_err("double proposal must be rejected");
+    }
+
+    /// Same audit_log coverage for stage_attestation paths.
+    #[test]
+    fn test_audit_log_fires_on_stage_attestation() {
+        let subscriber = tracing_subscriber::registry();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory"));
+        let scoped = PubkeyScopedDb::new(Arc::clone(&db), "peer-dvt-2".to_string(), GVR);
+
+        // Happy-path: audit_log fires with "staged".
+        scoped
+            .stage_attestation(PUBKEY, 3, 8, Some("0xatt_fire".into()))
+            .expect("stage must succeed")
+            .commit()
+            .expect("commit must succeed");
+
+        // Rejection path: audit_log fires with "rejected".
+        let _err = scoped
+            .stage_attestation(PUBKEY, 3, 8, Some("0xatt_conflict".into()))
+            .expect_err("double vote must be rejected");
     }
 }
