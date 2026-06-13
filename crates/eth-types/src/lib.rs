@@ -12,6 +12,7 @@ mod domains;
 mod duties;
 mod fork;
 pub(crate) mod hex_fixed;
+pub mod insecure;
 pub(crate) mod serde_signature;
 pub mod ssz_helpers;
 mod sync_committee;
