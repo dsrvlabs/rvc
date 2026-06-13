@@ -337,6 +337,19 @@ impl SlashingProtection for SlashingProtectionAdapter {
             .map_err(|e| e.to_string())
     }
 
+    /// Export an EIP-3076 interchange blob for the specified public keys.
+    ///
+    /// # Atomicity contract (ADR-008 / KM-1)
+    ///
+    /// This function is all-or-nothing: either every requested key's records
+    /// are included in the returned JSON string, or `Err` is returned and no
+    /// partial interchange is emitted.  The guarantee comes from the underlying
+    /// `SlashingDb::export`, which traverses all records under a single read
+    /// path and propagates `?` on any per-pubkey DB failure — there is no code
+    /// path that returns a partial `Ok(json)` when a subset of keys could not
+    /// be read.  The caller (`delete_keystores` handler) relies on this
+    /// guarantee to abort fail-closed before any keystore deletion when this
+    /// function returns `Err`.
     fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, String> {
         let interchange =
             self.slashing_db.export(&self.genesis_validators_root).map_err(|e| e.to_string())?;

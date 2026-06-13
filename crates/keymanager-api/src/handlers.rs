@@ -241,14 +241,30 @@ pub async fn delete_keystores(
         .copied()
         .collect();
 
-    // Export slashing protection BEFORE any deletions
+    // Export slashing protection BEFORE any deletions.
+    //
+    // KM-1 (ADR-008): the export must be atomic and fail-closed.
+    // If export_interchange returns Err, we abort the entire DELETE with
+    // HTTP 500 BEFORE touching the keystore.  Swallowing the error and
+    // returning an empty interchange (the previous behaviour) would allow
+    // re-import without any slashing history, creating a double-sign hazard.
+    //
+    // Atomicity contract: SlashingProtectionAdapter::export_interchange (in
+    // keymanager_adapters.rs) delegates to SlashingDb::export, which
+    // collects all rows inside a single read path and returns Err on any
+    // per-pubkey failure — no partial interchange is ever emitted.
     let slashing_protection = if existing_keys.is_empty() {
         empty_interchange()
     } else {
-        state.slashing_protection.export_interchange(&existing_keys).unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "Failed to export slashing protection");
-            empty_interchange()
-        })
+        state.slashing_protection.export_interchange(&existing_keys).map_err(|e| {
+            tracing::error!(
+                error = %e,
+                "DELETE aborted: slashing-protection export failed; no keystores deleted"
+            );
+            ApiError::Internal(
+                "slashing protection export failed; no keystores deleted".to_string(),
+            )
+        })?
     };
 
     // Now process deletions

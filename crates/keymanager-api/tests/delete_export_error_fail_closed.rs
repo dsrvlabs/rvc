@@ -226,8 +226,7 @@ async fn test_delete_keystores_export_error_fails_closed_no_deletion() {
     // The fix aborts before the deletion loop, so delete_call_count stays 0.
     let delete_calls = keystore_manager.delete_call_count();
     assert_eq!(
-        delete_calls,
-        0,
+        delete_calls, 0,
         "KM-1 BUG: delete_keystore was called {delete_calls} time(s) even though \
          slashing-protection export failed — keys must NOT be deleted when export errors."
     );
