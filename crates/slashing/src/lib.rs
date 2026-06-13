@@ -5,11 +5,13 @@
 
 mod db;
 mod error;
+mod reader;
 mod stage;
 mod types;
 
 pub use db::SlashingDb;
 pub use error::{AttestationSlashingViolation, BlockSlashingViolation, SlashingError};
+pub use reader::{SlashingDbReader, TargetEpoch};
 pub use stage::{StagedAttestation, StagedBlock};
 pub use types::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata, PruneStats,
