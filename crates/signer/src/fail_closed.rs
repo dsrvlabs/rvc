@@ -7,7 +7,13 @@ pub trait FailClosedDefault {
     type Out;
 
     /// The fail-closed value to use when a boundary condition is unknown.
-    fn default_when_unknown() -> Self::Out;
+    ///
+    /// `where Self: Sized` keeps this static method off the vtable so the trait
+    /// stays dyn-compatible (callers invoke it monomorphically, e.g.
+    /// `<bool as FailClosedDefault>::default_when_unknown()`).
+    fn default_when_unknown() -> Self::Out
+    where
+        Self: Sized;
 }
 
 impl FailClosedDefault for bool {
