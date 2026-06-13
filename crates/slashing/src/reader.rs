@@ -30,27 +30,62 @@ pub trait SlashingDbReader: Send + Sync {
 impl SlashingDbReader for SlashingDb {
     /// Returns the maximum target epoch recorded for `pubkey`, scoped to `gvr`.
     ///
-    /// # GVR scoping
+    /// # Fail-closed GVR scoping
     ///
     /// `SignedAttestation` carries no per-row GVR field; GVR scoping is therefore enforced
-    /// via the DB's single pinned GVR (stored in `metadata.genesis_validators_root`).  If
-    /// `self.pinned_gvr()` returns `Ok(Some(pinned))` and `pinned != *gvr`, the caller is
-    /// asking about a different chain, so we return `None` — there is no relevant prior
-    /// attestation under the requested GVR.  If the DB has no pinned GVR yet (`Ok(None)`),
-    /// we proceed and return whatever records exist (backward-compat behaviour).
+    /// via the DB's single pinned GVR (stored in `metadata.genesis_validators_root`).
     ///
-    /// # Fail-quiet contract
+    /// A `Some(epoch)` answer is consumed downstream as an **unlock** signal — the
+    /// doppelganger forward-window's restart-aware safe-skip treats "we already have an
+    /// attestation under this chain" as grounds to skip monitoring. An answer derived from
+    /// an *unidentified* or *different* chain must therefore never be returned: it would
+    /// skip doppelganger protection based on foreign signing history (a slashing-bypass
+    /// hazard). This method is fail-closed (PRD §6.3): it returns `Some` **only** when the
+    /// DB's pinned GVR exactly matches `gvr`. In every other case — GVR mismatch, no pinned
+    /// GVR (chain identity unknown), or any I/O error — it returns `None`, which makes the
+    /// caller run the full forward window. Missing a safe-skip optimization is harmless; a
+    /// spurious unlock is not.
     ///
-    /// Any I/O or parse error from `pinned_gvr()` or `get_attestations()` is silently
-    /// mapped to `None`.  The trait returns no `Result` by design: this is a best-effort
-    /// read used to inform safe-skip decisions; an error means "no usable record".
+    /// Per-row GVR filtering (so legacy / cross-chain rows in a single DB cannot inflate the
+    /// answer) lands with the Phase 2 DVT-1/CN-1/GVR-1 schema migration; until then this
+    /// method relies on the DB's single-pinned-GVR invariant established at stage time.
     fn last_signed_attestation(&self, pubkey: &str, gvr: &Root) -> Option<TargetEpoch> {
         match self.pinned_gvr() {
-            Ok(Some(pinned)) if pinned != *gvr => return None,
-            Err(_) => return None,
-            _ => {}
+            // Pinned GVR matches the requested chain — the only path that may answer `Some`.
+            Ok(Some(pinned)) if pinned == *gvr => {}
+            Ok(Some(pinned)) => {
+                tracing::warn!(
+                    requested_gvr = ?gvr,
+                    pinned_gvr = ?pinned,
+                    "SlashingDbReader: GVR mismatch; returning None (fail-closed)"
+                );
+                return None;
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    "SlashingDbReader: DB has no pinned GVR; returning None \
+                     (fail-closed — cannot confirm chain identity for safe-skip)"
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "SlashingDbReader: pinned_gvr() failed; returning None (fail-closed)"
+                );
+                return None;
+            }
         }
 
-        self.get_attestations(pubkey).ok().and_then(|v| v.into_iter().map(|a| a.target_epoch).max())
+        match self.get_attestations(pubkey) {
+            Ok(v) => v.into_iter().map(|a| a.target_epoch).max(),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "SlashingDbReader: get_attestations failed; returning None (fail-closed)"
+                );
+                None
+            }
+        }
     }
 }

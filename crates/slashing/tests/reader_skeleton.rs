@@ -5,7 +5,7 @@
 //! - `last_signed_attestation` returns the max target epoch for a known pubkey under the pinned GVR.
 //! - Returns `None` for an unknown pubkey.
 //! - Returns `None` when queried with a GVR that differs from the one pinned in the DB.
-//! - Returns `Some(max)` when NO GVR is pinned (backward-compat: fail-open on unpinned DB).
+//! - Returns `None` when NO GVR is pinned (fail-closed: chain identity unknown → no unlock).
 //! - The trait is object-safe (cast to `&dyn SlashingDbReader` works).
 
 use rvc_slashing::{SlashingDb, SlashingDbReader};
@@ -78,13 +78,15 @@ fn test_last_signed_attestation_wrong_gvr_returns_none() {
 }
 
 /// When the DB has NO pinned GVR (fresh DB, no `set_genesis_validators_root` call),
-/// `last_signed_attestation` must still return `Some(max_target_epoch)`.
+/// `last_signed_attestation` must return `None` (fail-closed).
 ///
-/// This pins the documented backward-compat behaviour: an unpinned DB is fail-open
-/// so that validators migrating from legacy setups (no GVR in metadata) are not
-/// incorrectly treated as having no history.
+/// A `Some` answer is consumed downstream as a doppelganger safe-skip *unlock* signal.
+/// With no pinned GVR the DB's chain identity is unknown, so any history could belong to a
+/// different chain; returning `Some` would risk skipping doppelganger protection based on
+/// foreign history. Fail-closed (PRD §6.3): unknown chain → `None` → caller runs the full
+/// forward window. Missing the optimization is harmless; a spurious unlock is not.
 #[test]
-fn test_last_signed_attestation_no_pinned_gvr_returns_some() {
+fn test_last_signed_attestation_no_pinned_gvr_returns_none() {
     // Open without pinning any GVR.
     let db = SlashingDb::open_in_memory().expect("open_in_memory");
 
@@ -93,7 +95,7 @@ fn test_last_signed_attestation_no_pinned_gvr_returns_some() {
     let reader: &dyn SlashingDbReader = &db;
     assert_eq!(
         reader.last_signed_attestation(PUBKEY, GVR),
-        Some(5),
-        "unpinned DB must return Some — fail-open backward-compat"
+        None,
+        "unpinned DB must return None — fail-closed (chain identity unknown)"
     );
 }
