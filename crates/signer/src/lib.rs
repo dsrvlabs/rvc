@@ -3,12 +3,13 @@
 //! This module provides a signing service that ensures all validator
 //! signatures are checked against slashing protection rules before signing.
 
-mod enablement;
 mod fail_closed;
 mod traits;
 
 pub use crypto::is_aggregator;
-pub use enablement::SigningEnablement;
+// SigningEnablement was relocated from rvc-signer to rvc-doppelganger (Issue 2.6)
+// to allow ForwardWindowMachine to implement it without a doppelganger→signer cycle.
+pub use doppelganger::SigningEnablement;
 pub use fail_closed::FailClosedDefault;
 pub use traits::ValidatorSigner;
 

@@ -36,11 +36,7 @@ struct PriorAttestationAt {
 }
 
 impl slashing::SlashingDbReader for PriorAttestationAt {
-    fn last_signed_attestation(
-        &self,
-        _pubkey: &str,
-        _gvr: &Root,
-    ) -> Option<slashing::TargetEpoch> {
+    fn last_signed_attestation(&self, _pubkey: &str, _gvr: &Root) -> Option<slashing::TargetEpoch> {
         Some(self.target_epoch)
     }
 }
@@ -285,10 +281,7 @@ fn test_observe_liveness_live_validator_transitions_to_detected() {
     machine.observe_liveness(start_epoch, &samples).expect("observe_liveness must not fail");
 
     // State must be Detected → signing still denied.
-    assert!(
-        !machine.is_signing_enabled(&pubkey),
-        "Detected state must deny signing (fail-closed)"
-    );
+    assert!(!machine.is_signing_enabled(&pubkey), "Detected state must deny signing (fail-closed)");
 }
 
 #[test]
