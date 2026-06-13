@@ -1,0 +1,246 @@
+//! Standing CI gate: workspace-internal dependency DAG invariants.
+//!
+//! Purpose
+//! -------
+//! Parses `cargo metadata --format-version=1 --no-deps` (via `serde_json`; the
+//! `cargo_metadata` crate is NOT used — Phase-1 rule P6 prohibits new external
+//! dependencies) and enforces three layers of the level-graded DAG:
+//!
+//! 1. The workspace-internal production dependency graph is acyclic.
+//! 2. Documented forbidden edges are absent (slashing->doppelganger,
+//!    signer->keymanager-api, eth-types->any).
+//! 3. The expected `rvc-signer → rvc-doppelganger` edge (Issue 1.5) is present.
+//!
+//! Manual verification
+//! -------------------
+//! During development, the forbidden-edge injection was verified once:
+//!   `keymanager-api.workspace = true` was temporarily added to
+//!   `crates/signer/Cargo.toml` [dependencies], the test was run, it failed with
+//!   a clear "forbidden edge rvc-signer -> rvc-keymanager-api" message, and the
+//!   change was immediately reverted.  `crates/signer/Cargo.toml` is back to its
+//!   committed state.
+//!
+//! Forward-compatibility: rvc-signer-registry (Issue 1.7)
+//! -------------------------------------------------------
+//! `DEV_ONLY` lists crate names that are expected to have zero workspace-internal
+//! PRODUCTION out-edges even if they exist in the workspace.  Issue 1.7 will add
+//! `rvc-signer-registry` as exactly such a crate.  If the crate is absent from the
+//! metadata (before 1.7 lands), the check is silently skipped.  This test therefore
+//! requires NO edits when Issue 1.7 is merged — it stays green both before and after.
+
+use std::collections::{HashMap, HashSet};
+use std::process::Command;
+
+// ---------------------------------------------------------------------------
+// Policy tables
+// ---------------------------------------------------------------------------
+
+/// Production edges that must never appear in the workspace graph.
+const FORBIDDEN: &[(&str, &str)] =
+    &[("rvc-slashing", "rvc-doppelganger"), ("rvc-signer", "rvc-keymanager-api")];
+
+/// Crates that must have zero workspace-internal PRODUCTION out-edges.
+/// If a name is absent from `cargo metadata` output the check is skipped,
+/// so this list is forward-compatible with crates that do not yet exist.
+///
+/// Issue 1.7 will add `rvc-signer-registry` here; no edit to this test needed.
+const ZERO_OUT_EDGE_IF_PRESENT: &[&str] = &["rvc-eth-types", "rvc-signer-registry"];
+
+/// Edge that MUST be present (Issue 1.5 regression guard).
+const REQUIRED_EDGE: (&str, &str) = ("rvc-signer", "rvc-doppelganger");
+
+// ---------------------------------------------------------------------------
+// Helper: build the workspace-internal production edge map
+// ---------------------------------------------------------------------------
+
+/// Returns `HashMap<package_name, Vec<dep_name>>` for workspace-internal
+/// **production** dependencies only (`kind == null`, `path` is a string).
+fn build_edge_map(packages: &[serde_json::Value]) -> HashMap<String, Vec<String>> {
+    let mut map: HashMap<String, Vec<String>> = HashMap::new();
+
+    for pkg in packages {
+        let name = pkg["name"].as_str().expect("package must have a string name").to_string();
+
+        let deps = pkg["dependencies"].as_array().expect("package dependencies must be an array");
+
+        let ws_production_deps: Vec<String> = deps
+            .iter()
+            .filter(|dep| {
+                // Workspace-internal: `path` is a string (not null).
+                dep["path"].as_str().is_some()
+                    // Production only: `kind` is null / absent (not "dev" or "build").
+                    && dep["kind"].is_null()
+            })
+            .map(|dep| {
+                dep["name"].as_str().expect("dependency must have a string name").to_string()
+            })
+            .collect();
+
+        // Always insert the key so acyclic-check sees every node.
+        map.insert(name, ws_production_deps);
+    }
+
+    map
+}
+
+// ---------------------------------------------------------------------------
+// Helper: DFS cycle detection (3-colour)
+// ---------------------------------------------------------------------------
+
+/// Returns `Some(cycle_path)` if a cycle exists, `None` if the graph is acyclic.
+fn find_cycle(edges: &HashMap<String, Vec<String>>) -> Option<Vec<String>> {
+    // 0 = white (unvisited), 1 = grey (in stack), 2 = black (done)
+    let mut color: HashMap<&str, u8> = HashMap::new();
+    let mut path: Vec<String> = Vec::new();
+
+    for start in edges.keys() {
+        if color.get(start.as_str()).copied().unwrap_or(0) == 0 {
+            if let Some(cycle) = dfs(start, edges, &mut color, &mut path) {
+                return Some(cycle);
+            }
+        }
+    }
+    None
+}
+
+fn dfs<'a>(
+    node: &'a str,
+    edges: &'a HashMap<String, Vec<String>>,
+    color: &mut HashMap<&'a str, u8>,
+    path: &mut Vec<String>,
+) -> Option<Vec<String>> {
+    color.insert(node, 1); // grey
+    path.push(node.to_string());
+
+    if let Some(neighbours) = edges.get(node) {
+        for next in neighbours {
+            let next_str: &'a str = {
+                // Re-borrow from the map key whose lifetime is 'a.
+                edges
+                    .keys()
+                    .find(|k| k.as_str() == next.as_str())
+                    .map(|k| k.as_str())
+                    .unwrap_or(next.as_str())
+            };
+            match color.get(next_str).copied().unwrap_or(0) {
+                1 => {
+                    // Back-edge found: reconstruct the cycle portion.
+                    let cycle_start = path
+                        .iter()
+                        .position(|n| n == next_str)
+                        .expect("invariant: grey node must be in DFS path");
+                    let mut cycle = path[cycle_start..].to_vec();
+                    cycle.push(next_str.to_string());
+                    return Some(cycle);
+                }
+                0 => {
+                    if let Some(cycle) = dfs(next_str, edges, color, path) {
+                        return Some(cycle);
+                    }
+                }
+                _ => {} // black: already fully explored
+            }
+        }
+    }
+
+    path.pop();
+    color.insert(node, 2); // black
+    None
+}
+
+// ---------------------------------------------------------------------------
+// The gate
+// ---------------------------------------------------------------------------
+
+#[test]
+fn architecture_no_cycles() {
+    // ------------------------------------------------------------------
+    // 1. Run `cargo metadata`
+    // ------------------------------------------------------------------
+    // CARGO_MANIFEST_DIR is crates/architecture-tests; cargo walks up to
+    // the workspace root automatically.
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .current_dir(manifest_dir)
+        .output()
+        .expect("cargo metadata must run; cargo must be on PATH");
+
+    assert!(
+        output.status.success(),
+        "cargo metadata exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cargo metadata output must be valid JSON");
+
+    // ------------------------------------------------------------------
+    // 2. Assert metadata_version >= 1
+    // ------------------------------------------------------------------
+    let version = metadata["version"].as_u64().expect("metadata 'version' field must be a number");
+    assert!(
+        version == 1,
+        "cargo metadata format version 1 expected, got {version}; update this gate if the schema changed"
+    );
+
+    // ------------------------------------------------------------------
+    // 3. Build workspace-internal production edge map
+    // ------------------------------------------------------------------
+    let packages =
+        metadata["packages"].as_array().expect("metadata 'packages' field must be an array");
+
+    let edges = build_edge_map(packages);
+
+    // ------------------------------------------------------------------
+    // 4. Cycle detection
+    // ------------------------------------------------------------------
+    if let Some(cycle) = find_cycle(&edges) {
+        panic!(
+            "workspace-internal production dependency graph contains a cycle: {}",
+            cycle.join(" -> ")
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 5. Forbidden edges must be absent
+    // ------------------------------------------------------------------
+    for (from, to) in FORBIDDEN {
+        let has_edge = edges.get(*from).is_some_and(|deps| deps.contains(&to.to_string()));
+        assert!(!has_edge, "forbidden edge present in workspace graph: {from} -> {to}");
+    }
+
+    // ------------------------------------------------------------------
+    // 6. Zero-out-edge crates (rvc-eth-types always; others if present)
+    // ------------------------------------------------------------------
+    let all_package_names: HashSet<&str> =
+        packages.iter().filter_map(|p| p["name"].as_str()).collect();
+
+    for crate_name in ZERO_OUT_EDGE_IF_PRESENT {
+        if !all_package_names.contains(*crate_name) {
+            // Crate not yet in workspace — forward-compat skip.
+            continue;
+        }
+        let out_edges = edges.get(*crate_name).map_or(0, |deps| deps.len());
+        assert!(
+            out_edges == 0,
+            "{crate_name} must be a workspace leaf (zero production out-edges) \
+             but has {out_edges} edge(s): {:?}",
+            edges.get(*crate_name).unwrap()
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // 7. Required edge: rvc-signer -> rvc-doppelganger (Issue 1.5 guard)
+    // ------------------------------------------------------------------
+    let (req_from, req_to) = REQUIRED_EDGE;
+    let signer_deps = edges.get(req_from).unwrap_or_else(|| {
+        panic!("package '{req_from}' not found in workspace metadata");
+    });
+    assert!(
+        signer_deps.contains(&req_to.to_string()),
+        "required edge missing: {req_from} -> {req_to} \
+         (Issue 1.5 regression — rvc-signer must depend on rvc-doppelganger)"
+    );
+}
