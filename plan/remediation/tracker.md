@@ -16,22 +16,28 @@ behavior change on `develop`.
 
 | Issue | Deliverable | State |
 |-------|-------------|-------|
-| 1.0 | `plan/remediation/tracker.md` (this file) | Open |
-| 1.1 | `eth-types::canonical` newtypes + `parse_pubkey_hex` / `parse_gvr_hex` / `parse_signing_root_hex` / `eq_gvr` | Open |
-| 1.2 | `eth-types::insecure::InsecureGate { Refuse, Warn, Allow }` + `Decision` + `from_env` | Open |
-| 1.3 | `signer::SigningEnablement` + `signer::FailClosedDefault` traits | Open |
-| 1.4 | `slashing::SlashingDbReader` read-only trait | Open |
-| 1.5 | `signer → doppelganger` Cargo dep edge | Open |
-| 1.6 | `tests/architecture_no_cycles.rs` standing CI gate | Open |
-| 1.7 | `crates/signer-registry` dev-only crate skeleton | Open |
-| 1.8a | Q3 determination spike (production on-disk slashing DBs?) | Open |
-| 1.8b | Anonymized pre-migration fixture capture (conditional on Outcome B) | Open |
-| 1.9 | Q7 resolution (B-1/T-1 actual landed state) | Open |
+| 1.0 | `plan/remediation/tracker.md` (this file) | Pre-work-landed (`4789be0`) |
+| 1.1 | `eth-types::canonical` newtypes + `parse_pubkey_hex` / `parse_gvr_hex` / `parse_signing_root_hex` / `eq_gvr` | Pre-work-landed (`fa45d6a`) |
+| 1.2 | `eth-types::insecure::InsecureGate { Refuse, Warn, Allow }` + `Decision` + `from_env` | Pre-work-landed (`349aaba`) |
+| 1.3 | `signer::SigningEnablement` + `signer::FailClosedDefault` traits | Pre-work-landed (`d85a978`) |
+| 1.4 | `slashing::SlashingDbReader` read-only trait (fail-closed on unpinned/mismatched GVR) | Pre-work-landed (`2b36e0f`, `a1682c1`) |
+| 1.5 | `signer → doppelganger` Cargo dep edge | Pre-work-landed (`d1a6834`) |
+| 1.6 | `tests/architecture_no_cycles.rs` standing CI gate | Pre-work-landed (`6ba3c4e`) |
+| 1.7 | `crates/signer-registry` dev-only crate skeleton | Pre-work-landed (`97f7ec6`) |
+| 1.8a | Q3 determination spike (production on-disk slashing DBs?) | Resolved — Outcome A (no production DBs) |
+| 1.8b | Anonymized pre-migration fixture capture (conditional on Outcome B) | Skipped (Outcome A) |
+| 1.9 | Q7 resolution (B-1/T-1 actual landed state) | Resolved — State X3 (deserialize half landed) |
 
 **Open questions**
 
-- **Q3** (gates 2.4 migration test): are there production on-disk slashing DBs? Resolved by 1.8a.
-- **Q7** (gates 4.3/4.5 RED baseline): is B-1/T-1 partially landed? Resolved by 1.9.
+- **Q3** (gates 2.4 migration test): are there production on-disk slashing DBs? **Resolved by 1.8a → Outcome A.**
+  - **Outcome: A (no production on-disk slashing DBs assumed).** Phase 2 Task 2.4's migration regression test runs against a **synthetic fixture generated inline in Rust**; Issue 1.8b is **skipped**.
+  - **Method:** No operator channel is available in this autonomous execution; per the 1.8a SLA escalation path, the determination defaults to Outcome A with a deployment-config inspection as the secondary signal. Repo inspection found **no deployment infrastructure** (no helm/k8s/compose/`deploy*` dirs, no PersistentVolume/`*.sqlite` mounts). The only `slashing_db_path` references are config *examples* (`config.example.toml:40`, `README.md:45` → `./slashing_protection.sqlite`), i.e. a local default path, not a populated production DB artifact.
+  - **Residual risk:** If a real production deployment with a populated `slashing.sqlite` later surfaces, Phase 2 Task 2.4's migration must be re-validated against a captured fixture (re-open 1.8b). The migration is designed idempotent/transactional so this is a re-test, not a redesign.
+- **Q7** (gates 4.3/4.5 RED baseline): is B-1/T-1 partially landed? **Resolved by 1.9 → State X3 (for the L-9 deserialize tests).**
+  - **Evidence:** The two `#[ignore]`d tests in `crates/block-service/src/service.rs` (`test_ssz_deser_block_contents_with_kzg_proofs` @2598, `test_ssz_deser_multiple_blobs_deneb` @2642) **PASS** when run with `cargo test -p rvc-block-service -- --ignored` (`2 passed; 0 failed`). `crates/beacon/src/ssz_deser.rs` already has `resolve_block_region_end()` which bounds the block region at the **kzg_proofs offset** for `BlockContents` (and `bytes.len()` for raw `BeaconBlock`) — the correct framing. `deserialize_block_fields` enforces this bound.
+  - **Interpretation:** The **deserialize-side** body-bleed fix is **landed**; the `#[ignore]` annotations + their "Known body-bleed bug" comments are **stale**. → Phase 4 Task 4.7 (L-9) is a **relabel** job: remove the `#[ignore]`s and false comments, keep the two tests as positive regression tests.
+  - **Still open for Phase 4 (Task 4.5 / B-1+T-1):** the **publish/serialize-side** `SignedBlockContents` framing at `crates/block-service/src/service.rs:287-385,370-382` is NOT covered by the deserialize tests above. Phase 4 Task 4.5's RED must target the publish path: drive the propose pipeline with non-empty kzg/blob regions and assert the **published** bytes deserialize to a `SignedBlockContents` whose inner block tree-hashes to the signed root (PRD B-1/T-1 acceptance criterion c). Per Research R3, expect to invert/extend rather than write from scratch where the deserialize round-trip already passes.
 
 ---
 
@@ -111,7 +117,7 @@ the canonical individual-finding count is **46** per PRD §5 "Finding totals".
 
 | Gate | Introduced | Status |
 |------|------------|--------|
-| `tests/architecture_no_cycles.rs` | Phase 1 / 1.6 | Pending |
+| `crates/architecture-tests/tests/architecture_no_cycles.rs` | Phase 1 / 1.6 | Live (`6ba3c4e`) |
 | `bin/rvc-signer/tests/signing_path_enumeration.rs` | Phase 2 / 2.2 (strict flip 2.13) | Pending |
 | `crates/signer/tests/no_direct_composite_signer_outside_signer.rs` | Phase 2 / 2.10b | Pending |
 
