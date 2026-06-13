@@ -4,10 +4,21 @@
 //! Ethereum values. Later remediation issues (L-2, GVR-1, IMP-1, EXIT-1)
 //! will migrate existing ad-hoc parsing onto these seams.
 //!
-//! # Strict-prefix rules
-//! - Bare even-length hex (no `0x`) is accepted.
-//! - A single `0x` prefix is accepted.
-//! - A double `0x0x` prefix is rejected as [`ParseError::DoublePrefix`].
+//! # Accepted and rejected inputs
+//!
+//! | Input form                     | Result                              |
+//! |--------------------------------|-------------------------------------|
+//! | Bare even-length hex (`abcd…`) | Accepted                            |
+//! | `0x`-prefixed (`0xabcd…`)      | Accepted                            |
+//! | `0X`-prefixed (`0Xabcd…`)      | `InvalidHex` (only `0x` stripped)   |
+//! | `0x0x…` double prefix          | `DoublePrefix`                      |
+//! | `0x0X…` mixed double prefix    | `DoublePrefix`                      |
+//! | Empty string `""`              | `InvalidLength { got: 0 }`          |
+//! | Lone prefix `"0x"`             | `InvalidLength { got: 0 }`          |
+//! | Odd-length hex digits          | `InvalidHex`                        |
+//! | Non-hex character              | `InvalidHex`                        |
+//! | Wrong decoded byte count       | `InvalidLength`                     |
+//! | Whitespace                     | `InvalidHex`                        |
 
 pub mod gvr_hex;
 pub mod pubkey_hex;
@@ -25,7 +36,8 @@ pub enum ParseError {
     #[error("invalid length: expected {expected} bytes, got {got}")]
     InvalidLength { expected: usize, got: usize },
 
-    /// The string starts with `0x0x`, which is a double-prefix and is rejected.
+    /// The string starts with `0x0x` or `0x0X`, which is a double-prefix and
+    /// is rejected.
     #[error("double 0x prefix detected")]
     DoublePrefix,
 }

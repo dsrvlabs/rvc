@@ -23,13 +23,13 @@ impl PubkeyHex {
 /// Parse a BLS public key from a hex string.
 ///
 /// Accepts a bare 96-character hex string or a `0x`-prefixed one.
-/// Rejects a double `0x0x` prefix, odd-length hex, non-hex characters,
-/// and any decoded byte length other than 48.
+/// Rejects a double `0x0x` / `0x0X` prefix, odd-length hex, non-hex
+/// characters, and any decoded byte length other than 48.
 ///
 /// # Errors
-/// Returns [`ParseError::DoublePrefix`] for a `0x0x…` input, [`ParseError::InvalidHex`]
-/// for non-hex or odd-length input, and [`ParseError::InvalidLength`] when the
-/// decoded byte count is not 48.
+/// Returns [`ParseError::DoublePrefix`] for a `0x0x…` / `0x0X…` input,
+/// [`ParseError::InvalidHex`] for non-hex or odd-length input, and
+/// [`ParseError::InvalidLength`] when the decoded byte count is not 48.
 ///
 /// # Examples
 /// ```
@@ -48,10 +48,15 @@ pub fn parse_pubkey_hex(s: &str) -> Result<PubkeyHex, ParseError> {
     Ok(PubkeyHex(arr))
 }
 
-/// Strip a single optional `0x` prefix, rejecting a double `0x0x` prefix.
+/// Strip a single optional lowercase `0x` prefix, rejecting a double `0x0x`
+/// or `0x0X` prefix as [`ParseError::DoublePrefix`].
+///
+/// Only a lowercase `0x` outer prefix is recognised. An uppercase `0X` outer
+/// prefix is NOT stripped — it will surface as [`ParseError::InvalidHex`] when
+/// the caller passes the original string to `decode_hex`.
 pub(super) fn strip_prefix(s: &str) -> Result<&str, ParseError> {
     if let Some(rest) = s.strip_prefix("0x") {
-        if rest.starts_with("0x") {
+        if rest.starts_with("0x") || rest.starts_with("0X") {
             return Err(ParseError::DoublePrefix);
         }
         Ok(rest)
@@ -60,9 +65,22 @@ pub(super) fn strip_prefix(s: &str) -> Result<&str, ParseError> {
     }
 }
 
-/// Decode a hex string (no prefix) into bytes, returning `InvalidHex` on failure.
+/// Decode a hex string (no prefix) into bytes.
+///
+/// Maps each `hex::FromHexError` variant to a message that omits the raw
+/// offending character, preventing latent secret-byte leakage into logs if
+/// a secret value were ever misrouted through these parsers.
 pub(super) fn decode_hex(hex: &str) -> Result<Vec<u8>, ParseError> {
-    hex::decode(hex).map_err(|e| ParseError::InvalidHex(e.to_string()))
+    hex::decode(hex).map_err(|e| {
+        let msg = match e {
+            hex::FromHexError::OddLength => "odd number of hex digits".to_owned(),
+            hex::FromHexError::InvalidHexCharacter { index, .. } => {
+                format!("non-hex character at index {index}")
+            }
+            hex::FromHexError::InvalidStringLength => "invalid string length".to_owned(),
+        };
+        ParseError::InvalidHex(msg)
+    })
 }
 
 #[cfg(test)]
@@ -75,12 +93,33 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_prefix_single() {
+    fn test_strip_prefix_single_lowercase() {
         assert_eq!(strip_prefix("0xabcd").unwrap(), "abcd");
     }
 
     #[test]
-    fn test_strip_prefix_double_rejected() {
+    fn test_strip_prefix_double_0x0x_rejected() {
         assert!(matches!(strip_prefix("0x0xabcd"), Err(ParseError::DoublePrefix)));
+    }
+
+    #[test]
+    fn test_strip_prefix_double_0x0x_upper_rejected() {
+        assert!(matches!(strip_prefix("0x0Xabcd"), Err(ParseError::DoublePrefix)));
+    }
+
+    #[test]
+    fn test_decode_hex_odd_length_message_omits_raw_bytes() {
+        let err = decode_hex("abc").unwrap_err();
+        let ParseError::InvalidHex(msg) = err else { panic!("expected InvalidHex") };
+        assert_eq!(msg, "odd number of hex digits");
+    }
+
+    #[test]
+    fn test_decode_hex_non_hex_char_message_omits_raw_char() {
+        let err = decode_hex("zz").unwrap_err();
+        let ParseError::InvalidHex(msg) = err else { panic!("expected InvalidHex") };
+        // Message contains only the index, not the raw character value.
+        assert!(msg.starts_with("non-hex character at index"));
+        assert!(!msg.contains('z'));
     }
 }

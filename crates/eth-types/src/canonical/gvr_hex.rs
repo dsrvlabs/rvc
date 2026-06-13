@@ -76,6 +76,13 @@ pub fn parse_gvr_hex(s: &str) -> Result<Root, ParseError> {
 /// value mismatch, making this safe to call in security-sensitive comparisons
 /// where an invalid input must never be treated as a match.
 ///
+/// # Security note — not constant-time
+///
+/// This function is **not** constant-time. The genesis-validators-root is a
+/// public value so timing leakage is not a concern here, but do **not** use
+/// this function to compare secret material (private keys, signing nonces,
+/// passwords, etc.).
+///
 /// # Examples
 /// ```
 /// use rvc_eth_types::canonical::gvr_hex::eq_gvr;
