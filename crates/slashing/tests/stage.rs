@@ -232,9 +232,14 @@ fn test_stage_attestation_keeps_existing_check_and_record_unchanged() {
     );
 }
 
-// ── CN-scoping test ───────────────────────────────────────────────────────────
+// ── v3 pubkey-scoped test ─────────────────────────────────────────────────────
 
-/// Two different client CNs signing the same (pubkey, slot) must each succeed independently.
+/// After the v3 migration, cross-CN conflicting blocks for the same (pubkey, slot)
+/// MUST be rejected (DVT-1 / CN-1 fix).  The CN is audit-only; pubkey+slot is
+/// the uniqueness scope.
+///
+/// This test replaces the v2 "different CNs are independent" test.
+/// Updated in Issue 2.4: CN-scoped independence is removed.
 #[test]
 fn test_stage_block_cn_scoped_different_cns_independent() {
     let db = SlashingDb::open_in_memory().expect("open");
@@ -244,14 +249,27 @@ fn test_stage_block_cn_scoped_different_cns_independent() {
         .commit()
         .expect("commit cn-alpha");
 
-    // Different CN, same (pubkey, slot): should succeed (separate namespace).
-    db.stage_block("cn-beta", PUBKEY, 300, Some("0xroot_beta".into()), GVR)
-        .expect("stage cn-beta should succeed — different CN namespace")
-        .commit()
-        .expect("commit cn-beta");
+    // Different CN, same (pubkey, slot) but DIFFERENT root — must be rejected in v3.
+    let result = db.stage_block("cn-beta", PUBKEY, 300, Some("0xroot_beta".into()), GVR);
+    assert!(
+        matches!(
+            result,
+            Err(SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal {
+                slot: 300
+            }))
+        ),
+        "cross-CN conflicting block must be rejected in v3 pubkey-scoped schema: {result:?}"
+    );
 
+    // Same root from a different CN is a re-sign (not a violation).
+    db.stage_block("cn-beta", PUBKEY, 300, Some("0xroot_alpha".into()), GVR)
+        .expect("same-root re-sign from different CN must be allowed")
+        .commit()
+        .expect("commit cn-beta resign");
+
+    // Only one row (the cn-alpha row); the cn-beta re-sign didn't insert a new row.
     let blocks = db.get_blocks(PUBKEY).expect("get");
-    assert_eq!(blocks.len(), 2, "each CN produces its own row");
+    assert_eq!(blocks.len(), 1, "re-sign must not produce a duplicate row");
 }
 
 // ── Re-sign (idempotent) tests ────────────────────────────────────────────────

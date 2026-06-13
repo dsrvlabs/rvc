@@ -288,8 +288,27 @@ fn test_legacy_row_no_per_row_gvr_does_not_break_violation_checks() {
         .expect("insert legacy row");
     }
 
-    // Step 2: Open via SlashingDb and pin GVR R1 in metadata.
+    // Step 2: Pin GVR R1 in metadata BEFORE opening via SlashingDb.
+    //
+    // The v3 migration (pubkey-scoped indices) needs to back-fill the
+    // `genesis_validators_root` column for NULL rows.  It reads the pinned GVR
+    // from `metadata.genesis_validators_root`.  Without a pinned GVR, the
+    // migration fails closed (fail-closed safety invariant).
+    //
+    // In production, operators pin the GVR at startup before any signing call.
+    // The test simulates this by writing the metadata row directly.
+    {
+        let conn = Connection::open(&db_path).expect("open for gvr insert");
+        let hex = format!("0x{}", hex::encode(R1));
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('genesis_validators_root', ?1)",
+            [hex.as_str()],
+        )
+        .expect("insert genesis_validators_root");
+    }
+
     let db = SlashingDb::open(&db_path).expect("SlashingDb::open");
+    // GVR is already in metadata — set_genesis_validators_root is idempotent if matching.
     let hex = format!("0x{}", hex::encode(R1));
     db.set_genesis_validators_root(&hex).expect("set gvr");
 

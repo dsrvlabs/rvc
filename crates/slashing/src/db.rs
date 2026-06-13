@@ -28,6 +28,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
 use crate::error::{AttestationSlashingViolation, BlockSlashingViolation, SlashingError};
+use crate::migration;
 use crate::types::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata, PruneStats,
     SignedAttestation, SignedBlock, ValidatorRecord,
@@ -102,8 +103,10 @@ impl SlashingDb {
         // Then `migrate_to_v2` checks if the existing schema is v1 and upgrades.
         // For a brand-new DB, `migrate()` creates v2 tables and `migrate_to_v2` will
         // set schema_version=2 without needing a backup (tables are fresh/empty).
+        // Finally `migrate_to_v3` re-keys indices from CN-scoped to pubkey-scoped.
         db.migrate()?;
         db.migrate_to_v2(path)?;
+        db.migrate_to_v3()?;
 
         // ISSUE-4.8 / L-8: chmod 0o600 on `<path>-wal` / `<path>-shm` sidecars.
         //
@@ -242,12 +245,13 @@ impl SlashingDb {
             Self::run_v2_migration_transaction(&mut conn)
                 .map_err(|e| SlashingError::MigrationFailed(format!("{e}")))?;
         }
+        db.migrate_to_v3()?;
         Ok(db)
     }
 
     /// Open an in-memory database for testing.
     ///
-    /// Creates the full v2 schema directly (no backup needed — there is no file).
+    /// Creates the full v3 schema directly (no backup needed — there is no file).
     pub fn open_in_memory() -> Result<Self, SlashingError> {
         let conn = Connection::open_in_memory()?;
         let db = Self {
@@ -266,6 +270,8 @@ impl SlashingDb {
             Self::run_v2_migration_transaction(&mut conn)
                 .map_err(|e| SlashingError::MigrationFailed(format!("{e}")))?;
         }
+        // Migrate to v3: pubkey-scoped indices.
+        db.migrate_to_v3()?;
         Ok(db)
     }
 
@@ -597,6 +603,24 @@ impl SlashingDb {
         Ok(())
     }
 
+    /// Migrate the database to schema v3 (pubkey-scoped slashing indices).
+    ///
+    /// Gate: `schema_version >= 3` → no-op (idempotent).
+    ///
+    /// Delegates to [`migration::migrate_to_v3`] which runs all steps in a
+    /// single `IMMEDIATE` transaction.  A failure rolls back completely so the
+    /// DB remains at v2 with CN-scoped indices (degraded but safe).
+    fn migrate_to_v3(&self) -> Result<(), SlashingError> {
+        let mut conn = self.conn.lock();
+        migration::migrate_to_v3(&mut conn).map_err(|e| {
+            tracing::error!(
+                error = %e,
+                "schema v3 migration failed; database remains at v2 with CN-scoped indices"
+            );
+            e
+        })
+    }
+
     fn run_v2_migration_transaction(conn: &mut Connection) -> Result<(), SlashingError> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -674,6 +698,10 @@ impl SlashingDb {
     /// If an attestation with the same pubkey and target_epoch already exists,
     /// the operation silently succeeds without modifying the existing record.
     /// This makes the operation safe to retry.
+    ///
+    /// Idempotency is checked by `(pubkey, target_epoch)` so that the v3 pubkey-scoped
+    /// unique index (which also includes `genesis_validators_root`) does not admit
+    /// duplicate rows when gvr is NULL.
     pub fn record_attestation(
         &self,
         pubkey: &str,
@@ -684,8 +712,11 @@ impl SlashingDb {
         let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT OR IGNORE INTO attestations (client_cn, pubkey, source_epoch, target_epoch, signing_root)
-             VALUES ('local-vc', ?1, ?2, ?3, ?4)",
+            "INSERT INTO attestations (client_cn, pubkey, source_epoch, target_epoch, signing_root)
+             SELECT 'local-vc', ?1, ?2, ?3, ?4
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM attestations WHERE pubkey = ?1 AND target_epoch = ?3
+             )",
             (&pubkey, source_epoch as i64, target_epoch as i64, &signing_root),
         )?;
         Ok(())
@@ -1017,8 +1048,11 @@ impl SlashingDb {
                 })?;
 
                 tx.execute(
-                    "INSERT OR IGNORE INTO attestations (client_cn, pubkey, source_epoch, target_epoch, signing_root)
-                     VALUES ('local-vc', ?1, ?2, ?3, ?4)",
+                    "INSERT INTO attestations (client_cn, pubkey, source_epoch, target_epoch, signing_root)
+                     SELECT 'local-vc', ?1, ?2, ?3, ?4
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM attestations WHERE pubkey = ?1 AND target_epoch = ?3
+                     )",
                     (&pubkey, source_epoch as i64, target_epoch as i64, &attestation.signing_root),
                 )?;
             }
@@ -1029,7 +1063,11 @@ impl SlashingDb {
                 })?;
 
                 tx.execute(
-                    "INSERT OR IGNORE INTO blocks (client_cn, pubkey, slot, signing_root) VALUES ('local-vc', ?1, ?2, ?3)",
+                    "INSERT INTO blocks (client_cn, pubkey, slot, signing_root)
+                     SELECT 'local-vc', ?1, ?2, ?3
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM blocks WHERE pubkey = ?1 AND slot = ?2
+                     )",
                     (&pubkey, slot as i64, &block.signing_root),
                 )?;
             }
@@ -1049,6 +1087,10 @@ impl SlashingDb {
     ///
     /// If a block with the same pubkey and slot already exists,
     /// the operation silently succeeds without modifying the existing record.
+    ///
+    /// Idempotency is checked by `(pubkey, slot)` so that the v3 pubkey-scoped
+    /// unique index (which also includes `genesis_validators_root`) does not admit
+    /// duplicate rows when gvr is NULL.
     pub fn record_block(
         &self,
         pubkey: &str,
@@ -1058,8 +1100,11 @@ impl SlashingDb {
         let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT OR IGNORE INTO blocks (client_cn, pubkey, slot, signing_root)
-             VALUES ('local-vc', ?1, ?2, ?3)",
+            "INSERT INTO blocks (client_cn, pubkey, slot, signing_root)
+             SELECT 'local-vc', ?1, ?2, ?3
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM blocks WHERE pubkey = ?1 AND slot = ?2
+             )",
             (&pubkey, slot as i64, &signing_root),
         )?;
         Ok(())
@@ -1199,8 +1244,8 @@ impl SlashingDb {
 
         let existing: Option<Option<String>> = tx
             .query_row(
-                "SELECT signing_root FROM blocks WHERE client_cn = ?1 AND pubkey = ?2 AND slot = ?3",
-                (client_cn, &pubkey, slot as i64),
+                "SELECT signing_root FROM blocks WHERE pubkey = ?1 AND slot = ?2",
+                (&pubkey, slot as i64),
                 |row| row.get(0),
             )
             .optional()?;
@@ -1232,14 +1277,11 @@ impl SlashingDb {
             return Ok(());
         }
 
-        // No block at this (cn, pubkey, slot) — check that slot is not below the minimum
-        // within this CN scope.
+        // No block at this (pubkey, slot) — check that slot is not below the minimum.
         let min_slot: Option<i64> = tx
-            .query_row(
-                "SELECT MIN(slot) FROM blocks WHERE client_cn = ?1 AND pubkey = ?2",
-                (client_cn, &pubkey),
-                |row| row.get(0),
-            )
+            .query_row("SELECT MIN(slot) FROM blocks WHERE pubkey = ?1", (&pubkey,), |row| {
+                row.get(0)
+            })
             .optional()?
             .flatten();
 
@@ -1405,10 +1447,10 @@ impl SlashingDb {
             let mut stmt = tx.prepare(
                 "SELECT source_epoch, target_epoch, signing_root
                  FROM attestations
-                 WHERE client_cn = ?1 AND pubkey = ?2",
+                 WHERE pubkey = ?1",
             )?;
             let result = stmt
-                .query_map((client_cn, &pubkey), |row| {
+                .query_map((&pubkey,), |row| {
                     Ok((
                         row.get::<_, i64>(0)? as Epoch,
                         row.get::<_, i64>(1)? as Epoch,
@@ -2037,26 +2079,26 @@ mod tests {
 
     #[test]
     fn test_attestation_unique_constraint() {
+        // v3: uniqueness is enforced by (pubkey, gvr, target_epoch).
+        // Raw inserts with NULL gvr bypass the index (SQLite treats NULLs as distinct).
+        // The constraint is enforced at the slashing-check level (check_and_record_*).
+        // Verify pubkey-scoped uniqueness via the staging API.
+        let gvr = [0u8; 32];
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        let attestation = SignedAttestation {
-            pubkey: "0x1234".to_string(),
-            source_epoch: 100,
-            target_epoch: 101,
-            signing_root: None,
-        };
+        db.check_and_record_attestation("local-vc", "0x1234", 100, 101, None, &gvr)
+            .expect("first attestation should succeed");
 
-        db.insert_attestation(&attestation).expect("first insert should succeed");
-
-        let duplicate = SignedAttestation {
-            pubkey: "0x1234".to_string(),
-            source_epoch: 99,
-            target_epoch: 101,
-            signing_root: Some("0xdifferent".to_string()),
-        };
-
-        let result = db.insert_attestation(&duplicate);
-        assert!(result.is_err());
+        // Same pubkey+target_epoch with a different signing_root must be rejected.
+        let result = db.check_and_record_attestation(
+            "local-vc",
+            "0x1234",
+            99,
+            101,
+            Some("0xdifferent".to_string()),
+            &gvr,
+        );
+        assert!(result.is_err(), "duplicate target_epoch attestation must be rejected");
     }
 
     #[test]
@@ -2118,20 +2160,25 @@ mod tests {
 
     #[test]
     fn test_block_unique_constraint() {
+        // v3: uniqueness is enforced by (pubkey, gvr, slot).
+        // Raw inserts with NULL gvr bypass the index (SQLite treats NULLs as distinct).
+        // The constraint is enforced at the slashing-check level (check_and_record_*).
+        // Verify pubkey-scoped uniqueness via the staging API.
+        let gvr = [0u8; 32];
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        let block = SignedBlock { pubkey: "0x1234".to_string(), slot: 1000, signing_root: None };
+        db.check_and_record_block("local-vc", "0x1234", 1000, None, &gvr)
+            .expect("first block should succeed");
 
-        db.insert_block(&block).expect("first insert should succeed");
-
-        let duplicate = SignedBlock {
-            pubkey: "0x1234".to_string(),
-            slot: 1000,
-            signing_root: Some("0xdifferent".to_string()),
-        };
-
-        let result = db.insert_block(&duplicate);
-        assert!(result.is_err());
+        // Same pubkey+slot with a different signing_root must be rejected.
+        let result = db.check_and_record_block(
+            "local-vc",
+            "0x1234",
+            1000,
+            Some("0xdifferent".to_string()),
+            &gvr,
+        );
+        assert!(result.is_err(), "duplicate slot block must be rejected");
     }
 
     #[test]

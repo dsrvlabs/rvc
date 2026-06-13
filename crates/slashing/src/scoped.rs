@@ -1,0 +1,225 @@
+//! Pubkey-scoped view over the shared `SlashingDb` (Issue 2.4).
+//!
+//! `PubkeyScopedDb` binds a fixed `genesis_validators_root` and uses a fixed
+//! audit CN (`"local-vc"`).  It exposes no API to key by `client_cn`, enforcing
+//! that all slashing checks are purely pubkey+gvr scoped.
+//!
+//! This replaces `bin/rvc-signer::ScopedSlashingDb` as the canonical high-level
+//! entry point.  Existing call sites in `bin/rvc-signer` are migrated in Issue 2.5;
+//! `ScopedSlashingDb` is left in place for now.
+
+use std::sync::Arc;
+
+use eth_types::{Epoch, Root, Slot};
+
+use crate::error::SlashingError;
+use crate::stage::{StagedAttestation, StagedBlock};
+use crate::SlashingDb;
+
+/// A pubkey-scoped view over the shared `SlashingDb` bound to a specific
+/// `genesis_validators_root`.
+///
+/// All signing operations use `"local-vc"` as the audit `client_cn`.  There is
+/// no API to vary the CN — pubkey+gvr is the sole uniqueness scope.
+///
+/// # Example
+/// ```ignore
+/// use std::sync::Arc;
+/// use rvc_slashing::{SlashingDb, PubkeyScopedDb};
+///
+/// let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+/// let gvr: [u8; 32] = [1u8; 32];
+/// let scoped = PubkeyScopedDb::new(Arc::clone(&db), gvr);
+/// ```
+pub struct PubkeyScopedDb {
+    db: Arc<SlashingDb>,
+    gvr: Root,
+}
+
+impl PubkeyScopedDb {
+    /// Create a new pubkey-scoped view.
+    ///
+    /// - `db`: Shared database instance.
+    /// - `gvr`: Genesis validators root for this chain.  Every signing call will
+    ///   be validated against the metadata-pinned value via the M-6 GVR check.
+    pub fn new(db: Arc<SlashingDb>, gvr: Root) -> Self {
+        Self { db, gvr }
+    }
+
+    /// Begin an immediate transaction and run the EIP-3076 block-proposal check.
+    ///
+    /// Delegates to [`SlashingDb::stage_block`] with a fixed audit CN of `"local-vc"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SlashingError::SlashableBlock` if a different signing root has
+    /// already been committed for `(pubkey, slot)` across any CN.
+    pub fn stage_block<'db>(
+        &'db self,
+        pubkey_hex: &str,
+        slot: Slot,
+        signing_root_hex: Option<String>,
+    ) -> Result<StagedBlock<'db>, SlashingError> {
+        self.db.stage_block("local-vc", pubkey_hex, slot, signing_root_hex, &self.gvr)
+    }
+
+    /// Begin an immediate transaction and run the EIP-3076 attestation check.
+    ///
+    /// Delegates to [`SlashingDb::stage_attestation`] with a fixed audit CN of `"local-vc"`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SlashingError::SlashableAttestation` if the new `(source, target)` pair
+    /// conflicts with any existing attestation for `pubkey` across any CN.
+    pub fn stage_attestation<'db>(
+        &'db self,
+        pubkey_hex: &str,
+        source_epoch: Epoch,
+        target_epoch: Epoch,
+        signing_root_hex: Option<String>,
+    ) -> Result<StagedAttestation<'db>, SlashingError> {
+        self.db.stage_attestation(
+            "local-vc",
+            pubkey_hex,
+            source_epoch,
+            target_epoch,
+            signing_root_hex,
+            &self.gvr,
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::{AttestationSlashingViolation, BlockSlashingViolation};
+
+    const PUBKEY: &str =
+        "0xabababababababababababababababababababababababababababababababababababababababababababababababababababab";
+    const GVR: Root = [1u8; 32];
+
+    fn open_scoped() -> (Arc<SlashingDb>, PubkeyScopedDb) {
+        let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory"));
+        let scoped = PubkeyScopedDb::new(Arc::clone(&db), GVR);
+        (db, scoped)
+    }
+
+    #[test]
+    fn test_stage_block_commit_succeeds() {
+        let (_db, scoped) = open_scoped();
+        scoped
+            .stage_block(PUBKEY, 100, Some("0xroot_ok".into()))
+            .expect("stage_block must succeed")
+            .commit()
+            .expect("commit must succeed");
+    }
+
+    #[test]
+    fn test_stage_block_double_proposal_rejected() {
+        let (_db, scoped) = open_scoped();
+
+        scoped
+            .stage_block(PUBKEY, 200, Some("0xroot_1".into()))
+            .expect("first stage")
+            .commit()
+            .expect("first commit");
+
+        let err = scoped
+            .stage_block(PUBKEY, 200, Some("0xroot_2".into()))
+            .expect_err("double proposal must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal {
+                    slot: 200
+                })
+            ),
+            "expected DoubleBlockProposal at slot 200, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_stage_block_discard_leaves_no_row() {
+        let (db, scoped) = open_scoped();
+        scoped.stage_block(PUBKEY, 300, Some("0xroot".into())).expect("stage").discard();
+        assert!(db.get_blocks(PUBKEY).expect("get_blocks").is_empty());
+    }
+
+    #[test]
+    fn test_stage_attestation_commit_succeeds() {
+        let (_db, scoped) = open_scoped();
+        scoped
+            .stage_attestation(PUBKEY, 5, 10, Some("0xatt_root".into()))
+            .expect("stage_attestation must succeed")
+            .commit()
+            .expect("commit must succeed");
+    }
+
+    #[test]
+    fn test_stage_attestation_double_vote_rejected() {
+        let (_db, scoped) = open_scoped();
+
+        scoped
+            .stage_attestation(PUBKEY, 1, 5, Some("0xatt_1".into()))
+            .expect("first stage")
+            .commit()
+            .expect("first commit");
+
+        let err = scoped
+            .stage_attestation(PUBKEY, 1, 5, Some("0xatt_2".into()))
+            .expect_err("double vote must be rejected");
+
+        assert!(
+            matches!(
+                err,
+                SlashingError::SlashableAttestation(AttestationSlashingViolation::DoubleVote {
+                    target_epoch: 5
+                })
+            ),
+            "expected DoubleVote at target_epoch 5, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_stage_attestation_discard_leaves_no_row() {
+        let (db, scoped) = open_scoped();
+        scoped
+            .stage_attestation(PUBKEY, 10, 20, Some("0xatt_root".into()))
+            .expect("stage")
+            .discard();
+        assert!(db.get_attestations(PUBKEY).expect("get_attestations").is_empty());
+    }
+
+    /// PubkeyScopedDb records rows with audit CN = "local-vc".
+    #[test]
+    fn test_audit_cn_is_local_vc() {
+        use rusqlite::Connection;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("audit_cn.db");
+        let db = Arc::new(SlashingDb::open(&path).expect("open file db"));
+        let scoped = PubkeyScopedDb::new(Arc::clone(&db), GVR);
+
+        scoped
+            .stage_block(PUBKEY, 400, Some("0xaudit_root".into()))
+            .expect("stage")
+            .commit()
+            .expect("commit");
+
+        drop(scoped);
+        drop(db);
+
+        let conn = Connection::open(&path).expect("direct open");
+        let cn: String = conn
+            .query_row(
+                "SELECT client_cn FROM blocks WHERE pubkey = ?1 AND slot = 400",
+                [PUBKEY],
+                |row| row.get(0),
+            )
+            .expect("block row must exist");
+
+        assert_eq!(cn, "local-vc", "audit CN must be 'local-vc'");
+    }
+}

@@ -353,8 +353,8 @@ impl SlashingDb {
             let existing: Option<Option<String>> = guard
                 .query_row(
                     "SELECT signing_root FROM blocks \
-                     WHERE client_cn = ?1 AND pubkey = ?2 AND slot = ?3",
-                    (client_cn, &pubkey, slot as i64),
+                     WHERE pubkey = ?1 AND slot = ?2",
+                    (&pubkey, slot as i64),
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -378,11 +378,9 @@ impl SlashingDb {
             }
 
             let min_slot: Option<i64> = guard
-                .query_row(
-                    "SELECT MIN(slot) FROM blocks WHERE client_cn = ?1 AND pubkey = ?2",
-                    (client_cn, &pubkey),
-                    |row| row.get(0),
-                )
+                .query_row("SELECT MIN(slot) FROM blocks WHERE pubkey = ?1", (&pubkey,), |row| {
+                    row.get(0)
+                })
                 .optional()?
                 .flatten();
 
@@ -502,10 +500,10 @@ impl SlashingDb {
                 let mut stmt = guard.prepare(
                     "SELECT source_epoch, target_epoch, signing_root \
                      FROM attestations \
-                     WHERE client_cn = ?1 AND pubkey = ?2",
+                     WHERE pubkey = ?1",
                 )?;
                 let rows = stmt
-                    .query_map((client_cn, &pubkey), |row| {
+                    .query_map((&pubkey,), |row| {
                         Ok((
                             row.get::<_, i64>(0)? as Epoch,
                             row.get::<_, i64>(1)? as Epoch,

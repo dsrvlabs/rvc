@@ -13,7 +13,9 @@
 //! becomes `(pubkey, slot)` / `(pubkey, target_epoch)` scoped.  Cross-CN
 //! conflicting-root signs for the same pubkey MUST be rejected.
 
-use rvc_slashing::{BlockSlashingViolation, AttestationSlashingViolation, SlashingDb, SlashingError};
+use rvc_slashing::{
+    AttestationSlashingViolation, BlockSlashingViolation, SlashingDb, SlashingError,
+};
 
 /// A validator pubkey shared by both CNs in all tests below.
 const PUBKEY: &str =
