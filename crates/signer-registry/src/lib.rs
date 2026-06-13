@@ -1,8 +1,13 @@
 //! Compile-time registry of every gRPC signing entry point on `rvc-signer`.
 //!
-//! DEV-ONLY (ADR-010): no production code links this crate. Consumed by the PRD M4
-//! enumeration test (Phase 2 Task 2.1) to assert every registered handler is either a
-//! non-slashable message type or routes through `SigningGate`. Empty until Phase 2.
+//! DEV-ONLY (ADR-010): this crate MUST remain a `[dev-dependencies]` entry only.
+//! Promoting it to `[dependencies]` in any production crate violates ADR-010 and
+//! will be caught by the `architecture_no_cycles` CI gate (which asserts zero
+//! workspace-internal production out-edges for `rvc-signer-registry`).
+//!
+//! Consumed by the PRD M4 enumeration test (Phase 2 Task 2.1) to assert every
+//! registered handler is either a non-slashable message type or routes through
+//! `SigningGate`.
 #![forbid(unsafe_code)]
 
 /// Class of consensus message a signing method handles.

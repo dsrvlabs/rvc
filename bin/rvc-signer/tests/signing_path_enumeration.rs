@@ -104,3 +104,18 @@ fn all_entries_use_v2_service_path() {
         );
     }
 }
+
+/// Count floor: adding a v2 signing method without a `REGISTERED_METHODS` entry fails CI.
+///
+/// Update `EXPECTED` (and add the entry in `crates/signer-registry/src/lib.rs`)
+/// when a new v2 signing method is added or an existing one is removed.
+#[test]
+fn registered_methods_count_matches_live_listener() {
+    // Update when a v2 signing method is added/removed (see crates/signer-registry/src/lib.rs).
+    const EXPECTED: usize = 10;
+    assert_eq!(
+        signer_registry::REGISTERED_METHODS.len(),
+        EXPECTED,
+        "REGISTERED_METHODS count changed: add the new method's entry or update EXPECTED"
+    );
+}

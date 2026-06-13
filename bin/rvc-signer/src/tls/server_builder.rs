@@ -34,7 +34,7 @@ use tonic::transport::Server;
 /// ```rust,ignore
 /// hardened_server_builder()
 ///     .add_service(
-///         SignerServiceServer::new(svc).max_decoding_message_size(1 << 20),
+///         SignerServiceServerV2::new(svc_v2).max_decoding_message_size(1 << 20),
 ///     )
 ///     .serve_with_shutdown(addr, shutdown_signal())
 ///     .await?;
