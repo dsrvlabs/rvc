@@ -45,7 +45,7 @@ behavior change on `develop`.
 
 | ID | Priority | Crate | One-line problem | State | RED commit | GREEN commit | Test file | Seam/trait consumed | Notes |
 |----|----------|-------|------------------|-------|------------|--------------|-----------|---------------------|-------|
-| SS-1 | P0 | `bin/rvc-signer` | v1 raw-root `sign(signing_root, pubkey)` on live listener with zero EIP-3076 consultation. | Open | | | | `eth-types::insecure::InsecureGate` (1.2); `signer-registry` (1.7) | Phase 2 / 2.1–2.2 |
+| SS-1 | P0 | `bin/rvc-signer` | v1 raw-root `sign(signing_root, pubkey)` on live listener with zero EIP-3076 consultation. | GREEN-landed | `17bf9b5` | `0b157cf`,`90f0ef9`,`ecd8d17` | `bin/rvc-signer/tests/v1_raw_root_bypass.rs`, `bin/rvc-signer/tests/signing_path_enumeration.rs` | `signer-registry` (1.7) | Phase 2 / 2.1–2.2. v1 unregistered + returns Unimplemented; M4 enumeration gate live; grpc-signer client migrated to v2 ListPublicKeys. |
 | E-1 | P0 | `crates/eth-types` | `BeaconBlock` body leaf tree-hashed as `List[byte]` not `BeaconBlockBody` container. | Open | | | | spec-vector fixtures (Phase 3) | Phase 4 / 4.1–4.2 |
 | E-2 | P0 | `crates/eth-types` | `bitlist_tree_hash_root` merkleizes to `next_power_of_two(bytes)` not chunk-count. | Open | | | | spec-vector fixtures (Phase 3) | Phase 4 / 4.3–4.4 |
 | B-1 | P0 | `crates/block-service`, `crates/beacon` | Deneb+ SSZ publish splices kzg/blob bytes into signed `SignedBeaconBlock`; wrong framing. | Open | | | | Q7 (1.9) | Phase 4 / 4.5–4.7 (cluster B-1+T-1+L-9) |
@@ -118,7 +118,7 @@ the canonical individual-finding count is **46** per PRD §5 "Finding totals".
 | Gate | Introduced | Status |
 |------|------------|--------|
 | `crates/architecture-tests/tests/architecture_no_cycles.rs` | Phase 1 / 1.6 | Live (`6ba3c4e`) |
-| `bin/rvc-signer/tests/signing_path_enumeration.rs` | Phase 2 / 2.2 (strict flip 2.13) | Pending |
+| `bin/rvc-signer/tests/signing_path_enumeration.rs` | Phase 2 / 2.2 (strict flip 2.13) | Live (`90f0ef9`); weaker invariant + count gate, strict flip pending 2.13 |
 | `crates/signer/tests/no_direct_composite_signer_outside_signer.rs` | Phase 2 / 2.10b | Pending |
 
 ---
@@ -131,3 +131,12 @@ the canonical individual-finding count is **46** per PRD §5 "Finding totals".
 | M6 (doppelganger window enforced at every entry point) | Phase 2 / 2.13 | Open |
 | M2/M3/M5/M7 (duty correctness) | Phase 4 | Open |
 | M1/M8 (all findings closed; release gate) | Phase 6 | Open |
+
+---
+
+## Discovered follow-ups (out-of-scope of their finding; tracked for later)
+
+| ID | Discovered in | Description | Disposition |
+|----|---------------|-------------|-------------|
+| FUP-1 | SS-1 review (Issue 2.2) | v2 typed sign handlers in `bin/rvc-signer/src/service.rs` never increment the Prometheus `sign_total` / `sign_duration_seconds` / `sign_errors_total` counters (these were only wired on the now-removed v1 path). Counters are registered + scraped but always zero — an observability blind spot. **Pre-existing** (v2 never recorded them); not a regression of SS-1. | Defer to a follow-up: wire metrics into the 10 v2 handlers (helper or Tower layer). Not part of SS-1 acceptance criteria. |
+| FUP-2 | SS-1 review (Issue 2.2) | v2 typed sign handlers log via `tracing::info!` with full (untruncated) pubkey hex and without the `audit=true` flag, diverging from the M-5 `audit::log_audit` path used by the (now-removed) v1 handler. SIEM rules keyed on `audit=true` miss v2 sign events. **Pre-existing.** | Defer: route v2 handlers through `audit::log_audit` (truncated pubkey, audit flag) + add a v2-side audit test. |
