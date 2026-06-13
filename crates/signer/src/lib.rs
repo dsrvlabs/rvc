@@ -3,9 +3,13 @@
 //! This module provides a signing service that ensures all validator
 //! signatures are checked against slashing protection rules before signing.
 
+mod enablement;
+mod fail_closed;
 mod traits;
 
 pub use crypto::is_aggregator;
+pub use enablement::SigningEnablement;
+pub use fail_closed::FailClosedDefault;
 pub use traits::ValidatorSigner;
 
 use std::collections::HashMap;
