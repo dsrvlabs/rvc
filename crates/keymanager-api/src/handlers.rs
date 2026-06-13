@@ -257,8 +257,11 @@ pub async fn delete_keystores(
         empty_interchange()
     } else {
         state.slashing_protection.export_interchange(&existing_keys).map_err(|e| {
+            let req_id = Uuid::new_v4();
+            let safe = escape_log_control_chars(&e);
             tracing::error!(
-                error = %e,
+                request_id = %req_id,
+                error = %safe,
                 "DELETE aborted: slashing-protection export failed; no keystores deleted"
             );
             ApiError::Internal(

@@ -341,28 +341,50 @@ impl SlashingProtection for SlashingProtectionAdapter {
     ///
     /// # Atomicity contract (ADR-008 / KM-1)
     ///
-    /// This function is all-or-nothing: either every requested key's records
-    /// are included in the returned JSON string, or `Err` is returned and no
-    /// partial interchange is emitted.  The guarantee comes from the underlying
-    /// `SlashingDb::export`, which traverses all records under a single read
-    /// path and propagates `?` on any per-pubkey DB failure — there is no code
-    /// path that returns a partial `Ok(json)` when a subset of keys could not
-    /// be read.  The caller (`delete_keystores` handler) relies on this
-    /// guarantee to abort fail-closed before any keystore deletion when this
-    /// function returns `Err`.
+    /// This function is all-or-nothing: either the interchange for every
+    /// requested key is returned, or `Err` is returned and no partial
+    /// interchange is emitted.  The underlying `SlashingDb::export` holds a
+    /// single `Mutex<Connection>` lock for the entire read — `read_all_pubkeys`,
+    /// `read_attestations`, and `read_blocks` all execute under that one held
+    /// guard — so no concurrent `record_attestation`/`record_block` write can
+    /// interleave and produce a stale snapshot.
+    ///
+    /// # Completeness (KM-1(a))
+    ///
+    /// Every requested pubkey is represented in the output.  Keys with no
+    /// slashing rows in the DB receive an explicit empty
+    /// `ValidatorRecord { signed_blocks: [], signed_attestations: [] }` so
+    /// that a re-importing node sees a clean (rather than absent) record.
     fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, String> {
         let interchange =
             self.slashing_db.export(&self.genesis_validators_root).map_err(|e| e.to_string())?;
 
-        // Filter to only requested pubkeys
+        // Build a canonical hex-string set for fast membership lookup.
         let requested: std::collections::HashSet<String> =
             pubkeys.iter().map(|pk| format!("0x{}", hex::encode(pk))).collect();
 
-        let filtered_data: Vec<_> = interchange
+        // Collect DB records for requested keys.
+        let mut filtered_data: Vec<_> = interchange
             .data
             .into_iter()
             .filter(|record| requested.contains(&record.pubkey))
             .collect();
+
+        // KM-1(a): append an explicit empty record for every requested key
+        // absent from the DB export, so the interchange covers all deleted keys.
+        // Collect the keys to add first to avoid holding a shared borrow of
+        // filtered_data while also pushing into it.
+        let exported_pubkeys: std::collections::HashSet<String> =
+            filtered_data.iter().map(|r| r.pubkey.clone()).collect();
+        let missing: Vec<String> =
+            requested.into_iter().filter(|pk| !exported_pubkeys.contains(pk)).collect();
+        for pk_hex in missing {
+            filtered_data.push(slashing::ValidatorRecord {
+                pubkey: pk_hex,
+                signed_blocks: vec![],
+                signed_attestations: vec![],
+            });
+        }
 
         let filtered =
             slashing::InterchangeFormat { metadata: interchange.metadata, data: filtered_data };

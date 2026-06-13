@@ -695,6 +695,18 @@ impl SlashingDb {
     pub fn get_attestations(&self, pubkey: &str) -> Result<Vec<SignedAttestation>, SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock();
+        Self::read_attestations(&conn, &pubkey)
+    }
+
+    /// Read attestations for `pubkey` using a caller-held `Connection`.
+    ///
+    /// Private helper used by `export` to run all reads under a single held
+    /// lock (KM-1/ADR-008 consistent-snapshot guarantee).  The public
+    /// `get_attestations` is a thin wrapper that acquires the lock itself.
+    fn read_attestations(
+        conn: &Connection,
+        pubkey: &str,
+    ) -> Result<Vec<SignedAttestation>, SlashingError> {
         let mut stmt = conn.prepare(
             "SELECT pubkey, source_epoch, target_epoch, signing_root
              FROM attestations
@@ -702,7 +714,7 @@ impl SlashingDb {
              ORDER BY target_epoch ASC",
         )?;
 
-        let rows = stmt.query_map([&pubkey], |row| {
+        let rows = stmt.query_map([pubkey], |row| {
             Ok(SignedAttestation {
                 pubkey: row.get(0)?,
                 source_epoch: row.get::<_, i64>(1)? as Epoch,
@@ -735,6 +747,15 @@ impl SlashingDb {
     pub fn get_blocks(&self, pubkey: &str) -> Result<Vec<SignedBlock>, SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock();
+        Self::read_blocks(&conn, &pubkey)
+    }
+
+    /// Read blocks for `pubkey` using a caller-held `Connection`.
+    ///
+    /// Private helper used by `export` to run all reads under a single held
+    /// lock (KM-1/ADR-008 consistent-snapshot guarantee).  The public
+    /// `get_blocks` is a thin wrapper that acquires the lock itself.
+    fn read_blocks(conn: &Connection, pubkey: &str) -> Result<Vec<SignedBlock>, SlashingError> {
         let mut stmt = conn.prepare(
             "SELECT pubkey, slot, signing_root
              FROM blocks
@@ -742,7 +763,7 @@ impl SlashingDb {
              ORDER BY slot ASC",
         )?;
 
-        let rows = stmt.query_map([&pubkey], |row| {
+        let rows = stmt.query_map([pubkey], |row| {
             Ok(SignedBlock {
                 pubkey: row.get(0)?,
                 slot: row.get::<_, i64>(1)? as u64,
@@ -869,8 +890,10 @@ impl SlashingDb {
         Ok(())
     }
 
-    fn get_all_pubkeys(&self) -> Result<Vec<String>, SlashingError> {
-        let conn = self.conn.lock();
+    /// Read all distinct pubkeys from the DB using a caller-held `Connection`.
+    ///
+    /// Private helper for `export` so the full export runs under one lock.
+    fn read_all_pubkeys(conn: &Connection) -> Result<Vec<String>, SlashingError> {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT pubkey FROM attestations
              UNION
@@ -886,17 +909,35 @@ impl SlashingDb {
         Ok(pubkeys)
     }
 
+    /// Export all slashing-protection records as an EIP-3076 interchange.
+    ///
+    /// # Consistent-snapshot guarantee (KM-1/ADR-008)
+    ///
+    /// The lock on `self.conn` is acquired ONCE and held for the entire
+    /// duration of the export — `read_all_pubkeys`, `read_attestations`, and
+    /// `read_blocks` all operate on the already-borrowed `&Connection`.
+    /// Because `parking_lot::Mutex` is NOT reentrant, calling the public
+    /// `get_all_pubkeys`/`get_attestations`/`get_blocks` methods from here
+    /// would deadlock; the private `read_*` helpers avoid re-locking.
+    ///
+    /// Holding a single lock = no concurrent `record_attestation` or
+    /// `record_block` write can interleave between the pubkey scan and the
+    /// per-pubkey row reads, so the exported interchange is an atomic,
+    /// consistent snapshot of the DB at the moment of the call.
     #[tracing::instrument(name = "rvc.slashing.db.export", skip_all)]
     pub fn export(
         &self,
         genesis_validators_root: &str,
     ) -> Result<InterchangeFormat, SlashingError> {
-        let pubkeys = self.get_all_pubkeys()?;
+        // KM-1/ADR-008: single held lock = consistent snapshot; no interleaved writes.
+        let conn = self.conn.lock();
+
+        let pubkeys = Self::read_all_pubkeys(&conn)?;
 
         let mut data = Vec::new();
         for pubkey in pubkeys {
-            let attestations = self.get_attestations(&pubkey)?;
-            let blocks = self.get_blocks(&pubkey)?;
+            let attestations = Self::read_attestations(&conn, &pubkey)?;
+            let blocks = Self::read_blocks(&conn, &pubkey)?;
 
             let signed_attestations: Vec<InterchangeAttestation> = attestations
                 .into_iter()
