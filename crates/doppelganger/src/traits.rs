@@ -22,8 +22,14 @@ pub trait LivenessChecker: Send + Sync {
     ) -> Result<Vec<ValidatorLivenessData>, DoppelgangerError>;
 }
 
-/// Abstraction for reading the last signed attestation epoch from the slashing DB.
-pub trait SlashingDbReader: Send + Sync {
+/// GVR-blind reader used exclusively by [`crate::DoppelgangerService`].
+///
+/// Returns only the most-recent target epoch (no GVR scoping).  Named
+/// `LegacySlashingHistoryReader` to distinguish it from
+/// [`slashing::SlashingDbReader`], the GVR-aware reader consumed by
+/// [`crate::ForwardWindowMachine`].  Using the wrong reader for the
+/// forward-window machine would bypass chain-identity checks.
+pub trait LegacySlashingHistoryReader: Send + Sync {
     fn last_signed_attestation_epoch(
         &self,
         pubkey: &str,

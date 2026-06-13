@@ -15,10 +15,13 @@ pub use enablement::SigningEnablement;
 pub use error::DoppelgangerError;
 pub use forward_window::ForwardWindowMachine;
 pub use service::DoppelgangerService;
-pub use state::{DoppelgangerStatus as ForwardStatus, ValidatorState};
-pub use traits::{LivenessChecker, SlashingDbReader, ValidatorLivenessData};
+pub use state::{ForwardWindowStatus, ValidatorState};
+pub use traits::{LegacySlashingHistoryReader, LivenessChecker, ValidatorLivenessData};
 
 /// Status of doppelganger detection for a validator.
+///
+/// Used by [`DoppelgangerService`].  Distinct from [`ForwardWindowStatus`],
+/// which is the 4-variant status for [`ForwardWindowMachine`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DoppelgangerStatus {
     /// Validator is safe to sign (restart-aware skip or monitoring complete).

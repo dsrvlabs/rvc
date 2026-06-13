@@ -2,10 +2,10 @@
 //!
 //! Implements the Lighthouse v5.3.0 forward-window pattern: a validator is
 //! withheld from signing for `monitoring_epochs` epochs after registration.
-//! The monitoring window closes — and signing is permitted — only at the LAST
-//! slot of `start_epoch + monitoring_epochs`.  Any unexplained `is_live`
-//! observation during the window transitions the validator to `Detected`,
-//! which permanently denies signing (fail-closed).
+//! The monitoring window closes — and signing is permitted — only at or after
+//! the LAST slot of `start_epoch + monitoring_epochs`.  Any unexplained
+//! `is_live` observation during the window transitions the validator to
+//! `Detected`, which permanently denies signing (fail-closed).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 
 use crate::enablement::SigningEnablement;
 use crate::error::DoppelgangerError;
-use crate::state::{DoppelgangerStatus, ValidatorState};
+use crate::state::{ForwardWindowStatus, ValidatorState};
 use crate::traits::ValidatorLivenessData;
 
 /// Forward-window doppelganger state machine.
@@ -45,14 +45,20 @@ impl ForwardWindowMachine {
 
     /// Register a validator for monitoring, starting at `current_epoch`.
     ///
-    /// IDEMPOTENT: calling twice for the same pubkey (regardless of epoch) does
-    /// NOT reset state.  A validator that is already `Pending`, `Safe`, or
-    /// `Detected` is left unchanged.
+    /// IDEMPOTENT: calling twice for the same pubkey does NOT reset state.  A
+    /// validator that is already `Pending`, `Safe`, or `Detected` is left
+    /// unchanged.
     ///
-    /// Restart-aware safe-skip (Layer 4): if `last_signed_attestation` returns
-    /// `Some(_)` (indicating the validator already attested within this chain's
-    /// history), the validator is transitioned straight to `Safe` without
-    /// waiting for the full monitoring window.
+    /// Restart-aware safe-skip (Layer 4): if `last_signed_attestation` returns a
+    /// target epoch that is RECENT (within the monitoring window), the validator
+    /// transitions straight to `Safe` without waiting for the full window.
+    /// A stale attestation (outside the window) does NOT trigger the skip —
+    /// mirroring `DoppelgangerService::check_validators` (service.rs:129-131).
+    ///
+    /// The recency guard `current_epoch > monitoring_epochs` prevents the
+    /// pre-genesis-clock-skew bypass (same guard as the service M-7 fix):
+    /// when `current_epoch == 0`, saturating arithmetic would make every
+    /// validator with any history look recent.
     pub fn register(&self, pubkey: &crypto::PublicKey, current_epoch: Epoch) {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let mut states = self.states.lock();
@@ -64,14 +70,18 @@ impl ForwardWindowMachine {
             }
         }
 
-        // Restart-aware safe-skip: query the slashing DB for prior attestations.
+        // Restart-aware safe-skip: only skip if the prior attestation is RECENT.
         let prior = self.slashing_reader.last_signed_attestation(&pubkey_hex, &self.gvr);
-        if prior.is_some() {
-            states.insert(pubkey_hex, ValidatorState::Safe);
-            return;
+        if let Some(target_epoch) = prior {
+            if current_epoch > self.monitoring_epochs
+                && current_epoch.saturating_sub(target_epoch) <= self.monitoring_epochs
+            {
+                states.insert(pubkey_hex, ValidatorState::Safe);
+                return;
+            }
         }
 
-        let end_epoch = current_epoch + self.monitoring_epochs;
+        let end_epoch = current_epoch.saturating_add(self.monitoring_epochs);
         states.insert(
             pubkey_hex,
             ValidatorState::Pending { start_epoch: current_epoch, end_epoch, detected_live: false },
@@ -80,25 +90,25 @@ impl ForwardWindowMachine {
 
     /// Advance the state machine by one slot tick.
     ///
-    /// A `Pending` validator transitions to `Safe` ONLY when ALL of the
-    /// following hold:
+    /// A `Pending` validator transitions to `Safe` when ALL of the following hold:
     ///
-    /// - `current_epoch == end_epoch` (the satisfaction epoch)
-    /// - `slot_in_epoch == SLOTS_PER_EPOCH - 1` (the LAST slot of that epoch)
-    /// - `detected_live == false` (no unexplained liveness observed)
+    /// - The satisfaction boundary has been reached: `current_epoch > end_epoch`,
+    ///   OR `current_epoch == end_epoch && slot_in_epoch >= SLOTS_PER_EPOCH - 1`.
+    ///   This "at-or-after" semantics means a missed tick (e.g. after a restart)
+    ///   does not leave the validator stuck `Pending` forever.
+    /// - `detected_live == false` (no unexplained liveness was observed).
     ///
     /// Returns the current status of every registered validator.
-    pub fn tick(&self, current_epoch: Epoch, slot_in_epoch: u64) -> Vec<DoppelgangerStatus> {
+    pub fn tick(&self, current_epoch: Epoch, slot_in_epoch: u64) -> Vec<ForwardWindowStatus> {
         let mut states = self.states.lock();
         let mut statuses = Vec::with_capacity(states.len());
 
         for state in states.values_mut() {
             if let ValidatorState::Pending { end_epoch, detected_live, .. } = state {
-                // Satisfy only on the exact last slot of end_epoch.
-                if current_epoch == *end_epoch
-                    && slot_in_epoch == SLOTS_PER_EPOCH - 1
-                    && !*detected_live
-                {
+                let at_boundary =
+                    current_epoch == *end_epoch && slot_in_epoch >= SLOTS_PER_EPOCH - 1;
+                let past_boundary = current_epoch > *end_epoch;
+                if (at_boundary || past_boundary) && !*detected_live {
                     *state = ValidatorState::Safe;
                 }
             }
@@ -112,19 +122,18 @@ impl ForwardWindowMachine {
     /// Record liveness observations for a given epoch.
     ///
     /// For each `ValidatorLivenessData` entry with `is_live == true`, if the
-    /// corresponding validator is `Pending`, it transitions to `Detected`
-    /// (`detected_live = true` is set before the transition so it is preserved
-    /// if the caller inspects intermediate state, though the final state is
-    /// `Detected`).
+    /// corresponding validator is `Pending` AND the observation epoch falls within
+    /// the monitoring window `[start_epoch, end_epoch]`, it transitions to
+    /// `Detected`.  Out-of-window observations (stale or future) are ignored.
     ///
     /// # D-2 (Issue 2.7)
     ///
     /// Missing-entry fail-closed behavior (absent entries treated as `is_live =
-    /// true` for Pending validators) is deferred to Issue 2.7.  Leave a marker:
+    /// true` for Pending validators) is deferred to Issue 2.7.
     // D-2 (Issue 2.7): missing-entry fail-closed lands here
     pub fn observe_liveness(
         &self,
-        _epoch: Epoch,
+        epoch: Epoch,
         samples: &[ValidatorLivenessData],
     ) -> Result<(), DoppelgangerError> {
         let mut states = self.states.lock();
@@ -136,8 +145,11 @@ impl ForwardWindowMachine {
             // The ValidatorLivenessData.index field carries the pubkey hex in
             // this machine (the caller uses pubkey_hex as the index key).
             if let Some(state) = states.get_mut(&sample.index) {
-                if let ValidatorState::Pending { detected_live, .. } = state {
-                    *detected_live = true;
+                if let ValidatorState::Pending { start_epoch, end_epoch, .. } = state {
+                    // Ignore out-of-window observations.
+                    if epoch < *start_epoch || epoch > *end_epoch {
+                        continue;
+                    }
                     *state = ValidatorState::Detected;
                 }
             }
@@ -155,21 +167,21 @@ impl ForwardWindowMachine {
     }
 
     /// Read-only status inspection for a single validator.
-    pub fn status(&self, pubkey: &crypto::PublicKey) -> DoppelgangerStatus {
+    pub fn status(&self, pubkey: &crypto::PublicKey) -> ForwardWindowStatus {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let states = self.states.lock();
         match states.get(&pubkey_hex) {
-            None => DoppelgangerStatus::Unmonitored,
+            None => ForwardWindowStatus::Unmonitored,
             Some(state) => Self::status_of(state),
         }
     }
 
-    fn status_of(state: &ValidatorState) -> DoppelgangerStatus {
+    fn status_of(state: &ValidatorState) -> ForwardWindowStatus {
         match state {
-            ValidatorState::Unmonitored => DoppelgangerStatus::Unmonitored,
-            ValidatorState::Pending { .. } => DoppelgangerStatus::Pending,
-            ValidatorState::Safe => DoppelgangerStatus::Safe,
-            ValidatorState::Detected => DoppelgangerStatus::Detected,
+            ValidatorState::Unmonitored => ForwardWindowStatus::Unmonitored,
+            ValidatorState::Pending { .. } => ForwardWindowStatus::Pending,
+            ValidatorState::Safe => ForwardWindowStatus::Safe,
+            ValidatorState::Detected => ForwardWindowStatus::Detected,
         }
     }
 }
@@ -180,6 +192,6 @@ impl SigningEnablement for ForwardWindowMachine {
     /// All other states (`Pending`, `Detected`, `Unmonitored`) return `false`
     /// (fail-closed by construction, per PRD §6.3).
     fn is_signing_enabled(&self, pubkey: &crypto::PublicKey) -> bool {
-        matches!(self.status(pubkey), DoppelgangerStatus::Safe)
+        matches!(self.status(pubkey), ForwardWindowStatus::Safe)
     }
 }

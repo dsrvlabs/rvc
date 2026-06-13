@@ -9,7 +9,7 @@ use eth_types::{Epoch, SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
 use tracing::{debug, info, warn, Instrument};
 
 use crate::error::DoppelgangerError;
-use crate::traits::{LivenessChecker, SlashingDbReader};
+use crate::traits::{LegacySlashingHistoryReader, LivenessChecker};
 use crate::{DoppelgangerResult, DoppelgangerStatus};
 
 const DEFAULT_MONITORING_EPOCHS: u64 = 2;
@@ -21,7 +21,7 @@ const DEFAULT_MONITORING_EPOCHS: u64 = 2;
 /// wall-clock steps cannot silently advance (or retract) the epoch window.
 pub struct DoppelgangerService {
     liveness_checker: Arc<dyn LivenessChecker>,
-    slashing_db: Arc<dyn SlashingDbReader>,
+    slashing_db: Arc<dyn LegacySlashingHistoryReader>,
     monitoring_epochs: u64,
     /// BN-supplied genesis time (Unix seconds).
     genesis_time: u64,
@@ -41,7 +41,7 @@ impl DoppelgangerService {
     /// adjustments.
     pub fn new(
         liveness_checker: Arc<dyn LivenessChecker>,
-        slashing_db: Arc<dyn SlashingDbReader>,
+        slashing_db: Arc<dyn LegacySlashingHistoryReader>,
         genesis_time: u64,
     ) -> Self {
         let start_unix_time =
@@ -264,7 +264,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::traits::{LivenessChecker, SlashingDbReader, ValidatorLivenessData};
+    use crate::traits::{LegacySlashingHistoryReader, LivenessChecker, ValidatorLivenessData};
     use crate::{DoppelgangerError, DoppelgangerStatus};
 
     // -- Mock implementations --
@@ -284,7 +284,7 @@ mod tests {
         }
     }
 
-    impl SlashingDbReader for MockSlashingDb {
+    impl LegacySlashingHistoryReader for MockSlashingDb {
         fn last_signed_attestation_epoch(
             &self,
             pubkey: &str,
@@ -321,7 +321,7 @@ mod tests {
 
     struct FailingSlashingDb;
 
-    impl SlashingDbReader for FailingSlashingDb {
+    impl LegacySlashingHistoryReader for FailingSlashingDb {
         fn last_signed_attestation_epoch(
             &self,
             _pubkey: &str,
@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn test_new_default_monitoring_epochs() {
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
+        let slashing_db: Arc<dyn LegacySlashingHistoryReader> = Arc::new(MockSlashingDb::new());
         let service = DoppelgangerService::new(liveness, slashing_db, 0);
         assert_eq!(service.monitoring_epochs, DEFAULT_MONITORING_EPOCHS);
     }
@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn test_with_monitoring_epochs() {
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
+        let slashing_db: Arc<dyn LegacySlashingHistoryReader> = Arc::new(MockSlashingDb::new());
         let service = DoppelgangerService::new(liveness, slashing_db, 0).with_monitoring_epochs(5);
         assert_eq!(service.monitoring_epochs, 5);
     }
@@ -433,7 +433,7 @@ mod tests {
 
     #[test]
     fn test_check_validators_empty_list() {
-        let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
+        let slashing_db: Arc<dyn LegacySlashingHistoryReader> = Arc::new(MockSlashingDb::new());
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
         let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_check_validators_slashing_db_error() {
-        let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(FailingSlashingDb);
+        let slashing_db: Arc<dyn LegacySlashingHistoryReader> = Arc::new(FailingSlashingDb);
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
         let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
@@ -500,7 +500,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_monitoring_empty_pubkeys() {
-        let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
+        let slashing_db: Arc<dyn LegacySlashingHistoryReader> = Arc::new(MockSlashingDb::new());
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
         let service = DoppelgangerService::new(liveness, slashing_db, 0);
 
@@ -733,7 +733,7 @@ mod tests {
     #[should_panic(expected = "monitoring_epochs must be >= 1")]
     fn test_with_monitoring_epochs_zero_panics() {
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
+        let slashing_db: Arc<dyn LegacySlashingHistoryReader> = Arc::new(MockSlashingDb::new());
         DoppelgangerService::new(liveness, slashing_db, 0).with_monitoring_epochs(0);
     }
 
@@ -915,12 +915,12 @@ mod tests {
         let genesis2 = genesis1 + SECONDS_PER_EPOCH * 1_000;
 
         let liveness1: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let slashing1: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
+        let slashing1: Arc<dyn LegacySlashingHistoryReader> = Arc::new(MockSlashingDb::new());
         let service1 = DoppelgangerService::new(liveness1, slashing1, genesis1)
             .with_start_time(start_instant, start_unix_time);
 
         let liveness2: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let slashing2: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
+        let slashing2: Arc<dyn LegacySlashingHistoryReader> = Arc::new(MockSlashingDb::new());
         let service2 = DoppelgangerService::new(liveness2, slashing2, genesis2)
             .with_start_time(start_instant, start_unix_time);
 
@@ -947,7 +947,7 @@ mod tests {
         let start_instant = Instant::now();
 
         let liveness: Arc<dyn LivenessChecker> = Arc::new(MockLivenessChecker::new(vec![]));
-        let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(MockSlashingDb::new());
+        let slashing_db: Arc<dyn LegacySlashingHistoryReader> = Arc::new(MockSlashingDb::new());
         let service = DoppelgangerService::new(liveness, slashing_db, genesis_time)
             .with_start_time(start_instant, start_unix);
 

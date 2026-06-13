@@ -3,6 +3,7 @@
 use eth_types::Epoch;
 
 /// Per-validator state in the forward-window doppelganger machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidatorState {
     /// Pubkey has never been registered with this machine.
     Unmonitored,
@@ -17,11 +18,16 @@ pub enum ValidatorState {
     Detected,
 }
 
-/// Observable status returned by `tick` and `status`.
+/// Observable status returned by [`ForwardWindowMachine::tick`] and
+/// [`ForwardWindowMachine::status`].
+///
+/// Named `ForwardWindowStatus` (not `DoppelgangerStatus`) to avoid confusion
+/// with the 3-variant [`crate::DoppelgangerStatus`] used by
+/// [`crate::DoppelgangerService`].
 ///
 /// `Copy` so callers can cheaply pass it around without cloning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DoppelgangerStatus {
+pub enum ForwardWindowStatus {
     /// Pubkey is unknown to this machine.
     Unmonitored,
     /// Monitoring window is active.

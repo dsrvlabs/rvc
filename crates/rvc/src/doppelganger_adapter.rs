@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use beacon::BeaconClient;
-use doppelganger::{DoppelgangerError, LivenessChecker, SlashingDbReader, ValidatorLivenessData};
+use doppelganger::{
+    DoppelgangerError, LegacySlashingHistoryReader, LivenessChecker, ValidatorLivenessData,
+};
 use eth_types::Epoch;
 use slashing::SlashingDb;
 
@@ -40,7 +42,11 @@ impl LivenessChecker for BeaconLivenessAdapter {
     }
 }
 
-/// Adapter implementing [`SlashingDbReader`] via [`SlashingDb::last_signed_attestation_epoch`].
+/// Adapter implementing [`LegacySlashingHistoryReader`] via
+/// [`SlashingDb::last_signed_attestation_epoch`].
+///
+/// Used by [`doppelganger::DoppelgangerService`] (the GVR-blind service).
+/// [`ForwardWindowMachine`] uses `slashing::SlashingDbReader` directly.
 pub struct SlashingDbReaderAdapter {
     db: Arc<SlashingDb>,
 }
@@ -51,7 +57,7 @@ impl SlashingDbReaderAdapter {
     }
 }
 
-impl SlashingDbReader for SlashingDbReaderAdapter {
+impl LegacySlashingHistoryReader for SlashingDbReaderAdapter {
     fn last_signed_attestation_epoch(
         &self,
         pubkey: &str,
