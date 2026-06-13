@@ -4,23 +4,26 @@
 //! now that `client_cn` is no longer a slashing-check discriminator (Issue 2.4).
 //! Call sites are wired in Issue 2.5; this module just lands the function and a test.
 
+use crypto::logging::TruncatedPubkey;
+
 /// Emit a structured audit record for a slashing-protection signing operation.
 ///
 /// # Arguments
 /// - `client_cn`: The mTLS Common Name of the requesting client (audit only; no
 ///   longer used as a slashing-check discriminator after Issue 2.4).
-/// - `pubkey`: Hex-encoded validator public key (may be abbreviated).
-/// - `outcome`: Human-readable outcome, e.g. `"safe"`, `"blocked"`, `"chain_swap"`.
+/// - `pubkey`: Hex-encoded validator public key.  Logged via [`TruncatedPubkey`]
+///   for consistency with all other tracing calls in this crate.
+/// - `outcome`: Human-readable outcome, e.g. `"staged"`, `"rejected"`.
 ///
 /// # Example
 /// ```
-/// rvc_slashing::audit_log("local-vc", "0xaabbcc...", "safe");
+/// rvc_slashing::audit_log("local-vc", "0xaabbcc...", "staged");
 /// ```
 pub fn audit_log(client_cn: &str, pubkey: &str, outcome: &str) {
     tracing::info!(
         target: "rvc.slashing.audit",
         client_cn,
-        pubkey,
+        pubkey = %TruncatedPubkey::new(pubkey),
         outcome,
         "slashing audit",
     );

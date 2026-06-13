@@ -67,6 +67,11 @@ impl PubkeyScopedDb {
     ) -> Result<StagedBlock<'db>, SlashingError> {
         let result = self.db.stage_block(pubkey_hex, slot, signing_root_hex, &self.gvr);
         let outcome = if result.is_ok() { "staged" } else { "rejected" };
+        // NOTE: audit_log fires at STAGE time (before commit), while the returned
+        // StagedBlock still holds the parking_lot::MutexGuard on the DB connection.
+        // A tracing subscriber that attempts to read the DB would deadlock because
+        // parking_lot mutexes are non-reentrant.  A "staged" event may therefore
+        // precede a rolled-back sign if the caller subsequently discards the guard.
         audit_log(&self.client_cn, pubkey_hex, outcome);
         result
     }
@@ -95,6 +100,9 @@ impl PubkeyScopedDb {
             &self.gvr,
         );
         let outcome = if result.is_ok() { "staged" } else { "rejected" };
+        // NOTE: same timing caveat as stage_block — fires at STAGE time while the
+        // StagedAttestation guard holds the DB mutex.  A "staged" event may precede
+        // a rolled-back sign.  Do not install a tracing subscriber that reads the DB.
         audit_log(&self.client_cn, pubkey_hex, outcome);
         result
     }

@@ -68,7 +68,8 @@ use std::sync::atomic::Ordering;
 /// Fixed audit origin written to the `client_cn` column on INSERT.
 ///
 /// Per-CN audit visibility now flows through [`crate::audit_log`] instead.
-const AUDIT_ORIGIN: &str = "local-vc";
+/// `pub(crate)` so `db.rs` can use the same constant for `check_and_record_*`.
+pub(crate) const AUDIT_ORIGIN: &str = "local-vc";
 
 /// Result of the EIP-3076 violation check for a staged block.
 ///

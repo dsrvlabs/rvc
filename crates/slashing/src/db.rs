@@ -1234,15 +1234,19 @@ impl SlashingDb {
     /// transaction with `IMMEDIATE` locking to prevent TOCTOU races.
     ///
     /// # Arguments
-    /// - `client_cn`: Per-client namespace. Use `"local-vc"` for VC-side writes.
-    ///   `"__legacy__"` is reserved for pre-migration rows only.
+    /// - `_client_cn`: Accepted for call-site compatibility with the EIP-3076
+    ///   conformance/test harness but **not written to the audit column**.
+    ///   All rows inserted by this method carry [`crate::stage::AUDIT_ORIGIN`]
+    ///   (`"local-vc"`) in the `client_cn` column, enforcing the post-2.5
+    ///   invariant that every new row is canonical.  Per-CN audit visibility is
+    ///   via [`crate::audit_log`] in [`crate::PubkeyScopedDb`].
     /// - `gvr`: Genesis validators root for this signing operation.  Compared
     ///   against `metadata.genesis_validators_root` (M-6 / ISSUE-3.5).
     ///   On mismatch, `Err(SlashingError::GenesisRootMismatch)` is returned.
     #[tracing::instrument(name = "rvc.slashing.db.block", skip_all, fields(rvc.slashing.result))]
     pub fn check_and_record_block(
         &self,
-        client_cn: &str,
+        _client_cn: &str,
         pubkey: &str,
         slot: Slot,
         signing_root: Option<String>,
@@ -1353,7 +1357,7 @@ impl SlashingDb {
         tx.execute(
             "INSERT INTO blocks (client_cn, pubkey, slot, signing_root, genesis_validators_root)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            (client_cn, &pubkey, slot as i64, &signing_root, &gvr_hex),
+            (crate::stage::AUDIT_ORIGIN, &pubkey, slot as i64, &signing_root, &gvr_hex),
         )?;
 
         tx.commit()?;
@@ -1392,8 +1396,12 @@ impl SlashingDb {
     /// Atomically check and record an attestation.
     ///
     /// # Arguments
-    /// - `client_cn`: Per-client namespace. Use `"local-vc"` for VC-side writes.
-    ///   `"__legacy__"` is reserved for pre-migration rows only.
+    /// - `_client_cn`: Accepted for call-site compatibility with the EIP-3076
+    ///   conformance/test harness but **not written to the audit column**.
+    ///   All rows inserted by this method carry [`crate::stage::AUDIT_ORIGIN`]
+    ///   (`"local-vc"`) in the `client_cn` column, enforcing the post-2.5
+    ///   invariant that every new row is canonical.  Per-CN audit visibility is
+    ///   via [`crate::audit_log`] in [`crate::PubkeyScopedDb`].
     /// - `gvr`: Genesis validators root for this signing operation.  Compared
     ///   against `metadata.genesis_validators_root` (M-6 / ISSUE-3.5).
     ///   On mismatch, `Err(SlashingError::GenesisRootMismatch)` is returned.
@@ -1419,7 +1427,7 @@ impl SlashingDb {
     #[tracing::instrument(name = "rvc.slashing.db.attestation", skip_all, fields(rvc.slashing.result))]
     pub fn check_and_record_attestation(
         &self,
-        client_cn: &str,
+        _client_cn: &str,
         pubkey: &str,
         source_epoch: Epoch,
         target_epoch: Epoch,
@@ -1613,7 +1621,14 @@ impl SlashingDb {
                 "INSERT INTO attestations
                  (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                (client_cn, &pubkey, source_epoch as i64, target_epoch as i64, &signing_root, &gvr_hex),
+                (
+                    crate::stage::AUDIT_ORIGIN,
+                    &pubkey,
+                    source_epoch as i64,
+                    target_epoch as i64,
+                    &signing_root,
+                    &gvr_hex,
+                ),
             )?;
         }
 
@@ -5115,6 +5130,95 @@ mod edge_case_tests {
             0o600,
             "DB file should have 0o600 permissions, got {:o}",
             mode & 0o777
+        );
+    }
+
+    /// Post-2.5 invariant: every new row written by `check_and_record_block`,
+    /// `check_and_record_attestation`, AND the `PubkeyScopedDb`/`stage_*` path
+    /// carries `AUDIT_ORIGIN` (`"local-vc"`) in the `client_cn` column, regardless
+    /// of the `_client_cn` argument supplied by the caller.
+    ///
+    /// This pins the guarantee that the DB column is always canonical, so a future
+    /// reader querying `SELECT client_cn …` sees a predictable value.
+    #[test]
+    fn test_new_rows_store_audit_origin() {
+        use rusqlite::Connection;
+        use tempfile::tempdir;
+
+        const PUBKEY_BLOCK: &str =
+            "0xabababababababababababababababababababababababababababababababababababababababababababababababababababab";
+        const PUBKEY_ATT: &str =
+            "0xcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        const GVR: [u8; 32] = [0u8; 32];
+
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("audit_origin.db");
+        let db = SlashingDb::open(&path).expect("open file db");
+
+        // check_and_record_block: caller passes arbitrary CN, row must carry AUDIT_ORIGIN.
+        db.check_and_record_block(
+            "arbitrary-caller-cn",
+            PUBKEY_BLOCK,
+            500,
+            Some("0xblockroot".to_string()),
+            &GVR,
+        )
+        .expect("check_and_record_block must succeed");
+
+        // check_and_record_attestation: same invariant.
+        db.check_and_record_attestation(
+            "another-arbitrary-cn",
+            PUBKEY_ATT,
+            10,
+            20,
+            Some("0xattroot".to_string()),
+            &GVR,
+        )
+        .expect("check_and_record_attestation must succeed");
+
+        // stage_block via PubkeyScopedDb (the RAII path).
+        {
+            use crate::PubkeyScopedDb;
+            use std::sync::Arc;
+            let db_arc = Arc::new(SlashingDb::open(&path).expect("open for scoped"));
+            let scoped = PubkeyScopedDb::new(Arc::clone(&db_arc), "peer-dvt-x".to_string(), GVR);
+            scoped
+                .stage_block(PUBKEY_BLOCK, 501, Some("0xscopedroot".to_string()))
+                .expect("scoped stage_block must succeed")
+                .commit()
+                .expect("commit");
+        }
+
+        drop(db);
+
+        // Inspect the rows directly to confirm all client_cn values = AUDIT_ORIGIN.
+        let conn = Connection::open(&path).expect("direct open");
+
+        let block_cns: Vec<String> = {
+            let mut stmt =
+                conn.prepare("SELECT client_cn FROM blocks ORDER BY slot").expect("prepare");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect")
+        };
+
+        assert!(
+            block_cns.iter().all(|cn| cn == crate::stage::AUDIT_ORIGIN),
+            "all block rows must carry AUDIT_ORIGIN; got: {block_cns:?}"
+        );
+
+        let att_cns: Vec<String> = {
+            let mut stmt = conn.prepare("SELECT client_cn FROM attestations").expect("prepare");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect")
+        };
+
+        assert!(
+            att_cns.iter().all(|cn| cn == crate::stage::AUDIT_ORIGIN),
+            "all attestation rows must carry AUDIT_ORIGIN; got: {att_cns:?}"
         );
     }
 }
