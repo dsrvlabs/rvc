@@ -4386,6 +4386,7 @@ dependencies = [
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-grpc-signer",
+ "rvc-signer-registry",
  "rvc-slashing",
  "serde",
  "serde_json",
