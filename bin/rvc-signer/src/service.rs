@@ -61,7 +61,6 @@
 //! spawns is also `Send`, which is what `Handle::block_on` requires.
 
 use std::sync::Arc;
-use std::time::Instant;
 
 use tonic::{Request, Response, Status};
 use tracing::Span;
@@ -227,108 +226,36 @@ fn root_hex(root: &[u8; 32]) -> String {
 }
 
 // ────────────���────────────────────────���───────────────────────────────────────
-// V1 SignerService impl (DEPRECATED — kept until ISSUE-1.8)
-// ────────────────────────────────────────────���────────────────────────────────
+// V1 SignerService impl — SS-1 FIX (Issue 2.2)
+// ─────────────────────────────────────────────────────────────────────────────
+// The v1 raw-root `sign(signing_root, pubkey)` path has been removed from the
+// live listener (see `main.rs`).  Per ADR-010, the trait impl is kept compiled
+// so the proto types remain usable for a future separately-bound, off-by-default
+// insecure listener that would require `eth_types::insecure::InsecureGate::Allow`
+// (NOT implemented here).  All methods return `Unimplemented` so any accidental
+// call produces a clear diagnostic rather than silent misbehavior.
+//
+// SS-1: v1 raw-root sign bypass — removed in Issue 2.2.
+// ─────────────────────────────────────────────────────────────────────────────
 
 #[tonic::async_trait]
 impl SignerService for SignerServiceImpl {
-    #[tracing::instrument(name = "rvc.signer.sign", skip_all, fields(pubkey))]
-    async fn sign(&self, request: Request<SignRequest>) -> Result<Response<SignResponse>, Status> {
-        let client_cn = audit::extract_client_cn(&request);
-        let req = request.into_inner();
-
-        if req.signing_root.len() != 32 {
-            return Err(Status::invalid_argument(format!(
-                "signing_root must be 32 bytes, got {}",
-                req.signing_root.len()
-            )));
-        }
-
-        if req.pubkey.len() != 48 {
-            return Err(Status::invalid_argument(format!(
-                "pubkey must be 48 bytes, got {}",
-                req.pubkey.len()
-            )));
-        }
-
-        let pubkey_hex_str = format!("0x{}", hex::encode(&req.pubkey));
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
-
-        let signing_root: [u8; 32] = req.signing_root.try_into().expect("length already validated");
-        let pubkey: [u8; 48] = req.pubkey.try_into().expect("length already validated");
-
-        let start = Instant::now();
-        let result = self.backend.sign(&signing_root, &pubkey).await;
-        let elapsed = start.elapsed();
-
-        if let Some(ref m) = self.metrics {
-            m.sign_duration_seconds
-                .with_label_values(&[&self.backend_name])
-                .observe(elapsed.as_secs_f64());
-        }
-
-        let (grpc_result, audit_result) = match result {
-            Ok(signature) => {
-                if let Some(ref m) = self.metrics {
-                    m.sign_total.with_label_values(&[self.backend_name.as_str(), "success"]).inc();
-                }
-                (
-                    Ok(Response::new(SignResponse { signature: signature.to_vec() })),
-                    "success".to_string(),
-                )
-            }
-            Err(ref e) => {
-                if let Some(ref m) = self.metrics {
-                    m.sign_total.with_label_values(&[self.backend_name.as_str(), "error"]).inc();
-                    let error_type = crate::metrics::classify_error(e);
-                    m.sign_errors_total
-                        .with_label_values(&[self.backend_name.as_str(), error_type])
-                        .inc();
-                }
-                let (status, audit_result) = match e {
-                    crate::backend::SigningBackendError::KeyNotFound(_) => {
-                        (Status::not_found("unknown public key"), "key_not_found".to_string())
-                    }
-                    _ => {
-                        tracing::error!(error = %e, "signing backend error");
-                        (Status::internal("internal signing error"), "error".to_string())
-                    }
-                };
-                (Err(status), audit_result)
-            }
-        };
-
-        audit::log_audit(&audit::AuditEntry {
-            timestamp: audit::now_rfc3339(),
-            pubkey_hex: pubkey_hex_str,
-            client_cn,
-            backend: self.backend_name.clone(),
-            result: audit_result,
-            duration_ms: elapsed.as_millis() as u64,
-            rpc: Some("sign".to_string()),
-        });
-
-        grpc_result
+    async fn sign(&self, _request: Request<SignRequest>) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("v1 raw-root signing has been removed; use the v2 typed RPCs."))
     }
 
     async fn list_public_keys(
         &self,
         _request: Request<ListPublicKeysRequest>,
     ) -> Result<Response<ListPublicKeysResponse>, Status> {
-        let pubkeys = self.backend.public_keys().into_iter().map(|pk| pk.to_vec()).collect();
-        Ok(Response::new(ListPublicKeysResponse { pubkeys }))
+        Err(Status::unimplemented("v1 list_public_keys has been removed; use the v2 typed RPCs."))
     }
 
     async fn get_status(
         &self,
         _request: Request<GetStatusRequest>,
     ) -> Result<Response<GetStatusResponse>, Status> {
-        let key_count = self.backend.public_keys().len() as u32;
-        Ok(Response::new(GetStatusResponse {
-            ready: true,
-            backend: self.backend_name.clone(),
-            key_count,
-        }))
+        Err(Status::unimplemented("v1 get_status has been removed; use the v2 typed RPCs."))
     }
 }
 
@@ -1190,44 +1117,50 @@ mod tests {
         }
     }
 
-    // --- V1 tests (preserved) ---
+    // --- V1 tests — updated for SS-1 fix (Issue 2.2) ---
+    // All v1 methods now return Unimplemented; previous assertions for Ok /
+    // NotFound / InvalidArgument are replaced with Unimplemented checks.
 
     #[tokio::test]
-    async fn test_sign_valid_request() {
+    async fn test_sign_returns_unimplemented() {
+        // Previously asserted Ok(signature); now asserts Unimplemented (SS-1 fix).
         let pubkey = [1u8; 48];
         let svc = make_service(MockBackend::new(vec![pubkey]));
 
         let req =
             Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: pubkey.to_vec() });
-        let resp = svc.sign(req).await.unwrap();
-        assert_eq!(resp.into_inner().signature.len(), 96);
+        let err = svc.sign(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 
     #[tokio::test]
-    async fn test_sign_unknown_key_returns_not_found() {
+    async fn test_sign_unknown_key_returns_unimplemented() {
+        // Previously asserted NotFound; now asserts Unimplemented (SS-1 fix).
         let svc = make_service(MockBackend::new(vec![[1u8; 48]]));
 
         let req = Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: vec![2u8; 48] });
         let err = svc.sign(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::NotFound);
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 
     #[tokio::test]
-    async fn test_sign_invalid_signing_root_length() {
+    async fn test_sign_invalid_signing_root_returns_unimplemented() {
+        // Previously asserted InvalidArgument; now asserts Unimplemented (SS-1 fix).
         let svc = make_service(MockBackend::empty());
 
         let req = Request::new(SignRequest { signing_root: vec![0u8; 16], pubkey: vec![1u8; 48] });
         let err = svc.sign(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 
     #[tokio::test]
-    async fn test_sign_invalid_pubkey_length() {
+    async fn test_sign_invalid_pubkey_returns_unimplemented() {
+        // Previously asserted InvalidArgument; now asserts Unimplemented (SS-1 fix).
         let svc = make_service(MockBackend::empty());
 
         let req = Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: vec![1u8; 32] });
         let err = svc.sign(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 
     // --- V2 tests ---
@@ -1437,7 +1370,10 @@ mod tests {
         assert_eq!(status.key_count, 3);
     }
 
-    // --- Metrics (v1) ---
+    // --- Metrics (v1) — updated for SS-1 fix (Issue 2.2) ---
+    // The v1 `sign` method no longer drives backend calls so sign_total / sign_errors_total
+    // counters are no longer incremented by v1.  The tests are repurposed to confirm
+    // the Unimplemented path and that the counters remain at zero (no phantom increments).
 
     fn make_service_with_metrics(backend: MockBackend) -> (SignerServiceImpl, Arc<SignerMetrics>) {
         let metrics = Arc::new(SignerMetrics::new());
@@ -1447,28 +1383,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sign_success_increments_counter() {
+    async fn test_v1_sign_returns_unimplemented_no_counter_increment() {
+        // Previously asserted sign_total counter incremented on success.
+        // After SS-1 fix: Unimplemented is returned immediately and no counter is touched.
         let pubkey = [1u8; 48];
         let (svc, metrics) = make_service_with_metrics(MockBackend::new(vec![pubkey]));
 
         let req =
             Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: pubkey.to_vec() });
-        svc.sign(req).await.unwrap();
-
-        assert_eq!(metrics.sign_total.with_label_values(&["basic", "success"]).get(), 1);
+        let err = svc.sign(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert_eq!(metrics.sign_total.with_label_values(&["basic", "success"]).get(), 0);
     }
 
     #[tokio::test]
-    async fn test_sign_error_increments_error_counter() {
+    async fn test_v1_sign_error_returns_unimplemented_no_error_counter() {
+        // Previously asserted error counters incremented on KeyNotFound.
+        // After SS-1 fix: Unimplemented is returned immediately and no counter is touched.
         let (svc, metrics) = make_service_with_metrics(MockBackend::new(vec![[1u8; 48]]));
 
         let req = Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: vec![2u8; 48] });
-        let _ = svc.sign(req).await;
-
-        assert_eq!(metrics.sign_total.with_label_values(&["basic", "error"]).get(), 1);
+        let err = svc.sign(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert_eq!(metrics.sign_total.with_label_values(&["basic", "error"]).get(), 0);
         assert_eq!(
             metrics.sign_errors_total.with_label_values(&["basic", "key_not_found"]).get(),
-            1
+            0
         );
     }
 }
