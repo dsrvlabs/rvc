@@ -20,4 +20,4 @@ tree_hash_derive.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-tracing-test = { version = "0.2", features = ["no-env-filter"] }
+tracing-test = { workspace = true, features = ["no-env-filter"] }

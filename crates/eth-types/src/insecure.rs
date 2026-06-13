@@ -10,15 +10,16 @@
 //! ```rust
 //! use rvc_eth_types::insecure::{evaluate, from_env, Decision, InsecureGate};
 //!
-//! let gate = from_env("MY_INSECURE_VAR", InsecureGate::Refuse);
-//! match evaluate(gate, true, "plaintext key material detected") {
-//!     Decision::Abort { reason } => eprintln!("aborted: {reason}"),
-//!     Decision::ProceedWithWarning { reason } => eprintln!("warning: {reason}"),
-//!     Decision::Proceed => {}
+//! fn perform_operation(gate: InsecureGate) -> Result<(), &'static str> {
+//!     match evaluate(gate, true, "plaintext key material detected") {
+//!         Decision::Abort { reason } => Err(reason),
+//!         Decision::ProceedWithWarning { .. } | Decision::Proceed => Ok(()),
+//!     }
 //! }
 //! ```
 
 /// Controls what happens when an insecure operation is attempted.
+#[must_use = "InsecureGate is a security decision and must be passed to evaluate()"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsecureGate {
     /// Abort the operation; return an error to the caller.
@@ -30,6 +31,11 @@ pub enum InsecureGate {
 }
 
 /// The outcome returned by [`evaluate`].
+///
+/// `reason` is `&'static str` so that every reason string is a grep-stable,
+/// compile-time constant — consumers can search the source for exact strings
+/// without worrying about runtime formatting.
+#[must_use = "Decision must be matched; dropping it allows the insecure operation to proceed"]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     /// The operation may proceed without any concern.
@@ -50,6 +56,10 @@ pub enum Decision {
 /// - [`InsecureGate::Refuse`] → [`Decision::Abort`]
 /// - [`InsecureGate::Warn`]   → [`Decision::ProceedWithWarning`] (and emits `tracing::warn!`)
 /// - [`InsecureGate::Allow`]  → [`Decision::Proceed`]
+///
+/// `reason` is `&'static str` so that every reason string is a grep-stable,
+/// compile-time constant — no heap allocation on hot bind paths.
+#[must_use = "Decision must be matched; dropping it allows the insecure operation to proceed"]
 pub fn evaluate(gate: InsecureGate, condition_is_insecure: bool, reason: &'static str) -> Decision {
     if !condition_is_insecure {
         return Decision::Proceed;
@@ -72,8 +82,10 @@ pub fn evaluate(gate: InsecureGate, condition_is_insecure: bool, reason: &'stati
 /// | `"false"`                | [`InsecureGate::Refuse`]    |
 /// | unset or unrecognised    | `default`                   |
 ///
-/// Unrecognised non-empty values fall back to `default` — the safe choice,
-/// because silently allowing an insecure operation on a typo would be worse.
+/// Unrecognised non-empty values (including `""`, `"1"`, `"0"`, whitespace-
+/// padded strings) fall back to `default` — the safe choice, because silently
+/// allowing an insecure operation on a typo would be worse than refusing it.
+#[must_use = "the gate setting must be inspected before performing any insecure operation"]
 pub fn from_env(var: &str, default: InsecureGate) -> InsecureGate {
     match std::env::var(var) {
         Ok(val) => match val.to_ascii_lowercase().as_str() {
