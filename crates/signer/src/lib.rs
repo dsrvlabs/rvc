@@ -1396,7 +1396,10 @@ mod tests {
         let pubkey = secret_key.public_key();
         let pubkey_hex = hex::encode(pubkey.to_bytes());
 
-        slashing_db.record_attestation(&pubkey_hex, 100, 101, None).expect("record should succeed");
+        let gvr = [0xaau8; 32]; // test gvr matching genesis_root below
+        slashing_db
+            .record_attestation(&pubkey_hex, 100, 101, None, &gvr)
+            .expect("record should succeed");
 
         let signer = create_empty_composite_signer();
         let service = SignerService::new(signer, slashing_db);

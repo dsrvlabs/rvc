@@ -263,14 +263,15 @@ impl SlashingDb {
         };
         // Create tables (v2-native layout).
         db.migrate()?;
-        // Create CN-scoped unique indexes and set schema_version = 2.
+        // Set schema_version = 2 (CN-keyed indices are created transiently here
+        // and immediately replaced by migrate_to_v3 below).
         // No backup is taken for in-memory DBs.
         {
             let mut conn = db.conn.lock();
             Self::run_v2_migration_transaction(&mut conn)
                 .map_err(|e| SlashingError::MigrationFailed(format!("{e}")))?;
         }
-        // Migrate to v3: pubkey-scoped indices.
+        // Migrate to v3: replace CN-keyed indices with pubkey+gvr-scoped indices.
         db.migrate_to_v3()?;
         Ok(db)
     }
@@ -672,22 +673,31 @@ impl SlashingDb {
         Ok(())
     }
 
-    /// Insert a signed attestation record.
+    /// Insert a signed attestation record (test helper).
+    ///
+    /// Every row must carry a non-NULL `genesis_validators_root` so that the v3
+    /// unique index `(pubkey, genesis_validators_root, target_epoch)` can enforce
+    /// per-pubkey uniqueness.  SQLite treats NULL as DISTINCT from all values,
+    /// including other NULLs, so a NULL gvr would silently bypass the index.
     #[cfg(test)]
     pub(crate) fn insert_attestation(
         &self,
         attestation: &SignedAttestation,
+        gvr: &Root,
     ) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(&attestation.pubkey);
+        let gvr_hex = Self::root_to_hex(gvr);
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO attestations (client_cn, pubkey, source_epoch, target_epoch, signing_root)
-             VALUES ('local-vc', ?1, ?2, ?3, ?4)",
+            "INSERT INTO attestations \
+             (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root)
+             VALUES ('local-vc', ?1, ?2, ?3, ?4, ?5)",
             (
                 &pubkey,
                 attestation.source_epoch as i64,
                 attestation.target_epoch as i64,
                 &attestation.signing_root,
+                &gvr_hex,
             ),
         )?;
         Ok(())
@@ -699,25 +709,32 @@ impl SlashingDb {
     /// the operation silently succeeds without modifying the existing record.
     /// This makes the operation safe to retry.
     ///
-    /// Idempotency is checked by `(pubkey, target_epoch)` so that the v3 pubkey-scoped
-    /// unique index (which also includes `genesis_validators_root`) does not admit
-    /// duplicate rows when gvr is NULL.
+    /// Every row carries a non-NULL `genesis_validators_root`.  The v3 unique index
+    /// `(pubkey, genesis_validators_root, target_epoch)` only fires for non-NULL gvr
+    /// values — SQLite treats NULL as DISTINCT, so a NULL gvr would bypass the
+    /// index entirely.  Callers must supply the chain's pinned GVR.
+    ///
+    /// Idempotency is checked by `(pubkey, target_epoch)` — this is safe because the
+    /// DB is single-chain: every row for a given pubkey has the same gvr.
     pub fn record_attestation(
         &self,
         pubkey: &str,
         source_epoch: Epoch,
         target_epoch: Epoch,
         signing_root: Option<String>,
+        gvr: &Root,
     ) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
+        let gvr_hex = Self::root_to_hex(gvr);
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO attestations (client_cn, pubkey, source_epoch, target_epoch, signing_root)
-             SELECT 'local-vc', ?1, ?2, ?3, ?4
+            "INSERT INTO attestations \
+             (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root)
+             SELECT 'local-vc', ?1, ?2, ?3, ?4, ?5
              WHERE NOT EXISTS (
                  SELECT 1 FROM attestations WHERE pubkey = ?1 AND target_epoch = ?3
              )",
-            (&pubkey, source_epoch as i64, target_epoch as i64, &signing_root),
+            (&pubkey, source_epoch as i64, target_epoch as i64, &signing_root, &gvr_hex),
         )?;
         Ok(())
     }
@@ -761,15 +778,25 @@ impl SlashingDb {
         Ok(attestations)
     }
 
-    /// Insert a signed block record.
+    /// Insert a signed block record (test helper).
+    ///
+    /// Every row must carry a non-NULL `genesis_validators_root` so that the v3
+    /// unique index `(pubkey, genesis_validators_root, slot)` can enforce uniqueness.
+    /// SQLite treats NULL as DISTINCT from all values including other NULLs, so a
+    /// NULL gvr would silently bypass the index.
     #[cfg(test)]
-    pub(crate) fn insert_block(&self, block: &SignedBlock) -> Result<(), SlashingError> {
+    pub(crate) fn insert_block(
+        &self,
+        block: &SignedBlock,
+        gvr: &Root,
+    ) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(&block.pubkey);
+        let gvr_hex = Self::root_to_hex(gvr);
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO blocks (client_cn, pubkey, slot, signing_root)
-             VALUES ('local-vc', ?1, ?2, ?3)",
-            (&pubkey, block.slot as i64, &block.signing_root),
+            "INSERT INTO blocks (client_cn, pubkey, slot, signing_root, genesis_validators_root)
+             VALUES ('local-vc', ?1, ?2, ?3, ?4)",
+            (&pubkey, block.slot as i64, &block.signing_root, &gvr_hex),
         )?;
         Ok(())
     }
@@ -1026,6 +1053,13 @@ impl SlashingDb {
             });
         }
 
+        // The gvr is already validated above against interchange.metadata.genesis_validators_root.
+        // Store it as a hex string to write into every inserted row.  Every row must carry a
+        // non-NULL genesis_validators_root so the v3 unique index
+        // (pubkey, genesis_validators_root, slot/target_epoch) actually fires — SQLite treats
+        // NULL as DISTINCT from all values, so a NULL gvr bypasses the index silently.
+        let gvr_hex = expected_genesis_validators_root.to_owned();
+
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -1048,12 +1082,19 @@ impl SlashingDb {
                 })?;
 
                 tx.execute(
-                    "INSERT INTO attestations (client_cn, pubkey, source_epoch, target_epoch, signing_root)
-                     SELECT 'local-vc', ?1, ?2, ?3, ?4
+                    "INSERT INTO attestations \
+                     (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root)
+                     SELECT 'local-vc', ?1, ?2, ?3, ?4, ?5
                      WHERE NOT EXISTS (
                          SELECT 1 FROM attestations WHERE pubkey = ?1 AND target_epoch = ?3
                      )",
-                    (&pubkey, source_epoch as i64, target_epoch as i64, &attestation.signing_root),
+                    (
+                        &pubkey,
+                        source_epoch as i64,
+                        target_epoch as i64,
+                        &attestation.signing_root,
+                        &gvr_hex,
+                    ),
                 )?;
             }
 
@@ -1063,12 +1104,13 @@ impl SlashingDb {
                 })?;
 
                 tx.execute(
-                    "INSERT INTO blocks (client_cn, pubkey, slot, signing_root)
-                     SELECT 'local-vc', ?1, ?2, ?3
+                    "INSERT INTO blocks \
+                     (client_cn, pubkey, slot, signing_root, genesis_validators_root)
+                     SELECT 'local-vc', ?1, ?2, ?3, ?4
                      WHERE NOT EXISTS (
                          SELECT 1 FROM blocks WHERE pubkey = ?1 AND slot = ?2
                      )",
-                    (&pubkey, slot as i64, &block.signing_root),
+                    (&pubkey, slot as i64, &block.signing_root, &gvr_hex),
                 )?;
             }
         }
@@ -1088,24 +1130,30 @@ impl SlashingDb {
     /// If a block with the same pubkey and slot already exists,
     /// the operation silently succeeds without modifying the existing record.
     ///
-    /// Idempotency is checked by `(pubkey, slot)` so that the v3 pubkey-scoped
-    /// unique index (which also includes `genesis_validators_root`) does not admit
-    /// duplicate rows when gvr is NULL.
+    /// Every row carries a non-NULL `genesis_validators_root`.  The v3 unique index
+    /// `(pubkey, genesis_validators_root, slot)` only fires for non-NULL gvr values —
+    /// SQLite treats NULL as DISTINCT, so a NULL gvr would bypass the index entirely.
+    /// Callers must supply the chain's pinned GVR.
+    ///
+    /// Idempotency is checked by `(pubkey, slot)` — safe because the DB is
+    /// single-chain: every row for a given pubkey has the same gvr.
     pub fn record_block(
         &self,
         pubkey: &str,
         slot: Slot,
         signing_root: Option<String>,
+        gvr: &Root,
     ) -> Result<(), SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
+        let gvr_hex = Self::root_to_hex(gvr);
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO blocks (client_cn, pubkey, slot, signing_root)
-             SELECT 'local-vc', ?1, ?2, ?3
+            "INSERT INTO blocks (client_cn, pubkey, slot, signing_root, genesis_validators_root)
+             SELECT 'local-vc', ?1, ?2, ?3, ?4
              WHERE NOT EXISTS (
                  SELECT 1 FROM blocks WHERE pubkey = ?1 AND slot = ?2
              )",
-            (&pubkey, slot as i64, &signing_root),
+            (&pubkey, slot as i64, &signing_root, &gvr_hex),
         )?;
         Ok(())
     }
@@ -1541,7 +1589,7 @@ impl SlashingDb {
         }
 
         if !is_duplicate {
-            // Check target epoch is not below minimum existing target (CN-scoped)
+            // Check target epoch is not below minimum existing target (pubkey-scoped).
             let min_target = existing.iter().map(|(_, t, _)| *t).min();
             if let Some(min) = min_target {
                 if target_epoch < min {
@@ -1965,6 +2013,11 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Zero GVR used as a test sentinel.  No GVR is pinned in metadata for these
+    /// unit tests, so the M-6 per-call GVR check is skipped and this value is
+    /// only written into the row's `genesis_validators_root` column.
+    const TEST_GVR: Root = [0u8; 32];
+
     #[test]
     fn test_open_in_memory_database() {
         let db = SlashingDb::open_in_memory();
@@ -2015,7 +2068,7 @@ mod tests {
             signing_root: Some("0xabcd".to_string()),
         };
 
-        db.insert_attestation(&attestation).expect("failed to insert");
+        db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
 
         let attestations = db.get_attestations("0x1234").expect("failed to get");
         assert_eq!(attestations.len(), 1);
@@ -2033,7 +2086,7 @@ mod tests {
             signing_root: None,
         };
 
-        db.insert_attestation(&attestation).expect("failed to insert");
+        db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
 
         let attestations = db.get_attestations("0x1234").expect("failed to get");
         assert_eq!(attestations.len(), 1);
@@ -2068,7 +2121,7 @@ mod tests {
         ];
 
         for a in &attestations {
-            db.insert_attestation(a).expect("failed to insert");
+            db.insert_attestation(a, &TEST_GVR).expect("failed to insert");
         }
 
         let result = db.get_attestations("0x1234").expect("failed to get");
@@ -2111,7 +2164,7 @@ mod tests {
             signing_root: Some("0xabcd".to_string()),
         };
 
-        db.insert_block(&block).expect("failed to insert");
+        db.insert_block(&block, &TEST_GVR).expect("failed to insert");
 
         let blocks = db.get_blocks("0x1234").expect("failed to get");
         assert_eq!(blocks.len(), 1);
@@ -2124,7 +2177,7 @@ mod tests {
 
         let block = SignedBlock { pubkey: "0x1234".to_string(), slot: 1000, signing_root: None };
 
-        db.insert_block(&block).expect("failed to insert");
+        db.insert_block(&block, &TEST_GVR).expect("failed to insert");
 
         let blocks = db.get_blocks("0x1234").expect("failed to get");
         assert_eq!(blocks.len(), 1);
@@ -2149,7 +2202,7 @@ mod tests {
         ];
 
         for b in &blocks {
-            db.insert_block(b).expect("failed to insert");
+            db.insert_block(b, &TEST_GVR).expect("failed to insert");
         }
 
         let result = db.get_blocks("0x1234").expect("failed to get");
@@ -2181,6 +2234,73 @@ mod tests {
         assert!(result.is_err(), "duplicate slot block must be rejected");
     }
 
+    /// Verify the v3 unique index `(pubkey, genesis_validators_root, slot)` fires
+    /// for non-NULL gvr rows inserted via raw SQL.
+    ///
+    /// SQLite treats NULL as DISTINCT from all values (including other NULLs), so a
+    /// NULL gvr bypasses a unique index silently.  This test proves the index works
+    /// when gvr is non-NULL — which is the guaranteed post-fix state of every insert path.
+    #[test]
+    fn test_v3_block_unique_index_fires_for_non_null_gvr() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let gvr_hex = SlashingDb::root_to_hex(&TEST_GVR);
+        let conn = db.conn.lock();
+
+        // Insert a block with non-NULL gvr directly.
+        conn.execute(
+            "INSERT INTO blocks (client_cn, pubkey, slot, signing_root, genesis_validators_root)
+             VALUES ('local-vc', '0xaaaa', 999, '0xroot_a', ?1)",
+            [&gvr_hex],
+        )
+        .expect("first insert must succeed");
+
+        // A second insert with the same (pubkey, gvr, slot) but different signing_root
+        // must fail because the v3 UNIQUE index fires.
+        let err = conn
+            .execute(
+                "INSERT INTO blocks (client_cn, pubkey, slot, signing_root, genesis_validators_root)
+                 VALUES ('cn-B', '0xaaaa', 999, '0xroot_b', ?1)",
+                [&gvr_hex],
+            )
+            .expect_err("duplicate (pubkey, gvr, slot) must violate unique index");
+
+        assert!(
+            err.to_string().contains("UNIQUE constraint failed"),
+            "expected UNIQUE constraint error, got: {err}"
+        );
+    }
+
+    /// Verify the v3 unique index `(pubkey, genesis_validators_root, target_epoch)` fires
+    /// for non-NULL gvr attestation rows.
+    #[test]
+    fn test_v3_attestation_unique_index_fires_for_non_null_gvr() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let gvr_hex = SlashingDb::root_to_hex(&TEST_GVR);
+        let conn = db.conn.lock();
+
+        conn.execute(
+            "INSERT INTO attestations \
+             (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root)
+             VALUES ('local-vc', '0xbbbb', 10, 20, '0xatt_root_a', ?1)",
+            [&gvr_hex],
+        )
+        .expect("first insert must succeed");
+
+        let err = conn
+            .execute(
+                "INSERT INTO attestations \
+                 (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root)
+                 VALUES ('cn-B', '0xbbbb', 11, 20, '0xatt_root_b', ?1)",
+                [&gvr_hex],
+            )
+            .expect_err("duplicate (pubkey, gvr, target_epoch) must violate unique index");
+
+        assert!(
+            err.to_string().contains("UNIQUE constraint failed"),
+            "expected UNIQUE constraint error, got: {err}"
+        );
+    }
+
     #[test]
     fn test_different_pubkeys_isolated() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
@@ -2199,8 +2319,8 @@ mod tests {
             signing_root: None,
         };
 
-        db.insert_attestation(&attestation1).expect("failed to insert");
-        db.insert_attestation(&attestation2).expect("failed to insert");
+        db.insert_attestation(&attestation1, &TEST_GVR).expect("failed to insert");
+        db.insert_attestation(&attestation2, &TEST_GVR).expect("failed to insert");
 
         let result1 = db.get_attestations("0x1111").expect("failed to get");
         let result2 = db.get_attestations("0x2222").expect("failed to get");
@@ -2224,7 +2344,7 @@ mod tests {
                 target_epoch: 101,
                 signing_root: None,
             };
-            db.insert_attestation(&attestation).expect("failed to insert");
+            db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
         }
 
         {
@@ -2253,7 +2373,7 @@ mod tests {
             target_epoch: 101,
             signing_root: None,
         };
-        db.insert_attestation(&attestation).expect("failed to insert");
+        db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
 
         let result = db.is_safe_to_sign("0x1234", 101, 102);
         assert!(result.is_ok());
@@ -2269,7 +2389,7 @@ mod tests {
             target_epoch: 101,
             signing_root: None,
         };
-        db.insert_attestation(&attestation).expect("failed to insert");
+        db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
 
         let result = db.is_safe_to_sign("0x1234", 99, 101);
         assert!(result.is_err());
@@ -2296,7 +2416,7 @@ mod tests {
             target_epoch: 10,
             signing_root: None,
         };
-        db.insert_attestation(&attestation).expect("failed to insert");
+        db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
 
         // New: source=4, target=11 (surrounds existing)
         let result = db.is_safe_to_sign("0x1234", 4, 11);
@@ -2329,7 +2449,7 @@ mod tests {
             target_epoch: 11,
             signing_root: None,
         };
-        db.insert_attestation(&attestation).expect("failed to insert");
+        db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
 
         // New: source=5, target=10 (surrounded by existing)
         let result = db.is_safe_to_sign("0x1234", 5, 10);
@@ -2361,7 +2481,7 @@ mod tests {
             target_epoch: 101,
             signing_root: None,
         };
-        db.insert_attestation(&attestation).expect("failed to insert");
+        db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
 
         // Different pubkey should not conflict
         let result = db.is_safe_to_sign("0x2222", 100, 101);
@@ -2394,7 +2514,7 @@ mod tests {
         ];
 
         for a in &attestations {
-            db.insert_attestation(a).expect("failed to insert");
+            db.insert_attestation(a, &TEST_GVR).expect("failed to insert");
         }
 
         // New attestation continuing the sequence
@@ -2412,7 +2532,7 @@ mod tests {
             target_epoch: 101,
             signing_root: None,
         };
-        db.insert_attestation(&attestation).expect("failed to insert");
+        db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
 
         // Same source, different target - should be safe if not surrounding/surrounded
         let result = db.is_safe_to_sign("0x1234", 100, 102);
@@ -2430,7 +2550,7 @@ mod tests {
             target_epoch: 10,
             signing_root: None,
         };
-        db.insert_attestation(&attestation).expect("failed to insert");
+        db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
 
         // New: source=5, target=11 - same source, not surrounding (need source < existing_source)
         let result = db.is_safe_to_sign("0x1234", 5, 11);
@@ -2452,7 +2572,7 @@ mod tests {
             target_epoch: 11,
             signing_root: None,
         };
-        db.insert_attestation(&attestation).expect("failed to insert");
+        db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
 
         // New: source=4, target=10 - below min target (11), rejected per EIP-3076
         let result = db.is_safe_to_sign("0x1234", 4, 10);
@@ -2478,7 +2598,7 @@ mod tests {
             target_epoch: 6,
             signing_root: None,
         };
-        db.insert_attestation(&attestation).expect("failed to insert");
+        db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
 
         // New: source=4, target=7 (minimal surrounding)
         let result = db.is_safe_to_sign("0x1234", 4, 7);
@@ -2503,7 +2623,7 @@ mod tests {
             target_epoch: 7,
             signing_root: None,
         };
-        db.insert_attestation(&attestation).expect("failed to insert");
+        db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
 
         // New: source=5, target=6 (minimal surrounded)
         let result = db.is_safe_to_sign("0x1234", 5, 6);
@@ -2537,7 +2657,7 @@ mod tests {
         ];
 
         for a in &attestations {
-            db.insert_attestation(a).expect("failed to insert");
+            db.insert_attestation(a, &TEST_GVR).expect("failed to insert");
         }
 
         // New: source=4, target=21 - surrounds both
@@ -2563,9 +2683,9 @@ mod tests {
         let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
 
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
-        db.record_attestation(pubkey, 100, 101, Some("0xabcd".to_string()))
+        db.record_attestation(pubkey, 100, 101, Some("0xabcd".to_string()), &TEST_GVR)
             .expect("record should succeed");
-        db.record_attestation(pubkey, 101, 102, None).expect("record should succeed");
+        db.record_attestation(pubkey, 101, 102, None, &TEST_GVR).expect("record should succeed");
 
         let interchange = db.export(genesis_root).expect("export should succeed");
 
@@ -2592,7 +2712,7 @@ mod tests {
             slot: 1000,
             signing_root: Some("0xefgh".to_string()),
         };
-        db.insert_block(&block).expect("insert should succeed");
+        db.insert_block(&block, &TEST_GVR).expect("insert should succeed");
 
         let interchange = db.export(genesis_root).expect("export should succeed");
 
@@ -2612,8 +2732,8 @@ mod tests {
         let pubkey1 = "0x1111";
         let pubkey2 = "0x2222";
 
-        db.record_attestation(pubkey1, 100, 101, None).expect("record should succeed");
-        db.record_attestation(pubkey2, 200, 201, None).expect("record should succeed");
+        db.record_attestation(pubkey1, 100, 101, None, &TEST_GVR).expect("record should succeed");
+        db.record_attestation(pubkey2, 200, 201, None, &TEST_GVR).expect("record should succeed");
 
         let interchange = db.export(genesis_root).expect("export should succeed");
 
@@ -2739,16 +2859,16 @@ mod tests {
         let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
 
-        db1.record_attestation(pubkey, 100, 101, Some("0xabcd".to_string()))
+        db1.record_attestation(pubkey, 100, 101, Some("0xabcd".to_string()), &TEST_GVR)
             .expect("record should succeed");
-        db1.record_attestation(pubkey, 101, 102, None).expect("record should succeed");
+        db1.record_attestation(pubkey, 101, 102, None, &TEST_GVR).expect("record should succeed");
 
         let block = SignedBlock {
             pubkey: pubkey.to_string(),
             slot: 1000,
             signing_root: Some("0xefgh".to_string()),
         };
-        db1.insert_block(&block).expect("insert should succeed");
+        db1.insert_block(&block, &TEST_GVR).expect("insert should succeed");
 
         let interchange = db1.export(genesis_root).expect("export should succeed");
 
@@ -2836,7 +2956,7 @@ mod tests {
     fn test_record_attestation_new() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        db.record_attestation("0x1234", 100, 101, Some("0xabcd".to_string()))
+        db.record_attestation("0x1234", 100, 101, Some("0xabcd".to_string()), &TEST_GVR)
             .expect("record should succeed");
 
         let attestations = db.get_attestations("0x1234").expect("failed to get");
@@ -2851,7 +2971,7 @@ mod tests {
     fn test_record_attestation_without_signing_root() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        db.record_attestation("0x1234", 100, 101, None).expect("record should succeed");
+        db.record_attestation("0x1234", 100, 101, None, &TEST_GVR).expect("record should succeed");
 
         let attestations = db.get_attestations("0x1234").expect("failed to get");
         assert_eq!(attestations.len(), 1);
@@ -2862,10 +2982,10 @@ mod tests {
     fn test_record_attestation_idempotent_exact_duplicate() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        db.record_attestation("0x1234", 100, 101, Some("0xabcd".to_string()))
+        db.record_attestation("0x1234", 100, 101, Some("0xabcd".to_string()), &TEST_GVR)
             .expect("first record should succeed");
 
-        db.record_attestation("0x1234", 100, 101, Some("0xabcd".to_string()))
+        db.record_attestation("0x1234", 100, 101, Some("0xabcd".to_string()), &TEST_GVR)
             .expect("duplicate record should also succeed (idempotent)");
 
         let attestations = db.get_attestations("0x1234").expect("failed to get");
@@ -2876,11 +2996,12 @@ mod tests {
     fn test_record_attestation_idempotent_same_target_different_source() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        db.record_attestation("0x1234", 100, 101, None).expect("first record should succeed");
+        db.record_attestation("0x1234", 100, 101, None, &TEST_GVR)
+            .expect("first record should succeed");
 
         // Same pubkey and target_epoch but different source_epoch
         // Due to UNIQUE(pubkey, target_epoch), this should be ignored
-        db.record_attestation("0x1234", 99, 101, None)
+        db.record_attestation("0x1234", 99, 101, None, &TEST_GVR)
             .expect("duplicate target should succeed (idempotent)");
 
         let attestations = db.get_attestations("0x1234").expect("failed to get");
@@ -2893,9 +3014,12 @@ mod tests {
     fn test_record_attestation_multiple_different_targets() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        db.record_attestation("0x1234", 100, 101, None).expect("first record should succeed");
-        db.record_attestation("0x1234", 101, 102, None).expect("second record should succeed");
-        db.record_attestation("0x1234", 102, 103, None).expect("third record should succeed");
+        db.record_attestation("0x1234", 100, 101, None, &TEST_GVR)
+            .expect("first record should succeed");
+        db.record_attestation("0x1234", 101, 102, None, &TEST_GVR)
+            .expect("second record should succeed");
+        db.record_attestation("0x1234", 102, 103, None, &TEST_GVR)
+            .expect("third record should succeed");
 
         let attestations = db.get_attestations("0x1234").expect("failed to get");
         assert_eq!(attestations.len(), 3);
@@ -2908,8 +3032,8 @@ mod tests {
     fn test_record_attestation_different_pubkeys() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        db.record_attestation("0x1111", 100, 101, None).expect("record should succeed");
-        db.record_attestation("0x2222", 100, 101, None).expect("record should succeed");
+        db.record_attestation("0x1111", 100, 101, None, &TEST_GVR).expect("record should succeed");
+        db.record_attestation("0x2222", 100, 101, None, &TEST_GVR).expect("record should succeed");
 
         let att1 = db.get_attestations("0x1111").expect("failed to get");
         let att2 = db.get_attestations("0x2222").expect("failed to get");
@@ -2930,7 +3054,7 @@ mod tests {
     #[test]
     fn test_block_is_safe_to_propose_first_proposal_for_slot() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_block("0x1234", 999, None).expect("record should succeed");
+        db.record_block("0x1234", 999, None, &TEST_GVR).expect("record should succeed");
         let result = db.is_safe_to_propose("0x1234", 1000, Some("0xroot1".to_string()));
         assert!(result.is_ok());
     }
@@ -2938,7 +3062,7 @@ mod tests {
     #[test]
     fn test_block_is_safe_to_propose_idempotent_resign_same_root() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_block("0x1234", 1000, Some("0xroot1".to_string()))
+        db.record_block("0x1234", 1000, Some("0xroot1".to_string()), &TEST_GVR)
             .expect("record should succeed");
         let result = db.is_safe_to_propose("0x1234", 1000, Some("0xroot1".to_string()));
         assert!(result.is_ok());
@@ -2947,7 +3071,7 @@ mod tests {
     #[test]
     fn test_block_is_safe_to_propose_double_proposal_different_root() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_block("0x1234", 1000, Some("0xroot1".to_string()))
+        db.record_block("0x1234", 1000, Some("0xroot1".to_string()), &TEST_GVR)
             .expect("record should succeed");
         let result = db.is_safe_to_propose("0x1234", 1000, Some("0xroot2".to_string()));
         assert!(result.is_err());
@@ -2963,7 +3087,7 @@ mod tests {
     #[test]
     fn test_block_is_safe_to_propose_double_proposal_existing_none_root() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_block("0x1234", 1000, None).expect("record should succeed");
+        db.record_block("0x1234", 1000, None, &TEST_GVR).expect("record should succeed");
         // Existing has no root, new has a root — different, should reject
         let result = db.is_safe_to_propose("0x1234", 1000, Some("0xroot1".to_string()));
         assert!(result.is_err());
@@ -2978,7 +3102,7 @@ mod tests {
     #[test]
     fn test_block_is_safe_to_propose_both_none_roots_idempotent() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_block("0x1234", 1000, None).expect("record should succeed");
+        db.record_block("0x1234", 1000, None, &TEST_GVR).expect("record should succeed");
         // Both have None root — same, should be safe (idempotent)
         let result = db.is_safe_to_propose("0x1234", 1000, None);
         assert!(result.is_ok());
@@ -2987,7 +3111,7 @@ mod tests {
     #[test]
     fn test_block_is_safe_to_propose_different_pubkey_no_conflict() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_block("0x1111", 1000, Some("0xroot1".to_string()))
+        db.record_block("0x1111", 1000, Some("0xroot1".to_string()), &TEST_GVR)
             .expect("record should succeed");
         let result = db.is_safe_to_propose("0x2222", 1000, Some("0xroot2".to_string()));
         assert!(result.is_ok());
@@ -2996,7 +3120,8 @@ mod tests {
     #[test]
     fn test_block_record_block_new() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_block("0x1234", 1000, Some("0xabcd".to_string())).expect("record should succeed");
+        db.record_block("0x1234", 1000, Some("0xabcd".to_string()), &TEST_GVR)
+            .expect("record should succeed");
         let blocks = db.get_blocks("0x1234").expect("failed to get");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].slot, 1000);
@@ -3006,8 +3131,8 @@ mod tests {
     #[test]
     fn test_block_record_block_idempotent() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_block("0x1234", 1000, None).expect("first record");
-        db.record_block("0x1234", 1000, None).expect("duplicate record (idempotent)");
+        db.record_block("0x1234", 1000, None, &TEST_GVR).expect("first record");
+        db.record_block("0x1234", 1000, None, &TEST_GVR).expect("duplicate record (idempotent)");
         let blocks = db.get_blocks("0x1234").expect("failed to get");
         assert_eq!(blocks.len(), 1);
     }
@@ -3015,9 +3140,9 @@ mod tests {
     #[test]
     fn test_block_record_block_multiple_slots() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_block("0x1234", 1000, None).expect("record");
-        db.record_block("0x1234", 1001, None).expect("record");
-        db.record_block("0x1234", 1002, None).expect("record");
+        db.record_block("0x1234", 1000, None, &TEST_GVR).expect("record");
+        db.record_block("0x1234", 1001, None, &TEST_GVR).expect("record");
+        db.record_block("0x1234", 1002, None, &TEST_GVR).expect("record");
         let blocks = db.get_blocks("0x1234").expect("failed to get");
         assert_eq!(blocks.len(), 3);
     }
@@ -3032,7 +3157,7 @@ mod tests {
     #[test]
     fn test_block_last_signed_block_slot_single() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_block("0x1234", 1000, None).expect("record");
+        db.record_block("0x1234", 1000, None, &TEST_GVR).expect("record");
         let result = db.last_signed_block_slot("0x1234").expect("query should succeed");
         assert_eq!(result, Some(1000));
     }
@@ -3040,9 +3165,9 @@ mod tests {
     #[test]
     fn test_block_last_signed_block_slot_multiple() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_block("0x1234", 1000, None).expect("record");
-        db.record_block("0x1234", 1002, None).expect("record");
-        db.record_block("0x1234", 1001, None).expect("record");
+        db.record_block("0x1234", 1000, None, &TEST_GVR).expect("record");
+        db.record_block("0x1234", 1002, None, &TEST_GVR).expect("record");
+        db.record_block("0x1234", 1001, None, &TEST_GVR).expect("record");
         let result = db.last_signed_block_slot("0x1234").expect("query should succeed");
         assert_eq!(result, Some(1002));
     }
@@ -3050,8 +3175,8 @@ mod tests {
     #[test]
     fn test_block_last_signed_block_slot_different_pubkeys() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_block("0x1111", 1000, None).expect("record");
-        db.record_block("0x2222", 2000, None).expect("record");
+        db.record_block("0x1111", 1000, None, &TEST_GVR).expect("record");
+        db.record_block("0x2222", 2000, None, &TEST_GVR).expect("record");
         assert_eq!(db.last_signed_block_slot("0x1111").unwrap(), Some(1000));
         assert_eq!(db.last_signed_block_slot("0x2222").unwrap(), Some(2000));
     }
@@ -3059,9 +3184,9 @@ mod tests {
     #[test]
     fn test_block_is_safe_to_propose_multiple_existing_blocks() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_block("0x1234", 1000, None).expect("record");
-        db.record_block("0x1234", 1001, None).expect("record");
-        db.record_block("0x1234", 1002, None).expect("record");
+        db.record_block("0x1234", 1000, None, &TEST_GVR).expect("record");
+        db.record_block("0x1234", 1001, None, &TEST_GVR).expect("record");
+        db.record_block("0x1234", 1002, None, &TEST_GVR).expect("record");
         // Proposing at unused slot should be safe
         let result = db.is_safe_to_propose("0x1234", 1003, None);
         assert!(result.is_ok());
@@ -3640,7 +3765,7 @@ mod tests {
     #[test]
     fn test_liveness_last_signed_attestation_epoch_single() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_attestation("0x1234", 100, 101, None).expect("record");
+        db.record_attestation("0x1234", 100, 101, None, &TEST_GVR).expect("record");
         let result = db.last_signed_attestation_epoch("0x1234").expect("query should succeed");
         assert_eq!(result, Some(101));
     }
@@ -3648,9 +3773,9 @@ mod tests {
     #[test]
     fn test_liveness_last_signed_attestation_epoch_multiple() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_attestation("0x1234", 100, 101, None).expect("record");
-        db.record_attestation("0x1234", 103, 105, None).expect("record");
-        db.record_attestation("0x1234", 101, 103, None).expect("record");
+        db.record_attestation("0x1234", 100, 101, None, &TEST_GVR).expect("record");
+        db.record_attestation("0x1234", 103, 105, None, &TEST_GVR).expect("record");
+        db.record_attestation("0x1234", 101, 103, None, &TEST_GVR).expect("record");
         let result = db.last_signed_attestation_epoch("0x1234").expect("query should succeed");
         assert_eq!(result, Some(105));
     }
@@ -3658,8 +3783,8 @@ mod tests {
     #[test]
     fn test_liveness_last_signed_attestation_epoch_different_pubkeys() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        db.record_attestation("0x1111", 100, 101, None).expect("record");
-        db.record_attestation("0x2222", 200, 201, None).expect("record");
+        db.record_attestation("0x1111", 100, 101, None, &TEST_GVR).expect("record");
+        db.record_attestation("0x2222", 200, 201, None, &TEST_GVR).expect("record");
         assert_eq!(db.last_signed_attestation_epoch("0x1111").unwrap(), Some(101));
         assert_eq!(db.last_signed_attestation_epoch("0x2222").unwrap(), Some(201));
     }
@@ -3729,7 +3854,7 @@ mod tests {
         let dir = tempdir().expect("failed to create temp dir");
         let path = dir.path().join("integrity.db");
         let db = SlashingDb::open(&path).expect("failed to open db");
-        db.record_attestation("0x1234", 100, 101, None).expect("record");
+        db.record_attestation("0x1234", 100, 101, None, &TEST_GVR).expect("record");
         let result = db.check_integrity();
         assert!(result.is_ok());
     }
@@ -4252,12 +4377,13 @@ mod tests {
 
         // Insert blocks: 100, 200, 300, 400, 500
         for slot in [100, 200, 300, 400, 500] {
-            db.record_block("0x1234", slot, None).expect("record should succeed");
+            db.record_block("0x1234", slot, None, &TEST_GVR).expect("record should succeed");
         }
 
         // Insert attestations: target epochs 10, 20, 30, 40, 50
         for (src, tgt) in [(5, 10), (10, 20), (20, 30), (30, 40), (40, 50)] {
-            db.record_attestation("0x1234", src, tgt, None).expect("record should succeed");
+            db.record_attestation("0x1234", src, tgt, None, &TEST_GVR)
+                .expect("record should succeed");
         }
 
         // Set watermarks: block at 300, attestation at (20, 30)
@@ -4286,8 +4412,8 @@ mod tests {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
         // Insert some records but no watermarks
-        db.record_block("0x1234", 100, None).expect("record should succeed");
-        db.record_attestation("0x1234", 5, 10, None).expect("record should succeed");
+        db.record_block("0x1234", 100, None, &TEST_GVR).expect("record should succeed");
+        db.record_attestation("0x1234", 5, 10, None, &TEST_GVR).expect("record should succeed");
 
         let result = db.prune_below_watermarks();
         assert!(result.is_err());
@@ -4306,13 +4432,13 @@ mod tests {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
         // Validator 1: blocks at 100, 200; watermark at 200
-        db.record_block("0x1111", 100, None).expect("record");
-        db.record_block("0x1111", 200, None).expect("record");
+        db.record_block("0x1111", 100, None, &TEST_GVR).expect("record");
+        db.record_block("0x1111", 200, None, &TEST_GVR).expect("record");
         db.set_block_watermark("0x1111", 200).expect("set");
 
         // Validator 2: blocks at 300, 400; watermark at 350
-        db.record_block("0x2222", 300, None).expect("record");
-        db.record_block("0x2222", 400, None).expect("record");
+        db.record_block("0x2222", 300, None, &TEST_GVR).expect("record");
+        db.record_block("0x2222", 400, None, &TEST_GVR).expect("record");
         db.set_block_watermark("0x2222", 350).expect("set");
 
         let stats = db.prune_below_watermarks().expect("prune should succeed");
@@ -4329,8 +4455,8 @@ mod tests {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
         // All records are at or above watermark
-        db.record_block("0x1234", 200, None).expect("record");
-        db.record_block("0x1234", 300, None).expect("record");
+        db.record_block("0x1234", 200, None, &TEST_GVR).expect("record");
+        db.record_block("0x1234", 300, None, &TEST_GVR).expect("record");
         db.set_block_watermark("0x1234", 100).expect("set");
 
         let stats = db.prune_below_watermarks().expect("prune should succeed");
@@ -4388,7 +4514,8 @@ mod tests {
         // Write a record, then drop without explicit close
         {
             let db = SlashingDb::open(&path).expect("failed to open db");
-            db.record_attestation(pubkey, 1, 2, Some("0xroot".to_string())).expect("record failed");
+            db.record_attestation(pubkey, 1, 2, Some("0xroot".to_string()), &TEST_GVR)
+                .expect("record failed");
             // Drop db without explicit close — WAL should ensure durability
         }
 
@@ -4562,6 +4689,8 @@ mod tests {
 #[cfg(test)]
 mod edge_case_tests {
     use super::*;
+
+    const TEST_GVR: Root = [0u8; 32];
 
     // ── FU-32: Same signing_root but different source_epoch ──────────
     //
@@ -4810,7 +4939,7 @@ mod edge_case_tests {
     #[test]
     fn test_pubkey_normalization_case_insensitive() {
         let db = SlashingDb::open_in_memory().expect("open");
-        db.record_attestation("0xABCD", 1, 2, None).expect("insert");
+        db.record_attestation("0xABCD", 1, 2, None, &TEST_GVR).expect("insert");
         let results = db.get_attestations("0xabcd").expect("get");
         assert_eq!(results.len(), 1);
     }
@@ -4818,7 +4947,7 @@ mod edge_case_tests {
     #[test]
     fn test_pubkey_normalization_adds_prefix() {
         let db = SlashingDb::open_in_memory().expect("open");
-        db.record_block("ABCD", 100, None).expect("insert");
+        db.record_block("ABCD", 100, None, &TEST_GVR).expect("insert");
         let results = db.get_blocks("0xabcd").expect("get");
         assert_eq!(results.len(), 1);
     }
@@ -4826,7 +4955,7 @@ mod edge_case_tests {
     #[test]
     fn test_pubkey_normalization_already_normalized() {
         let db = SlashingDb::open_in_memory().expect("open");
-        db.record_block("0xabcd", 100, None).expect("insert");
+        db.record_block("0xabcd", 100, None, &TEST_GVR).expect("insert");
         let results = db.get_blocks("0xabcd").expect("get");
         assert_eq!(results.len(), 1);
     }

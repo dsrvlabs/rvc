@@ -539,8 +539,10 @@ fn test_new_rows_store_client_cn() {
 /// so two different CNs CANNOT sign the same `(pubkey, slot)` with different roots.
 ///
 /// This is the DVT-1 / CN-1 fix: cross-CN double-sign is now rejected.
+/// (Formerly named `test_cn_scoping_different_cns_are_independent`; renamed in
+/// Issue 2.4 code-review to reflect the v3 pubkey-scoped reality.)
 #[test]
-fn test_cn_scoping_different_cns_are_independent() {
+fn test_cross_cn_double_sign_rejected_v3() {
     let gvr = [0u8; 32];
     let db = SlashingDb::open_in_memory().expect("open in-memory db");
     let pubkey = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";

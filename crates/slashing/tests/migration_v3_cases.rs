@@ -273,15 +273,26 @@ fn test_v3_migration_resolves_all_five_cases() {
     assert_eq!(count_4, 1, "case4: exactly one row survives");
 
     // ── Case 5: attestation at target_epoch=70, differing signing_root.
-    let (att_marker_5,): (i64,) = conn
+    // Both rows have source_epoch=55; sorted by client_cn ASC → 'cn-A' is keeper.
+    // Keeper has root='0xatt_root_z'; cn-B's root='0xatt_root_y' is deleted.
+    let (att_root_5, att_cn_5, att_marker_5): (Option<String>, String, i64) = conn
         .query_row(
-            "SELECT slashing_history_marker
+            "SELECT signing_root, client_cn, slashing_history_marker
              FROM attestations WHERE pubkey = ?1 AND target_epoch = 70",
             [PUBKEY],
-            |row| Ok((row.get(0)?,)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("case5 att must exist");
 
+    assert_eq!(
+        att_root_5.as_deref(),
+        Some("0xatt_root_z"),
+        "case5: keeper must have signing_root='0xatt_root_z' (cn-A, first by client_cn ASC)"
+    );
+    assert_eq!(
+        att_cn_5, "cn-A",
+        "case5: keeper client_cn must be 'cn-A' (lexicographically smaller)"
+    );
     assert_eq!(att_marker_5, 1, "case5: conflicting signing_root → marker=1");
 
     let count_5: i64 = conn
@@ -424,7 +435,104 @@ fn test_v3_migration_invariant_rejections_preserved() {
     );
 }
 
-// ── Test 5: Cross-CN double-sign now rejected (was silently accepted in v2) ───
+// ── Test 5: Fails-closed when NULL gvr rows exist but no metadata GVR is pinned ──
+
+/// Verifies that the v3 migration is fail-closed: if a v2 DB contains rows with
+/// NULL `genesis_validators_root` but no `genesis_validators_root` is pinned in
+/// `metadata`, `SlashingDb::open` must return `Err(MigrationFailed)` and leave
+/// the database unchanged at v2 (no partial migration).
+///
+/// This pins the critical invariant: the migration must not create a non-enforcing
+/// `(pubkey, NULL, slot)` unique index where NULLs are treated as distinct.
+#[test]
+fn test_v3_migration_fails_closed_null_gvr_without_metadata_pin() {
+    let dir = tempdir().expect("tempdir");
+    let path = dir.path().join("null_gvr_no_pin.db");
+
+    // Build a v2 DB with a NULL-gvr row and NO genesis_validators_root in metadata.
+    {
+        let conn = Connection::open(&path).expect("open");
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL;
+             CREATE TABLE attestations (
+                 id INTEGER PRIMARY KEY,
+                 client_cn TEXT NOT NULL DEFAULT '__legacy__',
+                 pubkey TEXT NOT NULL,
+                 source_epoch INTEGER NOT NULL,
+                 target_epoch INTEGER NOT NULL,
+                 signing_root TEXT,
+                 genesis_validators_root TEXT
+             );
+             CREATE TABLE blocks (
+                 id INTEGER PRIMARY KEY,
+                 client_cn TEXT NOT NULL DEFAULT '__legacy__',
+                 pubkey TEXT NOT NULL,
+                 slot INTEGER NOT NULL,
+                 signing_root TEXT,
+                 genesis_validators_root TEXT
+             );
+             CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE watermarks (
+                 pubkey TEXT NOT NULL,
+                 watermark_type TEXT NOT NULL,
+                 value INTEGER NOT NULL,
+                 UNIQUE(pubkey, watermark_type)
+             );
+             CREATE UNIQUE INDEX idx_attestations_cn_pubkey_target
+                 ON attestations(client_cn, pubkey, target_epoch);
+             CREATE UNIQUE INDEX idx_blocks_cn_pubkey_slot
+                 ON blocks(client_cn, pubkey, slot);
+             INSERT INTO metadata (key, value) VALUES ('schema_version', '2');",
+        )
+        .expect("create v2 schema");
+
+        // Insert a row with NULL genesis_validators_root (no metadata GVR pinned).
+        conn.execute(
+            "INSERT INTO blocks (client_cn, pubkey, slot, signing_root, genesis_validators_root)
+             VALUES ('local-vc', '0xcccc', 42, '0xroot', NULL)",
+            [],
+        )
+        .expect("insert null-gvr block");
+    }
+
+    let original_bytes = std::fs::read(&path).expect("read original");
+
+    // Open via SlashingDb — the v3 migration MUST fail closed.
+    let result = SlashingDb::open(&path);
+    assert!(result.is_err(), "migration must fail when NULL gvr rows exist without metadata GVR");
+    let err = result.err().expect("is_err checked above");
+    match err {
+        SlashingError::MigrationFailed(ref msg) => {
+            assert!(
+                msg.contains("NULL genesis_validators_root")
+                    || msg.contains("genesis_validators_root"),
+                "error message must mention gvr issue: {msg}"
+            );
+        }
+        other => panic!("expected MigrationFailed, got: {other:?}"),
+    }
+
+    // DB must be unchanged — schema still v2.
+    let after_bytes = std::fs::read(&path).expect("read after failed migration");
+    assert_eq!(
+        original_bytes.len(),
+        after_bytes.len(),
+        "DB file size must not change after failed migration"
+    );
+    {
+        let conn = Connection::open(&path).expect("direct open");
+        let version: Option<i64> = conn
+            .query_row("SELECT value FROM metadata WHERE key = 'schema_version'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+            .and_then(|v| v.parse().ok());
+        assert_eq!(version, Some(2), "schema_version must still be 2 after failed migration");
+    }
+}
+
+// ── Test 6: Cross-CN double-sign now rejected (was silently accepted in v2) ───
+// (was Test 5 before the fails-closed test was added above)
 
 #[test]
 fn test_v3_migration_cross_cn_double_sign_now_rejected() {

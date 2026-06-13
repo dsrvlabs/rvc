@@ -293,7 +293,7 @@ impl SlashingDb {
     /// Returns `SlashingError::GenesisRootMismatch` if `gvr` does not match the
     /// pinned metadata value.  Returns `SlashingError::SlashableBlock` (specifically
     /// `BlockSlashingViolation::DoubleBlockProposal`) if a different signing
-    /// root has already been committed for `(client_cn, pubkey, slot)`.
+    /// root has already been committed for `(pubkey, slot)` by any client CN.
     ///
     /// # Trade-off: mutex held across signer call
     ///
@@ -432,7 +432,7 @@ impl SlashingDb {
     /// Returns `SlashingError::GenesisRootMismatch` if `gvr` does not match the
     /// pinned metadata value.  Returns `SlashingError::SlashableAttestation` (double
     /// vote, surrounding, or surrounded) if the new `(source, target)` pair conflicts
-    /// with any existing attestation in `(client_cn, pubkey)` scope.
+    /// with any existing attestation for `pubkey` (pubkey-scoped, across all client CNs).
     pub fn stage_attestation<'db>(
         &'db self,
         client_cn: &str,

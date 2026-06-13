@@ -79,11 +79,14 @@ fn run_v3_steps(tx: &Connection) -> Result<(), SlashingError> {
         .unwrap_or(0)
         .to_string();
 
-    tx.execute_batch(&format!(
-        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', '3');
-         INSERT OR REPLACE INTO metadata (key, value) VALUES ('migration_v3_applied_at', '{now_ts}');"
-    ))
-    .map_err(|e| SlashingError::MigrationFailed(format!("update schema_version to 3: {e}")))?;
+    tx.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('schema_version', '3')", [])
+        .map_err(|e| SlashingError::MigrationFailed(format!("set schema_version=3: {e}")))?;
+
+    tx.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('migration_v3_applied_at', ?1)",
+        [now_ts.as_str()],
+    )
+    .map_err(|e| SlashingError::MigrationFailed(format!("set migration_v3_applied_at: {e}")))?;
 
     Ok(())
 }
