@@ -5,11 +5,12 @@
 //! - `last_signed_attestation` returns the max target epoch for a known pubkey under the pinned GVR.
 //! - Returns `None` for an unknown pubkey.
 //! - Returns `None` when queried with a GVR that differs from the one pinned in the DB.
+//! - Returns `Some(max)` when NO GVR is pinned (backward-compat: fail-open on unpinned DB).
 //! - The trait is object-safe (cast to `&dyn SlashingDbReader` works).
 
 use rvc_slashing::{SlashingDb, SlashingDbReader};
 
-const CN: &str = "";
+const CN: &str = "local-vc";
 const PUBKEY: &str =
     "0xaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd";
 const GVR: &[u8; 32] = &[7u8; 32];
@@ -73,5 +74,26 @@ fn test_last_signed_attestation_wrong_gvr_returns_none() {
         reader.last_signed_attestation(PUBKEY, OTHER_GVR),
         None,
         "different GVR must yield None even when records exist"
+    );
+}
+
+/// When the DB has NO pinned GVR (fresh DB, no `set_genesis_validators_root` call),
+/// `last_signed_attestation` must still return `Some(max_target_epoch)`.
+///
+/// This pins the documented backward-compat behaviour: an unpinned DB is fail-open
+/// so that validators migrating from legacy setups (no GVR in metadata) are not
+/// incorrectly treated as having no history.
+#[test]
+fn test_last_signed_attestation_no_pinned_gvr_returns_some() {
+    // Open without pinning any GVR.
+    let db = SlashingDb::open_in_memory().expect("open_in_memory");
+
+    db.stage_attestation(CN, PUBKEY, 4, 5, None, GVR).expect("stage").commit().expect("commit");
+
+    let reader: &dyn SlashingDbReader = &db;
+    assert_eq!(
+        reader.last_signed_attestation(PUBKEY, GVR),
+        Some(5),
+        "unpinned DB must return Some — fail-open backward-compat"
     );
 }

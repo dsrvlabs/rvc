@@ -21,7 +21,7 @@ pub type TargetEpoch = u64;
 /// This trait deliberately has NO staging, commit, or mutation methods — that is what
 /// makes the `slashing → doppelganger` cycle impossible: `doppelganger` consumes this
 /// read-only seam without gaining any ability to write to the slashing DB.
-pub trait SlashingDbReader {
+pub trait SlashingDbReader: Send + Sync {
     /// The highest target epoch this validator has attested under the DB's pinned GVR,
     /// or `None` if there is no such record (or the DB's pinned GVR differs from `gvr`).
     fn last_signed_attestation(&self, pubkey: &str, gvr: &Root) -> Option<TargetEpoch>;
