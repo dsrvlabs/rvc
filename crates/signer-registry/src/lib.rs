@@ -61,5 +61,79 @@ pub struct SigningMethod {
     pub gate_routing: GateRouting,
 }
 
-/// Every registered gRPC signing method. EMPTY until Phase 2 Task 2.1 populates it.
-pub const REGISTERED_METHODS: &[SigningMethod] = &[];
+/// Every gRPC signing method on the live listener, classified by message kind and gate routing.
+///
+/// This is the canonical surface enumerated by the PRD M4 gate.  Adding a new signing RPC
+/// without a matching entry here (or mis-classifying its `gate_routing`) will be caught by
+/// `bin/rvc-signer/tests/signing_path_enumeration.rs`.  Issue 2.13 strengthens the gate to
+/// verify each entry actually invokes `SigningGate` at runtime.
+///
+/// Only live-listener signing methods are listed:
+/// - `list_public_keys` and `get_status` are informational, not signing methods.
+/// - The v1 raw-root `sign` RPC has been removed from the live listener (SS-1, Issue 2.2).
+///
+/// Service path is the protobuf fully-qualified service name (`package.ServiceName`).
+pub const REGISTERED_METHODS: &[SigningMethod] = &[
+    SigningMethod {
+        service: "signer.v2.SignerService",
+        method: "SignBeaconBlock",
+        message_kind: MessageKind::Block,
+        gate_routing: GateRouting::Gated,
+    },
+    SigningMethod {
+        service: "signer.v2.SignerService",
+        method: "SignBlindedBeaconBlock",
+        message_kind: MessageKind::Block,
+        gate_routing: GateRouting::Gated,
+    },
+    SigningMethod {
+        service: "signer.v2.SignerService",
+        method: "SignAttestationData",
+        message_kind: MessageKind::Attestation,
+        gate_routing: GateRouting::Gated,
+    },
+    // TODO(SS-2/SS-3, Phase 4): reclassify aggregate as non-slashable once the
+    // SignAggregateAndProof path is fixed to not stage attestation slashing records.
+    SigningMethod {
+        service: "signer.v2.SignerService",
+        method: "SignAggregateAndProof",
+        message_kind: MessageKind::Aggregate,
+        gate_routing: GateRouting::Gated,
+    },
+    SigningMethod {
+        service: "signer.v2.SignerService",
+        method: "SignRandaoReveal",
+        message_kind: MessageKind::RandaoReveal,
+        gate_routing: GateRouting::NonSlashable,
+    },
+    SigningMethod {
+        service: "signer.v2.SignerService",
+        method: "SignSyncCommitteeMessage",
+        message_kind: MessageKind::SyncMessage,
+        gate_routing: GateRouting::NonSlashable,
+    },
+    SigningMethod {
+        service: "signer.v2.SignerService",
+        method: "SignSyncAggregatorSelectionData",
+        message_kind: MessageKind::SyncSelection,
+        gate_routing: GateRouting::NonSlashable,
+    },
+    SigningMethod {
+        service: "signer.v2.SignerService",
+        method: "SignContributionAndProof",
+        message_kind: MessageKind::SyncContribution,
+        gate_routing: GateRouting::NonSlashable,
+    },
+    SigningMethod {
+        service: "signer.v2.SignerService",
+        method: "SignBuilderRegistration",
+        message_kind: MessageKind::BuilderRegistration,
+        gate_routing: GateRouting::NonSlashable,
+    },
+    SigningMethod {
+        service: "signer.v2.SignerService",
+        method: "SignVoluntaryExit",
+        message_kind: MessageKind::VoluntaryExit,
+        gate_routing: GateRouting::NonSlashable,
+    },
+];
