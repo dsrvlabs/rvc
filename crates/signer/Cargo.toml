@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 crypto.workspace = true
+doppelganger.workspace = true
 eth-types.workspace = true
 hex.workspace = true
 metrics.workspace = true
