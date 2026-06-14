@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use rvc_doppelganger::{DoppelgangerError, ForwardWindowMachine, SigningEnablement, ValidatorLivenessData};
+use rvc_doppelganger::{
+    DoppelgangerError, ForwardWindowMachine, SigningEnablement, ValidatorLivenessData,
+};
 
 use crypto::SecretKey;
 use eth_types::{Epoch, Root, SLOTS_PER_EPOCH};
@@ -239,7 +241,9 @@ fn test_complete_observation_with_live_transitions_to_detected() {
 
     // Present AND is_live=true → must Detect.
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
-    machine.observe_liveness(start_epoch, &samples).expect("observe_liveness must succeed when index is present");
+    machine
+        .observe_liveness(start_epoch, &samples)
+        .expect("observe_liveness must succeed when index is present");
 
     assert!(
         !machine.is_signing_enabled(&pubkey),
@@ -286,10 +290,7 @@ fn test_out_of_window_before_start_ignored_completely() {
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
     let result = machine.observe_liveness(start_epoch - 1, &samples);
     // No in-window Pending validator was expected for this epoch → Ok (no IncompleteLiveness).
-    assert!(
-        result.is_ok(),
-        "out-of-window epoch: no in-window validator expected → must be Ok"
-    );
+    assert!(result.is_ok(), "out-of-window epoch: no in-window validator expected → must be Ok");
 
     // Confirm the validator is still Pending (not Detected) — out-of-window is_live ignored.
     assert!(

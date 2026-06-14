@@ -9,6 +9,17 @@
 //! - `observe_liveness` with `is_live = true` → Detected (terminal — no recovery)
 //! - In-window liveness guard: out-of-window observations are ignored
 //! - `cancel` removes the validator; next `register` starts fresh
+//!
+//! # D-2 update (Issue 2.7)
+//!
+//! Tests that assert a Safe transition now call `observe_liveness` with a
+//! COMPLETE (present, not-live) response for every epoch in the monitoring
+//! window before ticking to the boundary.  This is the correct semantics:
+//! Safe requires complete observation, not just window elapse.
+//!
+//! Tests that go Safe via the restart-aware safe-skip path (`register` returns
+//! Safe directly from slashing-DB history) are unaffected — that path bypasses
+//! liveness observation by design.
 
 use std::sync::Arc;
 
@@ -61,6 +72,23 @@ fn machine_with_prior(monitoring_epochs: u64, target_epoch: Epoch) -> ForwardWin
     ForwardWindowMachine::new(reader, monitoring_epochs, gvr())
 }
 
+/// Observe EVERY epoch in [start_epoch, end_epoch] as complete and not-live.
+///
+/// This is the D-2-correct way to satisfy the observation requirement before
+/// ticking to the boundary.  Panics if any call returns an error.
+fn observe_complete_window(
+    machine: &ForwardWindowMachine,
+    pubkey: &crypto::PublicKey,
+    start_epoch: Epoch,
+    end_epoch: Epoch,
+) {
+    let pubkey_hex = hex::encode(pubkey.to_bytes());
+    for epoch in start_epoch..=end_epoch {
+        let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false }];
+        machine.observe_liveness(epoch, &samples).expect("complete observation must succeed");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Core: signing is withheld while Pending
 // ---------------------------------------------------------------------------
@@ -89,6 +117,10 @@ fn test_signing_disabled_for_unmonitored_pubkey() {
 
 /// monitoring_epochs = 1, start_epoch = E → end_epoch = E + 1.
 /// Safe only at tick(end_epoch, SLOTS_PER_EPOCH - 1); all earlier slots stay Pending.
+///
+/// D-2: complete observation is provided for [start_epoch, end_epoch] before the
+/// boundary tick.  The slot-by-slot walk within start_epoch and end_epoch
+/// does not affect observation — those ticks are not at-or-past the boundary.
 #[test]
 fn test_safe_transition_fires_only_on_last_slot_of_satisfaction_epoch() {
     let monitoring_epochs: u64 = 1;
@@ -117,6 +149,10 @@ fn test_safe_transition_fires_only_on_last_slot_of_satisfaction_epoch() {
         );
     }
 
+    // Provide complete observation for the full window before the boundary tick.
+    // (D-2: Safe requires complete observation of every window epoch.)
+    observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
+
     // The last slot of end_epoch — transitions to Safe.
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
@@ -127,6 +163,9 @@ fn test_safe_transition_fires_only_on_last_slot_of_satisfaction_epoch() {
 }
 
 /// Per-slot off-by-one: tick at (end_epoch - 1, SLOTS_PER_EPOCH - 1) must NOT satisfy.
+///
+/// D-2: complete observation for the full window is provided before the final
+/// boundary tick.
 #[test]
 fn test_off_by_one_previous_epoch_last_slot_does_not_satisfy() {
     let monitoring_epochs: u64 = 2;
@@ -157,12 +196,17 @@ fn test_off_by_one_previous_epoch_last_slot_does_not_satisfy() {
         "second-to-last slot of end_epoch must NOT satisfy"
     );
 
+    // Provide complete observation before the final boundary tick.
+    observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
+
     // Last slot of end_epoch — NOW satisfies.
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(machine.is_signing_enabled(&pubkey), "last slot of end_epoch must satisfy");
 }
 
 /// Full slot-by-slot walk with monitoring_epochs = 2.
+///
+/// D-2: complete observation for [100, 102] is provided before the final tick.
 #[test]
 fn test_full_slot_walk_monitoring_epochs_2() {
     let monitoring_epochs: u64 = 2;
@@ -193,6 +237,9 @@ fn test_full_slot_walk_monitoring_epochs_2() {
         );
     }
 
+    // Provide complete observation for the full 3-epoch window before the boundary tick.
+    observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
+
     // Last slot of end_epoch — must flip to true.
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(machine.is_signing_enabled(&pubkey), "must become true at last slot of end_epoch");
@@ -204,6 +251,8 @@ fn test_full_slot_walk_monitoring_epochs_2() {
 
 /// A restart that skips the exact last slot of end_epoch must still resolve to Safe.
 /// tick(end_epoch, SLOTS_PER_EPOCH-2) stays Pending; tick(end_epoch+1, 0) → Safe.
+///
+/// D-2: complete observation must be provided for the window before the past-boundary tick.
 #[test]
 fn test_missed_tick_resolves_to_safe_on_next_epoch() {
     let monitoring_epochs: u64 = 1;
@@ -218,6 +267,9 @@ fn test_missed_tick_resolves_to_safe_on_next_epoch() {
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 2);
     assert!(!machine.is_signing_enabled(&pubkey), "second-to-last slot must be Pending");
 
+    // Provide complete observation before the missed-tick recovery tick.
+    observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
+
     // Miss the exact boundary; tick with first slot of end_epoch+1 → must resolve Safe.
     machine.tick(end_epoch + 1, 0);
     assert!(
@@ -227,6 +279,8 @@ fn test_missed_tick_resolves_to_safe_on_next_epoch() {
 }
 
 /// tick with current_epoch >> end_epoch also resolves to Safe.
+///
+/// D-2: complete observation is provided before the far-past tick.
 #[test]
 fn test_tick_far_past_end_epoch_resolves_to_safe() {
     let monitoring_epochs: u64 = 2;
@@ -236,6 +290,9 @@ fn test_tick_far_past_end_epoch_resolves_to_safe() {
     let machine = machine_no_prior(monitoring_epochs);
     let pubkey = new_pubkey();
     machine.register(&pubkey, start_epoch);
+
+    // Provide complete observation for the window.
+    observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
 
     // Jump many epochs ahead.
     machine.tick(end_epoch + 100, 0);
@@ -266,6 +323,7 @@ fn test_restart_safe_skip_stale_attestation_goes_pending() {
 }
 
 /// Recent attestation within the monitoring window → immediate Safe on register.
+/// (D-2 unaffected: restart-safe-skip bypasses liveness observation.)
 #[test]
 fn test_restart_safe_skip_recent_attestation_gives_immediate_safe() {
     let monitoring_epochs: u64 = 2;
@@ -284,6 +342,7 @@ fn test_restart_safe_skip_recent_attestation_gives_immediate_safe() {
 }
 
 /// Attestation exactly at the window edge (distance == monitoring_epochs) → Safe.
+/// (D-2 unaffected: restart-safe-skip bypasses liveness observation.)
 #[test]
 fn test_restart_safe_skip_edge_of_window_gives_safe() {
     let monitoring_epochs: u64 = 2;
@@ -351,6 +410,7 @@ fn test_restart_safe_skip_blocked_at_low_epoch() {
 // Idempotency (extended — should-fix #5)
 // ---------------------------------------------------------------------------
 
+/// D-2: tick to Safe requires complete window observation first.
 #[test]
 fn test_register_idempotent_does_not_reset_after_safe() {
     let monitoring_epochs: u64 = 1;
@@ -361,7 +421,8 @@ fn test_register_idempotent_does_not_reset_after_safe() {
     let pubkey = new_pubkey();
     machine.register(&pubkey, start_epoch);
 
-    // Tick to Safe.
+    // Observe completely, then tick to Safe.
+    observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(machine.is_signing_enabled(&pubkey));
 
@@ -374,6 +435,9 @@ fn test_register_idempotent_does_not_reset_after_safe() {
 }
 
 /// Second register while Pending must NOT extend end_epoch.
+///
+/// D-2: the original end_epoch (11) still applies; complete observation for the
+/// original window is provided before the boundary tick.
 #[test]
 fn test_register_idempotent_while_pending_does_not_extend_window() {
     let monitoring_epochs: u64 = 1;
@@ -387,6 +451,9 @@ fn test_register_idempotent_while_pending_does_not_extend_window() {
     // Attempt to re-register with a later epoch — must not extend the window.
     let later_epoch: Epoch = 50;
     machine.register(&pubkey, later_epoch);
+
+    // Provide complete observation for the ORIGINAL window (not the re-register epoch).
+    observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
 
     // Original end_epoch (11) still applies; tick at last slot of epoch 11 → Safe.
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
@@ -473,10 +540,15 @@ fn test_detected_is_terminal_tick_does_not_resurrect() {
     assert!(!machine.is_signing_enabled(&pubkey), "Detected is terminal even many epochs later");
 }
 
+/// not-live observation does not Detect AND (with complete window observation) allows Safe.
+///
+/// D-2: observe_liveness for start_epoch alone records that epoch. We must also
+/// observe end_epoch to complete the window.  Both calls use not-live samples.
 #[test]
 fn test_observe_liveness_not_live_does_not_detect() {
     let monitoring_epochs: u64 = 1;
     let start_epoch: Epoch = 30;
+    let end_epoch = start_epoch + monitoring_epochs;
 
     let machine = machine_no_prior(monitoring_epochs);
     let pubkey = new_pubkey();
@@ -484,15 +556,19 @@ fn test_observe_liveness_not_live_does_not_detect() {
 
     machine.register(&pubkey, start_epoch);
 
-    let samples = vec![ValidatorLivenessData { index: pubkey_hex, is_live: false }];
+    // Observe start_epoch as not-live (complete entry, present).
+    let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false }];
     machine.observe_liveness(start_epoch, &samples).expect("must not fail");
 
-    // Tick to end — if not Detected, should still become Safe at last slot.
-    let end_epoch = start_epoch + monitoring_epochs;
+    // Observe end_epoch as not-live (D-2: window is [start, end] inclusive).
+    let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false }];
+    machine.observe_liveness(end_epoch, &samples).expect("must not fail");
+
+    // Tick to end — fully observed and not Detected → Safe.
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
         machine.is_signing_enabled(&pubkey),
-        "not-live observation must not block Safe transition"
+        "not-live observation with complete window must allow Safe transition"
     );
 }
 
@@ -501,6 +577,9 @@ fn test_observe_liveness_not_live_does_not_detect() {
 // ---------------------------------------------------------------------------
 
 /// An is_live observation BEFORE start_epoch must be ignored.
+///
+/// D-2: out-of-window observations do not count toward `observed_epochs`.
+/// Complete in-window observation is provided separately before the final tick.
 #[test]
 fn test_observe_liveness_before_window_is_ignored() {
     let monitoring_epochs: u64 = 2;
@@ -513,7 +592,7 @@ fn test_observe_liveness_before_window_is_ignored() {
 
     machine.register(&pubkey, start_epoch);
 
-    // Observation at epoch before the window.
+    // Observation at epoch before the window (out-of-window — no in-window expected).
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
     machine.observe_liveness(start_epoch - 1, &samples).expect("must not fail");
 
@@ -523,15 +602,20 @@ fn test_observe_liveness_before_window_is_ignored() {
         "before-window observation must be ignored — still Pending"
     );
 
+    // Provide complete in-window observation before ticking to Safe.
+    observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
+
     // Tick to Safe — confirms not Detected.
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
         machine.is_signing_enabled(&pubkey),
-        "before-window observation must not Detect; Safe at end_epoch"
+        "before-window observation must not Detect; Safe at end_epoch after complete in-window observation"
     );
 }
 
 /// An is_live observation AFTER end_epoch must be ignored.
+///
+/// D-2: complete in-window observation is provided before the final tick.
 #[test]
 fn test_observe_liveness_after_window_is_ignored() {
     let monitoring_epochs: u64 = 1;
@@ -544,7 +628,10 @@ fn test_observe_liveness_after_window_is_ignored() {
 
     machine.register(&pubkey, start_epoch);
 
-    // Observation at epoch after the window.
+    // Observation at epoch after the window (out-of-window).
+    // Note: the validator is still Pending when this is called; end_epoch+1 is
+    // outside [start_epoch, end_epoch] so the validator is not "expected" for
+    // that epoch.  The call must return Ok (no IncompleteLiveness).
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
     machine.observe_liveness(end_epoch + 1, &samples).expect("must not fail");
 
@@ -554,11 +641,14 @@ fn test_observe_liveness_after_window_is_ignored() {
         "after-window observation must be ignored — still Pending"
     );
 
+    // Provide complete in-window observation before the boundary tick.
+    observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
+
     // Tick to Safe — confirms not Detected.
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
         machine.is_signing_enabled(&pubkey),
-        "after-window observation must not Detect; Safe at end_epoch"
+        "after-window observation must not Detect; Safe at end_epoch after complete observation"
     );
 }
 
@@ -584,6 +674,7 @@ fn test_cancel_removes_validator_state() {
     );
 }
 
+/// D-2: after cancel + re-register, the new window requires fresh complete observation.
 #[test]
 fn test_cancel_then_reregister_starts_fresh() {
     let monitoring_epochs: u64 = 1;
@@ -593,12 +684,13 @@ fn test_cancel_then_reregister_starts_fresh() {
     let machine = machine_no_prior(monitoring_epochs);
     let pubkey = new_pubkey();
 
-    // Tick to Safe.
+    // Observe completely and tick to Safe.
     machine.register(&pubkey, start_epoch);
+    observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(machine.is_signing_enabled(&pubkey));
 
-    // Cancel, then re-register → Pending again.
+    // Cancel, then re-register → Pending again (observed_epochs reset to empty).
     machine.cancel(&pubkey);
     machine.register(&pubkey, start_epoch);
     assert!(

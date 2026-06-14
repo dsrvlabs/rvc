@@ -13,6 +13,19 @@ pub struct ValidatorLivenessData {
 }
 
 /// Abstraction for querying validator liveness from a beacon node.
+///
+/// # Completeness contract (D-2, Issue 2.7)
+///
+/// A response from `check_liveness` MUST include an entry for every validator
+/// index that was requested.  A missing entry is treated as **inconclusive**
+/// (fail-closed): `ForwardWindowMachine::observe_liveness` will not record
+/// that epoch as observed for the absent validator, preventing a `Safe`
+/// transition until a complete response is received.
+///
+/// Implementors must NOT silently drop entries for validators whose liveness
+/// could not be determined.  If the beacon node returns a partial response,
+/// the implementor should return `Err(DoppelgangerError::IncompleteLiveness)`
+/// rather than an incomplete `Vec`.
 #[async_trait]
 pub trait LivenessChecker: Send + Sync {
     async fn check_liveness(

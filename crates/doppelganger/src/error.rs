@@ -9,4 +9,7 @@ pub enum DoppelgangerError {
 
     #[error("slashing DB query failed: {0}")]
     SlashingDbError(String),
+
+    #[error("incomplete liveness response: missing entry for one or more requested validators")]
+    IncompleteLiveness,
 }
