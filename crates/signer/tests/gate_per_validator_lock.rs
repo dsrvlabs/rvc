@@ -1,11 +1,19 @@
-//! RED test: per-validator lock serializes concurrent sign_block calls for the same pubkey.
+//! Test: concurrent sign_block calls for the same pubkey are serialized safely.
 //!
-//! Two concurrent sign_block calls for the SAME pubkey at DIFFERENT slots must
-//! complete without any slashing-DB race or inconsistency.  Both calls must
-//! succeed and exactly two rows must be committed.
+//! Two concurrent sign_block calls for the SAME pubkey at the SAME slot with the
+//! SAME signing root (an idempotent re-sign) must BOTH succeed and commit EXACTLY
+//! ONE row — regardless of which task acquires the per-pubkey lock first.
 //!
-//! This exercises the ValidatorLockMap: calls for the same pubkey are serialized,
-//! while the test shows both operations complete successfully (no data race).
+//! Why same-slot/same-root (not two different slots): EIP-3076 block protection
+//! rejects a block at a slot below the highest already-signed slot. Two concurrent
+//! signs at distinct slots (e.g. 100 and 101) have an order-dependent outcome —
+//! if slot 101 commits first, the slot-100 sign is *correctly* rejected as
+//! below-watermark. That is correct gate behavior, not a serialization failure,
+//! so it cannot be asserted as "both succeed". The same-slot/same-root re-sign is
+//! order-INDEPENDENT: whichever task wins, the other observes the committed row as
+//! an idempotent re-sign. This deterministically exercises the serialization
+//! invariant (no race-induced UNIQUE violation, no double row, no lost write)
+//! under concurrency, including under heavy parallel `cargo test --workspace` load.
 
 use std::sync::Arc;
 
@@ -44,43 +52,53 @@ async fn test_sign_block_per_validator_lock_serializes_concurrent_calls() {
     let lock_map = Arc::new(ValidatorLockMap::new());
 
     // Build two gate references sharing the same underlying resources.
-    let gate = Arc::new(SigningGate::new(
-        Arc::clone(&db),
-        Arc::new(AlwaysAllowed),
-        Arc::clone(&signer),
-        Arc::clone(&lock_map),
-    ));
+    // Use a generous sign timeout: this test exercises serialization, not the
+    // timeout. Under heavy parallel `cargo test --workspace` load the
+    // spawn_blocking + block_on(sign) thread can be starved, and the default 4s
+    // timeout could spuriously fire and turn a sign into SigningFailed (causing
+    // a flaky <2-rows assertion). 60s removes that timing dependency.
+    let gate = Arc::new(
+        SigningGate::new(
+            Arc::clone(&db),
+            Arc::new(AlwaysAllowed),
+            Arc::clone(&signer),
+            Arc::clone(&lock_map),
+        )
+        .with_sign_timeout(std::time::Duration::from_secs(60)),
+    );
 
-    let signing_root_a: Root = [0xaa; 32];
-    let signing_root_b: Root = [0xbb; 32];
+    // Same slot, same signing root → an idempotent re-sign. Order-independent:
+    // whichever task commits first, the other observes the committed row as a
+    // re-sign of the identical root and also succeeds, leaving exactly one row.
+    const SLOT: u64 = 100;
+    let signing_root: Root = [0xaa; 32];
 
     let pubkey_a = pubkey.clone();
     let pubkey_b = pubkey.clone();
     let gate_a = Arc::clone(&gate);
     let gate_b = Arc::clone(&gate);
 
-    // Launch two concurrent sign_block calls for different slots.
+    // Launch two concurrent sign_block calls for the SAME pubkey/slot/root.
     let task_a =
-        tokio::spawn(async move { gate_a.sign_block(&pubkey_a, 100, signing_root_a, GVR).await });
+        tokio::spawn(async move { gate_a.sign_block(&pubkey_a, SLOT, signing_root, GVR).await });
     let task_b =
-        tokio::spawn(async move { gate_b.sign_block(&pubkey_b, 101, signing_root_b, GVR).await });
+        tokio::spawn(async move { gate_b.sign_block(&pubkey_b, SLOT, signing_root, GVR).await });
 
     let result_a = task_a.await.expect("task_a did not panic");
     let result_b = task_b.await.expect("task_b did not panic");
 
-    // Both must succeed (different slots, no slashing conflict).
-    assert!(result_a.is_ok(), "sign_block slot 100 must succeed; err: {:?}", result_a.err());
-    assert!(result_b.is_ok(), "sign_block slot 101 must succeed; err: {:?}", result_b.err());
+    // Both must succeed: the first stages+commits, the second is an idempotent
+    // re-sign of the same root. A serialization failure would surface here as a
+    // UNIQUE-index violation on the second commit.
+    assert!(result_a.is_ok(), "concurrent re-sign A must succeed; err: {:?}", result_a.err());
+    assert!(result_b.is_ok(), "concurrent re-sign B must succeed; err: {:?}", result_b.err());
 
-    // Exactly two rows must be committed — serialization ensures no lost writes.
+    // Exactly ONE row: the re-sign must not double-insert under concurrency.
     let blocks = db.get_blocks(&pubkey_hex).expect("get_blocks must not fail");
     assert_eq!(
         blocks.len(),
-        2,
-        "both sign_block calls must have committed exactly one row each; found: {blocks:?}"
+        1,
+        "concurrent same-slot/same-root re-sign must commit exactly one row; found: {blocks:?}"
     );
-
-    let slots: Vec<u64> = blocks.iter().map(|b| b.slot).collect();
-    assert!(slots.contains(&100), "slot 100 row must be present; blocks: {blocks:?}");
-    assert!(slots.contains(&101), "slot 101 row must be present; blocks: {blocks:?}");
+    assert_eq!(blocks[0].slot, SLOT, "the single committed row must be at the signed slot");
 }
