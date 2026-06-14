@@ -91,8 +91,8 @@ use slashing::SlashingDb; // kept for new_v2 constructor parameter type
 /// Default per-sign timeout passed to the gate: 4 seconds.
 ///
 /// Well under a 12-second Ethereum slot.  Bounds the SQLite write-lock hold
-/// duration per BUG-003.  Configure via `SignerServiceImpl::with_sign_timeout`
-/// when the operator wants a different value.
+/// duration per BUG-003.  The `with_sign_timeout` builder is available but
+/// not yet wired to a CLI flag; it exists for future operator configuration.
 const DEFAULT_SIGN_TIMEOUT: Duration = Duration::from_secs(4);
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -168,9 +168,9 @@ impl SignerServiceImpl {
         self
     }
 
-    /// Override the sign timeout on the embedded gate.
+    /// Override the sign timeout on the embedded gate (builder style).
     ///
-    /// Use this when the operator configures a non-default timeout.
+    /// Available for future CLI-flag wiring; not yet operator-configurable.
     /// Has no effect when no gate is present (i.e. `new()` path).
     pub fn with_sign_timeout(mut self, timeout: Duration) -> Self {
         if let Some(gate) = self.gate.take() {
@@ -180,6 +180,9 @@ impl SignerServiceImpl {
     }
 
     /// Borrow the gate or return an `internal` status if it's missing.
+    ///
+    /// Used only by **slashable** handlers (block + attestation), which must fail
+    /// closed when no slashing DB is configured.
     #[allow(clippy::result_large_err)]
     fn require_gate(&self) -> Result<&SigningGate, Status> {
         self.gate.as_ref().ok_or_else(|| {
@@ -190,6 +193,40 @@ impl SignerServiceImpl {
             )
         })
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Non-slashable backend fallback (BUG-001 fix, Issue 2.10a review)
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Pre-2.10a, non-slashable handlers called `backend.sign` directly.  Post-2.10a
+// the gate owns signing, but the gate is `None` when `--disable-slashing-protection
+// + RVC_ALLOW_INSECURE=true` is set (no DB, SignerServiceImpl::new path).
+//
+// Slashable handlers (block, attestation) keep `require_gate()` — fail-closed
+// without a DB, correct.
+//
+// Non-slashable handlers must work without a DB.  When no gate is present they
+// fall through to the backend directly, preserving pre-2.10a semantics.
+
+/// Sign using the backend, mapping `SigningBackendError` to `tonic::Status`.
+///
+/// Used as the no-gate fallback for non-slashable handlers on the
+/// `--disable-slashing-protection` path.
+async fn sign_via_backend(
+    backend: &dyn crate::backend::SigningBackend,
+    signing_root: &[u8; 32],
+    pubkey: &[u8; 48],
+) -> Result<Vec<u8>, Status> {
+    backend.sign(signing_root, pubkey).await.map(|b| b.to_vec()).map_err(|e| match e {
+        crate::backend::SigningBackendError::KeyNotFound(_) => {
+            Status::not_found("unknown public key")
+        }
+        other => {
+            tracing::error!(error = %other, "signing backend error");
+            Status::internal("internal signing error")
+        }
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -248,35 +285,63 @@ fn ssz_err(e: SszDecodeError) -> Status {
 
 /// Map a `SigningGateError` to a gRPC `Status`.
 ///
-/// Mapping rationale:
-/// - `BlockedByDoppelganger` → `FailedPrecondition`: the validator is not yet
-///   cleared; the caller should back off and retry after the monitoring window.
-/// - `BlockedBySlashingDb` → `FailedPrecondition`: a slashable conflict was
-///   detected; the caller MUST NOT retry with a different root for the same slot.
-/// - `SlashingDbCommitFailed` → `Internal`: the sign succeeded but the DB write
-///   failed; same-root retry is safe once the DB recovers.
-/// - `KeyNotFound` → `NotFound`: the pubkey is not loaded in the backend.
-/// - `SigningFailed` → `Internal`: BLS backend error or sign timeout.
-/// - `UnknownPubkey` → `FailedPrecondition`: pubkey not registered.
+/// # Error sanitization
+///
+/// SQLite paths, rusqlite internals, and other low-level DB details MUST NOT
+/// be forwarded to gRPC callers.  Only slashing-violation details
+/// (`SlashableBlock`/`SlashableAttestation` — which carry epoch/slot numbers
+/// safe to surface) are included in the response body.  All other DB errors
+/// are logged server-side and a generic message is returned to the caller.
+///
+/// # Mapping rationale
+///
+/// - `BlockedByDoppelganger` → `FailedPrecondition`: validator not yet cleared;
+///   caller should back off and retry after the monitoring window.
+/// - `BlockedBySlashingDb(SlashableBlock|SlashableAttestation)` →
+///   `FailedPrecondition` with violation details: slashable conflict detected.
+///   Caller MUST NOT retry with a different root for the same slot/epoch.
+/// - `BlockedBySlashingDb(other)` → `FailedPrecondition` generic: DB I/O error
+///   during staging — detail is logged server-side to avoid leaking rusqlite paths.
+/// - `SlashingDbCommitFailed` → `Internal` generic: sign succeeded but DB write
+///   failed; same-root retry is safe.  Detail logged server-side.
+/// - `KeyNotFound` → `NotFound`: pubkey not loaded in backend.
+/// - `SigningFailed` → `Internal`: BLS backend error or sign timeout.  Detail
+///   logged server-side.
+/// - `UnknownPubkey` → `NotFound`: consistent with `KeyNotFound`.  Currently
+///   unreachable (the gate returns `BlockedByDoppelganger` for unknown pubkeys
+///   because `is_signing_enabled` returns `false` for them).
 fn gate_err_to_status(e: SigningGateError) -> Status {
+    use slashing::SlashingError;
     match e {
         SigningGateError::BlockedByDoppelganger => {
             Status::failed_precondition("signing blocked by doppelganger gate")
         }
-        SigningGateError::BlockedBySlashingDb(inner) => {
-            Status::failed_precondition(format!("slashing protection violation: {inner}"))
-        }
+        SigningGateError::BlockedBySlashingDb(inner) => match &inner {
+            // Slashing-violation details (epoch/slot numbers) are safe to surface.
+            SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => {
+                Status::failed_precondition(format!("slashing protection violation: {inner}"))
+            }
+            // All other DB errors (DatabaseError, MigrationError, etc.) may contain
+            // rusqlite internals or file paths — log server-side, return generic.
+            other => {
+                tracing::error!(error = %other, "slashing DB error during staging");
+                Status::failed_precondition("slashing protection error")
+            }
+        },
         SigningGateError::SlashingDbCommitFailed(inner) => {
-            Status::internal(format!("slashing DB commit failed: {inner}"))
+            // Commit error: same-root retry is safe.  Log detail, return generic.
+            tracing::error!(error = %inner, "slashing DB commit failed after successful sign");
+            Status::internal("slashing DB commit failed; same-root retry is safe")
         }
         SigningGateError::KeyNotFound => Status::not_found("unknown public key"),
         SigningGateError::SigningFailed(msg) => {
             tracing::error!(error = %msg, "signing backend error");
             Status::internal("internal signing error")
         }
-        SigningGateError::UnknownPubkey => {
-            Status::failed_precondition("pubkey not registered with signing gate")
-        }
+        // Currently unreachable: unknown pubkeys return BlockedByDoppelganger because
+        // AlwaysEnabled returns false for them.  Mapped to NotFound for consistency
+        // with KeyNotFound if the gate ever distinguishes the two cases.
+        SigningGateError::UnknownPubkey => Status::not_found("unknown public key"),
     }
 }
 
@@ -361,8 +426,10 @@ impl SignerServiceV2 for SignerServiceImpl {
 
         let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
         let gate = self.require_gate()?;
-        let sig =
-            gate.sign_block(&pubkey, slot, signing_root, gvr).await.map_err(gate_err_to_status)?;
+        let sig = gate
+            .sign_block(&pubkey, slot, signing_root, gvr, &client_cn)
+            .await
+            .map_err(gate_err_to_status)?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -406,8 +473,10 @@ impl SignerServiceV2 for SignerServiceImpl {
 
         let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
         let gate = self.require_gate()?;
-        let sig =
-            gate.sign_block(&pubkey, slot, signing_root, gvr).await.map_err(gate_err_to_status)?;
+        let sig = gate
+            .sign_block(&pubkey, slot, signing_root, gvr, &client_cn)
+            .await
+            .map_err(gate_err_to_status)?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -448,10 +517,12 @@ impl SignerServiceV2 for SignerServiceImpl {
         let domain = compute_domain(DOMAIN_RANDAO, current_version, gvr);
         let signing_root = compute_signing_root(&epoch, domain);
 
-        let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-        let gate = self.require_gate()?;
-        let sig =
-            gate.sign_randao_reveal(&pubkey, signing_root).await.map_err(gate_err_to_status)?;
+        let sig = if let Some(gate) = &self.gate {
+            let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
+            gate.sign_randao_reveal(&pubkey, signing_root).await.map_err(gate_err_to_status)?
+        } else {
+            sign_via_backend(self.backend.as_ref(), &signing_root, &pubkey_bytes).await?
+        };
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -536,7 +607,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
         let gate = self.require_gate()?;
         let sig = gate
-            .sign_attestation(&pubkey, source_epoch, target_epoch, signing_root, gvr)
+            .sign_attestation(&pubkey, source_epoch, target_epoch, signing_root, gvr, &client_cn)
             .await
             .map_err(gate_err_to_status)?;
 
@@ -599,13 +670,16 @@ impl SignerServiceV2 for SignerServiceImpl {
         let signing_root = compute_signing_root(&agg_and_proof, domain);
 
         // SS-2/SS-3: route through gate.sign_aggregate_and_proof which is non-slashable.
-        // No attestation staging occurs here.
-        let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-        let gate = self.require_gate()?;
-        let sig = gate
-            .sign_aggregate_and_proof(&pubkey, signing_root)
-            .await
-            .map_err(gate_err_to_status)?;
+        // No attestation staging occurs here.  Also works without a slashing DB
+        // (--disable-slashing-protection) since aggregates are non-slashable.
+        let sig = if let Some(gate) = &self.gate {
+            let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
+            gate.sign_aggregate_and_proof(&pubkey, signing_root)
+                .await
+                .map_err(gate_err_to_status)?
+        } else {
+            sign_via_backend(self.backend.as_ref(), &signing_root, &pubkey_bytes).await?
+        };
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -659,12 +733,14 @@ impl SignerServiceV2 for SignerServiceImpl {
         let domain = compute_domain(DOMAIN_SYNC_COMMITTEE, current_version, gvr);
         let signing_root = compute_signing_root(&beacon_block_root, domain);
 
-        let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-        let gate = self.require_gate()?;
-        let sig = gate
-            .sign_sync_committee_message(&pubkey, signing_root)
-            .await
-            .map_err(gate_err_to_status)?;
+        let sig = if let Some(gate) = &self.gate {
+            let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
+            gate.sign_sync_committee_message(&pubkey, signing_root)
+                .await
+                .map_err(gate_err_to_status)?
+        } else {
+            sign_via_backend(self.backend.as_ref(), &signing_root, &pubkey_bytes).await?
+        };
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -711,10 +787,12 @@ impl SignerServiceV2 for SignerServiceImpl {
             SyncAggregatorSelectionData { slot, subcommittee_index: r.subcommittee_index };
         let signing_root = compute_signing_root(&selection_data, domain);
 
-        let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-        let gate = self.require_gate()?;
-        let sig =
-            gate.sign_selection_proof(&pubkey, signing_root).await.map_err(gate_err_to_status)?;
+        let sig = if let Some(gate) = &self.gate {
+            let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
+            gate.sign_selection_proof(&pubkey, signing_root).await.map_err(gate_err_to_status)?
+        } else {
+            sign_via_backend(self.backend.as_ref(), &signing_root, &pubkey_bytes).await?
+        };
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -775,12 +853,14 @@ impl SignerServiceV2 for SignerServiceImpl {
         let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, current_version, gvr);
         let signing_root = compute_signing_root(&cap, domain);
 
-        let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-        let gate = self.require_gate()?;
-        let sig = gate
-            .sign_contribution_and_proof(&pubkey, signing_root)
-            .await
-            .map_err(gate_err_to_status)?;
+        let sig = if let Some(gate) = &self.gate {
+            let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
+            gate.sign_contribution_and_proof(&pubkey, signing_root)
+                .await
+                .map_err(gate_err_to_status)?
+        } else {
+            sign_via_backend(self.backend.as_ref(), &signing_root, &pubkey_bytes).await?
+        };
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -835,12 +915,14 @@ impl SignerServiceV2 for SignerServiceImpl {
         let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_hash);
         let signing_root = compute_signing_root(&registration, domain);
 
-        let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-        let gate = self.require_gate()?;
-        let sig = gate
-            .sign_builder_registration(&pubkey, signing_root)
-            .await
-            .map_err(gate_err_to_status)?;
+        let sig = if let Some(gate) = &self.gate {
+            let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
+            gate.sign_builder_registration(&pubkey, signing_root)
+                .await
+                .map_err(gate_err_to_status)?
+        } else {
+            sign_via_backend(self.backend.as_ref(), &signing_root, &pubkey_bytes).await?
+        };
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -889,10 +971,12 @@ impl SignerServiceV2 for SignerServiceImpl {
         let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, current_version, gvr);
         let signing_root = compute_signing_root(&exit, domain);
 
-        let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-        let gate = self.require_gate()?;
-        let sig =
-            gate.sign_voluntary_exit(&pubkey, signing_root).await.map_err(gate_err_to_status)?;
+        let sig = if let Some(gate) = &self.gate {
+            let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
+            gate.sign_voluntary_exit(&pubkey, signing_root).await.map_err(gate_err_to_status)?
+        } else {
+            sign_via_backend(self.backend.as_ref(), &signing_root, &pubkey_bytes).await?
+        };
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -1283,6 +1367,58 @@ mod tests {
         });
         let err = svc.sign_beacon_block(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Internal);
+    }
+
+    // --- BUG-001 regression: non-slashable ops work without a slashing DB ---
+
+    /// BUG-001 regression: `sign_randao_reveal` (a non-slashable operation) on a
+    /// service with no slashing DB (`SignerServiceImpl::new`, i.e.
+    /// `--disable-slashing-protection` mode) must return a 96-byte signature, NOT
+    /// `Internal`.  Pre-fix, every non-slashable handler called `require_gate()?`
+    /// which returned `Internal` when `gate.is_none()`.
+    #[tokio::test]
+    async fn test_v2_sign_randao_no_db_returns_signature() {
+        let pubkey = test_pubkey_bytes();
+        // `make_service` uses `SignerServiceImpl::new` — no DB, no gate.
+        let svc = make_service(MockBackend::with_test_key());
+
+        let req = Request::new(SignRandaoRevealRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            epoch: 5,
+            fork_id: 4,
+        });
+        // Must succeed: RANDAO is non-slashable and must not require the DB.
+        let resp = svc
+            .sign_randao_reveal(req)
+            .await
+            .expect("sign_randao_reveal without a slashing DB must succeed (BUG-001 regression)");
+        assert_eq!(
+            resp.into_inner().signature.len(),
+            96,
+            "expected 96-byte BLS signature, got wrong length"
+        );
+    }
+
+    /// Companion to BUG-001: slashable ops (sign_beacon_block) still fail closed
+    /// without a DB — the fail-closed invariant must not be disturbed.
+    #[tokio::test]
+    async fn test_v2_sign_beacon_block_still_fails_closed_without_db() {
+        let pubkey = test_pubkey_bytes();
+        let svc = make_service(MockBackend::with_test_key()); // no DB
+
+        let req = Request::new(SignBeaconBlockRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            block_ssz: sample_block_ssz(42),
+            fork_id: 4,
+        });
+        let err = svc.sign_beacon_block(req).await.unwrap_err();
+        assert_eq!(
+            err.code(),
+            tonic::Code::Internal,
+            "slashable op without DB must return Internal (fail-closed)"
+        );
     }
 
     // --- ListPublicKeys / GetStatus v2 ---

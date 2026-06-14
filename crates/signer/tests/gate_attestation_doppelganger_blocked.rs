@@ -47,7 +47,7 @@ async fn test_sign_attestation_blocked_by_doppelganger_no_row_committed() {
     let target_epoch = 11u64;
 
     let result =
-        gate.sign_attestation(&pubkey, source_epoch, target_epoch, signing_root, GVR).await;
+        gate.sign_attestation(&pubkey, source_epoch, target_epoch, signing_root, GVR, "test").await;
 
     // Must be blocked.
     assert!(

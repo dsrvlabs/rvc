@@ -45,7 +45,7 @@ async fn test_sign_block_blocked_by_doppelganger_no_row_committed() {
     let signing_root: Root = [0xbe; 32];
     let slot = 42u64;
 
-    let result = gate.sign_block(&pubkey, slot, signing_root, GVR).await;
+    let result = gate.sign_block(&pubkey, slot, signing_root, GVR, "test").await;
 
     // Must be blocked.
     assert!(

@@ -72,7 +72,7 @@ async fn test_unknown_pubkey_slashable_path_fails_closed() {
     // Signer only has the "known" key, but we sign for the unknown pubkey.
     let gate = make_gate(known_sk, Arc::clone(&db), enablement);
 
-    let result = gate.sign_block(&unknown_pubkey, 42, [0xfe; 32], GVR).await;
+    let result = gate.sign_block(&unknown_pubkey, 42, [0xfe; 32], GVR, "test").await;
 
     assert!(
         matches!(result, Err(SigningGateError::BlockedByDoppelganger)),

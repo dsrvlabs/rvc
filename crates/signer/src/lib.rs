@@ -17,7 +17,7 @@ pub use crypto::is_aggregator;
 pub use doppelganger::SigningEnablement;
 pub use error::SigningGateError;
 pub use fail_closed::FailClosedDefault;
-pub use gate::SigningGate;
+pub use gate::{SigningGate, AUDIT_CN_DEFAULT};
 pub use locks::ValidatorLockMap;
 pub use traits::ValidatorSigner;
 
@@ -55,13 +55,19 @@ pub enum SignerError {
     SigningFailed(String),
 }
 
-/// Truncates an error message body to a maximum length, appending
+/// Truncates an error message body to at most `max` bytes, appending
 /// "... (truncated)" if the message exceeds the limit.
+///
+/// The cut point is adjusted to the highest valid UTF-8 character boundary
+/// that is ≤ `max` bytes, so the result is always a valid `String` even when
+/// `msg` contains multi-byte Unicode sequences.
 fn truncate_error_body(msg: &str, max: usize) -> String {
     if msg.len() <= max {
         msg.to_string()
     } else {
-        format!("{}... (truncated)", &msg[..max])
+        // Walk back from `max` to find a valid char boundary.
+        let safe = (0..=max).rev().find(|&i| msg.is_char_boundary(i)).unwrap_or(0);
+        format!("{}... (truncated)", &msg[..safe])
     }
 }
 
@@ -79,87 +85,28 @@ impl From<SigningError> for SignerError {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// AlwaysEnabled — default enablement for SignerService::new()
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A `SigningEnablement` that always allows signing.
+/// Service that combines signing through CompositeSigner with slashing protection.
 ///
-/// Used by `SignerService::new()` so the local VC path stays compatible with
-/// existing tests and callers that do not inject an enablement.  In production,
-/// the `ForwardWindowMachine` is injected via `SignerService::new_with_enablement()`
-/// (wired in 2.10b/main.rs).
-pub struct AlwaysEnabled;
-
-impl SigningEnablement for AlwaysEnabled {
-    fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
-        true
-    }
-}
-
-/// Service that combines signing through `SigningGate` with slashing protection.
+/// Record-then-sign order is mandated by Ethereum consensus spec (phase0/validator.md):
+/// "Save a record to hard disk ... Generate and broadcast."
+/// The per-validator mutex prevents TOCTOU between concurrent signing requests.
 ///
-/// `sign_attestation` and `sign_block` still run the per-validator async lock +
-/// stage → sign → commit/discard logic in their own bodies to preserve metric
-/// instrumentation (ISSUE-3.12).  The embedded `gate` field is used by
-/// `new_with_enablement()` callers (production path, wired in 2.10b/main.rs)
-/// and serves as the doppelganger-aware signing seam for non-instrumented paths.
+/// # Gate integration (Issue 2.10b)
 ///
-/// Both the service's own lock map and the gate's lock map are shared via
-/// `Arc<ValidatorLockMap>` so there is only one lock map in memory.
+/// `sign_block` and `sign_attestation` currently run their own stage → sign →
+/// commit/discard loops to preserve `RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS`
+/// metric instrumentation (ISSUE-3.12).  Full routing through `SigningGate`
+/// (with the real `ForwardWindowMachine` enablement) is deferred to Issue 2.10b.
 pub struct SignerService {
     signer: Arc<CompositeSigner>,
     slashing_db: Arc<SlashingDb>,
-    validator_locks: Arc<ValidatorLockMap>,
-    /// Central signing gate — used by `new_with_enablement` callers.
-    ///
-    /// The gate holds an `Arc` clone of `slashing_db` and `validator_locks` so
-    /// they are shared; there is no duplication of the underlying resources.
-    gate: SigningGate,
+    validator_locks: ValidatorLockMap,
 }
 
 impl SignerService {
-    /// Creates a new `SignerService` with the provided composite signer and slashing database.
-    ///
-    /// Uses `AlwaysEnabled` enablement so the doppelganger gate always passes.
-    /// For production use with real doppelganger detection, use
-    /// [`new_with_enablement`][Self::new_with_enablement].
+    /// Creates a new SignerService with the provided composite signer and slashing database.
     pub fn new(signer: Arc<CompositeSigner>, slashing_db: Arc<SlashingDb>) -> Self {
-        let locks = Arc::new(ValidatorLockMap::new());
-        let gate = SigningGate::new(
-            Arc::clone(&slashing_db),
-            Arc::new(AlwaysEnabled),
-            Arc::clone(&signer),
-            Arc::clone(&locks),
-        );
-        Self { signer, slashing_db, validator_locks: locks, gate }
-    }
-
-    /// Creates a `SignerService` with a caller-supplied `SigningEnablement`.
-    ///
-    /// Use this constructor in production (wired in 2.10b/main.rs) to inject
-    /// the `ForwardWindowMachine` doppelganger implementation.
-    pub fn new_with_enablement(
-        signer: Arc<CompositeSigner>,
-        slashing_db: Arc<SlashingDb>,
-        enablement: Arc<dyn SigningEnablement>,
-    ) -> Self {
-        let locks = Arc::new(ValidatorLockMap::new());
-        let gate = SigningGate::new(
-            Arc::clone(&slashing_db),
-            enablement,
-            Arc::clone(&signer),
-            Arc::clone(&locks),
-        );
-        Self { signer, slashing_db, validator_locks: locks, gate }
-    }
-
-    /// Returns a reference to the embedded `SigningGate`.
-    ///
-    /// Exposes the gate for integration tests that need to verify gate routing
-    /// (e.g. Issue 2.10a `integration_block_routed_through_gate.rs`).
-    pub fn gate(&self) -> &SigningGate {
-        &self.gate
+        Self { signer, slashing_db, validator_locks: ValidatorLockMap::new() }
     }
 
     /// Signs an attestation after checking slashing protection.

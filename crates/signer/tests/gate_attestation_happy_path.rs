@@ -60,7 +60,7 @@ async fn test_sign_attestation_happy_path_commits_row_and_blocks_conflict() {
     let signing_root: Root = [0xaa; 32];
 
     // First sign: must succeed.
-    let result = gate.sign_attestation(&pubkey, 10, 11, signing_root, GVR).await;
+    let result = gate.sign_attestation(&pubkey, 10, 11, signing_root, GVR, "test").await;
     assert!(result.is_ok(), "first sign_attestation must succeed; err: {:?}", result.err());
 
     // Must be 96 bytes.
@@ -81,7 +81,7 @@ async fn test_sign_attestation_happy_path_commits_row_and_blocks_conflict() {
     // Second sign with a different signing_root at the same target epoch must
     // be rejected as a DoubleVote by the slashing-protection check.
     let conflict_root: Root = [0xbb; 32];
-    let conflict = gate.sign_attestation(&pubkey, 10, 11, conflict_root, GVR).await;
+    let conflict = gate.sign_attestation(&pubkey, 10, 11, conflict_root, GVR, "test").await;
     assert!(
         matches!(conflict, Err(SigningGateError::BlockedBySlashingDb(_))),
         "conflicting attestation must return BlockedBySlashingDb; got: {conflict:?}"
@@ -107,7 +107,7 @@ async fn test_sign_attestation_signer_failure_no_phantom_row() {
     let pubkey_hex = hex::encode(pubkey.to_bytes());
 
     let signing_root: Root = [0xcc; 32];
-    let result = gate.sign_attestation(&pubkey, 20, 21, signing_root, GVR).await;
+    let result = gate.sign_attestation(&pubkey, 20, 21, signing_root, GVR, "test").await;
 
     assert!(
         matches!(result, Err(SigningGateError::KeyNotFound)),

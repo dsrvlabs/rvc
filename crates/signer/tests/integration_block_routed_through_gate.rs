@@ -78,7 +78,7 @@ async fn test_block_routing_slashing_protection_enforced_by_gate() {
     let signing_root_b: Root = [0xbb; 32];
 
     // First sign: must succeed and commit a slashing-DB row.
-    let first = gate.sign_block(&pubkey, slot, signing_root_a, GVR).await;
+    let first = gate.sign_block(&pubkey, slot, signing_root_a, GVR, "test").await;
     assert!(first.is_ok(), "first sign_block must succeed; err: {:?}", first.err());
 
     // Row must be committed.
@@ -87,7 +87,7 @@ async fn test_block_routing_slashing_protection_enforced_by_gate() {
     assert_eq!(rows.len(), 1, "slashing row must be committed after first sign");
 
     // Second sign — same slot, different root — must be blocked.
-    let second = gate.sign_block(&pubkey, slot, signing_root_b, GVR).await;
+    let second = gate.sign_block(&pubkey, slot, signing_root_b, GVR, "test").await;
     assert!(
         matches!(second, Err(SigningGateError::BlockedBySlashingDb(_))),
         "double-proposal must return BlockedBySlashingDb; got: {second:?}"
@@ -114,7 +114,7 @@ async fn test_block_routing_doppelganger_gate_blocks_and_no_phantom_row() {
     let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
     let signing_root: Root = [0xcc; 32];
 
-    let result = gate.sign_block(&pubkey, 100, signing_root, GVR).await;
+    let result = gate.sign_block(&pubkey, 100, signing_root, GVR, "test").await;
 
     // Must be blocked by the doppelganger gate.
     assert!(

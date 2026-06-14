@@ -86,8 +86,13 @@ use crate::error::SigningGateError;
 use crate::fail_closed::FailClosedDefault;
 use crate::locks::ValidatorLockMap;
 
-/// Audit CN recorded in `PubkeyScopedDb` for all gate-originated staging calls.
-const AUDIT_CN: &str = "signing-gate";
+/// Audit CN used in `PubkeyScopedDb` when no caller-supplied CN is available.
+///
+/// Slashable handlers pass the real mTLS client CN via the `client_cn` parameter
+/// of `sign_block` / `sign_attestation`; this constant is the fallback for any
+/// call site that does not have an mTLS context (e.g. crate-internal callers and
+/// integration tests).
+pub const AUDIT_CN_DEFAULT: &str = "signing-gate";
 
 /// Default per-sign timeout: 4 seconds — well under a 12-second Ethereum slot.
 ///
@@ -201,6 +206,9 @@ impl SigningGate {
     /// - `signing_root`: The pre-computed signing root (caller applies domain).
     /// - `gvr`: Genesis validators root — passed to `PubkeyScopedDb` for the
     ///   M-6 GVR pinning check.
+    /// - `client_cn`: mTLS client CN for the audit-log origin field.  Pass the CN
+    ///   extracted by the gRPC handler, or `AUDIT_CN_DEFAULT` when no mTLS context
+    ///   is available.
     ///
     /// # Returns
     ///
@@ -220,6 +228,7 @@ impl SigningGate {
         slot: u64,
         signing_root: Root,
         gvr: Root,
+        client_cn: &str,
     ) -> Result<Vec<u8>, SigningGateError> {
         let pubkey_bytes = pubkey.to_bytes();
         let pubkey_hex = hex::encode(pubkey_bytes);
@@ -256,10 +265,11 @@ impl SigningGate {
         let handle = tokio::runtime::Handle::current();
         let sign_timeout = self.sign_timeout;
         let pubkey_hex_clone = pubkey_hex.clone();
+        let client_cn_owned = client_cn.to_string();
 
         tokio::task::spawn_blocking(move || -> Result<Vec<u8>, SigningGateError> {
             let signing_root_hex = hex::encode(signing_root);
-            let scoped = PubkeyScopedDb::new(Arc::clone(&db), AUDIT_CN.to_string(), gvr);
+            let scoped = PubkeyScopedDb::new(Arc::clone(&db), client_cn_owned, gvr);
 
             let staged = scoped
                 .stage_block(&pubkey_hex_clone, slot, Some(signing_root_hex))
@@ -343,6 +353,9 @@ impl SigningGate {
     /// - `signing_root`: The pre-computed signing root (caller applies domain).
     /// - `gvr`: Genesis validators root — passed to `PubkeyScopedDb` for the
     ///   M-6 GVR pinning check.
+    /// - `client_cn`: mTLS client CN for the audit-log origin field.  Pass the CN
+    ///   extracted by the gRPC handler, or `AUDIT_CN_DEFAULT` when no mTLS context
+    ///   is available.
     ///
     /// # Returns
     ///
@@ -362,6 +375,7 @@ impl SigningGate {
         target_epoch: u64,
         signing_root: Root,
         gvr: Root,
+        client_cn: &str,
     ) -> Result<Vec<u8>, SigningGateError> {
         let pubkey_bytes = pubkey.to_bytes();
         let pubkey_hex = hex::encode(pubkey_bytes);
@@ -386,10 +400,11 @@ impl SigningGate {
         let handle = tokio::runtime::Handle::current();
         let sign_timeout = self.sign_timeout;
         let pubkey_hex_clone = pubkey_hex.clone();
+        let client_cn_owned = client_cn.to_string();
 
         tokio::task::spawn_blocking(move || -> Result<Vec<u8>, SigningGateError> {
             let signing_root_hex = hex::encode(signing_root);
-            let scoped = PubkeyScopedDb::new(Arc::clone(&db), AUDIT_CN.to_string(), gvr);
+            let scoped = PubkeyScopedDb::new(Arc::clone(&db), client_cn_owned, gvr);
 
             let staged = scoped
                 .stage_attestation(
@@ -599,9 +614,10 @@ impl SigningGate {
     ///   b) it would re-interpret the outer `AggregateAndProof` as an
     ///      independent attestation, mis-attributing epochs/roots.
     ///
-    /// The final SS-2/SS-3 GREEN that removes the erroneous attestation-staging
-    /// from `bin/rvc-signer/src/service.rs:698-740` lands in Phase 4 Issue 4.5;
-    /// this issue lands only the gate method + this invariant doc.
+    /// The SS-2/SS-3 core fix — removing the erroneous attestation-staging from
+    /// `bin/rvc-signer/src/service.rs` — landed in Issue 2.10a by routing every
+    /// aggregate handler through this method.  Phase 4 Issue 4.9 covers the
+    /// end-to-end aggregator flow + orchestrator side.
     ///
     /// # Parameters
     ///

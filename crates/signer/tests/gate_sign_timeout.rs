@@ -85,7 +85,7 @@ async fn test_sign_block_timeout_discards_staged_row() {
 
     let gate = make_gate(sk, Arc::clone(&db), TEST_TIMEOUT, SIGNER_SLEEP);
 
-    let result = gate.sign_block(&pubkey, 42, [0xde; 32], GVR).await;
+    let result = gate.sign_block(&pubkey, 42, [0xde; 32], GVR, "test").await;
 
     assert!(
         matches!(result, Err(SigningGateError::SigningFailed(ref msg)) if msg.contains("timed out")),
@@ -106,7 +106,7 @@ async fn test_sign_attestation_timeout_discards_staged_row() {
 
     let gate = make_gate(sk, Arc::clone(&db), TEST_TIMEOUT, SIGNER_SLEEP);
 
-    let result = gate.sign_attestation(&pubkey, 10, 11, [0xde; 32], GVR).await;
+    let result = gate.sign_attestation(&pubkey, 10, 11, [0xde; 32], GVR, "test").await;
 
     assert!(
         matches!(result, Err(SigningGateError::SigningFailed(ref msg)) if msg.contains("timed out")),
