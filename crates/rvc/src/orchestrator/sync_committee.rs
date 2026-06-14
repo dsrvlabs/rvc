@@ -307,6 +307,23 @@ impl SyncCommitteeService {
 
         for duty in duties {
             if let Some(pk) = utils::find_pubkey(&self.pubkey_map, &duty.pubkey) {
+                // D-3: per-validator doppelganger gate (mirrors attestation.rs M-12 check).
+                // Strip optional "0x" prefix and decode to raw bytes for the store lookup.
+                let hex = duty.pubkey.strip_prefix("0x").unwrap_or(&duty.pubkey);
+                if let Ok(bytes) = hex::decode(hex) {
+                    if bytes.len() == 48 {
+                        let mut pk_bytes = [0u8; 48];
+                        pk_bytes.copy_from_slice(&bytes);
+                        if !self.validator_store.is_attesting_enabled(&pk_bytes) {
+                            warn!(
+                                pubkey = %TruncatedPubkey::new(&duty.pubkey),
+                                "Skipping sync committee duty: validator is inside the \
+                                 post-import doppelganger window (D-3)"
+                            );
+                            continue;
+                        }
+                    }
+                }
                 matching_duties.push(duty.clone());
                 matching_pubkeys.push(pk);
             }

@@ -606,6 +606,22 @@ where
             None => return,
         };
 
+        // D-3: per-validator doppelganger gate (mirrors attestation.rs M-12 check).
+        // Skip block proposal for validators still inside the post-import
+        // doppelganger window (`enabled = false`).
+        {
+            let pk_bytes = pubkey.to_bytes();
+            if !self.validator_store.is_attesting_enabled(&pk_bytes) {
+                warn!(
+                    slot,
+                    pubkey = %crypto::logging::TruncatedPubkey::new(&proposer_duty.pubkey),
+                    "Skipping block proposal: validator is inside the \
+                     post-import doppelganger window (D-3)"
+                );
+                return;
+            }
+        }
+
         // H-4: parse validator_index for proposer_index validation (returned as String by the BN type)
         let expected_proposer_index: u64 = match proposer_duty.validator_index.parse() {
             Ok(v) => v,
