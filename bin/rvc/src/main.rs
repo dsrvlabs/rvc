@@ -1264,8 +1264,11 @@ async fn run_validator(
             let current_epoch = doppelganger_service.current_epoch();
 
             // S-3 (Issue 2.8): detection is always invoked — the epoch-0 case is
-            // handled inside DoppelgangerService and ForwardWindowMachine as an
-            // explicit, logged pre-genesis bypass (not a silent skip).
+            // handled inside startup::run_doppelganger_detection as an explicit,
+            // logged pre-genesis bypass that returns all validators Safe without
+            // issuing a beacon liveness query (so a pre-genesis BN error cannot
+            // abort startup).  ForwardWindowMachine also applies an epoch-0 bypass
+            // for the future production wiring path (Issue 2.10).
             if current_epoch == 0 {
                 info!(
                     "Doppelganger detection: pre-genesis (epoch 0) startup — \

@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use rvc_doppelganger::{ForwardWindowMachine, SigningEnablement};
+use rvc_doppelganger::{ForwardWindowMachine, SigningEnablement, ValidatorLivenessData};
 
 use crypto::SecretKey;
 use eth_types::Root;
@@ -109,6 +109,57 @@ fn test_epoch_0_bypass_does_not_override_existing_state() {
     assert!(
         !machine.is_signing_enabled(&pubkey),
         "re-register at epoch 0 must not override existing Pending state (idempotency guard wins)"
+    );
+}
+
+/// S-3: epoch-0 bypass does NOT resurrect a `Detected` validator.
+///
+/// The idempotency guard must win: a validator that is already `Detected`
+/// (terminal — doppelganger confirmed) stays `Detected` even if `register` is
+/// called again at epoch 0.  The epoch-0 branch is only reached for validators
+/// in the `Unmonitored` state.
+#[test]
+fn test_epoch_0_bypass_does_not_override_detected_state() {
+    let machine = machine(2);
+    let pubkey = new_pubkey();
+    let pubkey_hex = hex::encode(pubkey.to_bytes());
+
+    // Register at epoch 5 → Pending.
+    machine.register(&pubkey, 5);
+    assert!(!machine.is_signing_enabled(&pubkey), "must be Pending after first register");
+
+    // Observe as live → Detected (terminal).
+    let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
+    machine.observe_liveness(5, &samples).expect("observe_liveness must not fail");
+    assert!(!machine.is_signing_enabled(&pubkey), "Detected → signing denied");
+
+    // Re-register at epoch 0 — idempotency guard must win; state stays Detected.
+    machine.register(&pubkey, 0);
+    assert!(
+        !machine.is_signing_enabled(&pubkey),
+        "epoch-0 bypass must NOT resurrect a Detected validator (idempotency guard wins)"
+    );
+}
+
+/// S-3: epoch-0 bypass is idempotent for a validator already `Safe`.
+///
+/// If the validator is already `Safe` (e.g. from a prior epoch-0 bypass or
+/// a restart-aware safe-skip), a second `register` at epoch 0 must leave it
+/// `Safe` — the idempotency guard wins before the epoch-0 branch is reached.
+#[test]
+fn test_epoch_0_bypass_is_idempotent_for_safe_state() {
+    let machine = machine(1);
+    let pubkey = new_pubkey();
+
+    // First register at epoch 0 → immediately Safe.
+    machine.register(&pubkey, 0);
+    assert!(machine.is_signing_enabled(&pubkey), "must be Safe after first register at epoch 0");
+
+    // Second register at epoch 0 — must stay Safe (idempotent).
+    machine.register(&pubkey, 0);
+    assert!(
+        machine.is_signing_enabled(&pubkey),
+        "re-register at epoch 0 while Safe must be idempotent — state stays Safe"
     );
 }
 

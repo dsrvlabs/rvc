@@ -141,6 +141,22 @@ pub async fn run_doppelganger_detection(
     validator_indices: &std::collections::HashMap<String, String>,
     current_epoch: u64,
 ) -> Result<Vec<String>, StartupError> {
+    // S-3 (Issue 2.8): at epoch 0 (genesis / pre-genesis) no slots have occurred,
+    // so liveness-based detection is not meaningful and a pre-genesis beacon node
+    // may return Err from check_liveness, which would abort startup.  Return all
+    // validators as safe immediately, without issuing any beacon query.
+    //
+    // TODO(Issue 2.10): defend against clock-skew making current_epoch==0 mid-chain
+    // (cross-check wall clock vs genesis_time before bypassing).
+    if current_epoch == 0 {
+        info!(
+            count = pubkeys.len(),
+            "Doppelganger detection: pre-genesis (epoch 0) bypass — all validators marked Safe \
+             without a monitoring window (no beacon liveness query issued)"
+        );
+        return Ok(pubkeys.to_vec());
+    }
+
     info!(validator_count = pubkeys.len(), "Starting doppelganger detection");
 
     let check_results = doppelganger.check_validators(pubkeys, current_epoch)?;
@@ -874,5 +890,85 @@ mod tests {
             "error variant must be InvalidHexInput"
         );
         assert!(logs_contain("double 0x prefix"), "expected warn log about double prefix");
+    }
+
+    // -- S-3 (Issue 2.8): epoch-0 bypass in run_doppelganger_detection --
+
+    /// A `LivenessChecker` that panics if `check_liveness` is ever called.
+    ///
+    /// Used to prove that `run_doppelganger_detection` at epoch 0 returns
+    /// immediately without issuing any beacon node liveness query.
+    struct PanicsOnCheckLiveness;
+
+    #[async_trait]
+    impl doppelganger::LivenessChecker for PanicsOnCheckLiveness {
+        async fn check_liveness(
+            &self,
+            _epoch: u64,
+            _validator_indices: &[String],
+        ) -> Result<Vec<doppelganger::ValidatorLivenessData>, doppelganger::DoppelgangerError>
+        {
+            panic!("check_liveness must NOT be called at epoch 0 (pre-genesis bypass)");
+        }
+    }
+
+    struct EmptySlashingDb;
+
+    impl doppelganger::LegacySlashingHistoryReader for EmptySlashingDb {
+        fn last_signed_attestation_epoch(
+            &self,
+            _pubkey: &str,
+        ) -> Result<Option<u64>, doppelganger::DoppelgangerError> {
+            Ok(None)
+        }
+    }
+
+    fn doppelganger_service_with_panicking_liveness() -> doppelganger::DoppelgangerService {
+        use std::sync::Arc;
+        let liveness: Arc<dyn doppelganger::LivenessChecker> = Arc::new(PanicsOnCheckLiveness);
+        let slashing: Arc<dyn doppelganger::LegacySlashingHistoryReader> =
+            Arc::new(EmptySlashingDb);
+        // genesis_time = 0 → current_epoch() would compute a very large number
+        // from SystemTime::now(), but we pass current_epoch explicitly so it
+        // does not matter for this test.
+        doppelganger::DoppelgangerService::new(liveness, slashing, 0)
+    }
+
+    /// S-3 (Issue 2.8): `run_doppelganger_detection` at epoch 0 must return all
+    /// pubkeys as Safe immediately without issuing any beacon liveness query.
+    ///
+    /// The `PanicsOnCheckLiveness` mock proves the BN is never contacted:
+    /// if the implementation falls through to `run_monitoring`, the panic fires.
+    #[tokio::test]
+    async fn test_run_doppelganger_detection_epoch_0_bypasses_bn_query() {
+        let service = doppelganger_service_with_panicking_liveness();
+        let pubkeys = vec!["0xpubkey_a".to_string(), "0xpubkey_b".to_string()];
+        let validator_indices = std::collections::HashMap::new();
+
+        let result = run_doppelganger_detection(&service, &pubkeys, &validator_indices, 0).await;
+
+        assert!(result.is_ok(), "epoch-0 bypass must return Ok, got: {:?}", result.unwrap_err());
+        let safe = result.unwrap();
+        assert_eq!(safe, pubkeys, "epoch-0 bypass must return all pubkeys as Safe");
+        // If PanicsOnCheckLiveness::check_liveness had been called, the test
+        // would have panicked before reaching this assertion.
+    }
+
+    /// S-3: epoch > 0 still invokes the normal detection path (regression guard).
+    ///
+    /// At epoch 1, `check_validators` is called and returns `DetectionInProgress`
+    /// (no slashing DB entry), which causes `run_monitoring` to be invoked — and
+    /// `PanicsOnCheckLiveness::check_liveness` fires.  This confirms the bypass
+    /// is epoch-0-ONLY and that the normal path is not silently short-circuited.
+    #[tokio::test]
+    #[should_panic(expected = "check_liveness must NOT be called at epoch 0")]
+    async fn test_run_doppelganger_detection_epoch_1_calls_bn() {
+        let service = doppelganger_service_with_panicking_liveness();
+        let pubkeys = vec!["0xpubkey_a".to_string()];
+        let mut validator_indices = std::collections::HashMap::new();
+        validator_indices.insert("0xpubkey_a".to_string(), "1".to_string());
+
+        // At epoch 1 the service calls run_monitoring → check_liveness → panic.
+        let _ = run_doppelganger_detection(&service, &pubkeys, &validator_indices, 1).await;
     }
 }
