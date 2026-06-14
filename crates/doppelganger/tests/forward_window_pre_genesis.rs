@@ -102,10 +102,7 @@ fn test_epoch_0_bypass_does_not_override_existing_state() {
 
     // First register at epoch 5 → Pending.
     machine.register(&pubkey, 5);
-    assert!(
-        !machine.is_signing_enabled(&pubkey),
-        "first register at epoch 5 must be Pending"
-    );
+    assert!(!machine.is_signing_enabled(&pubkey), "first register at epoch 5 must be Pending");
 
     // Second register at epoch 0 — idempotency guard must win; state stays Pending.
     machine.register(&pubkey, 0);

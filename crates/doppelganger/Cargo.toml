@@ -24,4 +24,4 @@ crypto = { workspace = true, features = ["test-utils"] }
 slashing = { workspace = true }
 hex = { workspace = true }
 tokio = { workspace = true }
-tracing-test = { workspace = true }
+tracing-test = { workspace = true, features = ["no-env-filter"] }

@@ -1263,25 +1263,30 @@ async fn run_validator(
             // is anchored on a monotonic Instant captured at startup.
             let current_epoch = doppelganger_service.current_epoch();
 
-            if current_epoch > 0 {
-                match startup::run_doppelganger_detection(
-                    &doppelganger_service,
-                    &pubkeys,
-                    &validator_index_map,
-                    current_epoch,
-                )
-                .await
-                {
-                    Ok(safe_validators) => {
-                        info!(
-                            safe_count = safe_validators.len(),
-                            "Doppelganger detection complete"
-                        );
-                    }
-                    Err(e) => {
-                        error!("Doppelganger detection failed: {}", e);
-                        return Err(e.into());
-                    }
+            // S-3 (Issue 2.8): detection is always invoked — the epoch-0 case is
+            // handled inside DoppelgangerService and ForwardWindowMachine as an
+            // explicit, logged pre-genesis bypass (not a silent skip).
+            if current_epoch == 0 {
+                info!(
+                    "Doppelganger detection: pre-genesis (epoch 0) startup — \
+                     validators will be marked Safe without a monitoring window"
+                );
+            }
+
+            match startup::run_doppelganger_detection(
+                &doppelganger_service,
+                &pubkeys,
+                &validator_index_map,
+                current_epoch,
+            )
+            .await
+            {
+                Ok(safe_validators) => {
+                    info!(safe_count = safe_validators.len(), "Doppelganger detection complete");
+                }
+                Err(e) => {
+                    error!("Doppelganger detection failed: {}", e);
+                    return Err(e.into());
                 }
             }
         }

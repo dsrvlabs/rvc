@@ -107,6 +107,24 @@ impl ForwardWindowMachine {
             }
         }
 
+        // Pre-genesis bypass (S-3, Issue 2.8): at epoch 0 no slots have occurred,
+        // so liveness-based detection is not meaningful.  Mirror the documented
+        // Lighthouse behaviour (remaining_epochs = 0) by marking the validator
+        // `Safe` immediately and emitting an explicit log so operators see the
+        // deliberate decision in the startup logs rather than a silent skip.
+        //
+        // Rationale: placing this branch AFTER the idempotency guard ensures that
+        // a validator already in Pending/Safe/Detected keeps its existing state
+        // even if `register` is called again at epoch 0 (idempotency wins).
+        if current_epoch == 0 {
+            tracing::info!(
+                pubkey = %crypto::logging::TruncatedPubkey::new(&pubkey_hex),
+                "doppelganger: pre-genesis (epoch 0) bypass — validator marked Safe without a monitoring window"
+            );
+            states.insert(pubkey_hex, ValidatorState::Safe);
+            return;
+        }
+
         // Restart-aware safe-skip: only skip if the prior attestation is RECENT.
         let prior = self.slashing_reader.last_signed_attestation(&pubkey_hex, &self.gvr);
         if let Some(target_epoch) = prior {
