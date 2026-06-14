@@ -1,9 +1,9 @@
 //! RED test: non-slashable gate methods return BlockedByDoppelganger when
 //! `is_signing_enabled` returns `false`.
 //!
-//! Covered: `sign_sync_committee_message` and `sign_contribution_and_proof`.
-//! Neither method should call the slashing DB; the gate must fail closed as soon
-//! as the doppelganger check returns false.
+//! All 7 non-slashable methods delegate to `sign_nonslashable`, which calls
+//! `gate_decision` before attempting any sign.  This test pins the routing for
+//! each method: gate denied → BlockedByDoppelganger, no slashing DB touched.
 
 use std::sync::Arc;
 
@@ -61,6 +61,91 @@ async fn test_sign_contribution_and_proof_blocked_by_doppelganger() {
 
     let signing_root: Root = [0x22; 32];
     let result = gate.sign_contribution_and_proof(&pubkey, signing_root).await;
+
+    assert!(
+        matches!(result, Err(SigningGateError::BlockedByDoppelganger)),
+        "expected BlockedByDoppelganger, got: {result:?}"
+    );
+}
+
+/// `sign_aggregate_and_proof` must return `BlockedByDoppelganger` when the
+/// doppelganger gate returns `false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sign_aggregate_and_proof_blocked_by_doppelganger() {
+    let sk = SecretKey::generate();
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
+    let (pubkey, gate) = make_gate(sk, Arc::clone(&db));
+
+    let signing_root: Root = [0x33; 32];
+    let result = gate.sign_aggregate_and_proof(&pubkey, signing_root).await;
+
+    assert!(
+        matches!(result, Err(SigningGateError::BlockedByDoppelganger)),
+        "expected BlockedByDoppelganger, got: {result:?}"
+    );
+}
+
+/// `sign_selection_proof` must return `BlockedByDoppelganger` when the
+/// doppelganger gate returns `false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sign_selection_proof_blocked_by_doppelganger() {
+    let sk = SecretKey::generate();
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
+    let (pubkey, gate) = make_gate(sk, Arc::clone(&db));
+
+    let signing_root: Root = [0x44; 32];
+    let result = gate.sign_selection_proof(&pubkey, signing_root).await;
+
+    assert!(
+        matches!(result, Err(SigningGateError::BlockedByDoppelganger)),
+        "expected BlockedByDoppelganger, got: {result:?}"
+    );
+}
+
+/// `sign_randao_reveal` must return `BlockedByDoppelganger` when the
+/// doppelganger gate returns `false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sign_randao_reveal_blocked_by_doppelganger() {
+    let sk = SecretKey::generate();
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
+    let (pubkey, gate) = make_gate(sk, Arc::clone(&db));
+
+    let signing_root: Root = [0x55; 32];
+    let result = gate.sign_randao_reveal(&pubkey, signing_root).await;
+
+    assert!(
+        matches!(result, Err(SigningGateError::BlockedByDoppelganger)),
+        "expected BlockedByDoppelganger, got: {result:?}"
+    );
+}
+
+/// `sign_voluntary_exit` must return `BlockedByDoppelganger` when the
+/// doppelganger gate returns `false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sign_voluntary_exit_blocked_by_doppelganger() {
+    let sk = SecretKey::generate();
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
+    let (pubkey, gate) = make_gate(sk, Arc::clone(&db));
+
+    let signing_root: Root = [0x66; 32];
+    let result = gate.sign_voluntary_exit(&pubkey, signing_root).await;
+
+    assert!(
+        matches!(result, Err(SigningGateError::BlockedByDoppelganger)),
+        "expected BlockedByDoppelganger, got: {result:?}"
+    );
+}
+
+/// `sign_builder_registration` must return `BlockedByDoppelganger` when the
+/// doppelganger gate returns `false`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sign_builder_registration_blocked_by_doppelganger() {
+    let sk = SecretKey::generate();
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
+    let (pubkey, gate) = make_gate(sk, Arc::clone(&db));
+
+    let signing_root: Root = [0x77; 32];
+    let result = gate.sign_builder_registration(&pubkey, signing_root).await;
 
     assert!(
         matches!(result, Err(SigningGateError::BlockedByDoppelganger)),

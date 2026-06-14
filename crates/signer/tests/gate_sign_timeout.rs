@@ -119,3 +119,25 @@ async fn test_sign_attestation_timeout_discards_staged_row() {
         "timeout must not commit a slashing-DB row; found: {attestations:?}"
     );
 }
+
+/// Non-slashable timeout: a stalled signer on a non-slashable path must return
+/// `Err(SigningFailed("signer timed out"))`.
+///
+/// Non-slashable paths have no staged slashing-DB row to discard, but the sign
+/// timeout still applies for consistency (BUG-003 hygiene: a wedged remote
+/// signer must not stall callers indefinitely on any path).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sign_sync_committee_message_timeout() {
+    let sk = SecretKey::generate();
+    let pubkey = sk.public_key();
+    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
+
+    let gate = make_gate(sk, Arc::clone(&db), TEST_TIMEOUT, SIGNER_SLEEP);
+
+    let result = gate.sign_sync_committee_message(&pubkey, [0xde; 32]).await;
+
+    assert!(
+        matches!(result, Err(SigningGateError::SigningFailed(ref msg)) if msg.contains("timed out")),
+        "expected SigningFailed containing 'timed out' on non-slashable path, got: {result:?}"
+    );
+}

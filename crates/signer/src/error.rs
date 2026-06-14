@@ -59,8 +59,16 @@ pub enum SigningGateError {
 
     /// The pubkey is not registered with the signing enablement implementation.
     ///
-    /// Reserved for use by 2.9b (FailClosedDefault routing); in 2.9a a false
-    /// from the enablement gate returns `BlockedByDoppelganger`.
+    /// Currently **unconstructed** by the gate.  When an unknown pubkey is
+    /// presented, `SigningEnablement::is_signing_enabled` returns `false` (the
+    /// fail-closed default) and the gate returns `BlockedByDoppelganger` —
+    /// it cannot distinguish "unknown pubkey" from "doppelganger-blocked pubkey"
+    /// because `is_signing_enabled` exposes only a `bool`, not a status enum.
+    ///
+    /// This variant is retained for the future path where `SigningEnablement`
+    /// is extended to return a richer status (unknown vs. blocked vs. allowed),
+    /// at which point the gate can route unknown pubkeys here instead of into
+    /// `BlockedByDoppelganger`.
     #[error("pubkey not registered with signing gate")]
     UnknownPubkey,
 }

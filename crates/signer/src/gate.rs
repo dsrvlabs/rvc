@@ -165,25 +165,31 @@ impl SigningGate {
     ///
     /// Returns `true` when signing is permitted, `false` when it is denied.
     ///
-    /// # Fail-closed default
+    /// # Fail-closed default (PRD §6.3 — unknown → denied)
     ///
     /// For any pubkey that the `SigningEnablement` implementation does not
     /// recognise (e.g. an unregistered validator in `ForwardWindowMachine`),
     /// `is_signing_enabled` returns `false`.  This matches the explicit
-    /// fail-closed default `<bool as FailClosedDefault>::default_when_unknown()` = `false`
-    /// (PRD §6.3 — unknown → denied).
+    /// fail-closed default `<bool as FailClosedDefault>::default_when_unknown()` = `false`.
+    ///
+    /// The `debug_assert_eq!` below makes this codification executable: in debug
+    /// and test builds it fires if the `FailClosedDefault` contract is ever
+    /// changed to a non-false value without updating the gate logic.
     ///
     /// This helper is the single gate-decision point for BOTH slashable and
     /// non-slashable signing paths, ensuring the fail-closed semantics are
     /// applied uniformly.
     fn gate_decision(&self, pubkey: &PublicKey) -> bool {
-        // The fail-closed sentinel: unknown pubkey ↦ false.
-        // `<bool as FailClosedDefault>::default_when_unknown()` is referenced
-        // here to make the PRD §6.3 intent explicit in the code.
-        let _fail_closed: bool = <bool as FailClosedDefault>::default_when_unknown();
-        // `is_signing_enabled` returns false for unknown pubkeys (same value as
-        // _fail_closed), so its result is the gate decision.
-        self.enablement.is_signing_enabled(pubkey)
+        let enabled = self.enablement.is_signing_enabled(pubkey);
+        // Codify PRD §6.3: when the enablement returns false (unknown or blocked),
+        // the gate decision must equal the fail-closed default.  This assert fires
+        // in debug/test builds if `FailClosedDefault::default_when_unknown()` is
+        // ever changed to a non-false value without a corresponding gate update.
+        debug_assert!(
+            !<bool as FailClosedDefault>::default_when_unknown(),
+            "FailClosedDefault::default_when_unknown() must remain false (PRD §6.3)"
+        );
+        enabled
     }
 
     /// Sign a beacon block proposal.
@@ -483,6 +489,28 @@ impl SigningGate {
     ///
     /// Shared by all 7 non-slashable methods so the error-mapping logic lives
     /// in one place.
+    ///
+    /// # No-lock invariant
+    ///
+    /// This helper deliberately does **NOT** acquire the per-pubkey
+    /// `ValidatorLockMap` lock and does **NOT** call any of
+    /// `PubkeyScopedDb`, `stage_block`, `stage_attestation`, or `commit`.
+    /// Non-slashable operations have no slashing-DB transaction to serialize,
+    /// so the lock is unnecessary overhead.
+    ///
+    /// **If a future variant of this helper needs to write to the slashing DB,
+    /// it MUST add the per-pubkey lock and the staging/commit/discard pattern
+    /// used by `sign_block` / `sign_attestation`.**
+    ///
+    /// # TOCTOU note
+    ///
+    /// There is a micro-window between `gate_decision` returning `true` and
+    /// `signer.sign().await` completing during which the doppelganger state
+    /// could theoretically change.  This window is intentionally accepted:
+    /// these operations are **not slashable**, so the worst case is a
+    /// signature produced for a pubkey that was concurrently disabled — a
+    /// tolerable transient condition.  No additional synchronization is needed
+    /// to shrink this window.
     async fn sign_nonslashable(
         &self,
         pubkey: &PublicKey,
