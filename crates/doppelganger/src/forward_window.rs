@@ -10,11 +10,39 @@
 //! # D-2: Fail-closed on incomplete liveness (Issue 2.7)
 //!
 //! A validator reaches `Safe` ONLY if EVERY epoch in its monitoring window
-//! `[start_epoch, end_epoch]` had a COMPLETE liveness observation — i.e. the
-//! validator's index was present in the beacon-node response for that epoch.
+//! `[start_epoch, end_epoch]` (INCLUSIVE — `end_epoch = start_epoch +
+//! monitoring_epochs`) had a COMPLETE liveness observation: the validator's
+//! pubkey-hex index was present in the beacon-node response for that epoch.
 //! An epoch whose response omits the validator's index is NOT recorded as
 //! observed; the validator remains `Pending` through the satisfaction boundary.
 //! This is "fail-closed": missing data never grants signing permission.
+//!
+//! # Caller polling contract
+//!
+//! Each slot cycle, the orchestrator SHOULD call these methods in order:
+//!
+//! 1. `observe_liveness(epoch, samples)` — record the beacon-node liveness
+//!    response for `epoch`.  The registration epoch (`start_epoch`) must be
+//!    observed just like any other window epoch; it is NOT exempted.  If the
+//!    method returns `Err(IncompleteLiveness)`, the caller MUST retry the
+//!    liveness check for that epoch rather than suppressing the error.
+//! 2. `tick(current_epoch, slot_in_epoch)` — advance the state machine.
+//!
+//! Calling `tick` before `observe_liveness` at the satisfaction boundary is
+//! safe but will leave the validator `Pending` for one more cycle: the
+//! `past_boundary` arm (`current_epoch > end_epoch`) will catch it on the next
+//! tick once observation is complete.
+//!
+//! # Pubkey-hex key contract (SEC-001)
+//!
+//! The machine keys its internal state by `hex::encode(pubkey.to_bytes())`
+//! (lowercase hex).  `ValidatorLivenessData.index` values in the `samples`
+//! slice passed to `observe_liveness` MUST use the same encoding.  Beacon
+//! nodes return NUMERIC validator indices; the orchestrator/adapter is
+//! responsible for translating numeric index → pubkey-hex BEFORE calling
+//! `observe_liveness`.  An index that cannot be translated MUST be treated as
+//! a missing entry (fail-closed).  The production wiring and translation land
+//! in Issue 2.10.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -96,7 +124,6 @@ impl ForwardWindowMachine {
             ValidatorState::Pending {
                 start_epoch: current_epoch,
                 end_epoch,
-                detected_live: false,
                 observed_epochs: BTreeSet::new(),
             },
         );
@@ -110,10 +137,13 @@ impl ForwardWindowMachine {
     ///   OR `current_epoch == end_epoch && slot_in_epoch >= SLOTS_PER_EPOCH - 1`.
     ///   This "at-or-after" semantics means a missed tick (e.g. after a restart)
     ///   does not leave the validator stuck `Pending` forever.
-    /// - `detected_live == false` (no unexplained liveness was observed).
-    /// - Every epoch in the monitoring window `[start_epoch, end_epoch]` has a
-    ///   COMPLETE liveness observation recorded in `observed_epochs` (D-2, Issue
-    ///   2.7).  A missing-entry epoch prevents the Safe transition (fail-closed).
+    /// - Every epoch in the monitoring window `[start_epoch, end_epoch]`
+    ///   (INCLUSIVE) has a COMPLETE liveness observation recorded in
+    ///   `observed_epochs` (D-2, Issue 2.7).  A missing-entry epoch prevents the
+    ///   `Safe` transition (fail-closed).
+    ///
+    /// `Detected` is TERMINAL: a validator in the `Detected` state is never
+    /// transitioned to `Safe` by `tick`, regardless of how much time has passed.
     ///
     /// Returns the current status of every registered validator.
     pub fn tick(&self, current_epoch: Epoch, slot_in_epoch: u64) -> Vec<ForwardWindowStatus> {
@@ -121,18 +151,12 @@ impl ForwardWindowMachine {
         let mut statuses = Vec::with_capacity(states.len());
 
         for state in states.values_mut() {
-            if let ValidatorState::Pending {
-                start_epoch,
-                end_epoch,
-                detected_live,
-                observed_epochs,
-            } = state
-            {
+            if let ValidatorState::Pending { start_epoch, end_epoch, observed_epochs } = state {
                 let at_boundary =
                     current_epoch == *end_epoch && slot_in_epoch >= SLOTS_PER_EPOCH - 1;
                 let past_boundary = current_epoch > *end_epoch;
 
-                if (at_boundary || past_boundary) && !*detected_live {
+                if at_boundary || past_boundary {
                     // D-2: Safe requires complete observation of every window epoch.
                     let window_fully_observed =
                         (*start_epoch..=*end_epoch).all(|e| observed_epochs.contains(&e));
@@ -150,37 +174,61 @@ impl ForwardWindowMachine {
 
     /// Record liveness observations for a given epoch.
     ///
-    /// For each `Pending` validator whose monitoring window includes `epoch`:
+    /// # Pubkey-hex key contract (SEC-001)
+    ///
+    /// Each `ValidatorLivenessData.index` in `samples` MUST be the lowercase
+    /// `hex::encode(pubkey.to_bytes())` for the corresponding validator — the
+    /// same encoding used as the state-map key in [`Self::register`].  Beacon
+    /// nodes return NUMERIC validator indices; the orchestrator/adapter MUST
+    /// translate numeric index → pubkey-hex before calling this method, and
+    /// MUST treat any untranslatable index as a missing entry (fail-closed).
+    /// See the module-level doc and Issue 2.10 for production wiring details.
+    ///
+    /// # Behaviour for each `Pending` in-window validator
+    ///
+    /// For each `Pending` validator whose monitoring window `[start_epoch,
+    /// end_epoch]` includes `epoch`:
     ///
     /// - If the validator's index **is present** in `samples`:
-    ///   - The epoch is recorded as completely observed in `observed_epochs`.
-    ///   - If `is_live == true`, the validator transitions to `Detected`.
+    ///   - `epoch` is recorded as completely observed in `observed_epochs`.
+    ///   - If ANY sample for that index has `is_live == true` (OR-fold over
+    ///     duplicate entries), the validator transitions to `Detected`.
     /// - If the validator's index **is absent** from `samples`:
-    ///   - The epoch is NOT recorded (incomplete response — fail-closed per D-2).
+    ///   - `epoch` is NOT recorded (incomplete response — fail-closed per D-2).
     ///   - The validator stays `Pending` and cannot satisfy the window.
     ///
     /// After processing all in-window validators, the method returns
-    /// `Err(DoppelgangerError::IncompleteLiveness)` if ANY expected validator
-    /// was absent from the response.  Callers should log this error and retry
-    /// the liveness check; they must NOT suppress it.
+    /// `Err(DoppelgangerError::IncompleteLiveness { epoch, missing_count })`
+    /// if ANY expected validator was absent from the response.  Callers MUST
+    /// log this error and retry the liveness check for the same epoch; they
+    /// MUST NOT suppress it.
     ///
-    /// Out-of-window epochs (before `start_epoch` or after `end_epoch`) are
-    /// ignored for any specific validator; if no `Pending` in-window validator
-    /// is expected for `epoch` at all, the method returns `Ok(())` regardless
-    /// of what `samples` contains.
+    /// # Out-of-window and non-Pending behaviour
+    ///
+    /// Out-of-window epochs (before `start_epoch` or after `end_epoch` for a
+    /// specific validator) are ignored for that validator.  If no `Pending`
+    /// in-window validator is expected for `epoch` at all (because all
+    /// validators are `Safe`, `Detected`, or out-of-window), the method
+    /// returns `Ok(())` regardless of what `samples` contains.
     pub fn observe_liveness(
         &self,
         epoch: Epoch,
         samples: &[ValidatorLivenessData],
     ) -> Result<(), DoppelgangerError> {
-        // Build a fast-lookup map of index → is_live for the response.
-        let response: std::collections::HashMap<&str, bool> =
-            samples.iter().map(|s| (s.index.as_str(), s.is_live)).collect();
+        // Build a lookup map of index → is_live using OR-fold over duplicates
+        // (SEC-008): if a pubkey appears more than once, ANY is_live=true wins.
+        // A naive HashMap::collect keeps the LAST entry, which could allow a
+        // malicious/buggy BN to append (pk, false) after (pk, true) and
+        // silently suppress a detection.
+        let mut response: HashMap<&str, bool> = HashMap::with_capacity(samples.len());
+        for s in samples {
+            response.entry(s.index.as_str()).and_modify(|v| *v |= s.is_live).or_insert(s.is_live);
+        }
 
         let mut states = self.states.lock();
 
         // Phase 1: collect keys of Pending validators whose window includes epoch.
-        // We gather keys first so that Phase 2 can use get_mut without borrow conflicts.
+        // Gathered first so Phase 2 can use get_mut without borrow conflicts.
         let pending_in_window_keys: Vec<String> = states
             .iter()
             .filter_map(|(key, state)| {
@@ -194,7 +242,7 @@ impl ForwardWindowMachine {
             .collect();
 
         // Phase 2: process each in-window Pending validator.
-        let mut any_missing = false;
+        let mut missing_count: usize = 0;
         for key in &pending_in_window_keys {
             let Some(state) = states.get_mut(key) else { continue };
 
@@ -204,20 +252,20 @@ impl ForwardWindowMachine {
                     if let ValidatorState::Pending { observed_epochs, .. } = state {
                         observed_epochs.insert(epoch);
                     }
-                    // Transition to Detected if the validator is live.
+                    // Transition to Detected if the validator is live (OR-folded above).
                     if is_live {
                         *state = ValidatorState::Detected;
                     }
                 }
                 None => {
                     // Index is absent from the response → incomplete (fail-closed D-2).
-                    any_missing = true;
+                    missing_count += 1;
                 }
             }
         }
 
-        if any_missing {
-            Err(DoppelgangerError::IncompleteLiveness)
+        if missing_count > 0 {
+            Err(DoppelgangerError::IncompleteLiveness { epoch, missing_count })
         } else {
             Ok(())
         }

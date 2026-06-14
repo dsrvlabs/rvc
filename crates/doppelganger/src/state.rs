@@ -11,23 +11,21 @@ pub enum ValidatorState {
     Unmonitored,
     /// Validator is in the monitoring window.
     ///
-    /// `detected_live` is set when `observe_liveness` finds an unexplained
-    /// `is_live == true` while in this state, transitioning to `Detected`.
+    /// When `observe_liveness` receives `is_live == true` for this validator
+    /// within the window, the whole variant is REPLACED by `Detected` — so
+    /// there is no `detected_live: bool` field.  The `Detected` state is
+    /// terminal and permanently denies signing.
     ///
     /// `observed_epochs` records which epochs in the monitoring window
     /// `[start_epoch, end_epoch]` have received a COMPLETE liveness response
-    /// (i.e. the validator's index was present in the beacon-node reply).
-    /// A Safe transition at the satisfaction boundary requires this set to
-    /// contain every epoch in the inclusive window (D-2, Issue 2.7).
-    Pending {
-        start_epoch: Epoch,
-        end_epoch: Epoch,
-        detected_live: bool,
-        observed_epochs: BTreeSet<Epoch>,
-    },
+    /// (i.e. the validator's pubkey-hex index was present in the beacon-node
+    /// reply).  A `Safe` transition at the satisfaction boundary requires this
+    /// set to contain every epoch in the inclusive window (D-2, Issue 2.7).
+    Pending { start_epoch: Epoch, end_epoch: Epoch, observed_epochs: BTreeSet<Epoch> },
     /// Monitoring window completed with no unexplained liveness → safe to sign.
     Safe,
     /// An unexplained `is_live` was observed during the monitoring window.
+    /// This state is TERMINAL: `tick` never transitions out of `Detected`.
     Detected,
 }
 
