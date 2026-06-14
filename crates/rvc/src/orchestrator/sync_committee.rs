@@ -4,11 +4,13 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use bn_manager::BeaconNodeClient;
+use crypto::logging::TruncatedPubkey;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{ContributionAndProof, SignedContributionAndProof, Slot, SyncCommitteeDuty};
 use signer::SignerService;
 use sync_service::is_sync_committee_aggregator;
+use validator_store::ValidatorStore;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
 use super::slot_context::SlotContext;
@@ -26,6 +28,10 @@ pub(crate) struct SyncCommitteeService {
     duty_tracker: Arc<DutyTracker>,
     pubkey_map: PubkeyMap,
     config: OrchestratorConfig,
+    /// D-3: per-validator doppelganger gate.  Mirrors the M-12 check already
+    /// present in attestation.rs so that sync messages and contributions
+    /// are also suppressed during the post-import doppelganger window.
+    validator_store: Arc<ValidatorStore>,
 }
 
 impl SyncCommitteeService {
@@ -35,8 +41,9 @@ impl SyncCommitteeService {
         duty_tracker: Arc<DutyTracker>,
         pubkey_map: PubkeyMap,
         config: OrchestratorConfig,
+        validator_store: Arc<ValidatorStore>,
     ) -> Self {
-        Self { signer, beacon, duty_tracker, pubkey_map, config }
+        Self { signer, beacon, duty_tracker, pubkey_map, config, validator_store }
     }
 
     #[tracing::instrument(name = "rvc.orchestrator.produce_sync_messages", skip_all, fields(rvc.slot = slot))]
@@ -340,6 +347,7 @@ mod tests {
     };
     use signer::SignerService;
     use slashing::SlashingDb;
+    use validator_store::{ValidatorConfig, ValidatorStore};
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -551,6 +559,23 @@ mod tests {
         pk: crypto::PublicKey,
         sk: SecretKey,
     ) -> SyncCommitteeService {
+        setup_service_with_store(
+            beacon,
+            pk_hex,
+            pk,
+            sk,
+            Arc::new(ValidatorStore::new([0u8; 20], 0)),
+        )
+        .await
+    }
+
+    async fn setup_service_with_store(
+        beacon: Arc<ToctouBeacon>,
+        pk_hex: String,
+        pk: crypto::PublicKey,
+        sk: SecretKey,
+        validator_store: Arc<ValidatorStore>,
+    ) -> SyncCommitteeService {
         let mut key_manager = KeyManager::new();
         key_manager.insert(sk);
         let local_signer = LocalSigner::new(key_manager);
@@ -566,7 +591,14 @@ mod tests {
         map.insert(pk_hex, pk);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
 
-        SyncCommitteeService::new(signer, beacon, duty_tracker, pubkey_map, create_test_config())
+        SyncCommitteeService::new(
+            signer,
+            beacon,
+            duty_tracker,
+            pubkey_map,
+            create_test_config(),
+            validator_store,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -705,6 +737,86 @@ mod tests {
             get_block_root_call_count.load(Ordering::SeqCst),
             0,
             "contributions phase must not fall back to a BN fetch when head_root is None"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D-3: sync message path skips validators whose is_attesting_enabled=false.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_sync_message_skipped_when_validator_disabled() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+        let pk_bytes: [u8; 48] = pk.to_bytes();
+
+        let submitted_roots = Arc::new(Mutex::new(Vec::<Root>::new()));
+        let get_block_root_call_count = Arc::new(AtomicUsize::new(0));
+
+        let beacon = Arc::new(ToctouBeacon {
+            get_block_root_call_count: get_block_root_call_count.clone(),
+            submitted_roots: submitted_roots.clone(),
+            r_from_bn_hex: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_string(),
+            duty_pubkey: pk_hex.clone(),
+        });
+
+        // Set up a store where the validator is disabled (doppelganger window).
+        let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        let mut config = ValidatorConfig::new(pk_bytes);
+        config.enabled = false;
+        store.add_validator(config);
+
+        let service = setup_service_with_store(beacon, pk_hex, pk, sk, store).await;
+
+        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some([0xAA; 32]) };
+        service.maybe_produce_sync_messages(0, 0, &ctx).await;
+
+        // No messages must be submitted for a disabled validator.
+        assert!(
+            submitted_roots.lock().unwrap().is_empty(),
+            "D-3: sync committee message must not be produced when is_attesting_enabled=false"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // D-3: sync contribution path skips validators whose is_attesting_enabled=false.
+    // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_sync_contribution_skipped_when_validator_disabled() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+        let pk_bytes: [u8; 48] = pk.to_bytes();
+
+        let submitted_roots = Arc::new(Mutex::new(Vec::<Root>::new()));
+        let get_block_root_call_count = Arc::new(AtomicUsize::new(0));
+
+        let beacon = Arc::new(ToctouBeacon {
+            get_block_root_call_count: get_block_root_call_count.clone(),
+            submitted_roots: submitted_roots.clone(),
+            r_from_bn_hex: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_string(),
+            duty_pubkey: pk_hex.clone(),
+        });
+
+        // Set up a store where the validator is disabled (doppelganger window).
+        let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        let mut config = ValidatorConfig::new(pk_bytes);
+        config.enabled = false;
+        store.add_validator(config);
+
+        let service = setup_service_with_store(beacon, pk_hex, pk, sk, store).await;
+
+        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some([0xAA; 32]) };
+        service.maybe_produce_sync_contributions(0, 0, &ctx).await;
+
+        // No contributions should be attempted for a disabled validator
+        // (filter_sync_duties skips the duty before any signing).
+        assert_eq!(
+            get_block_root_call_count.load(Ordering::SeqCst),
+            0,
+            "D-3: sync contribution path must not issue BN calls for a disabled validator"
         );
     }
 }

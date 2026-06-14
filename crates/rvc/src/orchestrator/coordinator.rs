@@ -121,6 +121,9 @@ where
     /// `attesting_enabled`. Defaults to `true`; can be toggled at runtime via
     /// [`set_sync_enabled`]. Internal-only — not wired to any Keymanager API (H-7).
     sync_enabled: Arc<AtomicBool>,
+    /// D-3: per-validator doppelganger gate for block proposals.
+    /// Shared reference to the ValidatorStore for `is_attesting_enabled` checks.
+    validator_store: Arc<validator_store::ValidatorStore>,
 }
 
 impl<C, S, B> DutyOrchestrator<C, S, B>
@@ -229,6 +232,7 @@ where
             duty_tracker.clone(),
             pubkey_map.clone(),
             config.clone(),
+            validator_store.clone(),
         );
 
         let sync_committee_service = SyncCommitteeService::new(
@@ -237,6 +241,7 @@ where
             duty_tracker.clone(),
             pubkey_map.clone(),
             config.clone(),
+            validator_store.clone(),
         );
 
         let attestation_service = AttestationService::new(
@@ -255,7 +260,7 @@ where
             signer,
             beacon.clone(),
             duty_tracker.clone(),
-            validator_store,
+            validator_store.clone(),
             pubkey_map.clone(),
             config.clone(),
         );
@@ -279,6 +284,7 @@ where
             shutdown_rx,
             attesting_enabled,
             sync_enabled,
+            validator_store,
         };
 
         let handle = OrchestratorHandle { shutdown_tx };
@@ -5441,6 +5447,119 @@ mod tests {
         assert!(
             submitted_roots.lock().unwrap().is_empty(),
             "H-7: sync contributions must NOT run when sync_enabled = false"
+        );
+    }
+
+    // ── D-3: block proposal gate ─────────────────────────────────────────────
+
+    /// D-3: a validator whose `is_attesting_enabled = false` must NOT propose a block.
+    ///
+    /// The test uses wiremock to serve a proposer duty, then checks that
+    /// `publish_block` is never called when the validator is disabled.
+    ///
+    /// RED: `maybe_propose_block` does not check `is_attesting_enabled` →
+    ///      the block_service is called (RANDAO sign, produce, publish).
+    ///      The `BadProposerBlockBeacon` sets `publish_called = true` via
+    ///      `produce_block_v3` returning a block with `proposer_index="1"`.
+    ///      Actually `BadProposerBlockBeacon` calls `produce_block_v3` which
+    ///      would attempt RANDAO sign first — the D-3 gate must fire before any
+    ///      signer call, so the RANDAO sign never happens if the gate is correct.
+    ///
+    /// GREEN: D-3 gate in `maybe_propose_block` returns early before
+    ///        `block_service.propose_block`, so `publish_called` stays `false`.
+    #[tokio::test]
+    async fn test_block_proposal_skipped_when_validator_disabled() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let slot: Slot = 10;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let validator_index = 1u64;
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+        let pk_bytes: [u8; 48] = pubkey.to_bytes();
+
+        // Serve proposer duties from wiremock.
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/validator/duties/proposer/{}", epoch)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": validator_index.to_string(),
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+        duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+        // BadProposerBlockBeacon is already defined above; it returns a block
+        // with a non-matching proposer_index which would also cause a drop.
+        // Use a matching proposer_index (validator_index) so the only gate is D-3.
+        let publish_called = Arc::new(AtomicBool::new(false));
+        let block_beacon = Arc::new(BadProposerBlockBeacon {
+            slot,
+            bad_proposer_index: validator_index, // matching index → no H-4 drop
+            publish_called: publish_called.clone(),
+        });
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        // Validator store with this validator DISABLED (doppelganger window).
+        let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        {
+            let mut config = validator_store::ValidatorConfig::new(pk_bytes);
+            config.enabled = false;
+            validator_store.add_validator(config);
+        }
+
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey_hex, pubkey);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(slot);
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            block_beacon,
+            None,
+            validator_store,
+            create_test_config(),
+            pubkey_map,
+        );
+
+        let ctx = SlotContext { slot, epoch, head_root: None };
+        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+
+        // D-3: the block must NOT be proposed when is_attesting_enabled=false.
+        // publish_called stays false because the gate returns early before
+        // block_service.propose_block (which would call produce_block_v3).
+        assert!(
+            !publish_called.load(Ordering::SeqCst),
+            "D-3: block must NOT be proposed when is_attesting_enabled=false"
         );
     }
 }
