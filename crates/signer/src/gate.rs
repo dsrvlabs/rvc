@@ -9,7 +9,7 @@
 //!
 //! 1. Acquire the per-pubkey async lock from `ValidatorLockMap` (held for the
 //!    entire operation).
-//! 2. Check `is_signing_enabled` — if false, return
+//! 2. Check `gate_decision` — if false, return
 //!    `Err(SigningGateError::BlockedByDoppelganger)` immediately; no staging or
 //!    signing occurs, and no slashing-DB row is written.
 //! 3. Stage → sign → commit/discard — run inside `tokio::task::spawn_blocking`
@@ -20,6 +20,31 @@
 //!    immediate `discard()` so the staged row is rolled back (no phantom row).
 //!    On sign success the staged row is committed; on sign failure it is
 //!    discarded (M-1 property — no phantom row on signer error).
+//!
+//! # Non-slashable signing flow
+//!
+//! For each non-slashable operation (`sign_sync_committee_message`,
+//! `sign_aggregate_and_proof`, `sign_contribution_and_proof`,
+//! `sign_selection_proof`, `sign_randao_reveal`, `sign_voluntary_exit`,
+//! `sign_builder_registration`):
+//!
+//! 1. Check `gate_decision` — if false, return
+//!    `Err(SigningGateError::BlockedByDoppelganger)` immediately.
+//! 2. Call the BLS backend `sign(signing_root, pubkey)` wrapped in the gate's
+//!    `tokio::time::timeout` (same duration as slashable, for consistency).
+//!    No slashing-DB staging or committing occurs — these operations are not
+//!    slashable by the Ethereum consensus spec.
+//!
+//! Because non-slashable signs carry no `!Send` staging guard, they are plain
+//! `async` with a direct `.await` on the signer — no `spawn_blocking` needed.
+//!
+//! # Gate decision and fail-closed default
+//!
+//! The single `gate_decision` helper centralises the doppelganger check for
+//! all paths (slashable and non-slashable).  It calls `is_signing_enabled` and
+//! returns the result.  For unknown pubkeys the `SigningEnablement`
+//! implementation (e.g. `ForwardWindowMachine`) returns `false`, matching the
+//! fail-closed default `<bool as FailClosedDefault>::default_when_unknown()` = `false`.
 //!
 //! # Cancellation safety and the true double-sign authoritative lock
 //!
@@ -47,12 +72,6 @@
 //! `tokio::time::timeout`; on expiry the staged guard is discarded (ROLLBACK) and
 //! `Err(SigningFailed("signer timed out"))` is returned.  The default is 4 seconds
 //! (well under a 12-second Ethereum slot).  Configure with `with_sign_timeout`.
-//!
-//! # Non-slashable methods
-//!
-//! Stubs returning `Err(SigningGateError::SigningFailed("not yet implemented"))`.
-//! Issue 2.9b will fill the bodies; the signatures here are fixed so callers can
-//! compile today.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,6 +83,7 @@ use slashing::{PubkeyScopedDb, SlashingDb};
 use tracing::{error, warn};
 
 use crate::error::SigningGateError;
+use crate::fail_closed::FailClosedDefault;
 use crate::locks::ValidatorLockMap;
 
 /// Audit CN recorded in `PubkeyScopedDb` for all gate-originated staging calls.
@@ -84,6 +104,9 @@ const DEFAULT_SIGN_TIMEOUT: Duration = Duration::from_secs(4);
 /// before calling the gate).  The gate stages `pubkey / slot|epochs /
 /// signing_root_hex` in the slashing DB, then signs `signing_root` via the
 /// BLS backend.
+///
+/// Non-slashable methods receive a **pre-computed** `signing_root`; they
+/// gate-check the pubkey and call the BLS backend directly — no slashing DB.
 pub struct SigningGate {
     slashing_db: Arc<SlashingDb>,
     enablement: Arc<dyn SigningEnablement>,
@@ -138,6 +161,31 @@ impl SigningGate {
         Self { slashing_db, enablement, signer, locks, sign_timeout }
     }
 
+    /// Evaluate the doppelganger gate for `pubkey`.
+    ///
+    /// Returns `true` when signing is permitted, `false` when it is denied.
+    ///
+    /// # Fail-closed default
+    ///
+    /// For any pubkey that the `SigningEnablement` implementation does not
+    /// recognise (e.g. an unregistered validator in `ForwardWindowMachine`),
+    /// `is_signing_enabled` returns `false`.  This matches the explicit
+    /// fail-closed default `<bool as FailClosedDefault>::default_when_unknown()` = `false`
+    /// (PRD §6.3 — unknown → denied).
+    ///
+    /// This helper is the single gate-decision point for BOTH slashable and
+    /// non-slashable signing paths, ensuring the fail-closed semantics are
+    /// applied uniformly.
+    fn gate_decision(&self, pubkey: &PublicKey) -> bool {
+        // The fail-closed sentinel: unknown pubkey ↦ false.
+        // `<bool as FailClosedDefault>::default_when_unknown()` is referenced
+        // here to make the PRD §6.3 intent explicit in the code.
+        let _fail_closed: bool = <bool as FailClosedDefault>::default_when_unknown();
+        // `is_signing_enabled` returns false for unknown pubkeys (same value as
+        // _fail_closed), so its result is the gate decision.
+        self.enablement.is_signing_enabled(pubkey)
+    }
+
     /// Sign a beacon block proposal.
     ///
     /// # Parameters
@@ -155,7 +203,7 @@ impl SigningGate {
     /// # Defense-in-depth
     ///
     /// 1. Acquire per-pubkey async lock (see module doc on cancellation).
-    /// 2. `is_signing_enabled` gate — fails closed on false.
+    /// 2. `gate_decision` — fails closed on false (unknown pubkey → denied).
     /// 3. Stage → sign (with timeout) → commit/discard (spawn_blocking +
     ///    Handle::block_on).  On stage error → `BlockedBySlashingDb` (slot
     ///    consumed).  On commit error → `SlashingDbCommitFailed` (nothing written;
@@ -179,8 +227,8 @@ impl SigningGate {
         // doc for the full analysis.
         let _guard = self.locks.lock(&pubkey_bytes).await;
 
-        // Step 2: doppelganger gate.
-        if !self.enablement.is_signing_enabled(pubkey) {
+        // Step 2: doppelganger gate (single gate-decision point for all paths).
+        if !self.gate_decision(pubkey) {
             warn!(
                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
                 slot,
@@ -296,7 +344,7 @@ impl SigningGate {
     ///
     /// # Defense-in-depth
     ///
-    /// Identical flow to `sign_block`: lock → enablement gate →
+    /// Identical flow to `sign_block`: lock → gate_decision →
     /// stage + sign (with timeout) + commit/discard (spawn_blocking + Handle::block_on).
     /// On stage error → `BlockedBySlashingDb` (epoch consumed).
     /// On commit error → `SlashingDbCommitFailed` (nothing written; same-root retry safe).
@@ -315,8 +363,8 @@ impl SigningGate {
         // Step 1: per-pubkey async lock (see CANCELLATION NOTE in sign_block).
         let _guard = self.locks.lock(&pubkey_bytes).await;
 
-        // Step 2: doppelganger gate.
-        if !self.enablement.is_signing_enabled(pubkey) {
+        // Step 2: doppelganger gate (single gate-decision point for all paths).
+        if !self.gate_decision(pubkey) {
             warn!(
                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
                 source_epoch,
@@ -421,58 +469,207 @@ impl SigningGate {
         })?
     }
 
-    // ── Non-slashable stubs (Issue 2.9b) ─────────────────────────────────────
+    // ── Non-slashable signing methods ─────────────────────────────────────────
     //
-    // These stubs return `Err(SigningFailed("not yet implemented"))` rather than
-    // panicking, so a stray call during the 2.9a window returns a well-formed
-    // error rather than crashing a tokio worker.  Issue 2.9b replaces the bodies.
+    // All 7 non-slashable methods share the same 2-step flow:
+    //   1. `gate_decision(pubkey)` — fail-closed on false (unknown → denied).
+    //   2. `timeout(sign_timeout, signer.sign(...)).await` — no slashing DB,
+    //      no spawn_blocking (no !Send guard), no commit/discard.
+    //
+    // Error mapping is uniform: timeout/generic → SigningFailed,
+    // KeyNotFound → KeyNotFound.
 
-    /// Sign a sync committee message. (Issue 2.9b stub)
-    pub async fn sign_sync_committee_message(&self) -> Result<Vec<u8>, SigningGateError> {
-        Err(SigningGateError::SigningFailed(
-            "sign_sync_committee_message not yet implemented (Issue 2.9b)".to_string(),
-        ))
+    /// Execute the non-slashable signing flow: gate check → BLS sign with timeout.
+    ///
+    /// Shared by all 7 non-slashable methods so the error-mapping logic lives
+    /// in one place.
+    async fn sign_nonslashable(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+        op_name: &str,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+
+        // Step 1: doppelganger gate (same gate_decision point as slashable paths).
+        if !self.gate_decision(pubkey) {
+            warn!(
+                pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                op = op_name,
+                "SigningGate: non-slashable sign blocked by doppelganger gate"
+            );
+            return Err(SigningGateError::BlockedByDoppelganger);
+        }
+
+        // Step 2: BLS sign with timeout — no slashing DB, no spawn_blocking.
+        let sign_result =
+            tokio::time::timeout(self.sign_timeout, self.signer.sign(&signing_root, &pubkey_bytes))
+                .await;
+
+        match sign_result {
+            Err(_elapsed) => {
+                error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    op = op_name,
+                    timeout_secs = self.sign_timeout.as_secs_f64(),
+                    "SigningGate: non-slashable signer timed out"
+                );
+                Err(SigningGateError::SigningFailed("signer timed out".to_string()))
+            }
+            Ok(Ok(sig)) => Ok(sig.to_bytes().to_vec()),
+            Ok(Err(SigningError::KeyNotFound(_))) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    op = op_name,
+                    "SigningGate: non-slashable key not found"
+                );
+                Err(SigningGateError::KeyNotFound)
+            }
+            Ok(Err(e)) => {
+                error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    op = op_name,
+                    error = %e,
+                    "SigningGate: non-slashable signer error"
+                );
+                Err(SigningGateError::SigningFailed(e.to_string()))
+            }
+        }
     }
 
-    /// Sign an aggregate-and-proof. (Issue 2.9b stub)
-    pub async fn sign_aggregate_and_proof(&self) -> Result<Vec<u8>, SigningGateError> {
-        Err(SigningGateError::SigningFailed(
-            "sign_aggregate_and_proof not yet implemented (Issue 2.9b)".to_string(),
-        ))
+    /// Sign a sync committee message.
+    ///
+    /// Non-slashable: gate check → BLS sign, NO slashing-DB staging.
+    ///
+    /// # Parameters
+    ///
+    /// - `pubkey`: The validator's BLS public key.
+    /// - `signing_root`: The pre-computed signing root (caller applies
+    ///   `DOMAIN_SYNC_COMMITTEE` domain).
+    pub async fn sign_sync_committee_message(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(pubkey, signing_root, "sign_sync_committee_message").await
     }
 
-    /// Sign a contribution-and-proof. (Issue 2.9b stub)
-    pub async fn sign_contribution_and_proof(&self) -> Result<Vec<u8>, SigningGateError> {
-        Err(SigningGateError::SigningFailed(
-            "sign_contribution_and_proof not yet implemented (Issue 2.9b)".to_string(),
-        ))
+    /// Sign an aggregate-and-proof.
+    ///
+    /// # Chain-of-custody invariant (SS-2 / SS-3)
+    ///
+    /// An `AggregateAndProof` is **NOT** itself slashable; its inner
+    /// `Attestation` is, and the caller MUST have already signed that inner
+    /// attestation via `sign_attestation` (which staged the slashing watermark).
+    ///
+    /// This method therefore does **NOT** touch the slashing DB.  Running
+    /// attestation-slashing staging here would be wrong on two counts:
+    ///   a) it would double-stage the attestation rows (the inner attestation
+    ///      was already committed by `sign_attestation`), breaking the
+    ///      EIP-3076 replay-detection logic; and
+    ///   b) it would re-interpret the outer `AggregateAndProof` as an
+    ///      independent attestation, mis-attributing epochs/roots.
+    ///
+    /// The final SS-2/SS-3 GREEN that removes the erroneous attestation-staging
+    /// from `bin/rvc-signer/src/service.rs:698-740` lands in Phase 4 Issue 4.5;
+    /// this issue lands only the gate method + this invariant doc.
+    ///
+    /// # Parameters
+    ///
+    /// - `pubkey`: The validator's BLS public key.
+    /// - `signing_root`: The pre-computed signing root (caller applies
+    ///   `DOMAIN_AGGREGATE_AND_PROOF` domain).
+    pub async fn sign_aggregate_and_proof(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(pubkey, signing_root, "sign_aggregate_and_proof").await
     }
 
-    /// Sign a sync committee selection proof. (Issue 2.9b stub)
-    pub async fn sign_selection_proof(&self) -> Result<Vec<u8>, SigningGateError> {
-        Err(SigningGateError::SigningFailed(
-            "sign_selection_proof not yet implemented (Issue 2.9b)".to_string(),
-        ))
+    /// Sign a contribution-and-proof.
+    ///
+    /// Non-slashable: gate check → BLS sign, NO slashing-DB staging.
+    ///
+    /// # Parameters
+    ///
+    /// - `pubkey`: The validator's BLS public key.
+    /// - `signing_root`: The pre-computed signing root (caller applies
+    ///   `DOMAIN_CONTRIBUTION_AND_PROOF` domain).
+    pub async fn sign_contribution_and_proof(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(pubkey, signing_root, "sign_contribution_and_proof").await
     }
 
-    /// Sign a RANDAO reveal. (Issue 2.9b stub)
-    pub async fn sign_randao_reveal(&self) -> Result<Vec<u8>, SigningGateError> {
-        Err(SigningGateError::SigningFailed(
-            "sign_randao_reveal not yet implemented (Issue 2.9b)".to_string(),
-        ))
+    /// Sign a sync committee selection proof.
+    ///
+    /// Non-slashable: gate check → BLS sign, NO slashing-DB staging.
+    ///
+    /// # Parameters
+    ///
+    /// - `pubkey`: The validator's BLS public key.
+    /// - `signing_root`: The pre-computed signing root (caller applies
+    ///   `DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF` domain).
+    pub async fn sign_selection_proof(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(pubkey, signing_root, "sign_selection_proof").await
     }
 
-    /// Sign a voluntary exit. (Issue 2.9b stub)
-    pub async fn sign_voluntary_exit(&self) -> Result<Vec<u8>, SigningGateError> {
-        Err(SigningGateError::SigningFailed(
-            "sign_voluntary_exit not yet implemented (Issue 2.9b)".to_string(),
-        ))
+    /// Sign a RANDAO reveal.
+    ///
+    /// Non-slashable: gate check → BLS sign, NO slashing-DB staging.
+    ///
+    /// # Parameters
+    ///
+    /// - `pubkey`: The validator's BLS public key.
+    /// - `signing_root`: The pre-computed signing root (caller applies
+    ///   `DOMAIN_RANDAO` domain over the epoch SSZ-encoded as `Epoch`).
+    pub async fn sign_randao_reveal(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(pubkey, signing_root, "sign_randao_reveal").await
     }
 
-    /// Sign a builder registration. (Issue 2.9b stub)
-    pub async fn sign_builder_registration(&self) -> Result<Vec<u8>, SigningGateError> {
-        Err(SigningGateError::SigningFailed(
-            "sign_builder_registration not yet implemented (Issue 2.9b)".to_string(),
-        ))
+    /// Sign a voluntary exit.
+    ///
+    /// Non-slashable: gate check → BLS sign, NO slashing-DB staging.
+    ///
+    /// # Parameters
+    ///
+    /// - `pubkey`: The validator's BLS public key.
+    /// - `signing_root`: The pre-computed signing root (caller applies
+    ///   `DOMAIN_VOLUNTARY_EXIT` domain, capped at Capella per EIP-7044).
+    pub async fn sign_voluntary_exit(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(pubkey, signing_root, "sign_voluntary_exit").await
+    }
+
+    /// Sign a builder registration.
+    ///
+    /// Non-slashable: gate check → BLS sign, NO slashing-DB staging.
+    ///
+    /// # Parameters
+    ///
+    /// - `pubkey`: The validator's BLS public key.
+    /// - `signing_root`: The pre-computed signing root (caller applies
+    ///   `DOMAIN_APPLICATION_BUILDER` domain with zeroed genesis root).
+    pub async fn sign_builder_registration(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(pubkey, signing_root, "sign_builder_registration").await
     }
 }
