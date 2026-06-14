@@ -89,22 +89,18 @@ impl AggregationService {
             };
 
             // D-3: per-validator doppelganger gate (mirrors attestation.rs M-12 check).
+            // `pubkey` is the already-resolved typed PublicKey — use its infallible
+            // `to_bytes()` instead of re-decoding the hex string (no fail-open).
             {
-                let hex = duty.pubkey.strip_prefix("0x").unwrap_or(&duty.pubkey);
-                if let Ok(bytes) = hex::decode(hex) {
-                    if bytes.len() == 48 {
-                        let mut pk_bytes = [0u8; 48];
-                        pk_bytes.copy_from_slice(&bytes);
-                        if !self.validator_store.is_attesting_enabled(&pk_bytes) {
-                            warn!(
-                                pubkey = %TruncatedPubkey::new(&duty.pubkey),
-                                slot,
-                                "Skipping aggregation duty: validator is inside the \
-                                 post-import doppelganger window (D-3)"
-                            );
-                            continue;
-                        }
-                    }
+                let pk_bytes = pubkey.to_bytes();
+                if !self.validator_store.is_attesting_enabled(&pk_bytes) {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(&duty.pubkey),
+                        slot,
+                        "Skipping aggregation duty: validator is inside the \
+                         post-import doppelganger window (D-3)"
+                    );
+                    continue;
                 }
             }
 

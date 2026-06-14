@@ -308,21 +308,16 @@ impl SyncCommitteeService {
         for duty in duties {
             if let Some(pk) = utils::find_pubkey(&self.pubkey_map, &duty.pubkey) {
                 // D-3: per-validator doppelganger gate (mirrors attestation.rs M-12 check).
-                // Strip optional "0x" prefix and decode to raw bytes for the store lookup.
-                let hex = duty.pubkey.strip_prefix("0x").unwrap_or(&duty.pubkey);
-                if let Ok(bytes) = hex::decode(hex) {
-                    if bytes.len() == 48 {
-                        let mut pk_bytes = [0u8; 48];
-                        pk_bytes.copy_from_slice(&bytes);
-                        if !self.validator_store.is_attesting_enabled(&pk_bytes) {
-                            warn!(
-                                pubkey = %TruncatedPubkey::new(&duty.pubkey),
-                                "Skipping sync committee duty: validator is inside the \
-                                 post-import doppelganger window (D-3)"
-                            );
-                            continue;
-                        }
-                    }
+                // `pk` is the already-resolved typed PublicKey — use its infallible
+                // `to_bytes()` instead of re-decoding the hex string (no fail-open).
+                let pk_bytes = pk.to_bytes();
+                if !self.validator_store.is_attesting_enabled(&pk_bytes) {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(&duty.pubkey),
+                        "Skipping sync committee duty: validator is inside the \
+                         post-import doppelganger window (D-3)"
+                    );
+                    continue;
                 }
                 matching_duties.push(duty.clone());
                 matching_pubkeys.push(pk);
@@ -798,42 +793,279 @@ mod tests {
 
     // -----------------------------------------------------------------------
     // D-3: sync contribution path skips validators whose is_attesting_enabled=false.
+    //
+    // ContribGateBeacon: a beacon that returns a valid contribution and tracks
+    // how many times `get_sync_committee_contribution` is called.  If the D-3
+    // gate fires correctly (filter_sync_duties skips the disabled validator),
+    // the loop body is never entered and the contribution endpoint is never
+    // reached.  If the gate is absent (RED state), the loop runs, the selection
+    // proof is signed, and — because we arrange for the key to be deterministically
+    // selected as a sync committee aggregator — `get_sync_committee_contribution`
+    // is called, incrementing the counter.
     // -----------------------------------------------------------------------
+
+    struct ContribGateBeacon {
+        /// Counts calls to `get_sync_committee_contribution`.
+        /// Must be 0 in GREEN (gate fires); > 0 in RED (validator passes filter
+        /// AND is selected as aggregator).
+        contrib_fetch_calls: Arc<AtomicUsize>,
+        duty_pubkey: String,
+    }
+
+    #[async_trait]
+    impl BeaconNodeClient for ContribGateBeacon {
+        async fn get_block_root(&self, _: &str) -> Result<BlockRootResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+
+        async fn post_sync_committee_duties(
+            &self,
+            _epoch: u64,
+            _validator_indices: &[String],
+        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
+            Ok(ExecutionOptimisticResponse {
+                execution_optimistic: false,
+                data: vec![SyncCommitteeDuty {
+                    pubkey: self.duty_pubkey.clone(),
+                    validator_index: 1,
+                    validator_sync_committee_indices: vec![0],
+                }],
+            })
+        }
+
+        async fn submit_sync_committee_messages(
+            &self,
+            _: &[BeaconSyncCommitteeMessage],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+
+        async fn get_sync_committee_contribution(
+            &self,
+            slot: u64,
+            subcommittee_index: u64,
+            _beacon_block_root: &str,
+        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
+            self.contrib_fetch_calls.fetch_add(1, Ordering::SeqCst);
+            // Return a valid (stub) contribution so the signing path continues
+            // and we can observe whether `submit_contribution_and_proofs` is reached.
+            Ok(DataResponse {
+                data: eth_types::SyncCommitteeContribution {
+                    slot,
+                    beacon_block_root: [0xAA; 32],
+                    subcommittee_index,
+                    aggregation_bits: vec![0xFF, 0x01],
+                    signature: vec![0u8; 96],
+                },
+            })
+        }
+
+        async fn submit_contribution_and_proofs(
+            &self,
+            _: &[BeaconSignedContributionAndProof],
+        ) -> Result<(), BeaconError> {
+            Ok(())
+        }
+
+        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_fork_schedule(&self) -> Result<eth_types::ForkSchedule, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_fork(&self, _: &str) -> Result<StateForkResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_validators(&self, _: &[String]) -> Result<ValidatorsResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_attester_duties(
+            &self,
+            _: u64,
+            _: &[String],
+        ) -> Result<AttesterDutiesResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_proposer_duties(&self, _: u64) -> Result<ProposerDutiesResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn produce_block_v3(
+            &self,
+            _: u64,
+            _: &str,
+            _: Option<&str>,
+            _: Option<u64>,
+        ) -> Result<ProduceBlockResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn publish_block(&self, _: &SignedBeaconBlock, _: &str) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn publish_blinded_block(
+            &self,
+            _: &SignedBlindedBeaconBlock,
+            _: &str,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_attestation_data(
+            &self,
+            _: u64,
+            _: u64,
+        ) -> Result<AttestationDataResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_attestation(
+            &self,
+            _: &VersionedAttestation,
+        ) -> Result<SubmitAttestationResult, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_aggregate_attestation(
+            &self,
+            _: u64,
+            _: &str,
+            _: Option<u64>,
+        ) -> Result<VersionedAggregateAttestation, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_aggregate_and_proofs(
+            &self,
+            _: &VersionedSignedAggregateAndProof,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn prepare_beacon_proposer(
+            &self,
+            _: &[ProposerPreparation],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_beacon_committee_subscriptions(
+            &self,
+            _: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn register_validators(
+            &self,
+            _: &[SignedValidatorRegistration],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_version(&self) -> Result<String, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+    }
+
+    /// Returns a `(SecretKey, PublicKey)` pair that is deterministically
+    /// selected as a sync committee aggregator for slot=0 / subcommittee=0
+    /// with the test fork schedule (genesis_fork_version=[0,0,0,1],
+    /// genesis_validators_root=[0u8;32]).
+    ///
+    /// The selection criterion is `sha256(bls_sig_bytes)[0..8] as u64 % 8 == 0`.
+    /// Expected to terminate in ~8 iterations on average.
+    fn find_aggregator_sk() -> (SecretKey, crypto::PublicKey) {
+        use eth_types::{
+            ForkName, SyncAggregatorSelectionData, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+        };
+
+        let fork_schedule = create_test_fork_schedule();
+        let genesis_validators_root: eth_types::Root = [0u8; 32];
+
+        // Slot 0 falls in epoch 0, which is Phase0 (altair_fork_epoch = 10).
+        let fork_name = ForkName::from_epoch(0, &fork_schedule);
+        let fork_version = fork_name.fork_version(&fork_schedule);
+        let domain = crypto::compute_domain(
+            DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+            fork_version,
+            genesis_validators_root,
+        );
+        let selection_data = SyncAggregatorSelectionData { slot: 0, subcommittee_index: 0 };
+        let signing_root = crypto::compute_signing_root(&selection_data, domain);
+
+        loop {
+            let sk = SecretKey::generate();
+            let pk = sk.public_key();
+            // `LocalSigner::sign` calls `sk.sign(signing_root)` internally.
+            // Mirror that directly: `SecretKey::sign(&self, message: &[u8])`.
+            let sig = sk.sign(&signing_root);
+            let sig_bytes = sig.to_bytes();
+            if is_sync_committee_aggregator(&sig_bytes) {
+                return (sk, pk);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_sync_contribution_skipped_when_validator_disabled() {
-        let sk = SecretKey::generate();
-        let pk = sk.public_key();
+        // Find a BLS key that is deterministically selected as a sync committee
+        // aggregator for slot=0 / subcommittee=0.  This ensures the test is
+        // meaningful in RED state: when the D-3 gate is absent, the selection
+        // proof is signed, `is_sync_committee_aggregator` returns true, and
+        // `get_sync_committee_contribution` is reached — incrementing the counter.
+        let (sk, pk) = find_aggregator_sk();
         let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
         let pk_bytes: [u8; 48] = pk.to_bytes();
 
-        let submitted_roots = Arc::new(Mutex::new(Vec::<Root>::new()));
-        let get_block_root_call_count = Arc::new(AtomicUsize::new(0));
-
-        let beacon = Arc::new(ToctouBeacon {
-            get_block_root_call_count: get_block_root_call_count.clone(),
-            submitted_roots: submitted_roots.clone(),
-            r_from_bn_hex: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                .to_string(),
+        let contrib_fetch_calls = Arc::new(AtomicUsize::new(0));
+        let beacon = Arc::new(ContribGateBeacon {
+            contrib_fetch_calls: contrib_fetch_calls.clone(),
             duty_pubkey: pk_hex.clone(),
         });
 
-        // Set up a store where the validator is disabled (doppelganger window).
+        // Validator is disabled (inside post-import doppelganger window).
         let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
         let mut config = ValidatorConfig::new(pk_bytes);
         config.enabled = false;
         store.add_validator(config);
 
-        let service = setup_service_with_store(beacon, pk_hex, pk, sk, store).await;
+        // Build the service with this beacon and the disabled-validator store.
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(sk);
+        let local_signer = LocalSigner::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(local_signer));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
+
+        let mut map = HashMap::new();
+        map.insert(pk_hex, pk);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
+
+        let service = SyncCommitteeService::new(
+            signer,
+            beacon,
+            duty_tracker,
+            pubkey_map,
+            create_test_config(),
+            store,
+        );
 
         let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some([0xAA; 32]) };
         service.maybe_produce_sync_contributions(0, 0, &ctx).await;
 
-        // No contributions should be attempted for a disabled validator
-        // (filter_sync_duties skips the duty before any signing).
+        // In GREEN: filter_sync_duties returns [] because the validator is
+        // disabled → the loop body is never entered → get_sync_committee_contribution
+        // is NEVER called → count stays 0.
+        //
+        // In RED (gate removed): the validator passes the filter → selection
+        // proof is signed → is_sync_committee_aggregator returns true (the key
+        // was chosen to guarantee this) → get_sync_committee_contribution IS called
+        // → count > 0 → assertion fails.
         assert_eq!(
-            get_block_root_call_count.load(Ordering::SeqCst),
+            contrib_fetch_calls.load(Ordering::SeqCst),
             0,
-            "D-3: sync contribution path must not issue BN calls for a disabled validator"
+            "D-3: get_sync_committee_contribution must not be called for a disabled \
+             validator (is_attesting_enabled=false)"
         );
     }
 }
