@@ -3,17 +3,22 @@
 //! This module provides a signing service that ensures all validator
 //! signatures are checked against slashing protection rules before signing.
 
+mod error;
 mod fail_closed;
+mod gate;
+mod locks;
 mod traits;
 
 pub use crypto::is_aggregator;
 // SigningEnablement was relocated from rvc-signer to rvc-doppelganger (Issue 2.6)
 // to allow ForwardWindowMachine to implement it without a doppelganger→signer cycle.
 pub use doppelganger::SigningEnablement;
+pub use error::SigningGateError;
 pub use fail_closed::FailClosedDefault;
+pub use gate::SigningGate;
+pub use locks::ValidatorLockMap;
 pub use traits::ValidatorSigner;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -69,35 +74,6 @@ impl From<SigningError> for SignerError {
                 SignerError::SigningFailed("remote signer returned invalid signature".to_string())
             }
         }
-    }
-}
-
-/// Per-validator lock map for serializing check-record-sign per validator.
-///
-/// Prevents TOCTOU races where two concurrent sign requests for the same
-/// validator could both pass the slashing check before either records.
-/// Different validators are NOT blocked by each other.
-pub struct ValidatorLockMap {
-    locks: parking_lot::Mutex<HashMap<[u8; 48], Arc<tokio::sync::Mutex<()>>>>,
-}
-
-impl ValidatorLockMap {
-    pub fn new() -> Self {
-        Self { locks: parking_lot::Mutex::new(HashMap::new()) }
-    }
-
-    pub fn get(&self, pubkey: &[u8; 48]) -> Arc<tokio::sync::Mutex<()>> {
-        self.locks
-            .lock()
-            .entry(*pubkey)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    }
-}
-
-impl Default for ValidatorLockMap {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

@@ -60,12 +60,10 @@ async fn test_sign_block_per_validator_lock_serializes_concurrent_calls() {
     let gate_b = Arc::clone(&gate);
 
     // Launch two concurrent sign_block calls for different slots.
-    let task_a = tokio::spawn(async move {
-        gate_a.sign_block(&pubkey_a, 100, signing_root_a, GVR).await
-    });
-    let task_b = tokio::spawn(async move {
-        gate_b.sign_block(&pubkey_b, 101, signing_root_b, GVR).await
-    });
+    let task_a =
+        tokio::spawn(async move { gate_a.sign_block(&pubkey_a, 100, signing_root_a, GVR).await });
+    let task_b =
+        tokio::spawn(async move { gate_b.sign_block(&pubkey_b, 101, signing_root_b, GVR).await });
 
     let result_a = task_a.await.expect("task_a did not panic");
     let result_b = task_b.await.expect("task_b did not panic");

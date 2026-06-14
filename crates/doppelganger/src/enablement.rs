@@ -11,7 +11,7 @@
 /// so that `ForwardWindowMachine` can implement it without creating a
 /// `doppelganger → signer` dependency cycle.  `rvc-signer` re-exports it as
 /// `pub use doppelganger::SigningEnablement`.
-pub trait SigningEnablement {
+pub trait SigningEnablement: Send + Sync {
     /// Returns whether signing is currently enabled for this validator.
     ///
     /// Fail-closed default: an unknown pubkey returns `false`.
