@@ -5414,10 +5414,12 @@ mod tests {
         let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         // --- Critical: add the DUTY pubkey as DISABLED (inside doppelganger window).
-        // The duty pubkey from the mock beacon is 0xdddd... (48 bytes).
-        // The validator store must track THIS pubkey as disabled so the filter
-        // has something to match against.
-        let duty_pk_bytes: [u8; 48] = [0xddu8; 48];
+        // D-3 (FUP-6): the gate now resolves the duty pubkey via `find_pubkey`
+        // and gates on the RESOLVED typed pubkey's infallible `to_bytes()` — it
+        // no longer re-decodes the raw `0xdddd...` duty string.  The store must
+        // therefore track the SAME bytes the `pubkey_map` resolves the duty to
+        // (`pubkey.to_bytes()`), not the literal `0xdddd...` byte pattern.
+        let duty_pk_bytes: [u8; 48] = pubkey.to_bytes();
         let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 30_000_000));
         {
             let mut config = validator_store::ValidatorConfig::new(duty_pk_bytes);
