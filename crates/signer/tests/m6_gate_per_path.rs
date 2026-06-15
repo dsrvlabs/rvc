@@ -172,7 +172,10 @@ async fn m6_all_six_paths_refuse_under_one_gate_off() {
     assert_blocked("block", gate.sign_block(&pubkey, 1, [0x01; 32], GVR, "t").await);
     assert_blocked("attestation", gate.sign_attestation(&pubkey, 1, 2, [0x02; 32], GVR, "t").await);
     assert_blocked("sync_message", gate.sign_sync_committee_message(&pubkey, [0x03; 32]).await);
-    assert_blocked("sync_contribution", gate.sign_contribution_and_proof(&pubkey, [0x04; 32]).await);
+    assert_blocked(
+        "sync_contribution",
+        gate.sign_contribution_and_proof(&pubkey, [0x04; 32]).await,
+    );
     assert_blocked("aggregate", gate.sign_aggregate_and_proof(&pubkey, [0x05; 32]).await);
     assert_blocked("selection", gate.sign_selection_proof(&pubkey, [0x06; 32]).await);
 

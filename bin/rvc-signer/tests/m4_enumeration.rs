@@ -93,10 +93,7 @@ fn live_listener_serves_v2_not_v1() {
         v1, "signer.SignerService",
         "the v1 raw-root service name is the legacy unregistered service"
     );
-    assert_ne!(
-        live, v1,
-        "the live listener must not serve the v1 raw-root service"
-    );
+    assert_ne!(live, v1, "the live listener must not serve the v1 raw-root service");
 }
 
 /// M4 core (zero v1 raw-root on the live listener): no enumerated method is a
@@ -173,9 +170,9 @@ fn block_and_attestation_are_present_and_gated() {
     let live = live_listener_service_name();
 
     let has_gated = |method: &str| {
-        REGISTERED_METHODS
-            .iter()
-            .any(|m| m.service == live && m.method == method && m.gate_routing == GateRouting::Gated)
+        REGISTERED_METHODS.iter().any(|m| {
+            m.service == live && m.method == method && m.gate_routing == GateRouting::Gated
+        })
     };
 
     assert!(
