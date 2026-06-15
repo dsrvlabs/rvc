@@ -323,14 +323,12 @@ fn make_state(
         import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
         doppelganger_window: window,
         cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+        doppelganger_state_lock: std::sync::Mutex::new(()),
     })
 }
 
 /// Snapshot the single cancel-token currently registered for `pubkey`.
-fn current_token(
-    state: &AppState,
-    pubkey: &Pubkey,
-) -> Option<tokio_util::sync::CancellationToken> {
+fn current_token(state: &AppState, pubkey: &Pubkey) -> Option<tokio_util::sync::CancellationToken> {
     state.cancel_tokens.lock().unwrap().get(pubkey).cloned()
 }
 

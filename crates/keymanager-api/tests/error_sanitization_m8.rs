@@ -219,6 +219,7 @@ async fn test_internal_error_sanitized() {
         import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
         doppelganger_window: std::time::Duration::ZERO,
         cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+        doppelganger_state_lock: std::sync::Mutex::new(()),
     });
 
     let slashing_data = r#"{"metadata":{"interchange_format_version":"5","genesis_validators_root":"0x0000000000000000000000000000000000000000000000000000000000000000"},"data":[]}"#;
@@ -272,6 +273,7 @@ async fn test_keystore_import_item_error_sanitized() {
         import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
         doppelganger_window: std::time::Duration::ZERO,
         cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+        doppelganger_state_lock: std::sync::Mutex::new(()),
     });
 
     let body = serde_json::json!({
@@ -327,6 +329,7 @@ async fn test_remote_key_import_item_error_sanitized() {
         import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
         doppelganger_window: std::time::Duration::ZERO,
         cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+        doppelganger_state_lock: std::sync::Mutex::new(()),
     });
 
     let pubkey_str = format!("0x{}", pubkey_hex(3));

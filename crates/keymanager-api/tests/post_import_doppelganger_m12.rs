@@ -208,6 +208,7 @@ fn make_state(
         import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
         doppelganger_window: window,
         cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+        doppelganger_state_lock: std::sync::Mutex::new(()),
     })
 }
 

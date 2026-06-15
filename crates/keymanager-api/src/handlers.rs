@@ -62,6 +62,30 @@ pub struct AppState {
     /// prematurely flip `enabled = true` on a re-imported key that has begun
     /// a fresh doppelganger window.
     pub cancel_tokens: Mutex<HashMap<Pubkey, CancellationToken>>,
+    /// KM-2 (ISSUE-2.12): serialises the doppelganger enable/disable state
+    /// transitions of `import_keystores` and `delete_keystores`.
+    ///
+    /// A concurrent delete + re-import could otherwise interleave such that a
+    /// re-import's cancel-token `insert` lands between the delete's keystore
+    /// removal and its cancel-token removal, leaving a stale background task
+    /// alive that later flips `enabled = true` on a key inside a fresh
+    /// doppelganger window (a slashing-safety hole).
+    ///
+    /// # Lock-ordering invariant
+    ///
+    /// This is the OUTERMOST doppelganger-state lock.  Holders MUST:
+    ///   - acquire it before touching `validator_manager`,
+    ///     `doppelganger_monitor`, or `cancel_tokens` for a state transition;
+    ///   - take the short-lived `cancel_tokens` mutex only WHILE holding this
+    ///     lock (never the reverse), so the two never deadlock;
+    ///   - never hold it across an `.await` (every guarded section is
+    ///     synchronous; the spawned background task runs outside the guard).
+    ///
+    /// The delete handler holds this lock across BOTH its keystore removal and
+    /// its cancel-token removal/cancel (PRD §KM-2 (b)); the import handler holds
+    /// it across its `add_validator` + `start_monitoring` + cancel-token insert,
+    /// so a re-import cannot interleave with an in-flight delete.
+    pub doppelganger_state_lock: Mutex<()>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,19 +174,46 @@ pub async fn import_keystores(
                 // (default 2 epochs ≈ 768 s on mainnet) before attestation is
                 // enabled. Operators who relied on instant activation must
                 // account for this delay.
-                state.validator_manager.add_validator(pubkey, false);
-                state.doppelganger_monitor.start_monitoring(pubkey);
-
-                // SF-3: create a cancellation token so that a delete + re-import
-                // within the window can cancel the stale task before it fires.
-                // SF-4: the task calls stop_monitoring after enabling so the
-                //       pending map is pruned and memory does not grow unboundedly.
+                //
+                // KM-2 (ISSUE-2.12): the validator/monitor/cancel-token state
+                // transition runs under `doppelganger_state_lock` so a
+                // concurrent `delete_keystores` cannot interleave between this
+                // insert and its own removal+cancel. The guard is synchronous
+                // and dropped before `spawn` returns control to the loop (it is
+                // never held across an `.await`).
                 let cancel_token = CancellationToken::new();
-                state.cancel_tokens.lock().unwrap().insert(pubkey, cancel_token.clone());
-
                 {
+                    let _guard = state
+                        .doppelganger_state_lock
+                        .lock()
+                        .expect("doppelganger_state_lock poisoned");
+
+                    state.validator_manager.add_validator(pubkey, false);
+                    state.doppelganger_monitor.start_monitoring(pubkey);
+
+                    // SF-3 / KM-2 (a): register the cancellation token. If a
+                    // token was already present for this pubkey (e.g. a stale
+                    // task from a prior import that a racing delete had not yet
+                    // cancelled), cancel the DISPLACED token so it can never
+                    // enable a key that is now inside a fresh window. No token
+                    // is ever dropped from the map without being cancelled.
+                    //
+                    // The `.cancel()` runs WHILE the `cancel_tokens` guard is
+                    // held so that "insert new + cancel old" is atomic against a
+                    // concurrent task's self-prune (KM-2 (c)): a displaced task
+                    // observes its token cancelled before it can prune the fresh
+                    // entry.
+                    {
+                        let mut tokens = state.cancel_tokens.lock().unwrap();
+                        if let Some(displaced) = tokens.insert(pubkey, cancel_token.clone()) {
+                            displaced.cancel();
+                        }
+                    }
+
                     let vm = Arc::clone(&state.validator_manager);
                     let dm = Arc::clone(&state.doppelganger_monitor);
+                    let st = Arc::clone(&state);
+                    let token = cancel_token.clone();
                     let window = state.doppelganger_window;
                     let pk_hex = pubkey_hex.clone();
                     // Capture the deadline NOW (before spawn) so that
@@ -176,15 +227,25 @@ pub async fn import_keystores(
                             _ = tokio::time::sleep_until(deadline) => {
                                 vm.set_validator_enabled(&pubkey, true);
                                 dm.stop_monitoring(&pubkey); // SF-4: prune pending entry
+                                // KM-2 (c): the window elapsed for THIS task, so
+                                // prune its OWN cancel-token entry. We only remove
+                                // when our token is still uncancelled: a cancelled
+                                // token means a delete/re-import already displaced
+                                // us and now owns the map slot — leave it alone so
+                                // we never drop an unrelated (fresh) token.
+                                if !token.is_cancelled() {
+                                    st.cancel_tokens.lock().unwrap().remove(&pubkey);
+                                }
                                 info!(
                                     pubkey = %TruncatedPubkey::new(&pk_hex),
                                     "Doppelganger window elapsed; enabling validator for attestation"
                                 );
                             }
-                            _ = cancel_token.cancelled() => {
+                            _ = token.cancelled() => {
                                 // Key was deleted (or re-imported) before the window elapsed.
                                 // Do not enable: a fresh window is already running or the
-                                // key has been removed entirely.
+                                // key has been removed entirely. The displacer/deleter owns
+                                // the map slot, so we do not touch cancel_tokens here.
                                 info!(
                                     pubkey = %TruncatedPubkey::new(&pk_hex),
                                     "Doppelganger background task cancelled (key deleted or re-imported)"
@@ -275,44 +336,54 @@ pub async fn delete_keystores(
     for (i, parse_result) in parsed.iter().enumerate() {
         let pubkey_hex = &request.pubkeys[i];
         match parse_result {
-            Ok(pubkey) => match state.keystore_manager.delete_keystore(pubkey) {
-                Ok(true) => {
-                    warn!(
-                        pubkey = %TruncatedPubkey::new(pubkey_hex),
-                        status = "deleted",
-                        "Keystore delete result"
-                    );
-                    state.validator_manager.remove_validator(pubkey);
-                    state.doppelganger_monitor.stop_monitoring(pubkey);
-                    // SF-3: cancel any in-flight doppelganger background task so a
-                    // stale task cannot prematurely enable a re-imported key.
-                    if let Some(token) = state.cancel_tokens.lock().unwrap().remove(pubkey) {
-                        token.cancel();
+            Ok(pubkey) => {
+                // KM-2 (ISSUE-2.12) (b): hold `doppelganger_state_lock` across
+                // BOTH the keystore removal AND the cancel-token removal/cancel,
+                // so a concurrent `import_keystores` cannot interleave its
+                // cancel-token insert between them and leave a stale background
+                // task alive. The guard is synchronous and released at the end
+                // of this iteration (never held across an `.await`).
+                let _guard =
+                    state.doppelganger_state_lock.lock().expect("doppelganger_state_lock poisoned");
+                match state.keystore_manager.delete_keystore(pubkey) {
+                    Ok(true) => {
+                        warn!(
+                            pubkey = %TruncatedPubkey::new(pubkey_hex),
+                            status = "deleted",
+                            "Keystore delete result"
+                        );
+                        state.validator_manager.remove_validator(pubkey);
+                        state.doppelganger_monitor.stop_monitoring(pubkey);
+                        // SF-3: cancel any in-flight doppelganger background task so a
+                        // stale task cannot prematurely enable a re-imported key.
+                        if let Some(token) = state.cancel_tokens.lock().unwrap().remove(pubkey) {
+                            token.cancel();
+                        }
+                        results.push(DeleteKeystoreResult {
+                            status: DeleteStatus::Deleted,
+                            message: String::new(),
+                        });
                     }
-                    results.push(DeleteKeystoreResult {
-                        status: DeleteStatus::Deleted,
-                        message: String::new(),
-                    });
+                    Ok(false) => {
+                        warn!(
+                            pubkey = %TruncatedPubkey::new(pubkey_hex),
+                            status = "not_found",
+                            "Keystore delete result"
+                        );
+                        results.push(DeleteKeystoreResult {
+                            status: DeleteStatus::NotFound,
+                            message: String::new(),
+                        });
+                    }
+                    Err(e) => {
+                        // M-8: sanitize underlying error (paths, errno, etc.) before
+                        // returning to the client. The full chain is logged inside
+                        // sanitize_item_err with a request_id correlator.
+                        let message = sanitize_item_err(&e, "keystore delete failed");
+                        results.push(DeleteKeystoreResult { status: DeleteStatus::Error, message });
+                    }
                 }
-                Ok(false) => {
-                    warn!(
-                        pubkey = %TruncatedPubkey::new(pubkey_hex),
-                        status = "not_found",
-                        "Keystore delete result"
-                    );
-                    results.push(DeleteKeystoreResult {
-                        status: DeleteStatus::NotFound,
-                        message: String::new(),
-                    });
-                }
-                Err(e) => {
-                    // M-8: sanitize underlying error (paths, errno, etc.) before
-                    // returning to the client. The full chain is logged inside
-                    // sanitize_item_err with a request_id correlator.
-                    let message = sanitize_item_err(&e, "keystore delete failed");
-                    results.push(DeleteKeystoreResult { status: DeleteStatus::Error, message });
-                }
-            },
+            }
             Err(e) => {
                 // Pubkey-parse error — the value of `e` here is generated
                 // server-side from caller input (parse_pubkey), so it is
@@ -1290,6 +1361,7 @@ mod tests {
                 import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
                 doppelganger_window: std::time::Duration::ZERO,
                 cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+                doppelganger_state_lock: std::sync::Mutex::new(()),
             });
             Router::new()
                 .route(
@@ -1616,6 +1688,7 @@ mod tests {
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_state_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -2728,6 +2801,7 @@ mod tests {
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_state_lock: std::sync::Mutex::new(()),
         });
 
         let router = Router::new()
@@ -2778,6 +2852,7 @@ mod tests {
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_state_lock: std::sync::Mutex::new(()),
         });
 
         let router = Router::new()
@@ -2828,6 +2903,7 @@ mod tests {
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_state_lock: std::sync::Mutex::new(()),
         });
 
         let router = Router::new()
@@ -2921,6 +2997,7 @@ mod tests {
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_state_lock: std::sync::Mutex::new(()),
         });
         Router::new()
             .route(
@@ -3342,6 +3419,7 @@ mod tests {
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_state_lock: std::sync::Mutex::new(()),
         });
         Router::new()
             .route(
@@ -3479,6 +3557,7 @@ mod tests {
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_state_lock: std::sync::Mutex::new(()),
         });
         Router::new()
             .route("/rvc/v1/validator/:pubkey/prepare_exit", axum::routing::post(prepare_exit))
@@ -3593,6 +3672,7 @@ mod tests {
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
             doppelganger_window: std::time::Duration::ZERO,
             cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            doppelganger_state_lock: std::sync::Mutex::new(()),
         });
 
         let api = Router::new()
