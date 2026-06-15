@@ -1566,14 +1566,18 @@ block_selection_mode = "builder-only"
         assert_eq!(config.block_selection_mode, Some(BlockSelectionMode::BuilderOnly));
     }
 
-    // ── M-12 (Critical #1): is_attesting_enabled ─────────────────────────
+    // ── M-12 (Critical #1): is_signing_enabled ───────────────────────────
 
-    /// Unknown pubkeys (not in the store) default to enabled=true so that
-    /// validators loaded at startup without an explicit config still attest.
+    /// D-3 (Issue 2.11): unknown pubkeys (not tracked by the store) are
+    /// fail-closed — `is_signing_enabled` returns `false` so a pubkey the store
+    /// has never seen is never permitted to sign by default.
     #[test]
-    fn test_is_attesting_enabled_unknown_pubkey_defaults_to_true() {
+    fn test_is_signing_enabled_unknown_pubkey_fails_closed() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
-        assert!(store.is_attesting_enabled(&test_pubkey(99)));
+        assert!(
+            !store.is_signing_enabled(&test_pubkey(99)),
+            "unknown pubkey must fail closed (return false)"
+        );
     }
 
     /// A validator explicitly added with enabled=true is attestable.

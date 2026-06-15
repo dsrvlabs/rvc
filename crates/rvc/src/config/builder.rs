@@ -844,4 +844,91 @@ mod tests {
         assert_eq!(store.default_fee_recipient(), [0xbbu8; 20]);
         assert_eq!(store.default_gas_limit(), 50_000_000);
     }
+
+    // --- D-3 (Issue 2.11): no-availability-regression for fail-closed default ---
+
+    /// Builds an in-memory `KeyManager` populated with `count` freshly generated
+    /// keys, returning the manager and the matching `pubkey_map`. Mirrors the
+    /// startup path where keystore-loaded keys flow into `build_pubkey_map`.
+    fn loaded_key_manager(builder: &ServiceBuilder, count: usize) -> (KeyManager, PubkeyMap) {
+        let mut key_manager = KeyManager::new();
+        for _ in 0..count {
+            key_manager.insert(crypto::SecretKey::generate());
+        }
+        let pubkey_map = builder.build_pubkey_map(&key_manager);
+        (key_manager, pubkey_map)
+    }
+
+    /// CRITICAL (D-3 fail-closed safety): after flipping the unknown-pubkey
+    /// default to fail-closed, every validator the VC actually loads from
+    /// keystores — with NO per-validator `validators_config` TOML entry — must
+    /// still be permitted to sign, because startup registers each loaded pubkey
+    /// in the `ValidatorStore`. Without `register_loaded_validators`, every
+    /// keystore-loaded key would hit the fail-closed default and be silently
+    /// blocked (catastrophic availability regression).
+    #[test]
+    fn test_loaded_validators_registered_so_signing_enabled() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let fr_hex = "0x".to_string() + &hex::encode([0xccu8; 20]);
+        // Non-zero default fee recipient but NO per-validator entries — the common
+        // production case where keys are loaded into the KeyManager, not the store.
+        std::fs::write(&config_path, format!("[defaults]\nfee_recipient = \"{fr_hex}\"\n"))
+            .unwrap();
+
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let store = builder.build_validator_store(Some(&config_path)).unwrap();
+        let (key_manager, pubkey_map) = loaded_key_manager(&builder, 3);
+
+        // Before registration the loaded keys are untracked → fail-closed.
+        for pubkey in key_manager.list_public_keys() {
+            assert!(
+                !store.is_signing_enabled(&pubkey.to_bytes()),
+                "untracked loaded key must be fail-closed before registration"
+            );
+        }
+
+        builder.register_loaded_validators(&store, &pubkey_map);
+
+        // After registration every loaded key is tracked & enabled.
+        for pubkey in key_manager.list_public_keys() {
+            assert!(
+                store.is_signing_enabled(&pubkey.to_bytes()),
+                "loaded keystore key must be permitted to sign after startup registration"
+            );
+        }
+    }
+
+    /// `register_loaded_validators` must NOT clobber an existing disabled entry
+    /// (e.g. a validator set `enabled = false` by the doppelganger window or via
+    /// the validators TOML). Registration only adds keys that are not already
+    /// tracked.
+    #[test]
+    fn test_register_loaded_validators_preserves_disabled_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let fr_hex = "0x".to_string() + &hex::encode([0xddu8; 20]);
+        std::fs::write(&config_path, format!("[defaults]\nfee_recipient = \"{fr_hex}\"\n"))
+            .unwrap();
+
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let store = builder.build_validator_store(Some(&config_path)).unwrap();
+        let (key_manager, pubkey_map) = loaded_key_manager(&builder, 1);
+        let pk = key_manager.list_public_keys()[0].to_bytes();
+
+        // Simulate the doppelganger window having disabled this validator before
+        // registration runs.
+        let mut disabled = validator_store::ValidatorConfig::new(pk);
+        disabled.enabled = false;
+        store.add_validator(disabled);
+
+        builder.register_loaded_validators(&store, &pubkey_map);
+
+        assert!(
+            !store.is_signing_enabled(&pk),
+            "registration must not re-enable a validator already tracked as disabled"
+        );
+    }
 }
