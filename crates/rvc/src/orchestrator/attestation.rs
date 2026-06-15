@@ -24,30 +24,46 @@ use super::validation::attestation_data::validate_attestation_data;
 /// Decide whether an attestation duty may proceed past the doppelganger gate.
 ///
 /// Returns `true` when the duty is allowed to be signed, `false` when it must be
-/// skipped (the validator is inside its post-import doppelganger window, or the
-/// duty pubkey cannot be resolved).
+/// skipped.  This is **fail-closed** (D-3 / FUP-6): the duty is skipped when
+///
+/// - the pubkey cannot be resolved via `find_pubkey` (case-insensitive,
+///   `0x`/`0X`-tolerant) — an unresolved pubkey cannot be gate-checked, so the
+///   only safe action is to skip; or
+/// - the resolved validator is disabled (`is_signing_enabled` returns `false`),
+///   i.e. still inside its post-import doppelganger window (M-12).
+///
+/// The gate decision is taken on the **infallible** `pk.to_bytes()` of the
+/// already-resolved typed `PublicKey`, never by re-decoding the raw beacon
+/// pubkey string.  This mirrors the sibling sync/aggregate/coordinator paths
+/// and removes the previous fail-OPEN fall-through where a non-`0x`-lowercase
+/// or non-decoding pubkey string skipped the gate entirely.
 pub(crate) fn attestation_duty_enabled(
     duty: &AttesterDuty,
     pubkey_map: &PubkeyMap,
     validator_store: &ValidatorStore,
     slot: Slot,
 ) -> bool {
-    let hex = duty.pubkey.strip_prefix("0x").unwrap_or(&duty.pubkey);
-    if let Ok(bytes) = hex::decode(hex) {
-        if bytes.len() == 48 {
-            let mut pk = [0u8; 48];
-            pk.copy_from_slice(&bytes);
-            if !validator_store.is_signing_enabled(&pk) {
-                warn!(
-                    pubkey = %duty.pubkey,
-                    slot,
-                    "Skipping attestation duty: validator is inside the \
-                     post-import doppelganger window (M-12)"
-                );
-                return false;
-            }
-        }
+    let Some(pk) = utils::find_pubkey(pubkey_map, &duty.pubkey) else {
+        warn!(
+            pubkey = %TruncatedPubkey::new(&duty.pubkey),
+            slot,
+            "Skipping attestation duty: pubkey did not resolve to a tracked \
+             validator (D-3 fail-closed)"
+        );
+        return false;
+    };
+
+    let pk_bytes = pk.to_bytes();
+    if !validator_store.is_signing_enabled(&pk_bytes) {
+        warn!(
+            pubkey = %TruncatedPubkey::new(&duty.pubkey),
+            slot,
+            "Skipping attestation duty: validator is inside the \
+             post-import doppelganger window (M-12)"
+        );
+        return false;
     }
+
     true
 }
 
@@ -127,7 +143,12 @@ where
 
         // M-12 (Critical #1) / D-3: skip duties for validators still inside
         // their post-import doppelganger window, or whose pubkey cannot be
-        // resolved.  See `attestation_duty_enabled` for the fail-closed policy.
+        // resolved.  The decision is fail-CLOSED: a duty is dropped unless its
+        // pubkey resolves to a tracked validator whose `is_signing_enabled`
+        // flag is `true`.  Keystore-loaded keys are registered in the store at
+        // startup (`ServiceBuilder::register_loaded_validators`), so they
+        // resolve and remain enabled; an unresolved or disabled pubkey is
+        // skipped rather than passed through.  See `attestation_duty_enabled`.
         let duties: Vec<AttesterDuty> = raw_duties
             .into_iter()
             .filter(|duty| {
@@ -620,6 +641,26 @@ mod tests {
             !attestation_duty_enabled(&duty, &pubkey_map, &store, 0),
             "a duty whose pubkey does not resolve via find_pubkey must be SKIPPED \
              (fail-closed); the old code falls through to enabled=true (fail-open)"
+        );
+    }
+
+    /// GREEN guard: the fail-closed fix must NOT over-skip — a resolvable,
+    /// enabled validator's duty (even with an uppercase `0X` prefix) is allowed.
+    #[test]
+    fn test_resolvable_enabled_validator_is_allowed() {
+        let sk = SecretKey::generate();
+        let pubkey = sk.public_key();
+
+        let duty_pubkey = format!("0X{}", hex::encode(pubkey.to_bytes()).to_uppercase());
+        let duty = duty_with_pubkey(&duty_pubkey);
+
+        let pubkey_map = pubkey_map_with(&pubkey);
+        let store = ValidatorStore::new([0u8; 20], 30_000_000);
+        store.add_validator(ValidatorConfig::new(pubkey.to_bytes())); // enabled by default
+
+        assert!(
+            attestation_duty_enabled(&duty, &pubkey_map, &store, 0),
+            "a resolvable, enabled validator must be allowed through the gate"
         );
     }
 }

@@ -358,7 +358,7 @@ impl ServiceBuilder {
         }
         info!(
             registered,
-            tracked_total = store.list_enabled_pubkeys().len(),
+            enabled_total = store.list_enabled_pubkeys().len(),
             "Registered loaded validators in the validator store (D-3 fail-closed)"
         );
     }
