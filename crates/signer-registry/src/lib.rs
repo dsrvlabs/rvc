@@ -64,7 +64,41 @@ pub struct SigningMethod {
     pub method: &'static str,
     pub message_kind: MessageKind,
     pub gate_routing: GateRouting,
+    /// The `crates/signer::SigningGate::sign_*` method this handler invokes.
+    ///
+    /// Every live-listener signing handler routes through `SigningGate`
+    /// (slashable handlers stage the slashing DB; non-slashable handlers only
+    /// run the doppelganger gate-decision), so this is `Some(_)` for all current
+    /// entries.  It MUST be `Some(_)` for any `Gated` entry — that is the strict
+    /// PRD M4 invariant enforced by `signing_path_enumeration.rs` (Issue 2.13):
+    /// a slashable method that does not name a `SigningGate::sign_*` method
+    /// cannot be confirmed to consult EIP-3076.
+    ///
+    /// The named method MUST be one of [`SIGNING_GATE_METHODS`].
+    pub gate_method: Option<&'static str>,
 }
+
+/// The canonical set of `crates/signer::SigningGate::sign_*` method names.
+///
+/// This is the authoritative list a `SigningMethod::gate_method` is validated
+/// against by the strict enumeration gate.  Keep it in lockstep with the public
+/// `SigningGate` API in `crates/signer/src/gate.rs`: adding a `SigningGate`
+/// signing method (or renaming one) requires updating this list and any
+/// `REGISTERED_METHODS` entry that routes through it.
+///
+/// DEV-ONLY: this list is consumed by the M4 enumeration gate, not by
+/// production code (ADR-010 — this crate is `[dev-dependencies]` only).
+pub const SIGNING_GATE_METHODS: &[&str] = &[
+    "sign_block",
+    "sign_attestation",
+    "sign_sync_committee_message",
+    "sign_aggregate_and_proof",
+    "sign_contribution_and_proof",
+    "sign_selection_proof",
+    "sign_randao_reveal",
+    "sign_voluntary_exit",
+    "sign_builder_registration",
+];
 
 /// Every gRPC signing method on the live listener, classified by message kind and gate routing.
 ///
@@ -84,18 +118,21 @@ pub const REGISTERED_METHODS: &[SigningMethod] = &[
         method: "SignBeaconBlock",
         message_kind: MessageKind::Block,
         gate_routing: GateRouting::Gated,
+        gate_method: Some("sign_block"),
     },
     SigningMethod {
         service: "signer.v2.SignerService",
         method: "SignBlindedBeaconBlock",
         message_kind: MessageKind::Block,
         gate_routing: GateRouting::Gated,
+        gate_method: Some("sign_block"),
     },
     SigningMethod {
         service: "signer.v2.SignerService",
         method: "SignAttestationData",
         message_kind: MessageKind::Attestation,
         gate_routing: GateRouting::Gated,
+        gate_method: Some("sign_attestation"),
     },
     // TODO(SS-2/SS-3, Phase 4): reclassify aggregate as non-slashable once the
     // SignAggregateAndProof path is fixed to not stage attestation slashing records.
@@ -104,41 +141,48 @@ pub const REGISTERED_METHODS: &[SigningMethod] = &[
         method: "SignAggregateAndProof",
         message_kind: MessageKind::Aggregate,
         gate_routing: GateRouting::Gated,
+        gate_method: Some("sign_aggregate_and_proof"),
     },
     SigningMethod {
         service: "signer.v2.SignerService",
         method: "SignRandaoReveal",
         message_kind: MessageKind::RandaoReveal,
         gate_routing: GateRouting::NonSlashable,
+        gate_method: Some("sign_randao_reveal"),
     },
     SigningMethod {
         service: "signer.v2.SignerService",
         method: "SignSyncCommitteeMessage",
         message_kind: MessageKind::SyncMessage,
         gate_routing: GateRouting::NonSlashable,
+        gate_method: Some("sign_sync_committee_message"),
     },
     SigningMethod {
         service: "signer.v2.SignerService",
         method: "SignSyncAggregatorSelectionData",
         message_kind: MessageKind::SyncSelection,
         gate_routing: GateRouting::NonSlashable,
+        gate_method: Some("sign_selection_proof"),
     },
     SigningMethod {
         service: "signer.v2.SignerService",
         method: "SignContributionAndProof",
         message_kind: MessageKind::SyncContribution,
         gate_routing: GateRouting::NonSlashable,
+        gate_method: Some("sign_contribution_and_proof"),
     },
     SigningMethod {
         service: "signer.v2.SignerService",
         method: "SignBuilderRegistration",
         message_kind: MessageKind::BuilderRegistration,
         gate_routing: GateRouting::NonSlashable,
+        gate_method: Some("sign_builder_registration"),
     },
     SigningMethod {
         service: "signer.v2.SignerService",
         method: "SignVoluntaryExit",
         message_kind: MessageKind::VoluntaryExit,
         gate_routing: GateRouting::NonSlashable,
+        gate_method: Some("sign_voluntary_exit"),
     },
 ];

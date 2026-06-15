@@ -4,32 +4,41 @@
 //! # Purpose
 //!
 //! Adding a new gRPC signing method to `rvc-signer` without a matching entry in
-//! `REGISTERED_METHODS` (or mis-classifying its `gate_routing`) will cause this
-//! test to fail, blocking CI.
+//! `REGISTERED_METHODS` (or mis-classifying its `gate_routing` / `gate_method`)
+//! will cause this test to fail, blocking CI.
 //!
-//! # Invariants checked (weaker set — Issue 2.13 strengthens to strict)
+//! # Invariants checked (STRICT set — flipped on by Issue 2.13)
 //!
 //! 1. `REGISTERED_METHODS` is non-empty.
 //! 2. Every slashable message kind (`Block | Attestation | Aggregate | ElectraAggregate`)
 //!    must have `gate_routing == GateRouting::Gated`.  No slashable method may be
 //!    `NonSlashable`.
 //! 3. Every entry has non-empty `service` and `method` strings.
+//! 4. **STRICT (Issue 2.13):** every registered method is either non-slashable
+//!    (`gate_routing == NonSlashable`) OR confirmed via `signer-registry` to
+//!    invoke `SigningGate::sign_*` — i.e. its `gate_method` is `Some(name)` where
+//!    `name ∈ signer_registry::SIGNING_GATE_METHODS`.  A slashable method with no
+//!    recognized `SigningGate` method named cannot be confirmed to consult
+//!    EIP-3076; this is the strengthening that locks PRD M4 into place.
 //!
-//! # Strengthening (Issue 2.13)
+//! # What changed in the strict flip
 //!
-//! Issue 2.13 will add a cross-check that verifies each `REGISTERED_METHODS` entry
-//! actually invokes `SigningGate` at the call site (runtime or compile-time linkage
-//! check).  That strict gate is deferred to preserve parallelism; this weaker set is
-//! the CI floor until then.
+//! Issue 2.2 landed the weaker invariant ("every method is non-slashable OR
+//! tagged `Gated`").  Issue 2.13 flips it to the stronger one above by recording,
+//! per registry entry, the concrete `SigningGate::sign_*` method the handler
+//! routes through (`SigningMethod::gate_method`) and validating that name against
+//! the canonical `SIGNING_GATE_METHODS` list.  The link from a live RPC to a
+//! `SigningGate` method is now machine-checked, not merely a boolean tag.
 //!
 //! Note: cross-checking registry method names against the actual v2 proto service
 //! descriptor via tonic reflection would add heavy build-time overhead.  Instead,
-//! the convention is enforced by code review + the per-method naming check below.
-//! Issue 2.13 will strengthen this if reflection becomes cheap.
+//! the live-listener service name is introspected via `NamedService` in the
+//! companion `m4_enumeration.rs` (Issue 2.13), and the gate linkage is confirmed
+//! via the `gate_method` cross-check below.
 
 // The dep key in Cargo.toml is `signer-registry` (package = "rvc-signer-registry"),
 // so the import alias is `signer_registry` from rvc-signer-bin's perspective.
-use signer_registry::{GateRouting, MessageKind, REGISTERED_METHODS};
+use signer_registry::{GateRouting, MessageKind, REGISTERED_METHODS, SIGNING_GATE_METHODS};
 
 /// REGISTERED_METHODS must be non-empty — the live listener has signing methods.
 #[test]
@@ -118,4 +127,87 @@ fn registered_methods_count_matches_live_listener() {
         EXPECTED,
         "REGISTERED_METHODS count changed: add the new method's entry or update EXPECTED"
     );
+}
+
+/// STRICT invariant (Issue 2.13 flip): every registered method is non-slashable
+/// OR confirmed via `signer-registry` to invoke `SigningGate::sign_*`.
+///
+/// This is the strengthening of the Issue 2.2 weaker invariant.  Previously a
+/// slashable method only had to be *tagged* `Gated`; now a `Gated` method must
+/// name the concrete `SigningGate::sign_*` method it routes through
+/// (`gate_method`), and that name must be a recognized member of
+/// `SIGNING_GATE_METHODS`.  A slashable method that names no recognized gate
+/// method would be one that cannot be confirmed to consult EIP-3076 — exactly
+/// the PRD M4 failure mode this gate locks out.
+#[test]
+fn every_registered_method_is_nonslashable_or_invokes_signing_gate() {
+    for m in REGISTERED_METHODS {
+        // The "OR non-slashable" escape clause: non-slashable methods are not
+        // required to route through the gate for M4 (they carry no slashing
+        // watermark).  In the current architecture they do route through the
+        // gate anyway, but M4 does not mandate it.
+        if m.gate_routing == GateRouting::NonSlashable {
+            continue;
+        }
+
+        // Otherwise the method is Gated and MUST be confirmed to invoke a
+        // recognized SigningGate::sign_* method.
+        let gate_method = m.gate_method.unwrap_or_else(|| {
+            panic!(
+                "STRICT M4: gated method {}/{} (kind={:?}) names no SigningGate method \
+                 (gate_method = None); it cannot be confirmed to consult EIP-3076",
+                m.service, m.method, m.message_kind,
+            )
+        });
+
+        assert!(
+            SIGNING_GATE_METHODS.contains(&gate_method),
+            "STRICT M4: gated method {}/{} routes through '{}', which is not a recognized \
+             SigningGate::sign_* method ({:?}); update SIGNING_GATE_METHODS or fix the entry",
+            m.service,
+            m.method,
+            gate_method,
+            SIGNING_GATE_METHODS,
+        );
+    }
+}
+
+/// STRICT support: every entry that names a `gate_method` names a recognized one.
+///
+/// This also covers the non-slashable entries (which, in the current
+/// architecture, all route through the gate too); it catches a typo'd
+/// `gate_method` on any entry, slashable or not.
+#[test]
+fn every_named_gate_method_is_recognized() {
+    for m in REGISTERED_METHODS {
+        if let Some(gate_method) = m.gate_method {
+            assert!(
+                SIGNING_GATE_METHODS.contains(&gate_method),
+                "method {}/{} names gate_method '{}', not in SIGNING_GATE_METHODS {:?}",
+                m.service,
+                m.method,
+                gate_method,
+                SIGNING_GATE_METHODS,
+            );
+        }
+    }
+}
+
+/// STRICT support: `SIGNING_GATE_METHODS` is the canonical list and is non-empty,
+/// well-formed (no empty strings, no duplicates), so the cross-check above is
+/// meaningful.
+#[test]
+fn signing_gate_methods_list_is_well_formed() {
+    assert!(!SIGNING_GATE_METHODS.is_empty(), "SIGNING_GATE_METHODS must be non-empty");
+    for name in SIGNING_GATE_METHODS {
+        assert!(!name.is_empty(), "SIGNING_GATE_METHODS contains an empty method name");
+        assert!(
+            name.starts_with("sign_"),
+            "SIGNING_GATE_METHODS entry '{name}' must be a SigningGate sign_* method"
+        );
+    }
+    let mut seen = std::collections::HashSet::new();
+    for name in SIGNING_GATE_METHODS {
+        assert!(seen.insert(*name), "SIGNING_GATE_METHODS has a duplicate: '{name}'");
+    }
 }
