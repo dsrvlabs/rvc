@@ -73,18 +73,25 @@ pub struct AppState {
     ///
     /// # Lock-ordering invariant
     ///
-    /// This is the OUTERMOST doppelganger-state lock.  Holders MUST:
-    ///   - acquire it before touching `validator_manager`,
-    ///     `doppelganger_monitor`, or `cancel_tokens` for a state transition;
-    ///   - take the short-lived `cancel_tokens` mutex only WHILE holding this
-    ///     lock (never the reverse), so the two never deadlock;
-    ///   - never hold it across an `.await` (every guarded section is
-    ///     synchronous; the spawned background task runs outside the guard).
+    /// This is the OUTERMOST doppelganger-state lock.  All three paths MUST
+    /// follow the invariant: acquire `doppelganger_state_lock` first, then (if
+    /// needed) `cancel_tokens` — never the reverse — to avoid deadlock.
+    ///   - `cancel_tokens` is ALWAYS taken while holding this lock on any path
+    ///     that mutates doppelganger state.
+    ///   - This lock is NEVER held across an `.await`; every guarded section is
+    ///     synchronous (the spawned task acquires it AFTER its `sleep_until`
+    ///     future resolves, so no std-Mutex spans an await point).
     ///
-    /// The delete handler holds this lock across BOTH its keystore removal and
-    /// its cancel-token removal/cancel (PRD §KM-2 (b)); the import handler holds
-    /// it across its `add_validator` + `start_monitoring` + cancel-token insert,
-    /// so a re-import cannot interleave with an in-flight delete.
+    /// The three protected paths are:
+    ///   - **import**: holds it across `add_validator` + `start_monitoring` +
+    ///     cancel-token insert (PRD §KM-2 (a)+(b)).
+    ///   - **delete**: holds it across `delete_keystore` + unconditional
+    ///     cancel-token remove/cancel (PRD §KM-2 (b)+(Finding 3)).
+    ///   - **spawned enable task** (timer branch): acquires it after
+    ///     `sleep_until` resolves, re-checks `is_cancelled()` under the lock
+    ///     before enabling, then holds it across `set_validator_enabled` +
+    ///     `stop_monitoring` + cancel-token self-prune (PRD §KM-2
+    ///     (c)+(Finding 1+2)).
     pub doppelganger_state_lock: Mutex<()>,
 }
 
@@ -204,7 +211,8 @@ pub async fn import_keystores(
                     // observes its token cancelled before it can prune the fresh
                     // entry.
                     {
-                        let mut tokens = state.cancel_tokens.lock().unwrap();
+                        let mut tokens =
+                            state.cancel_tokens.lock().expect("cancel_tokens poisoned");
                         if let Some(displaced) = tokens.insert(pubkey, cancel_token.clone()) {
                             displaced.cancel();
                         }
@@ -225,17 +233,36 @@ pub async fn import_keystores(
                     tokio::spawn(async move {
                         tokio::select! {
                             _ = tokio::time::sleep_until(deadline) => {
+                                // KM-2 (Finding 1+2): the sleep branch and a
+                                // concurrent cancel() can both be ready in the
+                                // same scheduler tick; `select!` does not
+                                // prioritize cancelled().  Re-check cancellation
+                                // under `doppelganger_state_lock` (the same lock
+                                // held by import's insert and delete's cancel) so
+                                // the enable is serialised against a concurrent
+                                // displacement.  The `sleep_until` future has
+                                // already resolved, so no std-Mutex is held across
+                                // any `.await`.
+                                let _g = st
+                                    .doppelganger_state_lock
+                                    .lock()
+                                    .expect("doppelganger_state_lock poisoned");
+                                // Displaced: a delete or re-import cancelled our
+                                // token under the same lock — never enable.
+                                if token.is_cancelled() {
+                                    return;
+                                }
                                 vm.set_validator_enabled(&pubkey, true);
                                 dm.stop_monitoring(&pubkey); // SF-4: prune pending entry
-                                // KM-2 (c): the window elapsed for THIS task, so
-                                // prune its OWN cancel-token entry. We only remove
-                                // when our token is still uncancelled: a cancelled
-                                // token means a delete/re-import already displaced
-                                // us and now owns the map slot — leave it alone so
-                                // we never drop an unrelated (fresh) token.
-                                if !token.is_cancelled() {
-                                    st.cancel_tokens.lock().unwrap().remove(&pubkey);
-                                }
+                                // KM-2 (c): prune our OWN cancel-token entry now
+                                // that the window has elapsed.  We hold
+                                // `doppelganger_state_lock` here, consistent with
+                                // the lock-ordering invariant (outer lock, then
+                                // cancel_tokens).
+                                st.cancel_tokens
+                                    .lock()
+                                    .expect("cancel_tokens poisoned")
+                                    .remove(&pubkey);
                                 info!(
                                     pubkey = %TruncatedPubkey::new(&pk_hex),
                                     "Doppelganger window elapsed; enabling validator for attestation"
@@ -345,7 +372,23 @@ pub async fn delete_keystores(
                 // of this iteration (never held across an `.await`).
                 let _guard =
                     state.doppelganger_state_lock.lock().expect("doppelganger_state_lock poisoned");
-                match state.keystore_manager.delete_keystore(pubkey) {
+                let delete_result = state.keystore_manager.delete_keystore(pubkey);
+
+                // KM-2 Finding 3: cancel any live token unconditionally,
+                // regardless of the keystore-delete outcome (Ok(true/false) or
+                // Err).  A delete that returns NotFound or Err could still have a
+                // live background task from a prior import, and leaving it alive
+                // would allow it to enable the key after a concurrent re-import.
+                // This runs under `doppelganger_state_lock` so no concurrent
+                // import can insert a fresh token between the delete attempt and
+                // this cancel.
+                if let Some(token) =
+                    state.cancel_tokens.lock().expect("cancel_tokens poisoned").remove(pubkey)
+                {
+                    token.cancel();
+                }
+
+                match delete_result {
                     Ok(true) => {
                         warn!(
                             pubkey = %TruncatedPubkey::new(pubkey_hex),
@@ -354,11 +397,6 @@ pub async fn delete_keystores(
                         );
                         state.validator_manager.remove_validator(pubkey);
                         state.doppelganger_monitor.stop_monitoring(pubkey);
-                        // SF-3: cancel any in-flight doppelganger background task so a
-                        // stale task cannot prematurely enable a re-imported key.
-                        if let Some(token) = state.cancel_tokens.lock().unwrap().remove(pubkey) {
-                            token.cancel();
-                        }
                         results.push(DeleteKeystoreResult {
                             status: DeleteStatus::Deleted,
                             message: String::new(),

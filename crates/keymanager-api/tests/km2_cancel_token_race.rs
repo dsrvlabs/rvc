@@ -563,14 +563,99 @@ async fn km2_concurrent_delete_reimport_no_stale_enable() {
     );
 
     // (iii) The re-imported key must NOT be enabled while still inside the fresh
-    // doppelganger window — i.e. no stale task fired early.  We advance time past
-    // the ORIGINAL task's deadline (import #1 + window) but the fresh window's
-    // deadline is later, so a correctly-cancelled stale task leaves the key
-    // disabled here.
+    // doppelganger window.  This test uses a 3600 s window and never advances the
+    // virtual clock, so NEITHER task fires.  Assertion (iii) here confirms that no
+    // task has fired YET (structural: only one live task remains).  The timer-fires
+    // scenario (Finding 4) is covered by km2_stale_timer_cannot_enable_after_displacement.
     assert!(
         !vm.is_enabled(&pubkey),
-        "PRD §KM-2 (iii): the re-imported key must remain disabled inside its \
-         fresh doppelganger window; on develop the stale (uncancelled) task \
-         enables it prematurely",
+        "PRD §KM-2 (iii): neither task should have fired (3600 s window, no clock advance); \
+         re-imported key must remain disabled",
+    );
+}
+
+// ── Finding 4: stale timer must never enable a displaced key ──────────────────
+
+/// Finding 4 (code-review): the stale background task's `tokio::select!` timer
+/// branch called `set_validator_enabled(true)` UNCONDITIONALLY; the
+/// `is_cancelled()` guard only gated the map `remove`, not the enable.
+///
+/// When the stale task's `sleep_until` deadline and the displacing `cancel()` are
+/// both ready in the same scheduler tick, `select!` can pick the sleep branch and
+/// enable a re-imported key that is inside a fresh doppelganger window.  This
+/// test reproduces that scenario deterministically by:
+///   1. importing key K (short window);
+///   2. ADVANCING the virtual clock past K's original deadline (so Task1's
+///      sleep_until is ready BEFORE cancel fires — the stale timer has elapsed);
+///   3. deleting then re-importing K (Task1's token cancelled, fresh Task2
+///      spawned with deadline now + window, still far in the future);
+///   4. yielding so Task1 runs with BOTH select! branches ready simultaneously;
+///   5. asserting K is NOT enabled and NOT doppelganger_safe.
+///
+/// On the GREEN code before Finding 1 was fixed, this test FAILS because Task1
+/// calls `set_validator_enabled(true)` and `stop_monitoring` unconditionally.
+/// After the fix (re-check `is_cancelled()` under `doppelganger_state_lock`
+/// before enabling), this test PASSES.
+#[tokio::test(start_paused = true)]
+async fn km2_stale_timer_cannot_enable_after_displacement() {
+    let pubkey = test_pubkey();
+    // Short window so we can advance past it cheaply.
+    let window = Duration::from_secs(60);
+
+    let keystore = Arc::new(GatedKeystoreManager::new());
+    let vm = Arc::new(SpyValidatorManager::new());
+    // Use the ungated monitor (no blocking) — this test is sequential.
+    let monitor = Arc::new(GatedDoppelgangerMonitor::ungated(window));
+    let state = make_state(keystore.clone(), vm.clone(), monitor.clone(), window);
+
+    // Step 1: import K.  Task1 is spawned with deadline = virtual_now + window.
+    let _ = import_keystores(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(import_body(&pubkey)),
+    )
+    .await
+    .expect("import");
+    assert!(!vm.is_enabled(&pubkey), "disabled immediately after import");
+    assert!(!monitor.is_doppelganger_safe(&pubkey), "gate active after import");
+
+    // Step 2: advance the clock past K's original deadline so Task1's
+    // sleep_until is satisfied, but Task1 has not yet been polled.
+    tokio::time::advance(window + Duration::from_secs(1)).await;
+
+    // Step 3: delete K (cancels Task1's token) then re-import K (fresh Task2,
+    // deadline = (window+1s) + window — far in the future).
+    let _ = delete_keystores(axum::extract::State(state.clone()), axum::Json(delete_body(&pubkey)))
+        .await;
+    let _ = import_keystores(
+        axum::extract::State(state.clone()),
+        axum::http::HeaderMap::new(),
+        axum::Json(import_body(&pubkey)),
+    )
+    .await
+    .expect("re-import");
+    assert!(!vm.is_enabled(&pubkey), "still disabled after re-import, Task2 window not elapsed");
+    assert!(!monitor.is_doppelganger_safe(&pubkey), "gate active for fresh window");
+
+    // Step 4: yield so Task1 runs.  At this point Task1's select! has BOTH branches
+    // ready: sleep_until (elapsed in step 2) AND cancelled() (cancelled in step 3).
+    // The broken code takes the sleep branch and unconditionally enables the key.
+    tokio::task::yield_now().await;
+    tokio::task::yield_now().await;
+
+    // Step 5: assert the stale Task1 did NOT enable the re-imported key.
+    assert!(
+        !vm.is_enabled(&pubkey),
+        "Finding 1: the stale task's timer branch must NOT enable a displaced key; \
+         on the pre-fix GREEN code Task1 calls set_validator_enabled(true) \
+         unconditionally before checking is_cancelled()",
+    );
+
+    // Assert the stale Task1 did NOT clear the fresh gate entry (Finding 2).
+    assert!(
+        !monitor.is_doppelganger_safe(&pubkey),
+        "Finding 2: the stale task must NOT call stop_monitoring on a re-imported \
+         key; on the pre-fix GREEN code Task1 cleared the fresh key's gate entry, \
+         making is_doppelganger_safe wrongly return true",
     );
 }
