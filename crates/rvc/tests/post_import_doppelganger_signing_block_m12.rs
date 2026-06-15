@@ -2,12 +2,12 @@
 //!
 //! These tests verify the public-API surface of the M-12 fix:
 //!
-//! 1. `ValidatorStore::is_attesting_enabled` blocks newly imported validators
+//! 1. `ValidatorStore::is_signing_enabled` blocks newly imported validators
 //!    that are still inside their doppelganger window (enabled=false).
 //! 2. `DoppelgangerGate` and `ValidatorStore` together correctly represent the
-//!    combined gate state: a validator is safe to attest only when both
+//!    combined gate state: a validator is safe to sign only when both
 //!    - the gate's time window has elapsed (`is_doppelganger_safe` = true), AND
-//!    - the validator store's enabled flag is true (`is_attesting_enabled` = true).
+//!    - the validator store's enabled flag is true (`is_signing_enabled` = true).
 //! 3. `scan_and_rearm_gate` re-arms the gate after restart for recently-imported
 //!    keys (Critical #2 fix).
 
@@ -38,7 +38,7 @@ fn test_newly_imported_validator_blocked() {
     store.add_validator(config);
 
     assert!(
-        !store.is_attesting_enabled(&pk),
+        !store.is_signing_enabled(&pk),
         "validator must be blocked while inside doppelganger window"
     );
 }
@@ -57,21 +57,24 @@ fn test_validator_enabled_after_window() {
     store.set_enabled(&pk, true);
 
     assert!(
-        store.is_attesting_enabled(&pk),
+        store.is_signing_enabled(&pk),
         "validator must be enabled after the doppelganger window expires"
     );
 }
 
-/// Validators not tracked by the store (loaded at startup without API import)
-/// must default to enabled so they are never silently blocked.
+/// D-3 (Issue 2.11): a pubkey not tracked by the store is fail-closed — it must
+/// default to disabled. Keystore-loaded keys are never silently blocked because
+/// startup registers them in the store (see
+/// `ServiceBuilder::register_loaded_validators`); only a genuinely-unknown
+/// pubkey reaches this default.
 #[test]
-fn test_untracked_validator_defaults_to_enabled() {
+fn test_untracked_validator_defaults_to_disabled() {
     let store = ValidatorStore::new([0u8; 20], 30_000_000);
     let unknown_pk = test_pk(99);
 
     assert!(
-        store.is_attesting_enabled(&unknown_pk),
-        "validators not in store must default to enabled (startup-loaded keys)"
+        !store.is_signing_enabled(&unknown_pk),
+        "validators not tracked by the store must fail closed (default disabled)"
     );
 }
 

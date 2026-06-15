@@ -122,7 +122,7 @@ where
     /// [`set_sync_enabled`]. Internal-only — not wired to any Keymanager API (H-7).
     sync_enabled: Arc<AtomicBool>,
     /// D-3: per-validator doppelganger gate for block proposals.
-    /// Shared reference to the ValidatorStore for `is_attesting_enabled` checks.
+    /// Shared reference to the ValidatorStore for `is_signing_enabled` checks.
     validator_store: Arc<validator_store::ValidatorStore>,
 }
 
@@ -611,7 +611,7 @@ where
         // doppelganger window (`enabled = false`).
         {
             let pk_bytes = pubkey.to_bytes();
-            if !self.validator_store.is_attesting_enabled(&pk_bytes) {
+            if !self.validator_store.is_signing_enabled(&pk_bytes) {
                 warn!(
                     slot,
                     pubkey = %crypto::logging::TruncatedPubkey::new(&proposer_duty.pubkey),
@@ -1673,6 +1673,11 @@ mod tests {
         pubkey_map_inner.insert(pubkey_hex.clone(), pubkey.clone());
         let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
+        // D-3 fail-closed: register the loaded validator so the per-validator
+        // signing gate permits its duties (mirrors startup registration).
+        let validator_store = create_mock_validator_store();
+        validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
+
         let (orchestrator, handle) = DutyOrchestrator::new(
             clock,
             duty_tracker,
@@ -1681,7 +1686,7 @@ mod tests {
             beacon,
             create_mock_block_beacon(),
             None,
-            create_mock_validator_store(),
+            validator_store,
             config,
             pubkey_map,
         );
@@ -2827,9 +2832,15 @@ mod tests {
         let propagator = Arc::new(Propagator::new(capturing_submitter.clone()));
 
         let config = create_test_config();
+        let pubkey_bytes = pubkey.to_bytes();
         let mut pubkey_map_inner = HashMap::new();
         pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        // D-3 fail-closed: register the loaded validator so the per-validator
+        // signing gate permits its duties (mirrors startup registration).
+        let validator_store = create_mock_validator_store();
+        validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey_bytes));
 
         let (orchestrator, handle) = DutyOrchestrator::new(
             clock,
@@ -2839,7 +2850,7 @@ mod tests {
             beacon,
             create_mock_block_beacon(),
             None,
-            create_mock_validator_store(),
+            validator_store,
             config,
             pubkey_map,
         );
@@ -4579,9 +4590,15 @@ mod tests {
         let propagator = Arc::new(Propagator::new(capturing_submitter.clone()));
 
         let config = create_test_config();
+        let pubkey_bytes = pubkey.to_bytes();
         let mut pubkey_map_inner = HashMap::new();
         pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        // D-3 fail-closed: register the loaded validator so the per-validator
+        // signing gate permits its duties (mirrors startup registration).
+        let validator_store = create_mock_validator_store();
+        validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey_bytes));
 
         let (orchestrator, handle) = DutyOrchestrator::new(
             clock.clone(),
@@ -4591,7 +4608,7 @@ mod tests {
             beacon,
             create_mock_block_beacon(),
             None,
-            create_mock_validator_store(),
+            validator_store,
             config,
             pubkey_map,
         );
@@ -4900,6 +4917,9 @@ mod tests {
 
         // ExecutionOnly → builder_boost_factor = 0 → not a builder attempt.
         let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        // D-3 fail-closed: register the loaded validator so the per-validator
+        // signing gate permits this proposal (mirrors startup registration).
+        validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
         validator_store
             .set_global_block_selection_mode(validator_store::BlockSelectionMode::ExecutionOnly);
 
@@ -4978,6 +4998,9 @@ mod tests {
 
         // BuilderAlways → builder_boost_factor = u64::MAX → builder attempt.
         let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        // D-3 fail-closed: register the loaded validator so the per-validator
+        // signing gate permits this proposal (mirrors startup registration).
+        validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
         validator_store
             .set_global_block_selection_mode(validator_store::BlockSelectionMode::BuilderAlways);
 
@@ -5058,6 +5081,10 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        // D-3 fail-closed: register the loaded validator so the signing gate is
+        // passed and the RANDAO signing failure (empty KeyManager) is the path
+        // under test (mirrors startup registration).
+        validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
 
         let config = create_test_config();
         let mut pubkey_map_inner = HashMap::new();
@@ -5117,6 +5144,7 @@ mod tests {
         // Pre-populate sync committee duties for period 0 (epoch 0).
         duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
 
+        let pk_bytes = pk.to_bytes();
         let mut map = HashMap::new();
         map.insert(pk_hex, pk);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
@@ -5125,6 +5153,11 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        // D-3 fail-closed: register the loaded validator so the per-validator
+        // signing gate permits sync duties (mirrors startup registration). The
+        // sync_enabled=false test short-circuits before this gate, so it stays
+        // correct regardless.
+        validator_store.add_validator(validator_store::ValidatorConfig::new(pk_bytes));
         let config = create_test_config();
         let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
         clock.set_slot(0);
@@ -5468,12 +5501,12 @@ mod tests {
 
     // ── D-3: block proposal gate ─────────────────────────────────────────────
 
-    /// D-3: a validator whose `is_attesting_enabled = false` must NOT propose a block.
+    /// D-3: a validator whose `is_signing_enabled = false` must NOT propose a block.
     ///
     /// The test uses wiremock to serve a proposer duty, then checks that
     /// `publish_block` is never called when the validator is disabled.
     ///
-    /// RED: `maybe_propose_block` does not check `is_attesting_enabled` →
+    /// RED: `maybe_propose_block` does not check `is_signing_enabled` →
     ///      the block_service is called (RANDAO sign, produce, publish).
     ///      The `BadProposerBlockBeacon` sets `publish_called = true` via
     ///      `produce_block_v3` returning a block with `proposer_index="1"`.
@@ -5570,12 +5603,12 @@ mod tests {
         let ctx = SlotContext { slot, epoch, head_root: None };
         orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
 
-        // D-3: the block must NOT be proposed when is_attesting_enabled=false.
+        // D-3: the block must NOT be proposed when is_signing_enabled=false.
         // publish_called stays false because the gate returns early before
         // block_service.propose_block (which would call produce_block_v3).
         assert!(
             !publish_called.load(Ordering::SeqCst),
-            "D-3: block must NOT be proposed when is_attesting_enabled=false"
+            "D-3: block must NOT be proposed when is_signing_enabled=false"
         );
     }
 }

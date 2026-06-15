@@ -1302,6 +1302,12 @@ async fn run_validator(
     let propagator = builder.build_propagator(beacon_client.clone());
     let validator_store = builder.build_validator_store(config.validators_config.as_deref())?;
 
+    // D-3 (Issue 2.11): register every keystore-loaded validator so the
+    // fail-closed per-validator signing gate permits the keys the VC loaded.
+    // Without this, the common no-validators_config deployment would have every
+    // loaded validator silently blocked from signing.
+    builder.register_loaded_validators(&validator_store, &pubkey_map);
+
     let beacon: std::sync::Arc<dyn BeaconNodeClient> = bn_manager;
     let validator_indices: Vec<String> = match validator_index_map {
         Ok(ref map) => map.values().cloned().collect(),

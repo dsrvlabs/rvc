@@ -93,7 +93,7 @@ impl AggregationService {
             // `to_bytes()` instead of re-decoding the hex string (no fail-open).
             {
                 let pk_bytes = pubkey.to_bytes();
-                if !self.validator_store.is_attesting_enabled(&pk_bytes) {
+                if !self.validator_store.is_signing_enabled(&pk_bytes) {
                     warn!(
                         pubkey = %TruncatedPubkey::new(&duty.pubkey),
                         slot,
@@ -734,7 +734,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // D-3: aggregation path skips validators whose is_attesting_enabled=false.
+    // D-3: aggregation path skips validators whose is_signing_enabled=false.
     // -----------------------------------------------------------------------
     #[tokio::test]
     async fn test_aggregation_skipped_when_validator_disabled() {
@@ -760,7 +760,7 @@ mod tests {
         assert_eq!(
             submit_calls.load(Ordering::SeqCst),
             0,
-            "D-3: aggregate_and_proofs must not be submitted when is_attesting_enabled=false"
+            "D-3: aggregate_and_proofs must not be submitted when is_signing_enabled=false"
         );
     }
 

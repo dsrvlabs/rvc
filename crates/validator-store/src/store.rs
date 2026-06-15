@@ -208,15 +208,17 @@ impl ValidatorStore {
         self.validators.read().values().filter(|c| c.enabled).map(|c| c.pubkey).collect()
     }
 
-    /// Returns `true` if this validator is permitted to attest.
+    /// Returns `true` if this validator is permitted to sign.
     ///
-    /// Keys that are not tracked by the store (e.g. loaded at startup before
-    /// the M-12 gate existed) default to `true` so they are never silently
-    /// blocked.  Only keys explicitly added as `enabled = false` (i.e. freshly
-    /// imported via the Keymanager API while inside the doppelganger window)
-    /// return `false`.
-    pub fn is_attesting_enabled(&self, pubkey: &[u8; 48]) -> bool {
-        self.validators.read().get(pubkey).map(|c| c.enabled).unwrap_or(true)
+    /// Fail-closed (D-3 / Issue 2.11): keys that are not tracked by the store
+    /// default to `false` so an unknown pubkey is never permitted to sign. Every
+    /// validator the VC actually loads is registered in the store at startup (see
+    /// `ServiceBuilder::register_loaded_validators`), so only a genuinely-unknown
+    /// pubkey hits this default. Keys explicitly added as `enabled = false` (e.g.
+    /// freshly imported via the Keymanager API while inside the doppelganger
+    /// window) also return `false`.
+    pub fn is_signing_enabled(&self, pubkey: &[u8; 48]) -> bool {
+        self.validators.read().get(pubkey).map(|c| c.enabled).unwrap_or(false)
     }
 
     pub fn add_validator(&self, config: ValidatorConfig) {
@@ -1566,7 +1568,7 @@ block_selection_mode = "builder-only"
         assert_eq!(config.block_selection_mode, Some(BlockSelectionMode::BuilderOnly));
     }
 
-    // ── M-12 (Critical #1): is_signing_enabled ───────────────────────────
+    // ── M-12 (Critical #1) / D-3 (Issue 2.11): is_signing_enabled ─────────
 
     /// D-3 (Issue 2.11): unknown pubkeys (not tracked by the store) are
     /// fail-closed — `is_signing_enabled` returns `false` so a pubkey the store
@@ -1580,39 +1582,39 @@ block_selection_mode = "builder-only"
         );
     }
 
-    /// A validator explicitly added with enabled=true is attestable.
+    /// A validator explicitly added with enabled=true is permitted to sign.
     #[test]
-    fn test_is_attesting_enabled_explicit_true() {
+    fn test_is_signing_enabled_explicit_true() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let pk = test_pubkey(1);
         store.add_validator(ValidatorConfig::new(pk)); // default enabled=true
-        assert!(store.is_attesting_enabled(&pk));
+        assert!(store.is_signing_enabled(&pk));
     }
 
-    /// A validator explicitly added with enabled=false is NOT attestable
+    /// A validator explicitly added with enabled=false is NOT permitted to sign
     /// (post-import doppelganger window scenario).
     #[test]
-    fn test_is_attesting_enabled_explicit_false() {
+    fn test_is_signing_enabled_explicit_false() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let pk = test_pubkey(2);
         let mut config = ValidatorConfig::new(pk);
         config.enabled = false;
         store.add_validator(config);
-        assert!(!store.is_attesting_enabled(&pk));
+        assert!(!store.is_signing_enabled(&pk));
     }
 
-    /// After set_enabled flips the flag to true, is_attesting_enabled must
+    /// After set_enabled flips the flag to true, is_signing_enabled must
     /// return true (simulates the doppelganger window expiring).
     #[test]
-    fn test_is_attesting_enabled_flips_after_set_enabled() {
+    fn test_is_signing_enabled_flips_after_set_enabled() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let pk = test_pubkey(3);
         let mut config = ValidatorConfig::new(pk);
         config.enabled = false;
         store.add_validator(config);
-        assert!(!store.is_attesting_enabled(&pk), "must be disabled before flip");
+        assert!(!store.is_signing_enabled(&pk), "must be disabled before flip");
 
         store.set_enabled(&pk, true);
-        assert!(store.is_attesting_enabled(&pk), "must be enabled after flip");
+        assert!(store.is_signing_enabled(&pk), "must be enabled after flip");
     }
 }

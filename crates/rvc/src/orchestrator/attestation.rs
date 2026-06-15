@@ -109,7 +109,7 @@ where
                     if bytes.len() == 48 {
                         let mut pk = [0u8; 48];
                         pk.copy_from_slice(&bytes);
-                        if !self.validator_store.is_attesting_enabled(&pk) {
+                        if !self.validator_store.is_signing_enabled(&pk) {
                             warn!(
                                 pubkey = %duty.pubkey,
                                 slot,

@@ -332,6 +332,37 @@ impl ServiceBuilder {
         Ok(Arc::new(store))
     }
 
+    /// Registers every loaded validator pubkey in the [`ValidatorStore`] so the
+    /// per-validator signing gate ([`ValidatorStore::is_signing_enabled`]) treats
+    /// keystore-loaded keys as tracked-and-enabled.
+    ///
+    /// D-3 (Issue 2.11) flipped the unknown-pubkey default to fail-closed
+    /// (`false`). The common production deployment supplies no per-validator
+    /// `validators_config` TOML — the actual keys are loaded into the
+    /// `KeyManager`/`pubkey_map`, not the store — so without this registration
+    /// every loaded validator would hit the fail-closed default and be silently
+    /// blocked from signing (a catastrophic availability regression).
+    ///
+    /// Registration is additive and idempotent: a pubkey already tracked by the
+    /// store (e.g. set `enabled = false` by the doppelganger window or via the
+    /// validators TOML) is left untouched, so the doppelganger flow's ability to
+    /// keep a freshly-imported key disabled is preserved.
+    pub fn register_loaded_validators(&self, store: &ValidatorStore, pubkey_map: &PubkeyMap) {
+        let mut registered = 0usize;
+        for pubkey in pubkey_map.read().values() {
+            let pk_bytes = pubkey.to_bytes();
+            if !store.has_validator(&pk_bytes) {
+                store.add_validator(validator_store::ValidatorConfig::new(pk_bytes));
+                registered += 1;
+            }
+        }
+        info!(
+            registered,
+            tracked_total = store.list_enabled_pubkeys().len(),
+            "Registered loaded validators in the validator store (D-3 fail-closed)"
+        );
+    }
+
     pub fn build_builder_service(
         &self,
         signer: Arc<SignerService>,
@@ -453,6 +484,11 @@ impl ServiceBuilder {
         let slot_clock = self.build_slot_clock()?;
         let validator_store =
             self.build_validator_store(self.config.validators_config.as_deref())?;
+
+        // D-3 (Issue 2.11): with the fail-closed `is_signing_enabled` default,
+        // register every keystore-loaded validator in the store so the
+        // per-validator signing gate permits the keys the VC actually loaded.
+        self.register_loaded_validators(&validator_store, &pubkey_map);
 
         let beacon: Arc<dyn BeaconNodeClient> = beacon_client.clone();
         let duty_tracker = self.build_duty_tracker(beacon.clone(), validator_indices);

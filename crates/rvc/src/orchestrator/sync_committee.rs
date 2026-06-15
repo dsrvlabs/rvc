@@ -311,7 +311,7 @@ impl SyncCommitteeService {
                 // `pk` is the already-resolved typed PublicKey — use its infallible
                 // `to_bytes()` instead of re-decoding the hex string (no fail-open).
                 let pk_bytes = pk.to_bytes();
-                if !self.validator_store.is_attesting_enabled(&pk_bytes) {
+                if !self.validator_store.is_signing_enabled(&pk_bytes) {
                     warn!(
                         pubkey = %TruncatedPubkey::new(&duty.pubkey),
                         "Skipping sync committee duty: validator is inside the \
@@ -588,6 +588,13 @@ mod tests {
         sk: SecretKey,
         validator_store: Arc<ValidatorStore>,
     ) -> SyncCommitteeService {
+        // D-3 fail-closed: register the loaded validator (enabled) unless the
+        // test already tracks it (e.g. as disabled for the doppelganger-window
+        // path). Mirrors startup registration so the per-validator gate permits
+        // signing for keys the VC actually loaded.
+        if !validator_store.has_validator(&pk.to_bytes()) {
+            validator_store.add_validator(ValidatorConfig::new(pk.to_bytes()));
+        }
         let mut key_manager = KeyManager::new();
         key_manager.insert(sk);
         let local_signer = LocalSigner::new(key_manager);
@@ -753,7 +760,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // D-3: sync message path skips validators whose is_attesting_enabled=false.
+    // D-3: sync message path skips validators whose is_signing_enabled=false.
     // -----------------------------------------------------------------------
     #[tokio::test]
     async fn test_sync_message_skipped_when_validator_disabled() {
@@ -787,12 +794,12 @@ mod tests {
         // No messages must be submitted for a disabled validator.
         assert!(
             submitted_roots.lock().unwrap().is_empty(),
-            "D-3: sync committee message must not be produced when is_attesting_enabled=false"
+            "D-3: sync committee message must not be produced when is_signing_enabled=false"
         );
     }
 
     // -----------------------------------------------------------------------
-    // D-3: sync contribution path skips validators whose is_attesting_enabled=false.
+    // D-3: sync contribution path skips validators whose is_signing_enabled=false.
     //
     // ContribGateBeacon: a beacon that returns a valid contribution and tracks
     // how many times `get_sync_committee_contribution` is called.  If the D-3
@@ -1065,7 +1072,7 @@ mod tests {
             contrib_fetch_calls.load(Ordering::SeqCst),
             0,
             "D-3: get_sync_committee_contribution must not be called for a disabled \
-             validator (is_attesting_enabled=false)"
+             validator (is_signing_enabled=false)"
         );
     }
 }
