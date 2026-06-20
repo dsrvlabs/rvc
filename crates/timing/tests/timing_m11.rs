@@ -1,8 +1,10 @@
 //! Regression tests for M-11: attestation timing rounding.
 //!
-//! Verifies that `time_until_attestation` uses millisecond arithmetic (slot_duration_ms / 3)
-//! rather than integer seconds (slot_duration_secs / 3), so attestation fires at the
-//! exact one-third mark even for non-12 s slot durations.
+//! Verifies that `time_until_attestation` uses the spec basis-points formula
+//! `due_ms = ATTESTATION_DUE_BPS * slot_duration_ms / BASIS_POINTS` (floor) in
+//! millisecond arithmetic rather than integer seconds, so attestation fires at the
+//! exact spec mark even for non-12 s slot durations. On mainnet this is
+//! `3333 * 12000 / 10000 = 3999 ms` (not 4000), per report §4.3.
 
 use rvc_timing::{MockSlotClock, SlotClock};
 use std::time::Duration;
@@ -37,7 +39,7 @@ fn test_attestation_fires_at_one_third_of_6s_slot() {
     );
 }
 
-// -- Regression guard: 12 s slot fires at exactly 4.000 s (12000 ms / 3 = 4000 ms).
+// -- Regression guard: 12 s slot fires at the spec BPS mark 3333 * 12000 / 10000 = 3999 ms.
 #[test]
 fn test_attestation_fires_at_one_third_of_12s_slot() {
     let clock = MockSlotClock::new(TEST_GENESIS, Duration::from_secs(12), 32);
@@ -45,8 +47,36 @@ fn test_attestation_fires_at_one_third_of_12s_slot() {
     let time_until = clock.time_until_attestation(0).unwrap();
     assert_eq!(
         time_until,
-        Duration::from_millis(4000),
-        "12 s slot must fire at exactly 4.000 s (4000 ms)"
+        Duration::from_millis(3999),
+        "12 s slot must fire at 3333 * 12000 / 10000 = 3999 ms"
+    );
+}
+
+// -- Default-bps (3333) vector: mainnet 12 s slot via `time_until_attestation`.
+// 3333 * 12000 / 10000 = 3999 ms (floor). Explicit BPS restatement of the 12 s lock-in.
+#[test]
+fn test_attestation_default_bps_12s_slot_is_3999ms() {
+    let clock = MockSlotClock::new(TEST_GENESIS, Duration::from_secs(12), 32);
+    clock.set_current_time(TEST_GENESIS); // at exact slot start
+    let time_until = clock.time_until_attestation(0).unwrap();
+    assert_eq!(
+        time_until,
+        Duration::from_millis(3999),
+        "12 s slot: 3333 * 12000 / 10000 = 3999 ms"
+    );
+}
+
+// -- Default-bps (3333) vector: non-12 s 5 s slot via `time_until_attestation`.
+// 3333 * 5000 / 10000 = 1666 ms (floor), proving correctness for non-12 s networks.
+#[test]
+fn test_attestation_default_bps_5s_slot_is_1666ms() {
+    let clock = MockSlotClock::new(TEST_GENESIS, Duration::from_secs(5), 32);
+    clock.set_current_time(TEST_GENESIS); // at exact slot start
+    let time_until = clock.time_until_attestation(0).unwrap();
+    assert_eq!(
+        time_until,
+        Duration::from_millis(1666),
+        "5 s slot: 3333 * 5000 / 10000 = 1666 ms"
     );
 }
 
