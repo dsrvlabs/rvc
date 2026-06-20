@@ -18,6 +18,7 @@ use crate::backend::SigningBackend;
 
 pub mod tls;
 
+mod pubkey;
 mod request;
 mod routes;
 
