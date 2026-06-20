@@ -433,10 +433,19 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     // live listener; `impl SignerService for SignerServiceImpl` is kept compiled
     // but all v1 methods return `Unimplemented`.
     let svc_v2 = if let Some(ref db) = slashing_db_opt {
-        service::SignerServiceImpl::new_v2(
+        // Hoist (ADR-003, FR-26): build the ONE shared `SigningGate` here at the
+        // composition root, then inject the same `Arc` into the gRPC service.
+        let shared_gate = Arc::new(service::SignerServiceImpl::build_gate(
+            Arc::clone(&signing_backend),
+            Arc::clone(db),
+        ));
+        // TODO(phase-3): clone `shared_gate` into the HTTP `Web3SignerState` so the
+        // HTTP listener shares this exact `Arc<SigningGate>` (unified slashing DB +
+        // in-memory `ValidatorLockMap` across gRPC and HTTP).
+        service::SignerServiceImpl::new_v2_with_gate(
             Arc::clone(&signing_backend),
             resolved.backend.clone(),
-            Arc::clone(db),
+            Arc::clone(&shared_gate),
         )
         .with_metrics(Arc::clone(&signer_metrics))
     } else {
