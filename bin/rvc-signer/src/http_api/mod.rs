@@ -20,6 +20,7 @@ pub mod tls;
 
 mod pubkey;
 mod request;
+mod response;
 mod routes;
 
 /// Audit configuration for the HTTP API.
