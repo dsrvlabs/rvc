@@ -558,6 +558,13 @@ impl Config {
 
             if let Some((pubkey, password)) = line.split_once('=') {
                 let pubkey_trimmed = pubkey.trim();
+                if pubkey_trimmed == crypto::WILDCARD_KEY {
+                    passwords.insert(
+                        crypto::WILDCARD_KEY.to_string(),
+                        SecretString::from(password.trim().to_string()),
+                    );
+                    continue;
+                }
                 let pubkey = match strip_prefix_strict(pubkey_trimmed) {
                     Ok(s) => s,
                     Err(HexError::DoubleZeroXPrefix) => {
@@ -1142,6 +1149,100 @@ log_level = "debug"
         let config = Config { password_file: None, ..Default::default() };
         let passwords = config.load_passwords().unwrap();
         assert!(passwords.is_empty());
+    }
+
+    #[test]
+    fn test_load_passwords_wildcard_only() {
+        use secrecy::ExposeSecret;
+
+        let mut file = NamedTempFile::new().unwrap();
+        let shared_pw = format!("shared_value_{}", 1);
+        writeln!(file, "*={}", shared_pw).unwrap();
+
+        let config =
+            Config { password_file: Some(file.path().to_path_buf()), ..Default::default() };
+        let passwords = config.load_passwords().unwrap();
+
+        assert_eq!(passwords.len(), 1);
+        let entry = passwords.get(crypto::WILDCARD_KEY).unwrap();
+        assert_eq!(entry.expose_secret(), shared_pw);
+    }
+
+    #[test]
+    fn test_load_passwords_wildcard_and_per_key() {
+        use secrecy::ExposeSecret;
+
+        let mut file = NamedTempFile::new().unwrap();
+        let shared_pw = format!("shared_value_{}", 1);
+        let special_pw = format!("special_value_{}", 2);
+        writeln!(file, "*={}\n0xabcd1234 = {}", shared_pw, special_pw).unwrap();
+
+        let config =
+            Config { password_file: Some(file.path().to_path_buf()), ..Default::default() };
+        let passwords = config.load_passwords().unwrap();
+
+        assert_eq!(passwords.len(), 2);
+        assert_eq!(passwords.get(crypto::WILDCARD_KEY).unwrap().expose_secret(), shared_pw);
+        assert_eq!(passwords.get("abcd1234").unwrap().expose_secret(), special_pw);
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_load_passwords_wildcard_not_hex_validated() {
+        use secrecy::ExposeSecret;
+
+        // The wildcard line is never hex-validated: the password VALUE is stored verbatim
+        // (even a pathological `0x0x...` value that would trip the double-0x check were it
+        // ever passed to `strip_prefix_strict`), and the `*` key never emits the double-0x
+        // warning. The verbatim-value assertion is the real teeth here -- the original
+        // version of this test asserted no value at all and so proved nothing.
+        let mut file = NamedTempFile::new().unwrap();
+        let shared_pw = "0x0xdeadbeef";
+        writeln!(file, "* = {}", shared_pw).unwrap();
+
+        let config =
+            Config { password_file: Some(file.path().to_path_buf()), ..Default::default() };
+        let passwords = config.load_passwords().unwrap();
+
+        assert_eq!(passwords.len(), 1);
+        let entry = passwords.get(crypto::WILDCARD_KEY).unwrap();
+        assert_eq!(entry.expose_secret(), shared_pw, "wildcard value stored verbatim");
+        assert!(
+            !logs_contain("double 0x prefix"),
+            "wildcard line must not trigger the double-0x warn path"
+        );
+    }
+
+    #[test]
+    fn test_load_passwords_wildcard_empty_value() {
+        use secrecy::ExposeSecret;
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "*=").unwrap();
+
+        let config =
+            Config { password_file: Some(file.path().to_path_buf()), ..Default::default() };
+        let passwords = config.load_passwords().unwrap();
+
+        assert_eq!(passwords.len(), 1);
+        assert_eq!(passwords.get(crypto::WILDCARD_KEY).unwrap().expose_secret(), "");
+    }
+
+    #[test]
+    fn test_load_passwords_wildcard_last_wins() {
+        use secrecy::ExposeSecret;
+
+        let mut file = NamedTempFile::new().unwrap();
+        let first_pw = format!("first_value_{}", 1);
+        let second_pw = format!("second_value_{}", 2);
+        writeln!(file, "*={}\n*={}", first_pw, second_pw).unwrap();
+
+        let config =
+            Config { password_file: Some(file.path().to_path_buf()), ..Default::default() };
+        let passwords = config.load_passwords().unwrap();
+
+        assert_eq!(passwords.len(), 1);
+        assert_eq!(passwords.get(crypto::WILDCARD_KEY).unwrap().expose_secret(), second_pw);
     }
 
     #[test]

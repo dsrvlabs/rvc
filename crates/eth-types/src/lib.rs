@@ -6,11 +6,13 @@ mod aggregation;
 mod attestation;
 mod block;
 mod builder;
+pub mod canonical;
 mod deposit;
 mod domains;
 mod duties;
 mod fork;
 pub(crate) mod hex_fixed;
+pub mod insecure;
 pub(crate) mod serde_signature;
 pub mod ssz_helpers;
 mod sync_committee;
@@ -61,6 +63,13 @@ pub const SIGNATURE_BYTES_LEN: usize = 96;
 pub const SLOTS_PER_EPOCH: u64 = 32;
 pub const SECONDS_PER_SLOT: u64 = 12;
 pub const TARGET_AGGREGATORS_PER_COMMITTEE: u64 = 16;
+
+/// SSZ preset bound on a single committee's size. Sets the `Bitlist[N]` limit for a pre-Electra
+/// `Attestation.aggregation_bits` (chunk_count = ceil(2048 / 256) = 8).
+pub const MAX_VALIDATORS_PER_COMMITTEE: u64 = 2048;
+/// EIP-7549 preset bound on committees aggregated into one Electra attestation. The Electra
+/// `Attestation.aggregation_bits` is `Bitlist[MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT]`.
+pub const MAX_COMMITTEES_PER_SLOT: u64 = 64;
 
 /// Consensus specification version this client implements.
 pub const CONSENSUS_SPEC_VERSION: &str = "v1.5.0-alpha.12";

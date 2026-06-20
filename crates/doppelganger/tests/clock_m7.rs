@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rvc_doppelganger::{
-    DoppelgangerError, DoppelgangerService, LivenessChecker, SlashingDbReader,
+    DoppelgangerError, DoppelgangerService, LegacySlashingHistoryReader, LivenessChecker,
     ValidatorLivenessData,
 };
 
@@ -19,7 +19,7 @@ const SECONDS_PER_EPOCH: u64 = 12 * 32;
 
 struct EmptySlashingDb;
 
-impl SlashingDbReader for EmptySlashingDb {
+impl LegacySlashingHistoryReader for EmptySlashingDb {
     fn last_signed_attestation_epoch(
         &self,
         _pubkey: &str,
@@ -47,7 +47,7 @@ fn mock_service(
     start_instant: Instant,
 ) -> DoppelgangerService {
     let liveness: Arc<dyn LivenessChecker> = Arc::new(EmptyLivenessChecker);
-    let slashing_db: Arc<dyn SlashingDbReader> = Arc::new(EmptySlashingDb);
+    let slashing_db: Arc<dyn LegacySlashingHistoryReader> = Arc::new(EmptySlashingDb);
     DoppelgangerService::new(liveness, slashing_db, genesis_time)
         .with_start_time(start_instant, start_unix_time)
 }

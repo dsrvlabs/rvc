@@ -160,12 +160,19 @@ fn find_backup_files(original_path: &std::path::Path) -> Vec<PathBuf> {
 // Test 1: v1 populated DB migrates losslessly
 // ---------------------------------------------------------------------------
 
-/// Verifies that opening a populated v1 database:
+/// Verifies that opening a populated v1 database migrates cleanly to v3:
 /// - creates a backup file `<path>.bak.<UNIX_TS>` that is byte-for-byte identical
-/// - sets `schema_version = 2` in metadata
+/// - sets `schema_version = 3` in metadata
 /// - preserves all row data losslessly
 /// - fills `client_cn = '__legacy__'` for all migrated rows
-/// - leaves `genesis_validators_root` NULL for all migrated rows
+/// - back-fills `genesis_validators_root` from metadata for all NULL rows
+///
+/// # Note on GVR
+///
+/// The v3 migration requires `genesis_validators_root` to be pinned in metadata
+/// before opening if there are rows with NULL `genesis_validators_root`.  The v1
+/// builder here inserts the GVR into metadata to simulate an operator who has
+/// configured the GVR.  In production, operators pin the GVR at startup.
 #[test]
 fn test_v1_populated_migrates_losslessly() {
     let dir = tempdir().expect("tempdir");
@@ -175,6 +182,17 @@ fn test_v1_populated_migrates_losslessly() {
     let att_count = 5000;
     let blk_count = 5000;
     build_v1_db(&db_path, att_count, blk_count);
+
+    // Pin the GVR in metadata so the v3 migration can back-fill NULL rows.
+    // (In production, the operator pins the GVR at startup before any signing.)
+    let gvr_hex = "0x0707070707070707070707070707070707070707070707070707070707070707";
+    {
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(&format!(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('genesis_validators_root', '{gvr_hex}')"
+        ))
+        .expect("insert gvr into v1 db metadata");
+    }
 
     // Capture original row data BEFORE migration.
     let original_atts = {
@@ -200,11 +218,11 @@ fn test_v1_populated_migrates_losslessly() {
 
     let after_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-    // 1. schema_version = 2
+    // 1. schema_version = 3 (v1→v2→v3 in one open() call)
     {
         let conn = Connection::open(&db_path).unwrap();
         let version = read_schema_version(&conn);
-        assert_eq!(version, Some(2), "schema_version should be 2 after migration");
+        assert_eq!(version, Some(3), "schema_version should be 3 after v1→v2→v3 migration");
     }
 
     // 2. Backup file exists and matches byte-for-byte (WAL is checkpointed before backup).
@@ -259,7 +277,8 @@ fn test_v1_populated_migrates_losslessly() {
             "all migrated attestation rows should have client_cn = '__legacy__'"
         );
 
-        // All migrated rows have genesis_validators_root IS NULL.
+        // After v3 migration, all rows have genesis_validators_root back-filled from metadata
+        // (NULL rows are updated to the pinned GVR so the unique index can function).
         let null_gvr_att: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM attestations WHERE genesis_validators_root IS NULL",
@@ -268,8 +287,20 @@ fn test_v1_populated_migrates_losslessly() {
             )
             .unwrap();
         assert_eq!(
-            null_gvr_att as usize, att_count,
-            "all migrated attestation rows should have NULL genesis_validators_root"
+            null_gvr_att, 0,
+            "after v3 migration, all attestation rows should have genesis_validators_root back-filled"
+        );
+
+        let backfilled_att: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM attestations WHERE genesis_validators_root = ?1",
+                [gvr_hex],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            backfilled_att as usize, att_count,
+            "all attestation rows should have the pinned gvr after back-fill"
         );
 
         let migrated_blks = collect_block_triples(&conn);
@@ -301,8 +332,20 @@ fn test_v1_populated_migrates_losslessly() {
             )
             .unwrap();
         assert_eq!(
-            null_gvr_blk as usize, blk_count,
-            "all migrated block rows should have NULL genesis_validators_root"
+            null_gvr_blk, 0,
+            "after v3 migration, all block rows should have genesis_validators_root back-filled"
+        );
+
+        let backfilled_blk: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blocks WHERE genesis_validators_root = ?1",
+                [gvr_hex],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            backfilled_blk as usize, blk_count,
+            "all block rows should have the pinned gvr after back-fill"
         );
     }
 
@@ -311,36 +354,38 @@ fn test_v1_populated_migrates_losslessly() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: re-opening a v2 DB is a no-op (idempotent)
+// Test 2: re-opening a v3 DB is a no-op (idempotent)
 // ---------------------------------------------------------------------------
 
-/// Verifies that opening a v2 database:
-/// - does NOT create a backup file
-/// - leaves schema_version = 2
-/// - leaves row count unchanged
+/// Verifies that opening a database (which now starts at v3) is idempotent:
+/// - does NOT create a backup file for a brand-new DB
+/// - sets schema_version = 3
+/// - a second open is a complete no-op
 #[test]
 fn test_v2_open_is_idempotent() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("slashing.db");
 
-    // First open: creates a fresh v2 DB (no migration needed — it starts at v2).
+    // First open: creates a fresh v3 DB.
     {
         let db = SlashingDb::open(&db_path).expect("first open should succeed");
         drop(db);
     }
 
-    // Verify it is at v2 already.
+    // Verify it is at v3 (fresh DBs go directly to v3 via v2→v3 migration in open()).
     {
         let conn = Connection::open(&db_path).unwrap();
-        assert_eq!(read_schema_version(&conn), Some(2), "fresh DB should be at schema_version=2");
+        assert_eq!(
+            read_schema_version(&conn),
+            Some(3),
+            "fresh DB should be at schema_version=3 after v2+v3 migrations"
+        );
     }
 
-    // No backup files should exist after first open of a brand-new (v2) DB.
+    // No backup files should exist after first open of a brand-new DB
+    // (backup is only taken for v1 → v2 upgrades of existing DBs with data).
     let backups_after_first = find_backup_files(&db_path);
-    assert!(
-        backups_after_first.is_empty(),
-        "no backup should be created when opening a fresh v2 DB"
-    );
+    assert!(backups_after_first.is_empty(), "no backup should be created when opening a fresh DB");
 
     // Second open: should be a complete no-op regarding migration.
     {
@@ -351,13 +396,13 @@ fn test_v2_open_is_idempotent() {
     let backups_after_second = find_backup_files(&db_path);
     assert!(
         backups_after_second.is_empty(),
-        "no backup should be created on idempotent re-open of v2 DB"
+        "no backup should be created on idempotent re-open of v3 DB"
     );
 
-    // Schema version still 2.
+    // Schema version still 3.
     {
         let conn = Connection::open(&db_path).unwrap();
-        assert_eq!(read_schema_version(&conn), Some(2), "schema_version must remain 2");
+        assert_eq!(read_schema_version(&conn), Some(3), "schema_version must remain 3");
     }
 }
 
@@ -487,13 +532,17 @@ fn test_new_rows_store_client_cn() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 5: client_cn scoping — same pubkey+slot/epoch, different CNs both succeed
+// Test 5: v3 pubkey-scoped enforcement — cross-CN conflicting blocks rejected
 // ---------------------------------------------------------------------------
 
-/// Verifies that `(client_cn, pubkey, slot)` is the uniqueness key for blocks,
-/// so two different CNs can record the same `(pubkey, slot)` independently.
+/// Verifies that the v3 schema uses `(pubkey, slot)` as the slashing-check scope,
+/// so two different CNs CANNOT sign the same `(pubkey, slot)` with different roots.
+///
+/// This is the DVT-1 / CN-1 fix: cross-CN double-sign is now rejected.
+/// (Formerly named `test_cn_scoping_different_cns_are_independent`; renamed in
+/// Issue 2.4 code-review to reflect the v3 pubkey-scoped reality.)
 #[test]
-fn test_cn_scoping_different_cns_are_independent() {
+fn test_cross_cn_double_sign_rejected_v3() {
     let gvr = [0u8; 32];
     let db = SlashingDb::open_in_memory().expect("open in-memory db");
     let pubkey = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -502,9 +551,21 @@ fn test_cn_scoping_different_cns_are_independent() {
     db.check_and_record_block("peer-A", pubkey, 42, Some("0x1111".to_string()), &gvr)
         .expect("peer-A block should succeed");
 
-    // peer-B records the same slot 42 with a different root R2 — should succeed (different CN).
-    db.check_and_record_block("peer-B", pubkey, 42, Some("0x2222".to_string()), &gvr)
-        .expect("peer-B block with same slot should succeed (CN-scoped)");
+    // peer-B attempts the same slot 42 with a DIFFERENT root — MUST be rejected (v3 pubkey-scoped).
+    let result = db.check_and_record_block("peer-B", pubkey, 42, Some("0x2222".to_string()), &gvr);
+    assert!(
+        result.is_err(),
+        "peer-B conflicting block must be rejected in v3 pubkey-scoped schema (DVT-1 / CN-1 fix)"
+    );
+    assert!(
+        matches!(
+            result.unwrap_err(),
+            SlashingError::SlashableBlock(
+                rvc_slashing::BlockSlashingViolation::DoubleBlockProposal { slot: 42 }
+            )
+        ),
+        "must be DoubleBlockProposal at slot 42"
+    );
 }
 
 // ---------------------------------------------------------------------------

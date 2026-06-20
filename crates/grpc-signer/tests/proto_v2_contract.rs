@@ -248,9 +248,16 @@ impl SignerServiceV2 for MockV2Signer {
             pubkey,
         };
         let zero_gvr = [0u8; 32];
-        // Builder registrations use a fixed GENESIS_FORK_VERSION (Phase0 for mainnet).
-        // We accept whatever the client sends — for tests we use [0,0,0,0].
-        let genesis_fork_version = [0u8; 4];
+        // Builder registrations carry a per-network GENESIS_FORK_VERSION on the
+        // request (empty ⇒ mainnet 0x00000000), mirroring the real server.
+        let genesis_fork_version: [u8; 4] = if r.genesis_fork_version.is_empty() {
+            [0u8; 4]
+        } else {
+            r.genesis_fork_version
+                .as_slice()
+                .try_into()
+                .map_err(|_| Status::invalid_argument("genesis_fork_version must be 4 bytes"))?
+        };
         let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_gvr);
         let root = compute_signing_root(&reg, domain);
         Ok(Response::new(SignResponse { signature: self.sign_root(&root) }))
@@ -593,7 +600,10 @@ async fn test_typed_builder_registration_round_trip() {
 
     let signer = GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await.unwrap();
 
-    let genesis_fork_version = [0u8; 4];
+    // Non-zero (Holesky) version so the roundtrip would fail if the field were
+    // dropped on the wire — the old [0u8; 4] passed only by coincidence with the
+    // mock's hardcoded default.
+    let genesis_fork_version = [0x01, 0x01, 0x70, 0x00];
     let reg = ValidatorRegistrationV1 {
         fee_recipient: [0xab; 20],
         gas_limit: 30_000_000,
@@ -700,44 +710,35 @@ async fn start_v1_only_server(sk: SecretKey) -> (SocketAddr, tokio::task::JoinHa
     (addr, handle)
 }
 
-/// Verify that a `GrpcRemoteSigner` connected to a v1-only signer fails with
-/// a meaningful error when a typed RPC (v2) is called.
+/// Verify that a `GrpcRemoteSigner` rejects a v1-only server at connect time.
 ///
-/// This is the runtime enforcement of the C-2/C-3 fix: a v1 signer that only
-/// speaks raw-root RPCs cannot be used with the v2 client.
+/// SS-1 (Issue 2.2): the client now calls the v2 `ListPublicKeys` RPC during
+/// `connect()`.  A v1-only server does not implement the v2 service, so the
+/// connect-time key-listing returns `Unimplemented` and `connect()` itself
+/// fails — providing earlier, clearer rejection than the previous sign-time
+/// failure.
+///
+/// This is the updated enforcement of the C-2/C-3 fix: a v1-only signer cannot
+/// be used with the v2 client at all; the failure is now surfaced at startup.
 #[tokio::test]
 async fn test_refuses_v1_signer_at_typed_rpc_time() {
     let sk = SecretKey::generate();
-    let pk = sk.public_key();
     let (addr, _handle) = start_v1_only_server(sk).await;
 
-    // connect() succeeds because the v1 server has ListPublicKeys
-    let signer = GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await.unwrap();
-
-    // But calling a typed v2 RPC fails — the v1 server doesn't implement it.
-    let block = BeaconBlock {
-        slot: 1,
-        proposer_index: 0,
-        parent_root: [0u8; 32],
-        state_root: [0u8; 32],
-        body: vec![],
-    };
-    let ctx = test_ctx(pk.clone());
-    let result = TypedSigner::sign_block(&signer, &block, &ctx).await;
-
-    assert!(result.is_err(), "typed RPC against v1 server must fail");
-    let err = result.unwrap_err();
-    match &err {
-        crypto::SigningError::RemoteSignerError(msg) => {
-            // gRPC status code for unimplemented is 12 (Unimplemented) / "Operation is not
-            // implemented or not supported". Verify the error is about the sign_block call.
+    // SS-1: connect() now fails immediately because the v1-only server does not
+    // implement the v2 ListPublicKeys RPC used during key-listing.
+    match GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await {
+        Ok(_) => panic!("connect() to a v1-only server must fail"),
+        Err(crypto::SigningError::RemoteSignerError(msg)) => {
+            // The v1 server returns Unimplemented for the v2 ListPublicKeys call.
             assert!(
-                msg.contains("sign_block")
-                    || msg.contains("not implemented")
-                    || msg.contains("Unimplemented"),
-                "error should indicate v2 RPC is unavailable, got: {msg}"
+                msg.contains("list public keys")
+                    || msg.contains("Unimplemented")
+                    || msg.contains("not implemented"),
+                "error should indicate v2 ListPublicKeys is unavailable on the v1 server, \
+                 got: {msg}"
             );
         }
-        other => panic!("expected RemoteSignerError, got: {other:?}"),
+        Err(other) => panic!("expected RemoteSignerError, got: {other:?}"),
     }
 }

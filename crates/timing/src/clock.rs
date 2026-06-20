@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eth_types::Slot;
 
 use crate::error::TimingError;
-use crate::{SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
+use crate::{due_ms, ATTESTATION_DUE_BPS, SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
 
 pub trait SlotClock: Send + Sync {
     fn genesis_time(&self) -> u64;
@@ -91,7 +91,7 @@ impl SlotClock for SystemSlotClock {
     fn attestation_time(&self, slot: Slot) -> u64 {
         let slot_start_ms = self.slot_start_time(slot) * 1000;
         let slot_duration_ms = self.slot_duration.as_millis() as u64;
-        (slot_start_ms + (slot_duration_ms / 3)) / 1000
+        (slot_start_ms + due_ms(ATTESTATION_DUE_BPS, slot_duration_ms)) / 1000
     }
 
     fn time_until_slot(&self, slot: Slot) -> Result<Duration, TimingError> {
@@ -106,16 +106,17 @@ impl SlotClock for SystemSlotClock {
     }
 
     fn time_until_attestation(&self, slot: Slot) -> Result<Duration, TimingError> {
-        // Use millisecond arithmetic to preserve sub-second precision for
-        // non-standard slot durations (e.g. 6 s testnets where 1/3 = 2.000 s
-        // exactly, but 7 s slots would be truncated from 2.333 s to 2 s without
-        // this fix — firing up to ~333 ms early).
+        // Use the basis-points formula in millisecond arithmetic so the deadline
+        // is exact for non-standard slot durations (e.g. 6 s testnets where 1/3 =
+        // 2.000 s exactly, but a 7 s slot would be truncated from 2.333 s to 2 s
+        // under integer-second division — firing up to ~333 ms early). Mainnet is
+        // 3333 * 12000 / 10000 = 3999 ms (report §4.3).
         let current_time_ms =
             SystemTime::now().duration_since(UNIX_EPOCH).expect("time went backwards").as_millis()
                 as u64;
         let slot_start_ms = self.slot_start_time(slot) * 1000;
         let slot_duration_ms = self.slot_duration.as_millis() as u64;
-        let attestation_time_ms = slot_start_ms + (slot_duration_ms / 3);
+        let attestation_time_ms = slot_start_ms + due_ms(ATTESTATION_DUE_BPS, slot_duration_ms);
 
         if current_time_ms >= attestation_time_ms {
             return Ok(Duration::ZERO);
@@ -204,7 +205,7 @@ impl SlotClock for MockSlotClock {
     fn attestation_time(&self, slot: Slot) -> u64 {
         let slot_start_ms = self.slot_start_time(slot) * 1000;
         let slot_duration_ms = self.slot_duration.as_millis() as u64;
-        (slot_start_ms + (slot_duration_ms / 3)) / 1000
+        (slot_start_ms + due_ms(ATTESTATION_DUE_BPS, slot_duration_ms)) / 1000
     }
 
     fn time_until_slot(&self, slot: Slot) -> Result<Duration, TimingError> {
@@ -219,12 +220,13 @@ impl SlotClock for MockSlotClock {
     }
 
     fn time_until_attestation(&self, slot: Slot) -> Result<Duration, TimingError> {
-        // Mirror the millisecond arithmetic used in SystemSlotClock so behaviour
-        // is consistent regardless of which implementation is active.
+        // Mirror the basis-points millisecond arithmetic used in SystemSlotClock
+        // so behaviour is consistent regardless of which implementation is active
+        // (report §4.3).
         let current_time_ms = self.get_current_time() * 1000;
         let slot_start_ms = self.slot_start_time(slot) * 1000;
         let slot_duration_ms = self.slot_duration.as_millis() as u64;
-        let attestation_time_ms = slot_start_ms + (slot_duration_ms / 3);
+        let attestation_time_ms = slot_start_ms + due_ms(ATTESTATION_DUE_BPS, slot_duration_ms);
 
         if current_time_ms >= attestation_time_ms {
             return Ok(Duration::ZERO);
@@ -322,8 +324,11 @@ mod tests {
     #[test]
     fn test_attestation_time() {
         let clock = create_mock_clock();
-        assert_eq!(clock.attestation_time(0), TEST_GENESIS_TIME + 4);
-        assert_eq!(clock.attestation_time(1), TEST_GENESIS_TIME + 16);
+        // Seconds API floors (slot_start_ms + due_ms) / 1000. For a 12 s slot,
+        // due_ms = 3333 * 12000 / 10000 = 3999, so (0 + 3999) / 1000 = genesis + 3
+        // and ((12)*1000 + 3999) / 1000 = genesis + 15 (down from +4 / +16).
+        assert_eq!(clock.attestation_time(0), TEST_GENESIS_TIME + 3);
+        assert_eq!(clock.attestation_time(1), TEST_GENESIS_TIME + 15);
     }
 
     #[test]
@@ -347,7 +352,8 @@ mod tests {
         let clock = create_mock_clock();
         clock.set_current_time(TEST_GENESIS_TIME);
         let time_until = clock.time_until_attestation(0).unwrap();
-        assert_eq!(time_until, Duration::from_secs(4));
+        // BPS: 3333 * 12000 / 10000 = 3999 ms (down from the legacy 4 s).
+        assert_eq!(time_until, Duration::from_millis(3999));
     }
 
     #[test]

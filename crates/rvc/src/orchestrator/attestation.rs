@@ -21,6 +21,52 @@ use super::error::OrchestratorError;
 use super::utils;
 use super::validation::attestation_data::validate_attestation_data;
 
+/// Decide whether an attestation duty may proceed past the doppelganger gate.
+///
+/// Returns `true` when the duty is allowed to be signed, `false` when it must be
+/// skipped.  This is **fail-closed** (D-3 / FUP-6): the duty is skipped when
+///
+/// - the pubkey cannot be resolved via `find_pubkey` (case-insensitive,
+///   `0x`/`0X`-tolerant) — an unresolved pubkey cannot be gate-checked, so the
+///   only safe action is to skip; or
+/// - the resolved validator is disabled (`is_signing_enabled` returns `false`),
+///   i.e. still inside its post-import doppelganger window (M-12).
+///
+/// The gate decision is taken on the **infallible** `pk.to_bytes()` of the
+/// already-resolved typed `PublicKey`, never by re-decoding the raw beacon
+/// pubkey string.  This mirrors the sibling sync/aggregate/coordinator paths
+/// and removes the previous fail-OPEN fall-through where a non-`0x`-lowercase
+/// or non-decoding pubkey string skipped the gate entirely.
+pub(crate) fn attestation_duty_enabled(
+    duty: &AttesterDuty,
+    pubkey_map: &PubkeyMap,
+    validator_store: &ValidatorStore,
+    slot: Slot,
+) -> bool {
+    let Some(pk) = utils::find_pubkey(pubkey_map, &duty.pubkey) else {
+        warn!(
+            pubkey = %TruncatedPubkey::new(&duty.pubkey),
+            slot,
+            "Skipping attestation duty: pubkey did not resolve to a tracked \
+             validator (D-3 fail-closed)"
+        );
+        return false;
+    };
+
+    let pk_bytes = pk.to_bytes();
+    if !validator_store.is_signing_enabled(&pk_bytes) {
+        warn!(
+            pubkey = %TruncatedPubkey::new(&duty.pubkey),
+            slot,
+            "Skipping attestation duty: validator is inside the \
+             post-import doppelganger window (M-12)"
+        );
+        return false;
+    }
+
+    true
+}
+
 pub(crate) struct AttestationService<C, S>
 where
     C: SlotClock + 'static,
@@ -95,32 +141,18 @@ where
         let raw_duties =
             utils::get_duties_for_slot(&self.pubkey_map, &self.duty_tracker, slot).await?;
 
-        // M-12 (Critical #1): skip duties for validators still inside their
-        // post-import doppelganger window.  The ValidatorStore enabled flag is
-        // set to `false` when a key is imported via the Keymanager API and
-        // flipped to `true` once the background task's window elapses.  Keys
-        // that were never added via the API (i.e. loaded at startup) default
-        // to `enabled = true` and pass through unimpeded.
+        // M-12 (Critical #1) / D-3: skip duties for validators still inside
+        // their post-import doppelganger window, or whose pubkey cannot be
+        // resolved.  The decision is fail-CLOSED: a duty is dropped unless its
+        // pubkey resolves to a tracked validator whose `is_signing_enabled`
+        // flag is `true`.  Keystore-loaded keys are registered in the store at
+        // startup (`ServiceBuilder::register_loaded_validators`), so they
+        // resolve and remain enabled; an unresolved or disabled pubkey is
+        // skipped rather than passed through.  See `attestation_duty_enabled`.
         let duties: Vec<AttesterDuty> = raw_duties
             .into_iter()
             .filter(|duty| {
-                let hex = duty.pubkey.strip_prefix("0x").unwrap_or(&duty.pubkey);
-                if let Ok(bytes) = hex::decode(hex) {
-                    if bytes.len() == 48 {
-                        let mut pk = [0u8; 48];
-                        pk.copy_from_slice(&bytes);
-                        if !self.validator_store.is_attesting_enabled(&pk) {
-                            warn!(
-                                pubkey = %duty.pubkey,
-                                slot,
-                                "Skipping attestation duty: validator is inside the \
-                                 post-import doppelganger window (M-12)"
-                            );
-                            return false;
-                        }
-                    }
-                }
-                true
+                attestation_duty_enabled(duty, &self.pubkey_map, &self.validator_store, slot)
             })
             .collect();
 
@@ -516,5 +548,119 @@ where
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use crypto::{PublicKey, SecretKey};
+    use parking_lot::RwLock;
+    use validator_store::{ValidatorConfig, ValidatorStore};
+
+    /// Build a minimal `AttesterDuty` for the given pubkey string.
+    fn duty_with_pubkey(pubkey: &str) -> AttesterDuty {
+        AttesterDuty {
+            pubkey: pubkey.to_string(),
+            validator_index: "0".to_string(),
+            committee_index: "0".to_string(),
+            committee_length: "1".to_string(),
+            committees_at_slot: "1".to_string(),
+            validator_committee_index: "0".to_string(),
+            slot: "0".to_string(),
+        }
+    }
+
+    /// Build a `PubkeyMap` containing a single resolvable pubkey under its
+    /// canonical `0x`-lowercase key (the form the orchestrator inserts).
+    fn pubkey_map_with(pubkey: &PublicKey) -> PubkeyMap {
+        let mut map: HashMap<String, PublicKey> = HashMap::new();
+        let key = format!("0x{}", hex::encode(pubkey.to_bytes()));
+        map.insert(key, pubkey.clone());
+        Arc::new(RwLock::new(map))
+    }
+
+    fn disabled_store(pubkey: &PublicKey) -> ValidatorStore {
+        let store = ValidatorStore::new([0u8; 20], 30_000_000);
+        let mut config = ValidatorConfig::new(pubkey.to_bytes());
+        config.enabled = false;
+        store.add_validator(config);
+        store
+    }
+
+    /// FUP-6 / D-3 RED: a duty whose pubkey is uppercase-`0X`-prefixed is
+    /// resolvable via `find_pubkey` (case-insensitive `CanonicalPubkey`), so the
+    /// gate MUST be consulted.  The validator is disabled, so the duty must be
+    /// SKIPPED (fail-closed).
+    ///
+    /// On `develop` the inline filter used `strip_prefix("0x")` (lowercase only)
+    /// then `hex::decode`, which fails on a `0X` prefix and falls through to
+    /// `true` — fail OPEN.  This test fails on `develop` and passes after the
+    /// fail-closed fix.
+    #[test]
+    fn test_uppercase_0x_disabled_validator_is_skipped_fail_closed() {
+        let sk = SecretKey::generate();
+        let pubkey = sk.public_key();
+
+        // Duty carries the uppercase `0X` prefix — `find_pubkey` resolves it,
+        // but the old lowercase-only `strip_prefix("0x")` + decode does not.
+        let duty_pubkey = format!("0X{}", hex::encode(pubkey.to_bytes()).to_uppercase());
+        let duty = duty_with_pubkey(&duty_pubkey);
+
+        let pubkey_map = pubkey_map_with(&pubkey);
+        let store = disabled_store(&pubkey);
+
+        assert!(
+            !attestation_duty_enabled(&duty, &pubkey_map, &store, 0),
+            "uppercase-0X duty for a disabled validator must be SKIPPED (fail-closed); \
+             the old lowercase-only decode falls through to enabled=true (fail-open)"
+        );
+    }
+
+    /// FUP-6 / D-3 RED: a duty whose pubkey does not resolve via `find_pubkey`
+    /// at all must be SKIPPED (fail-closed) — an unresolved pubkey cannot be
+    /// gate-checked, so the only safe action is to skip.
+    ///
+    /// On `develop` an unresolved-but-decodable 48-byte pubkey reaches
+    /// `is_signing_enabled` and is skipped, but a NON-decoding pubkey falls
+    /// through to `true`.  This test uses a non-hex pubkey to exercise the
+    /// fail-open path.
+    #[test]
+    fn test_unresolved_nondecoding_pubkey_is_skipped_fail_closed() {
+        // Not valid hex (contains 'z') and not present in the map.
+        let duty = duty_with_pubkey("0xzzzznotvalidhex");
+
+        let other = SecretKey::generate().public_key();
+        let pubkey_map = pubkey_map_with(&other);
+        let store = disabled_store(&other);
+
+        assert!(
+            !attestation_duty_enabled(&duty, &pubkey_map, &store, 0),
+            "a duty whose pubkey does not resolve via find_pubkey must be SKIPPED \
+             (fail-closed); the old code falls through to enabled=true (fail-open)"
+        );
+    }
+
+    /// GREEN guard: the fail-closed fix must NOT over-skip — a resolvable,
+    /// enabled validator's duty (even with an uppercase `0X` prefix) is allowed.
+    #[test]
+    fn test_resolvable_enabled_validator_is_allowed() {
+        let sk = SecretKey::generate();
+        let pubkey = sk.public_key();
+
+        let duty_pubkey = format!("0X{}", hex::encode(pubkey.to_bytes()).to_uppercase());
+        let duty = duty_with_pubkey(&duty_pubkey);
+
+        let pubkey_map = pubkey_map_with(&pubkey);
+        let store = ValidatorStore::new([0u8; 20], 30_000_000);
+        store.add_validator(ValidatorConfig::new(pubkey.to_bytes())); // enabled by default
+
+        assert!(
+            attestation_duty_enabled(&duty, &pubkey_map, &store, 0),
+            "a resolvable, enabled validator must be allowed through the gate"
+        );
     }
 }

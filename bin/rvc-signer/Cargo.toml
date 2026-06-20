@@ -28,6 +28,7 @@ hex.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+signer.workspace = true
 slashing.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -68,6 +69,9 @@ slashing.workspace = true
 # DVT test dependencies (always available in tests when dvt feature is on)
 vsss-rs.workspace = true
 bls12_381_plus.workspace = true
+
+# M4 enumeration gate (SS-1, Issue 2.2) — dev-only; must NOT be a production edge
+signer-registry.workspace = true
 
 [build-dependencies]
 tonic-build.workspace = true

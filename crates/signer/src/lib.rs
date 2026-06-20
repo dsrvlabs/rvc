@@ -3,12 +3,24 @@
 //! This module provides a signing service that ensures all validator
 //! signatures are checked against slashing protection rules before signing.
 
+mod error;
+mod fail_closed;
+mod gate;
+mod locks;
+pub mod non_slashable;
+pub mod slashable;
 mod traits;
 
 pub use crypto::is_aggregator;
+// SigningEnablement was relocated from rvc-signer to rvc-doppelganger (Issue 2.6)
+// to allow ForwardWindowMachine to implement it without a doppelganger→signer cycle.
+pub use doppelganger::SigningEnablement;
+pub use error::SigningGateError;
+pub use fail_closed::FailClosedDefault;
+pub use gate::{SigningGate, AUDIT_CN_DEFAULT};
+pub use locks::ValidatorLockMap;
 pub use traits::ValidatorSigner;
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -43,13 +55,19 @@ pub enum SignerError {
     SigningFailed(String),
 }
 
-/// Truncates an error message body to a maximum length, appending
+/// Truncates an error message body to at most `max` bytes, appending
 /// "... (truncated)" if the message exceeds the limit.
+///
+/// The cut point is adjusted to the highest valid UTF-8 character boundary
+/// that is ≤ `max` bytes, so the result is always a valid `String` even when
+/// `msg` contains multi-byte Unicode sequences.
 fn truncate_error_body(msg: &str, max: usize) -> String {
     if msg.len() <= max {
         msg.to_string()
     } else {
-        format!("{}... (truncated)", &msg[..max])
+        // Walk back from `max` to find a valid char boundary.
+        let safe = (0..=max).rev().find(|&i| msg.is_char_boundary(i)).unwrap_or(0);
+        format!("{}... (truncated)", &msg[..safe])
     }
 }
 
@@ -67,40 +85,18 @@ impl From<SigningError> for SignerError {
     }
 }
 
-/// Per-validator lock map for serializing check-record-sign per validator.
-///
-/// Prevents TOCTOU races where two concurrent sign requests for the same
-/// validator could both pass the slashing check before either records.
-/// Different validators are NOT blocked by each other.
-pub struct ValidatorLockMap {
-    locks: parking_lot::Mutex<HashMap<[u8; 48], Arc<tokio::sync::Mutex<()>>>>,
-}
-
-impl ValidatorLockMap {
-    pub fn new() -> Self {
-        Self { locks: parking_lot::Mutex::new(HashMap::new()) }
-    }
-
-    pub fn get(&self, pubkey: &[u8; 48]) -> Arc<tokio::sync::Mutex<()>> {
-        self.locks
-            .lock()
-            .entry(*pubkey)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    }
-}
-
-impl Default for ValidatorLockMap {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Service that combines signing through CompositeSigner with slashing protection.
 ///
 /// Record-then-sign order is mandated by Ethereum consensus spec (phase0/validator.md):
 /// "Save a record to hard disk ... Generate and broadcast."
 /// The per-validator mutex prevents TOCTOU between concurrent signing requests.
+///
+/// # Gate integration (Issue 2.10b)
+///
+/// `sign_block` and `sign_attestation` currently run their own stage → sign →
+/// commit/discard loops to preserve `RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS`
+/// metric instrumentation (ISSUE-3.12).  Full routing through `SigningGate`
+/// (with the real `ForwardWindowMachine` enablement) is deferred to Issue 2.10b.
 pub struct SignerService {
     signer: Arc<CompositeSigner>,
     slashing_db: Arc<SlashingDb>,
@@ -215,7 +211,6 @@ impl SignerService {
                 let tx_start = Instant::now();
                 let staged = db
                     .stage_attestation(
-                        "local-vc",
                         &pubkey_hex_clone,
                         source_epoch,
                         target_epoch,
@@ -378,7 +373,7 @@ impl SignerService {
                 // Capture the start of the SQLite transaction hold (ISSUE-3.12).
                 let tx_start = Instant::now();
                 let staged = db
-                    .stage_block("local-vc", &pubkey_hex_clone, slot, Some(signing_root_hex), &gvr)
+                    .stage_block(&pubkey_hex_clone, slot, Some(signing_root_hex), &gvr)
                     .map_err(|e| {
                         error!(
                             pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
@@ -1392,7 +1387,10 @@ mod tests {
         let pubkey = secret_key.public_key();
         let pubkey_hex = hex::encode(pubkey.to_bytes());
 
-        slashing_db.record_attestation(&pubkey_hex, 100, 101, None).expect("record should succeed");
+        let gvr = [0xaau8; 32]; // test gvr matching genesis_root below
+        slashing_db
+            .record_attestation(&pubkey_hex, 100, 101, None, &gvr)
+            .expect("record should succeed");
 
         let signer = create_empty_composite_signer();
         let service = SignerService::new(signer, slashing_db);

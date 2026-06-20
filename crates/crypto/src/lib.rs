@@ -37,7 +37,7 @@ pub use error::{BlsError, KeyManagerError, KeystoreError};
 pub use eth_types::{DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
 pub use hex::{strip_prefix_strict, HexError};
 pub use insecure::{InsecureGate, InsecureGateError, InsecureMode};
-pub use key_manager::KeyManager;
+pub use key_manager::{KeyManager, WILDCARD_KEY};
 pub use keystore::{EncryptionKdf, KdfParams, Keystore, Pbkdf2Params, ScryptParams};
 pub use pubkey::CanonicalPubkey;
 pub use remote_signer::{

@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use beacon::BeaconClient;
-use doppelganger::{DoppelgangerError, LivenessChecker, SlashingDbReader, ValidatorLivenessData};
+use doppelganger::{
+    DoppelgangerError, LegacySlashingHistoryReader, LivenessChecker, ValidatorLivenessData,
+};
 use eth_types::Epoch;
 use slashing::SlashingDb;
 
@@ -40,7 +42,11 @@ impl LivenessChecker for BeaconLivenessAdapter {
     }
 }
 
-/// Adapter implementing [`SlashingDbReader`] via [`SlashingDb::last_signed_attestation_epoch`].
+/// Adapter implementing [`LegacySlashingHistoryReader`] via
+/// [`SlashingDb::last_signed_attestation_epoch`].
+///
+/// Used by [`doppelganger::DoppelgangerService`] (the GVR-blind service).
+/// [`ForwardWindowMachine`] uses `slashing::SlashingDbReader` directly.
 pub struct SlashingDbReaderAdapter {
     db: Arc<SlashingDb>,
 }
@@ -51,7 +57,7 @@ impl SlashingDbReaderAdapter {
     }
 }
 
-impl SlashingDbReader for SlashingDbReaderAdapter {
+impl LegacySlashingHistoryReader for SlashingDbReaderAdapter {
     fn last_signed_attestation_epoch(
         &self,
         pubkey: &str,
@@ -77,7 +83,8 @@ mod tests {
     #[test]
     fn test_slashing_db_reader_adapter_with_attestation() {
         let db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        db.record_attestation("0xabc", 5, 10, None).unwrap();
+        let gvr = [0u8; 32];
+        db.record_attestation("0xabc", 5, 10, None, &gvr).unwrap();
         let adapter = SlashingDbReaderAdapter::new(db);
         let result = adapter.last_signed_attestation_epoch("0xabc").unwrap();
         assert_eq!(result, Some(10));
@@ -86,9 +93,10 @@ mod tests {
     #[test]
     fn test_slashing_db_reader_adapter_returns_max_epoch() {
         let db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        db.record_attestation("0xabc", 1, 5, None).unwrap();
-        db.record_attestation("0xabc", 5, 10, None).unwrap();
-        db.record_attestation("0xabc", 10, 15, None).unwrap();
+        let gvr = [0u8; 32];
+        db.record_attestation("0xabc", 1, 5, None, &gvr).unwrap();
+        db.record_attestation("0xabc", 5, 10, None, &gvr).unwrap();
+        db.record_attestation("0xabc", 10, 15, None, &gvr).unwrap();
         let adapter = SlashingDbReaderAdapter::new(db);
         let result = adapter.last_signed_attestation_epoch("0xabc").unwrap();
         assert_eq!(result, Some(15));

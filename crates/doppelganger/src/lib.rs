@@ -4,15 +4,24 @@
 //! Implements restart-awareness (Lodestar pattern) to avoid false positives
 //! when a validator client restarts after recently signing attestations.
 
+mod enablement;
 mod error;
+mod forward_window;
 mod service;
+mod state;
 mod traits;
 
+pub use enablement::SigningEnablement;
 pub use error::DoppelgangerError;
+pub use forward_window::ForwardWindowMachine;
 pub use service::DoppelgangerService;
-pub use traits::{LivenessChecker, SlashingDbReader, ValidatorLivenessData};
+pub use state::{ForwardWindowStatus, ValidatorState};
+pub use traits::{LegacySlashingHistoryReader, LivenessChecker, ValidatorLivenessData};
 
 /// Status of doppelganger detection for a validator.
+///
+/// Used by [`DoppelgangerService`].  Distinct from [`ForwardWindowStatus`],
+/// which is the 4-variant status for [`ForwardWindowMachine`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DoppelgangerStatus {
     /// Validator is safe to sign (restart-aware skip or monitoring complete).

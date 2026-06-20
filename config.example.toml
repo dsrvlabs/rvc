@@ -24,6 +24,13 @@ keystore_path = "./keystores"
 
 # Password file for keystore decryption (optional).
 # Format: one `pubkey=password` per line. Lines starting with # are comments.
+# A `*=<password>` line sets one default password for every keystore, with
+# optional per-validator overrides:
+#   *=mySharedPassword
+#   0xabcd1234...=differentPassword
+# Precedence: exact pubkey entry, else the `*` wildcard, else the keystore is skipped.
+# The `*` password decrypts every keystore without its own line, so anyone who
+# can read this file holds those keys -- scope it tightly and keep it chmod 600.
 # If omitted, passwords are prompted interactively.
 # WARNING: Ensure restrictive permissions (chmod 600).
 # password_file = "./passwords.txt"

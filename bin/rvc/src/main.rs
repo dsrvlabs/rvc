@@ -826,6 +826,15 @@ fn init_logging(
         boxed_layers.push(fl);
     }
 
+    // tracing-subscriber 0.3 `Vec<L: Layer<S>>::register_callsite()` returns
+    // `Interest::never()` when empty. As the outer layer in a `Layered` stack
+    // that short-circuits every callsite via `Layered::pick_interest`, so no
+    // events ever reach `fmt::layer` underneath. Pad with `Identity` (a no-op
+    // that returns `Interest::always()`) when no optional layers are present.
+    if boxed_layers.is_empty() {
+        boxed_layers.push(Box::new(tracing_subscriber::layer::Identity::new()));
+    }
+
     tracing_subscriber::registry()
         .with(boxed_layers)
         .with(tracing_subscriber::fmt::layer())
@@ -1254,25 +1263,33 @@ async fn run_validator(
             // is anchored on a monotonic Instant captured at startup.
             let current_epoch = doppelganger_service.current_epoch();
 
-            if current_epoch > 0 {
-                match startup::run_doppelganger_detection(
-                    &doppelganger_service,
-                    &pubkeys,
-                    &validator_index_map,
-                    current_epoch,
-                )
-                .await
-                {
-                    Ok(safe_validators) => {
-                        info!(
-                            safe_count = safe_validators.len(),
-                            "Doppelganger detection complete"
-                        );
-                    }
-                    Err(e) => {
-                        error!("Doppelganger detection failed: {}", e);
-                        return Err(e.into());
-                    }
+            // S-3 (Issue 2.8): detection is always invoked — the epoch-0 case is
+            // handled inside startup::run_doppelganger_detection as an explicit,
+            // logged pre-genesis bypass that returns all validators Safe without
+            // issuing a beacon liveness query (so a pre-genesis BN error cannot
+            // abort startup).  ForwardWindowMachine also applies an epoch-0 bypass
+            // for the future production wiring path (Issue 2.10).
+            if current_epoch == 0 {
+                info!(
+                    "Doppelganger detection: pre-genesis (epoch 0) startup — \
+                     validators will be marked Safe without a monitoring window"
+                );
+            }
+
+            match startup::run_doppelganger_detection(
+                &doppelganger_service,
+                &pubkeys,
+                &validator_index_map,
+                current_epoch,
+            )
+            .await
+            {
+                Ok(safe_validators) => {
+                    info!(safe_count = safe_validators.len(), "Doppelganger detection complete");
+                }
+                Err(e) => {
+                    error!("Doppelganger detection failed: {}", e);
+                    return Err(e.into());
                 }
             }
         }
@@ -1284,6 +1301,12 @@ async fn run_validator(
     let signer = builder.build_signer(composite_signer.clone(), slashing_db.clone());
     let propagator = builder.build_propagator(beacon_client.clone());
     let validator_store = builder.build_validator_store(config.validators_config.as_deref())?;
+
+    // D-3 (Issue 2.11): register every keystore-loaded validator so the
+    // fail-closed per-validator signing gate permits the keys the VC loaded.
+    // Without this, the common no-validators_config deployment would have every
+    // loaded validator silently blocked from signing.
+    builder.register_loaded_validators(&validator_store, &pubkey_map);
 
     let beacon: std::sync::Arc<dyn BeaconNodeClient> = bn_manager;
     let validator_indices: Vec<String> = match validator_index_map {
@@ -2163,5 +2186,67 @@ mod tests {
 
         assert!(config.grpc_signer_url.is_none());
         assert!(config.grpc_signer_tls_cert.is_none());
+    }
+
+    /// Regression guard for the v0.4.0 logging silence bug.
+    ///
+    /// `Vec<L: Layer<S>>::register_callsite()` returns `Interest::never()`
+    /// for an empty Vec (tracing-subscriber 0.3 `layer/mod.rs:1788`). When
+    /// that empty Vec is the outer layer in a `Layered` stack, the
+    /// short-circuit in `Layered::pick_interest` disables every callsite,
+    /// so no events ever reach `fmt::layer` underneath.
+    ///
+    /// This test mirrors `init_logging`'s subscriber composition for the
+    /// no-extras case (no `--tracing-endpoint`, no `--logfile`) and asserts
+    /// that a basic `info!` event reaches the writer.
+    #[test]
+    fn test_init_logging_no_extras_emits_events() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::Layer;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for SharedBuf {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = SharedBuf::default();
+        let filter = tracing_subscriber::EnvFilter::new("info");
+
+        // Match the exact shape `init_logging` builds when both
+        // `tracing_config` and `file_config` are None: a Vec that would have
+        // been empty, padded with `Identity` to avoid the never-Interest poison.
+        let boxed_layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
+            vec![Box::new(tracing_subscriber::layer::Identity::new())];
+
+        let subscriber = tracing_subscriber::registry()
+            .with(boxed_layers)
+            .with(tracing_subscriber::fmt::layer().with_writer(buf.clone()))
+            .with(filter);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("init_logging regression marker");
+        });
+
+        let captured = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("init_logging regression marker"),
+            "init_logging composition silently drops events; captured: {captured:?}"
+        );
     }
 }

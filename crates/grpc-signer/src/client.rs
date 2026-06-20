@@ -27,8 +27,8 @@ use crate::proto::signer_v2::{
     SignVoluntaryExitRequest,
 };
 
-// Keep v1 client for ListPublicKeys and GetStatus during connect
-use crate::proto::signer::signer_service_client::SignerServiceClient;
+// SS-1 (Issue 2.2): v1 SignerServiceClient removed from connect path.
+// The v2 client handles ListPublicKeys via SignerServiceClientV2.
 
 /// The proto package name emitted by the v2 `GetStatus` response.
 /// `bin/rvc` checks this at startup to refuse a v1 signer.
@@ -158,11 +158,16 @@ impl GrpcRemoteSigner {
                 })?
         };
 
-        // Use v1 client for ListPublicKeys (shared proto; both versions expose this RPC)
-        let mut v1_client = SignerServiceClient::new(channel.clone());
+        // SS-1 (Issue 2.2): use the v2 client for ListPublicKeys.
+        // The v1 service has been removed from the live listener; only the v2 typed RPCs
+        // are served.  Both v1 and v2 expose ListPublicKeys, but the live server only
+        // responds to v2 requests.
+        let mut v2_list_client = SignerServiceClientV2::new(channel.clone());
 
-        let response =
-            v1_client.list_public_keys(crate::ListPublicKeysRequest {}).await.map_err(|e| {
+        let response = v2_list_client
+            .list_public_keys(crate::proto::signer_v2::ListPublicKeysRequest {})
+            .await
+            .map_err(|e| {
                 tracing::error!(
                     endpoint = %redact_url(&url),
                     error = %e,
@@ -682,6 +687,7 @@ impl TypedSigner for GrpcRemoteSigner {
                 fee_recipient: reg.fee_recipient.to_vec(),
                 gas_limit: reg.gas_limit,
                 timestamp: reg.timestamp,
+                genesis_fork_version: genesis_fork_version.to_vec(),
             };
 
             let mut client = self.client_v2.clone();

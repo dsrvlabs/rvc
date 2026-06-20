@@ -1,10 +1,10 @@
 [workspace]
-members = ["bin/rvc", "bin/rvc-keygen", "bin/rvc-signer", "crates/rvc", "crates/beacon", "crates/bn-manager", "crates/builder", "crates/doppelganger", "crates/eth-types", "crates/grpc-signer", "crates/keymanager-api", "crates/metrics", "crates/secret-provider", "crates/slashing", "crates/telemetry", "crates/timing", "crates/crypto", "crates/duty-tracker", "crates/propagator", "crates/signer", "crates/validator-store", "crates/block-service", "crates/sync-service"]
-default-members = ["bin/rvc"]
+members = ["bin/rvc", "bin/rvc-keygen", "bin/rvc-signer", "crates/rvc", "crates/beacon", "crates/bn-manager", "crates/builder", "crates/doppelganger", "crates/eth-types", "crates/grpc-signer", "crates/keymanager-api", "crates/metrics", "crates/secret-provider", "crates/slashing", "crates/telemetry", "crates/timing", "crates/crypto", "crates/duty-tracker", "crates/propagator", "crates/signer", "crates/validator-store", "crates/block-service", "crates/sync-service", "crates/architecture-tests", "crates/signer-registry"]
+default-members = ["bin/rvc", "crates/architecture-tests"]
 resolver = "2"
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
@@ -32,6 +32,7 @@ keymanager-api = { path = "crates/keymanager-api", package = "rvc-keymanager-api
 telemetry = { path = "crates/telemetry", package = "rvc-telemetry" }
 secret-provider = { path = "crates/secret-provider", package = "rvc-secret-provider" }
 grpc-signer = { path = "crates/grpc-signer", package = "rvc-grpc-signer" }
+signer-registry = { path = "crates/signer-registry", package = "rvc-signer-registry" }
 
 # External
 async-trait = "0.1"
@@ -125,3 +126,9 @@ tracing-test = "0.2"
 
 [workspace.dependencies.tonic-build]
 version = "0.12"
+
+# Optimize all third-party dependencies (incl. scrypt/bls/sha2 KDF+crypto) even in
+# debug/test builds. Workspace crates stay unoptimized for fast incremental builds and
+# clean backtraces; only deps are optimized. Cuts crypto-heavy test time ~3-5x.
+[profile.dev.package."*"]
+opt-level = 3

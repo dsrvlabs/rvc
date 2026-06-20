@@ -2,7 +2,13 @@ use serde::{Deserialize, Serialize};
 use tree_hash::{Hash256, MerkleHasher, TreeHash, TreeHashType};
 
 use crate::tree_hash_utils::{bitlist_tree_hash_root, vec_u8_tree_hash_root, TreeHashError};
-use crate::{AttestationData, Signature};
+use crate::{AttestationData, Signature, MAX_COMMITTEES_PER_SLOT, MAX_VALIDATORS_PER_COMMITTEE};
+
+/// `Bitlist[N]` limit for a pre-Electra `Attestation.aggregation_bits` (chunk_count = 8).
+const PRE_ELECTRA_AGG_BITS_LIMIT: u64 = MAX_VALIDATORS_PER_COMMITTEE;
+/// EIP-7549 `Bitlist[N]` limit for an Electra `Attestation.aggregation_bits`:
+/// `MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT` = 131072 (chunk_count = 512).
+const ELECTRA_AGG_BITS_LIMIT: u64 = MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attestation {
@@ -17,7 +23,10 @@ impl Attestation {
     pub fn try_tree_hash_root(&self) -> Result<Hash256, TreeHashError> {
         let mut hasher = MerkleHasher::with_leaves(3);
         hasher
-            .write(bitlist_tree_hash_root(&self.aggregation_bits)?.as_slice())
+            .write(
+                bitlist_tree_hash_root(&self.aggregation_bits, PRE_ELECTRA_AGG_BITS_LIMIT)?
+                    .as_slice(),
+            )
             .expect("valid leaf");
         hasher.write(self.data.tree_hash_root().as_slice()).expect("valid leaf");
         hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
@@ -102,12 +111,14 @@ impl ElectraAttestation {
     pub fn try_tree_hash_root(&self) -> Result<Hash256, TreeHashError> {
         let mut hasher = MerkleHasher::with_leaves(4);
         hasher
-            .write(bitlist_tree_hash_root(&self.aggregation_bits)?.as_slice())
+            .write(
+                bitlist_tree_hash_root(&self.aggregation_bits, ELECTRA_AGG_BITS_LIMIT)?.as_slice(),
+            )
             .expect("valid leaf");
         hasher.write(self.data.tree_hash_root().as_slice()).expect("valid leaf");
-        // EIP-7549 spec order: field 2 = committee_bits, field 3 = signature
-        hasher.write(vec_u8_tree_hash_root(&self.committee_bits).as_slice()).expect("valid leaf");
+        // EIP-7549 container field order: leaf 2 = signature, leaf 3 = committee_bits
         hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
+        hasher.write(vec_u8_tree_hash_root(&self.committee_bits).as_slice()).expect("valid leaf");
         Ok(hasher.finish().expect("valid root"))
     }
 }
@@ -438,11 +449,15 @@ mod tests {
 
         let mut hasher = MerkleHasher::with_leaves(4);
         hasher
-            .write(bitlist_tree_hash_root(&att.aggregation_bits).unwrap().as_slice())
+            .write(
+                bitlist_tree_hash_root(&att.aggregation_bits, ELECTRA_AGG_BITS_LIMIT)
+                    .unwrap()
+                    .as_slice(),
+            )
             .expect("leaf");
         hasher.write(att.data.tree_hash_root().as_slice()).expect("leaf");
-        hasher.write(vec_u8_tree_hash_root(&att.committee_bits).as_slice()).expect("leaf");
         hasher.write(vec_u8_tree_hash_root(&att.signature).as_slice()).expect("leaf");
+        hasher.write(vec_u8_tree_hash_root(&att.committee_bits).as_slice()).expect("leaf");
         let expected = hasher.finish().expect("root");
 
         assert_eq!(att.tree_hash_root(), expected, "tree_hash_root must match spec field order");
@@ -454,17 +469,59 @@ mod tests {
 
         let mut hasher = MerkleHasher::with_leaves(4);
         hasher
-            .write(bitlist_tree_hash_root(&att.aggregation_bits).unwrap().as_slice())
+            .write(
+                bitlist_tree_hash_root(&att.aggregation_bits, ELECTRA_AGG_BITS_LIMIT)
+                    .unwrap()
+                    .as_slice(),
+            )
             .expect("leaf");
         hasher.write(att.data.tree_hash_root().as_slice()).expect("leaf");
-        hasher.write(vec_u8_tree_hash_root(&att.signature).as_slice()).expect("leaf");
         hasher.write(vec_u8_tree_hash_root(&att.committee_bits).as_slice()).expect("leaf");
+        hasher.write(vec_u8_tree_hash_root(&att.signature).as_slice()).expect("leaf");
         let wrong_root = hasher.finish().expect("root");
 
         assert_ne!(
             att.tree_hash_root(),
             wrong_root,
             "tree_hash_root must differ from wrong field order"
+        );
+    }
+
+    // Known-answer test pinning the Electra `Attestation` tree-hash root to the TRUE consensus-spec
+    // root, so leaf order can no longer be silently re-swapped (report §4.1, Decision Log D3) AND
+    // the `aggregation_bits` leaf is byte-equal to the SSZ spec (bitlist limit-padding fix).
+    //
+    // Provenance of the golden root (EXTERNAL oracle, not rvc's own helpers):
+    //   Derived with `remerkleable` (the consensus-spec SSZ implementation) modelling the exact
+    //   EIP-7549 Electra `Attestation` container:
+    //     aggregation_bits : Bitlist[MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT]
+    //                        = Bitlist[131072]  (chunk_count 512), value = SSZ [0xff;4] (31 bits set)
+    //     data             : AttestationData{slot:100,index:0,bbr:[1;32],src{3,[2;32]},tgt{4,[3;32]}}
+    //     signature        : Vector[byte, 96]  = [0xaa;96]
+    //     committee_bits   : Bitvector[64]      = SSZ [0x01;8]  (bit 0 set)
+    //   remerkleable per-leaf roots:
+    //     leaf0 aggregation_bits = 0x0acb28fe2d45369378d2ec4fd21993e5bf593d2b62d1493da535c6c3978e37a3
+    //     leaf1 data             = 0x3810cbc2daad89c727791c249ea17025b976d05c2fd41344285bc86ecd5105c6
+    //     leaf2 signature        = 0x31e174b330d124df75b7fbe184191693a4c9820e5f82bcaa41f6f22bd3f2fb68
+    //     leaf3 committee_bits   = 0x0101010101010101000000000000000000000000000000000000000000000000
+    //     root = sha256( sha256(leaf0‖leaf1) ‖ sha256(leaf2‖leaf3) )
+    //          = 0x26b23c318b00c7e774670fa8c54f3ba256018f798226d717df0d82c2e143914f
+    //   Leaves 1/2/3 are byte-identical to the previous (self-consistent) literal; only leaf 0
+    //   changed once bitlist_tree_hash_root pads the chunk tree to chunk_count(131072)=512. The old
+    //   literal 0x452361d8…2128fe4 was spec-divergent and is intentionally replaced here.
+    const ELECTRA_ATTESTATION_KNOWN_ROOT: [u8; 32] = [
+        0x26, 0xb2, 0x3c, 0x31, 0x8b, 0x00, 0xc7, 0xe7, 0x74, 0x67, 0x0f, 0xa8, 0xc5, 0x4f, 0x3b,
+        0xa2, 0x56, 0x01, 0x8f, 0x79, 0x82, 0x26, 0xd7, 0x17, 0xdf, 0x0d, 0x82, 0xc2, 0xe1, 0x43,
+        0x91, 0x4f,
+    ];
+
+    #[test]
+    fn test_electra_attestation_tree_hash_known_answer() {
+        let att = sample_electra_attestation();
+        assert_eq!(
+            att.tree_hash_root().as_slice(),
+            ELECTRA_ATTESTATION_KNOWN_ROOT.as_slice(),
+            "tree_hash_root must equal the EIP-7549 per-leaf known-answer root"
         );
     }
 

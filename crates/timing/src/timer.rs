@@ -289,7 +289,7 @@ mod tests {
     #[tokio::test]
     async fn test_attestation_delay_captures_sub_second_precision() {
         let clock = create_mock_clock();
-        // Attestation time for slot 0 = genesis + slot_duration/3 = genesis + 4
+        // Attestation time for slot 0 = genesis + due_ms(3333, 12000)/1000 = genesis + 3
         let attestation_time = clock.attestation_time(0);
         // Set current time to 500ms after attestation time
         // Since MockSlotClock uses integer seconds, we test the metric pipeline:

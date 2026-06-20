@@ -12,9 +12,16 @@ categories = ["cryptography::cryptocurrencies"]
 [dependencies]
 crypto = { workspace = true }
 eth-types = { workspace = true }
+slashing = { workspace = true }
 async-trait = { workspace = true }
+hex = { workspace = true }
+parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+crypto = { workspace = true, features = ["test-utils"] }
+slashing = { workspace = true }
+hex = { workspace = true }
 tokio = { workspace = true }
+tracing-test = { workspace = true, features = ["no-env-filter"] }

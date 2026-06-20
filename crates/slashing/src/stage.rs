@@ -65,6 +65,12 @@ use eth_types::{Epoch, Root, Slot};
 
 use std::sync::atomic::Ordering;
 
+/// Fixed audit origin written to the `client_cn` column on INSERT.
+///
+/// Per-CN audit visibility now flows through [`crate::audit_log`] instead.
+/// `pub(crate)` so `db.rs` can use the same constant for `check_and_record_*`.
+pub(crate) const AUDIT_ORIGIN: &str = "local-vc";
+
 /// Result of the EIP-3076 violation check for a staged block.
 ///
 /// `Stage` means the row is new and `commit()` will run the INSERT.
@@ -79,8 +85,10 @@ enum BlockStageOutcome {
 
 /// Parameters for the staged block INSERT — stored in the guard so `commit` can
 /// execute the INSERT without re-running any business logic.
+///
+/// The `client_cn` column in the INSERT is always written as [`AUDIT_ORIGIN`].
+/// Per-CN audit visibility flows through [`crate::audit_log`].
 struct BlockRow {
-    client_cn: String,
     pubkey: String,
     slot: Slot,
     signing_root: Option<String>,
@@ -94,8 +102,10 @@ struct BlockRow {
 // ── AttestationRow ────────────────────────────────────────────────────────────
 
 /// Parameters for the staged attestation INSERT.
+///
+/// The `client_cn` column in the INSERT is always written as [`AUDIT_ORIGIN`].
+/// Per-CN audit visibility flows through [`crate::audit_log`].
 struct AttestationRow {
-    client_cn: String,
     pubkey: String,
     source_epoch: Epoch,
     target_epoch: Epoch,
@@ -157,7 +167,7 @@ impl<'db> StagedBlock<'db> {
                  (client_cn, pubkey, slot, signing_root, genesis_validators_root)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 (
-                    &self.row.client_cn,
+                    AUDIT_ORIGIN,
                     &self.row.pubkey,
                     self.row.slot as i64,
                     &self.row.signing_root,
@@ -231,7 +241,7 @@ impl<'db> StagedAttestation<'db> {
                  (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 (
-                    &self.row.client_cn,
+                    AUDIT_ORIGIN,
                     &self.row.pubkey,
                     self.row.source_epoch as i64,
                     self.row.target_epoch as i64,
@@ -280,8 +290,6 @@ impl SlashingDb {
     /// [`commit`](StagedBlock::commit) or dropped (which rolls back).
     ///
     /// # Arguments
-    /// - `client_cn`: Per-client namespace (e.g. `"local-vc"` for VC-side,
-    ///   or the mTLS peer CN for DVT).
     /// - `pubkey_hex`: Validator public key as a hex string.
     /// - `slot`: Beacon chain slot being proposed.
     /// - `signing_root_hex`: Optional signing root.
@@ -289,11 +297,15 @@ impl SlashingDb {
     ///   `metadata.genesis_validators_root` (M-6 / ISSUE-3.5).  On mismatch,
     ///   returns `Err(SlashingError::GenesisRootMismatch)` before acquiring the lock.
     ///
+    /// The `client_cn` column in the committed row is always written as `"local-vc"`.
+    /// Per-CN audit visibility is emitted via [`crate::audit_log`] by callers
+    /// (e.g. [`crate::PubkeyScopedDb`]) that know the CN.
+    ///
     /// # Errors
     /// Returns `SlashingError::GenesisRootMismatch` if `gvr` does not match the
     /// pinned metadata value.  Returns `SlashingError::SlashableBlock` (specifically
     /// `BlockSlashingViolation::DoubleBlockProposal`) if a different signing
-    /// root has already been committed for `(client_cn, pubkey, slot)`.
+    /// root has already been committed for `(pubkey, slot)`.
     ///
     /// # Trade-off: mutex held across signer call
     ///
@@ -302,7 +314,6 @@ impl SlashingDb {
     /// full analysis.  Callers should bound the signer call's wall-clock budget.
     pub fn stage_block<'db>(
         &'db self,
-        client_cn: &str,
         pubkey_hex: &str,
         slot: Slot,
         signing_root_hex: Option<String>,
@@ -353,8 +364,8 @@ impl SlashingDb {
             let existing: Option<Option<String>> = guard
                 .query_row(
                     "SELECT signing_root FROM blocks \
-                     WHERE client_cn = ?1 AND pubkey = ?2 AND slot = ?3",
-                    (client_cn, &pubkey, slot as i64),
+                     WHERE pubkey = ?1 AND slot = ?2",
+                    (&pubkey, slot as i64),
                     |row| row.get(0),
                 )
                 .optional()?;
@@ -378,11 +389,9 @@ impl SlashingDb {
             }
 
             let min_slot: Option<i64> = guard
-                .query_row(
-                    "SELECT MIN(slot) FROM blocks WHERE client_cn = ?1 AND pubkey = ?2",
-                    (client_cn, &pubkey),
-                    |row| row.get(0),
-                )
+                .query_row("SELECT MIN(slot) FROM blocks WHERE pubkey = ?1", (&pubkey,), |row| {
+                    row.get(0)
+                })
                 .optional()?
                 .flatten();
 
@@ -414,7 +423,6 @@ impl SlashingDb {
         Ok(StagedBlock {
             guard: Some(guard),
             row: BlockRow {
-                client_cn: client_cn.to_owned(),
                 pubkey,
                 slot,
                 signing_root: signing_root_hex,
@@ -430,14 +438,16 @@ impl SlashingDb {
     ///
     /// See [`stage_block`](SlashingDb::stage_block) for the general contract.
     ///
+    /// The `client_cn` column in the committed row is always written as `"local-vc"`.
+    /// Per-CN audit visibility is emitted via [`crate::audit_log`] by callers.
+    ///
     /// # Errors
     /// Returns `SlashingError::GenesisRootMismatch` if `gvr` does not match the
     /// pinned metadata value.  Returns `SlashingError::SlashableAttestation` (double
     /// vote, surrounding, or surrounded) if the new `(source, target)` pair conflicts
-    /// with any existing attestation in `(client_cn, pubkey)` scope.
+    /// with any existing attestation for `pubkey` (pubkey-scoped).
     pub fn stage_attestation<'db>(
         &'db self,
-        client_cn: &str,
         pubkey_hex: &str,
         source_epoch: Epoch,
         target_epoch: Epoch,
@@ -502,10 +512,10 @@ impl SlashingDb {
                 let mut stmt = guard.prepare(
                     "SELECT source_epoch, target_epoch, signing_root \
                      FROM attestations \
-                     WHERE client_cn = ?1 AND pubkey = ?2",
+                     WHERE pubkey = ?1",
                 )?;
                 let rows = stmt
-                    .query_map((client_cn, &pubkey), |row| {
+                    .query_map((&pubkey,), |row| {
                         Ok((
                             row.get::<_, i64>(0)? as Epoch,
                             row.get::<_, i64>(1)? as Epoch,
@@ -615,7 +625,6 @@ impl SlashingDb {
         Ok(StagedAttestation {
             guard: Some(guard),
             row: AttestationRow {
-                client_cn: client_cn.to_owned(),
                 pubkey,
                 source_epoch,
                 target_epoch,

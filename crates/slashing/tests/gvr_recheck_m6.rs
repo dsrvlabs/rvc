@@ -140,7 +140,7 @@ fn test_stage_block_chain_swap_rejected() {
     let db = open_memory_db_with_pinned_gvr(R1);
 
     let err = db
-        .stage_block(CN, PUBKEY, 300, Some("0xstage_root".into()), R2)
+        .stage_block(PUBKEY, 300, Some("0xstage_root".into()), R2)
         .expect_err("chain swap must be rejected at stage time");
 
     match err {
@@ -160,7 +160,7 @@ fn test_stage_block_matching_gvr_succeeds_and_writes_row_column() {
     let db_path = dir.path().join("slashing.db");
     let db = open_file_db_with_pinned_gvr(&db_path, R1);
 
-    db.stage_block(CN, PUBKEY, 400, Some("0xstage_ok".into()), R1)
+    db.stage_block(PUBKEY, 400, Some("0xstage_ok".into()), R1)
         .expect("stage must succeed")
         .commit()
         .expect("commit must succeed");
@@ -187,7 +187,7 @@ fn test_stage_attestation_chain_swap_rejected() {
     let db = open_memory_db_with_pinned_gvr(R1);
 
     let err = db
-        .stage_attestation(CN, PUBKEY, 10, 15, Some("0xatt_stage".into()), R2)
+        .stage_attestation(PUBKEY, 10, 15, Some("0xatt_stage".into()), R2)
         .expect_err("chain swap must be rejected at stage time");
 
     match err {
@@ -207,7 +207,7 @@ fn test_stage_attestation_matching_gvr_succeeds_and_writes_row_column() {
     let db_path = dir.path().join("slashing.db");
     let db = open_file_db_with_pinned_gvr(&db_path, R1);
 
-    db.stage_attestation(CN, PUBKEY, 20, 25, Some("0xatt_ok".into()), R1)
+    db.stage_attestation(PUBKEY, 20, 25, Some("0xatt_ok".into()), R1)
         .expect("stage must succeed")
         .commit()
         .expect("commit must succeed");
@@ -288,8 +288,27 @@ fn test_legacy_row_no_per_row_gvr_does_not_break_violation_checks() {
         .expect("insert legacy row");
     }
 
-    // Step 2: Open via SlashingDb and pin GVR R1 in metadata.
+    // Step 2: Pin GVR R1 in metadata BEFORE opening via SlashingDb.
+    //
+    // The v3 migration (pubkey-scoped indices) needs to back-fill the
+    // `genesis_validators_root` column for NULL rows.  It reads the pinned GVR
+    // from `metadata.genesis_validators_root`.  Without a pinned GVR, the
+    // migration fails closed (fail-closed safety invariant).
+    //
+    // In production, operators pin the GVR at startup before any signing call.
+    // The test simulates this by writing the metadata row directly.
+    {
+        let conn = Connection::open(&db_path).expect("open for gvr insert");
+        let hex = format!("0x{}", hex::encode(R1));
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata (key, value) VALUES ('genesis_validators_root', ?1)",
+            [hex.as_str()],
+        )
+        .expect("insert genesis_validators_root");
+    }
+
     let db = SlashingDb::open(&db_path).expect("SlashingDb::open");
+    // GVR is already in metadata — set_genesis_validators_root is idempotent if matching.
     let hex = format!("0x{}", hex::encode(R1));
     db.set_genesis_validators_root(&hex).expect("set gvr");
 

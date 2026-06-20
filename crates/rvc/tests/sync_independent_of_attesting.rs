@@ -49,7 +49,7 @@ use rvc::orchestrator::{DutyOrchestrator, OrchestratorConfig};
 use signer::SignerService;
 use slashing::SlashingDb;
 use timing::MockSlotClock;
-use validator_store::ValidatorStore;
+use validator_store::{ValidatorConfig, ValidatorStore};
 
 // ── constants ────────────────────────────────────────────────────────────────
 
@@ -344,12 +344,19 @@ async fn build_integration_orchestrator(
     // to reach the BN for it inside run().
     duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
 
+    let pk_bytes = pk.to_bytes();
     let mut map = HashMap::new();
     map.insert(pk_hex, pk);
     let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
 
     let propagator = Arc::new(Propagator::new(Arc::new(NoopSubmitter)));
     let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+    // D-3 fail-closed gate (Issue 2.11): the sync path skips any duty whose
+    // validator is not signing-enabled in the store. The real VC registers loaded
+    // validators at startup (ServiceBuilder::register_loaded_validators); this
+    // harness bypasses that, so register the test validator (enabled) here —
+    // otherwise the H-7 phase under test is suppressed before it can run.
+    validator_store.add_validator(ValidatorConfig::new(pk_bytes));
     let config = create_test_config();
 
     // Set clock to 2/3 of slot 0 so all phase waits resolve immediately.

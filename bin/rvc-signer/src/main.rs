@@ -5,7 +5,7 @@
 
 use rvc_signer_bin::{
     backend, config, insecure_startup, metrics, reload, service, slashing, tls,
-    SignerServiceServer, SignerServiceServerV2,
+    SignerServiceServerV2,
 };
 #[cfg(feature = "dvt")]
 use rvc_signer_bin::{dvt, PeerSignerServiceServerV2};
@@ -420,24 +420,21 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    // Build service implementations (v1 + v2 share the same backend).
-    // V1 is deprecated — kept alive until ISSUE-1.8 deletes the v1 client path.
-    let make_svc = |db: Option<&Arc<::slashing::SlashingDb>>| {
-        if let Some(db) = db {
-            service::SignerServiceImpl::new_v2(
-                Arc::clone(&signing_backend),
-                resolved.backend.clone(),
-                Arc::clone(db),
-            )
+    // Build the v2 service implementation.
+    // SS-1 (Issue 2.2): the v1 raw-root service is no longer registered on the
+    // live listener; `impl SignerService for SignerServiceImpl` is kept compiled
+    // but all v1 methods return `Unimplemented`.
+    let svc_v2 = if let Some(ref db) = slashing_db_opt {
+        service::SignerServiceImpl::new_v2(
+            Arc::clone(&signing_backend),
+            resolved.backend.clone(),
+            Arc::clone(db),
+        )
+        .with_metrics(Arc::clone(&signer_metrics))
+    } else {
+        service::SignerServiceImpl::new(Arc::clone(&signing_backend), resolved.backend.clone())
             .with_metrics(Arc::clone(&signer_metrics))
-        } else {
-            service::SignerServiceImpl::new(Arc::clone(&signing_backend), resolved.backend.clone())
-                .with_metrics(Arc::clone(&signer_metrics))
-        }
     };
-
-    let svc_v1 = make_svc(slashing_db_opt.as_ref());
-    let svc_v2 = make_svc(slashing_db_opt.as_ref());
 
     // Build the PeerSignerService (DVT) now that we have the slashing DB.
     // The allow-list was already loaded and validated above (hoisted from here
@@ -503,11 +500,11 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     // encoding; 1 MiB is a comfortable upper bound per research/05.
     const MAX_DECODE_BYTES: usize = 1 << 20; // 1 MiB
 
-    let router = builder
-        .add_service(SignerServiceServer::new(svc_v1).max_decoding_message_size(MAX_DECODE_BYTES))
-        .add_service(
-            SignerServiceServerV2::new(svc_v2).max_decoding_message_size(MAX_DECODE_BYTES),
-        );
+    // SS-1 (Issue 2.2): only the v2 typed-RPC service is registered.
+    // The v1 raw-root service has been removed from the live listener.
+    let router = builder.add_service(
+        SignerServiceServerV2::new(svc_v2).max_decoding_message_size(MAX_DECODE_BYTES),
+    );
 
     #[cfg(feature = "dvt")]
     let router = if let Some(peer_svc) = peer_signer_service {

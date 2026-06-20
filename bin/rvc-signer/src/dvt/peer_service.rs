@@ -11,12 +11,13 @@
 //! peer with a valid client certificate could claim any share index,
 //! bypassing the cryptographic binding between identity and share position.
 //!
-//! # CN-scoped slashing (A1)
+//! # Pubkey-scoped slashing (Issue 2.5)
 //!
-//! The `ScopedSlashingDb` is keyed by `client_cn = peer_cn` so every DVT
-//! peer has its own watermark namespace.  A second request from peer-A for
-//! `(pubkey-X, slot=42)` with a different root is rejected; the same request
-//! from peer-B succeeds because it is in a separate namespace.
+//! The `PubkeyScopedDb` is scoped by `(pubkey, genesis_validators_root)` only.
+//! A second request from any peer for `(pubkey-X, slot=42)` with a different root
+//! is rejected (cross-CN double-sign protection).  The peer CN is passed to
+//! `PubkeyScopedDb::new` for audit-log emission only — it does not affect the
+//! slashing check.
 //!
 //! # spawn_blocking + block_on
 //!
@@ -33,7 +34,7 @@ use tracing::Span;
 use crate::audit;
 use crate::dvt::allow_list::AllowedPeers;
 use crate::dvt::types::ShareInfo;
-use crate::slashing::ScopedSlashingDb;
+use slashing::PubkeyScopedDb;
 
 // V2 proto imports
 use crate::proto::signer_v2::peer_signer_service_server::PeerSignerService;
@@ -241,7 +242,7 @@ impl PeerSignerService for PeerSignerServiceImpl {
         drop(shares);
 
         // 5. Stage → sign → commit.
-        let scoped = ScopedSlashingDb::new(db_arc, peer_cn.clone(), gvr);
+        let scoped = PubkeyScopedDb::new(db_arc, peer_cn.clone(), gvr);
         let peer_cn_for_log = peer_cn;
 
         // spawn_blocking is required because StagedBlock holds a !Send MutexGuard.
@@ -374,7 +375,7 @@ impl PeerSignerService for PeerSignerServiceImpl {
         drop(shares);
 
         // 5. Stage → sign → commit.
-        let scoped = ScopedSlashingDb::new(db_arc, peer_cn.clone(), gvr);
+        let scoped = PubkeyScopedDb::new(db_arc, peer_cn.clone(), gvr);
         let peer_cn_for_log = peer_cn;
 
         // spawn_blocking is required because StagedAttestation holds a !Send MutexGuard.
@@ -711,8 +712,15 @@ mod tests {
         );
     }
 
+    /// Proves pubkey-scoped enforcement across peers on a SHARED `SlashingDb`.
+    ///
+    /// Post-Issue-2.5, the slashing check is keyed by (pubkey, slot) only — not by CN.
+    /// Two peers signing the same (pubkey, slot=42) with DIFFERENT block bodies (different
+    /// signing roots) MUST produce a `DoubleBlockProposal` rejection for the second peer,
+    /// regardless of which CN it presents.  Two separate DBs would only test DB isolation,
+    /// not the pubkey-scoped enforcement that matters for DVT safety.
     #[tokio::test]
-    async fn test_partial_sign_different_peers_independent() {
+    async fn test_partial_sign_cross_peer_double_block_rejected() {
         let (pk, share_a_info) = make_share(1);
         let share_b_info = ShareInfo {
             index: 2,
@@ -722,23 +730,17 @@ mod tests {
             aggregate_pubkey: share_a_info.aggregate_pubkey,
         };
 
-        // peer-A: CN "unknown", share_index 1 (extracted from no-TLS request)
-        // Actually we need to simulate two different CNs. Since our test doesn't
-        // use TLS, both get CN "unknown". We use two separate DBs and separate
-        // allow-lists to simulate independent scopes.
-        //
-        // peer-A: db_a, allow_list_a maps "unknown" → 1
-        // peer-B: db_b, allow_list_b maps "unknown" → 2
-        // Both sign the same (pubkey, slot=42) — both should succeed (CN scoping).
+        // Both peers share ONE SlashingDb — this is what tests pubkey-scoped enforcement.
+        // Each peer's CN goes to the audit log only (via PubkeyScopedDb); the slashing
+        // check sees (pubkey, slot) regardless of CN.
+        let shared_db = make_db();
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let svc_a =
+            make_service(vec![(pk, share_a_info)], Arc::clone(&al), Some(Arc::clone(&shared_db)));
+        let svc_b =
+            make_service(vec![(pk, share_b_info)], Arc::clone(&al), Some(Arc::clone(&shared_db)));
 
-        let db_a = make_db();
-        let al_a = make_allow_list(vec![("unknown", 1)]);
-        let svc_a = make_service(vec![(pk, share_a_info)], al_a, Some(Arc::clone(&db_a)));
-
-        let db_b = make_db();
-        let al_b = make_allow_list(vec![("unknown", 2)]);
-        let svc_b = make_service(vec![(pk, share_b_info)], al_b, Some(Arc::clone(&db_b)));
-
+        // Peer-A signs slot 42 with block body A (requester_index=1 per allow-list).
         let req_a = Request::new(PartialSignBeaconBlockRequest {
             requester_index: 1,
             pubkey: pk.to_vec(),
@@ -746,19 +748,43 @@ mod tests {
             block_ssz: sample_block_ssz(42),
             fork_id: 4,
         });
-        let req_b = Request::new(PartialSignBeaconBlockRequest {
-            requester_index: 2,
+        svc_a.partial_sign_beacon_block(req_a).await.expect("peer-A first sign must succeed");
+
+        // Peer-B attempts slot 42 with a DIFFERENT block body → different signing root.
+        // Must be rejected as DoubleBlockProposal (pubkey-scoped enforcement).
+        let mut different_body = sample_block_ssz(42);
+        for b in &mut different_body[16..48] {
+            *b ^= 0xFF;
+        }
+        let req_b_conflict = Request::new(PartialSignBeaconBlockRequest {
+            requester_index: 1,
+            pubkey: pk.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            block_ssz: different_body,
+            fork_id: 4,
+        });
+        let err = svc_b
+            .partial_sign_beacon_block(req_b_conflict)
+            .await
+            .expect_err("peer-B with conflicting root must be rejected");
+        assert!(
+            err.code() == tonic::Code::FailedPrecondition || err.code() == tonic::Code::Aborted,
+            "expected slashing rejection (DoubleBlockProposal), got: {:?}",
+            err.code()
+        );
+
+        // Peer-B with the SAME block body/root as peer-A → idempotent re-sign, must succeed.
+        let req_b_resign = Request::new(PartialSignBeaconBlockRequest {
+            requester_index: 1,
             pubkey: pk.to_vec(),
             fork_info: Some(sample_fork_info()),
             block_ssz: sample_block_ssz(42),
             fork_id: 4,
         });
-
-        let resp_a = svc_a.partial_sign_beacon_block(req_a).await.expect("peer-A sign succeeded");
-        assert_eq!(resp_a.into_inner().share_index, 1);
-
-        let resp_b = svc_b.partial_sign_beacon_block(req_b).await.expect("peer-B sign succeeded");
-        assert_eq!(resp_b.into_inner().share_index, 2);
+        svc_b
+            .partial_sign_beacon_block(req_b_resign)
+            .await
+            .expect("peer-B with same root must succeed (idempotent re-sign)");
     }
 
     // ── partial_sign_attestation_data tests ───────────────────────────────────

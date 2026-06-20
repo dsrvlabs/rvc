@@ -1,6 +1,7 @@
 pub mod basic;
 #[cfg(feature = "dvt")]
 pub mod dvt;
+pub mod signer_adapter;
 
 use async_trait::async_trait;
 use thiserror::Error;

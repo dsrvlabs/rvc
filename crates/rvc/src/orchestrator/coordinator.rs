@@ -20,7 +20,7 @@ use metrics::definitions::{
 };
 use propagator::{AttestationSubmitter, Propagator};
 use signer::SignerService;
-use timing::{SlotClock, SLOTS_PER_EPOCH};
+use timing::{due_ms, SlotClock, AGGREGATE_DUE_BPS, ATTESTATION_DUE_BPS, SLOTS_PER_EPOCH};
 
 use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
@@ -121,6 +121,9 @@ where
     /// `attesting_enabled`. Defaults to `true`; can be toggled at runtime via
     /// [`set_sync_enabled`]. Internal-only — not wired to any Keymanager API (H-7).
     sync_enabled: Arc<AtomicBool>,
+    /// D-3: per-validator doppelganger gate for block proposals.
+    /// Shared reference to the ValidatorStore for `is_signing_enabled` checks.
+    validator_store: Arc<validator_store::ValidatorStore>,
 }
 
 impl<C, S, B> DutyOrchestrator<C, S, B>
@@ -229,6 +232,7 @@ where
             duty_tracker.clone(),
             pubkey_map.clone(),
             config.clone(),
+            validator_store.clone(),
         );
 
         let sync_committee_service = SyncCommitteeService::new(
@@ -237,6 +241,7 @@ where
             duty_tracker.clone(),
             pubkey_map.clone(),
             config.clone(),
+            validator_store.clone(),
         );
 
         let attestation_service = AttestationService::new(
@@ -255,7 +260,7 @@ where
             signer,
             beacon.clone(),
             duty_tracker.clone(),
-            validator_store,
+            validator_store.clone(),
             pubkey_map.clone(),
             config.clone(),
         );
@@ -279,6 +284,7 @@ where
             shutdown_rx,
             attesting_enabled,
             sync_enabled,
+            validator_store,
         };
 
         let handle = OrchestratorHandle { shutdown_tx };
@@ -408,18 +414,20 @@ where
                     return Ok(());
                 }
 
-                // Check for missed attestation deadline
+                // Check for missed attestation deadline.
+                // Basis-points formula in milliseconds (report §4.3), consistent
+                // with `time_until_attestation`: mainnet 1/3 = 3999 ms.
                 {
-                    let slot_duration = self.clock.slot_duration();
-                    let expected_att_time =
-                        self.clock.slot_start_time(current_slot) + slot_duration.as_secs() / 3;
-                    let now = self.clock.current_time_secs();
-                    if now > expected_att_time {
-                        let delay_ms = (now - expected_att_time) * 1000;
+                    let slot_duration_ms = self.clock.slot_duration().as_millis() as u64;
+                    let att_window_ms = due_ms(ATTESTATION_DUE_BPS, slot_duration_ms);
+                    let slot_start_ms = self.clock.slot_start_time(current_slot) * 1000;
+                    let expected_att_ms = slot_start_ms + att_window_ms;
+                    let now_ms = self.clock.current_time_secs() * 1000;
+                    if now_ms > expected_att_ms {
+                        let delay_ms = now_ms - expected_att_ms;
                         // Only warn if the delay exceeds the expected attestation window
-                        // (i.e., we're past 2/3 of the slot)
-                        let att_window = slot_duration.as_secs() / 3;
-                        if delay_ms > att_window * 1000 {
+                        // (i.e., we're past 2/3 of the slot).
+                        if delay_ms > att_window_ms {
                             warn!(slot = current_slot, delay_ms, "Missed attestation deadline");
                         }
                     }
@@ -468,13 +476,17 @@ where
             {
                 let agg_phase_span = info_span!(parent: &slot_span, "rvc.slot.phase.aggregation");
 
-                let slot_duration = self.clock.slot_duration();
-                let two_thirds_offset = slot_duration.as_secs() * 2 / 3;
-                let two_thirds_time = self.clock.slot_start_time(current_slot) + two_thirds_offset;
-                let now = self.clock.current_time_secs();
+                // Basis-points formula in milliseconds (report §4.3): mainnet
+                // 2/3 = 6667 * 12000 / 10000 = 8000 ms (unchanged from the legacy
+                // `as_secs() * 2 / 3`), but exact for non-12 s / Gloas slots.
+                let slot_duration_ms = self.clock.slot_duration().as_millis() as u64;
+                let two_thirds_offset_ms = due_ms(AGGREGATE_DUE_BPS, slot_duration_ms);
+                let slot_start_ms = self.clock.slot_start_time(current_slot) * 1000;
+                let two_thirds_ms = slot_start_ms + two_thirds_offset_ms;
+                let now_ms = self.clock.current_time_secs() * 1000;
 
-                if now < two_thirds_time {
-                    let wait_duration = Duration::from_secs(two_thirds_time - now);
+                if now_ms < two_thirds_ms {
+                    let wait_duration = Duration::from_millis(two_thirds_ms - now_ms);
                     {
                         let _guard = agg_phase_span.enter();
                         debug!(
@@ -599,6 +611,22 @@ where
             Some(pk) => pk,
             None => return,
         };
+
+        // D-3: per-validator doppelganger gate (mirrors attestation.rs M-12 check).
+        // Skip block proposal for validators still inside the post-import
+        // doppelganger window (`enabled = false`).
+        {
+            let pk_bytes = pubkey.to_bytes();
+            if !self.validator_store.is_signing_enabled(&pk_bytes) {
+                warn!(
+                    slot,
+                    pubkey = %crypto::logging::TruncatedPubkey::new(&proposer_duty.pubkey),
+                    "Skipping block proposal: validator is inside the \
+                     post-import doppelganger window (D-3)"
+                );
+                return;
+            }
+        }
 
         // H-4: parse validator_index for proposer_index validation (returned as String by the BN type)
         let expected_proposer_index: u64 = match proposer_duty.validator_index.parse() {
@@ -1651,6 +1679,11 @@ mod tests {
         pubkey_map_inner.insert(pubkey_hex.clone(), pubkey.clone());
         let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
+        // D-3 fail-closed: register the loaded validator so the per-validator
+        // signing gate permits its duties (mirrors startup registration).
+        let validator_store = create_mock_validator_store();
+        validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
+
         let (orchestrator, handle) = DutyOrchestrator::new(
             clock,
             duty_tracker,
@@ -1659,7 +1692,7 @@ mod tests {
             beacon,
             create_mock_block_beacon(),
             None,
-            create_mock_validator_store(),
+            validator_store,
             config,
             pubkey_map,
         );
@@ -2805,9 +2838,15 @@ mod tests {
         let propagator = Arc::new(Propagator::new(capturing_submitter.clone()));
 
         let config = create_test_config();
+        let pubkey_bytes = pubkey.to_bytes();
         let mut pubkey_map_inner = HashMap::new();
         pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        // D-3 fail-closed: register the loaded validator so the per-validator
+        // signing gate permits its duties (mirrors startup registration).
+        let validator_store = create_mock_validator_store();
+        validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey_bytes));
 
         let (orchestrator, handle) = DutyOrchestrator::new(
             clock,
@@ -2817,7 +2856,7 @@ mod tests {
             beacon,
             create_mock_block_beacon(),
             None,
-            create_mock_validator_store(),
+            validator_store,
             config,
             pubkey_map,
         );
@@ -4557,9 +4596,15 @@ mod tests {
         let propagator = Arc::new(Propagator::new(capturing_submitter.clone()));
 
         let config = create_test_config();
+        let pubkey_bytes = pubkey.to_bytes();
         let mut pubkey_map_inner = HashMap::new();
         pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        // D-3 fail-closed: register the loaded validator so the per-validator
+        // signing gate permits its duties (mirrors startup registration).
+        let validator_store = create_mock_validator_store();
+        validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey_bytes));
 
         let (orchestrator, handle) = DutyOrchestrator::new(
             clock.clone(),
@@ -4569,7 +4614,7 @@ mod tests {
             beacon,
             create_mock_block_beacon(),
             None,
-            create_mock_validator_store(),
+            validator_store,
             config,
             pubkey_map,
         );
@@ -4878,6 +4923,9 @@ mod tests {
 
         // ExecutionOnly → builder_boost_factor = 0 → not a builder attempt.
         let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        // D-3 fail-closed: register the loaded validator so the per-validator
+        // signing gate permits this proposal (mirrors startup registration).
+        validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
         validator_store
             .set_global_block_selection_mode(validator_store::BlockSelectionMode::ExecutionOnly);
 
@@ -4956,6 +5004,9 @@ mod tests {
 
         // BuilderAlways → builder_boost_factor = u64::MAX → builder attempt.
         let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        // D-3 fail-closed: register the loaded validator so the per-validator
+        // signing gate permits this proposal (mirrors startup registration).
+        validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
         validator_store
             .set_global_block_selection_mode(validator_store::BlockSelectionMode::BuilderAlways);
 
@@ -5036,6 +5087,10 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        // D-3 fail-closed: register the loaded validator so the signing gate is
+        // passed and the RANDAO signing failure (empty KeyManager) is the path
+        // under test (mirrors startup registration).
+        validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
 
         let config = create_test_config();
         let mut pubkey_map_inner = HashMap::new();
@@ -5095,6 +5150,7 @@ mod tests {
         // Pre-populate sync committee duties for period 0 (epoch 0).
         duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
 
+        let pk_bytes = pk.to_bytes();
         let mut map = HashMap::new();
         map.insert(pk_hex, pk);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
@@ -5103,6 +5159,11 @@ mod tests {
         let propagator = Arc::new(Propagator::new(submitter));
 
         let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        // D-3 fail-closed: register the loaded validator so the per-validator
+        // signing gate permits sync duties (mirrors startup registration). The
+        // sync_enabled=false test short-circuits before this gate, so it stays
+        // correct regardless.
+        validator_store.add_validator(validator_store::ValidatorConfig::new(pk_bytes));
         let config = create_test_config();
         let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
         clock.set_slot(0);
@@ -5359,10 +5420,12 @@ mod tests {
         let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
         // --- Critical: add the DUTY pubkey as DISABLED (inside doppelganger window).
-        // The duty pubkey from the mock beacon is 0xdddd... (48 bytes).
-        // The validator store must track THIS pubkey as disabled so the filter
-        // has something to match against.
-        let duty_pk_bytes: [u8; 48] = [0xddu8; 48];
+        // D-3 (FUP-6): the gate now resolves the duty pubkey via `find_pubkey`
+        // and gates on the RESOLVED typed pubkey's infallible `to_bytes()` — it
+        // no longer re-decodes the raw `0xdddd...` duty string.  The store must
+        // therefore track the SAME bytes the `pubkey_map` resolves the duty to
+        // (`pubkey.to_bytes()`), not the literal `0xdddd...` byte pattern.
+        let duty_pk_bytes: [u8; 48] = pubkey.to_bytes();
         let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 30_000_000));
         {
             let mut config = validator_store::ValidatorConfig::new(duty_pk_bytes);
@@ -5442,5 +5505,174 @@ mod tests {
             submitted_roots.lock().unwrap().is_empty(),
             "H-7: sync contributions must NOT run when sync_enabled = false"
         );
+    }
+
+    // ── D-3: block proposal gate ─────────────────────────────────────────────
+
+    /// D-3: a validator whose `is_signing_enabled = false` must NOT propose a block.
+    ///
+    /// The test uses wiremock to serve a proposer duty, then checks that
+    /// `publish_block` is never called when the validator is disabled.
+    ///
+    /// RED: `maybe_propose_block` does not check `is_signing_enabled` →
+    ///      the block_service is called (RANDAO sign, produce, publish).
+    ///      The `BadProposerBlockBeacon` sets `publish_called = true` via
+    ///      `produce_block_v3` returning a block with `proposer_index="1"`.
+    ///      Actually `BadProposerBlockBeacon` calls `produce_block_v3` which
+    ///      would attempt RANDAO sign first — the D-3 gate must fire before any
+    ///      signer call, so the RANDAO sign never happens if the gate is correct.
+    ///
+    /// GREEN: D-3 gate in `maybe_propose_block` returns early before
+    ///        `block_service.propose_block`, so `publish_called` stays `false`.
+    #[tokio::test]
+    async fn test_block_proposal_skipped_when_validator_disabled() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        let slot: Slot = 10;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let validator_index = 1u64;
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+        let pk_bytes: [u8; 48] = pubkey.to_bytes();
+
+        // Serve proposer duties from wiremock.
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/validator/duties/proposer/{}", epoch)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": validator_index.to_string(),
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+        duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+        // BadProposerBlockBeacon is already defined above; it returns a block
+        // with a non-matching proposer_index which would also cause a drop.
+        // Use a matching proposer_index (validator_index) so the only gate is D-3.
+        let publish_called = Arc::new(AtomicBool::new(false));
+        let block_beacon = Arc::new(BadProposerBlockBeacon {
+            slot,
+            bad_proposer_index: validator_index, // matching index → no H-4 drop
+            publish_called: publish_called.clone(),
+        });
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(SignerService::new(composite, slashing_db));
+
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        // Validator store with this validator DISABLED (doppelganger window).
+        let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        {
+            let mut config = validator_store::ValidatorConfig::new(pk_bytes);
+            config.enabled = false;
+            validator_store.add_validator(config);
+        }
+
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey_hex, pubkey);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(slot);
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            block_beacon,
+            None,
+            validator_store,
+            create_test_config(),
+            pubkey_map,
+        );
+
+        let ctx = SlotContext { slot, epoch, head_root: None };
+        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+
+        // D-3: the block must NOT be proposed when is_signing_enabled=false.
+        // publish_called stays false because the gate returns early before
+        // block_service.propose_block (which would call produce_block_v3).
+        assert!(
+            !publish_called.load(Ordering::SeqCst),
+            "D-3: block must NOT be proposed when is_signing_enabled=false"
+        );
+    }
+
+    // Pin the aggregation 2/3 wait (coordinator.rs Phase 3) to the spec BPS value.
+    // 6667 * 12000 / 10000 = 8000 ms on mainnet (unchanged from the legacy
+    // `as_secs() * 2 / 3`), now exact for non-12 s / Gloas slots (report §4.3).
+    #[test]
+    fn test_aggregation_waits_until_two_thirds_8000ms_mainnet() {
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32);
+        let slot_duration_ms = clock.slot_duration().as_millis() as u64;
+
+        // Same call the Phase 3 wait makes in production (`due_ms(AGGREGATE_DUE_BPS, ..)`);
+        // pinning the literal 8000 here fails if either the constant or the formula drifts.
+        let two_thirds_offset_ms = due_ms(AGGREGATE_DUE_BPS, slot_duration_ms);
+        assert_eq!(two_thirds_offset_ms, 8000, "mainnet 2/3 offset must be 8000 ms");
+
+        // At slot start, the wait is the full 8000 ms offset.
+        clock.set_current_time(TEST_GENESIS_TIME);
+        let slot_start_ms = clock.slot_start_time(0) * 1000;
+        let two_thirds_ms = slot_start_ms + two_thirds_offset_ms;
+        let now_ms = clock.current_time_secs() * 1000;
+        assert!(now_ms < two_thirds_ms);
+        assert_eq!(two_thirds_ms - now_ms, 8000, "wait at slot start must be 8000 ms");
+
+        // Past 2/3, no wait remains.
+        clock.set_current_time(TEST_GENESIS_TIME + 9);
+        let now_ms = clock.current_time_secs() * 1000;
+        assert!(now_ms >= two_thirds_ms, "9 s into a 12 s slot is past the 8000 ms mark");
+    }
+
+    // Pin the missed-deadline 1/3 check (coordinator.rs:421/:427 site) to the spec
+    // BPS value: 3333 * 12000 / 10000 = 3999 ms on mainnet, and confirm the warn
+    // window opens only once we are a further 3999 ms past the deadline (~2/3 slot).
+    #[test]
+    fn test_missed_deadline_uses_one_third_bps_at_421_427() {
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32);
+        let slot_duration_ms = clock.slot_duration().as_millis() as u64;
+
+        // Same call the missed-deadline check makes in production
+        // (`due_ms(ATTESTATION_DUE_BPS, ..)`); the literal 3999 fails on drift.
+        let att_window_ms = due_ms(ATTESTATION_DUE_BPS, slot_duration_ms);
+        assert_eq!(att_window_ms, 3999, "mainnet 1/3 attestation window must be 3999 ms");
+
+        let slot_start_ms = clock.slot_start_time(0) * 1000;
+        let expected_att_ms = slot_start_ms + att_window_ms;
+
+        // `would_warn` mirrors the production condition: now past the deadline AND
+        // the overrun exceeds the attestation window.
+        let would_warn =
+            |now_ms: u64| now_ms > expected_att_ms && now_ms - expected_att_ms > att_window_ms;
+
+        // Just past 1/3 (4 s): missed but inside the window — no warn yet.
+        assert!(!would_warn((TEST_GENESIS_TIME + 4) * 1000), "4 s in: missed but within window");
+        // At 2/3 (8 s): exactly one window past 3999 ms (overrun 4001 > 3999) — warn.
+        assert!(would_warn((TEST_GENESIS_TIME + 8) * 1000), "8 s in: past the window, warn fires");
+        // Before the deadline (3 s): not missed.
+        assert!(!would_warn((TEST_GENESIS_TIME + 3) * 1000), "3 s in: before the deadline");
     }
 }
