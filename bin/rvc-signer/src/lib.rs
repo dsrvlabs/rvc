@@ -11,6 +11,7 @@ pub mod commands;
 pub mod config;
 #[cfg(feature = "dvt")]
 pub mod dvt;
+pub mod http_api;
 pub mod insecure_startup;
 #[cfg(test)]
 mod integration_polish;

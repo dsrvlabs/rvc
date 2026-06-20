@@ -35,6 +35,36 @@ tokio.workspace = true
 tokio-util.workspace = true
 toml.workspace = true
 tonic = { workspace = true, features = ["tls"] }
+# rustls reached via the `tokio_rustls::rustls` re-export so the HTTP transport
+# binds the same rustls as the gRPC/tonic stack (single CertificateDer type,
+# enforced by 1.5's guard test). Pinned to the versions already in Cargo.lock.
+#
+# default-features = false is REQUIRED. The rustls `default` set enables the
+# `aws_lc_rs` provider feature (and `prefer-post-quantum`, which also pulls it).
+# Cargo unifies features across the workspace, so enabling `aws_lc_rs` here would
+# turn on BOTH providers on the single shared rustls crate, making automatic
+# provider detection ambiguous; `ServerConfig::builder()` would then panic in
+# every gRPC mTLS path that builds without an installed default (verified while
+# implementing: it broke rvc-grpc-signer integration + rvc-signer-bin dvt tests
+# on a --workspace run). We instead match the workspace's existing backend
+# (`ring`, pulled by rcgen/quinn/reqwest) and install the ring provider as the
+# startup default (see `http_api::tls`). This keeps the shared rustls feature set
+# identical to `develop` — zero graph perturbation, zero net-new crates (R1/R4).
+# NOTE: deviates from ADR-006's named `aws_lc_rs` provider; see http_api/tls.rs.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "logging",
+    "std",
+    "tls12",
+] }
+# tokio-rustls's default features ALSO enable `aws_lc_rs` (→ rustls/aws_lc_rs),
+# so it gets the same default-features = false + `ring` treatment for the reason
+# documented above; otherwise it re-introduces the second provider via unification.
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "logging",
+    "tls12",
+] }
 prometheus.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

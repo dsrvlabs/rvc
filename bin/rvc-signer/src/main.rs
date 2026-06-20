@@ -4,7 +4,7 @@
 //! This file only handles CLI parsing and wires up the library.
 
 use rvc_signer_bin::{
-    backend, config, insecure_startup, metrics, reload, service, slashing, tls,
+    backend, config, http_api, insecure_startup, metrics, reload, service, slashing, tls,
     SignerServiceServerV2,
 };
 #[cfg(feature = "dvt")]
@@ -226,6 +226,14 @@ async fn main() {
 }
 
 async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Install the rustls crypto provider before any TLS work. Idempotent and
+    // safe even with HTTP disabled. Forward-defense (ADR-006, R1): pins a single
+    // explicit default so the Phase-3 `ServerConfig::builder()` path stays
+    // deterministic and never hits rustls's automatic resolution, which panics
+    // if the feature graph ever compiles in more than one provider. Not
+    // load-bearing in today's ring-only build; see http_api::tls for details.
+    http_api::tls::install_crypto_provider();
+
     let resolved = resolve_config(&args)?;
 
     info!(
