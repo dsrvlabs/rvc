@@ -20,7 +20,7 @@ use metrics::definitions::{
 };
 use propagator::{AttestationSubmitter, Propagator};
 use signer::SignerService;
-use timing::{SlotClock, SLOTS_PER_EPOCH};
+use timing::{SlotClock, AGGREGATE_DUE_BPS, ATTESTATION_DUE_BPS, BASIS_POINTS, SLOTS_PER_EPOCH};
 
 use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
@@ -414,18 +414,20 @@ where
                     return Ok(());
                 }
 
-                // Check for missed attestation deadline
+                // Check for missed attestation deadline.
+                // Basis-points formula in milliseconds (report §4.3), consistent
+                // with `time_until_attestation`: mainnet 1/3 = 3999 ms.
                 {
-                    let slot_duration = self.clock.slot_duration();
-                    let expected_att_time =
-                        self.clock.slot_start_time(current_slot) + slot_duration.as_secs() / 3;
-                    let now = self.clock.current_time_secs();
-                    if now > expected_att_time {
-                        let delay_ms = (now - expected_att_time) * 1000;
+                    let slot_duration_ms = self.clock.slot_duration().as_millis() as u64;
+                    let att_window_ms = ATTESTATION_DUE_BPS * slot_duration_ms / BASIS_POINTS;
+                    let slot_start_ms = self.clock.slot_start_time(current_slot) * 1000;
+                    let expected_att_ms = slot_start_ms + att_window_ms;
+                    let now_ms = self.clock.current_time_secs() * 1000;
+                    if now_ms > expected_att_ms {
+                        let delay_ms = now_ms - expected_att_ms;
                         // Only warn if the delay exceeds the expected attestation window
-                        // (i.e., we're past 2/3 of the slot)
-                        let att_window = slot_duration.as_secs() / 3;
-                        if delay_ms > att_window * 1000 {
+                        // (i.e., we're past 2/3 of the slot).
+                        if delay_ms > att_window_ms {
                             warn!(slot = current_slot, delay_ms, "Missed attestation deadline");
                         }
                     }
@@ -474,13 +476,17 @@ where
             {
                 let agg_phase_span = info_span!(parent: &slot_span, "rvc.slot.phase.aggregation");
 
-                let slot_duration = self.clock.slot_duration();
-                let two_thirds_offset = slot_duration.as_secs() * 2 / 3;
-                let two_thirds_time = self.clock.slot_start_time(current_slot) + two_thirds_offset;
-                let now = self.clock.current_time_secs();
+                // Basis-points formula in milliseconds (report §4.3): mainnet
+                // 2/3 = 6667 * 12000 / 10000 = 8000 ms (unchanged from the legacy
+                // `as_secs() * 2 / 3`), but exact for non-12 s / Gloas slots.
+                let slot_duration_ms = self.clock.slot_duration().as_millis() as u64;
+                let two_thirds_offset_ms = AGGREGATE_DUE_BPS * slot_duration_ms / BASIS_POINTS;
+                let slot_start_ms = self.clock.slot_start_time(current_slot) * 1000;
+                let two_thirds_ms = slot_start_ms + two_thirds_offset_ms;
+                let now_ms = self.clock.current_time_secs() * 1000;
 
-                if now < two_thirds_time {
-                    let wait_duration = Duration::from_secs(two_thirds_time - now);
+                if now_ms < two_thirds_ms {
+                    let wait_duration = Duration::from_millis(two_thirds_ms - now_ms);
                     {
                         let _guard = agg_phase_span.enter();
                         debug!(
@@ -5612,5 +5618,57 @@ mod tests {
             !publish_called.load(Ordering::SeqCst),
             "D-3: block must NOT be proposed when is_signing_enabled=false"
         );
+    }
+
+    // Pin the aggregation 2/3 wait (coordinator.rs Phase 3) to the spec BPS value.
+    // 6667 * 12000 / 10000 = 8000 ms on mainnet (unchanged from the legacy
+    // `as_secs() * 2 / 3`), now exact for non-12 s / Gloas slots (report §4.3).
+    #[test]
+    fn test_aggregation_waits_until_two_thirds_8000ms_mainnet() {
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32);
+        let slot_duration_ms = clock.slot_duration().as_millis() as u64;
+
+        let two_thirds_offset_ms = AGGREGATE_DUE_BPS * slot_duration_ms / BASIS_POINTS;
+        assert_eq!(two_thirds_offset_ms, 8000, "mainnet 2/3 offset must be 8000 ms");
+
+        // At slot start, the wait is the full 8000 ms offset.
+        clock.set_current_time(TEST_GENESIS_TIME);
+        let slot_start_ms = clock.slot_start_time(0) * 1000;
+        let two_thirds_ms = slot_start_ms + two_thirds_offset_ms;
+        let now_ms = clock.current_time_secs() * 1000;
+        assert!(now_ms < two_thirds_ms);
+        assert_eq!(two_thirds_ms - now_ms, 8000, "wait at slot start must be 8000 ms");
+
+        // Past 2/3, no wait remains.
+        clock.set_current_time(TEST_GENESIS_TIME + 9);
+        let now_ms = clock.current_time_secs() * 1000;
+        assert!(now_ms >= two_thirds_ms, "9 s into a 12 s slot is past the 8000 ms mark");
+    }
+
+    // Pin the missed-deadline 1/3 check (coordinator.rs:421/:427 site) to the spec
+    // BPS value: 3333 * 12000 / 10000 = 3999 ms on mainnet, and confirm the warn
+    // window opens only once we are a further 3999 ms past the deadline (~2/3 slot).
+    #[test]
+    fn test_missed_deadline_uses_one_third_bps_at_421_427() {
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32);
+        let slot_duration_ms = clock.slot_duration().as_millis() as u64;
+
+        let att_window_ms = ATTESTATION_DUE_BPS * slot_duration_ms / BASIS_POINTS;
+        assert_eq!(att_window_ms, 3999, "mainnet 1/3 attestation window must be 3999 ms");
+
+        let slot_start_ms = clock.slot_start_time(0) * 1000;
+        let expected_att_ms = slot_start_ms + att_window_ms;
+
+        // `would_warn` mirrors the production condition: now past the deadline AND
+        // the overrun exceeds the attestation window.
+        let would_warn =
+            |now_ms: u64| now_ms > expected_att_ms && now_ms - expected_att_ms > att_window_ms;
+
+        // Just past 1/3 (4 s): missed but inside the window — no warn yet.
+        assert!(!would_warn((TEST_GENESIS_TIME + 4) * 1000), "4 s in: missed but within window");
+        // At 2/3 (8 s): exactly one window past 3999 ms (overrun 4001 > 3999) — warn.
+        assert!(would_warn((TEST_GENESIS_TIME + 8) * 1000), "8 s in: past the window, warn fires");
+        // Before the deadline (3 s): not missed.
+        assert!(!would_warn((TEST_GENESIS_TIME + 3) * 1000), "3 s in: before the deadline");
     }
 }
