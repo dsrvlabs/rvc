@@ -6,7 +6,7 @@
 //! exact spec mark even for non-12 s slot durations. On mainnet this is
 //! `3333 * 12000 / 10000 = 3999 ms` (not 4000), per report §4.3.
 
-use rvc_timing::{MockSlotClock, SlotClock};
+use rvc_timing::{due_ms, MockSlotClock, SlotClock};
 use std::time::Duration;
 
 const TEST_GENESIS: u64 = 1_606_824_023;
@@ -73,11 +73,7 @@ fn test_attestation_default_bps_5s_slot_is_1666ms() {
     let clock = MockSlotClock::new(TEST_GENESIS, Duration::from_secs(5), 32);
     clock.set_current_time(TEST_GENESIS); // at exact slot start
     let time_until = clock.time_until_attestation(0).unwrap();
-    assert_eq!(
-        time_until,
-        Duration::from_millis(1666),
-        "5 s slot: 3333 * 5000 / 10000 = 1666 ms"
-    );
+    assert_eq!(time_until, Duration::from_millis(1666), "5 s slot: 3333 * 5000 / 10000 = 1666 ms");
 }
 
 // -- Verify `attestation_time` (slot_start + offset in whole seconds) is consistent.
@@ -98,4 +94,18 @@ fn test_attestation_time_past_returns_zero() {
     clock.set_current_time(TEST_GENESIS + 5);
     let time_until = clock.time_until_attestation(0).unwrap();
     assert_eq!(time_until, Duration::ZERO);
+}
+
+// -- Whole-slot edge: bps == BASIS_POINTS yields the full slot duration.
+// 10000 * 12000 / 10000 = 12000 ms.
+#[test]
+fn test_due_ms_whole_slot_edge() {
+    assert_eq!(due_ms(10000, 12000), 12000);
+}
+
+// -- Tiny-bps floor: proves multiply-before-divide.
+// 1 * 12000 / 10000 = 1 ms (whereas 1 / 10000 * 12000 would floor to 0).
+#[test]
+fn test_due_ms_tiny_bps_floor() {
+    assert_eq!(due_ms(1, 12000), 1);
 }
