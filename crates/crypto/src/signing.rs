@@ -177,6 +177,66 @@ mod tests {
         assert_ne!(root1, root2);
     }
 
+    // KAT (report §5 bullet 3): first absolute-byte vector for `compute_fork_data_root`.
+    // Golden value derived independently with `remerkleable` (ForkData = Container{
+    // current_version: Bytes4, genesis_validators_root: Bytes32 }) — NOT recomputed via
+    // rvc's compute_* in this test. Cross-checked: ForkData(00000000, zeros).htr ==
+    // sha256(zeros32||zeros32) == f5a5fd42… (the canonical consensus-spec zero-hash).
+    //   inputs: current_version = 0x01000000, genesis_validators_root = 0x00…00 (32 zeros)
+    //   fork_data_root = 16abab341fb7f370e27e4dadcf81766dd0dfd0ae64469477bb2cf6614938b2af
+    #[test]
+    fn test_compute_fork_data_root_known_answer_bytes() {
+        const EXPECTED: Root = [
+            0x16, 0xab, 0xab, 0x34, 0x1f, 0xb7, 0xf3, 0x70, 0xe2, 0x7e, 0x4d, 0xad, 0xcf, 0x81,
+            0x76, 0x6d, 0xd0, 0xdf, 0xd0, 0xae, 0x64, 0x46, 0x94, 0x77, 0xbb, 0x2c, 0xf6, 0x61,
+            0x49, 0x38, 0xb2, 0xaf,
+        ];
+        let root = compute_fork_data_root([0x01, 0x00, 0x00, 0x00], [0x00; 32]);
+        assert_eq!(root, EXPECTED);
+    }
+
+    // KAT (report §5 bullet 3): first absolute-byte vector for `compute_domain`. Pins the
+    // `domain[..4] = domain_type` / `domain[4..32] = fork_data_root[..28]` layout against
+    // an externally-derived literal. Golden value from `remerkleable` (see above).
+    //   inputs: domain_type = DOMAIN_BEACON_ATTESTER (0x01000000),
+    //           fork_version = 0x01000000, genesis_validators_root = 0x00…00 (32 zeros)
+    //   domain = 0100000016abab341fb7f370e27e4dadcf81766dd0dfd0ae64469477bb2cf661
+    #[test]
+    fn test_compute_domain_known_answer_bytes() {
+        const EXPECTED: Domain = [
+            0x01, 0x00, 0x00, 0x00, 0x16, 0xab, 0xab, 0x34, 0x1f, 0xb7, 0xf3, 0x70, 0xe2, 0x7e,
+            0x4d, 0xad, 0xcf, 0x81, 0x76, 0x6d, 0xd0, 0xdf, 0xd0, 0xae, 0x64, 0x46, 0x94, 0x77,
+            0xbb, 0x2c, 0xf6, 0x61,
+        ];
+        let domain = compute_domain(DOMAIN_BEACON_ATTESTER, [0x01, 0x00, 0x00, 0x00], [0x00; 32]);
+        assert_eq!(domain, EXPECTED);
+    }
+
+    // KAT (report §5 bullet 3): first absolute-byte vector for `compute_signing_root`. Pins
+    // the SigningData = Container{ object_root: Bytes32, domain: Bytes32 } field order and
+    // hashing against an externally-derived literal. Golden value from `remerkleable`.
+    // The object is a Root ([u8;32]); its hash_tree_root is the identity, so object_root is
+    // the 32 input bytes themselves.
+    //   inputs: object = 0x11…11 (32 bytes),
+    //           domain = 0100000016abab341fb7f370e27e4dadcf81766dd0dfd0ae64469477bb2cf661
+    //   signing_root = 18029e3e0be198604599daad88e7b3bc5c1aae9084c041669abd64e1a7b32de5
+    #[test]
+    fn test_compute_signing_root_known_answer_bytes() {
+        const DOMAIN: Domain = [
+            0x01, 0x00, 0x00, 0x00, 0x16, 0xab, 0xab, 0x34, 0x1f, 0xb7, 0xf3, 0x70, 0xe2, 0x7e,
+            0x4d, 0xad, 0xcf, 0x81, 0x76, 0x6d, 0xd0, 0xdf, 0xd0, 0xae, 0x64, 0x46, 0x94, 0x77,
+            0xbb, 0x2c, 0xf6, 0x61,
+        ];
+        const EXPECTED: Root = [
+            0x18, 0x02, 0x9e, 0x3e, 0x0b, 0xe1, 0x98, 0x60, 0x45, 0x99, 0xda, 0xad, 0x88, 0xe7,
+            0xb3, 0xbc, 0x5c, 0x1a, 0xae, 0x90, 0x84, 0xc0, 0x41, 0x66, 0x9a, 0xbd, 0x64, 0xe1,
+            0xa7, 0xb3, 0x2d, 0xe5,
+        ];
+        let object: Root = [0x11; 32];
+        let root = compute_signing_root(&object, DOMAIN);
+        assert_eq!(root, EXPECTED);
+    }
+
     #[test]
     fn test_sign_attestation_produces_valid_signature() {
         let secret_key = SecretKey::generate();

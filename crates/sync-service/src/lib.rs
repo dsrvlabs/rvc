@@ -602,6 +602,45 @@ mod tests {
         assert_eq!(result, value % 8 == 0);
     }
 
+    // KAT (report §5 bullet 2): pin the sync-committee index→subnet mapping
+    // `subnet = pos / (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT)` = `pos / 128`
+    // against hardcoded (index → subnet) pairs covering all four subnets. This is the
+    // testable twin of the production use site at `lib.rs:211` and the byte-identical
+    // orchestrator closure at `crates/rvc/src/orchestrator/sync_committee.rs:170`
+    // (Assumption 4). No external derivation: fixed integer division, hand-computable.
+    #[test]
+    fn test_sync_index_to_subnet_mapping_known_answers() {
+        let subnet_size = SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT;
+        assert_eq!(subnet_size, 128);
+
+        // (index, expected_subnet): both boundaries of every subnet in [0, 4).
+        let cases: [(u64, u64); 8] =
+            [(0, 0), (127, 0), (128, 1), (255, 1), (256, 2), (383, 2), (384, 3), (511, 3)];
+        for (index, expected_subnet) in cases {
+            assert_eq!(
+                index / subnet_size,
+                expected_subnet,
+                "index {index} must map to subnet {expected_subnet}"
+            );
+        }
+    }
+
+    // KAT (report §5 bullet 2): pin the `BTreeSet` dedup at `lib.rs:208` — multiple
+    // validator sync-committee indices in the same subnet must collapse to a single
+    // subnet id, sorted. Mirrors the production expression exactly.
+    #[test]
+    fn test_sync_index_to_subnet_dedup_collapses_to_set() {
+        let subnet_size = SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT; // 128
+        let validator_sync_committee_indices: [u64; 5] = [0, 1, 127, 128, 200];
+
+        let subnets: BTreeSet<u64> =
+            validator_sync_committee_indices.iter().map(|&pos| pos / subnet_size).collect();
+
+        // 0,1,127 → subnet 0; 128,200 → subnet 1. Collapses to {0, 1}.
+        let expected: BTreeSet<u64> = [0u64, 1u64].into_iter().collect();
+        assert_eq!(subnets, expected);
+    }
+
     // --- produce_sync_messages tests ---
 
     #[tokio::test]

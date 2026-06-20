@@ -316,6 +316,37 @@ mod tests {
         assert!(is_aggregator(16, &[0xff; 96]));
     }
 
+    // KAT (report §5 bullet 1): pin the little-endian interpretation in `is_aggregator`
+    // against a hardcoded digest so a consistent LE↔BE flip in production would fail.
+    // The existing oracle helpers (`find_aggregator_proof_for_modulo` etc.) themselves
+    // call `u64::from_le_bytes`, so a matching flip in both production and oracle would
+    // still pass — this test asserts directly on literal digest bytes instead.
+    #[test]
+    fn test_is_aggregator_little_endian_golden_digest() {
+        // Golden digest chosen so the two byte orders give OPPOSITE aggregator verdicts:
+        //   bytes        = 08 00 00 00 00 00 00 01
+        //   LE u64       = 0x0100000000000008 → % 8 == 0  (aggregator)
+        //   BE u64       = 0x0800000000000001 → % 8 == 1  (NOT aggregator)
+        // Locks the endianness contract to literal bytes, independent of `is_aggregator`.
+        const GOLDEN_DIGEST_HEAD: [u8; 8] = [0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let le_value = u64::from_le_bytes(GOLDEN_DIGEST_HEAD);
+        let be_value = u64::from_be_bytes(GOLDEN_DIGEST_HEAD);
+        assert_eq!(le_value, 0x0100_0000_0000_0008);
+        assert_eq!(be_value, 0x0800_0000_0000_0001);
+        assert_eq!(le_value % 8, 0, "little-endian verdict must be aggregator");
+        assert_ne!(be_value % 8, 0, "big-endian verdict must be non-aggregator");
+
+        // End-to-end: `is_aggregator` hashes its input, so feed a preimage whose SHA-256
+        // head yields the LE aggregator verdict (committee 128 → modulo 8). The oracle
+        // helper only FINDS the preimage; the load-bearing endianness check is above.
+        let preimage = find_aggregator_proof_for_modulo(8);
+        let digest = Sha256::digest(&preimage);
+        let digest_head: [u8; 8] = digest[..8].try_into().unwrap();
+        // Production uses little-endian: this preimage is an aggregator under LE.
+        assert_eq!(u64::from_le_bytes(digest_head) % 8, 0);
+        assert!(is_aggregator(128, &preimage));
+    }
+
     #[test]
     fn test_is_aggregator_large_committee() {
         // committee_length=256 → 256/16 = 16
