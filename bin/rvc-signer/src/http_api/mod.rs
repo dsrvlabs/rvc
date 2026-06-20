@@ -18,6 +18,7 @@ use crate::backend::SigningBackend;
 
 pub mod tls;
 
+mod request;
 mod routes;
 
 /// Audit configuration for the HTTP API.
