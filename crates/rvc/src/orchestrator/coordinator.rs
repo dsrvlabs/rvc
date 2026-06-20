@@ -20,7 +20,7 @@ use metrics::definitions::{
 };
 use propagator::{AttestationSubmitter, Propagator};
 use signer::SignerService;
-use timing::{SlotClock, AGGREGATE_DUE_BPS, ATTESTATION_DUE_BPS, BASIS_POINTS, SLOTS_PER_EPOCH};
+use timing::{due_ms, SlotClock, AGGREGATE_DUE_BPS, ATTESTATION_DUE_BPS, SLOTS_PER_EPOCH};
 
 use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
@@ -419,7 +419,7 @@ where
                 // with `time_until_attestation`: mainnet 1/3 = 3999 ms.
                 {
                     let slot_duration_ms = self.clock.slot_duration().as_millis() as u64;
-                    let att_window_ms = ATTESTATION_DUE_BPS * slot_duration_ms / BASIS_POINTS;
+                    let att_window_ms = due_ms(ATTESTATION_DUE_BPS, slot_duration_ms);
                     let slot_start_ms = self.clock.slot_start_time(current_slot) * 1000;
                     let expected_att_ms = slot_start_ms + att_window_ms;
                     let now_ms = self.clock.current_time_secs() * 1000;
@@ -480,7 +480,7 @@ where
                 // 2/3 = 6667 * 12000 / 10000 = 8000 ms (unchanged from the legacy
                 // `as_secs() * 2 / 3`), but exact for non-12 s / Gloas slots.
                 let slot_duration_ms = self.clock.slot_duration().as_millis() as u64;
-                let two_thirds_offset_ms = AGGREGATE_DUE_BPS * slot_duration_ms / BASIS_POINTS;
+                let two_thirds_offset_ms = due_ms(AGGREGATE_DUE_BPS, slot_duration_ms);
                 let slot_start_ms = self.clock.slot_start_time(current_slot) * 1000;
                 let two_thirds_ms = slot_start_ms + two_thirds_offset_ms;
                 let now_ms = self.clock.current_time_secs() * 1000;
@@ -5628,7 +5628,9 @@ mod tests {
         let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32);
         let slot_duration_ms = clock.slot_duration().as_millis() as u64;
 
-        let two_thirds_offset_ms = AGGREGATE_DUE_BPS * slot_duration_ms / BASIS_POINTS;
+        // Same call the Phase 3 wait makes in production (`due_ms(AGGREGATE_DUE_BPS, ..)`);
+        // pinning the literal 8000 here fails if either the constant or the formula drifts.
+        let two_thirds_offset_ms = due_ms(AGGREGATE_DUE_BPS, slot_duration_ms);
         assert_eq!(two_thirds_offset_ms, 8000, "mainnet 2/3 offset must be 8000 ms");
 
         // At slot start, the wait is the full 8000 ms offset.
@@ -5653,7 +5655,9 @@ mod tests {
         let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32);
         let slot_duration_ms = clock.slot_duration().as_millis() as u64;
 
-        let att_window_ms = ATTESTATION_DUE_BPS * slot_duration_ms / BASIS_POINTS;
+        // Same call the missed-deadline check makes in production
+        // (`due_ms(ATTESTATION_DUE_BPS, ..)`); the literal 3999 fails on drift.
+        let att_window_ms = due_ms(ATTESTATION_DUE_BPS, slot_duration_ms);
         assert_eq!(att_window_ms, 3999, "mainnet 1/3 attestation window must be 3999 ms");
 
         let slot_start_ms = clock.slot_start_time(0) * 1000;
