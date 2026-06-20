@@ -65,6 +65,16 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
     "logging",
     "tls12",
 ] }
+# Web3Signer HTTP API direct deps (R4 version-pinning). Declared in Phase 1 so
+# Phases 2/3 start on a single, pinned rustls `CertificateDer` graph. `axum` is
+# pinned to "0.7" (NOT the transitive 0.8.8 in the lock) so the HTTP server
+# binds the same rustls/pki-types as tonic; rustls is always reached via
+# `tokio_rustls::rustls` (see http_api/mod.rs's compile-time guard). All three
+# resolve to versions already in Cargo.lock (axum 0.7.9, hyper-util 0.1.20,
+# rustls-pemfile 2.2.0) — zero net-new compiled crates. Unused until Phase 2.
+axum = "0.7"
+hyper-util = "0.1"
+rustls-pemfile = "2"
 prometheus.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

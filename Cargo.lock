@@ -4378,10 +4378,12 @@ name = "rvc-signer-bin"
 version = "0.5.0"
 dependencies = [
  "async-trait",
+ "axum 0.7.9",
  "bls12_381_plus",
  "blst",
  "clap",
  "hex",
+ "hyper-util",
  "libc",
  "parking_lot",
  "prometheus",
@@ -4390,6 +4392,7 @@ dependencies = [
  "rand 0.8.5",
  "rcgen",
  "rustls",
+ "rustls-pemfile",
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-grpc-signer",
