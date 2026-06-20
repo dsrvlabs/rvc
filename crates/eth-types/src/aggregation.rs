@@ -105,9 +105,9 @@ impl ElectraAttestation {
             .write(bitlist_tree_hash_root(&self.aggregation_bits)?.as_slice())
             .expect("valid leaf");
         hasher.write(self.data.tree_hash_root().as_slice()).expect("valid leaf");
-        // EIP-7549 spec order: field 2 = committee_bits, field 3 = signature
-        hasher.write(vec_u8_tree_hash_root(&self.committee_bits).as_slice()).expect("valid leaf");
+        // EIP-7549 container field order: leaf 2 = signature, leaf 3 = committee_bits
         hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
+        hasher.write(vec_u8_tree_hash_root(&self.committee_bits).as_slice()).expect("valid leaf");
         Ok(hasher.finish().expect("valid root"))
     }
 }
@@ -441,8 +441,8 @@ mod tests {
             .write(bitlist_tree_hash_root(&att.aggregation_bits).unwrap().as_slice())
             .expect("leaf");
         hasher.write(att.data.tree_hash_root().as_slice()).expect("leaf");
-        hasher.write(vec_u8_tree_hash_root(&att.committee_bits).as_slice()).expect("leaf");
         hasher.write(vec_u8_tree_hash_root(&att.signature).as_slice()).expect("leaf");
+        hasher.write(vec_u8_tree_hash_root(&att.committee_bits).as_slice()).expect("leaf");
         let expected = hasher.finish().expect("root");
 
         assert_eq!(att.tree_hash_root(), expected, "tree_hash_root must match spec field order");
@@ -457,14 +457,51 @@ mod tests {
             .write(bitlist_tree_hash_root(&att.aggregation_bits).unwrap().as_slice())
             .expect("leaf");
         hasher.write(att.data.tree_hash_root().as_slice()).expect("leaf");
-        hasher.write(vec_u8_tree_hash_root(&att.signature).as_slice()).expect("leaf");
         hasher.write(vec_u8_tree_hash_root(&att.committee_bits).as_slice()).expect("leaf");
+        hasher.write(vec_u8_tree_hash_root(&att.signature).as_slice()).expect("leaf");
         let wrong_root = hasher.finish().expect("root");
 
         assert_ne!(
             att.tree_hash_root(),
             wrong_root,
             "tree_hash_root must differ from wrong field order"
+        );
+    }
+
+    // Known-answer test pinning the Electra `Attestation` tree-hash root to a fixed byte literal,
+    // so leaf order can no longer be silently re-swapped by editing the self-referential builder
+    // tests above (report §4.1, Decision Log D3).
+    //
+    // Provenance of the golden root:
+    //   No external SSZ tool (Lighthouse) was runnable locally, so the literal was derived OFFLINE
+    //   from the documented per-leaf recipe — the lesser, order+encoding-self-consistent option:
+    //     leaf 0 = bitlist_tree_hash_root([0xff;4])
+    //     leaf 1 = AttestationData{slot:100,index:0,bbr:[1;32],src{3,[2;32]},tgt{4,[3;32]}} root
+    //     leaf 2 = vec_u8_tree_hash_root([0xaa;96])      (signature, Vector[byte,96])
+    //     leaf 3 = vec_u8_tree_hash_root([0x01;8])       (committee_bits, Bitvector[64])
+    //     root   = sha256( sha256(leaf0‖leaf1) ‖ sha256(leaf2‖leaf3) )
+    //   This pins the EIP-7549 leaf ORDER (signature=leaf2, committee_bits=leaf3); reverting the
+    //   Issue 1.2 swap yields 0x503fef28…07653 instead and fails this test.
+    //
+    //   Cross-checked against an independent oracle (remerkleable, the consensus-spec SSZ impl):
+    //   leaves 1, 2 and 3 are BYTE-IDENTICAL to remerkleable's hash_tree_root of the same
+    //   AttestationData / Vector[byte,96] / Bitvector[64]. Only leaf 0 differs, because rvc's
+    //   bitlist_tree_hash_root merkleizes the populated data chunks rather than padding the chunk
+    //   tree out to the Bitlist type limit (2048*64); that is a SEPARATE, pre-existing concern
+    //   outside this phase's scope (report §4.1 is leaf-order only), not part of this fix.
+    const ELECTRA_ATTESTATION_KNOWN_ROOT: [u8; 32] = [
+        0x45, 0x23, 0x61, 0xd8, 0x56, 0x6d, 0xe5, 0x07, 0x7e, 0x38, 0x3c, 0x9d, 0xa9, 0x6e, 0x1f,
+        0x16, 0x4a, 0x4c, 0xef, 0xf2, 0xfa, 0x2d, 0xf0, 0x4f, 0x5e, 0x7d, 0x8b, 0xc4, 0x82, 0x12,
+        0x8f, 0xe4,
+    ];
+
+    #[test]
+    fn test_electra_attestation_tree_hash_known_answer() {
+        let att = sample_electra_attestation();
+        assert_eq!(
+            att.tree_hash_root().as_slice(),
+            ELECTRA_ATTESTATION_KNOWN_ROOT.as_slice(),
+            "tree_hash_root must equal the EIP-7549 per-leaf known-answer root"
         );
     }
 
