@@ -248,9 +248,16 @@ impl SignerServiceV2 for MockV2Signer {
             pubkey,
         };
         let zero_gvr = [0u8; 32];
-        // Builder registrations use a fixed GENESIS_FORK_VERSION (Phase0 for mainnet).
-        // We accept whatever the client sends — for tests we use [0,0,0,0].
-        let genesis_fork_version = [0u8; 4];
+        // Builder registrations carry a per-network GENESIS_FORK_VERSION on the
+        // request (empty ⇒ mainnet 0x00000000), mirroring the real server.
+        let genesis_fork_version: [u8; 4] = if r.genesis_fork_version.is_empty() {
+            [0u8; 4]
+        } else {
+            r.genesis_fork_version
+                .as_slice()
+                .try_into()
+                .map_err(|_| Status::invalid_argument("genesis_fork_version must be 4 bytes"))?
+        };
         let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_gvr);
         let root = compute_signing_root(&reg, domain);
         Ok(Response::new(SignResponse { signature: self.sign_root(&root) }))
@@ -593,7 +600,10 @@ async fn test_typed_builder_registration_round_trip() {
 
     let signer = GrpcRemoteSigner::connect(insecure_grpc_config(addr)).await.unwrap();
 
-    let genesis_fork_version = [0u8; 4];
+    // Non-zero (Holesky) version so the roundtrip would fail if the field were
+    // dropped on the wire — the old [0u8; 4] passed only by coincidence with the
+    // mock's hardcoded default.
+    let genesis_fork_version = [0x01, 0x01, 0x70, 0x00];
     let reg = ValidatorRegistrationV1 {
         fee_recipient: [0xab; 20],
         gas_limit: 30_000_000,

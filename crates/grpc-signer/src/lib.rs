@@ -166,8 +166,10 @@ mod tests {
             fee_recipient: vec![0u8; 20],
             gas_limit: 30_000_000,
             timestamp: 1_700_000_000,
+            genesis_fork_version: vec![],
         };
         assert_eq!(req.gas_limit, 30_000_000);
+        assert!(req.genesis_fork_version.is_empty());
     }
 
     #[test]

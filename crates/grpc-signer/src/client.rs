@@ -687,6 +687,7 @@ impl TypedSigner for GrpcRemoteSigner {
                 fee_recipient: reg.fee_recipient.to_vec(),
                 gas_limit: reg.gas_limit,
                 timestamp: reg.timestamp,
+                genesis_fork_version: genesis_fork_version.to_vec(),
             };
 
             let mut client = self.client_v2.clone();
