@@ -24,12 +24,29 @@ fn bitlist_chunk_count(max_bits: u64) -> usize {
 ///
 /// `MerkleHasher::with_leaves(chunk_count)` rounds the leaf count up to the next power of two and
 /// zero-pads any unwritten leaves in `finish()`, which is exactly the SSZ merkleize-with-limit rule.
-fn merkleize_to_chunk_count(clean_bytes: &[u8], chunk_count: usize) -> Hash256 {
+///
+/// Returns `Err` if `clean_bytes` overflows the chunk tree. Callers MUST length-validate against
+/// the `Bitlist[N]` limit first (see `bitlist_tree_hash_root`); a within-limit bitlist always fits.
+fn merkleize_to_chunk_count(
+    clean_bytes: &[u8],
+    chunk_count: usize,
+) -> Result<Hash256, TreeHashError> {
     let mut hasher = MerkleHasher::with_leaves(chunk_count);
     if !clean_bytes.is_empty() {
-        hasher.write(clean_bytes).expect("valid bytes");
+        hasher.write(clean_bytes).map_err(|e| TreeHashError::InvalidBitlist {
+            reason: format!("bitlist data overflows chunk tree: {e:?}"),
+        })?;
     }
-    hasher.finish().expect("valid root")
+    hasher.finish().map_err(|e| TreeHashError::InvalidBitlist {
+        reason: format!("bitlist merkleization failed: {e:?}"),
+    })
+}
+
+/// Maximum SSZ-encoded byte length of a `Bitlist[max_bits]`: up to `max_bits` data bits plus one
+/// sentinel bit, i.e. `ceil((max_bits + 1) / 8) = max_bits / 8 + 1` bytes (the +1 holds the
+/// sentinel, which sits in a fresh byte only when `max_bits` is a multiple of 8 — the realistic case).
+fn bitlist_max_ssz_len(max_bits: u64) -> usize {
+    (max_bits / 8 + 1) as usize
 }
 
 /// Tree-hash an SSZ `Bitlist[max_bits]` from its raw SSZ encoding (data bits + sentinel bit).
@@ -37,14 +54,30 @@ fn merkleize_to_chunk_count(clean_bytes: &[u8], chunk_count: usize) -> Hash256 {
 /// `hash_tree_root(Bitlist[N]) = mix_in_length(merkleize(pack_bits(value), chunk_count(N)), len)`.
 /// The chunk tree MUST be padded to `chunk_count(N) = ceil(N / 256)` leaves before mixing in the
 /// length; sizing it to only the populated data chunks yields a spec-divergent root.
+///
+/// Rejects an input longer than a `Bitlist[max_bits]` can encode with `Err`: such input is invalid
+/// (an attacker-influenced over-length `aggregation_bits` from the beacon node would otherwise
+/// overflow the fixed chunk tree and panic the signing path).
 pub(crate) fn bitlist_tree_hash_root(
     bytes: &[u8],
     max_bits: u64,
 ) -> Result<Hash256, TreeHashError> {
     let chunk_count = bitlist_chunk_count(max_bits);
 
+    let max_len = bitlist_max_ssz_len(max_bits);
+    if bytes.len() > max_len {
+        return Err(TreeHashError::InvalidBitlist {
+            reason: format!(
+                "bitlist length {} bytes exceeds Bitlist[{}] limit of {} bytes",
+                bytes.len(),
+                max_bits,
+                max_len
+            ),
+        });
+    }
+
     if bytes.is_empty() {
-        let root = merkleize_to_chunk_count(&[], chunk_count);
+        let root = merkleize_to_chunk_count(&[], chunk_count)?;
         return Ok(mix_in_length(&root, 0));
     }
 
@@ -67,7 +100,7 @@ pub(crate) fn bitlist_tree_hash_root(
         clean_bytes.truncate(last_idx);
     }
 
-    let root = merkleize_to_chunk_count(&clean_bytes, chunk_count);
+    let root = merkleize_to_chunk_count(&clean_bytes, chunk_count)?;
     Ok(mix_in_length(&root, bit_length))
 }
 
@@ -202,6 +235,39 @@ mod tests {
     fn test_bitlist_tree_hash_returns_err_on_trailing_zero() {
         let result = bitlist_tree_hash_root(&[0xff, 0x00], PRE_ELECTRA_LIMIT);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_bitlist_max_ssz_len_matches_spec() {
+        // Bitlist[N] encodes <= N data bits + 1 sentinel => N/8 + 1 bytes (N a multiple of 8).
+        assert_eq!(bitlist_max_ssz_len(PRE_ELECTRA_LIMIT), 257);
+        assert_eq!(bitlist_max_ssz_len(ELECTRA_LIMIT), 16385);
+    }
+
+    #[test]
+    fn test_bitlist_oversized_input_returns_err_not_panic() {
+        // An over-length aggregation_bits (e.g. a hostile/buggy beacon node) must be rejected with
+        // an error, NOT panic the signing path by overflowing the fixed chunk tree. Pre-Electra
+        // rejects > 257 bytes; Electra > 16385 bytes.
+        let too_long_pre = vec![0xff; 258];
+        let err = bitlist_tree_hash_root(&too_long_pre, PRE_ELECTRA_LIMIT).unwrap_err();
+        assert!(err.to_string().contains("exceeds Bitlist[2048] limit"), "got: {err}");
+
+        let too_long_electra = vec![0xff; 16386];
+        assert!(bitlist_tree_hash_root(&too_long_electra, ELECTRA_LIMIT).is_err());
+    }
+
+    #[test]
+    fn test_bitlist_max_valid_length_succeeds() {
+        // The largest VALID bitlist (all N data bits set, sentinel in a fresh byte) must still hash:
+        // 257 bytes for Bitlist[2048] (256 data bytes + sentinel byte), 16385 for Bitlist[131072].
+        let mut full_pre = vec![0xff; 257];
+        full_pre[256] = 0x01; // sentinel just past the last data bit
+        assert!(bitlist_tree_hash_root(&full_pre, PRE_ELECTRA_LIMIT).is_ok());
+
+        let mut full_electra = vec![0xff; 16385];
+        full_electra[16384] = 0x01;
+        assert!(bitlist_tree_hash_root(&full_electra, ELECTRA_LIMIT).is_ok());
     }
 
     mod fuzz {
