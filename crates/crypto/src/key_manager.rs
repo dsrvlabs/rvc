@@ -167,7 +167,8 @@ impl KeyManager {
                 }
             };
 
-            let password = match passwords.get(&pubkey_hex) {
+            let password = match passwords.get(&pubkey_hex).or_else(|| passwords.get(WILDCARD_KEY))
+            {
                 Some(p) => p,
                 None => {
                     warn!(
@@ -393,7 +394,8 @@ impl KeyManager {
                 continue;
             }
 
-            let password = match passwords.get(&pubkey_hex) {
+            let password = match passwords.get(&pubkey_hex).or_else(|| passwords.get(WILDCARD_KEY))
+            {
                 Some(p) => p,
                 None => {
                     warn!(
@@ -1273,5 +1275,224 @@ mod tests {
             "Expected PathTraversal error for symlink outside dir, got: {:?}",
             result
         );
+    }
+
+    // ── Wildcard ("*") password fallback tests ────────────────────────────
+
+    #[test]
+    fn test_threads_wildcard_password_fallback_decrypts() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_pubkey_hex, password) = create_generated_keystore(&temp_dir, 0);
+
+        // No per-key entry; only the wildcard is present, with the correct password.
+        let mut passwords = HashMap::new();
+        passwords.insert(WILDCARD_KEY.to_string(), SecretString::from(password));
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2))
+                .unwrap();
+        assert_eq!(manager.len(), 1, "wildcard password should decrypt the keystore");
+    }
+
+    #[test]
+    fn test_threads_per_key_password_overrides_wildcard() {
+        let temp_dir = TempDir::new().unwrap();
+        let (pubkey_hex, password) = create_generated_keystore(&temp_dir, 0);
+
+        // Per-key entry has the correct password; wildcard has a wrong one.
+        // If the per-key entry wins, the keystore decrypts.
+        let mut passwords = HashMap::new();
+        passwords.insert(pubkey_hex, SecretString::from(password));
+        passwords
+            .insert(WILDCARD_KEY.to_string(), SecretString::from("wrong_password".to_string()));
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2))
+                .unwrap();
+        assert_eq!(manager.len(), 1, "per-key password must override the wildcard");
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_threads_no_entry_and_no_wildcard_skips_and_warns() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_pubkey_hex, _password) = create_generated_keystore(&temp_dir, 0);
+
+        // Neither a per-key entry nor a wildcard exists.
+        let passwords = HashMap::new();
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2))
+                .unwrap();
+        assert!(manager.is_empty(), "keystore must be skipped when no password matches");
+        assert!(
+            logs_contain("No password found"),
+            "expected warn log when neither per-key nor wildcard password exists"
+        );
+    }
+
+    #[test]
+    fn test_tracker_wildcard_password_fallback_decrypts() {
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        // No per-key entry; only the wildcard is present, with the correct password.
+        let mut passwords = HashMap::new();
+        passwords.insert(WILDCARD_KEY.to_string(), SecretString::from(test_password_string()));
+
+        let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
+
+        let manager =
+            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker)
+                .unwrap();
+        assert_eq!(manager.len(), 1, "wildcard password should decrypt the keystore");
+    }
+
+    #[test]
+    fn test_tracker_per_key_password_overrides_wildcard() {
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        // Per-key entry has the correct password; wildcard has a wrong one.
+        let mut passwords = HashMap::new();
+        passwords.insert(TEST_PUBKEY_HEX.to_string(), SecretString::from(test_password_string()));
+        passwords
+            .insert(WILDCARD_KEY.to_string(), SecretString::from("wrong_password".to_string()));
+
+        let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
+
+        let manager =
+            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker)
+                .unwrap();
+        assert_eq!(manager.len(), 1, "per-key password must override the wildcard");
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_tracker_no_entry_and_no_wildcard_skips_and_warns() {
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        // Neither a per-key entry nor a wildcard exists.
+        let passwords = HashMap::new();
+
+        let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
+
+        let manager =
+            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker)
+                .unwrap();
+        assert!(manager.is_empty(), "keystore must be skipped when no password matches");
+        assert!(
+            logs_contain("No password found"),
+            "expected warn log when neither per-key nor wildcard password exists"
+        );
+    }
+
+    /// Helper mirroring `create_generated_keystore` but with an explicit password,
+    /// so multiple keystores can deliberately share (or differ in) their password.
+    /// Returns the keystore's pubkey hex.
+    fn create_generated_keystore_with_password(
+        dir: &TempDir,
+        index: usize,
+        password: &str,
+    ) -> String {
+        use crate::keystore::EncryptionKdf;
+
+        let sk = SecretKey::generate();
+        let keystore = Keystore::encrypt(
+            &sk,
+            password.as_bytes(),
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
+        let pubkey_hex = keystore.pubkey.clone().unwrap();
+        let json = keystore.to_json().expect("should serialize");
+        let filename = format!("keystore-{}.json", index);
+        create_test_keystore_file(dir, &filename, &json);
+        pubkey_hex
+    }
+
+    #[test]
+    fn test_threads_mixed_batch_wildcard_and_per_key_override() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Three distinct keystores with distinct pubkeys. Keystores 0 and 2 are
+        // encrypted with the shared "wildcard" password; keystore 1 has its own
+        // password and must load via a per-key override (the wildcard would NOT
+        // decrypt it).
+        let wildcard_password = "shared-wildcard-pw";
+        let override_password = "per-key-override-pw";
+        let pubkey0 = create_generated_keystore_with_password(&temp_dir, 0, wildcard_password);
+        let pubkey1 = create_generated_keystore_with_password(&temp_dir, 1, override_password);
+        let pubkey2 = create_generated_keystore_with_password(&temp_dir, 2, wildcard_password);
+
+        // Password map: ONLY a wildcard plus a single per-key override for keystore 1.
+        let mut passwords = HashMap::new();
+        passwords
+            .insert(WILDCARD_KEY.to_string(), SecretString::from(wildcard_password.to_string()));
+        passwords.insert(pubkey1.clone(), SecretString::from(override_password.to_string()));
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(4))
+                .unwrap();
+
+        // All three keystores must load: 0 and 2 via the wildcard, 1 via override.
+        assert_eq!(manager.len(), 3, "all keystores in the batch must load");
+
+        for pubkey_hex in [&pubkey0, &pubkey1, &pubkey2] {
+            let pubkey_bytes = hex::decode(pubkey_hex).unwrap();
+            let pubkey = PublicKey::from_bytes(&pubkey_bytes).unwrap();
+            let sk = manager
+                .get_secret_key(&pubkey)
+                .unwrap_or_else(|| panic!("expected key {pubkey_hex} to be loaded"));
+            assert_eq!(
+                sk.public_key().to_bytes(),
+                pubkey.to_bytes(),
+                "loaded secret key must derive the expected pubkey for {pubkey_hex}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_threads_wrong_wildcard_no_per_key_skips() {
+        let temp_dir = TempDir::new().unwrap();
+        let (_pubkey_hex, _password) = create_generated_keystore(&temp_dir, 0);
+
+        // Only a wildcard entry, with the WRONG password, and no per-key entry.
+        let mut passwords = HashMap::new();
+        passwords
+            .insert(WILDCARD_KEY.to_string(), SecretString::from("wrong_password".to_string()));
+
+        let manager =
+            KeyManager::load_from_directory_with_threads(temp_dir.path(), &passwords, Some(2))
+                .unwrap();
+        assert!(manager.is_empty(), "wrong wildcard password must not silently succeed");
+    }
+
+    #[test]
+    fn test_tracker_wrong_wildcard_no_per_key_skips() {
+        use std::time::Duration;
+
+        let temp_dir = TempDir::new().unwrap();
+        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
+
+        // Only a wildcard entry, with the WRONG password, and no per-key entry.
+        let mut passwords = HashMap::new();
+        passwords
+            .insert(WILDCARD_KEY.to_string(), SecretString::from("wrong_password".to_string()));
+
+        let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
+
+        let manager =
+            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker)
+                .unwrap();
+        assert!(manager.is_empty(), "wrong wildcard password must not silently succeed");
     }
 }
