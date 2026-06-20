@@ -5,32 +5,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tempfile::{NamedTempFile, TempDir};
 
-const BINARY_NAME: &str = "rvc";
-
-fn build_binary() {
-    use std::sync::OnceLock;
-    static BUILD_OK: OnceLock<bool> = OnceLock::new();
-
-    let ok = *BUILD_OK.get_or_init(|| {
-        Command::new("cargo")
-            .args(["build", "--package", "rvc-bin"])
-            .status()
-            .expect("Failed to build binary")
-            .success()
-    });
-
-    assert!(ok, "Failed to build rvc binary");
-}
-
 fn get_binary_path() -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("target")
-        .join("debug")
-        .join(BINARY_NAME)
+    // Cargo builds the `rvc` binary as a prerequisite of these integration tests and
+    // exposes its path via CARGO_BIN_EXE_<name>, with the same profile/features as the
+    // test build. This avoids shelling out to `cargo build` from inside each test, which
+    // serialized on cargo's build lock and thrashed the build cache under parallel runners.
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_rvc"))
 }
 
 fn create_test_config(keystore_dir: &TempDir, slashing_db_path: &std::path::Path) -> NamedTempFile {
@@ -92,8 +72,6 @@ fn wait_for_http_endpoint(url: &str, timeout: Duration) -> bool {
 
 #[test]
 fn test_help_command() {
-    build_binary();
-
     let binary_path = get_binary_path();
     let output =
         Command::new(binary_path).args(["--help"]).output().expect("Failed to execute command");
@@ -106,8 +84,6 @@ fn test_help_command() {
 
 #[test]
 fn test_version_command() {
-    build_binary();
-
     let binary_path = get_binary_path();
     let output =
         Command::new(binary_path).args(["--version"]).output().expect("Failed to execute command");
@@ -119,8 +95,6 @@ fn test_version_command() {
 
 #[test]
 fn test_start_help() {
-    build_binary();
-
     let binary_path = get_binary_path();
     let output = Command::new(binary_path)
         .args(["start", "--help"])
@@ -143,8 +117,6 @@ fn test_start_help() {
 
 #[test]
 fn test_start_with_invalid_config() {
-    build_binary();
-
     let binary_path = get_binary_path();
     let output = Command::new(binary_path)
         .args(["start", "--config", "/nonexistent/config.toml"])
@@ -157,8 +129,6 @@ fn test_start_with_invalid_config() {
 #[test]
 #[ignore = "Requires network access and may be slow"]
 fn test_startup_and_health_endpoint() {
-    build_binary();
-
     let keystore_dir = TempDir::new().expect("Failed to create keystore dir");
     let slashing_db_dir = TempDir::new().expect("Failed to create slashing db dir");
     let slashing_db_path = slashing_db_dir.path().join("slashing.db");
@@ -202,8 +172,6 @@ fn test_startup_and_health_endpoint() {
 #[test]
 #[ignore = "Requires network access and may be slow"]
 fn test_startup_and_metrics_endpoint() {
-    build_binary();
-
     let keystore_dir = TempDir::new().expect("Failed to create keystore dir");
     let slashing_db_dir = TempDir::new().expect("Failed to create slashing db dir");
     let slashing_db_path = slashing_db_dir.path().join("slashing.db");
@@ -244,8 +212,6 @@ fn test_startup_and_metrics_endpoint() {
 #[test]
 #[ignore = "Requires network access and may be slow"]
 fn test_graceful_shutdown_sigterm() {
-    build_binary();
-
     let keystore_dir = TempDir::new().expect("Failed to create keystore dir");
     let slashing_db_dir = TempDir::new().expect("Failed to create slashing db dir");
     let slashing_db_path = slashing_db_dir.path().join("slashing.db");
@@ -297,8 +263,6 @@ fn test_graceful_shutdown_sigterm() {
 
 #[test]
 fn test_livez_endpoint_always_ok() {
-    build_binary();
-
     let keystore_dir = TempDir::new().expect("Failed to create keystore dir");
     let slashing_db_dir = TempDir::new().expect("Failed to create slashing db dir");
     let slashing_db_path = slashing_db_dir.path().join("slashing.db");
@@ -307,8 +271,7 @@ fn test_livez_endpoint_always_ok() {
 
     let mut child = spawn_validator(config_file.path());
 
-    std::thread::sleep(Duration::from_secs(2));
-
+    // No upfront sleep: wait_for_http_endpoint already polls from t=0 with retries.
     let livez_available =
         wait_for_http_endpoint("http://127.0.0.1:19090/livez", Duration::from_secs(10));
 

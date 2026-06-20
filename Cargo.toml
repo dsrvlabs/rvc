@@ -126,3 +126,9 @@ tracing-test = "0.2"
 
 [workspace.dependencies.tonic-build]
 version = "0.12"
+
+# Optimize all third-party dependencies (incl. scrypt/bls/sha2 KDF+crypto) even in
+# debug/test builds. Workspace crates stay unoptimized for fast incremental builds and
+# clean backtraces; only deps are optimized. Cuts crypto-heavy test time ~3-5x.
+[profile.dev.package."*"]
+opt-level = 3
