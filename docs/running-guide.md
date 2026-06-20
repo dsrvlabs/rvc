@@ -216,12 +216,43 @@ CLI flags override config file values.
 
 ## Password File Format
 
+One entry per line. Comments (`#`) and blank lines are ignored, and a leading
+`0x` prefix on a pubkey is stripped automatically.
+
 ```
 # Comments start with #
 # Format: pubkey=password (one per line, 0x prefix stripped automatically)
 abcd1234=mypassword
 0x5678efgh=anotherpassword
 ```
+
+### Wildcard default password
+
+A line whose key is `*` sets a single default password applied to any keystore
+that does not have its own `pubkey=password` line. This lets you decrypt many
+keystores with one shared password while still overriding individual validators:
+
+```
+# Default password for every keystore...
+*=mySharedPassword
+# ...with a per-validator override for this one
+0xabcd1234=differentPassword
+```
+
+The password for each keystore is resolved in this order:
+
+1. the exact `pubkey=password` entry for that validator, if present;
+2. otherwise the `*` wildcard entry, if present;
+3. otherwise the keystore is skipped with a `No password found for public key …`
+   warning.
+
+Existing password files that use only `pubkey=password` lines keep working
+unchanged — the wildcard is purely additive.
+
+> **Shared-secret blast radius:** the `*` password decrypts *every* keystore
+> that lacks its own entry, so anyone who can read the password file effectively
+> holds all of those un-overridden validator keys. Keep the file `chmod 600` and
+> scope the shared password to a trust boundary you are comfortable with.
 
 Set restrictive permissions: `chmod 600 passwords.txt`
 
