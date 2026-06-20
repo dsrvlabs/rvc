@@ -57,7 +57,10 @@ pub struct Web3SignerState {
 /// (Phase 3 `run_serve`) wraps it in the TLS accept loop. Exercised in tests via
 /// `tower::ServiceExt::oneshot` with no socket bound.
 pub fn router(state: Web3SignerState) -> Router {
-    Router::new().route("/upcheck", get(routes::upcheck)).with_state(state)
+    Router::new()
+        .route("/upcheck", get(routes::upcheck))
+        .route("/api/v1/eth2/publicKeys", get(routes::public_keys))
+        .with_state(state)
 }
 
 // ── Version-pin guard (R4) ───────────────────────────────────────────────────
@@ -187,5 +190,58 @@ mod tests {
         let state = test_state(Arc::new(MockBackend::empty()));
         let _clone = state.clone(); // Arc clones only
         assert_eq!(state.audit.default_cn, signer::AUDIT_CN_DEFAULT);
+    }
+
+    // ── GET /api/v1/eth2/publicKeys (Issue 2.2, FR-2) ────────────────────────
+
+    async fn public_keys(state: Web3SignerState) -> (StatusCode, Vec<String>) {
+        let resp = router(state)
+            .oneshot(Request::builder().uri("/api/v1/eth2/publicKeys").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let keys: Vec<String> = serde_json::from_slice(&bytes).unwrap();
+        (status, keys)
+    }
+
+    #[tokio::test]
+    async fn public_keys_lists_loaded_keys_as_0x_lowercase() {
+        let k1 = [0x11u8; 48];
+        let k2 = [0xabu8; 48];
+        let state = test_state(Arc::new(MockBackend::with_keys(vec![k1, k2])));
+        let (status, keys) = public_keys(state).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            keys,
+            vec![format!("0x{}", "11".repeat(48)), format!("0x{}", "ab".repeat(48))],
+            "keys must be 0x + lowercase hex, matching the gRPC pubkey_hex encoding"
+        );
+    }
+
+    #[tokio::test]
+    async fn public_keys_empty_backend_returns_empty_array() {
+        let state = test_state(Arc::new(MockBackend::empty()));
+        let (status, keys) = public_keys(state).await;
+        assert_eq!(status, StatusCode::OK, "empty backend is 200, not 404");
+        assert!(keys.is_empty());
+    }
+
+    /// Carry-forward from 2.1 review (CR-2): pin method/route negotiation now
+    /// that more than one route exists.
+    #[tokio::test]
+    async fn unknown_route_404_and_wrong_method_405() {
+        let state = test_state(Arc::new(MockBackend::empty()));
+        let not_found = router(state.clone())
+            .oneshot(Request::builder().uri("/nope").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+
+        let wrong_method = router(state)
+            .oneshot(Request::builder().method("POST").uri("/upcheck").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(wrong_method.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 }
