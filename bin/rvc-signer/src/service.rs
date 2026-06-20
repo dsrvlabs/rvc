@@ -874,9 +874,10 @@ impl SignerServiceV2 for SignerServiceImpl {
 
     // ── SignBuilderRegistration ────────────────────────────────────────────────
     //
-    // Per MEV-Boost spec (confirmed as correct by audit "False positive" note):
     // domain = DOMAIN_APPLICATION_BUILDER + GENESIS_FORK_VERSION + ZERO_HASH
-    // These are **fixed** constants — NOT from ForkInfo.
+    // GENESIS_FORK_VERSION is the per-network config value carried on the request
+    // (mainnet 0x00000000, Holesky 0x01017000, …; empty ⇒ mainnet). The genesis
+    // validators root is a zero hash, NOT sourced from ForkInfo.
     //
     // Not slashable — no stage/commit calls.
     #[tracing::instrument(

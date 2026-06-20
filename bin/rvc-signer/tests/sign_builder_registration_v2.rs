@@ -192,6 +192,33 @@ async fn test_fee_recipient_wrong_length_rejected() {
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 }
 
+// ── Test 3b: non-empty, non-4-byte genesis_fork_version is rejected ───────────
+//
+// Empty ⇒ mainnet (covered by the happy path); exactly 4 bytes ⇒ that network
+// (covered by the Holesky KAT). Any other length must fail closed with
+// `InvalidArgument`, mirroring the fee_recipient length check.
+
+#[tokio::test]
+async fn test_genesis_fork_version_wrong_length_rejected() {
+    let (svc, _db_path) = make_service_with_db();
+
+    for bad in [vec![0x01u8; 3], vec![0x01u8; 5]] {
+        let req = Request::new(sv2::SignBuilderRegistrationRequest {
+            pubkey: KNOWN_PUBKEY_BYTES.to_vec(),
+            fee_recipient: vec![0xabu8; 20],
+            gas_limit: 30_000_000,
+            timestamp: 1_700_000_000,
+            genesis_fork_version: bad,
+        });
+
+        let err = svc
+            .sign_builder_registration(req)
+            .await
+            .expect_err("non-4-byte genesis_fork_version must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+}
+
 // ── Test 4: unknown key returns NotFound ──────────────────────────────────────
 
 #[tokio::test]
