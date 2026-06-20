@@ -1,11 +1,64 @@
 //! Web3Signer-compatible HTTP remote-signing API.
 //!
-//! Phase 1 lands the rustls crypto-provider install ([`tls`]) and the
-//! version-pin guard below; the HTTP handlers, router, and listener arrive in
-//! later phases. The `axum` / `hyper-util` / `rustls-pemfile` direct deps are
-//! declared in `Cargo.toml` now (R4) but are unused until Phase 2.
+//! A thin, stateless transport frontend over the shared [`SigningGate`]: it
+//! routes, parses, computes a signing root, dispatches to one `sign_*` call, and
+//! maps the result to an HTTP status — it never signs, stores keys, or touches
+//! the slashing DB directly. [`router`] is pure and socket-free (testable with
+//! `tower`'s in-memory `oneshot`); the TLS accept loop / `serve` is Phase 3.
+//!
+//! The `hyper-util` / `rustls-pemfile` direct deps are declared in `Cargo.toml`
+//! (R4) but unused until the Phase-3 listener.
+
+use std::sync::Arc;
+
+use axum::{routing::get, Router};
+use signer::{SigningGate, AUDIT_CN_DEFAULT};
+
+use crate::backend::SigningBackend;
 
 pub mod tls;
+
+mod routes;
+
+/// Audit configuration for the HTTP API.
+///
+/// Phase 2 carries only the default CN (used when no client cert is present);
+/// per-request CN extraction from the TLS peer cert is wired in Phase 3.
+#[derive(Debug, Clone)]
+pub struct AuditCfg {
+    /// CN recorded for audit when the request carries no parseable client cert
+    /// (Prysm / server-TLS-only). Defaults to [`AUDIT_CN_DEFAULT`].
+    pub default_cn: String,
+}
+
+impl Default for AuditCfg {
+    fn default() -> Self {
+        Self { default_cn: AUDIT_CN_DEFAULT.to_string() }
+    }
+}
+
+/// Shared, cheaply-cloneable application state for the Web3Signer HTTP API.
+///
+/// Holds only `Arc` handles, so every request clones it for free and the front
+/// tier fans out across tokio workers, serializing only at the per-pubkey gate
+/// lock. The `gate` is the single signing authority shared with the gRPC
+/// transport (FR-26); `backend` serves `GET /publicKeys`; `audit` supplies the
+/// CN for audit entries.
+#[derive(Clone)]
+pub struct Web3SignerState {
+    pub gate: Arc<SigningGate>,
+    pub backend: Arc<dyn SigningBackend>,
+    pub audit: AuditCfg,
+}
+
+/// Build the Web3Signer HTTP API `Router`.
+///
+/// Pure and socket-free: attach `state` and return the `Router`; the caller
+/// (Phase 3 `run_serve`) wraps it in the TLS accept loop. Exercised in tests via
+/// `tower::ServiceExt::oneshot` with no socket bound.
+pub fn router(state: Web3SignerState) -> Router {
+    Router::new().route("/upcheck", get(routes::upcheck)).with_state(state)
+}
 
 // ── Version-pin guard (R4) ───────────────────────────────────────────────────
 //
@@ -19,27 +72,120 @@ pub mod tls;
 // This is a COMPILE-TIME identity assertion: the non-capturing closure coerces
 // to a `fn` pointer only if `tokio_rustls::rustls::pki_types::CertificateDer`
 // *is* `rustls::pki_types::CertificateDer` (the same type). If a transitive
-// dependency (e.g. an `axum 0.8` that pulls a newer rustls) ever introduces a
-// second rustls into this crate, the two paths resolve to different types and
-// this line fails to compile — turning the version-skew risk into a build error.
+// dependency (e.g. a `tokio-rustls`/`axum-server` that pulls a newer rustls)
+// ever introduces a second rustls into this crate, the two paths resolve to
+// different types and this line fails to compile — turning the version-skew risk
+// into a build error.
 const _: fn(
     tokio_rustls::rustls::pki_types::CertificateDer<'static>,
 ) -> rustls::pki_types::CertificateDer<'static> = |cert| cert;
 
+/// Shared test helpers for the `http_api` submodules.
 #[cfg(test)]
-mod version_pin_tests {
-    /// A DER cert constructed via the HTTP-side `tokio_rustls::rustls` path must
-    /// flow into the existing `audit::cn` extractor unchanged. This couples the
-    /// accept loop's cert type (Phase 3) to what audit consumes today, proving a
-    /// single rustls/pki-types across the binary (R4). It compiles only while the
-    /// two rustls paths are the same crate.
-    #[test]
-    fn http_cert_der_flows_into_audit_cn() {
-        let der = tokio_rustls::rustls::pki_types::CertificateDer::from(vec![0u8; 4]);
-        // A 4-byte blob is not a valid cert, so no CN is parsed — the point is
-        // that this COMPILES (`der.as_ref(): &[u8]`, the same input the gRPC
-        // audit path uses) and links the HTTP cert type to `audit::cn`.
-        let cn = crate::audit::cn::extract_cn_from_der(der.as_ref());
-        assert!(cn.is_none(), "a 4-byte non-cert must not yield a CN");
+pub(crate) mod test_support {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+
+    use super::{AuditCfg, Web3SignerState};
+    use crate::backend::{SigningBackend, SigningBackendError};
+
+    /// A trivial in-memory backend for socket-free router tests.
+    ///
+    /// `sign` returns a fixed 96-byte blob for a loaded key and `KeyNotFound`
+    /// otherwise — enough for routing/status tests. KAT sign tests that verify a
+    /// real BLS signature use the production `BasicSigner` backend instead.
+    pub struct MockBackend {
+        keys: Vec<[u8; 48]>,
+        sig: [u8; 96],
+    }
+
+    impl MockBackend {
+        pub fn with_keys(keys: Vec<[u8; 48]>) -> Self {
+            Self { keys, sig: [0xAB; 96] }
+        }
+
+        pub fn empty() -> Self {
+            Self { keys: vec![], sig: [0xAB; 96] }
+        }
+    }
+
+    #[async_trait]
+    impl SigningBackend for MockBackend {
+        async fn sign(
+            &self,
+            _signing_root: &[u8; 32],
+            pubkey: &[u8; 48],
+        ) -> Result<[u8; 96], SigningBackendError> {
+            if self.keys.contains(pubkey) {
+                Ok(self.sig)
+            } else {
+                Err(SigningBackendError::KeyNotFound(*pubkey))
+            }
+        }
+
+        fn public_keys(&self) -> Vec<[u8; 48]> {
+            self.keys.clone()
+        }
+    }
+
+    /// Build a [`Web3SignerState`] over an in-memory slashing DB and the given
+    /// backend. The state type requires a gate, but the `/upcheck` and
+    /// `/publicKeys` paths never invoke it.
+    pub fn test_state(backend: Arc<dyn SigningBackend>) -> Web3SignerState {
+        let db = Arc::new(slashing::SlashingDb::open_in_memory().expect("in-memory slashing DB"));
+        let gate =
+            Arc::new(crate::service::SignerServiceImpl::build_gate(Arc::clone(&backend), db));
+        Web3SignerState { gate, backend, audit: AuditCfg::default() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt; // oneshot
+
+    use super::test_support::{test_state, MockBackend};
+    use super::*;
+
+    async fn body_string(resp: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn upcheck_returns_200_ok() {
+        let state = test_state(Arc::new(MockBackend::with_keys(vec![[1u8; 48]])));
+        let app = router(state);
+        let resp = app
+            .oneshot(Request::builder().uri("/upcheck").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp).await, "OK");
+    }
+
+    #[tokio::test]
+    async fn upcheck_answers_without_invoking_the_gate() {
+        // Even with an empty backend (no keys loaded), `/upcheck` answers 200 —
+        // proving the liveness path has no gate/auth/state dependency (FR-1).
+        let state = test_state(Arc::new(MockBackend::empty()));
+        let app = router(state);
+        let resp = app
+            .oneshot(Request::builder().uri("/upcheck").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp).await, "OK");
+    }
+
+    #[tokio::test]
+    async fn state_is_cheaply_cloneable() {
+        let state = test_state(Arc::new(MockBackend::empty()));
+        let _clone = state.clone(); // Arc clones only
+        assert_eq!(state.audit.default_cn, signer::AUDIT_CN_DEFAULT);
     }
 }

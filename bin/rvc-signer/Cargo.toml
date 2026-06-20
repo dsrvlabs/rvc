@@ -105,6 +105,8 @@ grpc-signer.workspace = true
 crypto.workspace = true
 eth-types.workspace = true
 slashing.workspace = true
+# Drives the axum Router in-memory (oneshot) for socket-free http_api tests.
+tower = { workspace = true, features = ["util"] }
 
 # DVT test dependencies (always available in tests when dvt feature is on)
 vsss-rs.workspace = true
