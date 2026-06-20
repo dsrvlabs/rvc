@@ -92,12 +92,13 @@ message SignContributionAndProofRequest {
   uint32   fork_id           = 6;   // PHASE0 .. FULU enum
 }
 
-// --- BUILDER (no fork_info: spec-fixed GENESIS_FORK_VERSION + zero gvr) ---
+// --- BUILDER (no fork_info: per-network GENESIS_FORK_VERSION + zero gvr) ---
 message SignBuilderRegistrationRequest {
-  bytes  pubkey         = 1;
-  bytes  fee_recipient  = 2;   // 20 bytes
-  uint64 gas_limit      = 3;
-  uint64 timestamp      = 4;
+  bytes  pubkey               = 1;
+  bytes  fee_recipient        = 2;   // 20 bytes
+  uint64 gas_limit            = 3;
+  uint64 timestamp            = 4;
+  bytes  genesis_fork_version = 5;   // 4 bytes; empty ⇒ mainnet 0x00000000
   // pubkey duplicated in registration body; signer asserts equality
 }
 

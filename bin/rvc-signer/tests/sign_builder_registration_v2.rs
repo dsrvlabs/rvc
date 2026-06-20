@@ -1,8 +1,10 @@
 //! Integration tests for the typed builder-registration v2 RPC:
 //! `sign_builder_registration`.
 //!
-//! Per the MEV-Boost spec and the audit "False positive" finding:
+//! Builder-registration domain:
 //! domain = DOMAIN_APPLICATION_BUILDER + GENESIS_FORK_VERSION + ZERO_HASH
+//! `GENESIS_FORK_VERSION` is a per-network config value (mainnet 0x00000000,
+//! Holesky 0x01017000, …), carried on the request, NOT a spec-fixed constant.
 //! The caller supplies `pubkey` in the top-level proto field AND that same
 //! pubkey is used as the registration body's pubkey.  If they differ the
 //! server returns `Status::invalid_argument`.
@@ -20,38 +22,49 @@ use rvc_signer_bin::proto::signer_v2::signer_service_server::SignerService;
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Build a canonical builder-registration request using the known test key.
-fn canonical_request(pubkey: Vec<u8>) -> sv2::SignBuilderRegistrationRequest {
+///
+/// `genesis_fork_version` is the 4-byte per-network value carried on the
+/// request; an empty `Vec` means mainnet (`0x00000000`).
+fn canonical_request(
+    pubkey: Vec<u8>,
+    genesis_fork_version: Vec<u8>,
+) -> sv2::SignBuilderRegistrationRequest {
     sv2::SignBuilderRegistrationRequest {
         pubkey,
         fee_recipient: vec![0xabu8; 20],
         gas_limit: 30_000_000,
         timestamp: 1_700_000_000,
+        genesis_fork_version,
     }
 }
 
-/// Compute the expected signing root for the canonical registration.
-fn expected_signing_root(pubkey: [u8; 48]) -> [u8; 32] {
+/// Compute the expected signing root for the canonical registration under a
+/// given network `genesis_fork_version`. The genesis validators root is the
+/// builder-domain zero hash (`[0u8; 32]`).
+fn expected_signing_root(pubkey: [u8; 48], genesis_fork_version: [u8; 4]) -> [u8; 32] {
     let reg = ValidatorRegistrationV1 {
         fee_recipient: [0xab; 20],
         gas_limit: 30_000_000,
         timestamp: 1_700_000_000,
         pubkey,
     };
-    // Per MEV-Boost spec: fixed GENESIS_FORK_VERSION=[0u8;4], ZERO_HASH=[0u8;32]
-    let genesis_fork_version = [0u8; 4];
     let zero_hash = [0u8; 32];
     let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_hash);
     compute_signing_root(&reg, domain)
 }
 
-// ── Test 1: happy path — signature verifies against pubkey ───────────────────
+// ── Test 1: happy path (mainnet KAT) — signature verifies against pubkey ──────
+//
+// Mainnet GENESIS_FORK_VERSION = 0x00000000. The request omits the field
+// (empty `Vec`), which the server must treat as `[0u8; 4]`. This pins mainnet
+// so the per-network GREEN fix cannot silently change mainnet behavior.
 
 #[tokio::test]
 async fn test_builder_registration_happy_path() {
     let (svc, _db_path) = make_service_with_db();
     let pubkey_bytes = KNOWN_PUBKEY_BYTES.to_vec();
 
-    let req = Request::new(canonical_request(pubkey_bytes.clone()));
+    let req = Request::new(canonical_request(pubkey_bytes.clone(), vec![]));
 
     let resp = svc
         .sign_builder_registration(req)
@@ -60,15 +73,56 @@ async fn test_builder_registration_happy_path() {
     let sig_bytes = resp.into_inner().signature;
     assert_eq!(sig_bytes.len(), 96, "signature must be 96 bytes");
 
-    // Verify the signature against the expected signing root.
+    // Verify the signature against the expected mainnet signing root
+    // (GENESIS_FORK_VERSION = 0x00000000).
     let pubkey_arr: [u8; 48] = pubkey_bytes.try_into().unwrap();
-    let signing_root = expected_signing_root(pubkey_arr);
+    let signing_root = expected_signing_root(pubkey_arr, [0u8; 4]);
     let pubkey = crypto::PublicKey::from_bytes(&pubkey_arr).unwrap();
     let bls_sig = crypto::Signature::from_bytes(&sig_bytes).unwrap();
     assert!(
         bls_sig.verify(&pubkey, &signing_root).is_ok(),
         "signature must verify against DOMAIN_APPLICATION_BUILDER signing root \
          with GENESIS_FORK_VERSION=[0;4] and ZERO_HASH"
+    );
+}
+
+// ── Test 1b: Holesky KAT — server must use the per-network fork version ───────
+//
+// Holesky GENESIS_FORK_VERSION = 0x01017000 (report §4.2 network table;
+// Lighthouse `consensus/types/src/core/chain_spec.rs`). The request carries the
+// 4-byte version and the returned signature must verify against a domain built
+// from the byte-pinned literal `[0x01, 0x01, 0x70, 0x00]` — NOT an oracle that
+// re-derives the version through the server path. This is RED until the server
+// reads `genesis_fork_version` (issue 2.3): the unfixed server signs over the
+// mainnet `[0u8; 4]` domain, so the Holesky verification fails.
+
+#[tokio::test]
+async fn sign_builder_registration_holesky_domain() {
+    const HOLESKY_GENESIS_FORK_VERSION: [u8; 4] = [0x01, 0x01, 0x70, 0x00];
+
+    let (svc, _db_path) = make_service_with_db();
+    let pubkey_bytes = KNOWN_PUBKEY_BYTES.to_vec();
+
+    let req = Request::new(canonical_request(
+        pubkey_bytes.clone(),
+        HOLESKY_GENESIS_FORK_VERSION.to_vec(),
+    ));
+
+    let resp = svc
+        .sign_builder_registration(req)
+        .await
+        .expect("sign_builder_registration must succeed with known key");
+    let sig_bytes = resp.into_inner().signature;
+    assert_eq!(sig_bytes.len(), 96, "signature must be 96 bytes");
+
+    let pubkey_arr: [u8; 48] = pubkey_bytes.try_into().unwrap();
+    let signing_root = expected_signing_root(pubkey_arr, HOLESKY_GENESIS_FORK_VERSION);
+    let pubkey = crypto::PublicKey::from_bytes(&pubkey_arr).unwrap();
+    let bls_sig = crypto::Signature::from_bytes(&sig_bytes).unwrap();
+    assert!(
+        bls_sig.verify(&pubkey, &signing_root).is_ok(),
+        "signature must verify against the Holesky DOMAIN_APPLICATION_BUILDER \
+         signing root with GENESIS_FORK_VERSION=0x01017000 and ZERO_HASH"
     );
 }
 
@@ -104,6 +158,7 @@ async fn test_pubkey_mismatch_rejected() {
         fee_recipient: vec![0xabu8; 20],
         gas_limit: 30_000_000,
         timestamp: 1_700_000_000,
+        genesis_fork_version: vec![],
     });
 
     let err =
@@ -127,6 +182,7 @@ async fn test_fee_recipient_wrong_length_rejected() {
         fee_recipient: vec![0xabu8; 10], // wrong: must be 20
         gas_limit: 30_000_000,
         timestamp: 1_700_000_000,
+        genesis_fork_version: vec![],
     });
 
     let err = svc
@@ -142,7 +198,7 @@ async fn test_fee_recipient_wrong_length_rejected() {
 async fn test_builder_registration_unknown_key_returns_not_found() {
     let (svc, _db_path) = make_service_with_db_unknown_key();
 
-    let req = Request::new(canonical_request(KNOWN_PUBKEY_BYTES.to_vec()));
+    let req = Request::new(canonical_request(KNOWN_PUBKEY_BYTES.to_vec(), vec![]));
 
     let err = svc.sign_builder_registration(req).await.expect_err("unknown key must return error");
     assert_eq!(err.code(), tonic::Code::NotFound);
@@ -155,7 +211,7 @@ async fn test_builder_registration_not_slashable() {
     let (svc, db_path) = make_service_with_db();
 
     for _ in 0..2 {
-        let req = Request::new(canonical_request(KNOWN_PUBKEY_BYTES.to_vec()));
+        let req = Request::new(canonical_request(KNOWN_PUBKEY_BYTES.to_vec(), vec![]));
         svc.sign_builder_registration(req)
             .await
             .expect("builder registration must succeed — not slashable");
