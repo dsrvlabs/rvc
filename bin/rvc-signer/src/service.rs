@@ -909,8 +909,18 @@ impl SignerServiceV2 for SignerServiceImpl {
             pubkey: pubkey_bytes,
         };
 
-        // Per MEV-Boost spec: fixed GENESIS_FORK_VERSION=[0u8;4], ZERO_HASH=[0u8;32]
-        let genesis_fork_version = [0u8; 4];
+        // Per-network GENESIS_FORK_VERSION from the request; empty ⇒ mainnet
+        // 0x00000000 (back-compat). ZERO_HASH=[0u8;32] for the genesis gvr.
+        let genesis_fork_version: [u8; 4] = if r.genesis_fork_version.is_empty() {
+            [0u8; 4]
+        } else {
+            r.genesis_fork_version.as_slice().try_into().map_err(|_| {
+                Status::invalid_argument(format!(
+                    "genesis_fork_version must be 4 bytes, got {}",
+                    r.genesis_fork_version.len()
+                ))
+            })?
+        };
         let zero_hash = [0u8; 32];
         let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_hash);
         let signing_root = compute_signing_root(&registration, domain);
