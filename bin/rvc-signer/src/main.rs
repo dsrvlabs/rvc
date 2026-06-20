@@ -49,6 +49,12 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// `Serve` carries the full server-config arg set and is necessarily larger than
+// `SplitKey`. This enum is parsed exactly once at startup and immediately
+// matched/consumed, so the variant-size disparity costs nothing — boxing the
+// variant is not an option because clap's `Subcommand` derive requires the field
+// to implement `Args`, which `Box<ServeArgs>` does not.
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Start the gRPC signing server
     Serve(ServeArgs),
@@ -91,6 +97,31 @@ struct ServeArgs {
     /// Path to the TLS CA certificate file for client authentication (PEM)
     #[arg(long)]
     tls_ca_cert: Option<PathBuf>,
+
+    /// Enable the Web3Signer HTTP Remote Signing API (opt-in; gRPC stays on).
+    /// Parsed/resolved only for now; the listener is wired in a later phase.
+    #[arg(long, default_value_t = false)]
+    http_enabled: bool,
+
+    /// HTTP Remote Signing API listen address (host:port). Default :9000.
+    #[arg(long, default_value = config::DEFAULT_HTTP_LISTEN_ADDRESS)]
+    http_listen_address: String,
+
+    /// HTTP API TLS mode: "mtls" (default) or "server-tls-only".
+    #[arg(long, default_value = config::DEFAULT_HTTP_TLS_MODE)]
+    http_tls_mode: String,
+
+    /// HTTP API server certificate (PEM). Independent of the gRPC TLS material.
+    #[arg(long)]
+    http_tls_cert: Option<PathBuf>,
+
+    /// HTTP API server private key (PEM). Independent of the gRPC TLS material.
+    #[arg(long)]
+    http_tls_key: Option<PathBuf>,
+
+    /// HTTP API client CA certificate (PEM). Required in both TLS modes.
+    #[arg(long)]
+    http_tls_ca_cert: Option<PathBuf>,
 
     /// Validate configuration and exit without starting the server
     #[arg(long)]
@@ -635,6 +666,10 @@ fn resolve_config(args: &ServeArgs) -> Result<config::ResolvedConfig, Box<dyn st
     let listen_address_is_default = has_config && args.listen_address == DEFAULT_LISTEN_ADDRESS;
     let backend_is_default = has_config && matches!(args.backend, Backend::Basic);
     let reload_interval_is_default = has_config && args.reload_interval == 30;
+    let http_listen_address_is_default =
+        has_config && args.http_listen_address == config::DEFAULT_HTTP_LISTEN_ADDRESS;
+    let http_tls_mode_is_default =
+        has_config && args.http_tls_mode == config::DEFAULT_HTTP_TLS_MODE;
 
     #[cfg(feature = "dvt")]
     let dvt_timeout_is_default = has_config && args.dvt_timeout == 2000;
@@ -672,6 +707,14 @@ fn resolve_config(args: &ServeArgs) -> Result<config::ResolvedConfig, Box<dyn st
         dvt_index,
         dvt_timeout,
         dvt_timeout_is_default,
+        http_enabled: args.http_enabled,
+        http_listen_address: &args.http_listen_address,
+        http_listen_address_is_default,
+        http_tls_mode: &args.http_tls_mode,
+        http_tls_mode_is_default,
+        http_tls_cert: args.http_tls_cert.as_deref(),
+        http_tls_key: args.http_tls_key.as_deref(),
+        http_tls_ca_cert: args.http_tls_ca_cert.as_deref(),
     };
 
     config::merge_with_cli(file_config, &cli)

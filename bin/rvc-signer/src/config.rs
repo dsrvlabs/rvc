@@ -2,9 +2,47 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+/// Default HTTP Remote Signing API listen address (Web3Signer convention: port
+/// 9000). Parsed/resolved only this phase; the listener is bound in Phase 3,
+/// which normalizes the host portion as needed.
+pub const DEFAULT_HTTP_LISTEN_ADDRESS: &str = ":9000";
+
+/// Default HTTP TLS mode: mutual TLS (the recommended posture, FR-29).
+pub const DEFAULT_HTTP_TLS_MODE: &str = "mtls";
+
 #[derive(Debug, Default, Deserialize)]
 pub struct SignerConfig {
     pub signer: Option<SignerSection>,
+}
+
+/// TLS posture for the HTTP Remote Signing API listener (FR-28/FR-29, ADR-004).
+///
+/// In both modes the server presents a certificate and the CA stays required;
+/// only the *client*-auth requirement differs. Server authentication is never
+/// weakened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpTlsMode {
+    /// Mutual TLS: client cert required and verified against the configured CA.
+    /// Recommended/default posture (Lighthouse).
+    Mtls,
+    /// Server-TLS-only: server presents a cert; client cert is optional/absent.
+    /// Required for Prysm. Only the client-auth requirement is relaxed (opt-in).
+    ServerTlsOnly,
+}
+
+impl HttpTlsMode {
+    /// Parse from the config/CLI string. Accepts `"mtls"` and
+    /// `"server-tls-only"`; any other value is a hard resolve error (no silent
+    /// fallback).
+    fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "mtls" => Ok(Self::Mtls),
+            "server-tls-only" => Ok(Self::ServerTlsOnly),
+            other => Err(format!(
+                "invalid [signer.http] tls_mode {other:?}: expected \"mtls\" or \"server-tls-only\""
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -23,6 +61,30 @@ pub struct SignerSection {
     /// the reloader is not spawned regardless of `reload_interval_secs`.
     pub enable_hot_reload: Option<bool>,
     pub dvt: Option<DvtConfig>,
+    /// Opt-in Web3Signer HTTP API listener block (FR-25/27/28/30). Absent =
+    /// HTTP disabled; gRPC stays default-on.
+    pub http: Option<HttpSection>,
+}
+
+/// Opt-in `[signer.http]` config block for the Web3Signer HTTP API.
+///
+/// Parsed/resolved only in this phase — the listener is wired in Phase 3. The
+/// HTTP TLS material is independent of the gRPC listener's (FR-30), so gRPC can
+/// run mTLS while HTTP runs server-TLS-only.
+#[derive(Debug, Default, Deserialize)]
+pub struct HttpSection {
+    /// Enable the HTTP API. Default `false` (opt-in, FR-27).
+    pub enabled: Option<bool>,
+    /// Listen address. Default `:9000` (FR-25).
+    pub listen_address: Option<String>,
+    /// `"mtls"` (default) or `"server-tls-only"` (FR-28/29).
+    pub tls_mode: Option<String>,
+    /// Server cert / key / client CA — independent of the gRPC TLS material.
+    /// The CA is required in both modes (the requirement is enforced in Phase 3;
+    /// here the path is only resolved).
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
+    pub tls_ca_cert: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -52,6 +114,13 @@ pub struct ResolvedConfig {
     pub dvt_threshold: Option<u64>,
     pub dvt_index: Option<u64>,
     pub dvt_timeout_ms: u64,
+    /// Web3Signer HTTP API (opt-in; default off). gRPC is unaffected by these.
+    pub http_enabled: bool,
+    pub http_listen_address: String,
+    pub http_tls_mode: HttpTlsMode,
+    pub http_tls_cert: Option<PathBuf>,
+    pub http_tls_key: Option<PathBuf>,
+    pub http_tls_ca_cert: Option<PathBuf>,
 }
 
 pub struct CliOverrides<'a> {
@@ -74,6 +143,18 @@ pub struct CliOverrides<'a> {
     pub dvt_index: Option<u64>,
     pub dvt_timeout: u64,
     pub dvt_timeout_is_default: bool,
+    // --- Web3Signer HTTP API overrides (FR-25/27/28/30) ---
+    /// `--http-enabled`. Combined with the TOML value via OR (mirrors
+    /// `enable_hot_reload`): a clap bool can't distinguish explicit-false from
+    /// default-false, so the policy is "CLI flag set OR TOML `enabled = true`".
+    pub http_enabled: bool,
+    pub http_listen_address: &'a str,
+    pub http_listen_address_is_default: bool,
+    pub http_tls_mode: &'a str,
+    pub http_tls_mode_is_default: bool,
+    pub http_tls_cert: Option<&'a Path>,
+    pub http_tls_key: Option<&'a Path>,
+    pub http_tls_ca_cert: Option<&'a Path>,
 }
 
 pub fn load_config(path: &Path) -> Result<SignerConfig, Box<dyn std::error::Error>> {
@@ -144,6 +225,34 @@ pub fn merge_with_cli(
         dvt.timeout_ms.unwrap_or(cli.dvt_timeout)
     };
 
+    // --- Web3Signer HTTP API (opt-in; FR-25/27/28/30). Listener not bound this
+    // phase; an absent [signer.http] block leaves HTTP disabled and does not
+    // affect any gRPC-side resolution. ---
+    let http = section.http.unwrap_or_default();
+
+    // Opt-in: CLI flag OR TOML `enabled = true` (mirrors `enable_hot_reload`).
+    let http_enabled = cli.http_enabled || http.enabled.unwrap_or(false);
+
+    let http_listen_address = if !cli.http_listen_address_is_default {
+        cli.http_listen_address.to_string()
+    } else {
+        http.listen_address.unwrap_or_else(|| cli.http_listen_address.to_string())
+    };
+
+    // CLI > TOML > default; the resolved string is then parsed into the enum,
+    // so an invalid value is a hard error rather than a silent fallback.
+    let http_tls_mode_str = if !cli.http_tls_mode_is_default {
+        cli.http_tls_mode.to_string()
+    } else {
+        http.tls_mode.unwrap_or_else(|| cli.http_tls_mode.to_string())
+    };
+    let http_tls_mode = HttpTlsMode::parse(&http_tls_mode_str)?;
+
+    // Independent of the gRPC TLS material (FR-30) — do not alias the gRPC paths.
+    let http_tls_cert = cli.http_tls_cert.map(PathBuf::from).or(http.tls_cert);
+    let http_tls_key = cli.http_tls_key.map(PathBuf::from).or(http.tls_key);
+    let http_tls_ca_cert = cli.http_tls_ca_cert.map(PathBuf::from).or(http.tls_ca_cert);
+
     Ok(ResolvedConfig {
         listen_address,
         keystore_dir,
@@ -160,6 +269,12 @@ pub fn merge_with_cli(
         dvt_threshold,
         dvt_index,
         dvt_timeout_ms,
+        http_enabled,
+        http_listen_address,
+        http_tls_mode,
+        http_tls_cert,
+        http_tls_key,
+        http_tls_ca_cert,
     })
 }
 
@@ -196,6 +311,14 @@ mod tests {
             dvt_index: None,
             dvt_timeout: 2000,
             dvt_timeout_is_default: true,
+            http_enabled: false,
+            http_listen_address: DEFAULT_HTTP_LISTEN_ADDRESS,
+            http_listen_address_is_default: true,
+            http_tls_mode: DEFAULT_HTTP_TLS_MODE,
+            http_tls_mode_is_default: true,
+            http_tls_cert: None,
+            http_tls_key: None,
+            http_tls_ca_cert: None,
         }
     }
 
@@ -484,5 +607,138 @@ dry_run = true
         let resolved = merge_with_cli(config, &cli).unwrap();
 
         assert_eq!(resolved.password_dir.unwrap(), PathBuf::from("/cli/pwdir"));
+    }
+
+    // --- [signer.http] config surface (Issue 1.3, FR-25/27/28/30) ---
+
+    #[test]
+    fn test_load_http_section_full() {
+        let f = write_toml(
+            r#"
+[signer]
+keystore_dir = "/ks"
+
+[signer.http]
+enabled = true
+listen_address = "0.0.0.0:9000"
+tls_mode = "server-tls-only"
+tls_cert = "/http/cert.pem"
+tls_key = "/http/key.pem"
+tls_ca_cert = "/http/ca.pem"
+"#,
+        );
+        let cfg = load_config(f.path()).unwrap();
+        let http = cfg.signer.unwrap().http.unwrap();
+        assert_eq!(http.enabled, Some(true));
+        assert_eq!(http.listen_address.unwrap(), "0.0.0.0:9000");
+        assert_eq!(http.tls_mode.unwrap(), "server-tls-only");
+        assert_eq!(http.tls_cert.unwrap(), PathBuf::from("/http/cert.pem"));
+        assert_eq!(http.tls_key.unwrap(), PathBuf::from("/http/key.pem"));
+        assert_eq!(http.tls_ca_cert.unwrap(), PathBuf::from("/http/ca.pem"));
+    }
+
+    #[test]
+    fn test_http_defaults_when_block_absent() {
+        // No [signer.http]: HTTP disabled, default address/mode, gRPC untouched.
+        let cli = CliOverrides { keystore_dir: Some(Path::new("/ks")), ..default_cli_overrides() };
+        let resolved = merge_with_cli(SignerConfig::default(), &cli).unwrap();
+        assert!(!resolved.http_enabled);
+        assert_eq!(resolved.http_listen_address, ":9000");
+        assert_eq!(resolved.http_tls_mode, HttpTlsMode::Mtls);
+        assert!(resolved.http_tls_cert.is_none());
+        assert!(resolved.http_tls_key.is_none());
+        assert!(resolved.http_tls_ca_cert.is_none());
+        // gRPC-side resolution unchanged by the absent HTTP block.
+        assert_eq!(resolved.listen_address, "127.0.0.1:50052");
+        assert_eq!(resolved.backend, "basic");
+    }
+
+    #[test]
+    fn test_http_resolved_from_file() {
+        let config = SignerConfig {
+            signer: Some(SignerSection {
+                keystore_dir: Some(PathBuf::from("/ks")),
+                http: Some(HttpSection {
+                    enabled: Some(true),
+                    listen_address: Some("0.0.0.0:9000".to_string()),
+                    tls_mode: Some("server-tls-only".to_string()),
+                    tls_cert: Some(PathBuf::from("/http/cert.pem")),
+                    tls_key: Some(PathBuf::from("/http/key.pem")),
+                    tls_ca_cert: Some(PathBuf::from("/http/ca.pem")),
+                }),
+                ..Default::default()
+            }),
+        };
+        let resolved = merge_with_cli(config, &default_cli_overrides()).unwrap();
+        assert!(resolved.http_enabled);
+        assert_eq!(resolved.http_listen_address, "0.0.0.0:9000");
+        assert_eq!(resolved.http_tls_mode, HttpTlsMode::ServerTlsOnly);
+        assert_eq!(resolved.http_tls_cert.unwrap(), PathBuf::from("/http/cert.pem"));
+        assert_eq!(resolved.http_tls_key.unwrap(), PathBuf::from("/http/key.pem"));
+        assert_eq!(resolved.http_tls_ca_cert.unwrap(), PathBuf::from("/http/ca.pem"));
+    }
+
+    #[test]
+    fn test_http_cli_overrides_file() {
+        let config = SignerConfig {
+            signer: Some(SignerSection {
+                keystore_dir: Some(PathBuf::from("/ks")),
+                http: Some(HttpSection {
+                    enabled: Some(false),
+                    listen_address: Some("0.0.0.0:9000".to_string()),
+                    tls_mode: Some("mtls".to_string()),
+                    tls_cert: Some(PathBuf::from("/file/cert.pem")),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let cli = CliOverrides {
+            keystore_dir: Some(Path::new("/ks")),
+            http_enabled: true, // CLI flag set
+            http_listen_address: "127.0.0.1:7000",
+            http_listen_address_is_default: false,
+            http_tls_mode: "server-tls-only",
+            http_tls_mode_is_default: false,
+            http_tls_cert: Some(Path::new("/cli/cert.pem")),
+            ..default_cli_overrides()
+        };
+        let resolved = merge_with_cli(config, &cli).unwrap();
+        assert!(resolved.http_enabled); // CLI flag OR file → enabled
+        assert_eq!(resolved.http_listen_address, "127.0.0.1:7000");
+        assert_eq!(resolved.http_tls_mode, HttpTlsMode::ServerTlsOnly);
+        assert_eq!(resolved.http_tls_cert.unwrap(), PathBuf::from("/cli/cert.pem"));
+    }
+
+    #[test]
+    fn test_http_invalid_tls_mode_is_hard_error() {
+        let config = SignerConfig {
+            signer: Some(SignerSection {
+                keystore_dir: Some(PathBuf::from("/ks")),
+                http: Some(HttpSection {
+                    tls_mode: Some("none".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        let err = merge_with_cli(config, &default_cli_overrides()).unwrap_err().to_string();
+        assert!(err.contains("tls_mode"), "error must name the offending field: {err}");
+        assert!(err.contains("none"), "error must name the bad value: {err}");
+    }
+
+    #[test]
+    fn test_http_default_mode_is_mtls_when_enabled_without_mode() {
+        let config = SignerConfig {
+            signer: Some(SignerSection {
+                keystore_dir: Some(PathBuf::from("/ks")),
+                http: Some(HttpSection { enabled: Some(true), ..Default::default() }),
+                ..Default::default()
+            }),
+        };
+        let resolved = merge_with_cli(config, &default_cli_overrides()).unwrap();
+        assert!(resolved.http_enabled);
+        assert_eq!(resolved.http_tls_mode, HttpTlsMode::Mtls);
+        assert_eq!(resolved.http_listen_address, ":9000");
     }
 }
