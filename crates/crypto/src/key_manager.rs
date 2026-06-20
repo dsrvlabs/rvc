@@ -13,6 +13,9 @@ use super::error::KeyManagerError;
 use super::keystore::Keystore;
 use super::logging::TruncatedPubkey;
 
+/// Reserved password-map key for the wildcard (global default) password.
+pub const WILDCARD_KEY: &str = "*";
+
 /// A prepared decryption work item. Produced by Phase 1, consumed by Phase 2.
 struct DecryptionTask<'a> {
     file_path: PathBuf,

@@ -114,6 +114,15 @@ mod tests {
         assert_eq!(strip_prefix_strict("0xABCDEF"), Ok("ABCDEF"));
     }
 
+    #[test]
+    fn test_wildcard_unchanged() {
+        // Invariant relied on by `Config::load_passwords()`'s `*` wildcard branch: `"*"`
+        // has no `0x`/`0X` prefix, so it passes through unchanged and is never rejected.
+        // If this ever started rejecting or transforming `"*"`, the wildcard password
+        // parsing must be revisited.
+        assert_eq!(strip_prefix_strict("*"), Ok("*"));
+    }
+
     // ── property tests ──────────────────────────────────────────────────────
 
     proptest! {
