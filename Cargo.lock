@@ -4383,6 +4383,7 @@ dependencies = [
  "blst",
  "clap",
  "hex",
+ "hyper",
  "hyper-util",
  "libc",
  "parking_lot",

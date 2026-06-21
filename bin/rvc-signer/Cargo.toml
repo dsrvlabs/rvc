@@ -73,7 +73,13 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 # resolve to versions already in Cargo.lock (axum 0.7.9, hyper-util 0.1.20,
 # rustls-pemfile 2.2.0) — zero net-new compiled crates. Unused until Phase 2.
 axum = "0.7"
-hyper-util = "0.1"
+# `hyper` (http1 serve_connection) + `hyper-util` (TokioIo/TokioTimer) + `tower`
+# (ServiceExt::oneshot) drive the Phase-3 accept loop (Issue 3.3). All are already
+# resolved in Cargo.lock (hyper 1.8.1, hyper-util 0.1.20, tower) via axum/tonic —
+# zero net-new compiled crates; these add only direct-dependency declarations.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { workspace = true, features = ["util"] }
 rustls-pemfile = "2"
 prometheus.workspace = true
 tracing.workspace = true
@@ -107,6 +113,9 @@ eth-types.workspace = true
 slashing.workspace = true
 # Drives the axum Router in-memory (oneshot) for socket-free http_api tests.
 tower = { workspace = true, features = ["util"] }
+# The `client` hyper feature drives the real-TLS-client integration tests for
+# the Issue 3.3 accept loop. Dev-only so production hyper stays server+http1.
+hyper = { version = "1", features = ["client"] }
 
 # DVT test dependencies (always available in tests when dvt feature is on)
 vsss-rs.workspace = true

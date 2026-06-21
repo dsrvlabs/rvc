@@ -50,15 +50,37 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
+use axum::Router;
+use hyper::body::Incoming;
+use hyper::server::conn::http1;
+use hyper::service::service_fn;
+use hyper::Request;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::rustls::{
     self,
     pki_types::{CertificateDer, PrivateKeyDer},
     server::{VerifierBuilderError, WebPkiClientVerifier},
     RootCertStore, ServerConfig,
 };
+use tokio_rustls::TlsAcceptor;
+use tower::ServiceExt;
 
 use crate::config::HttpTlsMode;
+
+/// The leaf client certificate from the TLS handshake, injected as a request
+/// extension so the audit layer (Issue 3.4) can derive the client CN. `None` on
+/// a server-TLS-only / no-cert connection (→ `AUDIT_CN_DEFAULT`).
+#[derive(Clone, Debug)]
+pub struct PeerCert(pub Option<CertificateDer<'static>>);
+
+/// Per-connection handshake timeout: a stalled client cannot hold a task open.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Slow-header (slowloris) bound on each accepted connection (SEC-2.11-01, the
+/// Phase-2 request-hardening carry-forward).
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Errors building the HTTP listener's rustls `ServerConfig` (Issue 3.1).
 ///
@@ -197,6 +219,78 @@ fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, HttpTlsError> {
     rustls_pemfile::private_key(&mut pem.as_slice())
         .map_err(|e| HttpTlsError::Pem(path.to_path_buf(), e))?
         .ok_or_else(|| HttpTlsError::NoPrivateKey(path.to_path_buf()))
+}
+
+/// Serve the Web3Signer HTTP API over TLS on `listener` (ADR-005, R7).
+///
+/// Per accepted connection: complete the rustls handshake (bounded by
+/// [`HANDSHAKE_TIMEOUT`]), extract the leaf client cert into a [`PeerCert`]
+/// request extension, and serve the **opaque** `router` over HTTP/1.1 via hyper
+/// `serve_connection` (no upgrades — research R6). Each connection runs in its
+/// own `tokio::spawn`, so one bad client (handshake failure or a panicking
+/// handler) never wedges the accept loop or the process. A `header_read_timeout`
+/// bounds slow-header (slowloris) connections.
+///
+/// `router` is taken as an opaque [`axum::Router`]; this module stays ignorant
+/// of `/sign` and the gate (extraction-readiness). Runs until cancelled; mirrors
+/// the proven `serve_metrics` spawn shape.
+pub async fn serve_https(listener: TcpListener, tls: Arc<ServerConfig>, router: Router) {
+    let acceptor = TlsAcceptor::from(tls);
+    loop {
+        let (tcp, _peer) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                // A transient accept error must not wedge the loop.
+                tracing::warn!(error = %e, "HTTP listener: accept failed");
+                continue;
+            }
+        };
+        let acceptor = acceptor.clone();
+        let router = router.clone();
+        tokio::spawn(async move {
+            serve_one(acceptor, tcp, router).await;
+        });
+    }
+}
+
+/// Handshake one connection, inject [`PeerCert`], and serve `router` over it.
+async fn serve_one(acceptor: TlsAcceptor, tcp: TcpStream, router: Router) {
+    let tls_stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            // Handshake failure (e.g. an mTLS client with no/invalid cert) drops
+            // this connection only; the accept loop keeps serving others.
+            tracing::debug!(error = %e, "TLS handshake failed");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!("TLS handshake timed out");
+            return;
+        }
+    };
+
+    // Leaf client cert (owned so it outlives the borrow); `None` in
+    // server-TLS-only / no-cert connections.
+    let leaf = tls_stream
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|chain| chain.first())
+        .map(|cert| cert.clone().into_owned());
+    let peer = PeerCert(leaf);
+
+    // Inject the per-connection PeerCert into every request, then serve the
+    // opaque Router (tower) via hyper. `oneshot` drives poll_ready + call.
+    let service = service_fn(move |mut req: Request<Incoming>| {
+        req.extensions_mut().insert(peer.clone());
+        router.clone().oneshot(req)
+    });
+
+    let mut builder = http1::Builder::new();
+    builder.timer(TokioTimer::new()).header_read_timeout(HEADER_READ_TIMEOUT);
+    if let Err(e) = builder.serve_connection(TokioIo::new(tls_stream), service).await {
+        tracing::debug!(error = %e, "HTTP connection closed with error");
+    }
 }
 
 /// Install the `ring` rustls provider as the process-global default.
@@ -516,6 +610,122 @@ mod tests {
             matches!(err, HttpTlsError::ServerCert(_)),
             "cert/key mismatch must be rejected at build time, got {err:?}"
         );
+    }
+
+    // ── serve_https accept loop (Issue 3.3) ──────────────────────────────────
+
+    use axum::routing::get;
+    use axum::Extension;
+
+    async fn peer_handler(Extension(PeerCert(leaf)): Extension<PeerCert>) -> &'static str {
+        if leaf.is_some() {
+            "some"
+        } else {
+            "none"
+        }
+    }
+
+    async fn panic_handler() -> &'static str {
+        panic!("intentional handler panic")
+    }
+
+    /// An OPAQUE test router (no gate/state) with a route that reflects the
+    /// injected `PeerCert`, a panicking route, and a liveness route.
+    fn serve_test_router() -> Router {
+        Router::new()
+            .route("/peer", get(peer_handler))
+            .route("/ok", get(|| async { "ok" }))
+            .route("/panic", get(panic_handler))
+    }
+
+    /// Spawn `serve_https` on an ephemeral loopback port; return its address.
+    async fn start_server(mode: HttpTlsMode, pki: &Pki) -> std::net::SocketAddr {
+        install_crypto_provider();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_https(listener, server_cfg(pki, mode), serve_test_router()));
+        addr
+    }
+
+    /// One real HTTPS GET over a fresh TLS connection (raw hyper client), using
+    /// `client` (with or without a client identity). `Err` if the TLS handshake
+    /// or the request fails.
+    async fn https_get(
+        addr: std::net::SocketAddr,
+        client: Arc<ClientConfig>,
+        path: &str,
+    ) -> Result<(axum::http::StatusCode, String), String> {
+        let tcp = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+        let connector = TlsConnector::from(client);
+        let name = ServerName::try_from("localhost").unwrap();
+        let tls = connector.connect(name, tcp).await.map_err(|e| e.to_string())?;
+
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+            .await
+            .map_err(|e| e.to_string())?;
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = Request::builder()
+            .uri(path)
+            .header("host", "localhost")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = sender.send_request(req).await.map_err(|e| e.to_string())?;
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(axum::body::Body::new(resp.into_body()), usize::MAX)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok((status, String::from_utf8(bytes.to_vec()).unwrap()))
+    }
+
+    #[tokio::test]
+    async fn mtls_client_cert_is_injected_as_peer_cert_some() {
+        let pki = test_pki();
+        let addr = start_server(HttpTlsMode::Mtls, &pki).await;
+        let client = client_cfg(&pki, Some((&pki.client_chain, &pki.client_key)));
+        let (status, body) = https_get(addr, client, "/peer").await.expect("mTLS request succeeds");
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, "some", "the leaf client cert must reach the handler as PeerCert(Some)");
+    }
+
+    #[tokio::test]
+    async fn server_tls_only_no_cert_is_peer_cert_none() {
+        let pki = test_pki();
+        let addr = start_server(HttpTlsMode::ServerTlsOnly, &pki).await;
+        let client = client_cfg(&pki, None);
+        let (status, body) = https_get(addr, client, "/peer").await.expect("no-cert request ok");
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, "none", "a no-cert connection must yield PeerCert(None)");
+    }
+
+    #[tokio::test]
+    async fn handshake_failure_does_not_wedge_the_loop() {
+        let pki = test_pki();
+        let addr = start_server(HttpTlsMode::Mtls, &pki).await;
+        // A no-cert client against mTLS fails the handshake — its connection dies.
+        let bad = https_get(addr, client_cfg(&pki, None), "/ok").await;
+        assert!(bad.is_err(), "no-cert client must be rejected at handshake");
+        // The loop must still serve a subsequent good client.
+        let good = client_cfg(&pki, Some((&pki.client_chain, &pki.client_key)));
+        let (status, body) = https_get(addr, good, "/ok").await.expect("loop still serves");
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, "ok");
+    }
+
+    #[tokio::test]
+    async fn handler_panic_does_not_take_down_the_listener() {
+        let pki = test_pki();
+        let addr = start_server(HttpTlsMode::ServerTlsOnly, &pki).await;
+        // Trigger a handler panic on one connection (the request errors as the
+        // connection task aborts) — the spawned-task panic is isolated by tokio.
+        let _ = https_get(addr, client_cfg(&pki, None), "/panic").await;
+        // A new connection must still be served.
+        let (status, body) =
+            https_get(addr, client_cfg(&pki, None), "/ok").await.expect("listener survived");
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, "ok");
     }
 
     /// After the install a process-global default provider is available.
