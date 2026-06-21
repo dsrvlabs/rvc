@@ -133,7 +133,7 @@ mod tests {
     // `rvc-beacon::BeaconBlockHeader` DTO exists and would compute a garbage root.
     use eth_types::{
         AttestationData, BeaconBlockHeader, Checkpoint, Root, DOMAIN_BEACON_ATTESTER,
-        DOMAIN_BEACON_PROPOSER,
+        DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
     };
 
     const CURRENT_VERSION: [u8; 4] = [0x04, 0x00, 0x00, 0x00];
@@ -228,6 +228,20 @@ mod tests {
         )
     }
 
+    fn randao_body(epoch: u64) -> String {
+        format!(
+            r#"{{ "type": "RANDAO_REVEAL", {fi}, "randao_reveal": {{ "epoch": "{epoch}" }} }}"#,
+            fi = fork_info_json(),
+        )
+    }
+
+    fn aggregation_slot_body(slot: u64) -> String {
+        format!(
+            r#"{{ "type": "AGGREGATION_SLOT", {fi}, "aggregation_slot": {{ "slot": "{slot}" }} }}"#,
+            fi = fork_info_json(),
+        )
+    }
+
     async fn post_sign(
         state: crate::http_api::Web3SignerState,
         identifier: &str,
@@ -277,6 +291,55 @@ mod tests {
             !body.contains(".db") && !body.to_lowercase().contains("sqlite"),
             "no DB internals: {body}"
         );
+    }
+
+    // ── RANDAO_REVEAL + AGGREGATION_SLOT (Issue 2.10): non-slashable KATs ─────
+
+    /// Sign `body` with a fresh real-key gate and return the raw 96-byte sig.
+    async fn sign_ok(body: String) -> Vec<u8> {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let resp = post_sign(state, &id, Some("application/json"), body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let hexsig = v["signature"].as_str().unwrap().strip_prefix("0x").unwrap().to_string();
+        hex::decode(hexsig).unwrap()
+    }
+
+    #[tokio::test]
+    async fn randao_reveal_kat_signs_epoch_under_randao_domain() {
+        let (sk, _) = test_keypair();
+        let domain = compute_domain(DOMAIN_RANDAO, CURRENT_VERSION, expected_gvr());
+        let expected = sk.sign(&compute_signing_root(&42u64, domain)).to_bytes();
+        assert_eq!(sign_ok(randao_body(42)).await, expected.to_vec());
+    }
+
+    #[tokio::test]
+    async fn aggregation_slot_kat_signs_slot_under_selection_proof_domain() {
+        let (sk, _) = test_keypair();
+        let domain = compute_domain(DOMAIN_SELECTION_PROOF, CURRENT_VERSION, expected_gvr());
+        let expected = sk.sign(&compute_signing_root(&77u64, domain)).to_bytes();
+        assert_eq!(sign_ok(aggregation_slot_body(77)).await, expected.to_vec());
+    }
+
+    /// RANDAO and AGGREGATION_SLOT share neither domain nor gate method; the same
+    /// scalar must NOT collide (0x02 RANDAO vs 0x05 SELECTION_PROOF).
+    #[tokio::test]
+    async fn randao_and_aggregation_slot_domains_do_not_collide() {
+        assert_ne!(sign_ok(randao_body(7)).await, sign_ok(aggregation_slot_body(7)).await);
+    }
+
+    /// Non-slashable: re-signing the same RANDAO succeeds (no slashing-DB row).
+    #[tokio::test]
+    async fn randao_reveal_is_non_slashable_resign_ok() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        for _ in 0..2 {
+            let resp = post_sign(state.clone(), &id, None, randao_body(9)).await;
+            assert_eq!(resp.status(), StatusCode::OK, "randao is non-slashable");
+        }
     }
 
     // ── BLOCK_V2 (Issue 2.9): KAT over the block header + double-proposal 412 ─
