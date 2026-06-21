@@ -1283,4 +1283,144 @@ mod tests {
         // the server's parse + dispatch agree with the eth-types Electra root.
         assert_eq!(sign_ok(fixture).await, expected.to_vec());
     }
+
+    // ── Issue 5.4: all-types completeness + regression gate ──────────────────
+
+    /// One valid body per supported Web3Signer `type` (FR-4..FR-14) — every duty
+    /// a running validator performs. The full Web3Signer protocol also defines
+    /// BLOCK v1 / DEPOSIT etc., which are out of scope for a VC (PRD); the 11
+    /// here are the complete dispatchable set.
+    fn all_supported_type_bodies() -> Vec<(&'static str, String)> {
+        vec![
+            ("BLOCK_V2", block_v2_body(0x11)),
+            ("ATTESTATION", attestation_body(None)),
+            ("RANDAO_REVEAL", randao_body(42)),
+            ("AGGREGATION_SLOT", aggregation_slot_body(77)),
+            (
+                "AGGREGATE_AND_PROOF",
+                p1_body(
+                    "AGGREGATE_AND_PROOF",
+                    "aggregate_and_proof",
+                    serde_json::to_string(&sample_aggregate_and_proof()).unwrap(),
+                ),
+            ),
+            (
+                "SYNC_COMMITTEE_MESSAGE",
+                p1_body(
+                    "SYNC_COMMITTEE_MESSAGE",
+                    "sync_committee_message",
+                    serde_json::to_string(&SyncCommitteeMessage {
+                        slot: 5,
+                        beacon_block_root: [0x22; 32],
+                        validator_index: 0,
+                        signature: dummy_sig(),
+                    })
+                    .unwrap(),
+                ),
+            ),
+            (
+                "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF",
+                p1_body(
+                    "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF",
+                    "contribution_and_proof",
+                    serde_json::to_string(&sample_contribution_and_proof()).unwrap(),
+                ),
+            ),
+            ("SYNC_COMMITTEE_SELECTION_PROOF", sync_selection_body(5, 1)),
+            ("VALIDATOR_REGISTRATION", registration_body(&sample_registration(), true)),
+            ("VOLUNTARY_EXIT", voluntary_exit_body(256, 99)),
+            ("AGGREGATE_AND_PROOF_V2", electra_v2_frozen_fixture()),
+        ]
+    }
+
+    /// Completeness: every supported type dispatches end-to-end to `200` with a
+    /// signature, after the P2 arms landed. A regression in any arm fails here.
+    #[tokio::test]
+    async fn all_supported_types_dispatch_to_200() {
+        let bodies = all_supported_type_bodies();
+        assert_eq!(bodies.len(), 11, "all FR-4..FR-14 types are covered");
+        for (type_name, body) in bodies {
+            let (sk, pk_bytes) = test_keypair();
+            let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+            let id = format!("0x{}", hex::encode(pk_bytes));
+            let resp = post_sign(state, &id, None, body).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{type_name} must dispatch to 200");
+        }
+    }
+
+    /// A bogus/unknown `type` is rejected with `400`, never a panic — the
+    /// dispatcher's tagged-enum decode fails closed.
+    #[tokio::test]
+    async fn unknown_type_returns_400_not_panic() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = format!(
+            r#"{{ "type": "NOT_A_REAL_TYPE", {fi}, "whatever": {{}} }}"#,
+            fi = fork_info_json(),
+        );
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Status-mapping spot-check after the P2 arms: a valid body to an unloaded
+    /// key still resolves to `404` pre-gate (the `412`/`500`/signingRoot-`400`
+    /// paths are covered by the per-type tests above).
+    #[tokio::test]
+    async fn completeness_unknown_key_still_404() {
+        let state = test_state(Arc::new(MockBackend::empty()));
+        let id = format!("0x{}", "ab".repeat(48));
+        let resp = post_sign(state, &id, None, voluntary_exit_body(7, 1)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `Accept` negotiation holds for the new P2 types: `text/plain` → bare
+    /// `0x..` (2 + 192 hex), JSON default → `{"signature":"0x.."}`.
+    #[tokio::test]
+    async fn p2_types_honor_accept_text_plain_and_json() {
+        for body in [voluntary_exit_body(7, 1), electra_v2_frozen_fixture()] {
+            let (sk, pk_bytes) = test_keypair();
+            let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+            let id = format!("0x{}", hex::encode(pk_bytes));
+
+            let r = post_sign(state.clone(), &id, Some("text/plain"), body.clone()).await;
+            assert_eq!(r.status(), StatusCode::OK);
+            let t = String::from_utf8(body_bytes(r).await).unwrap();
+            assert!(t.starts_with("0x") && !t.contains('{'), "bare 0x body: {t}");
+            assert_eq!(t.len(), 2 + 192, "0x + 96-byte sig hex");
+
+            let r = post_sign(state, &id, None, body).await;
+            assert_eq!(r.status(), StatusCode::OK);
+            let j = String::from_utf8(body_bytes(r).await).unwrap();
+            assert!(j.contains("\"signature\"") && j.contains("0x"), "json body: {j}");
+        }
+    }
+
+    /// The P2 arms inherit Phase-4 audit + metrics automatically: each emits an
+    /// audit line (type + success) and increments the per-type success counter,
+    /// matching FR-33/FR-34.
+    #[traced_test]
+    #[tokio::test]
+    async fn p2_types_emit_audit_and_metrics() {
+        for (type_name, body) in [
+            ("VOLUNTARY_EXIT", voluntary_exit_body(7, 1)),
+            ("AGGREGATE_AND_PROOF_V2", electra_v2_frozen_fixture()),
+        ] {
+            let (sk, pk_bytes) = test_keypair();
+            let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+            let metrics = Arc::clone(&state.metrics);
+            let id = format!("0x{}", hex::encode(pk_bytes));
+
+            let resp = post_sign(state, &id, None, body).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            assert_eq!(
+                metrics.http_sign_total.with_label_values(&[type_name, "success"]).get(),
+                1,
+                "{type_name} success metric fired"
+            );
+            assert!(logs_contain(&format!("rpc={type_name}")), "{type_name} audited");
+            assert!(logs_contain("result=success"));
+        }
+    }
 }
