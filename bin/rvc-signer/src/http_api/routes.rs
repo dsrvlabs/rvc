@@ -8,12 +8,13 @@ use axum::extract::{Path, State};
 use axum::http::header::ACCEPT;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
+use axum::{Extension, Json};
 
 use super::dispatch::{plan_sign, Slashing};
 use super::pubkey::{resolve_identifier, PubkeyError};
 use super::request::{SignPayload, SignRequest};
 use super::response::{sign_response, HttpSignError};
+use super::tls::{audit_cn, PeerCert};
 use super::Web3SignerState;
 
 /// `GET /upcheck` — liveness probe (FR-1).
@@ -50,11 +51,17 @@ pub(super) async fn public_keys(State(state): State<Web3SignerState>) -> Json<Ve
 pub(super) async fn sign(
     State(state): State<Web3SignerState>,
     Path(identifier): Path<String>,
+    peer: Option<Extension<PeerCert>>,
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
     let accept = headers.get(ACCEPT).and_then(|v| v.to_str().ok());
-    match sign_inner(&state, &identifier, accept, body.as_ref()).await {
+    // Derive the audit CN from the TLS peer cert (Phase 3). `None` extension
+    // (socket-free tests / no-TLS) or no client cert (Prysm / server-TLS-only)
+    // both degrade to the configured default (`AUDIT_CN_DEFAULT`). The CN is
+    // NEVER an authorization gate — a missing CN still signs.
+    let cn = audit_cn(peer.as_ref().map(|Extension(p)| p), &state.audit.default_cn);
+    match sign_inner(&state, &identifier, accept, &cn, body.as_ref()).await {
         Ok(resp) => resp,
         Err(e) => e.into_response(),
     }
@@ -66,6 +73,7 @@ async fn sign_inner(
     state: &Web3SignerState,
     identifier: &str,
     accept: Option<&str>,
+    cn: &str,
     body: &[u8],
 ) -> Result<Response, HttpSignError> {
     // 1. Resolve {identifier} to a loaded key: malformed → 400, unloaded → 404.
@@ -88,9 +96,8 @@ async fn sign_inner(
     let plan = plan_sign(&req)?;
     let root = plan.signing_root;
 
-    // 4. Route to the matching gate method. The CN is the Phase-2 audit default
-    //    (the TLS peer-cert CN is wired in Phase 3).
-    let cn = state.audit.default_cn.as_str();
+    // 4. Route to the matching gate method. `cn` is the TLS peer-cert audit CN
+    //    derived by the caller (Phase 3), or the audit default.
     let sig = match plan.slashing {
         Slashing::Block { slot, gvr } => state.gate.sign_block(&pubkey, slot, root, gvr, cn).await,
         Slashing::Attestation { source_epoch, target_epoch, gvr } => {

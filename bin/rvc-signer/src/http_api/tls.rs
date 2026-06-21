@@ -76,6 +76,20 @@ use crate::config::HttpTlsMode;
 #[derive(Clone, Debug)]
 pub struct PeerCert(pub Option<CertificateDer<'static>>);
 
+/// Derive the audit CN for a request from its [`PeerCert`] (Issue 3.4, FR-33 CN
+/// portion, R9).
+///
+/// Reuses `audit::cn::extract_cn_from_der` verbatim (first-CN-wins — identical
+/// CN semantics to the gRPC path) and degrades to `default`
+/// (`signer::AUDIT_CN_DEFAULT`) when there is no client cert (Prysm /
+/// server-TLS-only) or the leaf carries no parseable CN. The CN is for audit
+/// only and MUST NOT gate authorization — a `None` CN still signs.
+pub(crate) fn audit_cn(peer: Option<&PeerCert>, default: &str) -> String {
+    peer.and_then(|p| p.0.as_ref())
+        .and_then(|der| crate::audit::cn::extract_cn_from_der(der.as_ref()))
+        .unwrap_or_else(|| default.to_string())
+}
+
 /// Per-connection handshake timeout: a stalled client cannot hold a task open.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Slow-header (slowloris) bound on each accepted connection (SEC-2.11-01, the
@@ -344,7 +358,11 @@ mod tests {
         ca: &rcgen::Certificate,
         ca_key: &KeyPair,
     ) -> (Vec<CertificateDer<'static>>, Vec<u8>) {
-        let params = CertificateParams::new(vec![name.to_string()]).unwrap();
+        let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
+        // Set an explicit CommonName (= `name`) so the leaf carries a CN the audit
+        // extractor (Issue 3.4) can read — CN lives in the DN, not the SAN.
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params.distinguished_name.push(rcgen::DnType::CommonName, name);
         let key = KeyPair::generate().unwrap();
         let cert = params.signed_by(&key, ca, ca_key).unwrap();
         (vec![cert.der().clone()], key.serialize_der())
@@ -629,11 +647,18 @@ mod tests {
         panic!("intentional handler panic")
     }
 
+    /// Reflects the audit CN derived from the connection's `PeerCert` (Issue 3.4).
+    async fn cn_handler(Extension(peer): Extension<PeerCert>) -> String {
+        audit_cn(Some(&peer), signer::AUDIT_CN_DEFAULT)
+    }
+
     /// An OPAQUE test router (no gate/state) with a route that reflects the
-    /// injected `PeerCert`, a panicking route, and a liveness route.
+    /// injected `PeerCert`, the derived audit CN, a panicking route, and a
+    /// liveness route.
     fn serve_test_router() -> Router {
         Router::new()
             .route("/peer", get(peer_handler))
+            .route("/cn", get(cn_handler))
             .route("/ok", get(|| async { "ok" }))
             .route("/panic", get(panic_handler))
     }
@@ -726,6 +751,60 @@ mod tests {
             https_get(addr, client_cfg(&pki, None), "/ok").await.expect("listener survived");
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(body, "ok");
+    }
+
+    // ── audit CN derivation (Issue 3.4) ──────────────────────────────────────
+
+    /// A self-signed leaf carrying CN = `cn` (or no CN when `None`), as DER.
+    fn self_signed_with_cn(cn: Option<&str>) -> CertificateDer<'static> {
+        let mut params = CertificateParams::new(vec!["host.example".to_string()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        if let Some(cn) = cn {
+            params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        }
+        let key = KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().der().clone()
+    }
+
+    #[test]
+    fn audit_cn_reads_the_leaf_common_name() {
+        let peer = PeerCert(Some(self_signed_with_cn(Some("lighthouse-vc-1"))));
+        assert_eq!(audit_cn(Some(&peer), "signing-gate"), "lighthouse-vc-1");
+    }
+
+    #[test]
+    fn audit_cn_none_falls_back_to_default() {
+        assert_eq!(audit_cn(Some(&PeerCert(None)), "signing-gate"), "signing-gate");
+        assert_eq!(audit_cn(None, "signing-gate"), "signing-gate");
+    }
+
+    #[test]
+    fn audit_cn_cert_without_cn_falls_back_to_default() {
+        let peer = PeerCert(Some(self_signed_with_cn(None)));
+        assert_eq!(audit_cn(Some(&peer), "signing-gate"), "signing-gate");
+    }
+
+    #[tokio::test]
+    async fn server_tls_only_cert_bearing_client_yields_its_real_cn() {
+        // AC: a client that DOES present a cert on a server-TLS-only listener
+        // still has its CN extracted (allow_unauthenticated relaxes "required",
+        // not the cert's CA-validation or its CN).
+        let pki = test_pki();
+        let addr = start_server(HttpTlsMode::ServerTlsOnly, &pki).await;
+        let client = client_cfg(&pki, Some((&pki.client_chain, &pki.client_key)));
+        let (status, body) = https_get(addr, client, "/cn").await.expect("request ok");
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, "client", "the leaf CN must reach the audit layer");
+    }
+
+    #[tokio::test]
+    async fn server_tls_only_no_cert_yields_default_cn() {
+        let pki = test_pki();
+        let addr = start_server(HttpTlsMode::ServerTlsOnly, &pki).await;
+        let (status, body) =
+            https_get(addr, client_cfg(&pki, None), "/cn").await.expect("no-cert request ok");
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, signer::AUDIT_CN_DEFAULT, "no client cert → default audit CN");
     }
 
     /// After the install a process-global default provider is available.
