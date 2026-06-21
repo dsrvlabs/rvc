@@ -172,6 +172,9 @@ async fn sign_inner(
             SignPayload::ValidatorRegistration { .. } => {
                 state.gate.sign_builder_registration(&pubkey, root).await
             }
+            SignPayload::VoluntaryExit { .. } => {
+                state.gate.sign_voluntary_exit(&pubkey, root).await
+            }
             // BLOCK_V2 / ATTESTATION are slashable and never yield NonSlashable;
             // a no-`_` match keeps a future payload variant a compile error.
             SignPayload::BlockV2 { .. } | SignPayload::Attestation { .. } => {
@@ -206,10 +209,10 @@ mod tests {
     use eth_types::{
         AggregateAndProof, Attestation, AttestationData, BeaconBlockHeader, Checkpoint,
         ContributionAndProof, Root, SyncAggregatorSelectionData, SyncCommitteeContribution,
-        SyncCommitteeMessage, ValidatorRegistrationV1, DOMAIN_AGGREGATE_AND_PROOF,
+        SyncCommitteeMessage, ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
         DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
         DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
-        DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+        DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
     };
 
     const CURRENT_VERSION: [u8; 4] = [0x04, 0x00, 0x00, 0x00];
@@ -982,5 +985,114 @@ mod tests {
         let scrape = String::from_utf8(metrics.encode().unwrap()).unwrap();
         assert!(scrape.contains("rvc_signer_sign_total"), "gRPC series present");
         assert!(scrape.contains("rvc_signer_http_sign_total"), "HTTP series present");
+    }
+
+    // ── Issue 5.1: VOLUNTARY_EXIT (P2, non-slashable, FR-13) ──────────────────
+
+    fn voluntary_exit_body(epoch: u64, validator_index: u64) -> String {
+        format!(
+            r#"{{ "type": "VOLUNTARY_EXIT", {fi},
+                  "voluntary_exit": {{ "epoch": "{epoch}", "validator_index": "{validator_index}" }} }}"#,
+            fi = fork_info_json(),
+        )
+    }
+
+    /// A VOLUNTARY_EXIT body with an explicit `current_version` (drives the
+    /// EIP-7044 cap test) over the same gvr the other helpers use.
+    fn voluntary_exit_body_with_version(
+        epoch: u64,
+        validator_index: u64,
+        current_version_hex: &str,
+    ) -> String {
+        format!(
+            r#"{{ "type": "VOLUNTARY_EXIT",
+                  "fork_info": {{ "fork": {{ "previous_version": "0x03000000",
+                                             "current_version": "0x{cv}",
+                                             "epoch": "100" }},
+                       "genesis_validators_root": "0x{gvr}" }},
+                  "voluntary_exit": {{ "epoch": "{epoch}", "validator_index": "{validator_index}" }} }}"#,
+            cv = current_version_hex,
+            gvr = hex::encode(expected_gvr()),
+        )
+    }
+
+    /// KAT: the signing root is `DOMAIN_VOLUNTARY_EXIT` over the eth-types
+    /// `VoluntaryExit` SSZ object, and the BLS signature verifies.
+    #[tokio::test]
+    async fn voluntary_exit_kat_signs_under_voluntary_exit_domain() {
+        let (sk, _) = test_keypair();
+        let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, CURRENT_VERSION, expected_gvr());
+        let exit = VoluntaryExit { epoch: 256, validator_index: 99 };
+        let expected = sk.sign(&compute_signing_root(&exit, domain)).to_bytes();
+        assert_eq!(sign_ok(voluntary_exit_body(256, 99)).await, expected.to_vec());
+    }
+
+    /// EIP-7044: the domain uses the request's `current_version` verbatim, so a
+    /// Capella-capped caller gets the Capella domain. Non-tautological — a
+    /// different fork version yields a different signature.
+    #[tokio::test]
+    async fn voluntary_exit_domain_uses_request_fork_version_eip7044() {
+        let (sk, _) = test_keypair();
+        let exit = VoluntaryExit { epoch: 300, validator_index: 7 };
+
+        // Caller supplies the Capella fork version (0x03000000) per EIP-7044.
+        let capella = [0x03u8, 0x00, 0x00, 0x00];
+        let domain_capella = compute_domain(DOMAIN_VOLUNTARY_EXIT, capella, expected_gvr());
+        let expected = sk.sign(&compute_signing_root(&exit, domain_capella)).to_bytes();
+        let got = sign_ok(voluntary_exit_body_with_version(300, 7, "03000000")).await;
+        assert_eq!(got, expected.to_vec(), "domain must use the request's (capped) version");
+
+        // A DIFFERENT fork version (Deneb) would produce a DIFFERENT signature —
+        // proving the request's version actually drives the domain.
+        let domain_deneb = compute_domain(DOMAIN_VOLUNTARY_EXIT, CURRENT_VERSION, expected_gvr());
+        let under_deneb = sk.sign(&compute_signing_root(&exit, domain_deneb)).to_bytes();
+        assert_ne!(got, under_deneb.to_vec(), "fork version must change the domain");
+    }
+
+    /// VOLUNTARY_EXIT requires fork_info (it is NOT the VALIDATOR_REGISTRATION
+    /// exception): an absent fork_info is a pre-gate 400.
+    #[tokio::test]
+    async fn voluntary_exit_missing_fork_info_returns_400() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = r#"{ "type": "VOLUNTARY_EXIT",
+                        "voluntary_exit": { "epoch": "5", "validator_index": "9" } }"#
+            .to_string();
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A present, non-zero `signingRoot` that mismatches the server root → 400,
+    /// no gate call (the per-type signingRoot policy applies to this arm too).
+    #[tokio::test]
+    async fn voluntary_exit_signing_root_mismatch_returns_400() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let bad = format!("0x{}", "ff".repeat(32));
+        let body = format!(
+            r#"{{ "type": "VOLUNTARY_EXIT", {fi}, "signingRoot": "{bad}",
+                  "voluntary_exit": {{ "epoch": "5", "validator_index": "9" }} }}"#,
+            fi = fork_info_json(),
+        );
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A malformed `voluntary_exit` payload (the required `validator_index` field
+    /// is missing) → fixed 400, no decoder leak.
+    #[tokio::test]
+    async fn voluntary_exit_malformed_payload_returns_400() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = format!(
+            r#"{{ "type": "VOLUNTARY_EXIT", {fi},
+                  "voluntary_exit": {{ "epoch": "5" }} }}"#,
+            fi = fork_info_json(),
+        );
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

@@ -30,6 +30,7 @@ use eth_types::{
     Root, SyncAggregatorSelectionData, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
     DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO,
     DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_VOLUNTARY_EXIT,
 };
 
 use super::request::{SignPayload, SignRequest, WireForkInfo};
@@ -156,6 +157,18 @@ pub(super) fn plan_sign(req: &SignRequest) -> Result<SignPlan, HttpSignError> {
             let domain =
                 compute_domain(DOMAIN_APPLICATION_BUILDER, BUILDER_FORK_VERSION, ZERO_ROOT);
             let root = compute_signing_root(validator_registration, domain);
+            (root, Slashing::NonSlashable)
+        }
+        // ── P2 voluntary exit (Issue 5.1, FR-13) ─────────────────────────────
+        SignPayload::VoluntaryExit { voluntary_exit } => {
+            // Requires fork_info like the P0/P1 types. `current_version` is used
+            // verbatim — the caller supplies a Capella-capped version per
+            // EIP-7044 (mirroring the gRPC `sign_voluntary_exit` reference, which
+            // documents the same caller-cap contract), so the signing domain is
+            // byte-identical across both transports for identical input.
+            let (fork_version, gvr) = require_fork_info(req)?;
+            let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, fork_version, gvr);
+            let root = compute_signing_root(voluntary_exit, domain);
             (root, Slashing::NonSlashable)
         }
     };

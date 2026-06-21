@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use eth_types::{
     AggregateAndProof, AttestationData, BeaconBlockHeader, ContributionAndProof, Fork, Root,
-    SyncCommitteeMessage, ValidatorRegistrationV1,
+    SyncCommitteeMessage, ValidatorRegistrationV1, VoluntaryExit,
 };
 
 /// `fork_info` wire object: `{ fork: { previous_version, current_version, epoch },
@@ -105,6 +105,12 @@ pub enum SignPayload {
     // body that omits it parses cleanly.
     #[serde(rename = "VALIDATOR_REGISTRATION")]
     ValidatorRegistration { validator_registration: ValidatorRegistrationV1 },
+    // ── P2 voluntary exit (Issue 5.1, FR-13) ─────────────────────────────────
+    // Non-slashable; requires fork_info (NOT the VALIDATOR_REGISTRATION
+    // exception). Inner fields (epoch, validator_index) are field-for-field the
+    // existing eth-types VoluntaryExit, reused directly.
+    #[serde(rename = "VOLUNTARY_EXIT")]
+    VoluntaryExit { voluntary_exit: VoluntaryExit },
 }
 
 impl SignPayload {
@@ -124,6 +130,7 @@ impl SignPayload {
             }
             SignPayload::SyncCommitteeSelectionProof { .. } => "SYNC_COMMITTEE_SELECTION_PROOF",
             SignPayload::ValidatorRegistration { .. } => "VALIDATOR_REGISTRATION",
+            SignPayload::VoluntaryExit { .. } => "VOLUNTARY_EXIT",
         }
     }
 }
