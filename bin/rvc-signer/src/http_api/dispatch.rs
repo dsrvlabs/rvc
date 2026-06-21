@@ -171,6 +171,21 @@ pub(super) fn plan_sign(req: &SignRequest) -> Result<SignPlan, HttpSignError> {
             let root = compute_signing_root(voluntary_exit, domain);
             (root, Slashing::NonSlashable)
         }
+        // ── P2 Electra aggregate-and-proof (Issue 5.2, FR-14) ────────────────
+        SignPayload::AggregateAndProofV2 { aggregate_and_proof } => {
+            // Electra sibling of AGGREGATE_AND_PROOF: identical domain + gate
+            // method, only the decoded SSZ shape differs (the Electra `aggregate`
+            // adds committee_bits). `try_tree_hash_root` (NOT `tree_hash_root`)
+            // so a malformed/over-length aggregation_bits or committee_bits
+            // bitlist returns 400 instead of panicking (the liveness-DoS class).
+            let (fork_version, gvr) = require_fork_info(req)?;
+            let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, fork_version, gvr);
+            let object_root = aggregate_and_proof.try_tree_hash_root().map_err(|_| {
+                HttpSignError::BadRequest("invalid aggregate_and_proof".to_string())
+            })?;
+            let root = compute_signing_root(&object_root.0, domain);
+            (root, Slashing::NonSlashable)
+        }
     };
 
     verify_client_signing_root(req.signing_root, server_root)?;

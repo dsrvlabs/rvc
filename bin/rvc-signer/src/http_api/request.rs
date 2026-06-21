@@ -18,8 +18,9 @@
 use serde::Deserialize;
 
 use eth_types::{
-    AggregateAndProof, AttestationData, BeaconBlockHeader, ContributionAndProof, Fork, Root,
-    SyncCommitteeMessage, ValidatorRegistrationV1, VoluntaryExit,
+    AggregateAndProof, AttestationData, BeaconBlockHeader, ContributionAndProof,
+    ElectraAggregateAndProof, Fork, Root, SyncCommitteeMessage, ValidatorRegistrationV1,
+    VoluntaryExit,
 };
 
 /// `fork_info` wire object: `{ fork: { previous_version, current_version, epoch },
@@ -111,6 +112,14 @@ pub enum SignPayload {
     // existing eth-types VoluntaryExit, reused directly.
     #[serde(rename = "VOLUNTARY_EXIT")]
     VoluntaryExit { voluntary_exit: VoluntaryExit },
+    // ── P2 Electra aggregate-and-proof (Issue 5.2, FR-14) ────────────────────
+    // The version-discriminated Electra sibling of AGGREGATE_AND_PROOF: SAME
+    // payload key (`aggregate_and_proof`) and domain, but the inner `aggregate`
+    // is the Electra attestation (adds committee_bits, EIP-7549), so it decodes
+    // as ElectraAggregateAndProof. The distinct AGGREGATE_AND_PROOF_V2
+    // discriminator keys this variant — field-presence is never auto-detected.
+    #[serde(rename = "AGGREGATE_AND_PROOF_V2")]
+    AggregateAndProofV2 { aggregate_and_proof: ElectraAggregateAndProof },
 }
 
 impl SignPayload {
@@ -131,6 +140,7 @@ impl SignPayload {
             SignPayload::SyncCommitteeSelectionProof { .. } => "SYNC_COMMITTEE_SELECTION_PROOF",
             SignPayload::ValidatorRegistration { .. } => "VALIDATOR_REGISTRATION",
             SignPayload::VoluntaryExit { .. } => "VOLUNTARY_EXIT",
+            SignPayload::AggregateAndProofV2 { .. } => "AGGREGATE_AND_PROOF_V2",
         }
     }
 }

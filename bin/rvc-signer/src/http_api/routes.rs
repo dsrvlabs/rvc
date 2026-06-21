@@ -175,6 +175,12 @@ async fn sign_inner(
             SignPayload::VoluntaryExit { .. } => {
                 state.gate.sign_voluntary_exit(&pubkey, root).await
             }
+            // Electra: SAME gate method as the base AGGREGATE_AND_PROOF; the
+            // dispatcher already applied the (identical) domain over the Electra
+            // SSZ root, so the gate just signs the pre-computed root.
+            SignPayload::AggregateAndProofV2 { .. } => {
+                state.gate.sign_aggregate_and_proof(&pubkey, root).await
+            }
             // BLOCK_V2 / ATTESTATION are slashable and never yield NonSlashable;
             // a no-`_` match keeps a future payload variant a compile error.
             SignPayload::BlockV2 { .. } | SignPayload::Attestation { .. } => {
@@ -208,8 +214,9 @@ mod tests {
     // `rvc-beacon::BeaconBlockHeader` DTO exists and would compute a garbage root.
     use eth_types::{
         AggregateAndProof, Attestation, AttestationData, BeaconBlockHeader, Checkpoint,
-        ContributionAndProof, Root, SyncAggregatorSelectionData, SyncCommitteeContribution,
-        SyncCommitteeMessage, ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
+        ContributionAndProof, ElectraAggregateAndProof, ElectraAttestation, Root,
+        SyncAggregatorSelectionData, SyncCommitteeContribution, SyncCommitteeMessage,
+        ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
         DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
         DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
         DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
@@ -1091,6 +1098,118 @@ mod tests {
             r#"{{ "type": "VOLUNTARY_EXIT", {fi},
                   "voluntary_exit": {{ "epoch": "5" }} }}"#,
             fi = fork_info_json(),
+        );
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Issue 5.2: AGGREGATE_AND_PROOF_V2 (Electra, P2, FR-14) ────────────────
+
+    /// The Electra sibling of `sample_aggregate_and_proof`: same data, but the
+    /// `aggregate` is an `ElectraAttestation` carrying `committee_bits`.
+    fn sample_electra_aggregate_and_proof() -> ElectraAggregateAndProof {
+        ElectraAggregateAndProof {
+            aggregator_index: 1,
+            aggregate: ElectraAttestation {
+                aggregation_bits: valid_agg_bits(),
+                data: sample_attestation(),
+                signature: dummy_sig(),
+                committee_bits: vec![0x01; 8], // 64-bit committee bitvector (EIP-7549)
+            },
+            selection_proof: vec![0xCD; 96],
+        }
+    }
+
+    /// KAT: the server root is `DOMAIN_AGGREGATE_AND_PROOF` (SAME as the base
+    /// type) over the eth-types Electra `tree_hash_root`, and the sig verifies.
+    /// The use of `DOMAIN_AGGREGATE_AND_PROOF` here is the domain assertion (not
+    /// a new/wrong constant).
+    #[tokio::test]
+    async fn aggregate_and_proof_v2_electra_kat() {
+        let agg = sample_electra_aggregate_and_proof();
+        let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, CURRENT_VERSION, expected_gvr());
+        let object_root = agg.try_tree_hash_root().unwrap().0;
+        let (sk, _) = test_keypair();
+        let expected = sk.sign(&compute_signing_root(&object_root, domain)).to_bytes();
+        let body = p1_body(
+            "AGGREGATE_AND_PROOF_V2",
+            "aggregate_and_proof",
+            serde_json::to_string(&agg).unwrap(),
+        );
+        assert_eq!(sign_ok(body).await, expected.to_vec());
+    }
+
+    /// The base `AGGREGATE_AND_PROOF` arm is unaffected and does NOT collide with
+    /// the Electra V2 arm: same aggregator/data/sigs, but Electra's extra
+    /// `committee_bits` leaf yields a different SSZ root → a different signature.
+    #[tokio::test]
+    async fn base_and_electra_aggregate_and_proof_do_not_collide() {
+        let base = sample_aggregate_and_proof();
+        let electra = sample_electra_aggregate_and_proof();
+        let base_body = p1_body(
+            "AGGREGATE_AND_PROOF",
+            "aggregate_and_proof",
+            serde_json::to_string(&base).unwrap(),
+        );
+        let electra_body = p1_body(
+            "AGGREGATE_AND_PROOF_V2",
+            "aggregate_and_proof",
+            serde_json::to_string(&electra).unwrap(),
+        );
+        assert_ne!(sign_ok(base_body).await, sign_ok(electra_body).await);
+    }
+
+    /// An over-length `aggregation_bits` bitlist surfaces as 400 via
+    /// `try_tree_hash_root`, never a panic (the liveness-DoS class).
+    #[tokio::test]
+    async fn aggregate_and_proof_v2_malformed_bits_is_400_not_panic() {
+        let mut agg = sample_electra_aggregate_and_proof();
+        // Past the EIP-7549 Electra limit (2048*64 = 131072 bits ≈ 16384 bytes).
+        agg.aggregate.aggregation_bits = vec![0xff; 20000];
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = p1_body(
+            "AGGREGATE_AND_PROOF_V2",
+            "aggregate_and_proof",
+            serde_json::to_string(&agg).unwrap(),
+        );
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "malformed bits → 400, not panic");
+    }
+
+    /// An Electra `aggregate` missing the required `committee_bits` field is a
+    /// malformed V2 payload → fixed 400 (SEC-INFO-01, no decoder leak).
+    #[tokio::test]
+    async fn aggregate_and_proof_v2_missing_committee_bits_returns_400() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let agg_json = format!(
+            r#"{{ "aggregator_index": "1",
+                  "aggregate": {{ "aggregation_bits": "0x01",
+                                  "data": {data},
+                                  "signature": "0x{sig}" }},
+                  "selection_proof": "0x{sp}" }}"#,
+            data = serde_json::to_string(&sample_attestation()).unwrap(),
+            sig = "ab".repeat(96),
+            sp = "cd".repeat(96),
+        );
+        let body = p1_body("AGGREGATE_AND_PROOF_V2", "aggregate_and_proof", agg_json);
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// AGGREGATE_AND_PROOF_V2 requires fork_info (not the VALIDATOR_REGISTRATION
+    /// exception): an absent fork_info is a pre-gate 400.
+    #[tokio::test]
+    async fn aggregate_and_proof_v2_missing_fork_info_returns_400() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = format!(
+            r#"{{ "type": "AGGREGATE_AND_PROOF_V2", "aggregate_and_proof": {agg} }}"#,
+            agg = serde_json::to_string(&sample_electra_aggregate_and_proof()).unwrap(),
         );
         let resp = post_sign(state, &id, None, body).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
