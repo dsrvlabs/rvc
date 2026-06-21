@@ -582,6 +582,9 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 backend_name: resolved.backend.clone(),
                 ..http_api::AuditCfg::default()
             },
+            // Share the one SignerMetrics registry so HTTP-path series land on the
+            // same `:9101` scrape as the gRPC series (Issue 4.5).
+            metrics: Arc::clone(&signer_metrics),
         };
         let (bound, handle) = http_api::tls::spawn_https_listener(
             &resolved.http_listen_address,

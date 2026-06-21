@@ -79,13 +79,30 @@ pub(super) async fn sign(
                 (e.into_response(), label)
             }
         };
+    let elapsed = started.elapsed();
+
+    // HTTP-path metrics (Issue 4.5): count by `type` × outcome and observe
+    // latency on series distinct from the gRPC vecs, scraped on the same `:9101`
+    // listener. A pre-parse failure has no `type` → "unknown" (a single bounded
+    // bucket, never request-derived, so the label set stays low-cardinality).
+    state
+        .metrics
+        .http_sign_total
+        .with_label_values(&[rpc_type.unwrap_or("unknown"), result_label])
+        .inc();
+    state
+        .metrics
+        .http_sign_duration_seconds
+        .with_label_values(&[] as &[&str])
+        .observe(elapsed.as_secs_f64());
+
     audit::log_audit(&audit::AuditEntry {
         timestamp: audit::now_rfc3339(),
         pubkey_hex: identifier,
         client_cn: cn,
         backend: state.audit.backend_name.clone(),
         result: result_label.to_string(),
-        duration_ms: started.elapsed().as_millis() as u64,
+        duration_ms: elapsed.as_millis() as u64,
         rpc: rpc_type.map(str::to_string),
     });
     response
@@ -901,5 +918,69 @@ mod tests {
         // mTLS path: the audit CN is the leaf cert's first CN, not the default.
         assert!(logs_contain("client_cn=lighthouse-vc"));
         assert!(!logs_contain("client_cn=signing-gate"));
+    }
+
+    // ── Issue 4.5: HTTP metrics ──────────────────────────────────────────────
+
+    /// A successful HTTP sign increments `http_sign_total{type,result}` for the
+    /// exact type×outcome and records one latency-histogram sample.
+    #[tokio::test]
+    async fn http_sign_records_type_outcome_counter_and_latency() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let metrics = Arc::clone(&state.metrics);
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_eq!(
+            metrics.http_sign_total.with_label_values(&["ATTESTATION", "success"]).get(),
+            1,
+            "one ATTESTATION/success request counted"
+        );
+        assert_eq!(
+            metrics.http_sign_duration_seconds.with_label_values(&[] as &[&str]).get_sample_count(),
+            1,
+            "one latency sample recorded"
+        );
+    }
+
+    /// A rejection is counted under its outcome label, not `success`.
+    #[tokio::test]
+    async fn http_sign_counts_rejection_outcome() {
+        let state = test_state(Arc::new(MockBackend::empty()));
+        let metrics = Arc::clone(&state.metrics);
+        let id = format!("0x{}", "ab".repeat(48)); // well-formed, not loaded → 404
+
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Resolved before the body parses → type "unknown", outcome key_not_found.
+        assert_eq!(
+            metrics.http_sign_total.with_label_values(&["unknown", "key_not_found"]).get(),
+            1
+        );
+    }
+
+    /// AC: a single `:9101` scrape spans BOTH transports — after exercising a
+    /// gRPC-style series and an HTTP sign on the shared registry, the encoded
+    /// output carries both the gRPC `rvc_signer_sign_total` and the HTTP
+    /// `rvc_signer_http_sign_total` series.
+    #[tokio::test]
+    async fn single_scrape_spans_grpc_and_http_series() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let metrics = Arc::clone(&state.metrics);
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        // gRPC-style increment on the shared registry...
+        metrics.sign_total.with_label_values(&["basic", "success"]).inc();
+        // ...and a real HTTP sign on the same registry.
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let scrape = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(scrape.contains("rvc_signer_sign_total"), "gRPC series present");
+        assert!(scrape.contains("rvc_signer_http_sign_total"), "HTTP series present");
     }
 }

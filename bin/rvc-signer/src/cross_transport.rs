@@ -87,6 +87,7 @@ async fn http_sign_block(
         gate: Arc::clone(gate),
         backend: Arc::clone(backend),
         audit: AuditCfg::default(),
+        metrics: Arc::new(crate::metrics::SignerMetrics::new()),
     };
     let id = format!("0x{}", hex::encode(pubkey));
     let body = format!(

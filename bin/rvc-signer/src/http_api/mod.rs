@@ -62,12 +62,14 @@ impl Default for AuditCfg {
 /// tier fans out across tokio workers, serializing only at the per-pubkey gate
 /// lock. The `gate` is the single signing authority shared with the gRPC
 /// transport (FR-26); `backend` serves `GET /publicKeys`; `audit` supplies the
-/// CN for audit entries.
+/// CN for audit entries; `metrics` records the HTTP-path series (Issue 4.5) on
+/// the same `SignerMetrics` registry the gRPC transport and `:9101` scrape share.
 #[derive(Clone)]
 pub struct Web3SignerState {
     pub gate: Arc<SigningGate>,
     pub backend: Arc<dyn SigningBackend>,
     pub audit: AuditCfg,
+    pub metrics: Arc<crate::metrics::SignerMetrics>,
 }
 
 /// Build the Web3Signer HTTP API `Router`.
@@ -213,7 +215,12 @@ pub(crate) mod test_support {
         let db = Arc::new(slashing::SlashingDb::open_in_memory().expect("in-memory slashing DB"));
         let gate =
             Arc::new(crate::service::SignerServiceImpl::build_gate(Arc::clone(&backend), db));
-        Web3SignerState { gate, backend, audit: AuditCfg::default() }
+        Web3SignerState {
+            gate,
+            backend,
+            audit: AuditCfg::default(),
+            metrics: Arc::new(crate::metrics::SignerMetrics::new()),
+        }
     }
 }
 
