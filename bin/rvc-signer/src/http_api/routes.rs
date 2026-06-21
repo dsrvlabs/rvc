@@ -16,6 +16,7 @@ use super::request::{SignPayload, SignRequest};
 use super::response::{sign_response, HttpSignError};
 use super::tls::{audit_cn, PeerCert};
 use super::Web3SignerState;
+use crate::audit;
 
 /// `GET /upcheck` — liveness probe (FR-1).
 ///
@@ -61,20 +62,46 @@ pub(super) async fn sign(
     // both degrade to the configured default (`AUDIT_CN_DEFAULT`). The CN is
     // NEVER an authorization gate — a missing CN still signs.
     let cn = audit_cn(peer.as_ref().map(|Extension(p)| p), &state.audit.default_cn);
-    match sign_inner(&state, &identifier, accept, &cn, body.as_ref()).await {
-        Ok(resp) => resp,
-        Err(e) => e.into_response(),
-    }
+
+    // Audit posture (Issue 4.4): emit exactly one structured entry per request —
+    // success at `info`, every rejection at `warn` — carrying only metadata
+    // (pubkey identifier, Web3Signer `type`, outcome, peer CN, backend, latency).
+    // NEVER the request body, signing root, or signature. `rpc_type` is filled by
+    // `sign_inner` once the payload parses, so a pre-parse 400 audits with no
+    // `type` rather than a wrong one.
+    let started = std::time::Instant::now();
+    let mut rpc_type: Option<&'static str> = None;
+    let (response, result_label) =
+        match sign_inner(&state, &identifier, accept, &cn, body.as_ref(), &mut rpc_type).await {
+            Ok(resp) => (resp, "success"),
+            Err(e) => {
+                let label = e.audit_label();
+                (e.into_response(), label)
+            }
+        };
+    audit::log_audit(&audit::AuditEntry {
+        timestamp: audit::now_rfc3339(),
+        pubkey_hex: identifier,
+        client_cn: cn,
+        backend: state.audit.backend_name.clone(),
+        result: result_label.to_string(),
+        duration_ms: started.elapsed().as_millis() as u64,
+        rpc: rpc_type.map(str::to_string),
+    });
+    response
 }
 
 /// The fallible core of [`sign`], split out so every failure renders through the
-/// single [`HttpSignError`] → status mapping.
+/// single [`HttpSignError`] → status mapping. `rpc_type` is an out-param set to
+/// the Web3Signer `type` as soon as the body parses, so the caller can audit the
+/// type even on a post-parse failure (slashing/gate error).
 async fn sign_inner(
     state: &Web3SignerState,
     identifier: &str,
     accept: Option<&str>,
     cn: &str,
     body: &[u8],
+    rpc_type: &mut Option<&'static str>,
 ) -> Result<Response, HttpSignError> {
     // 1. Resolve {identifier} to a loaded key: malformed → 400, unloaded → 404.
     //    The pre-check runs before any decode/gate work.
@@ -90,6 +117,9 @@ async fn sign_inner(
     //    surfaced to the client (SEC-INFO-01).
     let req: SignRequest = serde_json::from_slice(body)
         .map_err(|_| HttpSignError::BadRequest("invalid sign request body".to_string()))?;
+    // Record the type for the audit entry now that the payload is known, so a
+    // later slashing/gate rejection still audits the correct `type` (Issue 4.4).
+    *rpc_type = Some(req.payload.type_name());
 
     // 3. Compute the signing root + slashing inputs; enforce the signingRoot /
     //    fork_info policy (the dispatcher owns the domain).
@@ -151,6 +181,7 @@ mod tests {
     use crate::http_api::test_support::{
         test_keypair, test_state, MockBackend, RealSigningBackend,
     };
+    use crate::http_api::tls::PeerCert;
 
     use crypto::{compute_domain, compute_signing_root};
     // Import BeaconBlockHeader EXPLICITLY from eth_types: an unrelated all-String
@@ -748,5 +779,127 @@ mod tests {
         );
         let resp = post_sign(state, &id, None, body).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Issue 4.4: HTTP audit logging ────────────────────────────────────────
+    //
+    // Every sign request emits exactly one structured audit entry (success at
+    // `info`, every rejection at `warn` via `log_audit`) carrying only
+    // metadata — pubkey identifier, Web3Signer `type`, outcome, peer CN,
+    // backend, latency — NEVER the body, signing root, or signature. These tests
+    // capture the emitted tracing events with `tracing-test` and assert the
+    // field set plus the absence of secrets.
+
+    use tracing_test::traced_test;
+
+    /// Mint a self-signed leaf whose subject CN is `cn`. Only the CN is read by
+    /// the audit extractor and no chain validation happens at the audit layer, so
+    /// a self-signed cert suffices to drive the cert-bearing CN path.
+    fn peer_cert_with_cn(cn: &str) -> PeerCert {
+        let mut params = rcgen::CertificateParams::new(vec![cn.to_string()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        PeerCert(Some(cert.der().clone()))
+    }
+
+    /// `post_sign` with a Phase-3 `PeerCert` request extension injected, so the
+    /// handler derives the audit CN from a (test) client cert instead of the
+    /// default.
+    async fn post_sign_with_peer(
+        state: crate::http_api::Web3SignerState,
+        identifier: &str,
+        body: String,
+        peer: PeerCert,
+    ) -> Response {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/eth2/sign/{identifier}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut().insert(peer);
+        router(state).oneshot(req).await.unwrap()
+    }
+
+    /// Pull the `0x`-prefixed signature out of a JSON `{"signature":"0x.."}` body.
+    fn signature_hex(json_body: &str) -> String {
+        let v: serde_json::Value = serde_json::from_str(json_body).unwrap();
+        v["signature"].as_str().unwrap().to_string()
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn audit_success_records_type_default_cn_and_omits_signature() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(resp).await).unwrap();
+        let sig = signature_hex(&body);
+
+        // One audit line: success, with the Web3Signer type and the default CN
+        // (no client cert on the socket-free path → AUDIT_CN_DEFAULT).
+        assert!(logs_contain("sign request audit"));
+        assert!(logs_contain("result=success"));
+        assert!(logs_contain("rpc=ATTESTATION"));
+        assert!(logs_contain("client_cn=signing-gate"));
+        // The signature (hence no key material) must NOT appear in any log line.
+        assert!(!logs_contain(&sig), "audit log leaked the signature");
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn audit_rejection_412_logged_with_slashing_outcome_and_type() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        // Commit, then a conflicting same-target-epoch attestation → 412.
+        let first =
+            post_sign(state.clone(), &id, None, attestation_body_with_block_root(0x00)).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second =
+            post_sign(state.clone(), &id, None, attestation_body_with_block_root(0x11)).await;
+        assert_eq!(second.status(), StatusCode::PRECONDITION_FAILED);
+
+        // The rejection is audited (at `warn` per `log_audit`) with the gate
+        // outcome label and the still-known type.
+        assert!(logs_contain("result=slashing"));
+        assert!(logs_contain("rpc=ATTESTATION"));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn audit_unknown_key_404_logged_with_key_not_found() {
+        let state = test_state(Arc::new(MockBackend::empty()));
+        let id = format!("0x{}", "ab".repeat(48)); // well-formed, not loaded
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Resolved before the body parses → outcome label set, no `type` recorded.
+        assert!(logs_contain("result=key_not_found"));
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn audit_records_client_cert_leaf_cn() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        let resp = post_sign_with_peer(
+            state,
+            &id,
+            attestation_body(None),
+            peer_cert_with_cn("lighthouse-vc"),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // mTLS path: the audit CN is the leaf cert's first CN, not the default.
+        assert!(logs_contain("client_cn=lighthouse-vc"));
+        assert!(!logs_contain("client_cn=signing-gate"));
     }
 }

@@ -576,7 +576,12 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let state = http_api::Web3SignerState {
             gate,
             backend: Arc::clone(&signing_backend),
-            audit: http_api::AuditCfg::default(),
+            // Record the active backend label ("basic"/"dvt") in HTTP audit lines
+            // so they line up with the gRPC metrics `backend` label (Issue 4.4).
+            audit: http_api::AuditCfg {
+                backend_name: resolved.backend.clone(),
+                ..http_api::AuditCfg::default()
+            },
         };
         let (bound, handle) = http_api::tls::spawn_https_listener(
             &resolved.http_listen_address,

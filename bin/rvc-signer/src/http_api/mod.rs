@@ -44,11 +44,15 @@ pub struct AuditCfg {
     /// CN recorded for audit when the request carries no parseable client cert
     /// (Prysm / server-TLS-only). Defaults to [`AUDIT_CN_DEFAULT`].
     pub default_cn: String,
+    /// Signing-backend label recorded in each audit entry (`"basic"` / `"dvt"`),
+    /// matching the gRPC metrics `backend` label so both transports' audit lines
+    /// are comparable. Defaults to `"basic"`.
+    pub backend_name: String,
 }
 
 impl Default for AuditCfg {
     fn default() -> Self {
-        Self { default_cn: AUDIT_CN_DEFAULT.to_string() }
+        Self { default_cn: AUDIT_CN_DEFAULT.to_string(), backend_name: "basic".to_string() }
     }
 }
 

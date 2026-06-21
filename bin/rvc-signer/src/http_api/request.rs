@@ -107,6 +107,27 @@ pub enum SignPayload {
     ValidatorRegistration { validator_registration: ValidatorRegistrationV1 },
 }
 
+impl SignPayload {
+    /// The Web3Signer `type` discriminator for this payload (e.g. `"BLOCK_V2"`),
+    /// matching the `#[serde(rename = ...)]` tag. Recorded in the audit entry's
+    /// `rpc` field so each audit line is per-type (Issue 4.4).
+    pub(super) fn type_name(&self) -> &'static str {
+        match self {
+            SignPayload::BlockV2 { .. } => "BLOCK_V2",
+            SignPayload::Attestation { .. } => "ATTESTATION",
+            SignPayload::RandaoReveal { .. } => "RANDAO_REVEAL",
+            SignPayload::AggregationSlot { .. } => "AGGREGATION_SLOT",
+            SignPayload::AggregateAndProof { .. } => "AGGREGATE_AND_PROOF",
+            SignPayload::SyncCommitteeMessage { .. } => "SYNC_COMMITTEE_MESSAGE",
+            SignPayload::SyncCommitteeContributionAndProof { .. } => {
+                "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF"
+            }
+            SignPayload::SyncCommitteeSelectionProof { .. } => "SYNC_COMMITTEE_SELECTION_PROOF",
+            SignPayload::ValidatorRegistration { .. } => "VALIDATOR_REGISTRATION",
+        }
+    }
+}
+
 /// The decoded sign request: common fields (`fork_info`, `signingRoot`) plus the
 /// type-tagged payload flattened in, mirroring the flat wire object where
 /// `type`, `fork_info`, `signingRoot`, and the payload key are all siblings.

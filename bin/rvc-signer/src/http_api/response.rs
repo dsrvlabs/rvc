@@ -44,6 +44,30 @@ impl HttpSignError {
             HttpSignError::Gate(e) => gate_err_to_http(e),
         }
     }
+
+    /// Stable, low-cardinality outcome label for the audit `result` field (Issue
+    /// 4.4). `success` and the backend categories `key_not_found` / `internal`
+    /// are kept byte-identical to the gRPC metrics labels so the two transports'
+    /// audit lines are comparable; the gate-specific rejections the HTTP path can
+    /// distinguish (`bad_request`, `doppelganger`, `slashing`) get their own
+    /// labels. Every non-`success` label logs at `warn` via [`super::super::audit::log_audit`].
+    pub(super) fn audit_label(&self) -> &'static str {
+        match self {
+            HttpSignError::BadRequest(_) => "bad_request",
+            HttpSignError::UnknownKey => "key_not_found",
+            HttpSignError::Gate(SigningGateError::BlockedByDoppelganger) => "doppelganger",
+            HttpSignError::Gate(SigningGateError::BlockedBySlashingDb(inner)) => match inner {
+                SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => {
+                    "slashing"
+                }
+                _ => "slashing_db_error",
+            },
+            HttpSignError::Gate(SigningGateError::SlashingDbCommitFailed(_)) => "internal",
+            HttpSignError::Gate(SigningGateError::KeyNotFound)
+            | HttpSignError::Gate(SigningGateError::UnknownPubkey) => "key_not_found",
+            HttpSignError::Gate(SigningGateError::SigningFailed(_)) => "internal",
+        }
+    }
 }
 
 /// Map a gate result error to `(status, safe-body)` (FR-20..FR-24), mirroring
