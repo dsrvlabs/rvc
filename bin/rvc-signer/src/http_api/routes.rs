@@ -177,6 +177,23 @@ mod tests {
         )
     }
 
+    /// An ATTESTATION body with the same source/target epochs (1/2) as
+    /// `attestation_body` but a caller-chosen `beacon_block_root`, so two calls
+    /// with different bytes produce two DISTINCT attestations sharing a target
+    /// epoch — a double vote (Issue 2.8b slashing harness, reused by 2.9).
+    fn attestation_body_with_block_root(block_root_byte: u8) -> String {
+        let br = format!("{block_root_byte:02x}").repeat(32);
+        format!(
+            r#"{{ "type": "ATTESTATION", {fi},
+                  "attestation": {{ "slot": "5", "index": "0",
+                                    "beacon_block_root": "0x{br}",
+                                    "source": {{ "epoch": "1", "root": "0x{z}" }},
+                                    "target": {{ "epoch": "2", "root": "0x{z}" }} }} }}"#,
+            fi = fork_info_json(),
+            z = "00".repeat(32),
+        )
+    }
+
     async fn post_sign(
         state: crate::http_api::Web3SignerState,
         identifier: &str,
@@ -195,6 +212,37 @@ mod tests {
 
     async fn body_bytes(resp: Response) -> Vec<u8> {
         axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap().to_vec()
+    }
+
+    // ── Real-gate 412 slashing harness (Issue 2.8b, reused by 2.9) ───────────
+
+    #[tokio::test]
+    async fn conflicting_attestation_same_target_epoch_returns_412() {
+        let (sk, pk_bytes) = test_keypair();
+        // One real gate over one in-memory slashing DB shared across both POSTs.
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        // First attestation (target epoch 2) stages + commits → 200.
+        let first =
+            post_sign(state.clone(), &id, None, attestation_body_with_block_root(0x00)).await;
+        assert_eq!(first.status(), StatusCode::OK, "first attestation signs");
+
+        // A DISTINCT attestation with the SAME target epoch (different
+        // beacon_block_root → different signing root) is a double vote → 412.
+        let second =
+            post_sign(state.clone(), &id, None, attestation_body_with_block_root(0x11)).await;
+        assert_eq!(
+            second.status(),
+            StatusCode::PRECONDITION_FAILED,
+            "double vote must be rejected by the gate as 412"
+        );
+        // The 412 body must not leak slashing-DB internals (paths/rusqlite).
+        let body = String::from_utf8(body_bytes(second).await).unwrap();
+        assert!(
+            !body.contains(".db") && !body.to_lowercase().contains("sqlite"),
+            "no DB internals: {body}"
+        );
     }
 
     // ── ATTESTATION happy path — KAT: the route signs the correct root ───────

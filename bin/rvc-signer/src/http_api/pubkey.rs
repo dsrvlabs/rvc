@@ -4,10 +4,8 @@
 //! unknown/unloaded key short-circuits to `404` *before* any signing root is
 //! computed or any gate call is made.
 //!
-//! NOTE: landed ahead of its consumer — the sign handler / dispatcher (Issue
-//! 2.6) calls `resolve_identifier`. Until then it is exercised only by this
-//! module's tests, hence the transitional `allow(dead_code)`; remove it in 2.6.
-#![allow(dead_code)]
+//! Consumed by the live `routes::sign` handler, which calls `resolve_identifier`
+//! and maps `PubkeyError::Malformed` → `400` / `NotLoaded` → `404`.
 
 use crate::backend::SigningBackend;
 
