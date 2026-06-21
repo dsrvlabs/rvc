@@ -129,7 +129,12 @@ mod tests {
     };
 
     use crypto::{compute_domain, compute_signing_root};
-    use eth_types::{AttestationData, Checkpoint, Root, DOMAIN_BEACON_ATTESTER};
+    // Import BeaconBlockHeader EXPLICITLY from eth_types: an unrelated all-String
+    // `rvc-beacon::BeaconBlockHeader` DTO exists and would compute a garbage root.
+    use eth_types::{
+        AttestationData, BeaconBlockHeader, Checkpoint, Root, DOMAIN_BEACON_ATTESTER,
+        DOMAIN_BEACON_PROPOSER,
+    };
 
     const CURRENT_VERSION: [u8; 4] = [0x04, 0x00, 0x00, 0x00];
 
@@ -194,6 +199,35 @@ mod tests {
         )
     }
 
+    /// A `BeaconBlockHeader` (slot 3_000_000) with a caller-chosen `state_root`,
+    /// so two headers at the same slot with different bytes are two DISTINCT
+    /// blocks — a double block proposal. Matches `block_v2_body`.
+    fn sample_block_header(state_root_byte: u8) -> BeaconBlockHeader {
+        BeaconBlockHeader {
+            slot: 3_000_000,
+            proposer_index: 12_345,
+            parent_root: [0xaa; 32],
+            state_root: [state_root_byte; 32],
+            body_root: [0xcc; 32],
+        }
+    }
+
+    fn block_v2_body(state_root_byte: u8) -> String {
+        format!(
+            r#"{{ "type": "BLOCK_V2", {fi},
+                  "beacon_block": {{ "version": "DENEB",
+                                     "block_header": {{ "slot": "3000000",
+                                                        "proposer_index": "12345",
+                                                        "parent_root": "0x{aa}",
+                                                        "state_root": "0x{sr}",
+                                                        "body_root": "0x{cc}" }} }} }}"#,
+            fi = fork_info_json(),
+            aa = "aa".repeat(32),
+            sr = format!("{state_root_byte:02x}").repeat(32),
+            cc = "cc".repeat(32),
+        )
+    }
+
     async fn post_sign(
         state: crate::http_api::Web3SignerState,
         identifier: &str,
@@ -243,6 +277,51 @@ mod tests {
             !body.contains(".db") && !body.to_lowercase().contains("sqlite"),
             "no DB internals: {body}"
         );
+    }
+
+    // ── BLOCK_V2 (Issue 2.9): KAT over the block header + double-proposal 412 ─
+
+    #[tokio::test]
+    async fn block_v2_happy_path_signs_the_block_header_root() {
+        // BLOCK_V2 signs the `block_header` (a BeaconBlockHeader), never a
+        // reconstructed block, under DOMAIN_BEACON_PROPOSER.
+        let header = sample_block_header(0xbb);
+        let domain = compute_domain(DOMAIN_BEACON_PROPOSER, CURRENT_VERSION, expected_gvr());
+        let expected_root = compute_signing_root(&header, domain);
+
+        let (sk, pk_bytes) = test_keypair();
+        let expected_sig = sk.sign(&expected_root).to_bytes();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        let resp = post_sign(state, &id, Some("application/json"), block_v2_body(0xbb)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let got = v["signature"].as_str().unwrap().strip_prefix("0x").unwrap();
+        assert_eq!(hex::decode(got).unwrap(), expected_sig.to_vec(), "route signs the header root");
+    }
+
+    #[tokio::test]
+    async fn conflicting_block_same_slot_returns_412() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        // First block at slot 3_000_000 stages + commits → 200.
+        let first = post_sign(state.clone(), &id, None, block_v2_body(0xaa)).await;
+        assert_eq!(first.status(), StatusCode::OK, "first block signs");
+
+        // A DISTINCT block at the SAME slot (different state_root → different
+        // signing root) is a double block proposal → 412.
+        let second = post_sign(state.clone(), &id, None, block_v2_body(0xbb)).await;
+        assert_eq!(second.status(), StatusCode::PRECONDITION_FAILED, "double proposal → 412");
+
+        // Safe-body check (2.8b review polish): the 412 surfaces only the safe
+        // slashing-violation detail, never the signature or DB internals.
+        let body = String::from_utf8(body_bytes(second).await).unwrap();
+        assert!(body.contains("slashing protection violation"), "safe violation message: {body}");
+        assert!(!body.contains("0x") && !body.contains(".db"), "no signature/DB internals: {body}");
     }
 
     // ── ATTESTATION happy path — KAT: the route signs the correct root ───────
