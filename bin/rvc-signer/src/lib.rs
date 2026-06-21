@@ -9,6 +9,8 @@ pub mod backend;
 #[cfg(feature = "dvt")]
 pub mod commands;
 pub mod config;
+#[cfg(test)]
+mod cross_transport;
 #[cfg(feature = "dvt")]
 pub mod dvt;
 pub mod http_api;
