@@ -117,6 +117,11 @@ async fn sign_inner(
             SignPayload::SyncCommitteeContributionAndProof { .. } => {
                 state.gate.sign_contribution_and_proof(&pubkey, root).await
             }
+            // Same gate method as AGGREGATION_SLOT; the dispatcher already applied
+            // the DISTINCT 0x08 domain, so the gate just signs the root.
+            SignPayload::SyncCommitteeSelectionProof { .. } => {
+                state.gate.sign_selection_proof(&pubkey, root).await
+            }
             // BLOCK_V2 / ATTESTATION are slashable and never yield NonSlashable;
             // a no-`_` match keeps a future payload variant a compile error.
             SignPayload::BlockV2 { .. } | SignPayload::Attestation { .. } => {
@@ -149,10 +154,10 @@ mod tests {
     // `rvc-beacon::BeaconBlockHeader` DTO exists and would compute a garbage root.
     use eth_types::{
         AggregateAndProof, Attestation, AttestationData, BeaconBlockHeader, Checkpoint,
-        ContributionAndProof, Root, SyncCommitteeContribution, SyncCommitteeMessage,
-        DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
-        DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
-        DOMAIN_SYNC_COMMITTEE,
+        ContributionAndProof, Root, SyncAggregatorSelectionData, SyncCommitteeContribution,
+        SyncCommitteeMessage, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER,
+        DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO,
+        DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
     };
 
     const CURRENT_VERSION: [u8; 4] = [0x04, 0x00, 0x00, 0x00];
@@ -472,6 +477,61 @@ mod tests {
         );
         let resp = post_sign(state, &id, None, body).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "malformed bits → 400, not panic");
+    }
+
+    /// 4.1-review polish: lock the no-panic property at the ROUTE layer for the
+    /// contribution arm — a multi-KB `aggregation_bits` signs cleanly (200), not
+    /// a panic (`SyncCommitteeContribution` hashes the bits via a self-sizing
+    /// `vec_u8_tree_hash_root`, so any length is safe).
+    #[tokio::test]
+    async fn sync_committee_contribution_large_bits_is_200() {
+        let mut cap = sample_contribution_and_proof();
+        cap.contribution.aggregation_bits = vec![0xff; 4096];
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = p1_body(
+            "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF",
+            "contribution_and_proof",
+            serde_json::to_string(&cap).unwrap(),
+        );
+        let resp = post_sign(state, &id, Some("application/json"), body).await;
+        assert_eq!(resp.status(), StatusCode::OK, "large contribution bits sign cleanly, no panic");
+    }
+
+    // ── SYNC_COMMITTEE_SELECTION_PROOF (Issue 4.2): the 0x08 disambiguation ───
+
+    fn sync_selection_body(slot: u64, subcommittee_index: u64) -> String {
+        format!(
+            r#"{{ "type": "SYNC_COMMITTEE_SELECTION_PROOF", {fi},
+                  "sync_aggregator_selection_data": {{ "slot": "{slot}",
+                                                       "subcommittee_index": "{subcommittee_index}" }} }}"#,
+            fi = fork_info_json(),
+        )
+    }
+
+    #[tokio::test]
+    async fn sync_committee_selection_proof_kat() {
+        let sasd = SyncAggregatorSelectionData { slot: 7, subcommittee_index: 3 };
+        let domain =
+            compute_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, CURRENT_VERSION, expected_gvr());
+        let (sk, _) = test_keypair();
+        let expected = sk.sign(&compute_signing_root(&sasd, domain)).to_bytes();
+        assert_eq!(sign_ok(sync_selection_body(7, 3)).await, expected.to_vec());
+    }
+
+    /// The load-bearing test: `SYNC_COMMITTEE_SELECTION_PROOF` (0x08 over the
+    /// `SyncAggregatorSelectionData` struct) must NOT collide with
+    /// `AGGREGATION_SLOT` (0x05 over a bare slot) for the same slot — a
+    /// regression pointing this arm at `DOMAIN_SELECTION_PROOF` would pass every
+    /// other check but fail here.
+    #[tokio::test]
+    async fn sync_selection_and_aggregation_slot_domains_do_not_collide() {
+        assert_ne!(
+            sign_ok(aggregation_slot_body(7)).await,
+            sign_ok(sync_selection_body(7, 0)).await,
+            "0x08 sync-selection must not equal 0x05 aggregation-slot for the same slot"
+        );
     }
 
     // ── BLOCK_V2 (Issue 2.9): KAT over the block header + double-proposal 412 ─

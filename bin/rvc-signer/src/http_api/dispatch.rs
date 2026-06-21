@@ -27,8 +27,9 @@
 
 use crypto::{compute_domain, compute_signing_root};
 use eth_types::{
-    Root, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
-    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    Root, SyncAggregatorSelectionData, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
+    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
 };
 
 use super::request::{SignPayload, SignRequest, WireForkInfo};
@@ -126,6 +127,18 @@ pub(super) fn plan_sign(req: &SignRequest) -> Result<SignPlan, HttpSignError> {
             let (fork_version, gvr) = require_fork_info(req)?;
             let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, fork_version, gvr);
             let root = compute_signing_root(contribution_and_proof, domain);
+            (root, Slashing::NonSlashable)
+        }
+        SignPayload::SyncCommitteeSelectionProof { sync_aggregator_selection_data } => {
+            let (fork_version, gvr) = require_fork_info(req)?;
+            // DISTINCT from AGGREGATION_SLOT: domain 0x08 (not 0x05) over the
+            // SyncAggregatorSelectionData struct (not a bare slot).
+            let domain = compute_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, fork_version, gvr);
+            let sasd = SyncAggregatorSelectionData {
+                slot: sync_aggregator_selection_data.slot,
+                subcommittee_index: sync_aggregator_selection_data.subcommittee_index,
+            };
+            let root = compute_signing_root(&sasd, domain);
             (root, Slashing::NonSlashable)
         }
     };

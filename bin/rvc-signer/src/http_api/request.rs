@@ -58,6 +58,19 @@ pub struct AggregationSlotPayload {
     pub slot: u64,
 }
 
+/// `sync_aggregator_selection_data` payload: `{slot, subcommittee_index}`.
+///
+/// A request-side wrapper because `eth_types::SyncAggregatorSelectionData`
+/// derives `TreeHash` but **no serde**; the dispatcher constructs the SSZ object
+/// from these two quoted ints (Issue 4.2).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SyncSelectionPayload {
+    #[serde(deserialize_with = "quoted_u64::deserialize")]
+    pub slot: u64,
+    #[serde(deserialize_with = "quoted_u64::deserialize")]
+    pub subcommittee_index: u64,
+}
+
 /// The per-`type` payload, internally tagged by the `type` field. Only the four
 /// P0 variants are defined here; P1/P2 add variants in later phases. An unknown
 /// `type` fails to decode (no `#[serde(other)]`), surfacing as a `400`.
@@ -79,6 +92,12 @@ pub enum SignPayload {
     SyncCommitteeMessage { sync_committee_message: SyncCommitteeMessage },
     #[serde(rename = "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF")]
     SyncCommitteeContributionAndProof { contribution_and_proof: ContributionAndProof },
+    // ── P1 sync-committee selection proof (Issue 4.2) ────────────────────────
+    // Shares the gate method `sign_selection_proof` with `AGGREGATION_SLOT` but a
+    // DIFFERENT domain (0x08) over a DIFFERENT object; the payload key differs
+    // from the type name. The dispatcher owns the domain split.
+    #[serde(rename = "SYNC_COMMITTEE_SELECTION_PROOF")]
+    SyncCommitteeSelectionProof { sync_aggregator_selection_data: SyncSelectionPayload },
 }
 
 /// The decoded sign request: common fields (`fork_info`, `signingRoot`) plus the
