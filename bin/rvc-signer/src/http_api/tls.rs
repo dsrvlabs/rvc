@@ -59,6 +59,8 @@ use hyper::service::service_fn;
 use hyper::Request;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_rustls::rustls::{
     self,
     pki_types::{CertificateDer, PrivateKeyDer},
@@ -66,6 +68,7 @@ use tokio_rustls::rustls::{
     RootCertStore, ServerConfig,
 };
 use tokio_rustls::TlsAcceptor;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 
 use crate::config::HttpTlsMode;
@@ -95,6 +98,17 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Slow-header (slowloris) bound on each accepted connection (SEC-2.11-01, the
 /// Phase-2 request-hardening carry-forward).
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Max concurrently-served connections. Bounds per-connection-task fan-out so a
+/// connection flood cannot exhaust memory/fds (3.3 review). Sensible default;
+/// promoting it to a `[signer.http]` knob is a follow-up.
+const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
+/// Backoff after an `accept()` error. EMFILE/ENFILE (fd exhaustion) leaves the
+/// listener readable, so a bare `continue` busy-spins at 100% CPU; this yields
+/// the task and bounds the spin (3.3 review).
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
+/// Upper bound on draining in-flight connections at shutdown, so SIGTERM cannot
+/// hang on an idle keep-alive client.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Errors building the HTTP listener's rustls `ServerConfig` (Issue 3.1).
 ///
@@ -241,30 +255,117 @@ fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, HttpTlsError> {
 /// [`HANDSHAKE_TIMEOUT`]), extract the leaf client cert into a [`PeerCert`]
 /// request extension, and serve the **opaque** `router` over HTTP/1.1 via hyper
 /// `serve_connection` (no upgrades — research R6). Each connection runs in its
-/// own `tokio::spawn`, so one bad client (handshake failure or a panicking
-/// handler) never wedges the accept loop or the process. A `header_read_timeout`
-/// bounds slow-header (slowloris) connections.
+/// own task, so one bad client (handshake failure or a panicking handler) never
+/// wedges the accept loop or the process. A `header_read_timeout` bounds
+/// slow-header (slowloris) connections.
+///
+/// Hardening (3.3 review):
+/// - a [`Semaphore`] caps concurrency at [`MAX_CONCURRENT_CONNECTIONS`] —
+///   acquired before each accept, so a flood applies backpressure rather than
+///   spawning unbounded tasks;
+/// - an `accept()` error backs off [`ACCEPT_ERROR_BACKOFF`] so EMFILE/ENFILE
+///   cannot busy-spin the loop;
+/// - on `shutdown`, the loop stops accepting and drains in-flight connections
+///   (bounded by [`DRAIN_TIMEOUT`]) so an in-progress `/sign` completes.
 ///
 /// `router` is taken as an opaque [`axum::Router`]; this module stays ignorant
-/// of `/sign` and the gate (extraction-readiness). Runs until cancelled; mirrors
-/// the proven `serve_metrics` spawn shape.
-pub async fn serve_https(listener: TcpListener, tls: Arc<ServerConfig>, router: Router) {
+/// of `/sign` and the gate (extraction-readiness). Unlike `serve_metrics` (which
+/// handles connections serially, inline), this fans connections out across tasks.
+pub async fn serve_https(
+    listener: TcpListener,
+    tls: Arc<ServerConfig>,
+    router: Router,
+    shutdown: CancellationToken,
+) {
+    serve_https_inner(listener, tls, router, shutdown, MAX_CONCURRENT_CONNECTIONS, DRAIN_TIMEOUT)
+        .await
+}
+
+/// [`serve_https`] with the connection cap and drain timeout injected, so tests
+/// can saturate the cap and assert prompt shutdown.
+async fn serve_https_inner(
+    listener: TcpListener,
+    tls: Arc<ServerConfig>,
+    router: Router,
+    shutdown: CancellationToken,
+    max_connections: usize,
+    drain_timeout: Duration,
+) {
     let acceptor = TlsAcceptor::from(tls);
+    let limit = Arc::new(Semaphore::new(max_connections));
+    let mut conns: JoinSet<()> = JoinSet::new();
+
     loop {
-        let (tcp, _peer) = match listener.accept().await {
-            Ok(conn) => conn,
-            Err(e) => {
-                // A transient accept error must not wedge the loop.
-                tracing::warn!(error = %e, "HTTP listener: accept failed");
-                continue;
-            }
+        // Backpressure: do not accept a new connection until a serving slot is
+        // free. The acquire is RACED against `shutdown` — when the cap is
+        // saturated the loop must still observe cancellation promptly rather than
+        // park on the permit until an in-flight connection frees one (3.5 review).
+        // `acquire_owned`'s future is cancel-safe (dropping it just deregisters
+        // the waiter), so losing the race leaks no permit.
+        let permit = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            permit = Arc::clone(&limit).acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => break,
+            },
         };
+
+        let (tcp, _peer) = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => break,
+            res = listener.accept() => match res {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::warn!(error = %e, "HTTP listener: accept failed");
+                    drop(permit);
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                    continue;
+                }
+            },
+        };
+
         let acceptor = acceptor.clone();
         let router = router.clone();
-        tokio::spawn(async move {
+        conns.spawn(async move {
             serve_one(acceptor, tcp, router).await;
+            drop(permit); // release the serving slot when the connection ends
         });
+
+        // Reap finished connection tasks so the JoinSet does not grow unbounded.
+        while conns.try_join_next().is_some() {}
     }
+
+    // Graceful shutdown: stop accepting (listener dropped) and drain in-flight
+    // connections, bounded so an idle keep-alive client cannot hang exit.
+    drop(listener);
+    let _ =
+        tokio::time::timeout(drain_timeout, async { while conns.join_next().await.is_some() {} })
+            .await;
+}
+
+/// Build the HTTP listener's TLS config + router from already-loaded paths and
+/// the shared application state, bind `listen_address`, and spawn
+/// [`serve_https`] (Issue 3.5). Returns the bound address + the listener task.
+///
+/// `run_serve` calls this when `[signer.http].enabled`; the `state` carries the
+/// SAME `Arc<SigningGate>` injected into the gRPC service (FR-26).
+#[allow(clippy::too_many_arguments)]
+pub async fn spawn_https_listener(
+    listen_address: &str,
+    tls_cert: &Path,
+    tls_key: &Path,
+    tls_ca_cert: &Path,
+    tls_mode: HttpTlsMode,
+    state: super::Web3SignerState,
+    shutdown: CancellationToken,
+) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
+    let tls = load_server_config(tls_cert, tls_key, tls_ca_cert, tls_mode)?;
+    let router = super::router(state);
+    let listener = TcpListener::bind(listen_address).await?;
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(serve_https(listener, tls, router, shutdown));
+    Ok((addr, handle))
 }
 
 /// Handshake one connection, inject [`PeerCert`], and serve `router` over it.
@@ -668,7 +769,12 @@ mod tests {
         install_crypto_provider();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_https(listener, server_cfg(pki, mode), serve_test_router()));
+        tokio::spawn(serve_https(
+            listener,
+            server_cfg(pki, mode),
+            serve_test_router(),
+            CancellationToken::new(),
+        ));
         addr
     }
 
@@ -805,6 +911,109 @@ mod tests {
             https_get(addr, client_cfg(&pki, None), "/cn").await.expect("no-cert request ok");
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(body, signer::AUDIT_CN_DEFAULT, "no client cert → default audit CN");
+    }
+
+    // ── run_serve wiring: spawn_https_listener + graceful shutdown (Issue 3.5) ─
+
+    /// A client config trusting `ca_pem` (to validate the server cert), no client cert.
+    fn client_trusting(ca_pem: &[u8]) -> Arc<ClientConfig> {
+        let ca = rustls_pemfile::certs(&mut &ca_pem[..]).next().unwrap().unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(ca).unwrap();
+        Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth())
+    }
+
+    #[tokio::test]
+    async fn spawn_https_listener_serves_upcheck_over_tls() {
+        install_crypto_provider();
+        let dir = TempDir::new().unwrap();
+        let (cert, key, ca) = server_pems();
+        let cert_p = write_pem(&dir, "c.pem", &cert);
+        let key_p = write_pem(&dir, "k.pem", &key);
+        let ca_p = write_pem(&dir, "ca.pem", &ca);
+
+        // The state carries a real shared SigningGate — the exact wiring
+        // `run_serve` performs (the gate is cloned from the gRPC service's gate).
+        let state = crate::http_api::test_support::test_state(Arc::new(
+            crate::http_api::test_support::MockBackend::empty(),
+        ));
+        let (addr, _handle) = spawn_https_listener(
+            "127.0.0.1:0",
+            &cert_p,
+            &key_p,
+            &ca_p,
+            HttpTlsMode::ServerTlsOnly,
+            state,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("HTTP listener spawns");
+
+        let (status, body) =
+            https_get(addr, client_trusting(&ca), "/upcheck").await.expect("upcheck over TLS");
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(body, "OK", "the full 3.1–3.4 path serves /upcheck over TLS");
+    }
+
+    #[tokio::test]
+    async fn serve_https_exits_promptly_on_shutdown() {
+        install_crypto_provider();
+        let pki = test_pki();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token = CancellationToken::new();
+        let handle = tokio::spawn(serve_https(
+            listener,
+            server_cfg(&pki, HttpTlsMode::ServerTlsOnly),
+            serve_test_router(),
+            token.clone(),
+        ));
+        token.cancel();
+        // The loop must break on cancellation and the drain must complete.
+        let exited = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        assert!(exited.is_ok(), "serve_https must exit promptly after cancellation");
+    }
+
+    /// The carry-forward #3 proof (3.5 review): shutdown must be prompt even when
+    /// the connection cap is SATURATED. Pre-fix, the loop parked on the permit
+    /// acquire (outside the select) and ignored cancellation until an in-flight
+    /// connection freed a permit (~HEADER_READ_TIMEOUT). This holds the only
+    /// permit and asserts exit well under that stall.
+    #[tokio::test]
+    async fn shutdown_is_prompt_even_when_connection_cap_is_saturated() {
+        install_crypto_provider();
+        let pki = test_pki();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let token = CancellationToken::new();
+        // cap = 1 so a single held connection saturates the loop's permit;
+        // a short drain timeout keeps the test fast.
+        let handle = tokio::spawn(serve_https_inner(
+            listener,
+            server_cfg(&pki, HttpTlsMode::ServerTlsOnly),
+            serve_test_router(),
+            token.clone(),
+            1,
+            Duration::from_millis(200),
+        ));
+
+        // Finish the TLS handshake but send NO request: this connection's
+        // serve_one task holds the only permit (parked in header-read), so the
+        // accept loop is parked acquiring the next permit.
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let connector = TlsConnector::from(client_cfg(&pki, None));
+        let _held =
+            connector.connect(ServerName::try_from("localhost").unwrap(), tcp).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        token.cancel();
+        // With the acquire raced against shutdown the loop breaks promptly and
+        // the bounded drain finishes — far under HEADER_READ_TIMEOUT (30s), the
+        // pre-fix stall point.
+        let exited = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            exited.is_ok(),
+            "shutdown must be prompt even when the connection cap is saturated"
+        );
     }
 
     /// After the install a process-global default provider is available.

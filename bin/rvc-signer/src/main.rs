@@ -463,20 +463,22 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     // SS-1 (Issue 2.2): the v1 raw-root service is no longer registered on the
     // live listener; `impl SignerService for SignerServiceImpl` is kept compiled
     // but all v1 methods return `Unimplemented`.
-    let svc_v2 = if let Some(ref db) = slashing_db_opt {
-        // Hoist (ADR-003, FR-26): build the ONE shared `SigningGate` here at the
-        // composition root, then inject the same `Arc` into the gRPC service.
-        let shared_gate = Arc::new(service::SignerServiceImpl::build_gate(
+    // Hoist (ADR-003, FR-26): build the ONE shared `SigningGate` at the
+    // composition root, then inject the same `Arc` into BOTH the gRPC service and
+    // the HTTP listener (Issue 3.5). `None` when slashing protection is disabled
+    // (the gRPC `new()` path and the HTTP no-gate refusal below both handle it).
+    let shared_gate: Option<Arc<signer::SigningGate>> = slashing_db_opt.as_ref().map(|db| {
+        Arc::new(service::SignerServiceImpl::build_gate(
             Arc::clone(&signing_backend),
             Arc::clone(db),
-        ));
-        // TODO(phase-3): clone `shared_gate` into the HTTP `Web3SignerState` so the
-        // HTTP listener shares this exact `Arc<SigningGate>` (unified slashing DB +
-        // in-memory `ValidatorLockMap` across gRPC and HTTP).
+        ))
+    });
+
+    let svc_v2 = if let Some(ref shared_gate) = shared_gate {
         service::SignerServiceImpl::new_v2_with_gate(
             Arc::clone(&signing_backend),
             resolved.backend.clone(),
-            Arc::clone(&shared_gate),
+            Arc::clone(shared_gate),
         )
         .with_metrics(Arc::clone(&signer_metrics))
     } else {
@@ -541,6 +543,57 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             .into());
     }
 
+    // ── Web3Signer HTTP API listener (Issue 3.5, FR-25/26/27, ADR-001) ────────
+    //
+    // Opt-in via `[signer.http]`; gRPC stays default-on and unchanged. The HTTP
+    // state carries the SAME `Arc<SigningGate>` injected into the gRPC service
+    // (FR-26), so slashing protection + the in-memory `ValidatorLockMap` are
+    // unified across both transports. A panic in an HTTP connection task is
+    // isolated and never touches the gRPC accept loop (Issue 3.3).
+    let http_shutdown = tokio_util::sync::CancellationToken::new();
+    let http_handle = if resolved.http_enabled {
+        // Fail closed: the HTTP API requires the shared gate. Running a remote
+        // signer's HTTP API without slashing protection is refused at startup
+        // (stricter than the gRPC per-request `require_gate()` 500).
+        let gate = shared_gate.clone().ok_or(
+            "[signer.http] is enabled but slashing protection is disabled. The HTTP \
+             API requires the shared signing gate; enable slashing protection or \
+             disable the HTTP API.",
+        )?;
+        let cert = resolved
+            .http_tls_cert
+            .as_deref()
+            .ok_or("[signer.http] enabled but http.tls_cert is not set")?;
+        let key = resolved
+            .http_tls_key
+            .as_deref()
+            .ok_or("[signer.http] enabled but http.tls_key is not set")?;
+        let ca = resolved
+            .http_tls_ca_cert
+            .as_deref()
+            .ok_or("[signer.http] enabled but http.tls_ca_cert is not set")?;
+
+        let state = http_api::Web3SignerState {
+            gate,
+            backend: Arc::clone(&signing_backend),
+            audit: http_api::AuditCfg::default(),
+        };
+        let (bound, handle) = http_api::tls::spawn_https_listener(
+            &resolved.http_listen_address,
+            cert,
+            key,
+            ca,
+            resolved.http_tls_mode,
+            state,
+            http_shutdown.clone(),
+        )
+        .await?;
+        info!(address = %bound, tls_mode = ?resolved.http_tls_mode, "Web3Signer HTTP API listening");
+        Some(handle)
+    } else {
+        None
+    };
+
     info!(address = %addr, "gRPC server listening");
 
     // 1 MiB per-message decode cap (M-10): blocks memory-pressure via oversized
@@ -565,6 +618,13 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     };
 
     router.serve_with_shutdown(addr, shutdown_signal()).await?;
+
+    // gRPC has shut down (Ctrl+C). Stop the HTTP listener accepting new
+    // connections and drain any in-flight `/sign` (bounded inside serve_https).
+    http_shutdown.cancel();
+    if let Some(handle) = http_handle {
+        let _ = handle.await;
+    }
 
     Ok(())
 }
