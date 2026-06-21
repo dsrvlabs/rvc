@@ -48,7 +48,101 @@
 //! rustls types are reached through the `tokio_rustls::rustls` re-export so the
 //! HTTP transport binds the *same* rustls as the gRPC/tonic stack.
 
-use tokio_rustls::rustls;
+use std::sync::Arc;
+
+use tokio_rustls::rustls::{
+    self,
+    pki_types::{CertificateDer, PrivateKeyDer},
+    server::{VerifierBuilderError, WebPkiClientVerifier},
+    RootCertStore, ServerConfig,
+};
+
+use crate::config::HttpTlsMode;
+
+/// Errors building the HTTP listener's rustls `ServerConfig` (Issue 3.1).
+///
+/// PEM→DER file loading and its richer, path-naming errors are Issue 3.2; this
+/// covers only the in-memory build from already-decoded DER.
+#[derive(Debug, thiserror::Error)]
+pub enum HttpTlsError {
+    /// No client-CA trust anchor was provided. The CA is **required in both**
+    /// modes (mTLS and server-TLS-only) — only the client-auth *requirement*
+    /// differs, never the CA. Refusing an empty CA prevents a silent
+    /// no-client-auth posture.
+    #[error("a client CA certificate is required (none provided)")]
+    NoCa,
+    /// A client-CA certificate could not be added to the trust-anchor store.
+    #[error("invalid client CA certificate: {0}")]
+    CaCert(rustls::Error),
+    /// The client-cert verifier could not be built.
+    #[error("client verifier build failed: {0}")]
+    Verifier(VerifierBuilderError),
+    /// The server cert chain / private key was rejected (e.g. cert/key mismatch).
+    #[error("invalid server certificate or key: {0}")]
+    ServerCert(rustls::Error),
+}
+
+/// Build the HTTP listener's rustls `ServerConfig` in one of two modes (FR-28,
+/// FR-29, FR-30, ADR-004).
+///
+/// Both modes verify a presented client cert against `client_ca` and **require**
+/// the CA; the only difference is whether a client cert is *mandatory*:
+/// - [`HttpTlsMode::Mtls`] → `WebPkiClientVerifier::builder(roots).build()`
+///   (client cert required — Lighthouse).
+/// - [`HttpTlsMode::ServerTlsOnly`] →
+///   `…builder(roots).allow_unauthenticated().build()` (client cert requested +
+///   validated if present, absence allowed — Prysm).
+///
+/// `NoClientAuth` is deliberately NOT used: it never requests a cert, so a
+/// cert-bearing client would yield no audit CN even on the server-TLS-only
+/// listener. This `ServerConfig` is independent of the gRPC tonic config
+/// (FR-30). rustls types are bound via the `tokio_rustls::rustls` re-export so
+/// the HTTP and gRPC paths share one `CertificateDer` type (R4).
+pub fn build_server_config(
+    cert_chain: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+    client_ca: Vec<CertificateDer<'static>>,
+    mode: HttpTlsMode,
+) -> Result<Arc<ServerConfig>, HttpTlsError> {
+    let verifier = client_verifier(client_ca, mode)?;
+
+    let mut config = ServerConfig::builder()
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(cert_chain, key)
+        .map_err(HttpTlsError::ServerCert)?;
+    // HTTP/1.1 only — the Web3Signer API needs no HTTP/2.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
+/// Build the client-cert verifier for `mode`, with the CA required in both.
+///
+/// Split out so the mandatory-vs-optional client-auth behavior is unit-testable
+/// via [`client_auth_mandatory`](rustls::server::danger::ClientCertVerifier::client_auth_mandatory)
+/// without a full handshake.
+fn client_verifier(
+    client_ca: Vec<CertificateDer<'static>>,
+    mode: HttpTlsMode,
+) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>, HttpTlsError> {
+    let mut roots = RootCertStore::empty();
+    for ca in client_ca {
+        roots.add(ca).map_err(HttpTlsError::CaCert)?;
+    }
+    // Refuse an empty CA explicitly (the builder would also error
+    // `NoRootAnchors`, but a typed `NoCa` is clearer and keeps the "CA required
+    // in both modes" invariant obvious).
+    if roots.is_empty() {
+        return Err(HttpTlsError::NoCa);
+    }
+    let roots = Arc::new(roots);
+
+    let builder = WebPkiClientVerifier::builder(roots);
+    let builder = match mode {
+        HttpTlsMode::Mtls => builder,
+        HttpTlsMode::ServerTlsOnly => builder.allow_unauthenticated(),
+    };
+    builder.build().map_err(HttpTlsError::Verifier)
+}
 
 /// Install the `ring` rustls provider as the process-global default.
 ///
@@ -75,6 +169,175 @@ pub fn install_crypto_provider() {
 mod tests {
     use super::*;
     use rustls::crypto::CryptoProvider;
+
+    // ── build_server_config / client_verifier (Issue 3.1) ────────────────────
+
+    use rcgen::{CertificateParams, KeyPair};
+    use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
+    use rustls::ClientConfig;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    /// rcgen-minted PKI: a trusted CA, a `localhost` server cert + key, a
+    /// CA-signed client cert + key, and a ROGUE client signed by a different CA.
+    struct Pki {
+        ca: CertificateDer<'static>,
+        server_chain: Vec<CertificateDer<'static>>,
+        server_key: Vec<u8>,
+        client_chain: Vec<CertificateDer<'static>>,
+        client_key: Vec<u8>,
+        rogue_chain: Vec<CertificateDer<'static>>,
+        rogue_key: Vec<u8>,
+    }
+
+    fn leaf(
+        name: &str,
+        ca: &rcgen::Certificate,
+        ca_key: &KeyPair,
+    ) -> (Vec<CertificateDer<'static>>, Vec<u8>) {
+        let params = CertificateParams::new(vec![name.to_string()]).unwrap();
+        let key = KeyPair::generate().unwrap();
+        let cert = params.signed_by(&key, ca, ca_key).unwrap();
+        (vec![cert.der().clone()], key.serialize_der())
+    }
+
+    fn test_pki() -> Pki {
+        let ca_params = CertificateParams::new(vec!["test-ca".to_string()]).unwrap();
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let (server_chain, server_key) = leaf("localhost", &ca, &ca_key);
+        let (client_chain, client_key) = leaf("client", &ca, &ca_key);
+
+        // A rogue CA + client the server's CA does NOT trust.
+        let rogue_ca_params = CertificateParams::new(vec!["rogue-ca".to_string()]).unwrap();
+        let rogue_ca_key = KeyPair::generate().unwrap();
+        let rogue_ca = rogue_ca_params.self_signed(&rogue_ca_key).unwrap();
+        let (rogue_chain, rogue_key) = leaf("rogue", &rogue_ca, &rogue_ca_key);
+
+        Pki {
+            ca: ca.der().clone(),
+            server_chain,
+            server_key,
+            client_chain,
+            client_key,
+            rogue_chain,
+            rogue_key,
+        }
+    }
+
+    fn key_of(der: &[u8]) -> PrivateKeyDer<'static> {
+        PrivatePkcs8KeyDer::from(der.to_vec()).into()
+    }
+
+    fn server_cfg(pki: &Pki, mode: HttpTlsMode) -> Arc<ServerConfig> {
+        build_server_config(
+            pki.server_chain.clone(),
+            key_of(&pki.server_key),
+            vec![pki.ca.clone()],
+            mode,
+        )
+        .expect("server config builds")
+    }
+
+    /// A client config trusting the CA (to validate the server cert), optionally
+    /// presenting a client identity.
+    fn client_cfg(
+        pki: &Pki,
+        client: Option<(&[CertificateDer<'static>], &[u8])>,
+    ) -> Arc<ClientConfig> {
+        let mut roots = RootCertStore::empty();
+        roots.add(pki.ca.clone()).unwrap();
+        let b = ClientConfig::builder().with_root_certificates(roots);
+        let cfg = match client {
+            Some((chain, key)) => b.with_client_auth_cert(chain.to_vec(), key_of(key)).unwrap(),
+            None => b.with_no_client_auth(),
+        };
+        Arc::new(cfg)
+    }
+
+    /// Drive one loopback TLS handshake; `Ok` iff BOTH sides complete.
+    async fn handshake(server: Arc<ServerConfig>, client: Arc<ClientConfig>) -> Result<(), String> {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let acceptor = TlsAcceptor::from(server);
+        let srv = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            acceptor.accept(stream).await.map(|_| ()).map_err(|e| e.to_string())
+        });
+        let connector = TlsConnector::from(client);
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+        let cli = connector.connect(name, stream).await.map(|_| ()).map_err(|e| e.to_string());
+        srv.await.unwrap().and(cli)
+    }
+
+    #[test]
+    fn mtls_verifier_is_mandatory() {
+        install_crypto_provider();
+        let pki = test_pki();
+        let v = client_verifier(vec![pki.ca.clone()], HttpTlsMode::Mtls).unwrap();
+        assert!(v.client_auth_mandatory(), "mTLS verifier must require a client cert");
+    }
+
+    #[test]
+    fn server_tls_only_verifier_is_not_mandatory() {
+        install_crypto_provider();
+        let pki = test_pki();
+        let v = client_verifier(vec![pki.ca.clone()], HttpTlsMode::ServerTlsOnly).unwrap();
+        assert!(!v.client_auth_mandatory(), "server-TLS-only verifier must not require a cert");
+    }
+
+    #[test]
+    fn empty_ca_is_a_hard_error_in_both_modes() {
+        let pki = test_pki();
+        for mode in [HttpTlsMode::Mtls, HttpTlsMode::ServerTlsOnly] {
+            let err = build_server_config(
+                pki.server_chain.clone(),
+                key_of(&pki.server_key),
+                vec![],
+                mode,
+            )
+            .unwrap_err();
+            assert!(matches!(err, HttpTlsError::NoCa), "empty CA must be NoCa, got {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mtls_rejects_client_without_cert() {
+        install_crypto_provider();
+        let pki = test_pki();
+        let res = handshake(server_cfg(&pki, HttpTlsMode::Mtls), client_cfg(&pki, None)).await;
+        assert!(res.is_err(), "mTLS must reject a client presenting no cert");
+    }
+
+    #[tokio::test]
+    async fn mtls_accepts_client_with_valid_cert() {
+        install_crypto_provider();
+        let pki = test_pki();
+        let client = client_cfg(&pki, Some((&pki.client_chain, &pki.client_key)));
+        let res = handshake(server_cfg(&pki, HttpTlsMode::Mtls), client).await;
+        assert!(res.is_ok(), "mTLS must accept a CA-signed client cert: {res:?}");
+    }
+
+    #[tokio::test]
+    async fn server_tls_only_accepts_client_without_cert() {
+        install_crypto_provider();
+        let pki = test_pki();
+        let res =
+            handshake(server_cfg(&pki, HttpTlsMode::ServerTlsOnly), client_cfg(&pki, None)).await;
+        assert!(res.is_ok(), "server-TLS-only must accept a no-cert client: {res:?}");
+    }
+
+    #[tokio::test]
+    async fn server_tls_only_still_validates_a_presented_cert() {
+        install_crypto_provider();
+        let pki = test_pki();
+        // Presents a cert, but one signed by an untrusted CA — server-TLS-only
+        // relaxes "client cert required", NOT "client cert must be valid".
+        let rogue = client_cfg(&pki, Some((&pki.rogue_chain, &pki.rogue_key)));
+        let res = handshake(server_cfg(&pki, HttpTlsMode::ServerTlsOnly), rogue).await;
+        assert!(res.is_err(), "a presented but untrusted client cert must be rejected");
+    }
 
     /// After the install a process-global default provider is available.
     ///
