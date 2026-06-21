@@ -48,6 +48,7 @@
 //! rustls types are reached through the `tokio_rustls::rustls` re-export so the
 //! HTTP transport binds the *same* rustls as the gRPC/tonic stack.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio_rustls::rustls::{
@@ -80,6 +81,18 @@ pub enum HttpTlsError {
     /// The server cert chain / private key was rejected (e.g. cert/key mismatch).
     #[error("invalid server certificate or key: {0}")]
     ServerCert(rustls::Error),
+    /// A cert/key/CA file could not be read (missing, unreadable). Names the path.
+    #[error("cannot read TLS file {0}: {1}")]
+    Read(PathBuf, std::io::Error),
+    /// A PEM file failed to decode. Names the path.
+    #[error("malformed PEM in {0}: {1}")]
+    Pem(PathBuf, std::io::Error),
+    /// A PEM file contained no certificates where some were required.
+    #[error("no certificates found in {0}")]
+    NoCertificates(PathBuf),
+    /// A PEM file contained no usable (unencrypted PKCS#8/PKCS#1/SEC1) private key.
+    #[error("no usable private key found in {0} (encrypted keys are not supported)")]
+    NoPrivateKey(PathBuf),
 }
 
 /// Build the HTTP listener's rustls `ServerConfig` in one of two modes (FR-28,
@@ -142,6 +155,48 @@ fn client_verifier(
         HttpTlsMode::ServerTlsOnly => builder.allow_unauthenticated(),
     };
     builder.build().map_err(HttpTlsError::Verifier)
+}
+
+/// Load the server cert chain, server private key, and client CA from the
+/// configured PEM paths and build the `ServerConfig` (Issue 3.2, R2/R3).
+///
+/// Genuinely new code: the gRPC `TlsConfig` hands raw PEM to tonic and never
+/// produces DER. Fails **closed** — a missing, malformed, or encrypted file is a
+/// hard error naming the path, consistent with the binary's "refuse to start
+/// without valid TLS" posture; there is no plaintext fallback. A cert/key
+/// mismatch is rejected here (build time), not at first connection.
+pub fn load_server_config(
+    cert_path: &Path,
+    key_path: &Path,
+    ca_path: &Path,
+    mode: HttpTlsMode,
+) -> Result<Arc<ServerConfig>, HttpTlsError> {
+    let cert_chain = read_certs(cert_path)?;
+    let key = read_key(key_path)?;
+    let client_ca = read_certs(ca_path)?;
+    build_server_config(cert_chain, key, client_ca, mode)
+}
+
+/// Read all PEM certificates from `path` (a server chain or a CA bundle).
+fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, HttpTlsError> {
+    let pem = std::fs::read(path).map_err(|e| HttpTlsError::Read(path.to_path_buf(), e))?;
+    let certs = rustls_pemfile::certs(&mut pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| HttpTlsError::Pem(path.to_path_buf(), e))?;
+    if certs.is_empty() {
+        return Err(HttpTlsError::NoCertificates(path.to_path_buf()));
+    }
+    Ok(certs)
+}
+
+/// Read the first PEM private key from `path`, accepting PKCS#8, PKCS#1 (RSA),
+/// and SEC1 (EC) encodings (rustls-pemfile dispatches by tag). An encrypted key
+/// carries an unsupported tag and yields [`HttpTlsError::NoPrivateKey`].
+fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, HttpTlsError> {
+    let pem = std::fs::read(path).map_err(|e| HttpTlsError::Read(path.to_path_buf(), e))?;
+    rustls_pemfile::private_key(&mut pem.as_slice())
+        .map_err(|e| HttpTlsError::Pem(path.to_path_buf(), e))?
+        .ok_or_else(|| HttpTlsError::NoPrivateKey(path.to_path_buf()))
 }
 
 /// Install the `ring` rustls provider as the process-global default.
@@ -255,20 +310,37 @@ mod tests {
         Arc::new(cfg)
     }
 
-    /// Drive one loopback TLS handshake; `Ok` iff BOTH sides complete.
-    async fn handshake(server: Arc<ServerConfig>, client: Arc<ClientConfig>) -> Result<(), String> {
+    /// Drive one loopback TLS handshake, returning `(server_result,
+    /// client_result)` so a test can assert which side rejected (SEC-001, 3.1
+    /// review). Each side is bounded by a 5s timeout so a future regression in
+    /// the early-error path fails CI instead of hanging (3.1 review).
+    async fn handshake(
+        server: Arc<ServerConfig>,
+        client: Arc<ClientConfig>,
+    ) -> (Result<(), String>, Result<(), String>) {
+        use tokio::time::{timeout, Duration};
+        const T: Duration = Duration::from_secs(5);
+
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let acceptor = TlsAcceptor::from(server);
         let srv = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            acceptor.accept(stream).await.map(|_| ()).map_err(|e| e.to_string())
+            let accept = async {
+                let (stream, _) = listener.accept().await.map_err(|e| e.to_string())?;
+                acceptor.accept(stream).await.map(|_| ()).map_err(|e| e.to_string())
+            };
+            timeout(T, accept).await.unwrap_or_else(|_| Err("server handshake timeout".into()))
         });
+
         let connector = TlsConnector::from(client);
-        let stream = TcpStream::connect(addr).await.unwrap();
-        let name = ServerName::try_from("localhost").unwrap();
-        let cli = connector.connect(name, stream).await.map(|_| ()).map_err(|e| e.to_string());
-        srv.await.unwrap().and(cli)
+        let connect = async {
+            let stream = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
+            let name = ServerName::try_from("localhost").unwrap();
+            connector.connect(name, stream).await.map(|_| ()).map_err(|e| e.to_string())
+        };
+        let cli =
+            timeout(T, connect).await.unwrap_or_else(|_| Err("client handshake timeout".into()));
+        (srv.await.unwrap(), cli)
     }
 
     #[test]
@@ -306,8 +378,8 @@ mod tests {
     async fn mtls_rejects_client_without_cert() {
         install_crypto_provider();
         let pki = test_pki();
-        let res = handshake(server_cfg(&pki, HttpTlsMode::Mtls), client_cfg(&pki, None)).await;
-        assert!(res.is_err(), "mTLS must reject a client presenting no cert");
+        let (srv, _) = handshake(server_cfg(&pki, HttpTlsMode::Mtls), client_cfg(&pki, None)).await;
+        assert!(srv.is_err(), "mTLS server must reject a client presenting no cert: {srv:?}");
     }
 
     #[tokio::test]
@@ -315,17 +387,23 @@ mod tests {
         install_crypto_provider();
         let pki = test_pki();
         let client = client_cfg(&pki, Some((&pki.client_chain, &pki.client_key)));
-        let res = handshake(server_cfg(&pki, HttpTlsMode::Mtls), client).await;
-        assert!(res.is_ok(), "mTLS must accept a CA-signed client cert: {res:?}");
+        let (srv, cli) = handshake(server_cfg(&pki, HttpTlsMode::Mtls), client).await;
+        assert!(
+            srv.is_ok() && cli.is_ok(),
+            "mTLS must accept a CA-signed client cert: {srv:?} {cli:?}"
+        );
     }
 
     #[tokio::test]
     async fn server_tls_only_accepts_client_without_cert() {
         install_crypto_provider();
         let pki = test_pki();
-        let res =
+        let (srv, cli) =
             handshake(server_cfg(&pki, HttpTlsMode::ServerTlsOnly), client_cfg(&pki, None)).await;
-        assert!(res.is_ok(), "server-TLS-only must accept a no-cert client: {res:?}");
+        assert!(
+            srv.is_ok() && cli.is_ok(),
+            "server-TLS-only must accept a no-cert client: {srv:?} {cli:?}"
+        );
     }
 
     #[tokio::test]
@@ -335,8 +413,109 @@ mod tests {
         // Presents a cert, but one signed by an untrusted CA — server-TLS-only
         // relaxes "client cert required", NOT "client cert must be valid".
         let rogue = client_cfg(&pki, Some((&pki.rogue_chain, &pki.rogue_key)));
-        let res = handshake(server_cfg(&pki, HttpTlsMode::ServerTlsOnly), rogue).await;
-        assert!(res.is_err(), "a presented but untrusted client cert must be rejected");
+        let (srv, _) = handshake(server_cfg(&pki, HttpTlsMode::ServerTlsOnly), rogue).await;
+        // Assert the SERVER side rejected (SEC-001): the failure must be the
+        // server validating the client cert, not an unrelated client-side error.
+        assert!(
+            srv.is_err(),
+            "the server must reject a presented but untrusted client cert: {srv:?}"
+        );
+    }
+
+    // ── PEM→DER loading (Issue 3.2) ──────────────────────────────────────────
+
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    /// Write `pem` to `dir/name` and return the path.
+    fn write_pem(dir: &TempDir, name: &str, pem: &[u8]) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(pem).unwrap();
+        path
+    }
+
+    /// rcgen CA + `localhost` server cert/key as PEM bytes (PKCS#8 key).
+    fn server_pems() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let ca_params = CertificateParams::new(vec!["test-ca".to_string()]).unwrap();
+        let ca_key = KeyPair::generate().unwrap();
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let sp = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let sk = KeyPair::generate().unwrap();
+        let server = sp.signed_by(&sk, &ca, &ca_key).unwrap();
+        (server.pem().into_bytes(), sk.serialize_pem().into_bytes(), ca.pem().into_bytes())
+    }
+
+    #[test]
+    fn loads_pkcs8_cert_key_ca_and_builds_config() {
+        install_crypto_provider();
+        let dir = TempDir::new().unwrap();
+        let (cert, key, ca) = server_pems();
+        let cert_p = write_pem(&dir, "server.pem", &cert);
+        let key_p = write_pem(&dir, "server.key", &key);
+        let ca_p = write_pem(&dir, "ca.pem", &ca);
+        // Both modes load the same material.
+        for mode in [HttpTlsMode::Mtls, HttpTlsMode::ServerTlsOnly] {
+            load_server_config(&cert_p, &key_p, &ca_p, mode).expect("PKCS#8 material loads");
+        }
+    }
+
+    #[test]
+    fn read_key_handles_rsa_pkcs1_and_sec1_encodings() {
+        // rustls-pemfile routes by PEM tag; assert the loader surfaces each
+        // encoding as the right `PrivateKeyDer` variant. (Cryptographic validity
+        // is enforced by webpki/with_single_cert, not the PEM loader.)
+        // The body need only be valid base64 — rustls-pemfile dispatches the
+        // variant from the PEM tag and does not parse the DER here.
+        let dir = TempDir::new().unwrap();
+        let rsa = b"-----BEGIN RSA PRIVATE KEY-----\nQUJDRUZHSElK\n-----END RSA PRIVATE KEY-----\n";
+        let sec1 = b"-----BEGIN EC PRIVATE KEY-----\nS0xNTk9QUVJT\n-----END EC PRIVATE KEY-----\n";
+        let rsa_p = write_pem(&dir, "rsa.key", rsa);
+        let sec1_p = write_pem(&dir, "sec1.key", sec1);
+        assert!(matches!(read_key(&rsa_p).unwrap(), PrivateKeyDer::Pkcs1(_)), "RSA PKCS#1 → Pkcs1");
+        assert!(matches!(read_key(&sec1_p).unwrap(), PrivateKeyDer::Sec1(_)), "SEC1 EC → Sec1");
+    }
+
+    #[test]
+    fn missing_path_is_a_hard_error_naming_the_path() {
+        let p = std::path::Path::new("/nonexistent/rvc-http-tls/server.pem");
+        let err = read_certs(p).unwrap_err();
+        assert!(format!("{err}").contains("server.pem"), "error must name the path: {err}");
+    }
+
+    #[test]
+    fn malformed_pem_has_no_certs() {
+        let dir = TempDir::new().unwrap();
+        let p = write_pem(&dir, "junk.pem", b"not a pem file at all\n");
+        assert!(matches!(read_certs(&p).unwrap_err(), HttpTlsError::NoCertificates(_)));
+    }
+
+    #[test]
+    fn encrypted_key_fails_closed() {
+        // An encrypted PKCS#8 key carries the "ENCRYPTED PRIVATE KEY" tag, which
+        // rustls-pemfile does NOT treat as a usable private key → fail closed
+        // (no passphrase support for the HTTP listener in MVP).
+        let dir = TempDir::new().unwrap();
+        let enc = b"-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIB...\n-----END ENCRYPTED PRIVATE KEY-----\n";
+        let p = write_pem(&dir, "enc.key", enc);
+        assert!(matches!(read_key(&p).unwrap_err(), HttpTlsError::NoPrivateKey(_)));
+    }
+
+    #[test]
+    fn cert_key_mismatch_is_rejected_at_build_time() {
+        install_crypto_provider();
+        let dir = TempDir::new().unwrap();
+        let (cert, _key, ca) = server_pems();
+        // A DIFFERENT key that does not match the server cert.
+        let wrong_key = KeyPair::generate().unwrap().serialize_pem().into_bytes();
+        let cert_p = write_pem(&dir, "server.pem", &cert);
+        let key_p = write_pem(&dir, "wrong.key", &wrong_key);
+        let ca_p = write_pem(&dir, "ca.pem", &ca);
+        let err = load_server_config(&cert_p, &key_p, &ca_p, HttpTlsMode::Mtls).unwrap_err();
+        assert!(
+            matches!(err, HttpTlsError::ServerCert(_)),
+            "cert/key mismatch must be rejected at build time, got {err:?}"
+        );
     }
 
     /// After the install a process-global default provider is available.
