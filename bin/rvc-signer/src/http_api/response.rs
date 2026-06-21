@@ -9,12 +9,9 @@
 //! path) is surfaced; SQLite paths, rusqlite internals, and lock messages are
 //! logged server-side and replaced with a generic message.
 //!
-//! The success / `Accept`-negotiated half is added in Issue 2.7.
-//!
-//! NOTE: landed ahead of its consumer — the sign handler (Issues 2.6/2.7)
-//! returns `HttpSignError`. Until then it is exercised only by this module's
-//! tests, hence the transitional `allow(dead_code)`; remove it in 2.6.
-#![allow(dead_code)]
+//! The success / `Accept`-negotiated half (`sign_response`) shapes the body per
+//! the request `Accept` header (FR-17). Both halves are consumed by the live
+//! `routes::sign` handler (Issue 2.8).
 
 use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
@@ -119,8 +116,16 @@ pub(super) fn sign_response(accept: Option<&str>, signature: &[u8]) -> Response 
 /// `true` only when the client explicitly accepts `text/plain`. An absent,
 /// wildcard (`*/*`), or `application/json` Accept defaults to JSON (Web3Signer
 /// mirrors the content type, defaulting to JSON).
+///
+/// Media-type matching is case-insensitive and ignores `;`-parameters
+/// (`q`/`charset`) per RFC 9110, and scans every comma-separated member so a
+/// multi-value `Accept` that lists `text/plain` is honored (2.7 review).
 fn wants_text_plain(accept: Option<&str>) -> bool {
-    accept.is_some_and(|a| a.split(',').any(|m| m.trim().starts_with("text/plain")))
+    accept.is_some_and(|a| {
+        a.split(',').any(|member| {
+            member.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("text/plain")
+        })
+    })
 }
 
 #[cfg(test)]
@@ -137,6 +142,18 @@ mod tests {
 
     fn content_type(resp: &Response) -> String {
         resp.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn wants_text_plain_is_case_insensitive_param_aware_and_multi_value() {
+        assert!(wants_text_plain(Some("text/plain")));
+        assert!(wants_text_plain(Some("Text/Plain")), "media types are case-insensitive");
+        assert!(wants_text_plain(Some("text/plain; q=0.9")), ";-params ignored");
+        assert!(wants_text_plain(Some("application/json, text/plain")), "multi-value scanned");
+        assert!(!wants_text_plain(Some("application/json")));
+        assert!(!wants_text_plain(Some("*/*")));
+        assert!(!wants_text_plain(Some("text/plainish")), "exact media type, not a prefix");
+        assert!(!wants_text_plain(None));
     }
 
     #[tokio::test]

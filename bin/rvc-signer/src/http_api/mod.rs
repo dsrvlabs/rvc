@@ -11,7 +11,10 @@
 
 use std::sync::Arc;
 
-use axum::{routing::get, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use signer::{SigningGate, AUDIT_CN_DEFAULT};
 
 use crate::backend::SigningBackend;
@@ -64,6 +67,7 @@ pub fn router(state: Web3SignerState) -> Router {
     Router::new()
         .route("/upcheck", get(routes::upcheck))
         .route("/api/v1/eth2/publicKeys", get(routes::public_keys))
+        .route("/api/v1/eth2/sign/:identifier", post(routes::sign))
         .with_state(state)
 }
 
@@ -134,6 +138,51 @@ pub(crate) mod test_support {
         fn public_keys(&self) -> Vec<[u8; 48]> {
             self.keys.clone()
         }
+    }
+
+    /// A backend that performs REAL BLS signing, for end-to-end KAT tests.
+    ///
+    /// Unlike [`MockBackend`] (fixed blob), `sign` produces a genuine BLS
+    /// signature over the signing root, so a test can assert the gate returned
+    /// `sk.sign(expected_root)` — proving the route computed the correct root
+    /// and signed with the right key.
+    pub struct RealSigningBackend {
+        km: Arc<crypto::KeyManager>,
+    }
+
+    impl RealSigningBackend {
+        pub fn with_key(sk: crypto::SecretKey) -> Self {
+            let mut km = crypto::KeyManager::new();
+            km.insert(sk);
+            Self { km: Arc::new(km) }
+        }
+    }
+
+    #[async_trait]
+    impl SigningBackend for RealSigningBackend {
+        async fn sign(
+            &self,
+            signing_root: &[u8; 32],
+            pubkey: &[u8; 48],
+        ) -> Result<[u8; 96], SigningBackendError> {
+            let pk = crypto::PublicKey::from_bytes(pubkey)
+                .map_err(|_| SigningBackendError::KeyNotFound(*pubkey))?;
+            let sk =
+                self.km.get_secret_key(&pk).ok_or(SigningBackendError::KeyNotFound(*pubkey))?;
+            Ok(sk.sign(signing_root).to_bytes())
+        }
+
+        fn public_keys(&self) -> Vec<[u8; 48]> {
+            self.km.list_public_keys().iter().map(|pk| pk.to_bytes()).collect()
+        }
+    }
+
+    /// A deterministic BLS keypair for KAT tests: returns the `SecretKey` and its
+    /// 48-byte public key.
+    pub fn test_keypair() -> (crypto::SecretKey, [u8; 48]) {
+        let sk = crypto::eip2333::derive_master_sk(&[0x11u8; 32]).expect("derive master sk");
+        let pk = sk.public_key().to_bytes();
+        (sk, pk)
     }
 
     /// Build a [`Web3SignerState`] over an in-memory slashing DB and the given

@@ -22,12 +22,8 @@
 //! enumerated string. It never interpolates request bytes, serde/SSZ decoder text,
 //! or filesystem paths into a client-visible body.
 //!
-//! NOTE: landed ahead of its consumer — the live sign route handler (Issue 2.8)
-//! is what calls `plan_sign` and makes this whole `request -> dispatch ->
-//! response` chain reachable from non-test code. Until then the module is
-//! exercised only by its own tests, hence the transitional `allow(dead_code)`;
-//! it (and the matching allows in `request.rs`/`response.rs`) come off in 2.8.
-#![allow(dead_code)]
+//! Consumed by the live `routes::sign` handler (Issue 2.8), which calls
+//! `plan_sign` and forwards the `SignPlan` to the matching gate method.
 
 use crypto::{compute_domain, compute_signing_root};
 use eth_types::{

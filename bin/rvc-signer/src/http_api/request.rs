@@ -10,11 +10,10 @@
 //! This module only *decodes*; the dispatcher (Issue 2.6) computes the domain +
 //! signing root and enforces the per-type `fork_info` requirement.
 //!
-//! NOTE: the envelope is landed ahead of its consumer — `dispatch.rs` (Issue
-//! 2.6) reads every field. Until then the fields are exercised only by this
-//! module's tests, so the whole module carries an `allow(dead_code)`; remove it
-//! once the dispatcher lands.
-#![allow(dead_code)]
+//! Consumed by `dispatch.rs` and the live `routes::sign` handler. The only
+//! decoded-but-unread field is `BeaconBlockEnvelope::version` (the block signing
+//! root comes from `block_header` + the `fork_info` domain), which carries a
+//! narrow `allow(dead_code)`.
 
 use serde::Deserialize;
 
@@ -35,6 +34,9 @@ pub struct WireForkInfo {
 /// is decoded but not part of the root (the domain comes from `fork_info`).
 #[derive(Debug, Clone, Deserialize)]
 pub struct BeaconBlockEnvelope {
+    /// Decoded for forward-compat but not hashed — the block signing root uses
+    /// `block_header` + the `fork_info` domain, never `version`.
+    #[allow(dead_code)]
     pub version: String,
     pub block_header: BeaconBlockHeader,
 }
