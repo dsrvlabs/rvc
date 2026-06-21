@@ -422,6 +422,20 @@ mod tests {
         assert_eq!(body.len(), 2 + 192, "0x + 96-byte sig hex");
     }
 
+    // ── Request hardening (Issue 2.11) ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn oversized_body_returns_413() {
+        // Empty backend: were the body cap missing, the route would resolve the
+        // (unloaded) key and return 404 — so a 413 strictly proves the cap fired
+        // at extraction, before any handler/gate work.
+        let state = test_state(Arc::new(MockBackend::empty()));
+        let id = format!("0x{}", "ab".repeat(48));
+        let oversized = "x".repeat((1 << 20) + 1); // 1 MiB + 1 byte
+        let resp = post_sign(state, &id, None, oversized).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     // ── Pre-gate error paths ─────────────────────────────────────────────────
 
     #[tokio::test]

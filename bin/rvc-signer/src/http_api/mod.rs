@@ -11,11 +11,19 @@
 
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::{
     routing::{get, post},
     Router,
 };
 use signer::{SigningGate, AUDIT_CN_DEFAULT};
+
+/// Maximum accepted request-body size (1 MiB), mirroring the gRPC listener's
+/// `MAX_DECODE_BYTES` (`main.rs`). A signing request — even a `BLOCK_V2` header —
+/// is far under this; an oversized body is rejected with `413 Payload Too Large`
+/// at extraction, before any parse/gate work, so a hostile client cannot force
+/// unbounded buffering (Issue 2.11).
+const MAX_BODY_BYTES: usize = 1 << 20;
 
 use crate::backend::SigningBackend;
 
@@ -63,11 +71,20 @@ pub struct Web3SignerState {
 /// Pure and socket-free: attach `state` and return the `Router`; the caller
 /// (Phase 3 `run_serve`) wraps it in the TLS accept loop. Exercised in tests via
 /// `tower::ServiceExt::oneshot` with no socket bound.
+///
+/// A [`DefaultBodyLimit`] of [`MAX_BODY_BYTES`] caps every request body (Issue
+/// 2.11). The two other request-hardening layers are Phase-3 accept-loop
+/// concerns and are deferred there: a **per-connection serve timeout** is applied
+/// at `serve_connection`, and **panic isolation** is provided by tokio — each
+/// accepted connection runs in its own `tokio::spawn`, so a panic in one
+/// connection task is isolated and never reaches the gRPC listener or the process
+/// accept loop (the handlers are already panic-free on attacker input).
 pub fn router(state: Web3SignerState) -> Router {
     Router::new()
         .route("/upcheck", get(routes::upcheck))
         .route("/api/v1/eth2/publicKeys", get(routes::public_keys))
         .route("/api/v1/eth2/sign/:identifier", post(routes::sign))
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(state)
 }
 
