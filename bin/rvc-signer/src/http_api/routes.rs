@@ -122,6 +122,9 @@ async fn sign_inner(
             SignPayload::SyncCommitteeSelectionProof { .. } => {
                 state.gate.sign_selection_proof(&pubkey, root).await
             }
+            SignPayload::ValidatorRegistration { .. } => {
+                state.gate.sign_builder_registration(&pubkey, root).await
+            }
             // BLOCK_V2 / ATTESTATION are slashable and never yield NonSlashable;
             // a no-`_` match keeps a future payload variant a compile error.
             SignPayload::BlockV2 { .. } | SignPayload::Attestation { .. } => {
@@ -155,9 +158,10 @@ mod tests {
     use eth_types::{
         AggregateAndProof, Attestation, AttestationData, BeaconBlockHeader, Checkpoint,
         ContributionAndProof, Root, SyncAggregatorSelectionData, SyncCommitteeContribution,
-        SyncCommitteeMessage, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER,
-        DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO,
-        DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+        SyncCommitteeMessage, ValidatorRegistrationV1, DOMAIN_AGGREGATE_AND_PROOF,
+        DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
+        DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
+        DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
     };
 
     const CURRENT_VERSION: [u8; 4] = [0x04, 0x00, 0x00, 0x00];
@@ -531,6 +535,63 @@ mod tests {
             sign_ok(aggregation_slot_body(7)).await,
             sign_ok(sync_selection_body(7, 0)).await,
             "0x08 sync-selection must not equal 0x05 aggregation-slot for the same slot"
+        );
+    }
+
+    // ── VALIDATOR_REGISTRATION (Issue 4.3): no fork_info, fixed builder domain ─
+
+    fn sample_registration() -> ValidatorRegistrationV1 {
+        ValidatorRegistrationV1 {
+            fee_recipient: [0x11; 20],
+            gas_limit: 30_000_000,
+            timestamp: 1_700_000_000,
+            pubkey: test_keypair().1,
+        }
+    }
+
+    fn registration_body(reg: &ValidatorRegistrationV1, with_fork_info: bool) -> String {
+        let reg_json = serde_json::to_string(reg).unwrap();
+        if with_fork_info {
+            format!(
+                r#"{{ "type": "VALIDATOR_REGISTRATION", {fi}, "validator_registration": {reg_json} }}"#,
+                fi = fork_info_json(),
+            )
+        } else {
+            format!(
+                r#"{{ "type": "VALIDATOR_REGISTRATION", "validator_registration": {reg_json} }}"#
+            )
+        }
+    }
+
+    /// Independently compute the builder signing root: fixed builder fork version
+    /// `0x00000000` + a ZERO genesis validators root (ADR-008), NOT a fork_info gvr.
+    fn expected_registration_sig(reg: &ValidatorRegistrationV1) -> Vec<u8> {
+        let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, [0, 0, 0, 0], [0u8; 32]);
+        let (sk, _) = test_keypair();
+        sk.sign(&compute_signing_root(reg, domain)).to_bytes().to_vec()
+    }
+
+    #[tokio::test]
+    async fn validator_registration_without_fork_info_signs_kat() {
+        // A body that OMITS fork_info must parse + sign (not 400), and sign the
+        // builder root (zero gvr, fixed builder fork version).
+        let reg = sample_registration();
+        assert_eq!(
+            sign_ok(registration_body(&reg, false)).await,
+            expected_registration_sig(&reg),
+            "VALIDATOR_REGISTRATION omitting fork_info signs the builder root"
+        );
+    }
+
+    #[tokio::test]
+    async fn validator_registration_with_fork_info_is_ignored_not_rejected() {
+        // A body that DOES include fork_info still signs and produces the SAME
+        // signature — fork_info is ignored for this type, not rejected.
+        let reg = sample_registration();
+        assert_eq!(
+            sign_ok(registration_body(&reg, true)).await,
+            expected_registration_sig(&reg),
+            "fork_info is ignored for VALIDATOR_REGISTRATION (same builder root)"
         );
     }
 

@@ -19,7 +19,7 @@ use serde::Deserialize;
 
 use eth_types::{
     AggregateAndProof, AttestationData, BeaconBlockHeader, ContributionAndProof, Fork, Root,
-    SyncCommitteeMessage,
+    SyncCommitteeMessage, ValidatorRegistrationV1,
 };
 
 /// `fork_info` wire object: `{ fork: { previous_version, current_version, epoch },
@@ -98,6 +98,13 @@ pub enum SignPayload {
     // from the type name. The dispatcher owns the domain split.
     #[serde(rename = "SYNC_COMMITTEE_SELECTION_PROOF")]
     SyncCommitteeSelectionProof { sync_aggregator_selection_data: SyncSelectionPayload },
+    // ── P1 builder registration (Issue 4.3, ADR-008) ─────────────────────────
+    // The ONE type with NO fork_info: the builder domain is fixed (zero gvr +
+    // genesis builder fork version). The dispatcher skips the fork_info-required
+    // check for this variant; `fork_info` stays Option at the serde layer so a
+    // body that omits it parses cleanly.
+    #[serde(rename = "VALIDATOR_REGISTRATION")]
+    ValidatorRegistration { validator_registration: ValidatorRegistrationV1 },
 }
 
 /// The decoded sign request: common fields (`fork_info`, `signingRoot`) plus the

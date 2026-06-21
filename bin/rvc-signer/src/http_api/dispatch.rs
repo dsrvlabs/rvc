@@ -27,13 +27,21 @@
 
 use crypto::{compute_domain, compute_signing_root};
 use eth_types::{
-    Root, SyncAggregatorSelectionData, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
-    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    Root, SyncAggregatorSelectionData, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
+    DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO,
+    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
 };
 
 use super::request::{SignPayload, SignRequest, WireForkInfo};
 use super::response::HttpSignError;
+
+/// The fixed application-builder fork version for `VALIDATOR_REGISTRATION`
+/// (ADR-008): the genesis (mainnet) `0x00000000`, matching the gRPC "empty ⇒
+/// mainnet" default. A `VALIDATOR_REGISTRATION` request carries no fork info, so
+/// the builder domain is fixed over this version + a zero gvr. (Non-mainnet
+/// genesis-fork-version handling is a follow-up to validate against real
+/// Lighthouse/Prysm captures.)
+const BUILDER_FORK_VERSION: [u8; 4] = [0, 0, 0, 0];
 
 /// The 32-byte zero root — a present-but-zero `signingRoot` means "do not verify".
 const ZERO_ROOT: Root = [0u8; 32];
@@ -139,6 +147,15 @@ pub(super) fn plan_sign(req: &SignRequest) -> Result<SignPlan, HttpSignError> {
                 subcommittee_index: sync_aggregator_selection_data.subcommittee_index,
             };
             let root = compute_signing_root(&sasd, domain);
+            (root, Slashing::NonSlashable)
+        }
+        SignPayload::ValidatorRegistration { validator_registration } => {
+            // The ONE type with NO fork_info (ADR-008): does NOT call
+            // require_fork_info. The builder domain is fixed over a zero gvr +
+            // the genesis builder fork version, NOT sourced from the request.
+            let domain =
+                compute_domain(DOMAIN_APPLICATION_BUILDER, BUILDER_FORK_VERSION, ZERO_ROOT);
+            let root = compute_signing_root(validator_registration, domain);
             (root, Slashing::NonSlashable)
         }
     };
