@@ -17,7 +17,10 @@
 
 use serde::Deserialize;
 
-use eth_types::{AttestationData, BeaconBlockHeader, Fork, Root};
+use eth_types::{
+    AggregateAndProof, AttestationData, BeaconBlockHeader, ContributionAndProof, Fork, Root,
+    SyncCommitteeMessage,
+};
 
 /// `fork_info` wire object: `{ fork: { previous_version, current_version, epoch },
 /// genesis_validators_root }`. Distinct from `eth_types::ForkInfo` (which
@@ -69,6 +72,13 @@ pub enum SignPayload {
     RandaoReveal { randao_reveal: RandaoRevealPayload },
     #[serde(rename = "AGGREGATION_SLOT")]
     AggregationSlot { aggregation_slot: AggregationSlotPayload },
+    // ── P1 non-slashable arms (Issue 4.1) — existing eth-types objects ────────
+    #[serde(rename = "AGGREGATE_AND_PROOF")]
+    AggregateAndProof { aggregate_and_proof: AggregateAndProof },
+    #[serde(rename = "SYNC_COMMITTEE_MESSAGE")]
+    SyncCommitteeMessage { sync_committee_message: SyncCommitteeMessage },
+    #[serde(rename = "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF")]
+    SyncCommitteeContributionAndProof { contribution_and_proof: ContributionAndProof },
 }
 
 /// The decoded sign request: common fields (`fork_info`, `signingRoot`) plus the

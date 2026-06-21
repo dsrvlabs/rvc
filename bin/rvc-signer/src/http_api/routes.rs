@@ -108,6 +108,15 @@ async fn sign_inner(
             SignPayload::AggregationSlot { .. } => {
                 state.gate.sign_selection_proof(&pubkey, root).await
             }
+            SignPayload::AggregateAndProof { .. } => {
+                state.gate.sign_aggregate_and_proof(&pubkey, root).await
+            }
+            SignPayload::SyncCommitteeMessage { .. } => {
+                state.gate.sign_sync_committee_message(&pubkey, root).await
+            }
+            SignPayload::SyncCommitteeContributionAndProof { .. } => {
+                state.gate.sign_contribution_and_proof(&pubkey, root).await
+            }
             // BLOCK_V2 / ATTESTATION are slashable and never yield NonSlashable;
             // a no-`_` match keeps a future payload variant a compile error.
             SignPayload::BlockV2 { .. } | SignPayload::Attestation { .. } => {
@@ -139,8 +148,11 @@ mod tests {
     // Import BeaconBlockHeader EXPLICITLY from eth_types: an unrelated all-String
     // `rvc-beacon::BeaconBlockHeader` DTO exists and would compute a garbage root.
     use eth_types::{
-        AttestationData, BeaconBlockHeader, Checkpoint, Root, DOMAIN_BEACON_ATTESTER,
-        DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
+        AggregateAndProof, Attestation, AttestationData, BeaconBlockHeader, Checkpoint,
+        ContributionAndProof, Root, SyncCommitteeContribution, SyncCommitteeMessage,
+        DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
+        DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
+        DOMAIN_SYNC_COMMITTEE,
     };
 
     const CURRENT_VERSION: [u8; 4] = [0x04, 0x00, 0x00, 0x00];
@@ -347,6 +359,119 @@ mod tests {
             let resp = post_sign(state.clone(), &id, None, randao_body(9)).await;
             assert_eq!(resp.status(), StatusCode::OK, "randao is non-slashable");
         }
+    }
+
+    // ── P1 aggregation + sync-committee arms (Issue 4.1) ─────────────────────
+
+    fn dummy_sig() -> Vec<u8> {
+        vec![0xAB; 96]
+    }
+
+    /// A valid (small, in-limit) pre-Electra aggregation bitlist: `0x01` is a
+    /// 0-data-bit bitlist (just the length delimiter).
+    fn valid_agg_bits() -> Vec<u8> {
+        vec![0x01]
+    }
+
+    fn sample_aggregate_and_proof() -> AggregateAndProof {
+        AggregateAndProof {
+            aggregator_index: 1,
+            aggregate: Attestation {
+                aggregation_bits: valid_agg_bits(),
+                data: sample_attestation(),
+                signature: dummy_sig(),
+            },
+            selection_proof: vec![0xCD; 96],
+        }
+    }
+
+    fn sample_contribution_and_proof() -> ContributionAndProof {
+        ContributionAndProof {
+            aggregator_index: 1,
+            contribution: SyncCommitteeContribution {
+                slot: 5,
+                beacon_block_root: [0x11; 32],
+                subcommittee_index: 0,
+                aggregation_bits: vec![0u8; 16],
+                signature: dummy_sig(),
+            },
+            selection_proof: vec![0xCD; 96],
+        }
+    }
+
+    /// Wrap a serialized payload object in the sign envelope with `fork_info`.
+    fn p1_body(type_name: &str, payload_key: &str, payload_json: String) -> String {
+        format!(
+            r#"{{ "type": "{type_name}", {fi}, "{payload_key}": {payload_json} }}"#,
+            fi = fork_info_json(),
+        )
+    }
+
+    #[tokio::test]
+    async fn aggregate_and_proof_kat() {
+        let agg = sample_aggregate_and_proof();
+        let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, CURRENT_VERSION, expected_gvr());
+        let object_root = agg.try_tree_hash_root().unwrap().0;
+        let (sk, _) = test_keypair();
+        let expected = sk.sign(&compute_signing_root(&object_root, domain)).to_bytes();
+        let body = p1_body(
+            "AGGREGATE_AND_PROOF",
+            "aggregate_and_proof",
+            serde_json::to_string(&agg).unwrap(),
+        );
+        assert_eq!(sign_ok(body).await, expected.to_vec());
+    }
+
+    #[tokio::test]
+    async fn sync_committee_message_kat_signs_the_block_root() {
+        let msg = SyncCommitteeMessage {
+            slot: 5,
+            beacon_block_root: [0x22; 32],
+            validator_index: 0,
+            signature: dummy_sig(),
+        };
+        let domain = compute_domain(DOMAIN_SYNC_COMMITTEE, CURRENT_VERSION, expected_gvr());
+        // The signed object is the block ROOT, not the message container.
+        let (sk, _) = test_keypair();
+        let expected = sk.sign(&compute_signing_root(&msg.beacon_block_root, domain)).to_bytes();
+        let body = p1_body(
+            "SYNC_COMMITTEE_MESSAGE",
+            "sync_committee_message",
+            serde_json::to_string(&msg).unwrap(),
+        );
+        assert_eq!(sign_ok(body).await, expected.to_vec());
+    }
+
+    #[tokio::test]
+    async fn sync_committee_contribution_and_proof_kat() {
+        let cap = sample_contribution_and_proof();
+        let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, CURRENT_VERSION, expected_gvr());
+        let (sk, _) = test_keypair();
+        let expected = sk.sign(&compute_signing_root(&cap, domain)).to_bytes();
+        let body = p1_body(
+            "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF",
+            "contribution_and_proof",
+            serde_json::to_string(&cap).unwrap(),
+        );
+        assert_eq!(sign_ok(body).await, expected.to_vec());
+    }
+
+    #[tokio::test]
+    async fn aggregate_and_proof_malformed_bits_is_400_not_panic() {
+        // An over-length aggregation_bits bitlist must surface as 400 via
+        // try_tree_hash_root, never a panic (the liveness-DoS class).
+        let mut agg = sample_aggregate_and_proof();
+        agg.aggregate.aggregation_bits = vec![0xff; 4096]; // far past the committee limit
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let body = p1_body(
+            "AGGREGATE_AND_PROOF",
+            "aggregate_and_proof",
+            serde_json::to_string(&agg).unwrap(),
+        );
+        let resp = post_sign(state, &id, None, body).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "malformed bits → 400, not panic");
     }
 
     // ── BLOCK_V2 (Issue 2.9): KAT over the block header + double-proposal 412 ─

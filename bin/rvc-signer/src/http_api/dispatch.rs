@@ -27,7 +27,8 @@
 
 use crypto::{compute_domain, compute_signing_root};
 use eth_types::{
-    Root, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
+    Root, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
+    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
 };
 
 use super::request::{SignPayload, SignRequest, WireForkInfo};
@@ -97,6 +98,34 @@ pub(super) fn plan_sign(req: &SignRequest) -> Result<SignPlan, HttpSignError> {
             let (fork_version, gvr) = require_fork_info(req)?;
             let domain = compute_domain(DOMAIN_SELECTION_PROOF, fork_version, gvr);
             let root = compute_signing_root(&aggregation_slot.slot, domain);
+            (root, Slashing::NonSlashable)
+        }
+        // ── P1 non-slashable arms (Issue 4.1) ────────────────────────────────
+        SignPayload::AggregateAndProof { aggregate_and_proof } => {
+            let (fork_version, gvr) = require_fork_info(req)?;
+            let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, fork_version, gvr);
+            // `try_tree_hash_root` (NOT `tree_hash_root`) so a malformed/over-length
+            // `aggregation_bits` bitlist returns 400 instead of panicking. The
+            // 32-byte object root tree-hashes to itself, so feeding it to
+            // `compute_signing_root` yields the same `SigningData{object_root, domain}`.
+            let object_root = aggregate_and_proof.try_tree_hash_root().map_err(|_| {
+                HttpSignError::BadRequest("invalid aggregate_and_proof".to_string())
+            })?;
+            let root = compute_signing_root(&object_root.0, domain);
+            (root, Slashing::NonSlashable)
+        }
+        SignPayload::SyncCommitteeMessage { sync_committee_message } => {
+            let (fork_version, gvr) = require_fork_info(req)?;
+            let domain = compute_domain(DOMAIN_SYNC_COMMITTEE, fork_version, gvr);
+            // The signed object is the block ROOT itself, not the message container;
+            // `slot` only selects the fork/domain.
+            let root = compute_signing_root(&sync_committee_message.beacon_block_root, domain);
+            (root, Slashing::NonSlashable)
+        }
+        SignPayload::SyncCommitteeContributionAndProof { contribution_and_proof } => {
+            let (fork_version, gvr) = require_fork_info(req)?;
+            let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, fork_version, gvr);
+            let root = compute_signing_root(contribution_and_proof, domain);
             (root, Slashing::NonSlashable)
         }
     };
