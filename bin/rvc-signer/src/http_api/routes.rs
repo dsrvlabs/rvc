@@ -1214,4 +1214,73 @@ mod tests {
         let resp = post_sign(state, &id, None, body).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
+
+    // ── Issue 5.3: freeze the Electra mapping (spec-derived fixture) ──────────
+    //
+    // FR-31 freeze. Unlike the 5.2 KAT (which round-trips our OWN struct through
+    // serde_json::to_string and back — self-consistent, so blind to a
+    // Serialize/Deserialize field-name mismatch), this fixture is HAND-AUTHORED
+    // as a client sends it: the JSON structure + field names + encodings are
+    // written out literally, so it independently pins the wire shape the server's
+    // Deserialize must accept. CAVEAT: spec-derived (Ethereum Remote Signing API
+    // AGGREGATE_AND_PROOF_V2 schema), NOT a primary-source Lighthouse/Prysm
+    // Electra capture (none reachable here); a follow-up confirms it against a
+    // live capture once Electra traffic is available, fixing any casing/encoding
+    // discrepancy in request.rs/dispatch.rs then.
+
+    /// A frozen, spec-derived Electra `AGGREGATE_AND_PROOF_V2` wire body. Field
+    /// names and encodings (quoted `u64`, `0x`-lowercase hex bitlists, nested
+    /// `data`) match the remote-signing schema; `committee_bits` is the EIP-7549
+    /// Electra addition. Only the repetitive hex blobs are generated.
+    fn electra_v2_frozen_fixture() -> String {
+        format!(
+            r#"{{ "type": "AGGREGATE_AND_PROOF_V2",
+                  "fork_info": {{ "fork": {{ "previous_version": "0x03000000",
+                                             "current_version": "0x04000000",
+                                             "epoch": "100" }},
+                       "genesis_validators_root": "0x{gvr}" }},
+                  "aggregate_and_proof": {{
+                    "aggregator_index": "1",
+                    "aggregate": {{
+                      "aggregation_bits": "0x01",
+                      "data": {{ "slot": "5", "index": "0",
+                                "beacon_block_root": "0x{z}",
+                                "source": {{ "epoch": "1", "root": "0x{z}" }},
+                                "target": {{ "epoch": "2", "root": "0x{z}" }} }},
+                      "signature": "0x{sig}",
+                      "committee_bits": "0x0101010101010101"
+                    }},
+                    "selection_proof": "0x{sp}"
+                  }} }}"#,
+            gvr = hex::encode(expected_gvr()),
+            z = "00".repeat(32),
+            sig = "ab".repeat(96),
+            sp = "cd".repeat(96),
+        )
+    }
+
+    /// The frozen wire body decodes (independent of this crate's Serialize) and
+    /// signs to the eth-types Electra `tree_hash_root` over the
+    /// `DOMAIN_AGGREGATE_AND_PROOF` domain — pinning the Electra serde shape.
+    #[tokio::test]
+    async fn electra_v2_frozen_fixture_parses_and_signs_to_eth_types_root() {
+        let fixture = electra_v2_frozen_fixture();
+
+        // Decode the inner Electra object straight from the frozen wire JSON
+        // (the same `ElectraAggregateAndProof` serde the server's variant uses),
+        // NOT from our own serializer — this is the wire-shape freeze check.
+        let v: serde_json::Value = serde_json::from_str(&fixture).unwrap();
+        let electra: ElectraAggregateAndProof =
+            serde_json::from_value(v["aggregate_and_proof"].clone()).unwrap();
+        assert!(!electra.aggregate.committee_bits.is_empty(), "Electra committee_bits decoded");
+
+        let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, CURRENT_VERSION, expected_gvr());
+        let object_root = electra.try_tree_hash_root().unwrap().0;
+        let (sk, _) = test_keypair();
+        let expected = sk.sign(&compute_signing_root(&object_root, domain)).to_bytes();
+
+        // The full frozen body through the real route signs to the same root →
+        // the server's parse + dispatch agree with the eth-types Electra root.
+        assert_eq!(sign_ok(fixture).await, expected.to_vec());
+    }
 }

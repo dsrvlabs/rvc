@@ -118,6 +118,16 @@ pub enum SignPayload {
     // is the Electra attestation (adds committee_bits, EIP-7549), so it decodes
     // as ElectraAggregateAndProof. The distinct AGGREGATE_AND_PROOF_V2
     // discriminator keys this variant — field-presence is never auto-detected.
+    //
+    // FROZEN (Issue 5.3, FR-31): the wire shape is pinned by a hand-authored
+    // fixture in `routes.rs` tests (`electra_v2_frozen_fixture`) that decodes a
+    // real-client-shaped JSON body — independent of this crate's own Serialize —
+    // and signs it to the eth-types Electra `tree_hash_root`. CAVEAT: the fixture
+    // is spec-derived (Ethereum Remote Signing API schema), not a primary-source
+    // Lighthouse/Prysm Electra capture (none reachable in this environment); a
+    // follow-up confirms it against a live capture once Electra traffic is
+    // available. Any field-casing / encoding discrepancy a real capture reveals
+    // is fixed here and in the dispatcher.
     #[serde(rename = "AGGREGATE_AND_PROOF_V2")]
     AggregateAndProofV2 { aggregate_and_proof: ElectraAggregateAndProof },
 }
