@@ -2,10 +2,16 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-/// Default HTTP Remote Signing API listen address (Web3Signer convention: port
-/// 9000). Parsed/resolved only this phase; the listener is bound in Phase 3,
-/// which normalizes the host portion as needed.
-pub const DEFAULT_HTTP_LISTEN_ADDRESS: &str = ":9000";
+/// Default HTTP Remote Signing API listen address: **loopback** on the
+/// Web3Signer port 9000.
+///
+/// Secure-by-default: the address is passed verbatim to `TcpListener::bind`
+/// (there is no host normalization), so the default must be a concrete bindable
+/// host. Loopback works out of the box for a same-host validator client and
+/// fails safe (not exposed) for a remote one — an operator with a remote VC must
+/// consciously set a routable **private-network** address behind a firewall, and
+/// must never bind a public interface (see `docs/web3signer-http-api.md`).
+pub const DEFAULT_HTTP_LISTEN_ADDRESS: &str = "127.0.0.1:9000";
 
 /// Default HTTP TLS mode: mutual TLS (the recommended posture, FR-29).
 pub const DEFAULT_HTTP_TLS_MODE: &str = "mtls";
@@ -75,7 +81,8 @@ pub struct SignerSection {
 pub struct HttpSection {
     /// Enable the HTTP API. Default `false` (opt-in, FR-27).
     pub enabled: Option<bool>,
-    /// Listen address. Default `:9000` (FR-25).
+    /// Listen address. Default `127.0.0.1:9000` (FR-25); set an explicit
+    /// private-network address for a remote validator client.
     pub listen_address: Option<String>,
     /// `"mtls"` (default) or `"server-tls-only"` (FR-28/29).
     pub tls_mode: Option<String>,
@@ -643,7 +650,7 @@ tls_ca_cert = "/http/ca.pem"
         let cli = CliOverrides { keystore_dir: Some(Path::new("/ks")), ..default_cli_overrides() };
         let resolved = merge_with_cli(SignerConfig::default(), &cli).unwrap();
         assert!(!resolved.http_enabled);
-        assert_eq!(resolved.http_listen_address, ":9000");
+        assert_eq!(resolved.http_listen_address, "127.0.0.1:9000");
         assert_eq!(resolved.http_tls_mode, HttpTlsMode::Mtls);
         assert!(resolved.http_tls_cert.is_none());
         assert!(resolved.http_tls_key.is_none());
@@ -739,6 +746,6 @@ tls_ca_cert = "/http/ca.pem"
         let resolved = merge_with_cli(config, &default_cli_overrides()).unwrap();
         assert!(resolved.http_enabled);
         assert_eq!(resolved.http_tls_mode, HttpTlsMode::Mtls);
-        assert_eq!(resolved.http_listen_address, ":9000");
+        assert_eq!(resolved.http_listen_address, "127.0.0.1:9000");
     }
 }
