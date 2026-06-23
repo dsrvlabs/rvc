@@ -2,6 +2,12 @@
 //!
 //! Provides OpenTelemetry-based distributed tracing with OTLP/HTTP
 //! export and optional GCP Cloud Trace support.
+//!
+//! The normative logging & observability contract for the whole workspace —
+//! level taxonomy, the canonical structured-field registry, the secret-redaction
+//! policy, and the `#[instrument]` idioms every crate codes against — is defined in
+//! [`plan/logging/STANDARD.md`](https://github.com/dsrvlabs/rvc/blob/develop/plan/logging/STANDARD.md)
+//! (also available in-tree at `plan/logging/STANDARD.md`).
 
 pub mod config;
 pub mod file_appender;
