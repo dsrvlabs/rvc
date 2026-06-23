@@ -10,6 +10,9 @@
 //! 2. Documented forbidden edges are absent (slashing->doppelganger,
 //!    signer->keymanager-api, eth-types->any).
 //! 3. The expected `rvc-signer → rvc-doppelganger` edge (Issue 1.5) is present.
+//! 4. The single new production edge the logging initiative introduces in Phase 2,
+//!    `rvc-signer-bin → rvc-telemetry`, is allowed (never forbidden) and provably acyclic
+//!    because `rvc-telemetry` is pinned as a zero-out-edge leaf sink (Issue 1.7).
 //!
 //! Manual verification
 //! -------------------
@@ -20,13 +23,16 @@
 //!   change was immediately reverted.  `crates/signer/Cargo.toml` is back to its
 //!   committed state.
 //!
-//! Forward-compatibility: rvc-signer-registry (Issue 1.7)
-//! -------------------------------------------------------
-//! `DEV_ONLY` lists crate names that are expected to have zero workspace-internal
-//! PRODUCTION out-edges even if they exist in the workspace.  Issue 1.7 will add
-//! `rvc-signer-registry` as exactly such a crate.  If the crate is absent from the
-//! metadata (before 1.7 lands), the check is silently skipped.  This test therefore
-//! requires NO edits when Issue 1.7 is merged — it stays green both before and after.
+//! Logging initiative: the new rvc-signer-bin -> rvc-telemetry edge (Issue 1.7)
+//! -----------------------------------------------------------------------------
+//! `ZERO_OUT_EDGE_IF_PRESENT` lists crate names that must have zero workspace-internal
+//! PRODUCTION out-edges even if they exist (leaf sinks); absent crates are skipped, so the
+//! list stays forward-compatible.  Issue 1.7 pins `rvc-telemetry` there to lock the
+//! acyclicity of the single new production edge the logging initiative introduces in Phase 2
+//! (Issue 2.3), `rvc-signer-bin -> rvc-telemetry` (see `EXPECTED_EDGE`).  That *edge* is absent
+//! on `develop` during Phase 1 (the `rvc-telemetry` *crate* exists and is leaf-checked now);
+//! this gate stays green both before AND after Phase 2 adds it.
+//! (`rvc-signer-registry`, a dev-only const table with no runtime out-edges, is also pinned.)
 
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
@@ -39,15 +45,32 @@ use std::process::Command;
 const FORBIDDEN: &[(&str, &str)] =
     &[("rvc-slashing", "rvc-doppelganger"), ("rvc-signer", "rvc-keymanager-api")];
 
-/// Crates that must have zero workspace-internal PRODUCTION out-edges.
+/// Crates that must have zero workspace-internal PRODUCTION out-edges (leaf SINKS).
 /// If a name is absent from `cargo metadata` output the check is skipped,
 /// so this list is forward-compatible with crates that do not yet exist.
 ///
-/// Issue 1.7 will add `rvc-signer-registry` here; no edit to this test needed.
-const ZERO_OUT_EDGE_IF_PRESENT: &[&str] = &["rvc-eth-types", "rvc-signer-registry"];
+/// - `rvc-eth-types`: keeping it at zero out-edges is what blocks "fixing" a field-constant
+///   import by adding a `uuid`/`rvc-telemetry` (or any workspace) edge to it.
+/// - `rvc-signer-registry`: dev-only const table, no runtime out-edges.
+/// - `rvc-telemetry`: a zero-internal-dependency leaf sink. Pinning it here locks the
+///   acyclicity of the Phase-2 `rvc-signer-bin -> rvc-telemetry` edge (`EXPECTED_EDGE`):
+///   attaching an edge *to* a zero-out-edge node can never create a cycle.
+const ZERO_OUT_EDGE_IF_PRESENT: &[&str] =
+    &["rvc-eth-types", "rvc-signer-registry", "rvc-telemetry"];
 
 /// Edge that MUST be present (Issue 1.5 regression guard).
 const REQUIRED_EDGE: (&str, &str) = ("rvc-signer", "rvc-doppelganger");
+
+/// Edge the structured-logging initiative introduces in Phase 2 (Issue 2.3):
+/// `rvc-signer-bin -> rvc-telemetry` (to call `set_parent_from_headers` + the init helper).
+/// The *edge* (not the `rvc-telemetry` crate, which exists and is leaf-checked today) does NOT
+/// exist on `develop` during Phase 1; this gate stays green before AND after Phase 2 adds it.
+/// It is provably acyclic because `rvc-telemetry` is a zero-internal-out-edge leaf sink
+/// (pinned in `ZERO_OUT_EDGE_IF_PRESENT`), so attaching an edge *to* it can never create a
+/// cycle. Documented + locked here per the architecture's Gate-6 recommendation: this is the
+/// single new production edge the whole logging initiative introduces; it must stay allowed
+/// (never forbidden) while remaining acyclic.
+const EXPECTED_EDGE: (&str, &str) = ("rvc-signer-bin", "rvc-telemetry");
 
 // ---------------------------------------------------------------------------
 // Helper: build the workspace-internal production edge map
@@ -209,6 +232,32 @@ fn architecture_no_cycles() {
     for (from, to) in FORBIDDEN {
         let has_edge = edges.get(*from).is_some_and(|deps| deps.contains(&to.to_string()));
         assert!(!has_edge, "forbidden edge present in workspace graph: {from} -> {to}");
+    }
+
+    // ------------------------------------------------------------------
+    // 5b. Expected/allowed leaf-attachment edge (Phase 2, Issue 2.3):
+    //     rvc-signer-bin -> rvc-telemetry. It may be ABSENT (Phase 1) or PRESENT
+    //     (Phase 2); either way it must never be a forbidden edge, and its target
+    //     must stay a zero-out-edge leaf sink (asserted in step 6) so the
+    //     attachment is provably acyclic. The whole-graph cycle check (step 4)
+    //     additionally guarantees no cycle regardless of presence. Steps 4 (cycle
+    //     check) + 6 (leaf-sink pin) are the REAL enforcers; the not-forbidden
+    //     assert below is a consistency tripwire — do not drop the rvc-telemetry pin.
+    // ------------------------------------------------------------------
+    assert!(
+        !FORBIDDEN.contains(&EXPECTED_EDGE),
+        "expected leaf-attachment edge {} -> {} must remain allowed, not forbidden",
+        EXPECTED_EDGE.0,
+        EXPECTED_EDGE.1
+    );
+    if edges.get(EXPECTED_EDGE.0).is_some_and(|d| d.contains(&EXPECTED_EDGE.1.to_string())) {
+        // Edge present (post Phase 2): its target must be a pinned leaf sink.
+        assert!(
+            ZERO_OUT_EDGE_IF_PRESENT.contains(&EXPECTED_EDGE.1),
+            "edge {} -> {} is present but its target is not pinned as a zero-out-edge leaf sink",
+            EXPECTED_EDGE.0,
+            EXPECTED_EDGE.1
+        );
     }
 
     // ------------------------------------------------------------------
