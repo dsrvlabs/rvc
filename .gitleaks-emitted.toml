@@ -1,0 +1,26 @@
+# Gate 2b: allow-list for the EMITTED trace-level log sample ONLY (Issue 1.8).
+#
+# Applied solely to the harness output (crates/crypto/examples/log_sample.rs -> emitted-sample/),
+# which is our own generated, non-attacker-controlled text. The single allow-listed value is the
+# `0x{10hex}...{8hex}` redaction-wrapper output — the sanctioned redacted form. A raw (contiguous)
+# pubkey/root/key hex leaking into the log has no `...` separator and is still caught here; a
+# low-entropy password regression is caught by the separate content-assertion CI step.
+#
+# This regex lives here (NOT in the source-tree .gitleaks.toml) precisely because a value regex is
+# matched as a substring of the detected secret and would smuggle secrets if applied to the whole
+# tree — over our own fixed example output that risk does not exist.
+
+title = "rs-vc emitted-log-sample allowlist"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Redaction-wrapper output 0x{10hex}...{8hex} (emitted sample only)"
+# regexTarget = "secret" + a fully ANCHORED ^…$ pattern: the regex must equal the ENTIRE detected
+# secret, so it can NOT be smuggled as a substring of a larger grafted secret (e.g.
+# "0x..shape..<real-key>"). A contiguous raw pubkey/root has no `...` separator and is caught.
+regexTarget = "secret"
+regexes = [
+  '''^0x[0-9a-fA-F]{10}\.\.\.[0-9a-fA-F]{8}$''',
+]

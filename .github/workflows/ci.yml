@@ -46,6 +46,76 @@ jobs:
       - name: Run clippy (dvt feature — Gate 1 secret-sink coverage)
         run: cargo clippy -p rvc-signer-bin --all-targets --features dvt -- -D warnings
 
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install gitleaks
+        run: |
+          GITLEAKS_VERSION=8.21.2
+          GITLEAKS_SHA256=5bc41815076e6ed6ef8fbecc9d9b75bcae31f39029ceb55da08086315316e3ba
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" -o gitleaks.tar.gz
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin -f gitleaks.tar.gz gitleaks
+          rm -f gitleaks.tar.gz
+          gitleaks version
+
+      # Gate 2a: scan the source tree (working files); fail closed on any finding.
+      - name: Gitleaks — source tree
+        run: gitleaks detect --no-git --source . --config .gitleaks.toml --redact --no-banner --exit-code 1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-secretscan-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-secretscan-
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Gate 2b: emit a representative trace-level log sample through the redaction primitives,
+      # then defend it two ways — (i) gitleaks over the emitted output catches a raw hex
+      # pubkey/root/key regression; (ii) an explicit content assertion catches ANY raw-secret
+      # regression, including a low-entropy password that gitleaks cannot detect. Fail closed.
+      - name: Emit a trace-level log sample via the redaction primitives
+        run: |
+          set -euo pipefail
+          mkdir -p emitted-sample
+          cargo run -q -p rvc-crypto --example log_sample > emitted-sample/emitted-trace.log
+          test -s emitted-sample/emitted-trace.log
+
+      - name: Gitleaks — emitted trace-level log sample
+        run: gitleaks detect --no-git --source emitted-sample --config .gitleaks-emitted.toml --redact --no-banner --exit-code 1
+
+      - name: Assert redaction on the emitted sample (raw absent, redacted present)
+        run: |
+          log=emitted-sample/emitted-trace.log
+          fail=0
+          absent()  { if grep -qF -- "$1" "$log"; then echo "REGRESSION: raw $2 present in emitted log"; fail=1; fi; }
+          present() { if ! grep -qF -- "$1" "$log"; then echo "REGRESSION: redacted $2 missing from emitted log"; fail=1; fi; }
+          # Raw secret-shaped inputs MUST NOT appear verbatim (gitleaks cannot see the password):
+          absent "93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a" "pubkey hex"
+          absent "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f" "root hex"
+          absent "hunter2pw" "URL password"
+          # Redacted/truncated forms MUST appear (proves the wrappers actually ran):
+          present "0x93247f2209...611df74a" "pubkey"
+          present "0x0001020304...1c1d1e1f" "root"
+          present "***:***@beacon.example.com" "URL"
+          exit "$fail"
+
   coverage:
     name: Coverage
     runs-on: ubuntu-latest
