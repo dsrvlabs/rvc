@@ -29,7 +29,7 @@ use thiserror::Error;
 use tracing::{debug, error, warn};
 
 use crypto::logging::fields::Duty;
-use crypto::logging::TruncatedPubkey;
+use crypto::logging::{TruncatedPubkey, TruncatedRoot};
 use crypto::{CompositeSigner, PublicKey, Signature, Signer, SigningError};
 use eth_types::{
     AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
@@ -124,7 +124,7 @@ impl SignerService {
     /// to completion via `Handle::current().block_on()` on the same blocking
     /// thread, which is the documented pattern for calling async code from a
     /// `spawn_blocking` closure.
-    #[tracing::instrument(name = "sign.attestation", skip_all, fields(duty = %Duty::Attestation.as_str(), slashing_result = tracing::field::Empty))]
+    #[tracing::instrument(name = "sign.attestation", skip_all, fields(slot = attestation_data.slot, duty = %Duty::Attestation.as_str(), slashing_result = tracing::field::Empty))]
     pub async fn sign_attestation(
         &self,
         attestation_data: &AttestationData,
@@ -159,9 +159,9 @@ impl SignerService {
 
         debug!(
             pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            fork_version_used = %format!("0x{}", hex::encode(fork_version)),
-            genesis_validators_root = %format!("0x{}", hex::encode(genesis_validators_root)),
-            domain = %format!("0x{}", hex::encode(domain)),
+            fork_version_used = %TruncatedRoot::new(&fork_version),
+            genesis_validators_root = %TruncatedRoot::new(genesis_validators_root),
+            domain = %TruncatedRoot::new(&domain),
             fork_name = ?fork_name,
             target_epoch = target_epoch,
             "Computed attestation domain"
@@ -172,7 +172,7 @@ impl SignerService {
 
         debug!(
             pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            signing_root = %format!("0x{}", &signing_root_hex),
+            signing_root = %TruncatedRoot::new(&signing_root),
             slot = attestation_data.slot,
             index = attestation_data.index,
             source_epoch = attestation_data.source.epoch,
@@ -197,6 +197,7 @@ impl SignerService {
         let pubkey_hex_clone = pubkey_hex.clone();
         let slot_for_log = attestation_data.slot;
         let gvr = *genesis_validators_root;
+        let span = tracing::Span::current();
 
         // Run the stage → sign → commit triple on a dedicated blocking thread.
         //
@@ -208,6 +209,12 @@ impl SignerService {
         // transaction so no phantom row is committed (M-1 fix, architecture A15).
         let inner_result =
             tokio::task::spawn_blocking(move || -> Result<Signature, SignerError> {
+                // Re-enter the parent sign span on the blocking OS thread so events
+                // emitted here are correlated with the duty trace (safe: no .await).
+                let _e = span.enter();
+                tracing::trace!(
+                    "staging attestation slashing-protection record on blocking thread"
+                );
                 // Capture the start of the SQLite transaction hold (ISSUE-3.12).
                 let tx_start = Instant::now();
                 let staged = db
@@ -332,7 +339,7 @@ impl SignerService {
     /// Uses the same stage + commit-on-success pattern as `sign_attestation`
     /// (M-1 fix, architecture A15).  See `sign_attestation` for the full
     /// rationale on `spawn_blocking` + `Handle::block_on`.
-    #[tracing::instrument(name = "sign.block", skip_all, fields(duty = %Duty::Block.as_str(), slashing_result = tracing::field::Empty))]
+    #[tracing::instrument(name = "sign.block", skip_all, fields(slot = slot, duty = %Duty::Block.as_str(), slashing_result = tracing::field::Empty))]
     pub async fn sign_block(
         &self,
         block_root: &Root,
@@ -372,9 +379,14 @@ impl SignerService {
         let handle = tokio::runtime::Handle::current();
         let pubkey_hex_clone = pubkey_hex.clone();
         let gvr = *genesis_validators_root;
+        let span = tracing::Span::current();
 
         let inner_result =
             tokio::task::spawn_blocking(move || -> Result<Signature, SignerError> {
+                // Re-enter the parent sign span on the blocking OS thread so events
+                // emitted here are correlated with the duty trace (safe: no .await).
+                let _e = span.enter();
+                tracing::trace!("staging block slashing-protection record on blocking thread");
                 // Capture the start of the SQLite transaction hold (ISSUE-3.12).
                 let tx_start = Instant::now();
                 let staged = db
@@ -1163,6 +1175,145 @@ impl ValidatorSigner for SignerService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Captured `(name, child-names)` pairs — for events `(message, span-scope
+    /// names)`, for spans `(span name, recorded-field names)`. Non-poisoning
+    /// `parking_lot::Mutex` so a failed assertion in one test can never poison
+    /// the buffer and cascade into a concurrent test under `cargo test`.
+    type Captured = Arc<parking_lot::Mutex<Vec<(String, Vec<String>)>>>;
+
+    /// Test-only capturing layer (format-independent). Records, per event, the
+    /// names of the spans in its scope (to prove a `spawn_blocking`-thread event
+    /// re-enters the sign span), and per span, the names of the fields recorded
+    /// at creation (to prove `slot` actually lands on the span).
+    struct Capture {
+        events: Captured,
+        spans: Captured,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for Capture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            // record_debug is the catch-all every typed `record_*` defaults to,
+            // so this captures every field recorded at span creation (incl. the
+            // u64 `slot`); fields declared `Empty` are not visited until recorded.
+            struct FieldNames(Vec<String>);
+            impl tracing::field::Visit for FieldNames {
+                fn record_debug(&mut self, field: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    self.0.push(field.name().to_string());
+                }
+            }
+            let mut fields = FieldNames(Vec::new());
+            attrs.record(&mut fields);
+            self.spans.lock().push((attrs.metadata().name().to_string(), fields.0));
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct MsgVisitor(Option<String>);
+            impl tracing::field::Visit for MsgVisitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = Some(format!("{value:?}"));
+                    }
+                }
+            }
+            let mut visitor = MsgVisitor(None);
+            event.record(&mut visitor);
+            let scope: Vec<String> = ctx
+                .event_scope(event)
+                .into_iter()
+                .flatten()
+                .map(|span| span.name().to_string())
+                .collect();
+            if let Some(message) = visitor.0 {
+                self.events.lock().push((message, scope));
+            }
+        }
+    }
+
+    /// Issue 2.2 acceptance, in one test (one global subscriber per process):
+    /// (1) the `spawn_blocking` closure re-enters the parent sign span so a
+    ///     blocking-thread event stays correlated to the duty trace, and
+    /// (2) the `sign.block` span actually records `slot` (the bare `fields(slot)`
+    ///     form is a silent no-op under `skip_all`; the explicit `slot = slot`
+    ///     form is required).
+    ///
+    /// A global subscriber is required because `spawn_blocking` runs on a
+    /// separate OS thread the thread-local dispatcher would not reach. This is
+    /// the crate's only `set_global_default` caller, so it always wins the
+    /// one-shot install; buffers use a non-poisoning `parking_lot::Mutex` and
+    /// every assertion clones out before checking, so a failure stays local even
+    /// under `cargo test`'s shared-process, multi-thread model.
+    #[tokio::test]
+    async fn test_sign_blocking_section_reentry_and_block_slot_field() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let events: Captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let spans: Captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry::Registry::default()
+            .with(Capture { events: events.clone(), spans: spans.clone() });
+        let _ = tracing::subscriber::set_global_default(subscriber);
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(signer, slashing_db);
+        let fork_schedule = create_test_fork_schedule_for_attestation();
+        let genesis_root = [0xaa; 32];
+
+        // Attestation path: exercises the first spawn_blocking closure.
+        let attestation_data = create_test_attestation_data(100, 101);
+        service
+            .sign_attestation(&attestation_data, &pubkey, &fork_schedule, &genesis_root)
+            .await
+            .expect("attestation sign should succeed");
+
+        // Block path: exercises the second spawn_blocking closure + the slot field.
+        service
+            .sign_block(&[0x11; 32], 3200, &pubkey, &fork_schedule, &genesis_root)
+            .await
+            .expect("block sign should succeed");
+
+        // (1) Re-entry: the attestation blocking-thread marker carries the span.
+        let att_scope = events
+            .lock()
+            .iter()
+            .find(|(message, _)| message.contains("staging attestation slashing-protection record"))
+            .map(|(_, scope)| scope.clone())
+            .expect("attestation blocking-section marker must be captured");
+        assert!(
+            att_scope.iter().any(|name| name == "sign.attestation"),
+            "blocking-section event must inherit the sign.attestation span (re-entry); scope was {att_scope:?}"
+        );
+
+        // (2) M-1 regression: the sign.block span must actually record `slot`.
+        let block_fields = spans
+            .lock()
+            .iter()
+            .find(|(name, _)| name == "sign.block")
+            .map(|(_, fields)| fields.clone())
+            .expect("sign.block span must be created");
+        assert!(
+            block_fields.iter().any(|name| name == "slot"),
+            "sign.block span must record the slot field; recorded fields were {block_fields:?}"
+        );
+    }
     use crypto::{
         compute_domain, compute_signing_root, KeyManager, LocalSigner, SecretKey,
         DOMAIN_BEACON_ATTESTER,
