@@ -53,6 +53,52 @@ impl std::fmt::Display for RedactedUrl<'_> {
     }
 }
 
+/// Displays a 32-byte root / signature / hash as `0x{first10hex}...{last8hex}`.
+///
+/// Zero-allocation `Display` wrapper for tracing's `%` specifier: the hex is written
+/// byte-by-byte directly into the `Formatter` (no `hex::encode` / `format!` / `to_string`),
+/// so nothing is heap-allocated and `fmt` only runs when the log level is enabled. This is
+/// the sanctioned way to render a block / head / signing root, hash, or signature in a log
+/// line (ADR-005); a full root or signature is never logged.
+///
+/// Wraps a **non-secret** root / signature only — a `Display` impl is never added to a
+/// secret type.
+///
+/// Inputs shorter than 9 bytes render their full lower-hex (`0x{all-bytes}`) instead of
+/// slicing out of bounds, and `fmt` never panics.
+pub struct TruncatedRoot<'a>(pub &'a [u8]);
+
+impl<'a> TruncatedRoot<'a> {
+    pub fn new(bytes: &'a [u8]) -> Self {
+        Self(bytes)
+    }
+}
+
+impl std::fmt::Display for TruncatedRoot<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes = self.0;
+        f.write_str("0x")?;
+        // Short input (< 9 bytes): the 5 leading + 4 trailing slices would overlap, so
+        // render the full lower-hex rather than slice out of bounds. Never panics.
+        if bytes.len() < 9 {
+            for b in bytes {
+                write!(f, "{b:02x}")?;
+            }
+            return Ok(());
+        }
+        // 5 leading bytes (10 hex chars) + "..." + 4 trailing bytes (8 hex chars).
+        // Written byte-by-byte: zero heap allocation, and lazy under `%`.
+        for b in &bytes[..5] {
+            write!(f, "{b:02x}")?;
+        }
+        f.write_str("...")?;
+        for b in &bytes[bytes.len() - 4..] {
+            write!(f, "{b:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,5 +200,62 @@ mod tests {
         let result = RedactedUrl(url).to_string();
         assert!(result.contains("***"));
         assert!(!result.contains("user@"));
+    }
+
+    // --- TruncatedRoot tests ---
+
+    #[test]
+    fn test_truncated_root_32_bytes() {
+        let result = TruncatedRoot::new(&[0xab; 32]).to_string();
+        assert_eq!(result, "0xababababab...abababab");
+        // 0x (2) + 10 leading hex + "..." (3) + 8 trailing hex = 23 chars.
+        // NOTE: Issue 1.2's acceptance text "exactly 22" is a miscount of this same
+        // breakdown (0x + 10 + ... + 8 = 23); the canonical rendering is 23 chars.
+        assert_eq!(result.len(), 23);
+    }
+
+    #[test]
+    fn test_truncated_root_distinct_bytes() {
+        // 0x00,0x01,...,0x1f — first 5 bytes -> 0001020304, last 4 -> 1c1d1e1f.
+        let root: [u8; 32] = std::array::from_fn(|i| i as u8);
+        assert_eq!(TruncatedRoot::new(&root).to_string(), "0x0001020304...1c1d1e1f");
+    }
+
+    /// Redaction (Gate-3 style): the FULL hex of a 32-byte root MUST be absent from a
+    /// `trace`-level log line that renders it via `%TruncatedRoot`; only the truncated
+    /// form appears.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_truncated_root_full_hex_absent_at_trace() {
+        let root: [u8; 32] = std::array::from_fn(|i| i as u8);
+        tracing::trace!(root = %TruncatedRoot::new(&root), "computed signing root");
+        let full_hex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        assert!(logs_contain("0x0001020304...1c1d1e1f"), "truncated form must be present");
+        assert!(!logs_contain(full_hex), "full 32-byte hex must NOT appear");
+        // A middle slice that exists only in the full encoding must be absent too.
+        assert!(!logs_contain("0a0b0c0d"), "middle bytes must be truncated away");
+    }
+
+    #[test]
+    fn test_truncated_root_empty_no_panic() {
+        assert_eq!(TruncatedRoot::new(&[]).to_string(), "0x");
+    }
+
+    #[test]
+    fn test_truncated_root_one_byte() {
+        assert_eq!(TruncatedRoot::new(&[0xab]).to_string(), "0xab");
+    }
+
+    #[test]
+    fn test_truncated_root_eight_bytes_full() {
+        // 8 bytes (< 9): full lower-hex, not truncated.
+        assert_eq!(TruncatedRoot::new(&[0xab; 8]).to_string(), "0xabababababababab");
+    }
+
+    #[test]
+    fn test_truncated_root_nine_bytes_truncates() {
+        // 9 bytes is the threshold: 5 leading + 4 trailing exactly cover it, no overlap.
+        let bytes: [u8; 9] = std::array::from_fn(|i| i as u8);
+        assert_eq!(TruncatedRoot::new(&bytes).to_string(), "0x0001020304...05060708");
     }
 }
