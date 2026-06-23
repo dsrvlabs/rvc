@@ -1,3 +1,5 @@
+#![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 

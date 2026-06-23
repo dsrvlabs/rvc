@@ -408,6 +408,8 @@ impl Keystore {
 
         let derived_key = Zeroizing::new(keystore.derive_key(password)?);
 
+        // Gate 1: keystore encryption needs the raw SK bytes (kept in Zeroizing, never logged).
+        #[allow(clippy::disallowed_methods)]
         let plaintext = Zeroizing::new(secret_key.to_bytes());
         let aes_key = &derived_key[..AES_KEY_LEN];
         let mut cipher = Aes128Ctr::new(aes_key.into(), iv.as_slice().into());
@@ -459,6 +461,7 @@ impl Keystore {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
     use super::*;
 
     // EIP-2335 official test vectors from https://eips.ethereum.org/EIPS/eip-2335

@@ -105,6 +105,8 @@ pub fn load_shares(dir: &Path, password: &Zeroizing<String>) -> Result<Vec<Share
             .decrypt(password.as_bytes())
             .map_err(|e| ShareError::DecryptKeystore(format!("{}: {}", path.display(), e)))?;
 
+        // Gate 1: DVT share-split needs the decrypted scalar bytes (kept in Zeroizing, never logged).
+        #[allow(clippy::disallowed_methods)]
         let scalar_bytes = Zeroizing::new(secret_key.to_bytes());
 
         // Extract aggregate pubkey from keystore pubkey field
@@ -137,6 +139,7 @@ pub fn load_shares(dir: &Path, password: &Zeroizing<String>) -> Result<Vec<Share
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
     use super::*;
     use crypto::{EncryptionKdf, Keystore, SecretKey};
     use std::fs;

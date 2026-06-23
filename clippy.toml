@@ -1,1 +1,29 @@
 msrv = "1.92"
+
+# Gate 1 (structured-logging / observability initiative): forbid secret-laundering sinks so
+# raw secret material cannot reach a logging macro. Each method below hands out decrypted
+# secrets or raw BLS secret-key bytes; any NEW use must be reviewed and scoped with a
+# `#[allow(clippy::disallowed_methods)]` at the call site, which is greppable.
+#
+# Stated limitation: `disallowed-methods` matches NAMED PATHS ONLY. It does NOT catch a secret
+# that reaches a log/format macro by another route, notably: (a) a value laundered into a
+# `String`/`&str`; (b) `zeroize::Zeroizing<T>`, whose derived `Debug` FORWARDS to the inner value,
+# so `?`/`{:?}` on a Zeroizing-wrapped seed/key/password prints it verbatim; (c) a foreign type
+# whose `Display`/`Debug` reveals a secret (e.g. `bip39::Mnemonic` Displays the phrase). Those
+# residual paths are covered by the type layer (redacted newtypes) plus Gate 2 (gitleaks) and
+# Gate 3 (captured-subscriber redaction tests, which must assert a Zeroizing seed/password is
+# absent from emitted output). A dataflow upgrade (dylint) is the documented P2 follow-up.
+#
+# NOTE: only the `SecretKey` methods are banned. `PublicKey::to_bytes` and
+# `Signature::to_bytes` (same method name, different non-secret types) are intentionally
+# allowed and must not be added here.
+#
+# NOTE: feature-gated code (e.g. `--features dvt`) is NOT compiled by the default workspace
+# clippy run, so CI runs an extra `cargo clippy -p rvc-signer-bin --all-targets --features dvt`
+# step (see Makefile / .github/workflows/ci.yml) to keep this gate effective over the DVT
+# decrypted-scalar paths.
+disallowed-methods = [
+    { path = "secrecy::ExposeSecret::expose_secret", reason = "decrypted secret must never reach a log macro; expose at the call site only" },
+    { path = "rvc_crypto::bls::SecretKey::raw_bytes", reason = "raw BLS secret-key bytes escape the redacted newtype; never log or format" },
+    { path = "rvc_crypto::bls::SecretKey::to_bytes", reason = "raw BLS secret-key bytes escape the redacted newtype; never log or format" },
+]

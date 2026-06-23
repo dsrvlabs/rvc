@@ -257,6 +257,7 @@ fn write_with_permissions(path: &Path, data: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
     use super::*;
 
     #[test]

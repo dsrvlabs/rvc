@@ -6,6 +6,8 @@
 //! 3. Calls the appropriate `TypedSigner` method.
 //! 4. Verifies the returned signature is valid for the reconstructed signing root.
 
+#![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
+
 use std::net::SocketAddr;
 
 use crypto::typed_signer::{SignContext, TypedSigner};

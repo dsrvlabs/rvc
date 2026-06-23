@@ -103,6 +103,7 @@ pub fn run(args: BlsToExecutionArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
     use super::*;
     use crypto::{compute_domain, compute_signing_root, eip2333, mnemonic};
     use eth_types::DOMAIN_BLS_TO_EXECUTION_CHANGE;

@@ -4,6 +4,8 @@
 //! expected values to verify that key derivation, deposit signing, and keystore
 //! encryption produce deterministic, standards-compliant output.
 
+#![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
+
 use crypto::{EncryptionKdf, Keystore};
 use eth_types::{DepositData, DepositMessage, DOMAIN_DEPOSIT};
 use sha2::Digest;

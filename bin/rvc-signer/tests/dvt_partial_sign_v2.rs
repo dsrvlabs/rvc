@@ -9,6 +9,7 @@
 //! All tests are gated on the `dvt` feature.
 
 #![cfg(feature = "dvt")]
+#![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
 
 use std::collections::HashMap;
 use std::sync::Arc;
