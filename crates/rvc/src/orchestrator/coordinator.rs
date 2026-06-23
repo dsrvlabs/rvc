@@ -4122,13 +4122,13 @@ mod tests {
 
         let span_names = captured.lock();
         assert!(
-            span_names.contains(&"rvc.sign.attestation".to_string()),
-            "Expected rvc.sign.attestation span, got: {:?}",
+            span_names.contains(&"sign.attestation".to_string()),
+            "Expected sign.attestation span, got: {:?}",
             *span_names
         );
         assert!(
-            span_names.contains(&"rvc.slashing.check".to_string()),
-            "Expected rvc.slashing.check span within sign_attestation, got: {:?}",
+            span_names.contains(&"slashing.check".to_string()),
+            "Expected slashing.check span within sign_attestation, got: {:?}",
             *span_names
         );
     }

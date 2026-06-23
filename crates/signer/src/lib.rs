@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tracing::{debug, error, warn};
 
+use crypto::logging::fields::Duty;
 use crypto::logging::TruncatedPubkey;
 use crypto::{CompositeSigner, PublicKey, Signature, Signer, SigningError};
 use eth_types::{
@@ -123,7 +124,7 @@ impl SignerService {
     /// to completion via `Handle::current().block_on()` on the same blocking
     /// thread, which is the documented pattern for calling async code from a
     /// `spawn_blocking` closure.
-    #[tracing::instrument(name = "rvc.sign.attestation", skip_all, fields(rvc.operation = "attestation", rvc.slashing.result))]
+    #[tracing::instrument(name = "sign.attestation", skip_all, fields(duty = %Duty::Attestation.as_str(), slashing_result = tracing::field::Empty))]
     pub async fn sign_attestation(
         &self,
         attestation_data: &AttestationData,
@@ -183,10 +184,10 @@ impl SignerService {
         let lock = self.validator_locks.get(&pubkey_bytes);
         let _guard = lock.lock_owned().await;
 
-        // Emit the `rvc.slashing.check` span on the async task so that
+        // Emit the `slashing.check` span on the async task so that
         // tracing subscribers (including tests) can observe it.  The actual
         // SQLite work happens inside `spawn_blocking` below.
-        let _slashing_span = tracing::info_span!("rvc.slashing.check").entered();
+        let _slashing_span = tracing::info_span!("slashing.check").entered();
         drop(_slashing_span);
 
         // Clone the Arc handles needed inside the blocking closure.
@@ -300,15 +301,19 @@ impl SignerService {
 
         // Now in async context — `Span::current()` refers to the
         // `#[tracing::instrument]` span declared on this method, so recording
-        // `rvc.slashing.result` actually lands on the instrument span.
+        // `slashing_result` actually lands on the instrument span.
         let outcome = inner_result.map_err(|e| {
             if matches!(e, SignerError::SlashingProtectionBlocked(_)) {
-                tracing::Span::current().record("rvc.slashing.result", "blocked");
+                crypto::logging::record_display(
+                    &tracing::Span::current(),
+                    "slashing_result",
+                    "blocked",
+                );
             }
             e
         })?;
 
-        tracing::Span::current().record("rvc.slashing.result", "safe");
+        crypto::logging::record_display(&tracing::Span::current(), "slashing_result", "safe");
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
         RVC_ATTESTATIONS_TOTAL.with_label_values(&["success"]).inc();
@@ -327,7 +332,7 @@ impl SignerService {
     /// Uses the same stage + commit-on-success pattern as `sign_attestation`
     /// (M-1 fix, architecture A15).  See `sign_attestation` for the full
     /// rationale on `spawn_blocking` + `Handle::block_on`.
-    #[tracing::instrument(name = "rvc.sign.block", skip_all, fields(rvc.operation = "block", rvc.slashing.result))]
+    #[tracing::instrument(name = "sign.block", skip_all, fields(duty = %Duty::Block.as_str(), slashing_result = tracing::field::Empty))]
     pub async fn sign_block(
         &self,
         block_root: &Root,
@@ -447,12 +452,16 @@ impl SignerService {
 
         let outcome = inner_result.map_err(|e| {
             if matches!(e, SignerError::SlashingProtectionBlocked(_)) {
-                tracing::Span::current().record("rvc.slashing.result", "blocked");
+                crypto::logging::record_display(
+                    &tracing::Span::current(),
+                    "slashing_result",
+                    "blocked",
+                );
             }
             e
         })?;
 
-        tracing::Span::current().record("rvc.slashing.result", "safe");
+        crypto::logging::record_display(&tracing::Span::current(), "slashing_result", "safe");
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
 
@@ -466,7 +475,7 @@ impl SignerService {
     }
 
     /// Signs a RANDAO reveal for the given epoch.
-    #[tracing::instrument(name = "rvc.sign.randao", skip_all, fields(rvc.operation = "randao"))]
+    #[tracing::instrument(name = "sign.randao", skip_all, fields(duty = %Duty::Block.as_str()))]
     pub async fn sign_randao_reveal(
         &self,
         epoch: Epoch,
@@ -516,7 +525,7 @@ impl SignerService {
     }
 
     /// Signs a sync committee message for the given beacon block root and slot.
-    #[tracing::instrument(name = "rvc.sign.sync_committee_message", skip_all, fields(rvc.operation = "sync_committee_message"))]
+    #[tracing::instrument(name = "sign.sync_committee_message", skip_all, fields(duty = %Duty::SyncCommittee.as_str()))]
     pub async fn sign_sync_committee_message(
         &self,
         beacon_block_root: &Root,
@@ -565,7 +574,7 @@ impl SignerService {
     }
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
-    #[tracing::instrument(name = "rvc.sign.selection_proof", skip_all, fields(rvc.operation = "selection_proof"))]
+    #[tracing::instrument(name = "sign.selection_proof", skip_all, fields(duty = %Duty::Aggregate.as_str()))]
     pub async fn sign_selection_proof(
         &self,
         slot: Slot,
@@ -616,7 +625,7 @@ impl SignerService {
     }
 
     /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
-    #[tracing::instrument(name = "rvc.sign.aggregate_and_proof", skip_all, fields(rvc.operation = "aggregate_and_proof"))]
+    #[tracing::instrument(name = "sign.aggregate_and_proof", skip_all, fields(duty = %Duty::Aggregate.as_str()))]
     pub async fn sign_aggregate_and_proof(
         &self,
         aggregate_and_proof: &AggregateAndProof,
@@ -668,7 +677,7 @@ impl SignerService {
     }
 
     /// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
-    #[tracing::instrument(name = "rvc.sign.electra_aggregate_and_proof", skip_all, fields(rvc.operation = "electra_aggregate_and_proof"))]
+    #[tracing::instrument(name = "sign.electra_aggregate_and_proof", skip_all, fields(duty = %Duty::Aggregate.as_str()))]
     pub async fn sign_electra_aggregate_and_proof(
         &self,
         aggregate_and_proof: &ElectraAggregateAndProof,
@@ -731,7 +740,7 @@ impl SignerService {
     /// The C2 error-handling invariant is still satisfied here: every signer
     /// failure is propagated directly to the caller via `Err(e.into())` — no
     /// error is swallowed or silently converted to `Ok`.
-    #[tracing::instrument(name = "rvc.sign.voluntary_exit", skip_all, fields(rvc.operation = "voluntary_exit"))]
+    #[tracing::instrument(name = "sign.voluntary_exit", skip_all, fields(duty = %Duty::VoluntaryExit.as_str()))]
     pub async fn sign_voluntary_exit(
         &self,
         voluntary_exit: &VoluntaryExit,
@@ -790,7 +799,7 @@ impl SignerService {
     /// Signs a builder registration with DOMAIN_APPLICATION_BUILDER.
     ///
     /// No slashing check is needed — builder registrations are not slashable.
-    #[tracing::instrument(name = "rvc.sign.builder_registration", skip_all, fields(rvc.operation = "builder_registration"))]
+    #[tracing::instrument(name = "sign.builder_registration", skip_all, fields(duty = %Duty::ValidatorRegistration.as_str()))]
     pub async fn sign_builder_registration(
         &self,
         registration: &ValidatorRegistrationV1,
@@ -834,7 +843,7 @@ impl SignerService {
     }
 
     /// Signs a sync committee selection proof for the given slot and subcommittee.
-    #[tracing::instrument(name = "rvc.sign.sync_committee_selection_proof", skip_all, fields(rvc.operation = "sync_committee_selection_proof"))]
+    #[tracing::instrument(name = "sign.sync_committee_selection_proof", skip_all, fields(duty = %Duty::SyncContribution.as_str()))]
     pub async fn sign_sync_committee_selection_proof(
         &self,
         slot: Slot,
@@ -888,7 +897,7 @@ impl SignerService {
     }
 
     /// Signs a ContributionAndProof with DOMAIN_CONTRIBUTION_AND_PROOF.
-    #[tracing::instrument(name = "rvc.sign.contribution_and_proof", skip_all, fields(rvc.operation = "contribution_and_proof"))]
+    #[tracing::instrument(name = "sign.contribution_and_proof", skip_all, fields(duty = %Duty::SyncContribution.as_str()))]
     pub async fn sign_contribution_and_proof(
         &self,
         contribution_and_proof: &ContributionAndProof,
