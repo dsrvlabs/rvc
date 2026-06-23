@@ -99,6 +99,72 @@ impl std::fmt::Display for TruncatedRoot<'_> {
     }
 }
 
+/// Canonical structured-field keys and `duty` value strings — the compile-checked,
+/// greppable mirror of the field registry in `plan/logging/STANDARD.md`.
+///
+/// These consts are the single source of truth for field-key spellings so no crate can
+/// invent a synonym (`val_idx`, `validator`, `rvc.slot`). They MUST stay in lockstep with
+/// the STANDARD.md registry table; Gate 5 (Phase 4/5) diffs emitted field names against
+/// them. `network` is intentionally **absent** — it is a resource attribute set once in
+/// `telemetry::init`, never a per-event key.
+pub mod fields {
+    /// Slot number (`u64`). Lives on the duty / attestation / block / sign span.
+    pub const SLOT: &str = "slot";
+    /// Epoch number (`u64`). Lives on the duty span.
+    pub const EPOCH: &str = "epoch";
+    /// Validator index (`u64`).
+    pub const VALIDATOR_INDEX: &str = "validator_index";
+    /// Truncated public key (`0x{first10}...{last8}`, via `TruncatedPubkey`).
+    pub const PUBKEY: &str = "pubkey";
+    /// Duty kind string (see [`Duty`]).
+    pub const DUTY: &str = "duty";
+    /// Correlation id for one signing / API request (including the :9000 hop).
+    pub const REQUEST_ID: &str = "request_id";
+    /// Committee index (`u64`).
+    pub const COMMITTEE_INDEX: &str = "committee_index";
+    /// Subcommittee index (`u64`) — sync-committee contribution lines only.
+    pub const SUBCOMMITTEE_INDEX: &str = "subcommittee_index";
+    /// Redacted beacon-node URL (via `RedactedUrl`).
+    pub const BN_URL: &str = "bn_url";
+    /// Attested head root (truncated via `TruncatedRoot`).
+    pub const HEAD: &str = "head";
+    /// Proposed block root (truncated via `TruncatedRoot`).
+    pub const BLOCK_ROOT: &str = "block_root";
+    /// Time into slot (duration / ms) — operator timing signal.
+    pub const TIME_INTO_SLOT: &str = "time_into_slot";
+
+    /// Canonical `duty` value strings.
+    ///
+    /// `as_str()` returns a `&'static str` so it is `Copy`-cheap and safe to use inside an
+    /// eagerly-evaluated `#[instrument(fields(duty = %Duty::….as_str()))]` (research R1).
+    /// Spellings are normative — `sync_committee`, not the Prysm/Lodestar variants.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Duty {
+        Attestation,
+        Block,
+        Aggregate,
+        SyncCommittee,
+        SyncContribution,
+        ValidatorRegistration,
+        VoluntaryExit,
+    }
+
+    impl Duty {
+        /// Returns the normative `&'static str` spelling for this duty.
+        pub fn as_str(&self) -> &'static str {
+            match self {
+                Duty::Attestation => "attestation",
+                Duty::Block => "block",
+                Duty::Aggregate => "aggregate",
+                Duty::SyncCommittee => "sync_committee",
+                Duty::SyncContribution => "sync_contribution",
+                Duty::ValidatorRegistration => "validator_registration",
+                Duty::VoluntaryExit => "voluntary_exit",
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +323,35 @@ mod tests {
         // 9 bytes is the threshold: 5 leading + 4 trailing exactly cover it, no overlap.
         let bytes: [u8; 9] = std::array::from_fn(|i| i as u8);
         assert_eq!(TruncatedRoot::new(&bytes).to_string(), "0x0001020304...05060708");
+    }
+
+    // --- fields registry + Duty tests ---
+
+    #[test]
+    fn test_field_const_values_match_registry() {
+        assert_eq!(fields::SLOT, "slot");
+        assert_eq!(fields::EPOCH, "epoch");
+        assert_eq!(fields::VALIDATOR_INDEX, "validator_index");
+        assert_eq!(fields::PUBKEY, "pubkey");
+        assert_eq!(fields::DUTY, "duty");
+        assert_eq!(fields::REQUEST_ID, "request_id");
+        assert_eq!(fields::COMMITTEE_INDEX, "committee_index");
+        assert_eq!(fields::SUBCOMMITTEE_INDEX, "subcommittee_index");
+        assert_eq!(fields::BN_URL, "bn_url");
+        assert_eq!(fields::HEAD, "head");
+        assert_eq!(fields::BLOCK_ROOT, "block_root");
+        assert_eq!(fields::TIME_INTO_SLOT, "time_into_slot");
+    }
+
+    #[test]
+    fn test_duty_as_str_pins_all_seven_variants() {
+        use fields::Duty;
+        assert_eq!(Duty::Attestation.as_str(), "attestation");
+        assert_eq!(Duty::Block.as_str(), "block");
+        assert_eq!(Duty::Aggregate.as_str(), "aggregate");
+        assert_eq!(Duty::SyncCommittee.as_str(), "sync_committee");
+        assert_eq!(Duty::SyncContribution.as_str(), "sync_contribution");
+        assert_eq!(Duty::ValidatorRegistration.as_str(), "validator_registration");
+        assert_eq!(Duty::VoluntaryExit.as_str(), "voluntary_exit");
     }
 }
