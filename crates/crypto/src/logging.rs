@@ -165,6 +165,40 @@ pub mod fields {
     }
 }
 
+/// Mints a fresh `request_id` (a v4 UUID) for one signing / API request.
+///
+/// Returns a [`uuid::Uuid`], **not** a pre-built `String`, so callers render it with `%`
+/// and pay nothing when the span level is disabled (ADR-002). The id follows a single
+/// request end to end, including across the :9000 Web3Signer hop.
+pub fn new_request_id() -> uuid::Uuid {
+    uuid::Uuid::new_v4()
+}
+
+/// Fills a deferred (`field::Empty`) span field with a `Display` value.
+///
+/// The target field **must** have been declared at span creation (e.g.
+/// `request_id = tracing::field::Empty`); recording a field that was **not** declared is a
+/// silent no-op — the #1 "vanishing attribute" bug. This helper exists because the `%`/`?`
+/// sigils are macro sugar and are **not** available at a `span.record(...)` call site.
+///
+/// **Secret-safety (STANDARD.md §3):** `val` is rendered verbatim, so it MUST be
+/// non-secret — wrap pubkeys in `TruncatedPubkey`, roots/signatures in `TruncatedRoot`, and
+/// URLs in `RedactedUrl`; never pass key material, passwords, or mnemonics. The recorded
+/// value surfaces only on events emitted **while the span is entered** (or via
+/// `#[instrument]` / `.in_scope()`).
+pub fn record_display(span: &tracing::Span, key: &'static str, val: impl std::fmt::Display) {
+    span.record(key, tracing::field::display(val));
+}
+
+/// Fills a deferred (`field::Empty`) span field with a `Debug` value.
+///
+/// Same contract as [`record_display`], including its secret-safety rule: the field must be
+/// declared at span creation or the record is silently dropped, and you must never
+/// `?`-format secret-bearing data (e.g. a type that derives `Debug` over key material).
+pub fn record_debug(span: &tracing::Span, key: &'static str, val: impl std::fmt::Debug) {
+    span.record(key, tracing::field::debug(val));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -353,5 +387,54 @@ mod tests {
         assert_eq!(Duty::SyncContribution.as_str(), "sync_contribution");
         assert_eq!(Duty::ValidatorRegistration.as_str(), "validator_registration");
         assert_eq!(Duty::VoluntaryExit.as_str(), "voluntary_exit");
+    }
+
+    // --- correlation kit tests ---
+
+    #[test]
+    fn test_new_request_id_is_v4_and_unique() {
+        let a = new_request_id();
+        let b = new_request_id();
+        assert_eq!(a.get_version(), Some(uuid::Version::Random));
+        assert_ne!(a, b, "two successive request ids must differ");
+    }
+
+    /// A field declared `field::Empty` at span creation is filled by `record_display` and
+    /// inherits to a child event under a capturing subscriber.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_record_display_fills_declared_empty_field() {
+        let span = tracing::info_span!("req", request_id = tracing::field::Empty);
+        let _e = span.enter();
+        let id = new_request_id();
+        record_display(&span, fields::REQUEST_ID, id);
+        tracing::info!("request handled");
+        assert!(logs_contain(&id.to_string()), "recorded request_id must appear on the event");
+    }
+
+    /// Recording a field that was NOT declared at span creation is a silent no-op — this
+    /// documents the foot-gun the helper guards against.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_record_to_undeclared_field_is_silent_noop() {
+        let span = tracing::info_span!("req"); // no fields declared
+        let _e = span.enter();
+        record_display(&span, "undeclared_key", "sentinel_value_xyz");
+        tracing::info!("request handled");
+        assert!(
+            !logs_contain("sentinel_value_xyz"),
+            "an undeclared field must be silently dropped"
+        );
+    }
+
+    /// `record_debug` behaves identically to `record_display` for a `Debug` value.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_record_debug_fills_declared_empty_field() {
+        let span = tracing::info_span!("op", marker = tracing::field::Empty);
+        let _e = span.enter();
+        record_debug(&span, "marker", "dbg_sentinel_987");
+        tracing::info!("done");
+        assert!(logs_contain("dbg_sentinel_987"), "recorded debug value must appear on the event");
     }
 }
