@@ -294,6 +294,11 @@ impl BeaconClient {
     /// Requests SSZ-encoded response for reduced network latency on large blocks.
     /// Falls back to JSON if the BN does not support SSZ or responds with JSON
     /// despite the SSZ preference.
+    ///
+    /// Wrapped in a `beacon.produce_block_v3` span (canonical `slot`), mirroring the sibling
+    /// `beacon.*` duty-call spans so the proposer-duty BN call is correlatable. `skip_all`
+    /// keeps `randao_reveal` and the other args out of the span (no eager formatting).
+    #[tracing::instrument(name = "beacon.produce_block_v3", level = "debug", skip_all, fields(slot = slot))]
     pub async fn produce_block_v3(
         &self,
         slot: u64,
@@ -2955,6 +2960,93 @@ mod tests {
         let block = result.parse_full_block().unwrap();
         assert_eq!(block.block().slot, 100);
         assert_eq!(block.block().proposer_index, 42);
+    }
+
+    /// `produce_block_v3` — the proposer-duty block-production BN call — must run its work
+    /// inside a `beacon.produce_block_v3` span carrying the canonical `slot` field, at `debug`
+    /// level, matching its sibling `beacon.*` hot-path spans. Proves the span fires (correct
+    /// name + level) and that `slot` lands; `skip_all` keeps `randao_reveal` out of the span.
+    #[tokio::test]
+    async fn produce_block_v3_emits_debug_span_with_slot() {
+        use std::sync::{Arc, Mutex};
+
+        use tracing::field::{Field, Visit};
+        use tracing::span::Attributes;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::registry::LookupSpan;
+
+        // (span name, span level, captured field keys) for one created span.
+        type SpanRecord = (String, tracing::Level, Vec<String>);
+
+        #[derive(Clone, Default)]
+        struct Cap {
+            spans: Arc<Mutex<Vec<SpanRecord>>>,
+        }
+        struct V<'a>(&'a mut Vec<String>);
+        impl Visit for V<'_> {
+            fn record_debug(&mut self, f: &Field, _v: &dyn std::fmt::Debug) {
+                self.0.push(f.name().to_string());
+            }
+        }
+        impl<S> Layer<S> for Cap
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_new_span(&self, attrs: &Attributes<'_>, _id: &tracing::Id, _ctx: Context<'_, S>) {
+                let meta = attrs.metadata();
+                let mut keys = Vec::new();
+                attrs.record(&mut V(&mut keys));
+                if let Ok(mut spans) = self.spans.lock() {
+                    spans.push((meta.name().to_string(), *meta.level(), keys));
+                }
+            }
+        }
+
+        let mock_server = MockServer::start().await;
+        let envelope = serde_json::json!({
+            "version": "deneb",
+            "execution_optimistic": false,
+            "data": {
+                "slot": "777",
+                "proposer_index": "42",
+                "parent_root": format!("0x{}", "01".repeat(32)),
+                "state_root": format!("0x{}", "02".repeat(32)),
+                "body": "0xdead"
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/777"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&envelope)
+                    .insert_header("Eth-Consensus-Version", "deneb"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let cap = Cap::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        // `set_default` sets the thread-local dispatcher and returns a drop-guard, so it works
+        // inside this async test (unlike `with_default`, whose closure cannot `.await`).
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let _ = client.produce_block_v3(777, "0xrandao", None, None).await;
+        drop(_guard);
+
+        let spans = cap.spans.lock().unwrap();
+        let span = spans
+            .iter()
+            .find(|(name, ..)| name == "beacon.produce_block_v3")
+            .expect("beacon.produce_block_v3 span must be created");
+        assert_eq!(span.1, tracing::Level::DEBUG, "span must be at DEBUG level");
+        assert!(
+            span.2.iter().any(|k| k == "slot"),
+            "span must carry canonical `slot`: {:?}",
+            span.2
+        );
     }
 
     #[tokio::test]
