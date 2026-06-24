@@ -133,6 +133,12 @@ fn slashing_err(e: slashing::SlashingError) -> Status {
     use slashing::SlashingError;
     match e {
         SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => {
+            // Terminal rejection log for the DVT partial-sign path: the slashing
+            // crate logs the decision at debug, so this is the one record at the
+            // layer that treats the rejection as terminal. It MUST be `error!`:
+            // rvc-signer's default EnvFilter is ERROR-only (RUST_LOG unset), so a
+            // warn! here would be dropped and the rejection would go unlogged.
+            tracing::error!(error = %e, "DVT partial sign rejected by slashing protection");
             Status::failed_precondition(format!("slashing protection violation: {e}"))
         }
         _ => Status::failed_precondition(format!("slashing check failed: {e}")),
@@ -506,6 +512,29 @@ mod tests {
     use super::*;
     use crate::dvt::allow_list::{AllowedPeer, AllowedPeers};
     use crate::dvt::types::ShareInfo;
+
+    /// Issue 2.7: the DVT terminal slashing-rejection log MUST be `error!` so it
+    /// survives rvc-signer's default ERROR-only EnvFilter (RUST_LOG unset). A
+    /// `warn!` here would be dropped and the rejection would go unlogged.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_dvt_slashing_rejection_logged_at_error() {
+        let _status = slashing_err(slashing::SlashingError::SlashableBlock(
+            slashing::BlockSlashingViolation::DoubleBlockProposal { slot: 42 },
+        ));
+        logs_assert(|lines: &[&str]| {
+            let line = lines
+                .iter()
+                .find(|l| l.contains("DVT partial sign rejected by slashing protection"))
+                .ok_or_else(|| "no DVT slashing-rejection log captured".to_string())?;
+            if !line.contains("ERROR") {
+                return Err(format!(
+                    "DVT rejection must be ERROR to survive the default filter: {line}"
+                ));
+            }
+            Ok(())
+        });
+    }
 
     fn make_share(index: u64) -> ([u8; 48], ShareInfo) {
         let sk = crypto::SecretKey::generate();

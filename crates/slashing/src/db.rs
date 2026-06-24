@@ -1243,6 +1243,12 @@ impl SlashingDb {
     /// - `gvr`: Genesis validators root for this signing operation.  Compared
     ///   against `metadata.genesis_validators_root` (M-6 / ISSUE-3.5).
     ///   On mismatch, `Err(SlashingError::GenesisRootMismatch)` is returned.
+    // Divergence note: this direct check-and-record API logs routine violations
+    // at `error!` (below), unlike the staged `stage_*` path which logs them at
+    // `debug!` and relies on its caller (signer/gate/DVT) to log the one terminal
+    // error. That demotion is safe only because every `stage_*` caller re-logs;
+    // `check_and_record_*` has no such guaranteed terminal layer (today it has no
+    // non-test callers), so its rejections stay at `error!`.
     #[tracing::instrument(name = "rvc.slashing.db.block", skip_all, fields(rvc.slashing.result))]
     pub fn check_and_record_block(
         &self,
