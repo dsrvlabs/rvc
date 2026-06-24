@@ -2248,4 +2248,69 @@ mod tests {
             "init_logging composition silently drops events; captured: {captured:?}"
         );
     }
+
+    // Serializes the RUST_LOG-mutating parity tests below (process-global env).
+    // nextest runs each test in its own process, but guard anyway.
+    static RUST_LOG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_rust_log<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = RUST_LOG_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("RUST_LOG").ok();
+        match value {
+            Some(v) => std::env::set_var("RUST_LOG", v),
+            None => std::env::remove_var("RUST_LOG"),
+        }
+        let out = f();
+        match prev {
+            Some(p) => std::env::set_var("RUST_LOG", p),
+            None => std::env::remove_var("RUST_LOG"),
+        }
+        out
+    }
+
+    // Cross-binary init parity (P0-5 / M3): bin/rvc and bin/rvc-signer must share
+    // one default level (`info`) and one RUST_LOG precedence — both route their
+    // filter through `telemetry::env_filter_or("info")`. These assertions mirror
+    // the `rvc-signer` parity tests so an operator learns one behavior, not two.
+    #[test]
+    fn test_rvc_unset_rust_log_defaults_to_info() {
+        let rendered = with_rust_log(None, || format!("{}", telemetry::env_filter_or("info")));
+        assert_eq!(rendered, "info", "unset RUST_LOG must default to info, got: {rendered}");
+    }
+
+    #[test]
+    fn test_rvc_rust_log_overrides_default() {
+        let rendered =
+            with_rust_log(Some("debug"), || format!("{}", telemetry::env_filter_or("info")));
+        assert!(rendered.contains("debug"), "RUST_LOG=debug must override the default: {rendered}");
+    }
+
+    #[test]
+    fn test_rvc_per_module_directive_preserved() {
+        let rendered = with_rust_log(Some("warn,rvc=trace"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert!(rendered.contains("warn"), "global directive missing: {rendered}");
+        assert!(rendered.contains("rvc=trace"), "per-module directive missing: {rendered}");
+    }
+
+    #[test]
+    fn test_rvc_malformed_rust_log_falls_back_to_info() {
+        let rendered = with_rust_log(Some("rvc=invalidlevel"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert_eq!(
+            rendered, "info",
+            "malformed RUST_LOG must fall back to info (no panic, no silence): {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_rvc_whitespace_padded_rust_log_honored() {
+        let rendered = with_rust_log(Some("warn, rvc=trace"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert!(rendered.contains("warn"), "global directive missing: {rendered}");
+        assert!(rendered.contains("rvc=trace"), "padded per-module directive missing: {rendered}");
+    }
 }

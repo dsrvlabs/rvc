@@ -913,4 +913,74 @@ mod tests {
             "reconciled init dropped an info event with RUST_LOG unset; captured: {captured:?}"
         );
     }
+
+    fn with_rust_log<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("RUST_LOG").ok();
+        match value {
+            Some(v) => unsafe { std::env::set_var("RUST_LOG", v) },
+            None => unsafe { std::env::remove_var("RUST_LOG") },
+        }
+        let out = f();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("RUST_LOG", p) },
+            None => unsafe { std::env::remove_var("RUST_LOG") },
+        }
+        out
+    }
+
+    // Cross-binary init parity (P0-5 / M3): rvc-signer must exhibit the SAME
+    // default level (`info`) and RUST_LOG precedence as bin/rvc — both route
+    // their filter through `telemetry::env_filter_or("info")`. These mirror the
+    // bin/rvc parity tests so an operator learns one behavior, not two.
+    #[test]
+    fn test_rvc_signer_unset_rust_log_defaults_to_info() {
+        let rendered = with_rust_log(None, || format!("{}", telemetry::env_filter_or("info")));
+        assert_eq!(rendered, "info", "unset RUST_LOG must default to info, got: {rendered}");
+    }
+
+    #[test]
+    fn test_rvc_signer_rust_log_overrides_default() {
+        let rendered =
+            with_rust_log(Some("debug"), || format!("{}", telemetry::env_filter_or("info")));
+        assert!(rendered.contains("debug"), "RUST_LOG=debug must override the default: {rendered}");
+    }
+
+    #[test]
+    fn test_rvc_signer_per_module_directive_preserved() {
+        let rendered = with_rust_log(Some("warn,rvc_signer_bin::http_api=trace"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert!(rendered.contains("warn"), "global directive missing: {rendered}");
+        // Assert the joined target=level token, not three independent substrings:
+        // the latter green-lights a filter where the target binds to a *different*
+        // level (e.g. http_api=info,foo=trace).
+        assert!(
+            rendered.contains("rvc_signer_bin::http_api=trace"),
+            "per-module directive not preserved verbatim (target must bind to trace): {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_rvc_signer_malformed_rust_log_falls_back_to_info() {
+        let rendered = with_rust_log(Some("rvc=invalidlevel"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert_eq!(
+            rendered, "info",
+            "malformed RUST_LOG must fall back to info (no panic, no silence): {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_rvc_signer_whitespace_padded_rust_log_honored() {
+        let rendered = with_rust_log(Some("warn, rvc_signer_bin::http_api=trace"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert!(rendered.contains("warn"), "global directive missing: {rendered}");
+        assert!(
+            rendered.contains("rvc_signer_bin::http_api=trace"),
+            "padded per-module directive not preserved verbatim (target must bind to trace): {rendered}"
+        );
+    }
 }
