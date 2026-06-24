@@ -105,7 +105,7 @@ pub struct GrpcRemoteSigner {
 }
 
 impl GrpcRemoteSigner {
-    #[tracing::instrument(name = "rvc.grpc_signer.connect", skip_all)]
+    #[tracing::instrument(name = "grpc_signer.connect", skip_all)]
     pub async fn connect(config: GrpcRemoteSignerConfig) -> Result<Self, SigningError> {
         // Gate plaintext URLs. Per NFR-10 / ISSUE-3.13 (GA) the gate refuses
         // http:// URLs unless RVC_REMOTE_SIGNER_ALLOW_INSECURE=true is set.
@@ -272,9 +272,9 @@ impl TypedSigner for GrpcRemoteSigner {
         let block_ssz = encode_beacon_block_ssz(block, fork_id);
 
         let span = tracing::info_span!(
-            "rvc.sign.grpc_remote_typed",
-            rvc.signer_type = "grpc_remote_typed",
-            rvc.duty_type = "block",
+            "sign.grpc_remote_typed",
+            signer_type = "grpc_remote_typed",
+            duty_type = "block",
             grpc.url = %redact_url(&self.url),
         );
 
@@ -337,9 +337,9 @@ impl TypedSigner for GrpcRemoteSigner {
         let block_ssz = encode_blinded_beacon_block_ssz(block, fork_id);
 
         let span = tracing::info_span!(
-            "rvc.sign.grpc_remote_typed",
-            rvc.signer_type = "grpc_remote_typed",
-            rvc.duty_type = "blinded_block",
+            "sign.grpc_remote_typed",
+            signer_type = "grpc_remote_typed",
+            duty_type = "blinded_block",
             grpc.url = %redact_url(&self.url),
         );
 
@@ -389,9 +389,9 @@ impl TypedSigner for GrpcRemoteSigner {
         let fork_id = Self::fork_id(ctx);
 
         let span = tracing::info_span!(
-            "rvc.sign.grpc_remote_typed",
-            rvc.signer_type = "grpc_remote_typed",
-            rvc.duty_type = "attestation",
+            "sign.grpc_remote_typed",
+            signer_type = "grpc_remote_typed",
+            duty_type = "attestation",
             grpc.url = %redact_url(&self.url),
         );
 
@@ -455,9 +455,9 @@ impl TypedSigner for GrpcRemoteSigner {
         let aggregate_ssz = encode_attestation_ssz(&agg.aggregate, fork_id);
 
         let span = tracing::info_span!(
-            "rvc.sign.grpc_remote_typed",
-            rvc.signer_type = "grpc_remote_typed",
-            rvc.duty_type = "aggregate_and_proof",
+            "sign.grpc_remote_typed",
+            signer_type = "grpc_remote_typed",
+            duty_type = "aggregate_and_proof",
             grpc.url = %redact_url(&self.url),
         );
 
@@ -510,9 +510,9 @@ impl TypedSigner for GrpcRemoteSigner {
         let fork_id = Self::fork_id(ctx);
 
         let span = tracing::info_span!(
-            "rvc.sign.grpc_remote_typed",
-            rvc.signer_type = "grpc_remote_typed",
-            rvc.duty_type = "sync_committee_message",
+            "sign.grpc_remote_typed",
+            signer_type = "grpc_remote_typed",
+            duty_type = "sync_committee_message",
             grpc.url = %redact_url(&self.url),
         );
 
@@ -564,9 +564,9 @@ impl TypedSigner for GrpcRemoteSigner {
         let fork_id = Self::fork_id(ctx);
 
         let span = tracing::info_span!(
-            "rvc.sign.grpc_remote_typed",
-            rvc.signer_type = "grpc_remote_typed",
-            rvc.duty_type = "sync_aggregator_selection",
+            "sign.grpc_remote_typed",
+            signer_type = "grpc_remote_typed",
+            duty_type = "sync_aggregator_selection",
             grpc.url = %redact_url(&self.url),
         );
 
@@ -620,9 +620,9 @@ impl TypedSigner for GrpcRemoteSigner {
         let contribution_ssz = encode_sync_committee_contribution_ssz(&c.contribution, fork_id);
 
         let span = tracing::info_span!(
-            "rvc.sign.grpc_remote_typed",
-            rvc.signer_type = "grpc_remote_typed",
-            rvc.duty_type = "contribution_and_proof",
+            "sign.grpc_remote_typed",
+            signer_type = "grpc_remote_typed",
+            duty_type = "contribution_and_proof",
             grpc.url = %redact_url(&self.url),
         );
 
@@ -674,9 +674,9 @@ impl TypedSigner for GrpcRemoteSigner {
         let pubkey_hex = hex::encode(ctx.pubkey.to_bytes());
 
         let span = tracing::info_span!(
-            "rvc.sign.grpc_remote_typed",
-            rvc.signer_type = "grpc_remote_typed",
-            rvc.duty_type = "builder_registration",
+            "sign.grpc_remote_typed",
+            signer_type = "grpc_remote_typed",
+            duty_type = "builder_registration",
             grpc.url = %redact_url(&self.url),
         );
 
@@ -724,9 +724,9 @@ impl TypedSigner for GrpcRemoteSigner {
         let fork_id = Self::fork_id(ctx);
 
         let span = tracing::info_span!(
-            "rvc.sign.grpc_remote_typed",
-            rvc.signer_type = "grpc_remote_typed",
-            rvc.duty_type = "randao_reveal",
+            "sign.grpc_remote_typed",
+            signer_type = "grpc_remote_typed",
+            duty_type = "randao_reveal",
             grpc.url = %redact_url(&self.url),
         );
 
@@ -776,9 +776,9 @@ impl TypedSigner for GrpcRemoteSigner {
         let fork_id = Self::fork_id(ctx);
 
         let span = tracing::info_span!(
-            "rvc.sign.grpc_remote_typed",
-            rvc.signer_type = "grpc_remote_typed",
-            rvc.duty_type = "voluntary_exit",
+            "sign.grpc_remote_typed",
+            signer_type = "grpc_remote_typed",
+            duty_type = "voluntary_exit",
             grpc.url = %redact_url(&self.url),
         );
 

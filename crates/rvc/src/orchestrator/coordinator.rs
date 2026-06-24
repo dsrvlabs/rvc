@@ -4552,12 +4552,9 @@ mod tests {
         let _ = beacon.get_node_version().await;
 
         let span_names = captured.lock();
-        // NOTE: this span is created by the `beacon` crate, whose rvc.* names are
-        // normalized in Phase 4 (4.11), not here. Keep the rvc.-prefixed name so
-        // the assertion matches beacon's current span; 4.11 updates both together.
         assert!(
-            span_names.contains(&"rvc.beacon.http".to_string()),
-            "Expected rvc.beacon.http span, got: {:?}",
+            span_names.contains(&"beacon.http".to_string()),
+            "Expected beacon.http span, got: {:?}",
             *span_names
         );
     }

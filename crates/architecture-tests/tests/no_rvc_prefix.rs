@@ -28,9 +28,6 @@ const EXCLUDE: &[&str] = &[
 /// Production files still carrying `rvc.`-prefixed tracing keys, pending their normalization
 /// issue. Tightened to EMPTY by issue 4.12b. Paths are workspace-relative, `/`-separated.
 const KNOWN_REMAINING: &[&str] = &[
-    // Planned per-crate normalization issues (4.6–4.11):
-    "crates/beacon/src/client.rs",                // 4.11
-    "crates/grpc-signer/src/client.rs",           // 4.11
     "crates/rvc/src/orchestrator/coordinator.rs", // 4.12a (Phase-2 2.9 left a beacon test ref)
     // Stragglers not named in the plan's issue list — real rvc. keys the census missed.
     // Absorbed by 4.12b (whose job is to empty this list); see its task notes.

@@ -184,7 +184,7 @@ impl BeaconClient {
     ) -> Result<AttesterDutiesResponse, BeaconError> {
         let path = format!("/eth/v1/validator/duties/attester/{}", epoch);
         self.post(&path, &validator_indices)
-            .instrument(tracing::info_span!("rvc.beacon.get_attester_duties", epoch = epoch))
+            .instrument(tracing::info_span!("beacon.get_attester_duties", epoch = epoch))
             .await
     }
 
@@ -199,14 +199,12 @@ impl BeaconClient {
         if pubkeys.len() > Self::POST_VALIDATORS_THRESHOLD {
             let path = "/eth/v1/beacon/states/head/validators";
             let body = serde_json::json!({ "ids": pubkeys });
-            self.post(path, &body)
-                .instrument(tracing::info_span!("rvc.beacon.get_validators"))
-                .await
+            self.post(path, &body).instrument(tracing::info_span!("beacon.get_validators")).await
         } else {
             let ids: String =
                 pubkeys.iter().map(|pk| format!("id={}", pk)).collect::<Vec<_>>().join("&");
             let path = format!("/eth/v1/beacon/states/head/validators?{}", ids);
-            self.get(&path).instrument(tracing::info_span!("rvc.beacon.get_validators")).await
+            self.get(&path).instrument(tracing::info_span!("beacon.get_validators")).await
         }
     }
 
@@ -227,7 +225,7 @@ impl BeaconClient {
             slot, committee_index
         );
         self.get(&path)
-            .instrument(tracing::info_span!("rvc.beacon.get_attestation_data", slot = slot))
+            .instrument(tracing::info_span!("beacon.get_attestation_data", slot = slot))
             .await
     }
 
@@ -235,13 +233,13 @@ impl BeaconClient {
     ///
     /// Returns a map of all configuration parameters as string key-value pairs.
     /// Includes fork versions, fork epochs, slot timing, and other consensus parameters.
-    #[tracing::instrument(name = "rvc.beacon.get_config_spec", skip_all)]
+    #[tracing::instrument(name = "beacon.get_config_spec", skip_all)]
     pub async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
         self.get("/eth/v1/config/spec").await
     }
 
     /// Fetches the config spec and parses fork epoch and version fields into a `ForkSchedule`.
-    #[tracing::instrument(name = "rvc.beacon.get_fork_schedule", skip_all)]
+    #[tracing::instrument(name = "beacon.get_fork_schedule", skip_all)]
     pub async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
         let spec = self.get_config_spec().await?;
         parse_fork_schedule(&spec.data)
@@ -250,7 +248,7 @@ impl BeaconClient {
     /// Fetches genesis information from the beacon node.
     ///
     /// Returns the genesis time, genesis validators root, and genesis fork version.
-    #[tracing::instrument(name = "rvc.beacon.get_genesis", skip_all)]
+    #[tracing::instrument(name = "beacon.get_genesis", skip_all)]
     pub async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
         self.get("/eth/v1/beacon/genesis").await
     }
@@ -259,7 +257,7 @@ impl BeaconClient {
     ///
     /// Returns the previous and current fork versions along with the fork epoch.
     /// Common state_id values: "head", "finalized", "justified", or a specific slot number.
-    #[tracing::instrument(name = "rvc.beacon.get_fork", skip_all)]
+    #[tracing::instrument(name = "beacon.get_fork", skip_all)]
     pub async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError> {
         let path = format!("/eth/v1/beacon/states/{}/fork", state_id);
         self.get(&path).await
@@ -268,7 +266,7 @@ impl BeaconClient {
     /// Fetches the block root for the given block identifier.
     ///
     /// Common block_id values: "head", "finalized", "justified", or a slot number.
-    #[tracing::instrument(name = "rvc.beacon.get_block_root", skip_all)]
+    #[tracing::instrument(name = "beacon.get_block_root", skip_all)]
     pub async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
         let path = format!("/eth/v1/beacon/blocks/{}/root", block_id);
         self.get(&path).await
@@ -281,7 +279,7 @@ impl BeaconClient {
     ) -> Result<ProposerDutiesResponse, BeaconError> {
         let path = format!("/eth/v1/validator/duties/proposer/{}", epoch);
         self.get(&path)
-            .instrument(tracing::info_span!("rvc.beacon.get_proposer_duties", epoch = epoch))
+            .instrument(tracing::info_span!("beacon.get_proposer_duties", epoch = epoch))
             .await
     }
 
@@ -496,7 +494,7 @@ impl BeaconClient {
             signed_block,
             &[("Eth-Consensus-Version", consensus_version)],
         )
-        .instrument(tracing::info_span!("rvc.beacon.publish_block"))
+        .instrument(tracing::info_span!("beacon.publish_block"))
         .await
     }
 
@@ -511,7 +509,7 @@ impl BeaconClient {
             signed_blinded_block,
             &[("Eth-Consensus-Version", consensus_version)],
         )
-        .instrument(tracing::info_span!("rvc.beacon.publish_blinded_block"))
+        .instrument(tracing::info_span!("beacon.publish_blinded_block"))
         .await
     }
 
@@ -565,7 +563,7 @@ impl BeaconClient {
     ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
         let path = format!("/eth/v1/validator/duties/sync/{}", epoch);
         self.post(&path, &validator_indices)
-            .instrument(tracing::info_span!("rvc.beacon.get_sync_committee_duties", epoch = epoch))
+            .instrument(tracing::info_span!("beacon.get_sync_committee_duties", epoch = epoch))
             .await
     }
 
@@ -575,12 +573,12 @@ impl BeaconClient {
         messages: &[SyncCommitteeMessage],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/beacon/pool/sync_committees", &messages)
-            .instrument(tracing::info_span!("rvc.beacon.submit_sync_committee_messages"))
+            .instrument(tracing::info_span!("beacon.submit_sync_committee_messages"))
             .await
     }
 
     /// Fetches a sync committee contribution for the given slot, subcommittee index, and block root.
-    #[tracing::instrument(name = "rvc.beacon.get_sync_committee_contribution", skip_all, fields(rvc.slot = slot))]
+    #[tracing::instrument(name = "beacon.get_sync_committee_contribution", skip_all, fields(slot = slot))]
     pub async fn get_sync_committee_contribution(
         &self,
         slot: u64,
@@ -600,7 +598,7 @@ impl BeaconClient {
         proofs: &[SignedContributionAndProof],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/validator/contribution_and_proofs", &proofs)
-            .instrument(tracing::info_span!("rvc.beacon.submit_contribution_and_proofs"))
+            .instrument(tracing::info_span!("beacon.submit_contribution_and_proofs"))
             .await
     }
 
@@ -610,7 +608,7 @@ impl BeaconClient {
     ///
     /// The `committee_index` parameter is required for Electra and later forks.
     /// Pass `None` for pre-Electra requests.
-    #[tracing::instrument(name = "rvc.beacon.get_aggregate_attestation", skip_all, fields(rvc.slot = slot))]
+    #[tracing::instrument(name = "beacon.get_aggregate_attestation", skip_all, fields(slot = slot))]
     pub async fn get_aggregate_attestation(
         &self,
         slot: u64,
@@ -639,7 +637,7 @@ impl BeaconClient {
         &self,
         proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError> {
-        let span = tracing::info_span!("rvc.beacon.submit_aggregate_and_proofs");
+        let span = tracing::info_span!("beacon.submit_aggregate_and_proofs");
         match proofs {
             VersionedSignedAggregateAndProof::PreElectra(ps) => {
                 self.post_empty("/eth/v1/validator/aggregate_and_proofs", ps).instrument(span).await
@@ -674,7 +672,7 @@ impl BeaconClient {
         preparations: &[ProposerPreparation],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/validator/prepare_beacon_proposer", &preparations)
-            .instrument(tracing::info_span!("rvc.beacon.prepare_beacon_proposer"))
+            .instrument(tracing::info_span!("beacon.prepare_beacon_proposer"))
             .await
     }
 
@@ -682,7 +680,7 @@ impl BeaconClient {
     ///
     /// Returns liveness data indicating whether each validator was active
     /// during the specified epoch. Used for doppelganger detection.
-    #[tracing::instrument(name = "rvc.beacon.post_validator_liveness", skip_all, fields(rvc.epoch = epoch))]
+    #[tracing::instrument(name = "beacon.post_validator_liveness", skip_all, fields(epoch = epoch))]
     pub async fn post_validator_liveness(
         &self,
         epoch: u64,
@@ -702,7 +700,7 @@ impl BeaconClient {
         signed_exit: &SignedVoluntaryExit,
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/beacon/pool/voluntary_exits", signed_exit)
-            .instrument(tracing::info_span!("rvc.beacon.submit_voluntary_exit"))
+            .instrument(tracing::info_span!("beacon.submit_voluntary_exit"))
             .await
     }
 
@@ -715,7 +713,7 @@ impl BeaconClient {
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/validator/beacon_committee_subscriptions", &subscriptions)
-            .instrument(tracing::info_span!("rvc.beacon.submit_beacon_committee_subscriptions"))
+            .instrument(tracing::info_span!("beacon.submit_beacon_committee_subscriptions"))
             .await
     }
 
@@ -726,7 +724,7 @@ impl BeaconClient {
         registrations: &[SignedValidatorRegistration],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/validator/register_validator", &registrations)
-            .instrument(tracing::info_span!("rvc.beacon.register_validators"))
+            .instrument(tracing::info_span!("beacon.register_validators"))
             .await
     }
 
@@ -734,13 +732,13 @@ impl BeaconClient {
     ///
     /// Returns whether the node is syncing, its head slot, sync distance,
     /// and whether the execution layer is offline.
-    #[tracing::instrument(name = "rvc.beacon.get_node_syncing", skip_all)]
+    #[tracing::instrument(name = "beacon.get_node_syncing", skip_all)]
     pub async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
         self.get("/eth/v1/node/syncing").await
     }
 
     /// Fetches the node version string from the beacon node.
-    #[tracing::instrument(name = "rvc.beacon.get_node_version", skip_all)]
+    #[tracing::instrument(name = "beacon.get_node_version", skip_all)]
     pub async fn get_node_version(&self) -> Result<String, BeaconError> {
         let response: crate::types::NodeVersionResponse = self.get("/eth/v1/node/version").await?;
         Ok(response.data.version)
@@ -760,7 +758,7 @@ impl BeaconClient {
         let url = format!("{}/eth/v2/beacon/pool/attestations", self.config.endpoint);
 
         let span = tracing::info_span!(
-            "rvc.beacon.submit_attestations",
+            "beacon.submit_attestations",
             http.method = "POST",
             http.url = %RedactedUrl(&url),
             http.status_code = tracing::field::Empty,
@@ -908,7 +906,7 @@ impl BeaconClient {
         T: DeserializeOwned,
     {
         let span = tracing::info_span!(
-            "rvc.beacon.http",
+            "beacon.http",
             http.method = %http_method,
             http.url = %RedactedUrl(url),
             http.status_code = tracing::field::Empty,
@@ -1038,7 +1036,7 @@ impl BeaconClient {
         let url = format!("{}{}", self.config.endpoint, path);
 
         let span = tracing::info_span!(
-            "rvc.beacon.http",
+            "beacon.http",
             http.method = "POST",
             http.url = %RedactedUrl(&url),
             http.status_code = tracing::field::Empty,
@@ -1168,7 +1166,7 @@ impl BeaconClient {
         Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
     {
         let span = tracing::info_span!(
-            "rvc.beacon.http",
+            "beacon.http",
             http.method = %http_method,
             http.url = %RedactedUrl(url),
             http.status_code = tracing::field::Empty,
