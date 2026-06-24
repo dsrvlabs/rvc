@@ -114,6 +114,9 @@ impl<C: SlotClock> AttestationTimer<C> {
 
             let epoch = self.clock.slot_to_epoch(current_slot);
             tracing::trace!(slot = current_slot, epoch, "slot loop tick");
+            // Operator heartbeat: one info line per slot (bounded volume, not per-poll) so the
+            // absence of ticks is alertable. Fields are Copy scalars — no eager work.
+            tracing::info!(slot = current_slot, epoch, "slot tick");
 
             self.update_slot_metrics(current_slot);
 
@@ -258,6 +261,29 @@ mod tests {
 
         let _ = timer_task.await;
         assert!(call_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn run_slot_loop_emits_info_heartbeat() {
+        let clock = create_mock_clock();
+        // 4s into slot 0: attestation time has passed, so the first iteration completes
+        // without a real wait.
+        clock.set_current_time(TEST_GENESIS_TIME + 4);
+
+        let (mut timer, handle) = AttestationTimer::new(clock);
+
+        // Cancel from inside the callback so the loop exits after exactly one tick. The loop
+        // is awaited inline on this current-thread runtime, so the traced_test thread-local
+        // subscriber captures its info! event (a spawned task would not).
+        let _ = timer
+            .run_slot_loop(|_slot| {
+                handle.cancel();
+                async {}
+            })
+            .await;
+
+        assert!(logs_contain("slot tick"), "once-per-slot info heartbeat not emitted");
     }
 
     #[test]
