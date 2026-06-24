@@ -454,6 +454,95 @@ rebuild a debug binary for that investigation.
 
 ---
 
+## 9. Logging roadmap & deferred items
+
+This section keeps every nice-to-have (P2) item — landed, deferred, or backlogged —
+**first-class and discoverable**, so nothing is silently dropped. It is the durable
+record an operator or a future contributor reads to know exactly **what shipped, what
+was consciously parked, and (for the parked items) what it would take to pick them up**.
+
+### 9.1 What is delivered
+
+The required commitment — every must-have (P0) and should-have (P1) item — is **fully
+delivered**, and the milestone bar that wraps this work is met (P2 is best-effort):
+
+- **P0-1** — the logging standard, the operator guide (this document), and the **six
+  fail-closed CI gates** (§9.4) are in place.
+- **P0-2 / P0-3 / P0-4 / P0-6** — secret redaction at the value level (truncated pubkeys
+  / roots / signatures, credential-stripped URLs; §3), correlation spans (§4), and the
+  zero-allocation-when-disabled guarantee for `debug!`/`trace!` (§1, §8) are enforced.
+- **P0-5** — both binaries share **one** filter init through `telemetry::env_filter_or`
+  so default level and `RUST_LOG` precedence cannot drift (§1).
+- **P1-1 / P1-2 / P1-3** — the breadth pass normalized field keys across the workspace and
+  removed the legacy `rvc.` prefix; the `no_rvc_prefixed_keys_outside_allow_lists` grep
+  gate keeps it from coming back (§3, §9.4).
+- **P1-4** — this **OPERATOR_GUIDE.md**.
+
+Three of the four P2 items also **landed**; the fourth (a workspace-wide conformance lint)
+is the one conscious **deferral** (§9.3). The **canonical-field conformance gate (Gate 5)
+is now BLOCKING** (§9.4) over the curated hot-path set.
+
+### 9.2 Status of each nice-to-have (P2) item
+
+No P2 item is dropped; each is recorded with its real state:
+
+| Item | Status | What it is / where it lives |
+|---|---|---|
+| Log-event sampling | **LANDED** | Per-site `crypto::logging::should_log_sampled` (1-in-N **behind** the level check, zero cost when off); the attestation-stage progress trace samples **1-in-16** (`ATTESTATION_STAGE_TRACE_SAMPLE_N`, `crates/signer/src/lib.rs`). Operator semantics in §8. |
+| Dynamic level reload | **LANDED** | Opt-in `--enable-log-reload`: `SIGHUP` re-reads `RUST_LOG` and swaps the active filter in place via `tracing_subscriber::reload::Layer`, no restart. Unix-only; no network surface. Operator workflow in §2.1. |
+| JSON output profile | **LANDED** | Opt-in `--log-format json` (or `RVC_LOG_FORMAT=json`); **pretty stays the default** so output is unchanged unless you ask. Redaction is identical in both formats. Details in §6. |
+| Workspace-wide conformance lint (dylint) | **DEFERRED** | A `dylint` field-name lint over all 23 crates. Conscious "not worth it / here's what it would take" conclusion — see §9.3. |
+
+Two further follow-ups, surfaced during the work and **tracked so they are not lost**:
+
+| Follow-up | Status | Detail |
+|---|---|---|
+| Truncate the full `pubkey` on the signer's gRPC paths | **BACKLOG** | The initiative truncates pubkeys to `0x{first10}...{last8}` everywhere on the hot path, but two non-hot-path gRPC sites still record the **full** pubkey on their span/event: `bin/rvc-signer/src/service.rs` (the v2 gRPC service, via its local `pubkey_hex`) and `bin/rvc-signer/src/dvt/peer_service.rs`. **Pubkeys are public, so this is not a secret leak** — it is a `STANDARD.md` truncation-conformance gap the hot-path pass did not reach. Fix: route these through `crypto::logging::TruncatedPubkey` like every other site. |
+| Phase-init polish hardenings | **BACKLOG** | Three small follow-ups left after the init-consistency work: (a) a `telemetry::DEFAULT_LOG_LEVEL` const as the **single source of truth** for the default level, wired into both bins' defaults and the cross-binary parity-test literals (today the `"info"` default is repeated); (b) an **RAII env-guard** for the `RUST_LOG` test helpers so a panicking test cannot leak process env into a sibling; (c) harden telemetry's own per-module env-filter test off the `rendered.contains(..)` **3-substring** anti-pattern (`crates/telemetry/src/init.rs`) onto a structural assertion. |
+
+### 9.3 Deferral: workspace-wide conformance lint (`dylint`) — DEFER
+
+> **Feasibility conclusion: DEFER.** A `dylint` dataflow lint that flags non-`crypto::logging::fields`
+> field names across **all 23 crates** (the P2-4 idea — broader than the curated Gate 5) requires a
+> **nightly** toolchain, because `dylint` links `rustc` internals. It therefore **cannot** ride the
+> existing **stable** mandatory `check` job; it would need a **separate, non-blocking, allow-failure CI
+> lane** carrying its own nightly toolchain, plus an optional `lint/` crate kept **outside** the default
+> workspace build. The marginal benefit over what already ships is low: **Gate 5 is now BLOCKING**
+> (§9.4) over the curated hot-path set, **`STANDARD.md`** is the author/reviewer rubric, and the
+> captured-subscriber conformance tests plus the `no_rvc_prefix` grep gate already enforce the canonical
+> field names on that curated surface — and the team **explicitly accepted bounded (curated, not
+> exhaustive-breadth) field-name enforcement** as the architectural floor. A documented "not worth it,
+> here is what it would take" conclusion **is** the sanctioned, complete outcome for this item.
+
+**What it would take** (so a future team can pick it up without rediscovery):
+
+- An optional `lint/` **dylint** crate that reads emitted field idents and checks them against the
+  canonical `crypto::logging::fields` set; keep it **advisory** (a report, not a hard error).
+- A **separate nightly, allow-failure CI lane** for it, isolated from the stable `check` job.
+- **Hard constraint preserved**: the stable standing invariant (`cargo fmt`, `cargo clippy -D warnings`,
+  `cargo nextest`) and the **six existing gates** (§9.4) stay **untouched** — no new *mandatory*
+  toolchain, no new blocking dependency on nightly. The lint only ever *adds* an advisory signal.
+
+### 9.4 The six CI gates — present and enforcing
+
+Conformance and redaction are held by **six fail-closed gates** (the safety net in
+[`STANDARD.md` §7](./STANDARD.md#7-enforcement-the-safety-net)). All are present and green;
+**Gate 5 is now blocking**:
+
+| Gate | Runner | What it enforces |
+|---|---|---|
+| **Gate 1** | `cargo clippy -D warnings` | `disallowed-methods` bans the path-qualified secret sinks (`expose_secret`, `SecretKey::raw_bytes` / `::to_bytes`) — never the public-key / SSZ `to_bytes` (`clippy.toml`). |
+| **Gate 2** | `gitleaks` (CI config) | Scans the source tree **and** an emitted trace-level log sample — 0 findings. Rides CI (`.github/workflows/ci.yml`, `.gitleaks*.toml`); it is an external tool, not a local `cargo` test. |
+| **Gate 3** | `cargo nextest` | Captured-subscriber tests: raw secret **absent**, truncated/redacted form **present**, events fire at the intended level with canonical fields. |
+| **Gate 4** | `cargo nextest` | Counting-allocator: a disabled `debug!`/`trace!` performs **zero** incremental allocation (`crates/*/tests/zero_alloc.rs`). |
+| **Gate 5** | `cargo nextest` | Emitted field keys conform to the canonical registry — **BLOCKING** (`gate5_canonical_field_conformance_blocking`), enforced over a **curated 16-event hot-path set**, not full 23-crate breadth. The `no_rvc_prefixed_keys_outside_allow_lists` grep gate guards the prefix removal. |
+| **Gate 6** | `cargo nextest` | The architecture DAG stays acyclic (`architecture_no_cycles`); the one new edge `rvc-signer-bin → rvc-telemetry` is allow-listed. |
+
+The local gates can be confirmed green with the standing invariant
+(`cargo nextest run --workspace`); Gate 2 (gitleaks) runs in CI and is not invoked locally.
+
+---
+
 ## See also
 
 - [`STANDARD.md`](./STANDARD.md) — the normative level taxonomy, canonical field registry,
