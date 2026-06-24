@@ -17,7 +17,7 @@ pub mod shutdown;
 
 pub use config::{ExporterKind, TelemetryConfig};
 pub use file_appender::{create_file_layer, FileAppenderConfig};
-pub use init::init_tracing;
+pub use init::{env_filter_or, init_tracing};
 pub use propagation::{inject_trace_context, set_parent_from_headers};
 pub use shutdown::shutdown_tracing;
 

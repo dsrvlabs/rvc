@@ -110,9 +110,124 @@ fn build_gcp_provider(resource: Resource, sampler: Sampler) -> Result<SdkTracerP
     })
 }
 
+/// Build an [`EnvFilter`](tracing_subscriber::EnvFilter) honoring the rs-vc
+/// logging precedence (ADR-003): if `RUST_LOG` is set to one or more valid
+/// directives, it wins entirely; otherwise the filter falls back to
+/// `default_level`.
+///
+/// The fallback deliberately covers every case that would otherwise leave the
+/// process with no logging, so "verbose off" never means "silent":
+/// - `RUST_LOG` unset (or non-UTF-8),
+/// - a malformed directive (e.g. an invalid level like `rvc=notalevel`), and
+/// - a set-but-empty value (`""`, `","`, whitespace) — which `tracing-subscriber`
+///   would otherwise parse into an all-`OFF` filter (a real `RUST_LOG=` /
+///   `value: ""` misconfig in a Dockerfile or k8s manifest).
+///
+/// This never panics: `default_level` is fed through the lossy
+/// [`EnvFilter::new`], which *ignores* an invalid directive (printing a warning)
+/// rather than panicking. Callers pass a static `"info"`. This is the single
+/// shared implementation both `bin/rvc` and `bin/rvc-signer` route their
+/// subscriber init through, so the two binaries cannot drift on default level
+/// or precedence.
+///
+/// # Example
+/// ```
+/// use rvc_telemetry::env_filter_or;
+/// // With `RUST_LOG` unset, empty, or malformed, the filter defaults to `info`.
+/// let _filter = env_filter_or("info");
+/// ```
+pub fn env_filter_or(default_level: &str) -> tracing_subscriber::EnvFilter {
+    use tracing_subscriber::EnvFilter;
+    match std::env::var("RUST_LOG") {
+        // `RUST_LOG` carries at least one non-empty directive: it wins, falling
+        // back only if the directives fail to parse (e.g. an invalid level).
+        Ok(v) if v.split(',').any(|d| !d.trim().is_empty()) => {
+            EnvFilter::try_new(v).unwrap_or_else(|_| EnvFilter::new(default_level))
+        }
+        // Unset, non-UTF-8, or set-but-effectively-empty ("", ",", "   ") — the
+        // latter would parse to an all-`OFF` filter and silence the process.
+        _ => EnvFilter::new(default_level),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Serializes the `RUST_LOG`-mutating `env_filter_or` tests. `nextest` runs
+    // each test in its own process, but guard anyway so the suite stays correct
+    // under any runner that threads tests in one process.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_rust_log<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("RUST_LOG").ok();
+        match value {
+            Some(v) => unsafe { std::env::set_var("RUST_LOG", v) },
+            None => unsafe { std::env::remove_var("RUST_LOG") },
+        }
+        let out = f();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("RUST_LOG", p) },
+            None => unsafe { std::env::remove_var("RUST_LOG") },
+        }
+        out
+    }
+
+    #[test]
+    fn env_filter_or_unset_defaults_to_info() {
+        let rendered = with_rust_log(None, || format!("{}", env_filter_or("info")));
+        assert_eq!(rendered, "info", "expected info default, got: {rendered}");
+    }
+
+    #[test]
+    fn env_filter_or_set_but_empty_falls_back_to_default() {
+        // A present-but-empty RUST_LOG ("", ",", whitespace) would otherwise
+        // parse to an all-OFF filter and silence the process; treat it as unset
+        // so logging never goes dark on a `RUST_LOG=` style misconfig.
+        for v in ["", ",", ",,,", "   "] {
+            let rendered = with_rust_log(Some(v), || format!("{}", env_filter_or("info")));
+            assert_eq!(
+                rendered, "info",
+                "RUST_LOG={v:?} should fall back to info, got: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_filter_or_respects_rust_log() {
+        let rendered = with_rust_log(Some("debug"), || format!("{}", env_filter_or("info")));
+        assert!(rendered.contains("debug"), "env RUST_LOG=debug should win, got: {rendered}");
+    }
+
+    #[test]
+    fn env_filter_or_malformed_falls_back_to_default() {
+        // A *syntactically invalid* directive — here an unknown level after `=`
+        // (a realistic operator typo) — fails to parse, so the helper falls back
+        // to the default rather than panicking or going silent. (A bare junk
+        // token like "garbage" would instead parse as a valid *target* directive,
+        // not an error, so it is not the malformed case this guards.)
+        let rendered =
+            with_rust_log(Some("rvc=invalidlevel"), || format!("{}", env_filter_or("info")));
+        assert_eq!(
+            rendered, "info",
+            "malformed RUST_LOG should fall back to info, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn env_filter_or_preserves_per_module_directive() {
+        let rendered = with_rust_log(Some("warn,rvc_signer_bin::http_api=trace"), || {
+            format!("{}", env_filter_or("info"))
+        });
+        assert!(rendered.contains("warn"), "global directive missing: {rendered}");
+        assert!(
+            rendered.contains("rvc_signer_bin::http_api"),
+            "per-module target missing: {rendered}"
+        );
+        assert!(rendered.contains("trace"), "per-module level missing: {rendered}");
+    }
 
     #[test]
     fn test_init_tracing_valid_config() {
