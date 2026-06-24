@@ -108,30 +108,45 @@ impl std::fmt::Display for TruncatedRoot<'_> {
 /// them. `network` is intentionally **absent** — it is a resource attribute set once in
 /// `telemetry::init`, never a per-event key.
 pub mod fields {
-    /// Slot number (`u64`). Lives on the duty / attestation / block / sign span.
-    pub const SLOT: &str = "slot";
-    /// Epoch number (`u64`). Lives on the duty span.
-    pub const EPOCH: &str = "epoch";
-    /// Validator index (`u64`).
-    pub const VALIDATOR_INDEX: &str = "validator_index";
-    /// Truncated public key (`0x{first10}...{last8}`, via `TruncatedPubkey`).
-    pub const PUBKEY: &str = "pubkey";
-    /// Duty kind string (see [`Duty`]).
-    pub const DUTY: &str = "duty";
-    /// Correlation id for one signing / API request (including the :9000 hop).
-    pub const REQUEST_ID: &str = "request_id";
-    /// Committee index (`u64`).
-    pub const COMMITTEE_INDEX: &str = "committee_index";
-    /// Subcommittee index (`u64`) — sync-committee contribution lines only.
-    pub const SUBCOMMITTEE_INDEX: &str = "subcommittee_index";
-    /// Redacted beacon-node URL (via `RedactedUrl`).
-    pub const BN_URL: &str = "bn_url";
-    /// Attested head root (truncated via `TruncatedRoot`).
-    pub const HEAD: &str = "head";
-    /// Proposed block root (truncated via `TruncatedRoot`).
-    pub const BLOCK_ROOT: &str = "block_root";
-    /// Time into slot (duration / ms) — operator timing signal.
-    pub const TIME_INTO_SLOT: &str = "time_into_slot";
+    /// Defines the canonical field-key consts **and** a complete `ALL` slice of
+    /// them from one list, so `ALL` (and thus `conformance::CANONICAL`) can never
+    /// drift from the consts: a new key added to this list automatically joins
+    /// `ALL`, making the Gate-5 registry self-maintaining.
+    macro_rules! field_keys {
+        ($( $(#[$doc:meta])* $name:ident = $value:literal ),+ $(,)?) => {
+            $( $(#[$doc])* pub const $name: &str = $value; )+
+            /// Every canonical field key, generated from the consts above.
+            /// `conformance::CANONICAL` re-exports this as the Gate-5 registry.
+            pub const ALL: &[&str] = &[$($name),+];
+        };
+    }
+
+    field_keys! {
+        /// Slot number (`u64`). Lives on the duty / attestation / block / sign span.
+        SLOT = "slot",
+        /// Epoch number (`u64`). Lives on the duty span.
+        EPOCH = "epoch",
+        /// Validator index (`u64`).
+        VALIDATOR_INDEX = "validator_index",
+        /// Truncated public key (`0x{first10}...{last8}`, via `TruncatedPubkey`).
+        PUBKEY = "pubkey",
+        /// Duty kind string (see [`Duty`]).
+        DUTY = "duty",
+        /// Correlation id for one signing / API request (including the :9000 hop).
+        REQUEST_ID = "request_id",
+        /// Committee index (`u64`).
+        COMMITTEE_INDEX = "committee_index",
+        /// Subcommittee index (`u64`) — sync-committee contribution lines only.
+        SUBCOMMITTEE_INDEX = "subcommittee_index",
+        /// Redacted beacon-node URL (via `RedactedUrl`).
+        BN_URL = "bn_url",
+        /// Attested head root (truncated via `TruncatedRoot`).
+        HEAD = "head",
+        /// Proposed block root (truncated via `TruncatedRoot`).
+        BLOCK_ROOT = "block_root",
+        /// Time into slot (duration / ms) — operator timing signal.
+        TIME_INTO_SLOT = "time_into_slot",
+    }
 
     /// Canonical `duty` value strings.
     ///
@@ -199,9 +214,101 @@ pub fn record_debug(span: &tracing::Span, key: &'static str, val: impl std::fmt:
     span.record(key, tracing::field::debug(val));
 }
 
+/// Gate 5 (canonical-field-name conformance) advisory helper.
+///
+/// Given the field keys observed on emitted events, [`conformance::non_canonical_keys`] returns the ones
+/// that are neither in the canonical [`fields`] registry nor on the documented advisory
+/// allow-list. It is a pure function (no subscriber needed) so it is unit-testable and can
+/// drive a captured-subscriber gate — Phase 4 wires it **advisory**, Phase 5 escalates it to
+/// **blocking**. `fields` is the single source of truth this diffs against (STANDARD.md).
+pub mod conformance {
+    use super::fields;
+
+    /// The canonical field-key registry — exactly [`fields::ALL`], which the
+    /// `field_keys!` macro generates from the same list as the consts. So a new
+    /// canonical key automatically joins this set; it cannot be added to the
+    /// registry yet omitted here (the drift is structurally impossible, not
+    /// guarded by a test).
+    pub const CANONICAL: &[&str] = fields::ALL;
+
+    /// Non-registry keys the STANDARD permits on events, so the advisory diff stays
+    /// meaningful rather than noisy. Each carries a one-line rationale:
+    pub const ADVISORY_ALLOW: &[&str] = &[
+        "count",   // generic cardinality on a milestone/summary event (e.g. validators loaded)
+        "error",   // the `err`-once / error-display field on a failure event
+        "phase",   // slot-phase label emitted by `timing` / the orchestrator
+        "network", // resource attribute (intentionally not a per-event `fields` const)
+    ];
+
+    /// Returns the observed keys that are **not** canonical and **not** advisory-allowed,
+    /// preserving input order. The OpenTelemetry semantic-convention namespaces `http.*` and
+    /// `otel.*` (e.g. `http.status_code`, `otel.kind`, used by `beacon`) are allowed — they
+    /// are deliberate OTel conventions, not rs-vc synonyms.
+    pub fn non_canonical_keys<'a>(observed: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+        // Returns offenders verbatim and in input order (no trim/dedup) so an
+        // advisory report names the exact stray keys, including typos/duplicates.
+        observed.into_iter().filter(|&k| !is_allowed(k)).collect()
+    }
+
+    fn is_allowed(key: &str) -> bool {
+        CANONICAL.contains(&key)
+            || ADVISORY_ALLOW.contains(&key)
+            || key.starts_with("http.")
+            || key.starts_with("otel.")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Gate 5 conformance tests ---
+
+    #[test]
+    fn non_canonical_keys_all_canonical_is_empty() {
+        assert!(conformance::non_canonical_keys(["slot", "epoch"]).is_empty());
+    }
+
+    #[test]
+    fn non_canonical_keys_flags_synonyms_in_input_order() {
+        assert_eq!(
+            conformance::non_canonical_keys(["rvc.slot", "val_idx"]),
+            vec!["rvc.slot", "val_idx"]
+        );
+    }
+
+    #[test]
+    fn non_canonical_keys_mixed_returns_only_offenders() {
+        assert_eq!(
+            conformance::non_canonical_keys(["slot", "val_idx", "epoch", "rvc.foo"]),
+            vec!["val_idx", "rvc.foo"]
+        );
+    }
+
+    #[test]
+    fn non_canonical_keys_allows_advisory_and_otel_namespaces() {
+        assert!(conformance::non_canonical_keys([
+            "count",
+            "error",
+            "phase",
+            "network",
+            "http.status_code",
+            "otel.kind",
+        ])
+        .is_empty());
+    }
+
+    #[test]
+    fn canonical_is_exactly_the_generated_field_registry() {
+        // CANONICAL is `fields::ALL`, generated by the `field_keys!` macro from
+        // the same list as the consts — so a new canonical key cannot be added
+        // without joining CANONICAL (drift is structurally impossible). This
+        // test pins the wiring + the registry size.
+        assert_eq!(conformance::CANONICAL, fields::ALL);
+        assert!(conformance::CANONICAL.contains(&fields::SLOT));
+        assert!(conformance::CANONICAL.contains(&fields::TIME_INTO_SLOT));
+        assert_eq!(conformance::CANONICAL.len(), 12);
+    }
 
     // --- TruncatedPubkey tests ---
 
