@@ -5,9 +5,8 @@
 //! on `slot`, not `rvc.slot`. This gate scans production `*.rs` source under `crates/*/src`
 //! and `bin/*/src` and fails if an `rvc.`-prefixed tracing span name or field key appears in
 //! a file that is neither permanently `EXCLUDE`d (non-key fixtures) nor on the temporary
-//! `KNOWN_REMAINING` allow-list. Each normalization issue removes its file(s) from
-//! `KNOWN_REMAINING`; issue 4.12b tightens it to empty (the workspace-wide zero-`rvc.`
-//! invariant).
+//! `KNOWN_REMAINING` allow-list. Each normalization issue removed its file(s) from
+//! `KNOWN_REMAINING`, which is now empty: the workspace-wide zero-`rvc.` invariant holds.
 //!
 //! No external dependency (Phase-1 rule P6): a tiny hand-rolled matcher, not `regex`.
 
@@ -26,13 +25,10 @@ const EXCLUDE: &[&str] = &[
 ];
 
 /// Production files still carrying `rvc.`-prefixed tracing keys, pending their normalization
-/// issue. Tightened to EMPTY by issue 4.12b. Paths are workspace-relative, `/`-separated.
-const KNOWN_REMAINING: &[&str] = &[
-    "crates/rvc/src/orchestrator/coordinator.rs", // 4.12a (Phase-2 2.9 left a beacon test ref)
-    "bin/rvc-signer/src/service.rs",              // 4.12b
-    "bin/rvc-signer/src/dvt/peer_service.rs",     // 4.12b
-    "bin/rvc-signer/src/backend/dvt.rs",          // 4.12b
-];
+/// issue. Now empty: the whole workspace is `rvc.`-free, and this list must stay `&[]` so the
+/// gate permanently enforces "no `rvc.` tracing key anywhere". Paths are workspace-relative,
+/// `/`-separated.
+const KNOWN_REMAINING: &[&str] = &[];
 
 fn workspace_root() -> PathBuf {
     // CARGO_MANIFEST_DIR is `<root>/crates/architecture-tests`; the workspace root is two up.

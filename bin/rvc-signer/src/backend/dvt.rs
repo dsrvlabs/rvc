@@ -114,7 +114,7 @@ impl DvtSigner {
 #[async_trait]
 impl SigningBackend for DvtSigner {
     #[tracing::instrument(
-        name = "rvc.signer.dvt.coordinate",
+        name = "signer.dvt.coordinate",
         skip_all,
         fields(threshold, peers_contacted, partials_received, peers_responded, peers_failed,)
     )]

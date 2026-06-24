@@ -196,7 +196,7 @@ impl PeerSignerService for PeerSignerServiceImpl {
     // ── PartialSignBeaconBlock ────────────────────────────────────────────────
 
     #[tracing::instrument(
-        name = "rvc.signer.dvt.partial_sign_beacon_block",
+        name = "signer.dvt.partial_sign_beacon_block",
         skip_all,
         fields(pubkey, slot, peer_cn, share_index)
     )]
@@ -292,7 +292,7 @@ impl PeerSignerService for PeerSignerServiceImpl {
     // ── PartialSignAttestationData ────────────────────────────────────────────
 
     #[tracing::instrument(
-        name = "rvc.signer.dvt.partial_sign_attestation_data",
+        name = "signer.dvt.partial_sign_attestation_data",
         skip_all,
         fields(pubkey, source_epoch, target_epoch, peer_cn, share_index)
     )]
@@ -428,7 +428,7 @@ impl PeerSignerService for PeerSignerServiceImpl {
     // Sync committee signing is NOT slashable (per FR-P0-3). No staging.
 
     #[tracing::instrument(
-        name = "rvc.signer.dvt.partial_sign_sync_committee",
+        name = "signer.dvt.partial_sign_sync_committee",
         skip_all,
         fields(pubkey, slot, peer_cn, share_index)
     )]

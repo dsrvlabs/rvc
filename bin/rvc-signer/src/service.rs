@@ -446,7 +446,7 @@ impl SignerServiceV2 for SignerServiceImpl {
     // ── SignBeaconBlock ───────────────────────────────────────────────────────
 
     #[allow(clippy::result_large_err)]
-    #[tracing::instrument(name = "rvc.signer.v2.sign_beacon_block", skip_all, fields(pubkey, slot))]
+    #[tracing::instrument(name = "signer.v2.sign_beacon_block", skip_all, fields(pubkey, slot))]
     async fn sign_beacon_block(
         &self,
         req: Request<SignBeaconBlockRequest>,
@@ -490,7 +490,7 @@ impl SignerServiceV2 for SignerServiceImpl {
 
     #[allow(clippy::result_large_err)]
     #[tracing::instrument(
-        name = "rvc.signer.v2.sign_blinded_beacon_block",
+        name = "signer.v2.sign_blinded_beacon_block",
         skip_all,
         fields(pubkey, slot)
     )]
@@ -535,11 +535,7 @@ impl SignerServiceV2 for SignerServiceImpl {
 
     // ── SignRandaoReveal ──────────────────────────────────────────────────────
 
-    #[tracing::instrument(
-        name = "rvc.signer.v2.sign_randao_reveal",
-        skip_all,
-        fields(pubkey, epoch)
-    )]
+    #[tracing::instrument(name = "signer.v2.sign_randao_reveal", skip_all, fields(pubkey, epoch))]
     async fn sign_randao_reveal(
         &self,
         req: Request<SignRandaoRevealRequest>,
@@ -582,7 +578,7 @@ impl SignerServiceV2 for SignerServiceImpl {
 
     #[allow(clippy::result_large_err)]
     #[tracing::instrument(
-        name = "rvc.signer.v2.sign_attestation_data",
+        name = "signer.v2.sign_attestation_data",
         skip_all,
         fields(pubkey, source_epoch, target_epoch)
     )]
@@ -677,7 +673,7 @@ impl SignerServiceV2 for SignerServiceImpl {
 
     #[allow(clippy::result_large_err)]
     #[tracing::instrument(
-        name = "rvc.signer.v2.sign_aggregate_and_proof",
+        name = "signer.v2.sign_aggregate_and_proof",
         skip_all,
         fields(pubkey, source_epoch, target_epoch)
     )]
@@ -743,7 +739,7 @@ impl SignerServiceV2 for SignerServiceImpl {
     ///
     /// Per FR-P0-3 / NFR-1: sync messages are **not slashable** — no staging.
     #[tracing::instrument(
-        name = "rvc.signer.v2.sign_sync_committee_message",
+        name = "signer.v2.sign_sync_committee_message",
         skip_all,
         fields(pubkey, slot)
     )]
@@ -803,7 +799,7 @@ impl SignerServiceV2 for SignerServiceImpl {
     ///
     /// Per FR-P0-3 / NFR-1: not slashable — no staging.
     #[tracing::instrument(
-        name = "rvc.signer.v2.sign_sync_aggregator_selection_data",
+        name = "signer.v2.sign_sync_aggregator_selection_data",
         skip_all,
         fields(pubkey, slot)
     )]
@@ -860,7 +856,7 @@ impl SignerServiceV2 for SignerServiceImpl {
     ///
     /// Per FR-P0-3 / NFR-1: not slashable — no staging.
     #[tracing::instrument(
-        name = "rvc.signer.v2.sign_contribution_and_proof",
+        name = "signer.v2.sign_contribution_and_proof",
         skip_all,
         fields(pubkey, slot)
     )]
@@ -926,11 +922,7 @@ impl SignerServiceV2 for SignerServiceImpl {
     // validators root is a zero hash, NOT sourced from ForkInfo.
     //
     // Not slashable — no stage/commit calls.
-    #[tracing::instrument(
-        name = "rvc.signer.v2.sign_builder_registration",
-        skip_all,
-        fields(pubkey)
-    )]
+    #[tracing::instrument(name = "signer.v2.sign_builder_registration", skip_all, fields(pubkey))]
     async fn sign_builder_registration(
         &self,
         req: Request<SignBuilderRegistrationRequest>,
@@ -997,7 +989,7 @@ impl SignerServiceV2 for SignerServiceImpl {
     //
     // Not slashable — no stage/commit calls.
     #[tracing::instrument(
-        name = "rvc.signer.v2.sign_voluntary_exit",
+        name = "signer.v2.sign_voluntary_exit",
         skip_all,
         fields(pubkey, epoch, validator_index)
     )]
