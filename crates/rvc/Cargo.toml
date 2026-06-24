@@ -60,3 +60,10 @@ tower = { workspace = true, features = ["util"] }
 tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }
 tracing-test.workspace = true
 wiremock.workspace = true
+criterion.workspace = true
+
+# Per-slot latency-sanity companion (issue 2.13). Run via `cargo bench`; NOT a
+# blocking gate and NOT run under nextest/CI.
+[[bench]]
+name = "per_slot"
+harness = false

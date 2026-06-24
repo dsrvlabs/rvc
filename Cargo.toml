@@ -123,6 +123,9 @@ tempfile = "3"
 wiremock = "0.6"
 proptest = "1"
 tracing-test = "0.2"
+# Bench harness (Phase-2 issue 2.13); cargo_bench_support only — no plotters/rayon
+# report deps, keeping the added surface minimal. Not run under nextest/CI.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [workspace.dependencies.tonic-build]
 version = "0.12"
