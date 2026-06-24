@@ -4143,7 +4143,10 @@ dependencies = [
 name = "rvc-architecture-tests"
 version = "0.5.0"
 dependencies = [
+ "rvc-crypto",
  "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
