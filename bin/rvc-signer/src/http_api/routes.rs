@@ -18,6 +18,11 @@ use super::tls::{audit_cn, PeerCert};
 use super::Web3SignerState;
 use crate::audit;
 
+use tracing::Instrument;
+
+use crypto::logging::fields::{self, Duty};
+use crypto::logging::{new_request_id, record_display, TruncatedPubkey};
+
 /// `GET /upcheck` — liveness probe (FR-1).
 ///
 /// Returns `200 OK` with the body `OK`. It takes no state and never calls the
@@ -48,7 +53,6 @@ pub(super) async fn public_keys(State(state): State<Web3SignerState>) -> Json<Ve
 /// `SigningGate.sign_*` call (the single signing authority — slashing + lock +
 /// timeout), and shapes the body per `Accept`. The gate result maps to the exact
 /// HTTP status (`200/400/404/412/500`) via [`HttpSignError`].
-#[tracing::instrument(skip_all)]
 pub(super) async fn sign(
     State(state): State<Web3SignerState>,
     Path(identifier): Path<String>,
@@ -56,6 +60,70 @@ pub(super) async fn sign(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Continue the caller's W3C trace: the handler span is parented from the
+    // inbound `traceparent` BEFORE it is entered (set_parent is a no-op once the
+    // span has started), then the body future is instrumented with it.
+    let span = sign_span(&headers);
+
+    // request_id correlates one signing request end to end, including across this
+    // :9000 hop — reuse the caller's `x-request-id` if present, else mint one.
+    // The reused value is recorded on the span and inherits into the signing
+    // audit line, so bound it (non-empty, <= 128 ASCII-graphic chars) to deny an
+    // attacker-chosen, header-buffer-sized token polluting the audit log; any
+    // value outside that gate is replaced by a fresh minted correlator.
+    let request_id = headers
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_graphic()))
+        .map(str::to_owned)
+        .unwrap_or_else(|| new_request_id().to_string());
+
+    let mut response = sign_traced(state, identifier, peer, headers, body, request_id.clone())
+        .instrument(span)
+        .await;
+
+    // Echo the correlator so the caller can stitch both sides of the trace.
+    if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
+/// Build the per-request handler span and continue the caller's trace.
+///
+/// `set_parent_from_headers` MUST run before the span is entered/started (it is a
+/// no-op once started — see `telemetry::propagation`), so the span is created
+/// here, parented from the inbound `traceparent`, and returned **unentered**; the
+/// caller instruments the body future with it. The correlation fields are
+/// declared `Empty` and late-bound by the handler once the payload parses.
+fn sign_span(headers: &axum::http::HeaderMap) -> tracing::Span {
+    let span = tracing::info_span!(
+        "sign",
+        otel.kind = "server",
+        request_id = tracing::field::Empty,
+        slot = tracing::field::Empty,
+        duty = tracing::field::Empty,
+        pubkey = tracing::field::Empty,
+    );
+    telemetry::set_parent_from_headers(&span, headers);
+    span
+}
+
+/// The body of [`sign`], instrumented with the handler span so every event it
+/// emits (including the audit line) inherits the span's correlation fields.
+/// Split out so [`sign`] can build + parent the span first.
+async fn sign_traced(
+    state: Web3SignerState,
+    identifier: String,
+    peer: Option<Extension<PeerCert>>,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+    request_id: String,
+) -> Response {
+    // request_id is a span field declared `Empty` in `sign_span`; record it so it
+    // lands on the handler span and inherits to the audit line.
+    record_display(&tracing::Span::current(), fields::REQUEST_ID, &request_id);
+
     let accept = headers.get(ACCEPT).and_then(|v| v.to_str().ok());
     // Derive the audit CN from the TLS peer cert (Phase 3). `None` extension
     // (socket-free tests / no-TLS) or no client cert (Prysm / server-TLS-only)
@@ -108,6 +176,53 @@ pub(super) async fn sign(
     response
 }
 
+/// Map a Web3Signer payload to its canonical [`Duty`] category (the span's `duty`
+/// field). Several request types collapse onto one duty (e.g. RANDAO_REVEAL is a
+/// proposer/block duty); the Web3Signer `type` stays distinct in the audit line.
+fn payload_duty(payload: &SignPayload) -> Duty {
+    match payload {
+        SignPayload::Attestation { .. } => Duty::Attestation,
+        SignPayload::BlockV2 { .. } | SignPayload::RandaoReveal { .. } => Duty::Block,
+        SignPayload::AggregationSlot { .. }
+        | SignPayload::AggregateAndProof { .. }
+        | SignPayload::AggregateAndProofV2 { .. } => Duty::Aggregate,
+        SignPayload::SyncCommitteeMessage { .. } => Duty::SyncCommittee,
+        SignPayload::SyncCommitteeContributionAndProof { .. }
+        | SignPayload::SyncCommitteeSelectionProof { .. } => Duty::SyncContribution,
+        SignPayload::ValidatorRegistration { .. } => Duty::ValidatorRegistration,
+        SignPayload::VoluntaryExit { .. } => Duty::VoluntaryExit,
+    }
+}
+
+/// The `slot` a payload pertains to, when it carries one. Epoch-only types
+/// (RANDAO_REVEAL, VOLUNTARY_EXIT) and the slotless VALIDATOR_REGISTRATION have
+/// none, so the span's `slot` field stays unset for them.
+fn payload_slot(payload: &SignPayload) -> Option<u64> {
+    match payload {
+        SignPayload::BlockV2 { beacon_block } => Some(beacon_block.block_header.slot),
+        SignPayload::Attestation { attestation } => Some(attestation.slot),
+        SignPayload::AggregationSlot { aggregation_slot } => Some(aggregation_slot.slot),
+        SignPayload::AggregateAndProof { aggregate_and_proof } => {
+            Some(aggregate_and_proof.aggregate.data.slot)
+        }
+        SignPayload::AggregateAndProofV2 { aggregate_and_proof } => {
+            Some(aggregate_and_proof.aggregate.data.slot)
+        }
+        SignPayload::SyncCommitteeMessage { sync_committee_message } => {
+            Some(sync_committee_message.slot)
+        }
+        SignPayload::SyncCommitteeContributionAndProof { contribution_and_proof } => {
+            Some(contribution_and_proof.contribution.slot)
+        }
+        SignPayload::SyncCommitteeSelectionProof { sync_aggregator_selection_data } => {
+            Some(sync_aggregator_selection_data.slot)
+        }
+        SignPayload::RandaoReveal { .. }
+        | SignPayload::ValidatorRegistration { .. }
+        | SignPayload::VoluntaryExit { .. } => None,
+    }
+}
+
 /// The fallible core of [`sign`], split out so every failure renders through the
 /// single [`HttpSignError`] → status mapping. `rpc_type` is an out-param set to
 /// the Web3Signer `type` as soon as the body parses, so the caller can audit the
@@ -128,6 +243,9 @@ async fn sign_inner(
         }
         PubkeyError::NotLoaded => HttpSignError::UnknownKey,
     })?;
+    // pubkey is a span field declared `Empty` in `sign_span`; record it truncated
+    // (never the full key) so the handler span carries the canonical correlator.
+    record_display(&tracing::Span::current(), fields::PUBKEY, TruncatedPubkey::new(identifier));
 
     // 2. Decode the body. A serde decode failure maps to a FIXED 400 — the
     //    decoder message can echo request bytes / field text and is NEVER
@@ -137,6 +255,12 @@ async fn sign_inner(
     // Record the type for the audit entry now that the payload is known, so a
     // later slashing/gate rejection still audits the correct `type` (Issue 4.4).
     *rpc_type = Some(req.payload.type_name());
+    // Record the canonical duty + slot (when the payload carries one) on the span.
+    let span = tracing::Span::current();
+    record_display(&span, fields::DUTY, payload_duty(&req.payload).as_str());
+    if let Some(slot) = payload_slot(&req.payload) {
+        record_display(&span, fields::SLOT, slot);
+    }
 
     // 3. Compute the signing root + slashing inputs; enforce the signingRoot /
     //    fork_info policy (the dispatcher owns the domain).
@@ -1422,5 +1546,161 @@ mod tests {
             assert!(logs_contain(&format!("rpc={type_name}")), "{type_name} audited");
             assert!(logs_contain("result=success"));
         }
+    }
+
+    // ── Issue 2.3: :9000 trace-continuity bridge ─────────────────────────────
+
+    /// `sign_span` parents the handler span from an inbound W3C `traceparent`
+    /// BEFORE the span is entered, so re-injecting from the (now parented) span
+    /// yields the SAME trace id — the duty trace continues across :9000. Uses the
+    /// proven `inject_trace_context` oracle under a real OTel layer.
+    #[test]
+    fn sign_span_continues_inbound_trace() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // `_guard` keeps the OTel pipeline alive for the test; it shuts down on
+        // drop (its `provider` is telemetry-private — no explicit flush needed,
+        // since these assertions read the span context locally, not an export).
+        let (layer, _guard) =
+            telemetry::init_tracing(&telemetry::TelemetryConfig::default()).expect("otel init");
+        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let trace_id = "0af7651916cd43dd8448eb211c80319c";
+        let mut inbound = axum::http::HeaderMap::new();
+        inbound
+            .insert("traceparent", format!("00-{trace_id}-b7ad6b7169203331-01").parse().unwrap());
+
+        let span = super::sign_span(&inbound);
+        let _enter = span.enter();
+        let mut outbound = reqwest::header::HeaderMap::new();
+        telemetry::inject_trace_context(&mut outbound);
+        let tp =
+            outbound.get("traceparent").and_then(|v| v.to_str().ok()).expect("traceparent present");
+        assert!(tp.contains(trace_id), "sign_span must continue the inbound trace (got {tp})");
+    }
+
+    /// No inbound `traceparent`: `sign_span` yields a root span and does not panic.
+    #[test]
+    fn sign_span_without_traceparent_is_root_no_panic() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        // `_guard` keeps the OTel pipeline alive for the test; it shuts down on
+        // drop (its `provider` is telemetry-private — no explicit flush needed,
+        // since these assertions read the span context locally, not an export).
+        let (layer, _guard) =
+            telemetry::init_tracing(&telemetry::TelemetryConfig::default()).expect("otel init");
+        let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let span = super::sign_span(&axum::http::HeaderMap::new()); // must not panic
+        let _enter = span.enter();
+        let mut outbound = reqwest::header::HeaderMap::new();
+        telemetry::inject_trace_context(&mut outbound);
+        if let Some(tp) = outbound.get("traceparent").and_then(|v| v.to_str().ok()) {
+            assert!(!tp.contains("00000000000000000000000000000000"), "fresh valid root");
+        }
+    }
+
+    /// A minted request_id is echoed as `x-request-id` on the response.
+    #[tokio::test]
+    async fn sign_echoes_minted_request_id() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rid = resp
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-request-id echoed");
+        // A v4 uuid string: 36 chars, 4 hyphens.
+        assert_eq!(rid.len(), 36, "minted request id is a uuid string: {rid}");
+        assert_eq!(rid.matches('-').count(), 4, "uuid hyphen grouping: {rid}");
+    }
+
+    /// A caller-supplied `x-request-id` is reused verbatim (not replaced).
+    #[tokio::test]
+    async fn sign_reuses_caller_request_id() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/eth2/sign/{id}"))
+            .header("content-type", "application/json")
+            .header("x-request-id", "caller-correlator-xyz")
+            .body(Body::from(attestation_body(None)))
+            .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-request-id").and_then(|v| v.to_str().ok()),
+            Some("caller-correlator-xyz"),
+        );
+    }
+
+    /// SEC-2.3-01: an over-long caller `x-request-id` is NOT reused (it would
+    /// otherwise pollute the signing audit log); a fresh uuid is minted instead.
+    #[tokio::test]
+    async fn sign_ignores_unbounded_caller_request_id() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let oversized = "a".repeat(200); // past the 128-char cap → must be replaced
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/eth2/sign/{id}"))
+            .header("content-type", "application/json")
+            .header("x-request-id", &oversized)
+            .body(Body::from(attestation_body(None)))
+            .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let rid = resp
+            .headers()
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .expect("x-request-id echoed");
+        assert_ne!(rid, oversized, "oversized caller id must not be reused");
+        assert_eq!(rid.len(), 36, "a fresh uuid is minted instead: {rid}");
+    }
+
+    /// The handler records the canonical correlators (`request_id`, `duty`,
+    /// `slot`, truncated `pubkey`) on the sign span; events under it (the audit
+    /// line) inherit them, and the FULL pubkey never appears.
+    #[traced_test]
+    #[tokio::test]
+    async fn sign_records_canonical_correlators_on_span() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(logs_contain("duty=attestation"), "canonical duty on span");
+        assert!(logs_contain("slot=5"), "canonical slot on span");
+        assert!(logs_contain("request_id="), "request_id on span");
+        assert!(logs_contain("pubkey="), "truncated pubkey on span");
+        let full = hex::encode(pk_bytes);
+        assert!(!logs_contain(&full), "full pubkey must never appear in logs");
+    }
+
+    /// A synthetic inbound `traceparent` does not break the live handler.
+    #[tokio::test]
+    async fn sign_with_inbound_traceparent_still_succeeds() {
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/api/v1/eth2/sign/{id}"))
+            .header("content-type", "application/json")
+            .header("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01")
+            .body(Body::from(attestation_body(None)))
+            .unwrap();
+        let resp = router(state).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "handler works with inbound traceparent");
     }
 }
