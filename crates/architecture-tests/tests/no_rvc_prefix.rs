@@ -29,20 +29,9 @@ const EXCLUDE: &[&str] = &[
 /// issue. Tightened to EMPTY by issue 4.12b. Paths are workspace-relative, `/`-separated.
 const KNOWN_REMAINING: &[&str] = &[
     "crates/rvc/src/orchestrator/coordinator.rs", // 4.12a (Phase-2 2.9 left a beacon test ref)
-    // Stragglers not named in the plan's issue list — real rvc. keys the census missed.
-    // Absorbed by 4.12b (whose job is to empty this list); see its task notes.
-    "crates/crypto/src/signing.rs",
-    "crates/crypto/src/aggregation_signing.rs",
-    "crates/crypto/src/block_signing.rs",
-    "crates/crypto/src/builder_signing.rs",
-    "crates/crypto/src/sync_signing.rs",
-    "crates/crypto/src/voluntary_exit_signing.rs",
-    "crates/crypto/src/remote_signer.rs",
-    "crates/keymanager-api/src/handlers.rs",
-    "crates/sync-service/src/lib.rs",
-    "bin/rvc-signer/src/service.rs",          // 4.12b
-    "bin/rvc-signer/src/dvt/peer_service.rs", // 4.12b
-    "bin/rvc-signer/src/backend/dvt.rs",      // 4.12b
+    "bin/rvc-signer/src/service.rs",              // 4.12b
+    "bin/rvc-signer/src/dvt/peer_service.rs",     // 4.12b
+    "bin/rvc-signer/src/backend/dvt.rs",          // 4.12b
 ];
 
 fn workspace_root() -> PathBuf {

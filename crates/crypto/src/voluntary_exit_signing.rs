@@ -3,10 +3,10 @@ use super::signing::{compute_domain, compute_signing_root};
 use eth_types::{ForkName, ForkSchedule, Root, VoluntaryExit, DOMAIN_VOLUNTARY_EXIT};
 
 #[tracing::instrument(
-    name = "rvc.crypto.sign_voluntary_exit",
+    name = "crypto.sign_voluntary_exit",
     level = "debug",
     skip_all,
-    fields(rvc.signing_type = "voluntary_exit"),
+    fields(signing_type = "voluntary_exit")
 )]
 /// Signs a voluntary exit with the correct fork-aware domain.
 ///

@@ -135,8 +135,8 @@ pub async fn import_keystores(
     Json(request): Json<ImportKeystoresRequest>,
 ) -> Result<Json<ImportKeystoresResponse>, ApiError> {
     let span = tracing::info_span!(
-        "rvc.keymanager.import_keystores",
-        rvc.keymanager.count = request.keystores.len(),
+        "keymanager.import_keystores",
+        keymanager.count = request.keystores.len(),
     );
     let _guard = span.enter();
 
@@ -311,8 +311,8 @@ pub async fn delete_keystores(
     Json(request): Json<DeleteKeystoresRequest>,
 ) -> Result<Json<DeleteKeystoresResponse>, ApiError> {
     let span = tracing::info_span!(
-        "rvc.keymanager.delete_keystores",
-        rvc.keymanager.count = request.pubkeys.len(),
+        "keymanager.delete_keystores",
+        keymanager.count = request.pubkeys.len(),
     );
     let _guard = span.enter();
 
@@ -464,8 +464,8 @@ pub async fn import_remote_keys(
     Json(request): Json<ImportRemoteKeysRequest>,
 ) -> Json<ImportRemoteKeysResponse> {
     let span = tracing::info_span!(
-        "rvc.keymanager.import_remote_keys",
-        rvc.keymanager.count = request.remote_keys.len(),
+        "keymanager.import_remote_keys",
+        keymanager.count = request.remote_keys.len(),
     );
     let _guard = span.enter();
 
@@ -553,8 +553,8 @@ pub async fn delete_remote_keys(
     Json(request): Json<DeleteRemoteKeysRequest>,
 ) -> Json<DeleteRemoteKeysResponse> {
     let span = tracing::info_span!(
-        "rvc.keymanager.delete_remote_keys",
-        rvc.keymanager.count = request.pubkeys.len(),
+        "keymanager.delete_remote_keys",
+        keymanager.count = request.pubkeys.len(),
     );
     let _guard = span.enter();
 

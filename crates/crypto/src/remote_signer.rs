@@ -149,11 +149,11 @@ impl Signer for RemoteSigner {
             format!("{}/api/v1/eth2/sign/{}", self.url, TruncatedPubkey::new(&identifier));
 
         let span = tracing::info_span!(
-            "rvc.sign.remote",
+            "sign.remote",
             http.method = "POST",
             http.url = %redact_url(&log_url),
             http.status_code = tracing::field::Empty,
-            rvc.signer_type = "remote",
+            signer_type = "remote",
         );
 
         async {
@@ -484,8 +484,8 @@ mod tests {
 
         let captured = spans.lock().unwrap();
         assert!(
-            captured.contains(&"rvc.sign.remote".to_string()),
-            "Expected rvc.sign.remote span, got: {:?}",
+            captured.contains(&"sign.remote".to_string()),
+            "Expected sign.remote span, got: {:?}",
             *captured
         );
     }
@@ -571,8 +571,8 @@ mod tests {
             *captured
         );
         assert!(
-            captured.iter().any(|(k, v)| k == "rvc.signer_type" && v == "remote"),
-            "Expected rvc.signer_type=remote, got: {:?}",
+            captured.iter().any(|(k, v)| k == "signer_type" && v == "remote"),
+            "Expected signer_type=remote, got: {:?}",
             *captured
         );
         assert!(
