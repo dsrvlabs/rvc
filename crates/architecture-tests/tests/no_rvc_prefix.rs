@@ -29,7 +29,6 @@ const EXCLUDE: &[&str] = &[
 /// issue. Tightened to EMPTY by issue 4.12b. Paths are workspace-relative, `/`-separated.
 const KNOWN_REMAINING: &[&str] = &[
     // Planned per-crate normalization issues (4.6–4.11):
-    "crates/validator-store/src/store.rs",              // 4.6
     "crates/doppelganger/src/service.rs",               // 4.7
     "crates/propagator/src/lib.rs",                     // 4.9
     "crates/bn-manager/src/manager.rs",                 // 4.10a
