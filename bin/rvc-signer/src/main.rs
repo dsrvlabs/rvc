@@ -176,6 +176,14 @@ struct ServeArgs {
     #[arg(long, default_value_t = false)]
     enable_log_reload: bool,
 
+    /// Console log output format: `pretty` (default, human-readable) or `json`
+    /// (one structured object per event, for log-aggregation backends). Also
+    /// settable via the `RVC_LOG_FORMAT` env var; an explicit flag wins. Identical
+    /// to `bin/rvc`'s `--log-format` (issue 5.5); console-only (rvc-signer wires no
+    /// file appender, see ADR-004 / OPERATOR_GUIDE §7).
+    #[arg(long, default_value = "pretty")]
+    log_format: String,
+
     /// Comma-separated list of DVT peer addresses (host:port)
     #[cfg(feature = "dvt")]
     #[arg(long, value_delimiter = ',')]
@@ -255,9 +263,21 @@ async fn main() {
     // it is deferred as a documented fallback rather than a rushed file path in a
     // security-sensitive signer; the console-only status is stated in the Phase-5
     // OPERATOR_GUIDE.
-    let reload_handle = init_logging();
-
+    // Parse the CLI BEFORE initializing logging so the `Serve` subcommand's
+    // `--log-format` flag can select the console format (issue 5.5). Nothing logs
+    // between parse and init, so the Phase-3 init parity (the reconciled filter is
+    // still the first subscriber installed) is preserved. One-shot subcommands
+    // without the flag (e.g. `split-key`) resolve the format from `RVC_LOG_FORMAT`
+    // env only (default pretty) via `resolve(None)`.
     let cli = Cli::parse();
+
+    let log_format = match &cli.command {
+        Command::Serve(args) => telemetry::LogFormat::resolve(Some(&args.log_format)),
+        #[cfg(feature = "dvt")]
+        Command::SplitKey(_) => telemetry::LogFormat::resolve(None),
+    };
+
+    let reload_handle = init_logging(log_format);
 
     match cli.command {
         Command::Serve(args) => {
@@ -297,11 +317,19 @@ async fn main() {
 /// a disabled `debug!`/`trace!` callsite short-circuits in the macro before
 /// reaching it (Gate 4 / P0-6 unaffected). The opt-in `SIGHUP` trigger (gated by
 /// `--enable-log-reload`) is wired in `run_serve`.
-fn init_logging() -> telemetry::LogReloadHandle {
+///
+/// `log_format` selects the CONSOLE rendering (issue 5.5): `Pretty` (default,
+/// byte-identical to the previous bare `fmt::layer()`) or `Json` (one structured
+/// object per event, for log aggregation). Both arms keep the same reload
+/// composition — the 5.4 reload-wrapped reconciled filter is the outer global
+/// layer over a single console `fmt` layer — so Phase-3 init parity holds for
+/// either format.
+fn init_logging(log_format: telemetry::LogFormat) -> telemetry::LogReloadHandle {
     use tracing_subscriber::prelude::*;
 
     let (filter, handle) = telemetry::reloadable_env_filter("info");
-    tracing_subscriber::registry().with(tracing_subscriber::fmt::layer()).with(filter).init();
+    let console_layer = telemetry::console_fmt_layer(log_format, std::io::stdout);
+    tracing_subscriber::registry().with(console_layer).with(filter).init();
     telemetry::LogReloadHandle::new("info", handle)
 }
 
@@ -1041,6 +1069,69 @@ mod tests {
             captured.contains("rvc-signer init regression marker"),
             "reconciled init dropped an info event with RUST_LOG unset; captured: {captured:?}"
         );
+    }
+
+    // ── Issue 5.5: opt-in JSON console log output profile ─────────────────────
+
+    /// `serve --log-format json` parses and resolves to `LogFormat::Json`; the
+    /// default (flag omitted) stays `Pretty`. Same flag/semantics as `bin/rvc`.
+    /// Pull the `ServeArgs` out of a parsed `Cli`, panicking on any other
+    /// subcommand. Written as a `match` (not `let…else`) so it is warning-free
+    /// whether or not the `dvt` feature adds a second `Command` variant.
+    fn serve_args(cli: super::Cli) -> super::ServeArgs {
+        match cli.command {
+            super::Command::Serve(args) => args,
+            #[cfg(feature = "dvt")]
+            _ => panic!("expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_serve_log_format_flag_parses_and_defaults_to_pretty() {
+        use clap::Parser;
+
+        let cli = super::Cli::try_parse_from(["rvc-signer", "serve", "--log-format", "json"])
+            .expect("serve --log-format json should parse");
+        let args = serve_args(cli);
+        assert_eq!(
+            telemetry::LogFormat::resolve(Some(&args.log_format)),
+            telemetry::LogFormat::Json
+        );
+
+        let cli = super::Cli::try_parse_from(["rvc-signer", "serve"])
+            .expect("serve default should parse");
+        let args = serve_args(cli);
+        assert_eq!(args.log_format, "pretty", "default --log-format must be pretty");
+        assert_eq!(
+            telemetry::LogFormat::resolve(Some(&args.log_format)),
+            telemetry::LogFormat::Pretty
+        );
+    }
+
+    /// The JSON arm of `init_logging`'s composition — `console_fmt_layer(Json, …)`
+    /// under the reload-wrapped reconciled filter — emits one parseable JSON
+    /// object per event with canonical fields as top-level keys. Mirrors the
+    /// shipped `init_logging` shape (rvc-signer wires no extra layers, so there is
+    /// no `boxed_layers`/`Identity` padding here, matching production).
+    #[test]
+    fn test_init_logging_json_arm_emits_parseable_json() {
+        use tracing_subscriber::prelude::*;
+
+        let buf = SharedBuf::default();
+        let (filter, _handle) = telemetry::reloadable_env_filter("info");
+        let console_layer = telemetry::console_fmt_layer(telemetry::LogFormat::Json, buf.clone());
+        let subscriber = tracing_subscriber::registry().with(console_layer).with(filter);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(request_id = "abc-123", "rvc-signer json arm marker");
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = out.lines().find(|l| l.contains("rvc-signer json arm marker")).expect("present");
+        let v: serde_json::Value =
+            serde_json::from_str(line).expect("JSON arm must emit parseable JSON");
+        assert_eq!(v["request_id"], "abc-123", "canonical field must be a top-level JSON key");
+        assert_eq!(v["message"], "rvc-signer json arm marker");
     }
 
     fn with_rust_log<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {

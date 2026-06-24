@@ -104,6 +104,14 @@ enum Commands {
         #[arg(long, default_value = "info")]
         log_level: String,
 
+        /// Console log output format: `pretty` (default, human-readable) or
+        /// `json` (one structured object per event, for log-aggregation backends
+        /// such as Loki / Elasticsearch / a SIEM). Also settable via the
+        /// `RVC_LOG_FORMAT` env var; an explicit flag wins. Applies to the console
+        /// stream only — the file appender keeps its own format (issue 5.5).
+        #[arg(long, default_value = "pretty")]
+        log_format: String,
+
         /// Enable runtime log-level reload on SIGHUP (opt-in; issue 5.4).
         ///
         /// When set, sending `SIGHUP` to the process re-reads `RUST_LOG` and
@@ -485,6 +493,7 @@ async fn main() -> anyhow::Result<()> {
             graffiti,
             no_doppelganger_detection,
             log_level,
+            log_format,
             enable_log_reload,
             keymanager_enabled,
             no_keymanager,
@@ -680,8 +689,13 @@ async fn main() -> anyhow::Result<()> {
 
             let tracing_config = build_tracing_config(&cfg);
             let file_layer_config = build_file_layer_config(&cfg);
-            let logging_guards =
-                init_logging(&log_level, tracing_config.as_ref(), file_layer_config.as_ref());
+            let log_format = telemetry::LogFormat::resolve(Some(&log_format));
+            let logging_guards = init_logging(
+                &log_level,
+                log_format,
+                tracing_config.as_ref(),
+                file_layer_config.as_ref(),
+            );
 
             info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -721,7 +735,9 @@ async fn main() -> anyhow::Result<()> {
             genesis_validators_root,
             log_level,
         } => {
-            init_logging(&log_level, None, None);
+            // One-shot CLI commands have no `--log-format` flag; honor only the
+            // `RVC_LOG_FORMAT` env (default pretty) via `resolve(None)`.
+            init_logging(&log_level, telemetry::LogFormat::resolve(None), None, None);
 
             let args = commands::voluntary_exit::VoluntaryExitArgs {
                 pubkey,
@@ -749,7 +765,7 @@ async fn main() -> anyhow::Result<()> {
             genesis_validators_root,
             log_level,
         } => {
-            init_logging(&log_level, None, None);
+            init_logging(&log_level, telemetry::LogFormat::resolve(None), None, None);
 
             let args = commands::prepare_exit::PrepareExitArgs {
                 pubkey,
@@ -766,7 +782,7 @@ async fn main() -> anyhow::Result<()> {
             commands::prepare_exit::execute(args).await?;
         }
         Commands::SubmitExit { file, beacon_url, log_level } => {
-            init_logging(&log_level, None, None);
+            init_logging(&log_level, telemetry::LogFormat::resolve(None), None, None);
 
             let args = commands::submit_exit::SubmitExitArgs { file, beacon_url };
 
@@ -789,6 +805,7 @@ struct LoggingGuards {
 
 fn init_logging(
     level: &str,
+    log_format: telemetry::LogFormat,
     tracing_config: Option<&telemetry::TelemetryConfig>,
     file_config: Option<&telemetry::FileAppenderConfig>,
 ) -> LoggingGuards {
@@ -857,11 +874,16 @@ fn init_logging(
         boxed_layers.push(Box::new(tracing_subscriber::layer::Identity::new()));
     }
 
-    tracing_subscriber::registry()
-        .with(boxed_layers)
-        .with(tracing_subscriber::fmt::layer())
-        .with(filter)
-        .init();
+    // The CONSOLE fmt layer is built for the selected format (issue 5.5): `pretty`
+    // (default — byte-identical to the previous `fmt::layer()`) or `json`. Both
+    // arms return one boxed `dyn Layer<Registry>`, so the surrounding composition —
+    // the `boxed_layers` (OTLP/file, Identity-padded when empty) and the 5.4
+    // reload-wrapped `filter` as the outer global layer — is unchanged either way.
+    // The selector governs only this console leaf; the file appender keeps its own
+    // format.
+    let console_layer = telemetry::console_fmt_layer(log_format, std::io::stdout);
+
+    tracing_subscriber::registry().with(boxed_layers).with(console_layer).with(filter).init();
 
     // Erase the concrete reload handle (its subscriber type is the unspellable
     // layered stack above) so it can be stored and moved into the SIGHUP task.
@@ -2344,6 +2366,93 @@ mod tests {
             captured.contains("init_logging regression marker"),
             "init_logging composition silently drops events; captured: {captured:?}"
         );
+    }
+
+    // ── Issue 5.5: opt-in JSON console log output profile ─────────────────────
+
+    /// `--log-format json` parses on `start` and resolves to `LogFormat::Json`;
+    /// the default (flag omitted) stays `Pretty` — the constraint that an unset
+    /// selector keeps today's behavior.
+    #[test]
+    fn test_log_format_flag_parses_and_defaults_to_pretty() {
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["rvc", "start", "--log-format", "json"])
+            .expect("--log-format json should parse");
+        match cli.command {
+            Commands::Start { log_format, .. } => {
+                assert_eq!(
+                    telemetry::LogFormat::resolve(Some(&log_format)),
+                    telemetry::LogFormat::Json
+                );
+            }
+            _ => panic!("expected Start command"),
+        }
+
+        let cli = Cli::try_parse_from(["rvc", "start"]).expect("default should parse");
+        match cli.command {
+            Commands::Start { log_format, .. } => {
+                assert_eq!(log_format, "pretty", "default --log-format must be pretty");
+                assert_eq!(
+                    telemetry::LogFormat::resolve(Some(&log_format)),
+                    telemetry::LogFormat::Pretty
+                );
+            }
+            _ => panic!("expected Start command"),
+        }
+    }
+
+    /// The JSON arm of `init_logging`'s composition — `Identity`-padded
+    /// `boxed_layers` + `console_fmt_layer(Json, …)` + the reconciled filter —
+    /// emits one parseable JSON object per event with canonical fields as
+    /// top-level keys. Mirrors `init_logging`'s shape exactly so this guards the
+    /// shipped JSON path (not just the telemetry helper in isolation).
+    #[test]
+    fn test_init_logging_json_arm_emits_parseable_json() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::Layer;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for SharedBuf {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = SharedBuf::default();
+        let filter = tracing_subscriber::EnvFilter::new("info");
+        // Same Identity-padded `boxed_layers` as the no-extras `init_logging` path.
+        let boxed_layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
+            vec![Box::new(tracing_subscriber::layer::Identity::new())];
+        let console_layer = telemetry::console_fmt_layer(telemetry::LogFormat::Json, buf.clone());
+
+        let subscriber =
+            tracing_subscriber::registry().with(boxed_layers).with(console_layer).with(filter);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(slot = 42u64, "json arm marker");
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = out.lines().find(|l| l.contains("json arm marker")).expect("event present");
+        let v: serde_json::Value =
+            serde_json::from_str(line).expect("JSON arm must emit parseable JSON");
+        assert_eq!(v["slot"], 42, "canonical field must be a top-level JSON key");
+        assert_eq!(v["message"], "json arm marker");
     }
 
     // Serializes the RUST_LOG-mutating parity tests below (process-global env).

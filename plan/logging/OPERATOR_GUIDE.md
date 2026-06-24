@@ -306,18 +306,78 @@ while the rest stays at the milestone level.
 **Pretty (human-readable) is the default** for both binaries — the `tracing_subscriber`
 `fmt` layer renders the colorized, span-scoped lines shown in §4 and §5. This is what you
 get on stdout/stderr with no extra configuration, and it is the right choice for
-interactive debugging and `grep`.
+interactive debugging and `grep`. **Leaving the format unset keeps exactly today's
+output** — JSON is strictly opt-in.
 
 **JSON is the sanctioned profile for log aggregation** (shipping to Loki / Elasticsearch /
 a SIEM, where a structured parser beats a regex). One JSON object per event, with the
-canonical fields (§3) as keys — ideal for indexing by `request_id`, `slot`, or
-`validator_index`.
+canonical correlation fields (§3) flattened to **top-level keys** — so a backend can index
+and filter by `request_id`, `slot`, or `validator_index` directly, no regex required.
 
-> **Status: JSON output is _planned_, not yet shipped.** The JSON aggregation profile is
-> issue **5.5 (P2-3)** of this initiative and has **not landed**. Until it does, both
-> binaries emit pretty output only; for machine ingestion today, parse the pretty stream or
-> rely on the OTLP trace pipeline (§4). **This section will be filled in by 5.5** with the
-> flag/config to select JSON and a sample object.
+### Selecting the format
+
+Both binaries take the **same** knob — a `--log-format` flag, or the `RVC_LOG_FORMAT`
+environment variable (an explicit flag wins over the env var; an unrecognized value falls
+back to `pretty` rather than silencing logs):
+
+| Selector | Value | Effect |
+|----------|-------|--------|
+| `--log-format <FMT>` | `pretty` (default) \| `json` | Console output format |
+| `RVC_LOG_FORMAT` env | `pretty` (default) \| `json` | Same, when the flag is omitted |
+
+```bash
+# rvc daemon, structured output for the log shipper:
+rvc start --log-format json ...
+# rvc-signer, same flag:
+rvc-signer serve --log-format json ...
+# Or set it once in the environment (e.g. a systemd unit's Environment=):
+env RVC_LOG_FORMAT=json rvc start ...
+```
+
+**Scope:** the selector governs the **console** stream only. The OTLP trace pipeline (§4),
+the trace sampler, and the file appender's own format (§7) are unaffected — a `--logfile`
+keeps its pretty on-disk rendering regardless of the console format.
+
+### A sample JSON event
+
+The §4 redacted audit line, emitted under `--log-format json`, is one object per line
+(pretty-printed here for readability; on the wire it is a single line). The span's
+correlation fields (`request_id`, `slot`, `duty`, `pubkey`) appear under `span`, and the
+event's own fields are flattened to the top level:
+
+```json
+{
+  "timestamp": "2026-06-25T14:02:11.000123Z",
+  "level": "INFO",
+  "target": "rvc_signer_bin::http_api",
+  "message": "sign request audit",
+  "audit": true,
+  "rpc": "sign_attestation",
+  "result": "success",
+  "backend": "basic",
+  "duration_ms": 3,
+  "client_cn": "lighthouse-vc-1",
+  "span": {
+    "name": "sign",
+    "request_id": "2f8e1c40-9a7b-4c1e-8d2a-1b3c4d5e6f70",
+    "slot": 7806432,
+    "duty": "attestation",
+    "pubkey": "0x93247f2209...611df74a"
+  }
+}
+```
+
+Index it by `span.request_id` to follow one request end to end (including the `:9000` hop —
+the caller echoes the same id, §4), or by `span.slot` / `validator_index` for per-duty
+queries.
+
+**Redaction is identical in both formats.** Secrets are redacted at the **value** level
+*before* a field is recorded — a `pubkey` is the truncated `0x{first10}...{last8}` string
+(via `TruncatedPubkey`), a beacon URL is credential-stripped (`RedactedUrl`), and roots /
+signatures are truncated (`TruncatedRoot`). The JSON profile serializes those
+already-redacted values verbatim, so **JSON is not a redaction bypass**: the full 96-char
+pubkey, URL credentials, and full roots/signatures never appear in either format (proven by
+a captured-subscriber test against the JSON layer in `crates/telemetry`).
 
 ---
 

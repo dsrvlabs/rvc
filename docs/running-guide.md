@@ -77,6 +77,7 @@ rvc start [OPTIONS]
 | `--graffiti <STRING>` | none | Block graffiti (max 32 bytes) |
 | `--no-doppelganger-detection` | false | Disable doppelganger detection (enabled by default) |
 | `--log-level <LEVEL>` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
+| `--log-format <FMT>` | `pretty` | Console output format: `pretty` (human-readable) or `json` (structured, for log aggregation). Also settable via `RVC_LOG_FORMAT`. See OPERATOR_GUIDE §6. |
 
 #### Keymanager API Options
 
