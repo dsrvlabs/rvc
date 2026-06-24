@@ -35,7 +35,10 @@ timing.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 clap.workspace = true
-tracing.workspace = true
+# release_max_level_debug: trace! (and below-cap spans) compile to nothing in
+# --release; debug! stays RUST_LOG-switchable. The `log` bridge feature is NOT
+# enabled (it reintroduces cost under a static cap; ADR-001).
+tracing = { workspace = true, features = ["release_max_level_debug"] }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow.workspace = true
