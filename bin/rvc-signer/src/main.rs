@@ -231,6 +231,22 @@ struct SplitKeyCliArgs {
 
 #[tokio::main]
 async fn main() {
+    // Logging output is console-only (stdout/stderr); operators collect rvc-signer
+    // logs from the process's standard streams. Unlike `bin/rvc`, rvc-signer does
+    // NOT wire the telemetry file appender, so there is no independent file level:
+    // file == console (ADR-004 "file more verbose than console" does not apply here).
+    //
+    // Phase-3 issue 3.5 spike conclusion: the appender itself *is* capable of an
+    // independent file level — `telemetry::create_file_layer` filters each file
+    // layer with its own `EnvFilter::new(config.level)` (see
+    // `crates/telemetry/src/file_appender.rs`), exactly as `bin/rvc` uses it.
+    // Delivering it for rvc-signer would require a new `--logfile`/`logfile_level`
+    // CLI + `ResolvedConfig` surface (it has none today) plus converting this single
+    // `fmt()` subscriber into a layered `registry()` composition holding a
+    // `WorkerGuard` for the process lifetime — broader than the P0-5 init
+    // reconciliation. Per 3.5's bounded scope it is deferred as a documented
+    // fallback rather than a rushed file path in a security-sensitive signer; the
+    // console-only status is to be stated in the Phase-5 OPERATOR_GUIDE.
     tracing_subscriber::fmt().with_env_filter(telemetry::env_filter_or("info")).init();
 
     let cli = Cli::parse();
