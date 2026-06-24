@@ -778,9 +778,8 @@ fn init_logging(
 ) -> LoggingGuards {
     use tracing_subscriber::layer::Layer;
     use tracing_subscriber::prelude::*;
-    use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let filter = telemetry::env_filter_or(level);
 
     let (file_layer, file_guard): (
         Option<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>>,

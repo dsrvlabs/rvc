@@ -115,13 +115,21 @@ fn build_gcp_provider(resource: Resource, sampler: Sampler) -> Result<SdkTracerP
 /// directives, it wins entirely; otherwise the filter falls back to
 /// `default_level`.
 ///
+/// The env value is normalized before parsing: each comma-separated directive
+/// is trimmed and empty ones are dropped, so human-written whitespace
+/// (`"warn, rvc=trace"`) is honored rather than discarded.
+///
 /// The fallback deliberately covers every case that would otherwise leave the
-/// process with no logging, so "verbose off" never means "silent":
+/// process with no logging, so an *accidental* "verbose off" never means
+/// "silent":
 /// - `RUST_LOG` unset (or non-UTF-8),
 /// - a malformed directive (e.g. an invalid level like `rvc=notalevel`), and
 /// - a set-but-empty value (`""`, `","`, whitespace) — which `tracing-subscriber`
 ///   would otherwise parse into an all-`OFF` filter (a real `RUST_LOG=` /
 ///   `value: ""` misconfig in a Dockerfile or k8s manifest).
+///
+/// An *explicit* `RUST_LOG=off` is still honored (the operator asked for
+/// silence); only the accidental-empty cases fall back to `default_level`.
 ///
 /// This never panics: `default_level` is fed through the lossy
 /// [`EnvFilter::new`], which *ignores* an invalid directive (printing a warning)
@@ -138,14 +146,19 @@ fn build_gcp_provider(resource: Resource, sampler: Sampler) -> Result<SdkTracerP
 /// ```
 pub fn env_filter_or(default_level: &str) -> tracing_subscriber::EnvFilter {
     use tracing_subscriber::EnvFilter;
-    match std::env::var("RUST_LOG") {
-        // `RUST_LOG` carries at least one non-empty directive: it wins, falling
-        // back only if the directives fail to parse (e.g. an invalid level).
-        Ok(v) if v.split(',').any(|d| !d.trim().is_empty()) => {
-            EnvFilter::try_new(v).unwrap_or_else(|_| EnvFilter::new(default_level))
+    // Normalize: split on ',', trim each directive, drop empties. This honors
+    // human-written whitespace ("warn, rvc=trace") and collapses a set-but-empty
+    // value ("", ",", "   ") to the unset case rather than an all-`OFF` filter.
+    let normalized = std::env::var("RUST_LOG").ok().map(|v| {
+        v.split(',').map(str::trim).filter(|d| !d.is_empty()).collect::<Vec<_>>().join(",")
+    });
+    match normalized {
+        // At least one directive survived normalization: it wins, falling back
+        // only if the directives fail to parse (e.g. an invalid level).
+        Some(dirs) if !dirs.is_empty() => {
+            EnvFilter::try_new(&dirs).unwrap_or_else(|_| EnvFilter::new(default_level))
         }
-        // Unset, non-UTF-8, or set-but-effectively-empty ("", ",", "   ") — the
-        // latter would parse to an all-`OFF` filter and silence the process.
+        // Unset, non-UTF-8, or set-but-effectively-empty.
         _ => EnvFilter::new(default_level),
     }
 }
@@ -199,6 +212,19 @@ mod tests {
     fn env_filter_or_respects_rust_log() {
         let rendered = with_rust_log(Some("debug"), || format!("{}", env_filter_or("info")));
         assert!(rendered.contains("debug"), "env RUST_LOG=debug should win, got: {rendered}");
+    }
+
+    #[test]
+    fn env_filter_or_trims_whitespace_around_directives() {
+        // Human-written RUST_LOG with spaces after commas must be honored, not
+        // silently discarded to the default (the way an SRE hand-types it).
+        let rendered =
+            with_rust_log(Some("warn, rvc=trace"), || format!("{}", env_filter_or("info")));
+        assert!(rendered.contains("warn"), "global directive missing: {rendered}");
+        assert!(rendered.contains("rvc=trace"), "trimmed per-module directive missing: {rendered}");
+        // A whitespace-padded single directive is also tolerated.
+        let single = with_rust_log(Some("  debug "), || format!("{}", env_filter_or("info")));
+        assert_eq!(single, "debug", "padded single directive should render debug, got: {single}");
     }
 
     #[test]
