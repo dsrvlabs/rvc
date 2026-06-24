@@ -189,6 +189,44 @@ pub fn new_request_id() -> uuid::Uuid {
     uuid::Uuid::new_v4()
 }
 
+/// Returns `true` once per `n` calls, advancing a caller-owned counter — a
+/// dependency-light **1-in-`n` log sampler** for the highest-volume `trace`/`debug`
+/// loop sites (issue 5.3, P2-1).
+///
+/// Each hot call site owns its own `static CTR: AtomicU64`; the predicate emits on the
+/// 1st call and every `n`-th call thereafter (`old % n == 0`), so the first hit of a
+/// fresh run is never silently dropped. `Relaxed` ordering is intentional: sampling is a
+/// volume-reduction heuristic, not a correctness barrier, so cross-thread interleaving
+/// that merely skews which calls emit is acceptable and the cheapest atomic to pay.
+///
+/// **Zero-cost-when-disabled (the crux, Gate 4 guards it).** This MUST sit **behind**
+/// the level check so a disabled site never bumps the counter nor allocates. Use an
+/// explicit [`tracing::enabled!`] guard — the outer check compiles to a cheap level test
+/// (free when the level is off), and the sampler runs only when the level is enabled:
+///
+/// ```ignore
+/// use std::sync::atomic::AtomicU64;
+/// static CTR: AtomicU64 = AtomicU64::new(0);
+/// if tracing::enabled!(tracing::Level::TRACE)
+///     && crypto::logging::should_log_sampled(&CTR, 16)
+/// {
+///     tracing::trace!(slot = slot, validator_index = idx, "hot per-validator line");
+/// }
+/// ```
+///
+/// Never wrap an `info` milestone in this — the heartbeat must stay complete
+/// ([`STANDARD.md` §6]). Sample only designated `trace`/`debug` hot loops, and document
+/// each sampled site in `plan/logging/OPERATOR_GUIDE.md` so an operator knows a 1-in-`n`
+/// line is sampled, not accidentally dropped.
+///
+/// `n == 0` is treated as `1` (emit every call) so a mis-supplied rate can never divide
+/// by zero or silence a site entirely.
+pub fn should_log_sampled(counter: &std::sync::atomic::AtomicU64, n: u64) -> bool {
+    let n = n.max(1);
+    let old = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    old.is_multiple_of(n)
+}
+
 /// Fills a deferred (`field::Empty`) span field with a `Display` value.
 ///
 /// The target field **must** have been declared at span creation (e.g.
@@ -543,5 +581,58 @@ mod tests {
         record_debug(&span, "marker", "dbg_sentinel_987");
         tracing::info!("done");
         assert!(logs_contain("dbg_sentinel_987"), "recorded debug value must appear on the event");
+    }
+
+    // --- should_log_sampled (1-in-N log sampler, issue 5.3) tests ---
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// 1-in-N: over `N` calls the predicate is `true` exactly once, and the first call of
+    /// a fresh counter always emits (so a run never silently drops its opening line).
+    #[test]
+    fn test_should_log_sampled_one_in_n() {
+        let ctr = AtomicU64::new(0);
+        let n = 16;
+        let emitted = (0..n).filter(|_| should_log_sampled(&ctr, n)).count();
+        assert_eq!(emitted, 1, "exactly one emit per window of N");
+        // Over K full windows the emit count is exactly K.
+        let ctr = AtomicU64::new(0);
+        let k = 5u64;
+        let emitted = (0..(k * n)).filter(|_| should_log_sampled(&ctr, n)).count() as u64;
+        assert_eq!(emitted, k, "K windows of N produce exactly K emits");
+    }
+
+    /// The very first consultation of a fresh counter emits (`0 % n == 0`).
+    #[test]
+    fn test_should_log_sampled_first_call_emits() {
+        let ctr = AtomicU64::new(0);
+        assert!(should_log_sampled(&ctr, 100), "first call must emit");
+        // Subsequent calls within the window are suppressed.
+        assert!(!should_log_sampled(&ctr, 100));
+    }
+
+    /// `n == 1` (and the degenerate `n == 0`, clamped to 1) emit on every call.
+    #[test]
+    fn test_should_log_sampled_rate_one_and_zero_emit_every_call() {
+        let ctr = AtomicU64::new(0);
+        assert!((0..50).all(|_| should_log_sampled(&ctr, 1)), "rate 1 emits every call");
+        let ctr = AtomicU64::new(0);
+        assert!(
+            (0..50).all(|_| should_log_sampled(&ctr, 0)),
+            "rate 0 clamps to 1, emits every call"
+        );
+    }
+
+    /// The predicate advances the supplied counter by exactly one per call — so a caller
+    /// can reason about the counter directly (this is what the zero-cost-when-disabled
+    /// guard test inspects: a DISABLED site must leave the counter untouched).
+    #[test]
+    fn test_should_log_sampled_advances_counter_by_one() {
+        let ctr = AtomicU64::new(0);
+        for expected in 0..10u64 {
+            assert_eq!(ctr.load(Ordering::Relaxed), expected);
+            should_log_sampled(&ctr, 4);
+        }
+        assert_eq!(ctr.load(Ordering::Relaxed), 10);
     }
 }

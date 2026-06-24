@@ -104,6 +104,13 @@ pub struct SignerService {
     validator_locks: ValidatorLockMap,
 }
 
+/// 1-in-N rate for the attestation-stage trace (issue 5.3). The site fires once per
+/// validator per slot; at 16 a 1000-validator load drops ~63 trace lines/slot to ~4
+/// while still proving the path is live. Per-call-site counter the sampler advances.
+const ATTESTATION_STAGE_TRACE_SAMPLE_N: u64 = 16;
+static ATTESTATION_STAGE_TRACE_CTR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl SignerService {
     /// Creates a new SignerService with the provided composite signer and slashing database.
     pub fn new(signer: Arc<CompositeSigner>, slashing_db: Arc<SlashingDb>) -> Self {
@@ -212,9 +219,21 @@ impl SignerService {
                 // Re-enter the parent sign span on the blocking OS thread so events
                 // emitted here are correlated with the duty trace (safe: no .await).
                 let _e = span.enter();
-                tracing::trace!(
-                    "staging attestation slashing-protection record on blocking thread"
-                );
+                // Sampled 1-in-N: this trace fires once per attestation sign, i.e.
+                // once per validator per slot — the highest-volume trace site on the
+                // sign path (5.3). The `enabled!` guard keeps it zero-cost when TRACE is
+                // off (Gate 4): a disabled site never consults the sampler / bumps the
+                // counter. Documented in plan/logging/OPERATOR_GUIDE.md §8.
+                if tracing::enabled!(tracing::Level::TRACE)
+                    && crypto::logging::should_log_sampled(
+                        &ATTESTATION_STAGE_TRACE_CTR,
+                        ATTESTATION_STAGE_TRACE_SAMPLE_N,
+                    )
+                {
+                    tracing::trace!(
+                        "staging attestation slashing-protection record on blocking thread (sampled 1-in-{ATTESTATION_STAGE_TRACE_SAMPLE_N})"
+                    );
+                }
                 // Capture the start of the SQLite transaction hold (ISSUE-3.12).
                 let tx_start = Instant::now();
                 let staged = db

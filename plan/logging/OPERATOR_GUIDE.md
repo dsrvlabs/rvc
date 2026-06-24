@@ -291,6 +291,45 @@ security-sensitive binary. ADR-004's "file more verbose than console" therefore 
 
 ---
 
+## 8. Sampled high-volume lines (1-in-N) — not dropped, sampled
+
+A handful of `trace`/`debug` lines fire **once per validator per slot**. At a few thousand
+validators that is thousands of identical lines every 12 s — enough to drown the stream the
+moment you raise verbosity to chase an issue. To keep verbose levels usable at scale, the
+very highest-volume of these are **sampled 1-in-N**: the line is emitted on the 1st hit and
+every N-th hit thereafter, not on every call (issue 5.3,
+`crypto::logging::should_log_sampled`).
+
+**This is sampling, not loss.** A sampled line carries `(sampled 1-in-N)` in its message so
+you can tell at a glance that the other N−1 occurrences were intentionally suppressed, not
+dropped by a bug. The sampler is **behind** the level check, so a sampled line that is *off*
+(e.g. `trace` on a release build, or the level not enabled) costs nothing at all — it is the
+same zero-overhead-when-disabled guarantee as every other `trace`/`debug` line (§1, Gate 4).
+
+| Line (message) | Crate / level | Rate | Fires |
+|---|---|---|---|
+| `staging attestation slashing-protection record on blocking thread (sampled 1-in-16)` | `rvc-signer` / `trace` | 1-in-16 | once per attestation **sign** (≈ once per validator per slot) |
+
+Operator consequences:
+
+- **Counts on a sampled line are not validator counts.** If you grep this line you see
+  ~1/16th of the attestation signs, by design. Use the per-slot **`info` summary**
+  (`"Batch attestation summary" {count}`, §5) or the `RVC_SIGNER_*` metrics for true totals —
+  never tally a sampled `trace` line.
+- **Sampling never hides a failure.** Only this one healthy, high-volume *progress* trace is
+  sampled. Every **rejection / error** on the sign path (slashing-protection block, sign
+  failure) is emitted at `warn`/`error` **unsampled** — you see every one.
+- **Everything else is unsampled.** Per-duty `debug` decision points, the `info` heartbeat,
+  and all `warn`/`error` lines are emitted in full. Only lines explicitly listed in the table
+  above are sampled; the list is the complete inventory.
+
+If you genuinely need every occurrence of a sampled line (e.g. reproducing a wire-level issue
+on a small validator set), the rate lives next to the call site
+(`ATTESTATION_STAGE_TRACE_SAMPLE_N` in `crates/signer/src/lib.rs`) — lower it to `1` and
+rebuild a debug binary for that investigation.
+
+---
+
 ## See also
 
 - [`STANDARD.md`](./STANDARD.md) — the normative level taxonomy, canonical field registry,

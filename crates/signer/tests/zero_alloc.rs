@@ -34,7 +34,7 @@
 //! measured region.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use crypto::logging::{TruncatedPubkey, TruncatedRoot};
 use tracing::level_filters::LevelFilter;
@@ -45,6 +45,10 @@ struct CountingAllocator;
 
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static COUNTING: AtomicBool = AtomicBool::new(false);
+/// Per-site counter for the 1-in-N sampled attestation-stage trace (issue 5.3). The
+/// disabled `enabled!` guard must short-circuit before this is ever consulted, so it
+/// stays untouched inside the measured (DISABLED) region — zero allocation either way.
+static SAMPLE_CTR: AtomicU64 = AtomicU64::new(0);
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -145,7 +149,14 @@ fn disabled_sign_hot_path_logging_is_zero_alloc() {
             target_epoch = 101u64,
             "Computed attestation signing root"
         );
-        tracing::trace!("staging attestation slashing-protection record on blocking thread");
+        // The attestation-stage trace is 1-in-N sampled (issue 5.3): under DISABLED
+        // TRACE the `enabled!` guard short-circuits so the sampler is never consulted —
+        // this mirrors the production guard shape and must still allocate nothing.
+        if tracing::enabled!(tracing::Level::TRACE)
+            && crypto::logging::should_log_sampled(&SAMPLE_CTR, 16)
+        {
+            tracing::trace!("staging attestation slashing-protection record (sampled 1-in-16)");
+        }
         tracing::trace!("staging block slashing-protection record on blocking thread");
         tracing::debug!(pubkey = %TruncatedPubkey::new(&pubkey_hex), slot = 3200u64, "Signing block");
         tracing::trace!(
