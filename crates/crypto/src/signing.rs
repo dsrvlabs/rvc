@@ -2,6 +2,7 @@ use tracing::trace;
 use tree_hash::TreeHash;
 
 use super::bls::{SecretKey, Signature};
+use crate::logging::TruncatedRoot;
 use eth_types::{AttestationData, Domain, DomainType, Fork, ForkData, Root, SigningData};
 
 pub const DOMAIN_BEACON_ATTESTER: DomainType = [0x01, 0x00, 0x00, 0x00];
@@ -31,7 +32,11 @@ pub fn compute_signing_root<T: TreeHash>(ssz_object: &T, domain: Domain) -> Root
     let object_root = hash_tree_root(ssz_object);
     let signing_data = SigningData { object_root, domain };
     let signing_root = hash_tree_root(&signing_data);
-    trace!(domain = ?domain, root = ?signing_root, "Computed signing root");
+    trace!(
+        domain = %TruncatedRoot::new(&domain),
+        signing_root = %TruncatedRoot::new(&signing_root),
+        "Computed signing root"
+    );
     signing_root
 }
 
@@ -175,6 +180,28 @@ mod tests {
         let root2 = compute_signing_root(&data, [0x02; 32]);
 
         assert_ne!(root1, root2);
+    }
+
+    /// Gate-3 (redaction) seed: `compute_signing_root`'s trace must render the
+    /// domain and the signing root TRUNCATED — the full 32-byte hex of neither
+    /// may appear at any level.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_compute_signing_root_trace_truncates_domain_and_root() {
+        // Distinct bytes (0x00,0x01,…,0x1f) so the full-hex needle is a real,
+        // non-vacuous match — a repeating-byte domain plus `?`-Debug's decimal
+        // rendering would make the negative assertion always pass.
+        let object: Root = [0x11; 32];
+        let domain: Domain = std::array::from_fn(|i| i as u8);
+        let root = compute_signing_root(&object, domain);
+
+        // The domain is truncated (first 5 + last 4 bytes), never logged in full,
+        // and a middle slice present only in the full encoding is absent.
+        assert!(logs_contain("0x0001020304...1c1d1e1f"), "domain must be truncated");
+        assert!(!logs_contain(&hex::encode(domain)), "full 32-byte domain hex must be absent");
+        assert!(!logs_contain("0a0b0c0d"), "middle domain bytes must be truncated away");
+        // The computed signing root is likewise never logged in full.
+        assert!(!logs_contain(&hex::encode(root)), "full signing-root hex must be absent");
     }
 
     // KAT (report §5 bullet 3): first absolute-byte vector for `compute_fork_data_root`.

@@ -10,6 +10,7 @@ use url::Url;
 use super::bls::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
 use super::insecure::{InsecureGate, InsecureMode};
 use super::signer_trait::{Signer, SigningError};
+use crate::logging::TruncatedPubkey;
 use eth_types::Root;
 
 /// Environment variable that must be set to `"true"` to allow plaintext
@@ -186,7 +187,7 @@ impl Signer for RemoteSigner {
                 .map_err(|e| SigningError::RemoteSignerError(format!("invalid public key: {e}")))?;
             if signature.verify(&pk, signing_root).is_err() {
                 tracing::error!(
-                    pubkey = %hex::encode(pubkey),
+                    pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
                     "Remote signer returned invalid signature"
                 );
                 return Err(SigningError::InvalidRemoteSignature);
