@@ -4104,6 +4104,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "tracing-test",
  "tree_hash",
 ]
 
