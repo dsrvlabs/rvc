@@ -4382,6 +4382,7 @@ dependencies = [
  "tempfile",
  "tiny-keccak",
  "tracing",
+ "tracing-subscriber",
  "tracing-test",
  "tree_hash",
  "zeroize",

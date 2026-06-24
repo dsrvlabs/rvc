@@ -3,8 +3,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+use tracing::{debug, info};
 use zeroize::Zeroizing;
 
+use crypto::logging::TruncatedPubkey;
 use crypto::{EncryptionKdf, Keystore};
 
 use crate::deposit;
@@ -77,6 +79,8 @@ pub fn run(
     };
 
     let mnemonic = crypto::mnemonic::generate_mnemonic();
+    // Milestone only — the mnemonic value, its length, and the seed are never logged.
+    info!(network = net.name, "generated new mnemonic");
 
     if let Some(path) = backup_file {
         let mnemonic_str = mnemonic.to_string();
@@ -144,10 +148,27 @@ pub fn generate_from_seed(
     let mut deposits = Vec::with_capacity(num_validators as usize);
     let mut summaries = Vec::with_capacity(num_validators as usize);
 
+    info!(
+        count = num_validators,
+        start_index,
+        network = net.name,
+        dry_run,
+        "generating validator keystores"
+    );
+
     for i in start_index..end_index {
         let signing_path = format!("m/12381/3600/{}/0/0", i);
         let signing_key = crypto::eip2333::derive_key_from_path(seed, &signing_path)
             .with_context(|| format!("Failed to derive signing key at {}", signing_path))?;
+
+        // Non-secret: only the derived public key (truncated). The seed and signing_key
+        // (secret material) are never passed to a logging macro.
+        let pubkey_hex = hex::encode(signing_key.public_key().to_bytes());
+        debug!(
+            validator_index = i,
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            "derived validator signing key"
+        );
 
         let withdrawal_credentials = match withdrawal_addr_bytes {
             Some(addr) => deposit::eth1_withdrawal_credentials(addr),
@@ -217,6 +238,12 @@ pub fn generate_from_seed(
 
     verify::print_summary(&summaries, net.name, output_dir);
 
+    info!(
+        count = num_validators,
+        output_dir = %output_dir.display(),
+        "validator keystores generated"
+    );
+
     Ok(())
 }
 
@@ -276,6 +303,65 @@ mod tests {
     fn test_deposit_data_filename_format() {
         let name = deposit_data_filename(1708800000);
         assert_eq!(name, "deposit_data-1708800000.json");
+    }
+
+    /// Gate 3 (high-risk redaction): driving the real key-generation core under a
+    /// subscriber that captures every level must NOT emit the mnemonic phrase, any
+    /// constituent word, or the seed hex — not at any level.
+    #[test]
+    fn generate_from_seed_never_logs_mnemonic_or_seed() {
+        use std::sync::{Arc, Mutex};
+
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        const TEST_MNEMONIC: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+
+        #[derive(Clone, Default)]
+        struct Cap(Arc<Mutex<String>>);
+        struct V<'a>(&'a mut String);
+        impl Visit for V<'_> {
+            fn record_debug(&mut self, f: &Field, val: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, " {}={:?}", f.name(), val);
+            }
+        }
+        impl<S: tracing::Subscriber> Layer<S> for Cap {
+            fn on_event(&self, e: &tracing::Event<'_>, _: Context<'_, S>) {
+                if let Ok(mut buf) = self.0.lock() {
+                    e.record(&mut V(&mut buf));
+                    buf.push('\n');
+                }
+            }
+        }
+
+        let cap = Cap::default();
+        // No per-layer filter → the capture sees every level (debug/trace included).
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+
+        let mnemonic = crypto::mnemonic::validate_mnemonic(TEST_MNEMONIC).unwrap();
+        let seed = crypto::mnemonic::mnemonic_to_seed(&mnemonic, "");
+        let seed_hex = hex::encode(seed.as_ref());
+        let net = network::from_name("mainnet").unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let password = Zeroizing::new("testpassword123".to_string());
+
+        tracing::subscriber::with_default(subscriber, || {
+            generate_from_seed(seed.as_ref(), net, dir.path(), 2, 0, None, false, &password, true)
+                .unwrap();
+        });
+
+        let logs = cap.0.lock().unwrap();
+        assert!(!logs.contains(TEST_MNEMONIC), "full mnemonic phrase leaked into logs");
+        assert!(!logs.contains("abandon"), "a mnemonic word leaked into logs: {}", &*logs);
+        assert!(!logs.contains(&seed_hex), "seed hex leaked into logs");
+        // Sanity: the breadth WAS captured, so the absence assertions are meaningful.
+        assert!(
+            logs.contains("derived validator signing key"),
+            "expected debug breadth not captured; harness may be inert: {}",
+            &*logs
+        );
     }
 
     #[test]

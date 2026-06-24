@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use crypto::{sign_voluntary_exit, Keystore};
 use eth_types::{SignedVoluntaryExit, VoluntaryExit};
+use tracing::info;
 
 use crate::network;
 use crate::password;
@@ -72,6 +73,13 @@ pub fn run(args: ExitArgs) -> Result<()> {
     }
 
     eprintln!("Signed voluntary exit written to: {}", output_path.display());
+
+    info!(
+        validator_index = args.validator_index,
+        epoch = args.epoch,
+        network = network.name,
+        "generated signed voluntary exit"
+    );
 
     Ok(())
 }

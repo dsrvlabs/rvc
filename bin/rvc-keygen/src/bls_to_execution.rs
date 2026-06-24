@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use tracing::info;
 use zeroize::Zeroizing;
 
 use crypto::{compute_domain, compute_signing_root, eip2333, mnemonic};
@@ -97,6 +98,12 @@ pub fn run(args: BlsToExecutionArgs) -> Result<()> {
     }
 
     eprintln!("BLS-to-execution change written to: {}", output_path.display());
+
+    info!(
+        validator_index = args.validator_index,
+        network = network.name,
+        "generated signed BLS-to-execution change"
+    );
 
     Ok(())
 }
