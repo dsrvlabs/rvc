@@ -323,8 +323,13 @@ Requires bearer token authentication.
 RUST_LOG=debug rvc start
 
 # Per-crate filtering
-RUST_LOG=rvc=trace,bn_manager=debug rvc start
+RUST_LOG=rvc=trace,rvc_bn_manager=debug rvc start
 ```
+
+> For reading the log stream, `RUST_LOG` recipes with verified target names, the
+> canonical field reference, following a `request_id` across the `:9000` signer hop, the
+> healthy `info` heartbeat, and the file-more-verbose-than-console recipe, see the
+> [Operator Guide](../plan/logging/OPERATOR_GUIDE.md).
 
 ## Shutdown
 
