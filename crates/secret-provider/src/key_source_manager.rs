@@ -24,7 +24,7 @@ impl KeySourceManager {
     }
 
     #[tracing::instrument(
-        name = "rvc.secret_provider.load_all",
+        name = "secret_provider.load_all",
         skip_all,
         fields(providers.count = self.providers.len())
     )]
@@ -39,7 +39,7 @@ impl KeySourceManager {
             let timer = std::time::Instant::now();
 
             let list_span = info_span!(
-                "rvc.secret_provider.list_keys",
+                "secret_provider.list_keys",
                 provider.name = %provider_name,
                 keys.count = tracing::field::Empty,
             );
@@ -71,7 +71,7 @@ impl KeySourceManager {
                 let prov = Arc::clone(provider);
                 let prov_name = provider_name.clone();
                 let fetch_span = info_span!(
-                    "rvc.secret_provider.fetch_key",
+                    "secret_provider.fetch_key",
                     key.id = %id,
                     provider.name = %prov_name,
                 );
@@ -475,8 +475,8 @@ mod tests {
 
         let captured = spans.lock();
         assert!(
-            captured.contains(&"rvc.secret_provider.load_all".to_string()),
-            "Expected rvc.secret_provider.load_all span, got: {:?}",
+            captured.contains(&"secret_provider.load_all".to_string()),
+            "Expected secret_provider.load_all span, got: {:?}",
             *captured
         );
     }
@@ -503,8 +503,8 @@ mod tests {
 
         let captured = spans.lock();
         assert!(
-            captured.contains(&"rvc.secret_provider.list_keys".to_string()),
-            "Expected rvc.secret_provider.list_keys span, got: {:?}",
+            captured.contains(&"secret_provider.list_keys".to_string()),
+            "Expected secret_provider.list_keys span, got: {:?}",
             *captured
         );
     }
@@ -531,8 +531,8 @@ mod tests {
 
         let captured = spans.lock();
         assert!(
-            captured.contains(&"rvc.secret_provider.fetch_key".to_string()),
-            "Expected rvc.secret_provider.fetch_key span, got: {:?}",
+            captured.contains(&"secret_provider.fetch_key".to_string()),
+            "Expected secret_provider.fetch_key span, got: {:?}",
             *captured
         );
     }
@@ -565,7 +565,7 @@ mod tests {
 
         let captured = fields.lock();
         assert!(
-            captured.iter().any(|(span, field, value)| span == "rvc.secret_provider.load_all"
+            captured.iter().any(|(span, field, value)| span == "secret_provider.load_all"
                 && field == "providers.count"
                 && value == "2"),
             "Expected providers.count=2 on load_all span, got: {:?}",
@@ -598,7 +598,7 @@ mod tests {
 
         let captured = fields.lock();
         assert!(
-            captured.iter().any(|(span, field, value)| span == "rvc.secret_provider.list_keys"
+            captured.iter().any(|(span, field, value)| span == "secret_provider.list_keys"
                 && field == "keys.count"
                 && value == "2"),
             "Expected keys.count=2 on list_keys span, got: {:?}",
@@ -628,7 +628,7 @@ mod tests {
 
         let captured = fields.lock();
         assert!(
-            captured.iter().any(|(span, field, value)| span == "rvc.secret_provider.fetch_key"
+            captured.iter().any(|(span, field, value)| span == "secret_provider.fetch_key"
                 && field == "key.id"
                 && value == "my-key-id"),
             "Expected key.id=my-key-id on fetch_key span, got: {:?}",
@@ -658,7 +658,7 @@ mod tests {
 
         let captured = fields.lock();
         assert!(
-            captured.iter().any(|(span, field, value)| span == "rvc.secret_provider.list_keys"
+            captured.iter().any(|(span, field, value)| span == "secret_provider.list_keys"
                 && field == "provider.name"
                 && value == "my-prov"),
             "Expected provider.name=my-prov on list_keys span, got: {:?}",
