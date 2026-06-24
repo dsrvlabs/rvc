@@ -85,6 +85,70 @@ These match the directive style already in
 [`docs/running-guide.md:319-327`](../../docs/running-guide.md). `RUST_LOG` overrides
 `--log-level` (§1).
 
+### 2.1 Changing the level at runtime — `SIGHUP` reload (no restart)
+
+`RUST_LOG` is read **once at startup**. To raise or lower verbosity on a running
+process **without restarting it** (so you don't lose in-memory state or drop
+duties), start the binary with the opt-in `--enable-log-reload` flag, then change
+`RUST_LOG` **in the process's own environment** and send it `SIGHUP`. On `SIGHUP`
+the binary **re-reads `RUST_LOG`** through the exact precedence in §1 and swaps
+the active log filter in place; newly enabled `debug!`/`trace!` callsites begin
+emitting immediately, and lowering the level quiets them again.
+
+The catch is that `SIGHUP` re-reads the *running process's* environment, which was
+captured at spawn — exporting a new `RUST_LOG` in your shell after launch does
+**not** change it. So drive it through whatever owns the process's environment.
+Under systemd (the common case for a deployed `rvc`/`rvc-signer`):
+
+```ini
+# /etc/systemd/system/rvc.service  (rvc-signer is identical bar the ExecStart)
+[Service]
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/rvc start --enable-log-reload
+ExecReload=/bin/kill -HUP $MAINPID
+```
+
+```bash
+# … incident: you need BN-selection decisions. Raise just that target to debug
+# by updating the unit's environment, reloading systemd, then HUPing the process.
+sudo systemctl set-environment RUST_LOG=info,rvc_bn_manager=debug   # or edit Environment=
+sudo systemctl kill -s HUP rvc.service          # SIGHUP → reload; rvc_bn_manager now at debug
+# (with the ExecReload above, `sudo systemctl reload rvc.service` does the same.)
+
+# … done: drop back to a quiet baseline and reload again.
+sudo systemctl set-environment RUST_LOG=info
+sudo systemctl kill -s HUP rvc.service
+```
+
+For a bare foreground/`&`-backgrounded process (dev/testing), launch it under an
+explicit `env` so the value lives in the *process's* environment, and re-launch
+to change it — a plain shell-var change after launch is not seen by `SIGHUP`:
+
+```bash
+# rvc-signer takes the same flag (console-only output, see §7).
+env RUST_LOG=warn rvc-signer serve --enable-log-reload ... &   # then `kill -HUP <pid>`
+```
+
+Notes & constraints:
+
+- **Opt-in only.** Without `--enable-log-reload`, `SIGHUP` is **not** intercepted
+  for log reload (default process behavior is unchanged). The reload *layer* is
+  always present but is free on the default path — a disabled `debug!` still
+  allocates nothing at `info` (the P0-6 zero-alloc gate still holds), so leaving
+  the flag off costs nothing and turning it on adds no steady-state overhead.
+- **You must change the environment the process re-reads** (see the systemd vs.
+  bare-process examples above). `SIGHUP` re-reads `RUST_LOG` from the running
+  process's environment, captured at spawn; exporting a new value in your *shell*
+  after launch does not change it.
+- **The §1 compile-time floor still applies.** `trace` requires a debug build; on
+  a release binary a reload to `=trace` raises the filter but emits nothing new
+  (no `trace!` callsites compiled in). `=debug` works on the release binary you
+  already deployed.
+- **Unix only.** `SIGHUP` reload is a Unix mechanism; on non-Unix targets the flag
+  is accepted but inert (a one-line warning is logged at startup).
+- **No new network surface.** Reload is signal-driven; it does **not** open any
+  HTTP/admin endpoint (in particular it does not touch rvc-signer's `:9000`).
+
 ---
 
 ## 3. Canonical fields reference

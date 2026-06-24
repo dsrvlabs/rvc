@@ -163,6 +163,104 @@ pub fn env_filter_or(default_level: &str) -> tracing_subscriber::EnvFilter {
     }
 }
 
+/// Wrap the reconciled [`EnvFilter`](tracing_subscriber::EnvFilter) in a
+/// [`reload::Layer`](tracing_subscriber::reload::Layer) so the active log filter
+/// can be swapped at runtime without restarting the process (issue 5.4 / P2-2).
+///
+/// The layer's **initial value is exactly `env_filter_or(default_level)`** — the
+/// same filter both binaries' init reconciles to (ADR-003 precedence) — so wiring
+/// this in place of a bare `env_filter_or(level)` changes nothing about the
+/// startup behavior: unset/empty/malformed `RUST_LOG` still yields
+/// `default_level`, and a valid `RUST_LOG` still wins. The only difference is that
+/// the returned [`reload::Handle`](tracing_subscriber::reload::Handle) can later
+/// call [`reload`](tracing_subscriber::reload::Handle::reload) to install a fresh
+/// filter; `reload` rebuilds tracing's callsite-interest cache, so a previously
+/// disabled `debug!`/`trace!` callsite is re-evaluated and begins emitting.
+///
+/// # Cost (P0-6 / Gate 4)
+/// The reload layer adds an `RwLock` read **only** when a callsite's interest is
+/// (re)computed or an enabled event dispatches. A callsite the inner `EnvFilter`
+/// reports as `Interest::never()` (e.g. a disabled `debug!` at the default `info`
+/// level) short-circuits in the `tracing` macro *before* dispatch, so it never
+/// enters this layer — the disabled hot path stays zero-allocation. Operators who
+/// want the absolute-minimum default build can leave the runtime trigger that
+/// drives the handle opt-in (it is); the layer itself is always-on but free on the
+/// disabled path.
+///
+/// Generic over the subscriber `S` so each binary can compose it as the outer
+/// filter layer over its own `Registry` stack, identically.
+///
+/// # Example
+/// ```
+/// use rvc_telemetry::reloadable_env_filter;
+/// use tracing_subscriber::Registry;
+/// let (_layer, handle) = reloadable_env_filter::<Registry>("info");
+/// // Later, raise a specific target at runtime:
+/// let _ = handle.reload(rvc_telemetry::env_filter_or("info"));
+/// ```
+pub fn reloadable_env_filter<S>(
+    default_level: &str,
+) -> (
+    tracing_subscriber::reload::Layer<tracing_subscriber::EnvFilter, S>,
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, S>,
+) {
+    tracing_subscriber::reload::Layer::new(env_filter_or(default_level))
+}
+
+/// A type-erased handle to the runtime-reloadable log filter (issue 5.4).
+///
+/// The underlying [`reload::Handle`](tracing_subscriber::reload::Handle) is
+/// generic over the (unspellable) layered subscriber type each binary composes,
+/// so the bins store this erased wrapper instead. [`reload_from_env`] re-reads
+/// `RUST_LOG` through the same [`env_filter_or`] precedence used at startup and
+/// swaps the active filter in place — exactly what an operator's runtime trigger
+/// (e.g. a `SIGHUP` handler) calls. Cloning is cheap (the inner handle holds a
+/// `Weak`), so the handle can be moved into a signal-handler task.
+#[derive(Clone)]
+pub struct LogReloadHandle {
+    default_level: std::sync::Arc<str>,
+    reload: std::sync::Arc<
+        dyn Fn(tracing_subscriber::EnvFilter) -> Result<(), tracing_subscriber::reload::Error>
+            + Send
+            + Sync,
+    >,
+}
+
+impl LogReloadHandle {
+    /// Erase a concrete [`reload::Handle`](tracing_subscriber::reload::Handle)
+    /// into a transport-agnostic handle, remembering the `default_level` so
+    /// [`reload_from_env`](Self::reload_from_env) reproduces the startup
+    /// precedence (unset/empty/malformed `RUST_LOG` → `default_level`).
+    pub fn new<S>(
+        default_level: &str,
+        handle: tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, S>,
+    ) -> Self
+    where
+        S: 'static,
+    {
+        Self {
+            default_level: std::sync::Arc::from(default_level),
+            reload: std::sync::Arc::new(move |filter| handle.reload(filter)),
+        }
+    }
+
+    /// Re-read `RUST_LOG` via [`env_filter_or`] and install the resulting filter,
+    /// rebuilding tracing's callsite-interest cache so newly enabled
+    /// `debug!`/`trace!` callsites begin emitting. Returns an error only if the
+    /// subscriber has already been torn down (the layer was dropped).
+    pub fn reload_from_env(&self) -> Result<(), tracing_subscriber::reload::Error> {
+        (self.reload)(env_filter_or(&self.default_level))
+    }
+}
+
+impl std::fmt::Debug for LogReloadHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogReloadHandle")
+            .field("default_level", &self.default_level)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +351,177 @@ mod tests {
             "per-module target missing: {rendered}"
         );
         assert!(rendered.contains("trace"), "per-module level missing: {rendered}");
+    }
+
+    // ── Issue 5.4: runtime log-level reload via `reload::Layer` ───────────────
+
+    /// `reloadable_env_filter` must seed the layer with EXACTLY the value
+    /// `env_filter_or` would return — so wiring it in place of a bare
+    /// `env_filter_or(level)` is invisible at startup (the Phase-3 init
+    /// reconciliation / cross-binary parity contract is preserved).
+    #[test]
+    fn reloadable_env_filter_initial_value_matches_env_filter_or() {
+        use tracing_subscriber::Registry;
+        for env in [None, Some("debug"), Some("warn,rvc=trace"), Some(""), Some("rvc=invalidlevel")]
+        {
+            let (reload_rendered, plain_rendered) = with_rust_log(env, || {
+                let (layer, handle) = reloadable_env_filter::<Registry>("info");
+                let reloaded = handle
+                    .with_current(|f| format!("{f}"))
+                    .expect("handle live while layer in scope");
+                drop(layer);
+                (reloaded, format!("{}", env_filter_or("info")))
+            });
+            assert_eq!(
+                reload_rendered, plain_rendered,
+                "reloadable layer initial value must match env_filter_or for RUST_LOG={env:?}"
+            );
+        }
+    }
+
+    /// The core mechanism: a subscriber initialized at effective `info` via the
+    /// reloadable layer suppresses `debug!` on every target; after the handle
+    /// reloads a filter that raises ONE target to `debug`, a `debug!` on THAT
+    /// target emits while an unrelated target's `debug!` still does not. This is
+    /// the runtime "raise verbosity without a restart" guarantee (issue 5.4),
+    /// proven by a direct `handle.reload(...)` (no live signal needed).
+    #[test]
+    fn reload_raises_one_target_without_restart() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::EnvFilter;
+
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for SharedBuf {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        // Force the default-`info` startup path regardless of the runner's env.
+        with_rust_log(None, || {
+            let buf = SharedBuf::default();
+            // Compose exactly as the binaries do — the reload filter is the OUTER
+            // layer over the fmt stack, so `S` is inferred as the layered type and
+            // the filter governs the whole subscriber globally.
+            let (reload_layer, handle) = reloadable_env_filter("info");
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_subscriber::fmt::layer().with_writer(buf.clone()))
+                .with(reload_layer);
+            let _: &tracing_subscriber::reload::Handle<EnvFilter, _> = &handle;
+
+            tracing::subscriber::with_default(subscriber, || {
+                // Before reload: both targets' `debug!` are below the `info` floor.
+                tracing::debug!(target: "reload_raise_me", "pre-reload debug on raise target");
+                tracing::debug!(target: "reload_leave_me", "pre-reload debug on other target");
+                let pre = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+                assert!(
+                    !pre.contains("pre-reload debug on raise target"),
+                    "debug must be suppressed at the info default; captured: {pre:?}"
+                );
+
+                // Raise ONLY `reload_raise_me` to debug, keep the global floor at info.
+                handle
+                    .reload(EnvFilter::new("info,reload_raise_me=debug"))
+                    .expect("reload must succeed while the subscriber is live");
+
+                tracing::debug!(target: "reload_raise_me", "post-reload debug on raise target");
+                tracing::debug!(target: "reload_leave_me", "post-reload debug on other target");
+
+                let post = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+                assert!(
+                    post.contains("post-reload debug on raise target"),
+                    "the reloaded target's debug! must now emit; captured: {post:?}"
+                );
+                assert!(
+                    !post.contains("post-reload debug on other target"),
+                    "an unrelated target's debug! must stay suppressed; captured: {post:?}"
+                );
+            });
+            // Outlive the closure so the `Weak` upgrade in `reload` stays valid.
+            let _ = &handle;
+        });
+    }
+
+    /// The type-erased [`LogReloadHandle`] that the binaries store must drive the
+    /// same effect from a runtime trigger: with the layer seeded at `info`,
+    /// setting `RUST_LOG=info,reload_via_env=debug` and calling
+    /// `reload_from_env()` (what a `SIGHUP` handler does) makes that target's
+    /// `debug!` start emitting — re-reading `RUST_LOG` through `env_filter_or`.
+    #[test]
+    fn erased_handle_reload_from_env_raises_target() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for SharedBuf {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("RUST_LOG").ok();
+        unsafe { std::env::remove_var("RUST_LOG") };
+
+        let buf = SharedBuf::default();
+        let (reload_layer, handle) = reloadable_env_filter("info");
+        let erased = LogReloadHandle::new("info", handle);
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(buf.clone()))
+            .with(reload_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(target: "reload_via_env", "pre debug via env");
+            assert!(
+                !String::from_utf8(buf.0.lock().unwrap().clone())
+                    .unwrap()
+                    .contains("pre debug via env"),
+                "debug suppressed at info default"
+            );
+
+            unsafe { std::env::set_var("RUST_LOG", "info,reload_via_env=debug") };
+            erased.reload_from_env().expect("reload while subscriber live");
+
+            tracing::debug!(target: "reload_via_env", "post debug via env");
+        });
+
+        let captured = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        match prev {
+            Some(p) => unsafe { std::env::set_var("RUST_LOG", p) },
+            None => unsafe { std::env::remove_var("RUST_LOG") },
+        }
+
+        assert!(
+            captured.contains("post debug via env"),
+            "reload_from_env must re-read RUST_LOG and enable the raised target; captured: {captured:?}"
+        );
     }
 
     #[test]

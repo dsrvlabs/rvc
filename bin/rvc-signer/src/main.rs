@@ -166,6 +166,16 @@ struct ServeArgs {
     #[arg(long, default_value = "30")]
     reload_interval: u64,
 
+    /// Enable runtime log-level reload on SIGHUP (opt-in; issue 5.4).
+    ///
+    /// When set, sending `SIGHUP` to the process re-reads `RUST_LOG` and swaps
+    /// the active log filter in place — raising or lowering verbosity without a
+    /// restart. Disabled by default so the steady-state log path is unchanged;
+    /// the always-on reload *layer* is free on the disabled hot path either way.
+    /// Distinct from `--enable-hot-reload` (which reloads keystores, not logs).
+    #[arg(long, default_value_t = false)]
+    enable_log_reload: bool,
+
     /// Comma-separated list of DVT peer addresses (host:port)
     #[cfg(feature = "dvt")]
     #[arg(long, value_delimiter = ',')]
@@ -241,19 +251,17 @@ async fn main() {
     // layer with its own `EnvFilter::new(config.level)` (see
     // `crates/telemetry/src/file_appender.rs`), exactly as `bin/rvc` uses it.
     // Delivering it for rvc-signer would require a new `--logfile`/`logfile_level`
-    // CLI + `ResolvedConfig` surface (it has none today) plus converting this single
-    // `fmt()` subscriber into a layered `registry()` composition holding a
-    // `WorkerGuard` for the process lifetime — broader than the P0-5 init
-    // reconciliation. Per 3.5's bounded scope it is deferred as a documented
-    // fallback rather than a rushed file path in a security-sensitive signer; the
-    // console-only status is to be stated in the Phase-5 OPERATOR_GUIDE.
-    tracing_subscriber::fmt().with_env_filter(telemetry::env_filter_or("info")).init();
+    // CLI + `ResolvedConfig` surface (it has none today); per 3.5's bounded scope
+    // it is deferred as a documented fallback rather than a rushed file path in a
+    // security-sensitive signer; the console-only status is stated in the Phase-5
+    // OPERATOR_GUIDE.
+    let reload_handle = init_logging();
 
     let cli = Cli::parse();
 
     match cli.command {
         Command::Serve(args) => {
-            if let Err(e) = run_serve(args).await {
+            if let Err(e) = run_serve(args, reload_handle).await {
                 error!(error = %e, "rvc-signer failed");
                 std::process::exit(1);
             }
@@ -270,7 +278,37 @@ async fn main() {
     }
 }
 
-async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+/// Initialize the console-only tracing subscriber and return a type-erased
+/// handle to the runtime-reloadable log filter (issue 5.4 / P2-2).
+///
+/// The reconciled `EnvFilter` (unset/empty/malformed `RUST_LOG` → `info`, env
+/// otherwise wins — ADR-003) is wrapped in a `reload::Layer` so its value can be
+/// swapped at runtime. The **initial value is exactly `env_filter_or("info")`**,
+/// so this produces byte-for-byte identical *user-visible* output to the previous
+/// bare `fmt().with_env_filter(env_filter_or("info"))` — the Phase-3 cross-binary
+/// init parity is preserved.
+///
+/// Moving from the `fmt()` builder to a `registry()` + `fmt::layer()` composition
+/// flips `log_internal_errors` from `true` to `false`; this is now `false`,
+/// matching `bin/rvc` (which already composes via `registry()`). The only
+/// behavioral difference is the rare diagnostic emitted when the fmt writer
+/// itself errors — intentionally consistent across both binaries, not an operator
+/// path. The reload layer is the outer global filter over a single `fmt::layer`;
+/// a disabled `debug!`/`trace!` callsite short-circuits in the macro before
+/// reaching it (Gate 4 / P0-6 unaffected). The opt-in `SIGHUP` trigger (gated by
+/// `--enable-log-reload`) is wired in `run_serve`.
+fn init_logging() -> telemetry::LogReloadHandle {
+    use tracing_subscriber::prelude::*;
+
+    let (filter, handle) = telemetry::reloadable_env_filter("info");
+    tracing_subscriber::registry().with(tracing_subscriber::fmt::layer()).with(filter).init();
+    telemetry::LogReloadHandle::new("info", handle)
+}
+
+async fn run_serve(
+    args: ServeArgs,
+    reload_handle: telemetry::LogReloadHandle,
+) -> Result<(), Box<dyn std::error::Error>> {
     // Install the rustls crypto provider before any TLS work. Idempotent and
     // safe even with HTTP disabled. Forward-defense (ADR-006, R1): pins a single
     // explicit default so the Phase-3 `ServerConfig::builder()` path stays
@@ -639,16 +677,83 @@ async fn run_serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         router
     };
 
+    // Runtime log-level reload (issue 5.4 / P2-2), opt-in via `--enable-log-reload`.
+    // Mirrors the `--enable-hot-reload` keystore opt-in conventions (a `--enable-*`
+    // flag + a `CancellationToken`-scoped task), but reloads the LOG filter, not
+    // keystores. On SIGHUP it re-reads `RUST_LOG` and swaps the active filter in
+    // place — no restart, no new network endpoint.
+    let log_reload_shutdown = tokio_util::sync::CancellationToken::new();
+    spawn_log_reload_handler(args.enable_log_reload, reload_handle, log_reload_shutdown.clone());
+
     router.serve_with_shutdown(addr, shutdown_signal()).await?;
 
-    // gRPC has shut down (Ctrl+C). Stop the HTTP listener accepting new
-    // connections and drain any in-flight `/sign` (bounded inside serve_https).
+    // gRPC has shut down (Ctrl+C). Stop the SIGHUP log-reload task, then stop the
+    // HTTP listener accepting new connections and drain any in-flight `/sign`
+    // (bounded inside serve_https).
+    log_reload_shutdown.cancel();
     http_shutdown.cancel();
     if let Some(handle) = http_handle {
         let _ = handle.await;
     }
 
     Ok(())
+}
+
+/// Spawn the opt-in `SIGHUP` log-reload handler (issue 5.4 / P2-2).
+///
+/// No-op unless `enabled` (the `--enable-log-reload` opt-in). When enabled on a
+/// Unix host, each `SIGHUP` re-reads `RUST_LOG` through the same
+/// [`telemetry::env_filter_or`] precedence used at startup and swaps the active
+/// filter, raising/lowering verbosity without a restart. The task is scoped to
+/// `shutdown_token` so it exits cleanly when the server stops. On non-Unix
+/// targets there is no `SIGHUP`; the flag is accepted but inert (logged once).
+fn spawn_log_reload_handler(
+    enabled: bool,
+    reload_handle: telemetry::LogReloadHandle,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) {
+    if !enabled {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            let mut sighup =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(error = %e, "failed to install SIGHUP handler; log reload disabled");
+                        return;
+                    }
+                };
+            info!("Runtime log-level reload enabled (send SIGHUP to re-read RUST_LOG)");
+            loop {
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => break,
+                    sig = sighup.recv() => {
+                        if sig.is_none() {
+                            break;
+                        }
+                        match reload_handle.reload_from_env() {
+                            Ok(()) => info!("Reloaded log filter from RUST_LOG (SIGHUP)"),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "log-filter reload failed (subscriber gone?)")
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (reload_handle, shutdown_token);
+        tracing::warn!(
+            "--enable-log-reload set, but SIGHUP-based reload is only supported on Unix"
+        );
+    }
 }
 
 /// Returns the DVT signing backend AND the share map (for `PeerSignerService`).
@@ -901,19 +1006,27 @@ mod tests {
     /// the reconciliation it used `EnvFilter::from_default_env()`, which drops
     /// `info` to `ERROR` when `RUST_LOG` is unset (the silent-by-default footgun
     /// this issue closes). Mirrors `bin/rvc`'s `test_init_logging_no_extras_emits_events`.
+    ///
+    /// This builds the ACTUAL shipped composition that `init_logging()` uses:
+    /// `registry().with(fmt::layer()).with(reloadable_env_filter("info"))`, i.e.
+    /// the reload-wrapped reconciled filter via the same shared helper, capturing
+    /// output through `.with_writer()` and `with_default` instead of `.init()`.
+    /// It guards the real composition, not the removed `fmt()` builder.
     #[test]
     fn test_init_logging_emits_info_by_default() {
+        use tracing_subscriber::prelude::*;
+
         let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let prev = std::env::var("RUST_LOG").ok();
         unsafe { std::env::remove_var("RUST_LOG") };
 
         let buf = SharedBuf::default();
-        // Mirror the production composition: the `fmt()` builder + the reconciled
-        // filter, with `.finish()` instead of `.init()` so we can capture output.
-        let subscriber = tracing_subscriber::fmt()
-            .with_env_filter(telemetry::env_filter_or("info"))
-            .with_writer(buf.clone())
-            .finish();
+        // Same shape as production `init_logging`: the reload-wrapped reconciled
+        // filter is the outer global layer over a single `fmt::layer`.
+        let (filter, _handle) = telemetry::reloadable_env_filter("info");
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(buf.clone()))
+            .with(filter);
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("rvc-signer init regression marker");
         });

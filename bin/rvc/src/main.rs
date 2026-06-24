@@ -104,6 +104,16 @@ enum Commands {
         #[arg(long, default_value = "info")]
         log_level: String,
 
+        /// Enable runtime log-level reload on SIGHUP (opt-in; issue 5.4).
+        ///
+        /// When set, sending `SIGHUP` to the process re-reads `RUST_LOG` and
+        /// swaps the active log filter in place — raising or lowering verbosity
+        /// without a restart. Disabled by default so the steady-state log path is
+        /// unchanged; the always-on reload *layer* is free on the disabled hot
+        /// path either way. Unix only (a no-op on other platforms).
+        #[arg(long, default_value_t = false)]
+        enable_log_reload: bool,
+
         /// Enable the Keymanager API server
         #[arg(long)]
         keymanager_enabled: bool,
@@ -475,6 +485,7 @@ async fn main() -> anyhow::Result<()> {
             graffiti,
             no_doppelganger_detection,
             log_level,
+            enable_log_reload,
             keymanager_enabled,
             no_keymanager,
             keymanager_address,
@@ -694,6 +705,7 @@ async fn main() -> anyhow::Result<()> {
                 strict_slashing_semantics,
                 timeouts,
                 logging_guards,
+                enable_log_reload,
             )
             .await?;
         }
@@ -769,6 +781,10 @@ async fn main() -> anyhow::Result<()> {
 struct LoggingGuards {
     _tracing_guard: Option<telemetry::TracingGuard>,
     _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    /// Type-erased handle to the runtime-reloadable log filter (issue 5.4). The
+    /// opt-in `SIGHUP` trigger (gated behind `--enable-log-reload`) calls
+    /// `reload_from_env()` to re-read `RUST_LOG` without a restart.
+    reload_handle: telemetry::LogReloadHandle,
 }
 
 fn init_logging(
@@ -779,7 +795,14 @@ fn init_logging(
     use tracing_subscriber::layer::Layer;
     use tracing_subscriber::prelude::*;
 
-    let filter = telemetry::env_filter_or(level);
+    // The reconciled filter is wrapped in a `reload::Layer` so verbosity can be
+    // changed at runtime (issue 5.4). The layer's INITIAL value is exactly
+    // `env_filter_or(level)` — identical to the bare filter this replaced — so
+    // the Phase-3 init reconciliation (unset/empty/malformed RUST_LOG → `level`)
+    // is unchanged. A disabled `debug!`/`trace!` callsite still short-circuits in
+    // the macro before reaching this layer, so the disabled hot path stays
+    // zero-allocation (Gate 4 / P0-6) whether or not the trigger is enabled.
+    let (filter, reload_filter_handle) = telemetry::reloadable_env_filter(level);
 
     let (file_layer, file_guard): (
         Option<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>>,
@@ -840,7 +863,11 @@ fn init_logging(
         .with(filter)
         .init();
 
-    LoggingGuards { _tracing_guard: tracing_guard, _file_guard: file_guard }
+    // Erase the concrete reload handle (its subscriber type is the unspellable
+    // layered stack above) so it can be stored and moved into the SIGHUP task.
+    let reload_handle = telemetry::LogReloadHandle::new(level, reload_filter_handle);
+
+    LoggingGuards { _tracing_guard: tracing_guard, _file_guard: file_guard, reload_handle }
 }
 
 fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
@@ -950,7 +977,8 @@ async fn run_validator(
     strict_permissions: bool,
     strict_slashing_semantics: bool,
     timeouts: bn_manager::OperationTimeouts,
-    _logging_guards: LoggingGuards,
+    logging_guards: LoggingGuards,
+    enable_log_reload: bool,
 ) -> anyhow::Result<()> {
     let startup_time = std::time::Instant::now();
 
@@ -971,6 +999,18 @@ async fn run_validator(
 
     let health_status = new_health_status();
     let shutdown_token = tokio_util::sync::CancellationToken::new();
+
+    // Runtime log-level reload (issue 5.4 / P2-2), opt-in via `--enable-log-reload`.
+    // Mirrors the keystore-hot-reload opt-in conventions (a `--enable-*` flag +
+    // a `CancellationToken`-scoped task): when enabled, `SIGHUP` re-reads
+    // `RUST_LOG` and swaps the active filter in place — no restart, no new network
+    // endpoint. The `LogReloadHandle` is held in `logging_guards` for the process
+    // lifetime; here we only clone it into the signal task.
+    spawn_log_reload_handler(
+        enable_log_reload,
+        logging_guards.reload_handle.clone(),
+        shutdown_token.clone(),
+    );
 
     let grpc_port = config.grpc_port;
     let metrics_address = config.metrics_address;
@@ -1737,8 +1777,9 @@ async fn run_validator(
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Logging guards (tracing + file) are held by _logging_guards and
-    // dropped at the end of the caller's scope, flushing pending data.
+    // Logging guards (tracing + file + the reload handle) are held by
+    // logging_guards and dropped at the end of this scope, flushing pending data.
+    let _ = &logging_guards;
 
     // Gracefully shut down metrics server with a brief timeout
     metrics_handle.abort();
@@ -1776,6 +1817,62 @@ async fn resolve_validator_indices(
     }
     info!(count = index_map.len(), "Resolved validator indices");
     Ok(index_map)
+}
+
+/// Spawn the opt-in `SIGHUP` log-reload handler (issue 5.4 / P2-2).
+///
+/// No-op unless `enabled` (the `--enable-log-reload` opt-in). When enabled on a
+/// Unix host, each `SIGHUP` re-reads `RUST_LOG` through the same
+/// [`telemetry::env_filter_or`] precedence used at startup and swaps the active
+/// filter, raising/lowering verbosity without a restart. The task is scoped to
+/// `shutdown_token`, so it exits cleanly on shutdown. On non-Unix targets there
+/// is no `SIGHUP`; the flag is accepted but inert (logged once).
+fn spawn_log_reload_handler(
+    enabled: bool,
+    reload_handle: telemetry::LogReloadHandle,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) {
+    if !enabled {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            let mut sighup =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(error = %e, "failed to install SIGHUP handler; log reload disabled");
+                        return;
+                    }
+                };
+            info!("Runtime log-level reload enabled (send SIGHUP to re-read RUST_LOG)");
+            loop {
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => break,
+                    sig = sighup.recv() => {
+                        if sig.is_none() {
+                            // Signal stream closed; stop listening.
+                            break;
+                        }
+                        match reload_handle.reload_from_env() {
+                            Ok(()) => info!("Reloaded log filter from RUST_LOG (SIGHUP)"),
+                            Err(e) => {
+                                warn!(error = %e, "log-filter reload failed (subscriber gone?)")
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (reload_handle, shutdown_token);
+        warn!("--enable-log-reload set, but SIGHUP-based reload is only supported on Unix");
+    }
 }
 
 async fn shutdown_signal() {
