@@ -982,7 +982,7 @@ impl SlashingDb {
     /// `record_block` write can interleave between the pubkey scan and the
     /// per-pubkey row reads, so the exported interchange is an atomic,
     /// consistent snapshot of the DB at the moment of the call.
-    #[tracing::instrument(name = "rvc.slashing.db.export", skip_all)]
+    #[tracing::instrument(name = "slashing.db.export", skip_all)]
     pub fn export(
         &self,
         genesis_validators_root: &str,
@@ -1033,7 +1033,7 @@ impl SlashingDb {
         Ok(result)
     }
 
-    #[tracing::instrument(name = "rvc.slashing.db.import", skip_all)]
+    #[tracing::instrument(name = "slashing.db.import", skip_all)]
     pub fn import(
         &self,
         interchange: &InterchangeFormat,
@@ -1249,7 +1249,7 @@ impl SlashingDb {
     // error. That demotion is safe only because every `stage_*` caller re-logs;
     // `check_and_record_*` has no such guaranteed terminal layer (today it has no
     // non-test callers), so its rejections stay at `error!`.
-    #[tracing::instrument(name = "rvc.slashing.db.block", skip_all, fields(rvc.slashing.result))]
+    #[tracing::instrument(name = "slashing.db.block", skip_all, fields(slashing_result))]
     pub fn check_and_record_block(
         &self,
         _client_cn: &str,
@@ -1286,7 +1286,7 @@ impl SlashingDb {
             .optional()?;
         if let Some(wm) = watermark {
             if (slot as i64) < wm {
-                tracing::Span::current().record("rvc.slashing.result", "blocked");
+                tracing::Span::current().record("slashing_result", "blocked");
                 tracing::error!(
                     pubkey = %TruncatedPubkey::new(&pubkey),
                     slot,
@@ -1315,7 +1315,7 @@ impl SlashingDb {
                 _ => false,
             };
             if !is_resign {
-                tracing::Span::current().record("rvc.slashing.result", "blocked");
+                tracing::Span::current().record("slashing_result", "blocked");
                 tracing::error!(
                     pubkey = %TruncatedPubkey::new(&pubkey),
                     slot,
@@ -1326,7 +1326,7 @@ impl SlashingDb {
             }
             // Same signing root — idempotent re-sign, commit without inserting
             tx.commit()?;
-            tracing::Span::current().record("rvc.slashing.result", "safe");
+            tracing::Span::current().record("slashing_result", "safe");
             tracing::debug!(
                 pubkey = %TruncatedPubkey::new(&pubkey),
                 slot,
@@ -1345,7 +1345,7 @@ impl SlashingDb {
 
         if let Some(min) = min_slot {
             if (slot as i64) < min {
-                tracing::Span::current().record("rvc.slashing.result", "blocked");
+                tracing::Span::current().record("slashing_result", "blocked");
                 tracing::error!(
                     pubkey = %TruncatedPubkey::new(&pubkey),
                     slot,
@@ -1367,7 +1367,7 @@ impl SlashingDb {
         )?;
 
         tx.commit()?;
-        tracing::Span::current().record("rvc.slashing.result", "safe");
+        tracing::Span::current().record("slashing_result", "safe");
         tracing::debug!(
             pubkey = %TruncatedPubkey::new(&pubkey),
             slot,
@@ -1430,7 +1430,7 @@ impl SlashingDb {
     /// `strict_semantics = true`: `None==None` is rejected as a potential
     /// double vote, matching Lighthouse/Prysm/Teku conservative behavior.
     /// See EIP-3076 §Conditions, note on `signing_root` handling.
-    #[tracing::instrument(name = "rvc.slashing.db.attestation", skip_all, fields(rvc.slashing.result))]
+    #[tracing::instrument(name = "slashing.db.attestation", skip_all, fields(slashing_result))]
     pub fn check_and_record_attestation(
         &self,
         _client_cn: &str,
@@ -1466,7 +1466,7 @@ impl SlashingDb {
             .optional()?;
         if let Some(ws) = wm_source {
             if (source_epoch as i64) < ws {
-                tracing::Span::current().record("rvc.slashing.result", "blocked");
+                tracing::Span::current().record("slashing_result", "blocked");
                 tracing::error!(
                     pubkey = %TruncatedPubkey::new(&pubkey),
                     source_epoch,
@@ -1490,7 +1490,7 @@ impl SlashingDb {
             .optional()?;
         if let Some(wt) = wm_target {
             if (target_epoch as i64) < wt {
-                tracing::Span::current().record("rvc.slashing.result", "blocked");
+                tracing::Span::current().record("slashing_result", "blocked");
                 tracing::error!(
                     pubkey = %TruncatedPubkey::new(&pubkey),
                     source_epoch,
@@ -1533,7 +1533,7 @@ impl SlashingDb {
                         // FU-32: Defense-in-depth — verify source also matches.
                         if source_epoch != *existing_source {
                             tracing::warn!(
-                                pubkey,
+                                pubkey = %TruncatedPubkey::new(&pubkey),
                                 target_epoch,
                                 existing_source = *existing_source,
                                 new_source = source_epoch,
@@ -1550,7 +1550,7 @@ impl SlashingDb {
                     }
                     _ => {
                         // Different roots, or None involved in strict mode
-                        tracing::Span::current().record("rvc.slashing.result", "blocked");
+                        tracing::Span::current().record("slashing_result", "blocked");
                         tracing::error!(
                             pubkey = %TruncatedPubkey::new(&pubkey),
                             source_epoch,
@@ -1566,7 +1566,7 @@ impl SlashingDb {
             }
 
             if source_epoch < *existing_source && target_epoch > *existing_target {
-                tracing::Span::current().record("rvc.slashing.result", "blocked");
+                tracing::Span::current().record("slashing_result", "blocked");
                 tracing::error!(
                     pubkey = %TruncatedPubkey::new(&pubkey),
                     source_epoch,
@@ -1584,7 +1584,7 @@ impl SlashingDb {
             }
 
             if *existing_source < source_epoch && *existing_target > target_epoch {
-                tracing::Span::current().record("rvc.slashing.result", "blocked");
+                tracing::Span::current().record("slashing_result", "blocked");
                 tracing::error!(
                     pubkey = %TruncatedPubkey::new(&pubkey),
                     source_epoch,
@@ -1607,7 +1607,7 @@ impl SlashingDb {
             let min_target = existing.iter().map(|(_, t, _)| *t).min();
             if let Some(min) = min_target {
                 if target_epoch < min {
-                    tracing::Span::current().record("rvc.slashing.result", "blocked");
+                    tracing::Span::current().record("slashing_result", "blocked");
                     tracing::error!(
                         pubkey = %TruncatedPubkey::new(&pubkey),
                         source_epoch,
@@ -1639,7 +1639,7 @@ impl SlashingDb {
         }
 
         tx.commit()?;
-        tracing::Span::current().record("rvc.slashing.result", "safe");
+        tracing::Span::current().record("slashing_result", "safe");
         tracing::debug!(
             pubkey = %TruncatedPubkey::new(&pubkey),
             source_epoch,
@@ -1882,7 +1882,7 @@ impl SlashingDb {
     /// Delete slashing protection records below all set watermarks.
     ///
     /// Returns an error if no watermarks are set (safety: prevents accidental deletion of all records).
-    #[tracing::instrument(name = "rvc.slashing.db.prune", skip_all)]
+    #[tracing::instrument(name = "slashing.db.prune", skip_all)]
     pub fn prune_below_watermarks(&self) -> Result<PruneStats, SlashingError> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2038,6 +2038,54 @@ mod tests {
     /// unit tests, so the M-6 per-call GVR check is skipped and this value is
     /// only written into the row's `genesis_validators_root` column.
     const TEST_GVR: Root = [0u8; 32];
+
+    /// The `slashing.db.block`/`slashing.db.attestation` spans declare
+    /// `slashing_result = field::Empty` and late-bind it via Span::record. This proves the
+    /// renamed key lands (the declared field name MUST match the record key, or it vanishes).
+    #[test]
+    fn slashing_result_field_late_binds() {
+        use std::sync::{Arc, Mutex};
+
+        use tracing::field::{Field, Visit};
+        use tracing::span::Record;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Clone, Default)]
+        struct Cap(Arc<Mutex<Vec<String>>>);
+        struct V<'a>(&'a mut Vec<String>);
+        impl Visit for V<'_> {
+            fn record_debug(&mut self, f: &Field, _v: &dyn std::fmt::Debug) {
+                self.0.push(f.name().to_string());
+            }
+        }
+        impl<S> Layer<S> for Cap
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_record(&self, _id: &tracing::Id, values: &Record<'_>, _ctx: Context<'_, S>) {
+                if let Ok(mut keys) = self.0.lock() {
+                    values.record(&mut V(&mut keys));
+                }
+            }
+        }
+
+        let cap = Cap::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span =
+                tracing::info_span!("slashing.db.block", slashing_result = tracing::field::Empty);
+            let _e = span.enter();
+            tracing::Span::current().record("slashing_result", "blocked");
+        });
+
+        let recorded = cap.0.lock().unwrap();
+        assert!(
+            recorded.iter().any(|k| k == "slashing_result"),
+            "late-bound slashing_result did not land: {recorded:?}"
+        );
+    }
 
     #[test]
     fn test_open_in_memory_database() {
