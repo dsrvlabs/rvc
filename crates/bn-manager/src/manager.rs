@@ -17,7 +17,7 @@ use eth_types::{
 };
 use futures::future::join_all;
 use tracing::Instrument;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, trace, warn};
 use url::Url;
 
 use crypto::logging::RedactedUrl;
@@ -717,7 +717,9 @@ impl BnManager {
                 match &result {
                     Ok(_) => {
                         guard[i].record_success(elapsed);
-                        debug!(
+                        // Per-BN broadcast success scales with node count, so it
+                        // is `trace` (the per-item loop rule), not `debug`.
+                        trace!(
                             op = op_name,
                             bn_index = i,
                             endpoint = %RedactedUrl(&endpoint),
@@ -745,8 +747,10 @@ impl BnManager {
     fn log_partial_failure<T>(op_name: &str, broadcast: &BroadcastResult<T>) {
         if broadcast.any_success() && !broadcast.all_success() {
             let (ok, fail) = broadcast.counts();
-            let failed_endpoints: Vec<&str> =
-                broadcast.failures().iter().map(|(e, _)| *e).collect();
+            // Redact each endpoint — a raw `Vec<&str>` Debug-printed here would
+            // leak `user:pass@` credentials from the configured BN URLs.
+            let failed_endpoints: Vec<String> =
+                broadcast.failures().into_iter().map(|(e, _)| RedactedUrl(e).to_string()).collect();
             warn!(
                 op = op_name,
                 successes = ok,

@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crypto::logging::RedactedUrl;
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Default EMA smoothing factor (alpha). Higher = more weight on recent samples.
 const DEFAULT_EMA_ALPHA: f64 = 0.3;
@@ -89,7 +89,9 @@ impl BnHealthTracker {
             );
         }
         if was_healthy && !self.is_healthy() {
-            info!(
+            // A BN degrading is a handled-but-degraded event (the manager fails
+            // over to healthy peers), so it is `warn`, not `info`.
+            warn!(
                 bn_url = %RedactedUrl(&self.endpoint),
                 old_status = "healthy",
                 new_status = "unhealthy",
@@ -331,6 +333,37 @@ mod tests {
             tracker.record_success(Duration::from_millis(50));
         }
         assert!(tracker.is_healthy());
+    }
+
+    /// Issue 2.6: a BN degrading (healthy -> unhealthy) is logged at WARN (a
+    /// handled-but-degraded event), and its endpoint is redacted — credentials
+    /// must never appear. Driving only errors fires exactly one transition line.
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_health_degradation_logs_warn_with_redacted_bn_url() {
+        let mut tracker = BnHealthTracker::new("http://user:secretpw@bn:5052".to_string());
+        tracker.unhealthy_threshold = 0.3;
+        for _ in 0..10 {
+            tracker.record_error();
+        }
+        assert!(!tracker.is_healthy());
+
+        logs_assert(|lines: &[&str]| {
+            let transition = lines
+                .iter()
+                .find(|l| l.contains("BN health transition"))
+                .ok_or_else(|| "no health transition line captured".to_string())?;
+            if !transition.contains("WARN") {
+                return Err(format!("degradation transition must be WARN: {transition}"));
+            }
+            if transition.contains("secretpw") {
+                return Err(format!("bn_url credentials leaked: {transition}"));
+            }
+            if !transition.contains("***:***@") {
+                return Err(format!("bn_url must be redacted: {transition}"));
+            }
+            Ok(())
+        });
     }
 
     // -- SharedHealthTrackers --

@@ -26,3 +26,4 @@ url = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 wiremock = { workspace = true }
+tracing-test = { workspace = true }
