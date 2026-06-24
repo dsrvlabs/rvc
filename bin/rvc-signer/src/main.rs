@@ -231,9 +231,7 @@ struct SplitKeyCliArgs {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    tracing_subscriber::fmt().with_env_filter(telemetry::env_filter_or("info")).init();
 
     let cli = Cli::parse();
 
@@ -851,4 +849,68 @@ fn run_split_key(args: SplitKeyCliArgs) -> Result<(), Box<dyn std::error::Error>
     })?;
     info!("Split key successfully");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+    impl io::Write for SharedBuf {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    // Serialize RUST_LOG mutation (process-global). nextest runs each test in
+    // its own process, but guard anyway so the suite stays correct under any
+    // runner that threads tests in one process.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// With `RUST_LOG` unset, rvc-signer's reconciled init must default to
+    /// `info` and emit `info!` events — the P0-5 cross-binary parity fix. Before
+    /// the reconciliation it used `EnvFilter::from_default_env()`, which drops
+    /// `info` to `ERROR` when `RUST_LOG` is unset (the silent-by-default footgun
+    /// this issue closes). Mirrors `bin/rvc`'s `test_init_logging_no_extras_emits_events`.
+    #[test]
+    fn test_init_logging_emits_info_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("RUST_LOG").ok();
+        unsafe { std::env::remove_var("RUST_LOG") };
+
+        let buf = SharedBuf::default();
+        // Mirror the production composition: the `fmt()` builder + the reconciled
+        // filter, with `.finish()` instead of `.init()` so we can capture output.
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(telemetry::env_filter_or("info"))
+            .with_writer(buf.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("rvc-signer init regression marker");
+        });
+
+        match prev {
+            Some(p) => unsafe { std::env::set_var("RUST_LOG", p) },
+            None => unsafe { std::env::remove_var("RUST_LOG") },
+        }
+
+        let captured = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("rvc-signer init regression marker"),
+            "reconciled init dropped an info event with RUST_LOG unset; captured: {captured:?}"
+        );
+    }
 }
