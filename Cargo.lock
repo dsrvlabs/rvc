@@ -4276,6 +4276,8 @@ dependencies = [
  "sha2",
  "tempfile",
  "tiny-keccak",
+ "tracing",
+ "tracing-test",
  "tree_hash",
  "zeroize",
 ]

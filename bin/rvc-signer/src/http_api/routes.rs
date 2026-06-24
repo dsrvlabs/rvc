@@ -1002,6 +1002,131 @@ mod tests {
         assert!(!logs_contain(&sig), "audit log leaked the signature");
     }
 
+    /// Gate 3 (:9000): a real sign over the HTTP frontend proves the exported
+    /// handler span carries the late-bound canonical fields — `pubkey` (truncated),
+    /// `duty`, `slot`, `request_id` — and that no raw secret (full pubkey hex or
+    /// the returned signature) reaches any handler or audit line.
+    #[tokio::test]
+    async fn sign_span_records_truncated_fields_and_logs_no_secrets() {
+        use std::sync::Mutex;
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Layer;
+
+        struct ValueVisitor<'a>(&'a mut Vec<(String, String)>);
+        impl tracing::field::Visit for ValueVisitor<'_> {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.push((f.name().to_string(), format!("{v:?}")));
+            }
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                self.0.push((f.name().to_string(), v.to_string()));
+            }
+            fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+                self.0.push((f.name().to_string(), v.to_string()));
+            }
+        }
+        struct LineVisitor(String);
+        impl tracing::field::Visit for LineVisitor {
+            fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!("{}={v:?} ", f.name()));
+            }
+            fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
+                self.0.push_str(&format!("{}={v} ", f.name()));
+            }
+            fn record_u64(&mut self, f: &tracing::field::Field, v: u64) {
+                self.0.push_str(&format!("{}={v} ", f.name()));
+            }
+        }
+        struct SignCapture {
+            span_fields: Arc<Mutex<Vec<(String, String)>>>,
+            event_lines: Arc<Mutex<Vec<String>>>,
+        }
+        impl<S> Layer<S> for SignCapture
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                _id: &tracing::span::Id,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut buf = self.span_fields.lock().unwrap();
+                attrs.record(&mut ValueVisitor(&mut buf));
+            }
+            fn on_record(
+                &self,
+                _id: &tracing::span::Id,
+                values: &tracing::span::Record<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut buf = self.span_fields.lock().unwrap();
+                values.record(&mut ValueVisitor(&mut buf));
+            }
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut line = LineVisitor(String::new());
+                event.record(&mut line);
+                self.event_lines.lock().unwrap().push(line.0);
+            }
+        }
+
+        let (sk, pk_bytes) = test_keypair();
+        let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+        let full_pubkey_hex = hex::encode(pk_bytes);
+
+        let span_fields = Arc::new(Mutex::new(Vec::new()));
+        let event_lines = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(SignCapture {
+            span_fields: span_fields.clone(),
+            event_lines: event_lines.clone(),
+        });
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp_body = String::from_utf8(body_bytes(resp).await).unwrap();
+        let sig = signature_hex(&resp_body);
+        drop(guard);
+
+        // (a) The exported handler span carries the late-bound canonical fields.
+        let fields = span_fields.lock().unwrap();
+        let pubkey =
+            fields.iter().find(|(k, _)| k == "pubkey").expect("sign span must record pubkey");
+        assert!(pubkey.1.contains("..."), "exported pubkey must be truncated: {}", pubkey.1);
+        assert!(
+            !pubkey.1.contains(&full_pubkey_hex),
+            "exported pubkey must not be the full hex: {}",
+            pubkey.1
+        );
+        assert!(
+            fields.iter().any(|(k, v)| k == "duty" && v == "attestation"),
+            "sign span must record duty=attestation; fields were {fields:?}"
+        );
+        assert!(
+            fields.iter().any(|(k, _)| k == "slot"),
+            "sign span must record slot; fields were {fields:?}"
+        );
+        assert!(
+            fields.iter().any(|(k, _)| k == "request_id"),
+            "sign span must record request_id; fields were {fields:?}"
+        );
+
+        // (b) No raw secret reaches any handler or audit line.
+        let lines = event_lines.lock().unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains("sign request audit")),
+            "audit line must be captured; lines were {lines:?}"
+        );
+        for l in lines.iter() {
+            assert!(!l.contains(&full_pubkey_hex), "full pubkey hex leaked into a log line: {l}");
+            assert!(!l.contains(&sig), "signature leaked into a log line: {l}");
+        }
+    }
+
     #[traced_test]
     #[tokio::test]
     async fn audit_rejection_412_logged_with_slashing_outcome_and_type() {

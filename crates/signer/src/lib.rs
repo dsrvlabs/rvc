@@ -1176,19 +1176,83 @@ impl ValidatorSigner for SignerService {
 mod tests {
     use super::*;
 
-    /// Captured `(name, child-names)` pairs — for events `(message, span-scope
-    /// names)`, for spans `(span name, recorded-field names)`. Non-poisoning
-    /// `parking_lot::Mutex` so a failed assertion in one test can never poison
-    /// the buffer and cascade into a concurrent test under `cargo test`.
-    type Captured = Arc<parking_lot::Mutex<Vec<(String, Vec<String>)>>>;
+    /// A captured event: its level, message, the names of the spans in its scope
+    /// (to prove a `spawn_blocking`-thread event re-enters the sign span), and the
+    /// rendered text of all its non-message fields (to prove no raw secret leaks).
+    #[derive(Clone)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        message: String,
+        scope: Vec<String>,
+        fields_text: String,
+    }
 
-    /// Test-only capturing layer (format-independent). Records, per event, the
-    /// names of the spans in its scope (to prove a `spawn_blocking`-thread event
-    /// re-enters the sign span), and per span, the names of the fields recorded
-    /// at creation (to prove `slot` actually lands on the span).
+    /// A captured span: its name and the `(field, value)` pairs recorded on it —
+    /// both at creation (e.g. `slot`/`duty`) and late-bound via `record()` (e.g.
+    /// `slashing_result`). Keyed by span id so `on_record` merges onto the same
+    /// entry the late value was recorded against.
+    #[derive(Clone)]
+    struct CapturedSpan {
+        name: String,
+        fields: Vec<(String, String)>,
+    }
+
+    type Events = Arc<parking_lot::Mutex<Vec<CapturedEvent>>>;
+    type Spans = Arc<parking_lot::Mutex<std::collections::HashMap<u64, CapturedSpan>>>;
+
+    /// Visits field VALUES (not just names) so span-field landing and redaction
+    /// can both be asserted. `%`/`?` values arrive via `record_debug`.
+    struct ValueVisitor(Vec<(String, String)>);
+    impl tracing::field::Visit for ValueVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push((field.name().to_string(), format!("{value:?}")));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    /// Splits an event's `message` from the rendered text of all other fields.
+    #[derive(Default)]
+    struct EventVisitor {
+        message: Option<String>,
+        fields_text: String,
+    }
+    impl tracing::field::Visit for EventVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            } else {
+                self.fields_text.push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = Some(value.to_string());
+            } else {
+                self.fields_text.push_str(&format!("{}={value} ", field.name()));
+            }
+        }
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields_text.push_str(&format!("{}={value} ", field.name()));
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields_text.push_str(&format!("{}={value} ", field.name()));
+        }
+    }
+
+    /// Test-only capturing layer (format-independent). Non-poisoning
+    /// `parking_lot::Mutex` buffers so a failed assertion in one test can never
+    /// poison the buffer and cascade into a concurrent test under `cargo test`.
     struct Capture {
-        events: Captured,
-        spans: Captured,
+        events: Events,
+        spans: Spans,
     }
 
     impl<S> tracing_subscriber::Layer<S> for Capture
@@ -1198,21 +1262,28 @@ mod tests {
         fn on_new_span(
             &self,
             attrs: &tracing::span::Attributes<'_>,
-            _id: &tracing::span::Id,
+            id: &tracing::span::Id,
             _ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            // record_debug is the catch-all every typed `record_*` defaults to,
-            // so this captures every field recorded at span creation (incl. the
-            // u64 `slot`); fields declared `Empty` are not visited until recorded.
-            struct FieldNames(Vec<String>);
-            impl tracing::field::Visit for FieldNames {
-                fn record_debug(&mut self, field: &tracing::field::Field, _: &dyn std::fmt::Debug) {
-                    self.0.push(field.name().to_string());
-                }
+            let mut v = ValueVisitor(Vec::new());
+            attrs.record(&mut v);
+            self.spans.lock().insert(
+                id.into_u64(),
+                CapturedSpan { name: attrs.metadata().name().to_string(), fields: v.0 },
+            );
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut v = ValueVisitor(Vec::new());
+            values.record(&mut v);
+            if let Some(span) = self.spans.lock().get_mut(&id.into_u64()) {
+                span.fields.extend(v.0);
             }
-            let mut fields = FieldNames(Vec::new());
-            attrs.record(&mut fields);
-            self.spans.lock().push((attrs.metadata().name().to_string(), fields.0));
         }
 
         fn on_event(
@@ -1220,29 +1291,20 @@ mod tests {
             event: &tracing::Event<'_>,
             ctx: tracing_subscriber::layer::Context<'_, S>,
         ) {
-            struct MsgVisitor(Option<String>);
-            impl tracing::field::Visit for MsgVisitor {
-                fn record_debug(
-                    &mut self,
-                    field: &tracing::field::Field,
-                    value: &dyn std::fmt::Debug,
-                ) {
-                    if field.name() == "message" {
-                        self.0 = Some(format!("{value:?}"));
-                    }
-                }
-            }
-            let mut visitor = MsgVisitor(None);
-            event.record(&mut visitor);
+            let mut v = EventVisitor::default();
+            event.record(&mut v);
             let scope: Vec<String> = ctx
                 .event_scope(event)
                 .into_iter()
                 .flatten()
                 .map(|span| span.name().to_string())
                 .collect();
-            if let Some(message) = visitor.0 {
-                self.events.lock().push((message, scope));
-            }
+            self.events.lock().push(CapturedEvent {
+                level: *event.metadata().level(),
+                message: v.message.unwrap_or_default(),
+                scope,
+                fields_text: v.fields_text,
+            });
         }
     }
 
@@ -1259,60 +1321,162 @@ mod tests {
     /// one-shot install; buffers use a non-poisoning `parking_lot::Mutex` and
     /// every assertion clones out before checking, so a failure stays local even
     /// under `cargo test`'s shared-process, multi-thread model.
+    /// Gate 3 (signer): one global subscriber proves, across a representative
+    /// sign path, that
+    ///  (1) the `spawn_blocking` closure re-enters the parent sign span so a
+    ///      blocking-thread event stays correlated to the duty trace,
+    ///  (2) the canonical fields land on the span — `slot`/`duty` at creation and
+    ///      `slashing_result` late-bound via `record()` (the vanishing-attribute
+    ///      guard); the bare `fields(slot)` form is a silent no-op under
+    ///      `skip_all`, so the explicit `slot = slot` form is required,
+    ///  (3) the validator pubkey appears only truncated — no full pubkey hex
+    ///      reaches any event, including the `spawn_blocking`-thread rejection
+    ///      line, and
+    ///  (4) the per-signature success milestone fires at `debug` while a slashing
+    ///      rejection fires at `error`.
+    ///
+    /// A global subscriber is required because `spawn_blocking` runs on a separate
+    /// OS thread the thread-local dispatcher would not reach. This is the crate's
+    /// only `set_global_default` caller, so it always wins the one-shot install;
+    /// buffers use a non-poisoning `parking_lot::Mutex` and every assertion clones
+    /// out before checking, so a failure stays local even under `cargo test`'s
+    /// shared-process, multi-thread model.
     #[tokio::test]
-    async fn test_sign_blocking_section_reentry_and_block_slot_field() {
+    async fn test_sign_path_redaction_level_and_field_conformance() {
         use tracing_subscriber::layer::SubscriberExt;
 
-        let events: Captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let spans: Captured = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let events: Events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let spans: Spans = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
         let subscriber = tracing_subscriber::registry::Registry::default()
             .with(Capture { events: events.clone(), spans: spans.clone() });
         let _ = tracing::subscriber::set_global_default(subscriber);
 
         let secret_key = SecretKey::generate();
         let pubkey = secret_key.public_key();
+        let full_pubkey_hex = hex::encode(pubkey.to_bytes());
         let signer = create_test_composite_signer_with_key(secret_key);
         let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
         let service = SignerService::new(signer, slashing_db);
         let fork_schedule = create_test_fork_schedule_for_attestation();
         let genesis_root = [0xaa; 32];
 
-        // Attestation path: exercises the first spawn_blocking closure.
+        // Attestation (slot 1000): exercises the first spawn_blocking closure and
+        // commits a record at target epoch 101.
         let attestation_data = create_test_attestation_data(100, 101);
         service
             .sign_attestation(&attestation_data, &pubkey, &fork_schedule, &genesis_root)
             .await
             .expect("attestation sign should succeed");
 
-        // Block path: exercises the second spawn_blocking closure + the slot field.
+        // Block (slot 3200): exercises the second spawn_blocking closure.
         service
             .sign_block(&[0x11; 32], 3200, &pubkey, &fork_schedule, &genesis_root)
             .await
             .expect("block sign should succeed");
 
+        // Conflicting attestation: same target epoch 101, different data → a
+        // double-vote the slashing DB rejects, exercising the blocking-thread
+        // `error!` rejection line and `slashing_result = "blocked"`.
+        let conflicting = AttestationData {
+            slot: 1000,
+            index: 5,
+            beacon_block_root: [0x99; 32],
+            source: Checkpoint { epoch: 100, root: [0x22; 32] },
+            target: Checkpoint { epoch: 101, root: [0x44; 32] },
+        };
+        let blocked =
+            service.sign_attestation(&conflicting, &pubkey, &fork_schedule, &genesis_root).await;
+        assert!(
+            matches!(blocked, Err(SignerError::SlashingProtectionBlocked(_))),
+            "conflicting attestation must be slashing-blocked, got {blocked:?}"
+        );
+
+        let events = events.lock().clone();
+        let spans: Vec<CapturedSpan> = spans.lock().values().cloned().collect();
+
         // (1) Re-entry: the attestation blocking-thread marker carries the span.
         let att_scope = events
-            .lock()
             .iter()
-            .find(|(message, _)| message.contains("staging attestation slashing-protection record"))
-            .map(|(_, scope)| scope.clone())
+            .find(|e| e.message.contains("staging attestation slashing-protection record"))
+            .map(|e| e.scope.clone())
             .expect("attestation blocking-section marker must be captured");
         assert!(
             att_scope.iter().any(|name| name == "sign.attestation"),
-            "blocking-section event must inherit the sign.attestation span (re-entry); scope was {att_scope:?}"
+            "blocking-section event must inherit the sign.attestation span; scope was {att_scope:?}"
         );
 
-        // (2) M-1 regression: the sign.block span must actually record `slot`.
-        let block_fields = spans
-            .lock()
-            .iter()
-            .find(|(name, _)| name == "sign.block")
-            .map(|(_, fields)| fields.clone())
-            .expect("sign.block span must be created");
+        // (2) Canonical fields land on the span (values, not just names).
+        let block =
+            spans.iter().find(|s| s.name == "sign.block").expect("sign.block span must be created");
         assert!(
-            block_fields.iter().any(|name| name == "slot"),
-            "sign.block span must record the slot field; recorded fields were {block_fields:?}"
+            block.fields.iter().any(|(k, v)| k == "slot" && v == "3200"),
+            "sign.block must record slot=3200; fields were {:?}",
+            block.fields
         );
+        assert!(
+            block.fields.iter().any(|(k, v)| k == "duty" && v == "block"),
+            "sign.block must record duty=block; fields were {:?}",
+            block.fields
+        );
+        assert!(
+            block.fields.iter().any(|(k, v)| k == "slashing_result" && v == "safe"),
+            "sign.block must late-bind slashing_result=safe; fields were {:?}",
+            block.fields
+        );
+
+        let att_spans: Vec<&CapturedSpan> =
+            spans.iter().filter(|s| s.name == "sign.attestation").collect();
+        assert!(
+            att_spans
+                .iter()
+                .any(|s| s.fields.iter().any(|(k, v)| k == "duty" && v == "attestation")),
+            "a sign.attestation span must record duty=attestation"
+        );
+        // The vanishing-attribute guard: both outcomes land late-bound.
+        assert!(
+            att_spans
+                .iter()
+                .any(|s| s.fields.iter().any(|(k, v)| k == "slashing_result" && v == "safe")),
+            "a committed attestation must late-bind slashing_result=safe"
+        );
+        assert!(
+            att_spans
+                .iter()
+                .any(|s| s.fields.iter().any(|(k, v)| k == "slashing_result" && v == "blocked")),
+            "the rejected attestation must late-bind slashing_result=blocked"
+        );
+
+        // (3) Redaction: the full pubkey hex never appears on ANY event...
+        for e in &events {
+            assert!(
+                !e.fields_text.contains(&full_pubkey_hex) && !e.message.contains(&full_pubkey_hex),
+                "full pubkey hex leaked into event {:?} / {}",
+                e.message,
+                e.fields_text
+            );
+        }
+        // ...and the blocking-thread rejection line carries the truncated pubkey.
+        let rejection = events
+            .iter()
+            .find(|e| e.message.contains("Slashing protection rejected attestation"))
+            .expect("rejection error line must be captured");
+        assert!(
+            rejection.fields_text.contains("..."),
+            "rejection line must render a truncated pubkey; fields were {}",
+            rejection.fields_text
+        );
+
+        // (4) Level conformance: success at debug, rejection at error.
+        let completed = events
+            .iter()
+            .find(|e| e.message.contains("Signing completed"))
+            .expect("success milestone must be captured");
+        assert_eq!(
+            completed.level,
+            tracing::Level::DEBUG,
+            "the per-signature success milestone must be debug, not info"
+        );
+        assert_eq!(rejection.level, tracing::Level::ERROR, "a slashing rejection must be error");
     }
     use crypto::{
         compute_domain, compute_signing_root, KeyManager, LocalSigner, SecretKey,

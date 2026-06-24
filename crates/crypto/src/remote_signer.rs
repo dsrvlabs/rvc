@@ -142,10 +142,16 @@ impl Signer for RemoteSigner {
         let identifier = format!("0x{}", hex::encode(pubkey));
         let url = format!("{}/api/v1/eth2/sign/{}", self.url, identifier);
 
+        // The logged URL truncates the pubkey path segment (pubkeys are truncated
+        // at every level per STANDARD.md) and redacts any credentials; the real
+        // request below still uses the full `url`.
+        let log_url =
+            format!("{}/api/v1/eth2/sign/{}", self.url, TruncatedPubkey::new(&identifier));
+
         let span = tracing::info_span!(
             "rvc.sign.remote",
             http.method = "POST",
-            http.url = %redact_url(&url),
+            http.url = %redact_url(&log_url),
             http.status_code = tracing::field::Empty,
             rvc.signer_type = "remote",
         );
@@ -572,6 +578,60 @@ mod tests {
         assert!(
             captured.iter().any(|(k, v)| k == "http.status_code" && v == "200"),
             "Expected http.status_code=200, got: {:?}",
+            *captured
+        );
+    }
+
+    /// Gate 3: the `rvc.sign.remote` span carries the validator pubkey only in
+    /// its truncated form. The pubkey is the Web3Signer endpoint's path segment
+    /// (`/api/v1/eth2/sign/0x<pubkey>`), so the leak surface is `http.url`; the
+    /// full 96-char pubkey hex must never reach the span even though the real
+    /// request uses the full URL.
+    #[tokio::test]
+    async fn test_sign_span_url_truncates_pubkey() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let full_pubkey_hex = hex::encode(pk_bytes);
+        let signing_root: Root = [0xab; 32];
+
+        let expected_sig = sk.sign(&signing_root);
+        let sig_hex = format!("0x{}", hex::encode(expected_sig.to_bytes()));
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/api/v1/eth2/sign/.*"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"signature": sig_hex})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = RemoteSignerConfig::new(mock_server.uri());
+        let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
+
+        let fields = Arc::new(Mutex::new(Vec::new()));
+        let layer = FieldCapture { fields: fields.clone() };
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let result = signer.sign(&signing_root, &pk_bytes).await;
+        assert!(result.is_ok());
+
+        let captured = fields.lock().unwrap();
+        let http_url = captured.iter().find(|(k, _)| k == "http.url");
+        assert!(http_url.is_some(), "Expected http.url span field, got: {:?}", *captured);
+        let (_, url_value) = http_url.unwrap();
+        // Truncated marker present...
+        assert!(url_value.contains("..."), "pubkey in URL must be truncated: {url_value}");
+        // ...and the full pubkey hex absent — from http.url and from every field.
+        assert!(
+            !url_value.contains(&full_pubkey_hex),
+            "full pubkey hex must never appear in http.url: {url_value}"
+        );
+        assert!(
+            !captured.iter().any(|(_, v)| v.contains(&full_pubkey_hex)),
+            "full pubkey hex leaked into a span field: {:?}",
             *captured
         );
     }

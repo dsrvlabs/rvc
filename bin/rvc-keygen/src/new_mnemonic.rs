@@ -792,4 +792,54 @@ mod tests {
         let result = write_mnemonic_backup(&path, "new mnemonic");
         assert!(result.is_err());
     }
+
+    /// Gate 3 (rvc-keygen): the BIP-39 mnemonic is an absolute sink. Driving the
+    /// new-mnemonic generation path under a capturing subscriber must never emit
+    /// the mnemonic phrase — nor even its length — through `tracing` at any level.
+    /// The phrase reaches the operator via the backup file / `eprintln!` only; it
+    /// must never enter the structured-logging layer where a collector could ship
+    /// it off-box.
+    #[test]
+    #[tracing_test::traced_test]
+    fn run_new_mnemonic_never_logs_mnemonic_through_tracing() {
+        let out = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let backup_path = backup.path().join("mnemonic.txt");
+        let password = Zeroizing::new("testpassword123".to_string());
+
+        // Probe: prove the subscriber is live, so the absence assertions below
+        // cannot pass merely because nothing was captured.
+        tracing::info!("keygen conformance probe");
+
+        run(
+            "mainnet",
+            out.path(),
+            1,    // num_validators
+            0,    // start_index
+            None, // withdrawal_address
+            "",   // mnemonic_passphrase
+            true, // pbkdf2 (faster KDF keeps the test cheap)
+            &password,
+            true, // dry_run: derive + encrypt in-memory, write no keystores
+            Some(&backup_path),
+        )
+        .expect("new-mnemonic generation should succeed");
+
+        // The randomly generated phrase is only knowable via the backup file.
+        let phrase = std::fs::read_to_string(&backup_path).unwrap();
+        let phrase = phrase.trim();
+        assert!(!phrase.is_empty(), "backup file must hold the generated mnemonic");
+        assert!(logs_contain("keygen conformance probe"), "subscriber must be capturing");
+
+        // The phrase — and a recognisable leading fragment — must never appear.
+        assert!(!logs_contain(phrase), "mnemonic phrase leaked into a log line");
+        let head = phrase.split_whitespace().take(4).collect::<Vec<_>>().join(" ");
+        assert!(!logs_contain(&head), "leading words of the mnemonic leaked into a log line");
+
+        // Not even the length: guard the realistic "N-word" / "N chars" phrasings.
+        let word_count = phrase.split_whitespace().count();
+        assert!(!logs_contain(&format!("{word_count}-word")), "mnemonic word count leaked");
+        assert!(!logs_contain(&format!("{word_count} word")), "mnemonic word count leaked");
+        assert!(!logs_contain(&format!("{} char", phrase.len())), "mnemonic char length leaked");
+    }
 }

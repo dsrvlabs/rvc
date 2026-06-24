@@ -26,3 +26,5 @@ tiny-keccak.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tracing.workspace = true
+tracing-test.workspace = true
