@@ -316,8 +316,7 @@ where
 
             let current_epoch = current_slot / SLOTS_PER_EPOCH;
 
-            let slot_span =
-                info_span!("rvc.slot.process", rvc.slot = current_slot, rvc.epoch = current_epoch,);
+            let slot_span = info_span!("slot.process", slot = current_slot, epoch = current_epoch,);
 
             // Check if keys changed (dynamic key import/delete via keymanager API)
             if self.key_gen_rx.has_changed().unwrap_or(false) {
@@ -342,7 +341,7 @@ where
                 info!(epoch = current_epoch, "Circuit breaker reset at epoch boundary");
 
                 let epoch_span =
-                    info_span!(parent: &slot_span, "rvc.epoch.boundary", rvc.epoch = current_epoch);
+                    info_span!(parent: &slot_span, "epoch.boundary", epoch = current_epoch);
                 async {
                     self.duty_management.check_reorg_at_epoch_boundary(current_epoch).await;
                     self.duty_management.prepare_proposers().await;
@@ -378,7 +377,7 @@ where
             // to avoid TOCTOU races (H-5). Uses slot-qualified query, not "head" (L-5).
             let ctx = SlotContext::capture(&*self.beacon, current_slot, current_epoch).await;
             {
-                let phase_span = info_span!(parent: &slot_span, "rvc.slot.phase.block");
+                let phase_span = info_span!(parent: &slot_span, "slot.phase.block");
                 self.maybe_propose_block(ctx.slot, ctx.epoch, &ctx).instrument(phase_span).await;
             }
 
@@ -388,7 +387,7 @@ where
 
             // === Phase 2: t=slot/3 — Attestations + sync committee messages ===
             {
-                let att_phase_span = info_span!(parent: &slot_span, "rvc.slot.phase.attestation");
+                let att_phase_span = info_span!(parent: &slot_span, "slot.phase.attestation");
 
                 let time_until_attestation = self.clock.time_until_attestation(current_slot)?;
                 if !time_until_attestation.is_zero() {
@@ -474,7 +473,7 @@ where
 
             // === Phase 3: t=2*slot/3 — Aggregation + sync committee contributions ===
             {
-                let agg_phase_span = info_span!(parent: &slot_span, "rvc.slot.phase.aggregation");
+                let agg_phase_span = info_span!(parent: &slot_span, "slot.phase.aggregation");
 
                 // Basis-points formula in milliseconds (report §4.3): mainnet
                 // 2/3 = 6667 * 12000 / 10000 = 8000 ms (unchanged from the legacy
@@ -599,7 +598,7 @@ where
         RVC_BUILDER_EPOCH_MISSES.set(self.circuit_breaker.epoch_misses() as i64);
     }
 
-    #[tracing::instrument(name = "rvc.orchestrator.maybe_propose_block", skip_all, fields(rvc.slot = slot, rvc.epoch = epoch))]
+    #[tracing::instrument(name = "orchestrator.maybe_propose_block", level = "debug", skip_all, fields(slot = slot, epoch = epoch))]
     async fn maybe_propose_block(&self, slot: Slot, epoch: u64, ctx: &SlotContext) {
         let proposer_duty = match self.duty_tracker.get_proposer_duty(slot).await {
             Some(duty) => duty,
@@ -3726,23 +3725,23 @@ mod tests {
 
         let span_names = captured.lock();
         assert!(
-            span_names.contains(&"rvc.slot.process".to_string()),
-            "Expected rvc.slot.process span, got: {:?}",
+            span_names.contains(&"slot.process".to_string()),
+            "Expected slot.process span, got: {:?}",
             *span_names
         );
         assert!(
-            span_names.contains(&"rvc.slot.phase.block".to_string()),
-            "Expected rvc.slot.phase.block span, got: {:?}",
+            span_names.contains(&"slot.phase.block".to_string()),
+            "Expected slot.phase.block span, got: {:?}",
             *span_names
         );
         assert!(
-            span_names.contains(&"rvc.slot.phase.attestation".to_string()),
-            "Expected rvc.slot.phase.attestation span, got: {:?}",
+            span_names.contains(&"slot.phase.attestation".to_string()),
+            "Expected slot.phase.attestation span, got: {:?}",
             *span_names
         );
         assert!(
-            span_names.contains(&"rvc.slot.phase.aggregation".to_string()),
-            "Expected rvc.slot.phase.aggregation span, got: {:?}",
+            span_names.contains(&"slot.phase.aggregation".to_string()),
+            "Expected slot.phase.aggregation span, got: {:?}",
             *span_names
         );
     }
@@ -3794,8 +3793,8 @@ mod tests {
 
         let span_names = captured.lock();
         assert!(
-            span_names.contains(&"rvc.epoch.boundary".to_string()),
-            "Expected rvc.epoch.boundary span at epoch boundary slot, got: {:?}",
+            span_names.contains(&"epoch.boundary".to_string()),
+            "Expected epoch.boundary span at epoch boundary slot, got: {:?}",
             *span_names
         );
     }
@@ -3886,11 +3885,11 @@ mod tests {
 
         let span_names = captured.lock();
         assert!(
-            span_names.contains(&"rvc.orchestrator.produce_aggregations".to_string()),
-            "Expected rvc.orchestrator.produce_aggregations span, got: {:?}",
+            span_names.contains(&"orchestrator.produce_aggregations".to_string()),
+            "Expected orchestrator.produce_aggregations span, got: {:?}",
             *span_names
         );
-        // Note: rvc.aggregation.submit may not appear under coverage instrumentation
+        // Note: aggregation.submit may not appear under coverage instrumentation
         // due to subscriber interference in concurrent test runs. The produce span
         // is the primary assertion for this test.
     }
@@ -3946,14 +3945,14 @@ mod tests {
         let span_names = captured.lock();
         // produce span should still be created (it wraps the entire per-validator loop body)
         assert!(
-            span_names.contains(&"rvc.orchestrator.produce_aggregations".to_string()),
-            "Expected rvc.orchestrator.produce_aggregations span even for non-aggregator, got: {:?}",
+            span_names.contains(&"orchestrator.produce_aggregations".to_string()),
+            "Expected orchestrator.produce_aggregations span even for non-aggregator, got: {:?}",
             *span_names
         );
         // submit span should NOT be created (no aggregates to submit)
         assert!(
-            !span_names.contains(&"rvc.aggregation.submit".to_string()),
-            "Did not expect rvc.aggregation.submit span for non-aggregator, got: {:?}",
+            !span_names.contains(&"aggregation.submit".to_string()),
+            "Did not expect aggregation.submit span for non-aggregator, got: {:?}",
             *span_names
         );
     }
@@ -4009,26 +4008,26 @@ mod tests {
 
         let span_map = spans.lock();
 
-        // Verify phase spans are children of rvc.slot.process
-        let block_parent = find_parent_name(&span_map, "rvc.slot.phase.block");
+        // Verify phase spans are children of slot.process
+        let block_parent = find_parent_name(&span_map, "slot.phase.block");
         assert_eq!(
             block_parent.as_deref(),
-            Some("rvc.slot.process"),
-            "rvc.slot.phase.block should be child of rvc.slot.process"
+            Some("slot.process"),
+            "slot.phase.block should be child of slot.process"
         );
 
-        let att_parent = find_parent_name(&span_map, "rvc.slot.phase.attestation");
+        let att_parent = find_parent_name(&span_map, "slot.phase.attestation");
         assert_eq!(
             att_parent.as_deref(),
-            Some("rvc.slot.process"),
-            "rvc.slot.phase.attestation should be child of rvc.slot.process"
+            Some("slot.process"),
+            "slot.phase.attestation should be child of slot.process"
         );
 
-        let agg_parent = find_parent_name(&span_map, "rvc.slot.phase.aggregation");
+        let agg_parent = find_parent_name(&span_map, "slot.phase.aggregation");
         assert_eq!(
             agg_parent.as_deref(),
-            Some("rvc.slot.process"),
-            "rvc.slot.phase.aggregation should be child of rvc.slot.process"
+            Some("slot.process"),
+            "slot.phase.aggregation should be child of slot.process"
         );
     }
 
@@ -4078,11 +4077,11 @@ mod tests {
 
         let span_map = spans.lock();
 
-        let epoch_parent = find_parent_name(&span_map, "rvc.epoch.boundary");
+        let epoch_parent = find_parent_name(&span_map, "epoch.boundary");
         assert_eq!(
             epoch_parent.as_deref(),
-            Some("rvc.slot.process"),
-            "rvc.epoch.boundary should be child of rvc.slot.process"
+            Some("slot.process"),
+            "epoch.boundary should be child of slot.process"
         );
     }
 
@@ -4553,6 +4552,9 @@ mod tests {
         let _ = beacon.get_node_version().await;
 
         let span_names = captured.lock();
+        // NOTE: this span is created by the `beacon` crate, whose rvc.* names are
+        // normalized in Phase 4 (4.11), not here. Keep the rvc.-prefixed name so
+        // the assertion matches beacon's current span; 4.11 updates both together.
         assert!(
             span_names.contains(&"rvc.beacon.http".to_string()),
             "Expected rvc.beacon.http span, got: {:?}",

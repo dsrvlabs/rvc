@@ -54,7 +54,7 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         }
     }
 
-    #[tracing::instrument(name = "rvc.orchestrator.fetch_epoch_duties", skip_all, fields(rvc.epoch = epoch))]
+    #[tracing::instrument(name = "orchestrator.fetch_epoch_duties", level = "debug", skip_all, fields(epoch = epoch))]
     pub(crate) async fn fetch_epoch_duties(&self, epoch: u64) {
         // Evict old caches to prevent unbounded growth
         self.duty_tracker.evict_old_caches(epoch).await;
@@ -200,7 +200,7 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         }
     }
 
-    #[tracing::instrument(name = "rvc.orchestrator.check_reorg", skip_all, fields(rvc.epoch = current_epoch))]
+    #[tracing::instrument(name = "orchestrator.check_reorg", level = "debug", skip_all, fields(epoch = current_epoch))]
     pub(crate) async fn check_reorg_at_epoch_boundary(&self, current_epoch: u64) {
         for epoch in [current_epoch, current_epoch + 1] {
             let attester_cached = self.duty_tracker.is_epoch_cached(epoch).await;
@@ -275,7 +275,7 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         }
     }
 
-    #[tracing::instrument(name = "rvc.orchestrator.prepare_proposers", skip_all)]
+    #[tracing::instrument(name = "orchestrator.prepare_proposers", level = "debug", skip_all)]
     pub(crate) async fn prepare_proposers(&self) {
         let mut preparations = Vec::new();
 
@@ -343,7 +343,7 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         }
     }
 
-    #[tracing::instrument(name = "rvc.orchestrator.submit_committee_subscriptions", skip_all, fields(rvc.epoch = epoch))]
+    #[tracing::instrument(name = "orchestrator.submit_committee_subscriptions", level = "debug", skip_all, fields(epoch = epoch))]
     pub(crate) async fn submit_committee_subscriptions(&self, epoch: u64) {
         let mut subscriptions = Vec::new();
         let pubkey_snapshot = self.pubkey_map.read().clone();
