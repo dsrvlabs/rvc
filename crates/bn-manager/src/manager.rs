@@ -174,7 +174,7 @@ impl BnManager {
     }
 
     /// Returns current health scores for all BNs.
-    #[tracing::instrument(name = "rvc.bn_manager.health_scores", skip_all)]
+    #[tracing::instrument(name = "bn_manager.health_scores", skip_all)]
     pub async fn health_scores(&self) -> Vec<BnHealthScore> {
         let health_guard = self.health_trackers.read().await;
         let sync_guard = self.sync_statuses.read().await;
@@ -202,7 +202,7 @@ impl BnManager {
     }
 
     /// Checks sync status of all configured BNs immediately.
-    #[tracing::instrument(name = "rvc.bn_manager.check_sync_status", skip_all)]
+    #[tracing::instrument(name = "bn_manager.check_sync_status", skip_all)]
     pub async fn check_sync_status(&self) {
         check_all_sync_statuses(&self.clients, &self.sync_statuses).await;
     }
@@ -253,7 +253,7 @@ impl BnManager {
     /// 1. If no BNs match the role, fall back to `All`-role BNs with WARN
     /// 2. If no BNs meet the tier, try the next lower tier with WARN
     /// 3. If still empty, fall back to all BNs
-    #[tracing::instrument(name = "rvc.bn_manager.synced_indices", skip_all, fields(role = %role, min_tier = %min_tier))]
+    #[tracing::instrument(name = "bn_manager.synced_indices", skip_all, fields(role = %role, min_tier = %min_tier))]
     async fn synced_indices(&self, role: BnRole, min_tier: HealthTier) -> Vec<usize> {
         let sync_guard = self.sync_statuses.read().await;
         let health_guard = self.health_trackers.read().await;
@@ -375,9 +375,9 @@ impl BnManager {
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
         let strategy_span = tracing::info_span!(
-            "rvc.bn.strategy.first",
-            rvc.bn.strategy = "first",
-            rvc.bn.tried = tracing::field::Empty,
+            "bn.strategy.first",
+            strategy = "first",
+            tried = tracing::field::Empty,
         );
         self.query_first_inner(op_name, role, min_tier, &op).instrument(strategy_span).await
     }
@@ -402,8 +402,8 @@ impl BnManager {
             let client = &self.clients[i];
             tried += 1;
             let attempt_span = tracing::info_span!(
-                "rvc.bn.attempt",
-                rvc.bn.url = %RedactedUrl(client.endpoint()),
+                "bn.attempt",
+                bn_url = %RedactedUrl(client.endpoint()),
             );
             let start = tokio::time::Instant::now();
             match op(client).instrument(attempt_span).await {
@@ -424,7 +424,7 @@ impl BnManager {
                         latency_ms = elapsed.as_millis() as u64,
                         "query succeeded"
                     );
-                    tracing::Span::current().record("rvc.bn.tried", tried);
+                    tracing::Span::current().record("tried", tried);
                     return Ok(result);
                 }
                 Err(e) => {
@@ -459,7 +459,7 @@ impl BnManager {
             }
         }
 
-        tracing::Span::current().record("rvc.bn.tried", tried);
+        tracing::Span::current().record("tried", tried);
         Err(last_err.expect("at least one client exists"))
     }
 
@@ -481,9 +481,9 @@ impl BnManager {
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
         let strategy_span = tracing::info_span!(
-            "rvc.bn.strategy.best",
-            rvc.bn.strategy = "best",
-            rvc.bn.tried = tracing::field::Empty,
+            "bn.strategy.best",
+            strategy = "best",
+            tried = tracing::field::Empty,
         );
         self.query_best_inner(op_name, role, min_tier, &op, pick_best)
             .instrument(strategy_span)
@@ -503,14 +503,14 @@ impl BnManager {
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
         let indices = self.synced_indices(role, min_tier).await;
-        tracing::Span::current().record("rvc.bn.tried", indices.len());
+        tracing::Span::current().record("tried", indices.len());
 
         if indices.len() == 1 {
             let client = &self.clients[indices[0]];
             let i = indices[0];
             let attempt_span = tracing::info_span!(
-                "rvc.bn.attempt",
-                rvc.bn.url = %RedactedUrl(client.endpoint()),
+                "bn.attempt",
+                bn_url = %RedactedUrl(client.endpoint()),
             );
             let start = tokio::time::Instant::now();
             match op(client).instrument(attempt_span).await {
@@ -546,8 +546,8 @@ impl BnManager {
             let idx = *i;
             let fut = op(client);
             let attempt_span = tracing::info_span!(
-                "rvc.bn.attempt",
-                rvc.bn.url = %RedactedUrl(client.endpoint()),
+                "bn.attempt",
+                bn_url = %RedactedUrl(client.endpoint()),
             );
             futs.push(Box::pin(
                 async move {
@@ -670,9 +670,9 @@ impl BnManager {
         F: Fn(&'s BeaconClient) -> BoxFut<'s, ()>,
     {
         let strategy_span = tracing::info_span!(
-            "rvc.bn.strategy.broadcast",
-            rvc.bn.strategy = "broadcast",
-            rvc.bn.tried = self.clients.len(),
+            "bn.strategy.broadcast",
+            strategy = "broadcast",
+            tried = self.clients.len(),
         );
         async {
             let broadcast = self.broadcast_inner(op_name, &op).await;
@@ -694,8 +694,8 @@ impl BnManager {
             let endpoint = client.endpoint().to_string();
             let fut = op(client);
             let attempt_span = tracing::info_span!(
-                "rvc.bn.attempt",
-                rvc.bn.url = %RedactedUrl(client.endpoint()),
+                "bn.attempt",
+                bn_url = %RedactedUrl(client.endpoint()),
             );
             futs.push(Box::pin(
                 async move {
@@ -773,9 +773,9 @@ impl BnManager {
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
         let strategy_span = tracing::info_span!(
-            "rvc.bn.strategy.broadcast",
-            rvc.bn.strategy = "broadcast",
-            rvc.bn.tried = self.clients.len(),
+            "bn.strategy.broadcast",
+            strategy = "broadcast",
+            tried = self.clients.len(),
         );
         async {
             let broadcast = self.broadcast_inner(op_name, &op).await;
@@ -1390,6 +1390,56 @@ mod tests {
     use crate::sync_status::{BnSyncDetail, BnSyncStatus};
 
     use super::*;
+
+    /// Gate 3 (high-risk redaction): the `bn.attempt` span's `bn_url` field MUST redact
+    /// URL credentials. Capturing the span's creation attributes, a credentialed endpoint
+    /// renders via RedactedUrl with no `user:pass@` reaching the log.
+    #[test]
+    fn attempt_span_redacts_bn_url_credentials() {
+        use std::sync::Mutex;
+
+        use tracing::field::{Field, Visit};
+        use tracing::span::Attributes;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Clone, Default)]
+        struct Cap(Arc<Mutex<String>>);
+        struct V<'a>(&'a mut String);
+        impl Visit for V<'_> {
+            fn record_debug(&mut self, f: &Field, v: &dyn std::fmt::Debug) {
+                use std::fmt::Write;
+                let _ = write!(self.0, " {}={:?}", f.name(), v);
+            }
+        }
+        impl<S> Layer<S> for Cap
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_new_span(&self, attrs: &Attributes<'_>, _id: &tracing::Id, _ctx: Context<'_, S>) {
+                if let Ok(mut buf) = self.0.lock() {
+                    attrs.record(&mut V(&mut buf));
+                }
+            }
+        }
+
+        let cap = Cap::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let _span = tracing::info_span!(
+                "bn.attempt",
+                bn_url = %RedactedUrl("http://user:pass@localhost:5052")
+            );
+        });
+
+        let captured = cap.0.lock().unwrap();
+        assert!(captured.contains("bn_url"), "bn_url field not captured: {captured}");
+        assert!(
+            !captured.contains("user:pass"),
+            "credentials leaked into the bn_url log field: {captured}"
+        );
+    }
 
     // -- Construction tests --
 
