@@ -920,7 +920,7 @@ impl BeaconClient {
             if attempt > 0 {
                 let backoff = self.calculate_backoff(attempt - 1);
                 debug!(
-                    endpoint = endpoint,
+                    endpoint = %RedactedUrl(endpoint),
                     attempt = attempt,
                     backoff_ms = backoff.as_millis() as u64,
                     bn_url = %RedactedUrl(url),
@@ -941,7 +941,7 @@ impl BeaconClient {
                         let latency_ms = request_start.elapsed().as_millis() as u64;
                         debug!(
                             method = http_method,
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(endpoint),
                             bn_url = %RedactedUrl(url),
                             status_code = status.as_u16(),
                             latency_ms = latency_ms,
@@ -997,7 +997,7 @@ impl BeaconClient {
                     if e.is_timeout() {
                         last_error = Some(BeaconError::Timeout);
                         warn!(
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(endpoint),
                             timeout_ms = self.config.timeout.as_millis() as u64,
                             attempt = attempt,
                             "Request timeout, will retry"
@@ -1019,7 +1019,7 @@ impl BeaconClient {
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
         span.in_scope(|| {
             error!(
-                endpoint = endpoint,
+                endpoint = %RedactedUrl(endpoint),
                 total_attempts = self.config.max_retries + 1,
                 last_error = %err,
                 "Request failed after all retries exhausted"
@@ -1053,7 +1053,7 @@ impl BeaconClient {
             if attempt > 0 {
                 let backoff = self.calculate_backoff(attempt - 1);
                 debug!(
-                    endpoint = endpoint,
+                    endpoint = %RedactedUrl(endpoint),
                     attempt = attempt,
                     backoff_ms = backoff.as_millis() as u64,
                     bn_url = %RedactedUrl(&url),
@@ -1080,7 +1080,7 @@ impl BeaconClient {
                     if status.is_success() {
                         debug!(
                             method = "POST",
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(endpoint),
                             bn_url = %RedactedUrl(&url),
                             status_code = status.as_u16(),
                             latency_ms = latency_ms,
@@ -1125,7 +1125,7 @@ impl BeaconClient {
                     if e.is_timeout() {
                         last_error = Some(BeaconError::Timeout);
                         warn!(
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(endpoint),
                             timeout_ms = self.config.timeout.as_millis() as u64,
                             attempt = attempt,
                             "Request timeout, will retry"
@@ -1147,7 +1147,7 @@ impl BeaconClient {
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
         span.in_scope(|| {
             error!(
-                endpoint = endpoint,
+                endpoint = %RedactedUrl(endpoint),
                 total_attempts = self.config.max_retries + 1,
                 last_error = %err,
                 "Request failed after all retries exhausted"
@@ -1180,7 +1180,7 @@ impl BeaconClient {
             if attempt > 0 {
                 let backoff = self.calculate_backoff(attempt - 1);
                 debug!(
-                    endpoint = endpoint,
+                    endpoint = %RedactedUrl(endpoint),
                     attempt = attempt,
                     backoff_ms = backoff.as_millis() as u64,
                     bn_url = %RedactedUrl(url),
@@ -1199,7 +1199,7 @@ impl BeaconClient {
                         let latency_ms = request_start.elapsed().as_millis() as u64;
                         debug!(
                             method = http_method,
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(endpoint),
                             bn_url = %RedactedUrl(url),
                             status_code = status.as_u16(),
                             latency_ms = latency_ms,
@@ -1244,7 +1244,7 @@ impl BeaconClient {
                     if e.is_timeout() {
                         last_error = Some(BeaconError::Timeout);
                         warn!(
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(endpoint),
                             timeout_ms = self.config.timeout.as_millis() as u64,
                             attempt = attempt,
                             "Request timeout, will retry"
@@ -1266,7 +1266,7 @@ impl BeaconClient {
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
         span.in_scope(|| {
             error!(
-                endpoint = endpoint,
+                endpoint = %RedactedUrl(endpoint),
                 total_attempts = self.config.max_retries + 1,
                 last_error = %err,
                 "Request failed after all retries exhausted"
@@ -5167,6 +5167,32 @@ mod tests {
         let result = client.get_validators(&pubkeys).await;
         assert!(result.is_ok(), "Small set should use GET: {:?}", result);
         assert_eq!(result.unwrap().data.len(), 3);
+    }
+
+    /// Issue 2.5: credentials embedded in the beacon endpoint must be redacted
+    /// in every emitted log field (bn_url + endpoint), never appearing raw.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_credentialed_endpoint_redacted_in_logs() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/states/head/validators"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(make_validators_response(1)))
+            .mount(&server)
+            .await;
+
+        // Embed basic-auth credentials in the configured endpoint URL.
+        let credentialed = server.uri().replace("http://", "http://user:secretpw@");
+        let config = BeaconClientConfig::new(credentialed).with_max_retries(0);
+        let client = BeaconClient::new(config).unwrap();
+
+        let pubkeys = vec![format!("0x{:096x}", 1)];
+        let result = client.get_validators(&pubkeys).await;
+        assert!(result.is_ok(), "credentialed request should still succeed: {result:?}");
+
+        // The emitted log fields show the redacted form, never the password.
+        assert!(logs_contain("***:***@"), "credentials must be redacted (bn_url/endpoint)");
+        assert!(!logs_contain("secretpw"), "the password must never appear in any log line");
     }
 
     #[tokio::test]

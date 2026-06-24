@@ -27,3 +27,4 @@ rand = { workspace = true }
 [dev-dependencies]
 tree_hash = { workspace = true }
 wiremock = { workspace = true }
+tracing-test = { workspace = true }
