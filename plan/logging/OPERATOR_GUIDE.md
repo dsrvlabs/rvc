@@ -128,6 +128,15 @@ So raising verbosity to `debug`/`trace` to chase an issue **never** exposes a ke
 credential. That is a hard P0 invariant, enforced by CI gates
 ([`STANDARD.md` §7](./STANDARD.md#7-enforcement-the-safety-net)).
 
+> **What's enforced (and what isn't).** Field-name conformance to this registry is a
+> **blocking** CI gate (Gate 5, issue 5.2) — but only over a **curated 16-event hot-path
+> set** (the attestation/block/sign/duty lines you actually grep), **not** every log line in
+> all 23 crates. So a green build guarantees the *covered* hot-path events use the canonical
+> spellings above; it is **not** an exhaustive promise that no crate anywhere ever emits a
+> stray key. If you spot a non-canonical key on some rarely-hit line, it is a normalization
+> gap to file, not a contract violation — the covered set is the enforced floor, widening it
+> to full breadth is future work.
+
 ---
 
 ## 4. Following a `request_id` (end to end, including the :9000 hop)

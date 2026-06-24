@@ -279,7 +279,8 @@ Gate 2  gitleaks                  → source tree + an emitted trace-level log s
 Gate 3  cargo nextest             → captured-subscriber tests: raw secret ABSENT, truncated/redacted form PRESENT,
                                      events fire at the intended level with the canonical fields, late-bound record() lands
 Gate 4  cargo nextest             → counting-allocator: a disabled debug!/trace! performs zero incremental allocation
-Gate 5  cargo nextest             → emitted field keys conform to the §2 registry (advisory, then blocking)
+Gate 5  cargo nextest             → emitted field keys conform to the §2 registry (BLOCKING as of issue 5.2)
+                                     — enforced over a CURATED 16-event hot-path set, NOT full 23-crate breadth
 Gate 6  cargo nextest             → architecture DAG stays acyclic; the one new edge rvc-signer-bin → rvc-telemetry is allowed
 ```
 
