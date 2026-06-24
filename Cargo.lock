@@ -4432,6 +4432,7 @@ dependencies = [
  "tokio",
  "tower 0.5.3",
  "tracing",
+ "tracing-test",
 ]
 
 [[package]]
@@ -4443,6 +4444,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "tracing-test",
 ]
 
 [[package]]
