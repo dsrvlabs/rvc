@@ -1,0 +1,83 @@
+# rvc - Per-Validator Configuration
+# Copy this file to validators.toml and customize as needed.
+#
+# Referenced from config.toml via:
+#   validators_config = "./validators.toml"
+# or on the CLI via:
+#   rvc start -c config.toml --validators-config validators.toml
+#
+# This file is effectively required: rvc has no top-level fee recipient
+# setting, and startup refuses to continue if the effective default fee
+# recipient resolves to the zero address. A file with just [defaults] and
+# no [[validators]] entries is enough to boot.
+#
+# See docs/validators-config.md for the full reference and
+# docs/keymanager-api.md / docs/keymanager-api.openapi.yaml for the HTTP API
+# that can read/write fee_recipient, gas_limit, and graffiti at runtime
+# (changes made through the API are written back into this file).
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+# Applied to every validator that does not specify its own override below.
+
+[defaults]
+
+# Execution-layer address that receives block rewards and MEV payments.
+# REQUIRED to be non-zero, or rvc will refuse to start.
+# Replace this placeholder with your own address before running rvc.
+fee_recipient = "0x00000000000000000000000000000000dEaDbEEF"
+
+# Execution-layer gas limit target passed to the builder/EL. (default: 30000000)
+gas_limit = 30000000
+
+# Default block graffiti. UTF-8, silently truncated to 32 bytes if longer.
+# (optional; default: none)
+# graffiti = "rvc"
+
+# ---------------------------------------------------------------------------
+# Per-validator overrides
+# ---------------------------------------------------------------------------
+# One [[validators]] table per BLS pubkey. Every field except `pubkey` is
+# optional and falls back to the [defaults] value (or its own hardcoded
+# default) when omitted.
+
+[[validators]]
+# 48-byte BLS public key. `0x` prefix optional. Required.
+pubkey = "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a"
+
+# Overrides [defaults].fee_recipient for this validator only. (optional)
+# fee_recipient = "0xAbcF8e0d4e9587369b2301D0790347320302cc09"
+
+# Overrides [defaults].gas_limit for this validator only. (optional)
+# gas_limit = 36000000
+
+# Overrides [defaults].graffiti for this validator only. (optional)
+# graffiti = "custom-graffiti"
+
+# Opt in to builder (MEV-boost) block production for this validator.
+# There is no global default for this — it is off unless enabled here.
+# (optional; default: false)
+# builder_proposals = true
+
+# Weighting used when comparing local vs. builder block value.
+# 0 disables the builder path; u64::MAX forces builder-always/only semantics.
+# (optional; default: 100)
+# builder_boost_factor = 100
+
+# Master per-validator signing gate. false blocks all attesting/proposing
+# for this key. Validators not listed in this file at all default to
+# enabled = false unless they were loaded from a keystore at startup, in
+# which case rvc registers them as enabled automatically.
+# (optional; default: true)
+# enabled = true
+
+# One of: max-profit (default), execution-only, builder-always, builder-only.
+# There is no [defaults]-level equivalent — this can only be set per-validator.
+# (optional; default: max-profit)
+# block_selection_mode = "max-profit"
+
+# A second validator with no overrides — inherits every [defaults] value,
+# and builder_proposals stays disabled since it has no global default.
+[[validators]]
+pubkey = "0xa1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6"
