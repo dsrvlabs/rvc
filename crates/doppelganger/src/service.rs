@@ -102,7 +102,7 @@ impl DoppelgangerService {
     /// If the validator signed within the last `monitoring_epochs` epochs,
     /// it is considered a restart and marked `Safe` immediately.
     /// Otherwise, it needs monitoring.
-    #[tracing::instrument(name = "rvc.doppelganger.check_validators", skip_all, fields(rvc.operation = "check_validators", rvc.doppelganger.validator_count = pubkeys.len()))]
+    #[tracing::instrument(name = "doppelganger.check_validators", skip_all, fields(validator_count = pubkeys.len()))]
     pub fn check_validators(
         &self,
         pubkeys: &[String],
@@ -162,7 +162,7 @@ impl DoppelgangerService {
     /// (no slashing DB entry for that epoch), that validator has a doppelganger.
     ///
     /// `validator_indices` maps pubkey -> validator index (as string).
-    #[tracing::instrument(name = "rvc.doppelganger.monitor", skip_all, fields(rvc.operation = "monitor", rvc.doppelganger.validator_count = pubkeys_to_monitor.len(), rvc.doppelganger.detected_count))]
+    #[tracing::instrument(name = "doppelganger.monitor", skip_all, fields(validator_count = pubkeys_to_monitor.len(), detected_count = tracing::field::Empty))]
     pub async fn run_monitoring(
         &self,
         pubkeys_to_monitor: &[String],
@@ -201,8 +201,7 @@ impl DoppelgangerService {
             }
             let check_epoch = base_epoch - epoch_offset;
 
-            let epoch_span =
-                tracing::info_span!("rvc.doppelganger.epoch_check", rvc.epoch = check_epoch,);
+            let epoch_span = tracing::info_span!("doppelganger.epoch_check", epoch = check_epoch,);
 
             let liveness_data = self
                 .liveness_checker
@@ -252,7 +251,14 @@ impl DoppelgangerService {
             );
         }
 
-        tracing::Span::current().record("rvc.doppelganger.detected_count", detected.len() as u64);
+        // Late-bind the detected count onto the `doppelganger.monitor` span via the kit
+        // helper. The field was declared `field::Empty` at span creation, so this record
+        // lands (a raw key not declared there would be silently dropped).
+        crypto::logging::record_debug(
+            &tracing::Span::current(),
+            "detected_count",
+            detected.len() as u64,
+        );
 
         Ok(DoppelgangerResult { safe_validators, detected })
     }
@@ -266,6 +272,53 @@ mod tests {
     use super::*;
     use crate::traits::{LegacySlashingHistoryReader, LivenessChecker, ValidatorLivenessData};
     use crate::{DoppelgangerError, DoppelgangerStatus};
+
+    /// The `doppelganger.monitor` span declares `detected_count = field::Empty` and the run
+    /// late-binds it via `crypto::logging::record_debug`. This proves that record lands —
+    /// the field name in the helper call MUST match the declared field or it silently
+    /// vanishes (the #1 record() foot-gun).
+    #[test]
+    fn monitor_span_late_binds_detected_count_via_kit() {
+        use tracing::field::{Field, Visit};
+        use tracing::span::Record;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Clone, Default)]
+        struct Cap(Arc<Mutex<Vec<String>>>);
+        struct V<'a>(&'a mut Vec<String>);
+        impl Visit for V<'_> {
+            fn record_debug(&mut self, f: &Field, _v: &dyn std::fmt::Debug) {
+                self.0.push(f.name().to_string());
+            }
+        }
+        impl<S> Layer<S> for Cap
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_record(&self, _id: &tracing::Id, values: &Record<'_>, _ctx: Context<'_, S>) {
+                if let Ok(mut keys) = self.0.lock() {
+                    values.record(&mut V(&mut keys));
+                }
+            }
+        }
+
+        let cap = Cap::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span =
+                tracing::info_span!("doppelganger.monitor", detected_count = tracing::field::Empty);
+            let _e = span.enter();
+            crypto::logging::record_debug(&tracing::Span::current(), "detected_count", 3u64);
+        });
+
+        let recorded = cap.0.lock().unwrap();
+        assert!(
+            recorded.iter().any(|k| k == "detected_count"),
+            "late-bound detected_count did not land on the monitor span: {recorded:?}"
+        );
+    }
 
     // -- Mock implementations --
 

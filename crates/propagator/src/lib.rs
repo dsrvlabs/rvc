@@ -86,7 +86,7 @@ impl<S: AttestationSubmitter> Propagator<S> {
     }
 
     /// Propagates attestations to the beacon node.
-    #[tracing::instrument(name = "rvc.propagator.propagate", skip_all, fields(rvc.count))]
+    #[tracing::instrument(name = "propagator.propagate", skip_all, fields(count = tracing::field::Empty))]
     pub async fn propagate(
         &self,
         attestations: &VersionedAttestation,
@@ -96,7 +96,10 @@ impl<S: AttestationSubmitter> Propagator<S> {
             VersionedAttestation::Electra(a) | VersionedAttestation::Fulu(a) => a.len(),
         };
 
-        tracing::Span::current().record("rvc.count", total);
+        // Late-bind the count onto the span. propagator has no crypto dep, so this uses the
+        // raw record() directly (not crypto::logging::record_debug); the key "count" matches
+        // the field::Empty declared on the #[instrument] above so the record lands.
+        tracing::Span::current().record("count", total);
 
         let (batch_slot, batch_target_epoch, _batch_committee_index) =
             extract_attestation_context(attestations);
@@ -186,6 +189,53 @@ mod tests {
 
     use super::*;
     use bn_manager::{AttestationData, Checkpoint, IndexedAttestationError, LegacyAttestation};
+
+    /// The `propagator.propagate` span declares `count = field::Empty` and the run late-binds
+    /// it via a raw `Span::record("count", ..)` (propagator has no crypto dep for the kit
+    /// helper). This proves the record lands — the key MUST match the declared field name.
+    #[test]
+    fn propagate_span_late_binds_count() {
+        use std::sync::{Arc, Mutex};
+
+        use tracing::field::{Field, Visit};
+        use tracing::span::Record;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::registry::LookupSpan;
+
+        #[derive(Clone, Default)]
+        struct Cap(Arc<Mutex<Vec<String>>>);
+        struct V<'a>(&'a mut Vec<String>);
+        impl Visit for V<'_> {
+            fn record_debug(&mut self, f: &Field, _v: &dyn std::fmt::Debug) {
+                self.0.push(f.name().to_string());
+            }
+        }
+        impl<S> Layer<S> for Cap
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_record(&self, _id: &tracing::Id, values: &Record<'_>, _ctx: Context<'_, S>) {
+                if let Ok(mut keys) = self.0.lock() {
+                    values.record(&mut V(&mut keys));
+                }
+            }
+        }
+
+        let cap = Cap::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("propagator.propagate", count = tracing::field::Empty);
+            let _e = span.enter();
+            tracing::Span::current().record("count", 5usize);
+        });
+
+        let recorded = cap.0.lock().unwrap();
+        assert!(
+            recorded.iter().any(|k| k == "count"),
+            "late-bound count did not land on the propagate span: {recorded:?}"
+        );
+    }
 
     struct MockSubmitter {
         result: tokio::sync::Mutex<SubmitAttestationResult>,

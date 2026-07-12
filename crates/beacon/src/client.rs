@@ -184,7 +184,7 @@ impl BeaconClient {
     ) -> Result<AttesterDutiesResponse, BeaconError> {
         let path = format!("/eth/v1/validator/duties/attester/{}", epoch);
         self.post(&path, &validator_indices)
-            .instrument(tracing::info_span!("rvc.beacon.get_attester_duties", epoch = epoch))
+            .instrument(tracing::info_span!("beacon.get_attester_duties", epoch = epoch))
             .await
     }
 
@@ -199,14 +199,12 @@ impl BeaconClient {
         if pubkeys.len() > Self::POST_VALIDATORS_THRESHOLD {
             let path = "/eth/v1/beacon/states/head/validators";
             let body = serde_json::json!({ "ids": pubkeys });
-            self.post(path, &body)
-                .instrument(tracing::info_span!("rvc.beacon.get_validators"))
-                .await
+            self.post(path, &body).instrument(tracing::info_span!("beacon.get_validators")).await
         } else {
             let ids: String =
                 pubkeys.iter().map(|pk| format!("id={}", pk)).collect::<Vec<_>>().join("&");
             let path = format!("/eth/v1/beacon/states/head/validators?{}", ids);
-            self.get(&path).instrument(tracing::info_span!("rvc.beacon.get_validators")).await
+            self.get(&path).instrument(tracing::info_span!("beacon.get_validators")).await
         }
     }
 
@@ -227,7 +225,7 @@ impl BeaconClient {
             slot, committee_index
         );
         self.get(&path)
-            .instrument(tracing::info_span!("rvc.beacon.get_attestation_data", slot = slot))
+            .instrument(tracing::info_span!("beacon.get_attestation_data", slot = slot))
             .await
     }
 
@@ -235,13 +233,13 @@ impl BeaconClient {
     ///
     /// Returns a map of all configuration parameters as string key-value pairs.
     /// Includes fork versions, fork epochs, slot timing, and other consensus parameters.
-    #[tracing::instrument(name = "rvc.beacon.get_config_spec", skip_all)]
+    #[tracing::instrument(name = "beacon.get_config_spec", skip_all)]
     pub async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
         self.get("/eth/v1/config/spec").await
     }
 
     /// Fetches the config spec and parses fork epoch and version fields into a `ForkSchedule`.
-    #[tracing::instrument(name = "rvc.beacon.get_fork_schedule", skip_all)]
+    #[tracing::instrument(name = "beacon.get_fork_schedule", skip_all)]
     pub async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
         let spec = self.get_config_spec().await?;
         parse_fork_schedule(&spec.data)
@@ -250,7 +248,7 @@ impl BeaconClient {
     /// Fetches genesis information from the beacon node.
     ///
     /// Returns the genesis time, genesis validators root, and genesis fork version.
-    #[tracing::instrument(name = "rvc.beacon.get_genesis", skip_all)]
+    #[tracing::instrument(name = "beacon.get_genesis", skip_all)]
     pub async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
         self.get("/eth/v1/beacon/genesis").await
     }
@@ -259,7 +257,7 @@ impl BeaconClient {
     ///
     /// Returns the previous and current fork versions along with the fork epoch.
     /// Common state_id values: "head", "finalized", "justified", or a specific slot number.
-    #[tracing::instrument(name = "rvc.beacon.get_fork", skip_all)]
+    #[tracing::instrument(name = "beacon.get_fork", skip_all)]
     pub async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError> {
         let path = format!("/eth/v1/beacon/states/{}/fork", state_id);
         self.get(&path).await
@@ -268,7 +266,7 @@ impl BeaconClient {
     /// Fetches the block root for the given block identifier.
     ///
     /// Common block_id values: "head", "finalized", "justified", or a slot number.
-    #[tracing::instrument(name = "rvc.beacon.get_block_root", skip_all)]
+    #[tracing::instrument(name = "beacon.get_block_root", skip_all)]
     pub async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
         let path = format!("/eth/v1/beacon/blocks/{}/root", block_id);
         self.get(&path).await
@@ -281,7 +279,7 @@ impl BeaconClient {
     ) -> Result<ProposerDutiesResponse, BeaconError> {
         let path = format!("/eth/v1/validator/duties/proposer/{}", epoch);
         self.get(&path)
-            .instrument(tracing::info_span!("rvc.beacon.get_proposer_duties", epoch = epoch))
+            .instrument(tracing::info_span!("beacon.get_proposer_duties", epoch = epoch))
             .await
     }
 
@@ -296,6 +294,11 @@ impl BeaconClient {
     /// Requests SSZ-encoded response for reduced network latency on large blocks.
     /// Falls back to JSON if the BN does not support SSZ or responds with JSON
     /// despite the SSZ preference.
+    ///
+    /// Wrapped in a `beacon.produce_block_v3` span (canonical `slot`), mirroring the sibling
+    /// `beacon.*` duty-call spans so the proposer-duty BN call is correlatable. `skip_all`
+    /// keeps `randao_reveal` and the other args out of the span (no eager formatting).
+    #[tracing::instrument(name = "beacon.produce_block_v3", level = "debug", skip_all, fields(slot = slot))]
     pub async fn produce_block_v3(
         &self,
         slot: u64,
@@ -496,7 +499,7 @@ impl BeaconClient {
             signed_block,
             &[("Eth-Consensus-Version", consensus_version)],
         )
-        .instrument(tracing::info_span!("rvc.beacon.publish_block"))
+        .instrument(tracing::info_span!("beacon.publish_block"))
         .await
     }
 
@@ -511,7 +514,7 @@ impl BeaconClient {
             signed_blinded_block,
             &[("Eth-Consensus-Version", consensus_version)],
         )
-        .instrument(tracing::info_span!("rvc.beacon.publish_blinded_block"))
+        .instrument(tracing::info_span!("beacon.publish_blinded_block"))
         .await
     }
 
@@ -565,7 +568,7 @@ impl BeaconClient {
     ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
         let path = format!("/eth/v1/validator/duties/sync/{}", epoch);
         self.post(&path, &validator_indices)
-            .instrument(tracing::info_span!("rvc.beacon.get_sync_committee_duties", epoch = epoch))
+            .instrument(tracing::info_span!("beacon.get_sync_committee_duties", epoch = epoch))
             .await
     }
 
@@ -575,12 +578,12 @@ impl BeaconClient {
         messages: &[SyncCommitteeMessage],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/beacon/pool/sync_committees", &messages)
-            .instrument(tracing::info_span!("rvc.beacon.submit_sync_committee_messages"))
+            .instrument(tracing::info_span!("beacon.submit_sync_committee_messages"))
             .await
     }
 
     /// Fetches a sync committee contribution for the given slot, subcommittee index, and block root.
-    #[tracing::instrument(name = "rvc.beacon.get_sync_committee_contribution", skip_all, fields(rvc.slot = slot))]
+    #[tracing::instrument(name = "beacon.get_sync_committee_contribution", skip_all, fields(slot = slot))]
     pub async fn get_sync_committee_contribution(
         &self,
         slot: u64,
@@ -600,7 +603,7 @@ impl BeaconClient {
         proofs: &[SignedContributionAndProof],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/validator/contribution_and_proofs", &proofs)
-            .instrument(tracing::info_span!("rvc.beacon.submit_contribution_and_proofs"))
+            .instrument(tracing::info_span!("beacon.submit_contribution_and_proofs"))
             .await
     }
 
@@ -610,7 +613,7 @@ impl BeaconClient {
     ///
     /// The `committee_index` parameter is required for Electra and later forks.
     /// Pass `None` for pre-Electra requests.
-    #[tracing::instrument(name = "rvc.beacon.get_aggregate_attestation", skip_all, fields(rvc.slot = slot))]
+    #[tracing::instrument(name = "beacon.get_aggregate_attestation", skip_all, fields(slot = slot))]
     pub async fn get_aggregate_attestation(
         &self,
         slot: u64,
@@ -639,7 +642,7 @@ impl BeaconClient {
         &self,
         proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError> {
-        let span = tracing::info_span!("rvc.beacon.submit_aggregate_and_proofs");
+        let span = tracing::info_span!("beacon.submit_aggregate_and_proofs");
         match proofs {
             VersionedSignedAggregateAndProof::PreElectra(ps) => {
                 self.post_empty("/eth/v1/validator/aggregate_and_proofs", ps).instrument(span).await
@@ -674,7 +677,7 @@ impl BeaconClient {
         preparations: &[ProposerPreparation],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/validator/prepare_beacon_proposer", &preparations)
-            .instrument(tracing::info_span!("rvc.beacon.prepare_beacon_proposer"))
+            .instrument(tracing::info_span!("beacon.prepare_beacon_proposer"))
             .await
     }
 
@@ -682,7 +685,7 @@ impl BeaconClient {
     ///
     /// Returns liveness data indicating whether each validator was active
     /// during the specified epoch. Used for doppelganger detection.
-    #[tracing::instrument(name = "rvc.beacon.post_validator_liveness", skip_all, fields(rvc.epoch = epoch))]
+    #[tracing::instrument(name = "beacon.post_validator_liveness", skip_all, fields(epoch = epoch))]
     pub async fn post_validator_liveness(
         &self,
         epoch: u64,
@@ -702,7 +705,7 @@ impl BeaconClient {
         signed_exit: &SignedVoluntaryExit,
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/beacon/pool/voluntary_exits", signed_exit)
-            .instrument(tracing::info_span!("rvc.beacon.submit_voluntary_exit"))
+            .instrument(tracing::info_span!("beacon.submit_voluntary_exit"))
             .await
     }
 
@@ -715,7 +718,7 @@ impl BeaconClient {
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/validator/beacon_committee_subscriptions", &subscriptions)
-            .instrument(tracing::info_span!("rvc.beacon.submit_beacon_committee_subscriptions"))
+            .instrument(tracing::info_span!("beacon.submit_beacon_committee_subscriptions"))
             .await
     }
 
@@ -726,7 +729,7 @@ impl BeaconClient {
         registrations: &[SignedValidatorRegistration],
     ) -> Result<(), BeaconError> {
         self.post_empty("/eth/v1/validator/register_validator", &registrations)
-            .instrument(tracing::info_span!("rvc.beacon.register_validators"))
+            .instrument(tracing::info_span!("beacon.register_validators"))
             .await
     }
 
@@ -734,13 +737,13 @@ impl BeaconClient {
     ///
     /// Returns whether the node is syncing, its head slot, sync distance,
     /// and whether the execution layer is offline.
-    #[tracing::instrument(name = "rvc.beacon.get_node_syncing", skip_all)]
+    #[tracing::instrument(name = "beacon.get_node_syncing", skip_all)]
     pub async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
         self.get("/eth/v1/node/syncing").await
     }
 
     /// Fetches the node version string from the beacon node.
-    #[tracing::instrument(name = "rvc.beacon.get_node_version", skip_all)]
+    #[tracing::instrument(name = "beacon.get_node_version", skip_all)]
     pub async fn get_node_version(&self) -> Result<String, BeaconError> {
         let response: crate::types::NodeVersionResponse = self.get("/eth/v1/node/version").await?;
         Ok(response.data.version)
@@ -760,7 +763,7 @@ impl BeaconClient {
         let url = format!("{}/eth/v2/beacon/pool/attestations", self.config.endpoint);
 
         let span = tracing::info_span!(
-            "rvc.beacon.submit_attestations",
+            "beacon.submit_attestations",
             http.method = "POST",
             http.url = %RedactedUrl(&url),
             http.status_code = tracing::field::Empty,
@@ -908,7 +911,7 @@ impl BeaconClient {
         T: DeserializeOwned,
     {
         let span = tracing::info_span!(
-            "rvc.beacon.http",
+            "beacon.http",
             http.method = %http_method,
             http.url = %RedactedUrl(url),
             http.status_code = tracing::field::Empty,
@@ -920,7 +923,7 @@ impl BeaconClient {
             if attempt > 0 {
                 let backoff = self.calculate_backoff(attempt - 1);
                 debug!(
-                    endpoint = endpoint,
+                    endpoint = %RedactedUrl(endpoint),
                     attempt = attempt,
                     backoff_ms = backoff.as_millis() as u64,
                     bn_url = %RedactedUrl(url),
@@ -941,7 +944,7 @@ impl BeaconClient {
                         let latency_ms = request_start.elapsed().as_millis() as u64;
                         debug!(
                             method = http_method,
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(endpoint),
                             bn_url = %RedactedUrl(url),
                             status_code = status.as_u16(),
                             latency_ms = latency_ms,
@@ -997,7 +1000,7 @@ impl BeaconClient {
                     if e.is_timeout() {
                         last_error = Some(BeaconError::Timeout);
                         warn!(
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(endpoint),
                             timeout_ms = self.config.timeout.as_millis() as u64,
                             attempt = attempt,
                             "Request timeout, will retry"
@@ -1019,7 +1022,7 @@ impl BeaconClient {
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
         span.in_scope(|| {
             error!(
-                endpoint = endpoint,
+                endpoint = %RedactedUrl(endpoint),
                 total_attempts = self.config.max_retries + 1,
                 last_error = %err,
                 "Request failed after all retries exhausted"
@@ -1038,7 +1041,7 @@ impl BeaconClient {
         let url = format!("{}{}", self.config.endpoint, path);
 
         let span = tracing::info_span!(
-            "rvc.beacon.http",
+            "beacon.http",
             http.method = "POST",
             http.url = %RedactedUrl(&url),
             http.status_code = tracing::field::Empty,
@@ -1053,7 +1056,7 @@ impl BeaconClient {
             if attempt > 0 {
                 let backoff = self.calculate_backoff(attempt - 1);
                 debug!(
-                    endpoint = endpoint,
+                    endpoint = %RedactedUrl(endpoint),
                     attempt = attempt,
                     backoff_ms = backoff.as_millis() as u64,
                     bn_url = %RedactedUrl(&url),
@@ -1080,7 +1083,7 @@ impl BeaconClient {
                     if status.is_success() {
                         debug!(
                             method = "POST",
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(endpoint),
                             bn_url = %RedactedUrl(&url),
                             status_code = status.as_u16(),
                             latency_ms = latency_ms,
@@ -1125,7 +1128,7 @@ impl BeaconClient {
                     if e.is_timeout() {
                         last_error = Some(BeaconError::Timeout);
                         warn!(
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(endpoint),
                             timeout_ms = self.config.timeout.as_millis() as u64,
                             attempt = attempt,
                             "Request timeout, will retry"
@@ -1147,7 +1150,7 @@ impl BeaconClient {
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
         span.in_scope(|| {
             error!(
-                endpoint = endpoint,
+                endpoint = %RedactedUrl(endpoint),
                 total_attempts = self.config.max_retries + 1,
                 last_error = %err,
                 "Request failed after all retries exhausted"
@@ -1168,7 +1171,7 @@ impl BeaconClient {
         Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
     {
         let span = tracing::info_span!(
-            "rvc.beacon.http",
+            "beacon.http",
             http.method = %http_method,
             http.url = %RedactedUrl(url),
             http.status_code = tracing::field::Empty,
@@ -1180,7 +1183,7 @@ impl BeaconClient {
             if attempt > 0 {
                 let backoff = self.calculate_backoff(attempt - 1);
                 debug!(
-                    endpoint = endpoint,
+                    endpoint = %RedactedUrl(endpoint),
                     attempt = attempt,
                     backoff_ms = backoff.as_millis() as u64,
                     bn_url = %RedactedUrl(url),
@@ -1199,7 +1202,7 @@ impl BeaconClient {
                         let latency_ms = request_start.elapsed().as_millis() as u64;
                         debug!(
                             method = http_method,
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(endpoint),
                             bn_url = %RedactedUrl(url),
                             status_code = status.as_u16(),
                             latency_ms = latency_ms,
@@ -1244,7 +1247,7 @@ impl BeaconClient {
                     if e.is_timeout() {
                         last_error = Some(BeaconError::Timeout);
                         warn!(
-                            endpoint = endpoint,
+                            endpoint = %RedactedUrl(endpoint),
                             timeout_ms = self.config.timeout.as_millis() as u64,
                             attempt = attempt,
                             "Request timeout, will retry"
@@ -1266,7 +1269,7 @@ impl BeaconClient {
         let err = last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string()));
         span.in_scope(|| {
             error!(
-                endpoint = endpoint,
+                endpoint = %RedactedUrl(endpoint),
                 total_attempts = self.config.max_retries + 1,
                 last_error = %err,
                 "Request failed after all retries exhausted"
@@ -2957,6 +2960,93 @@ mod tests {
         let block = result.parse_full_block().unwrap();
         assert_eq!(block.block().slot, 100);
         assert_eq!(block.block().proposer_index, 42);
+    }
+
+    /// `produce_block_v3` — the proposer-duty block-production BN call — must run its work
+    /// inside a `beacon.produce_block_v3` span carrying the canonical `slot` field, at `debug`
+    /// level, matching its sibling `beacon.*` hot-path spans. Proves the span fires (correct
+    /// name + level) and that `slot` lands; `skip_all` keeps `randao_reveal` out of the span.
+    #[tokio::test]
+    async fn produce_block_v3_emits_debug_span_with_slot() {
+        use std::sync::{Arc, Mutex};
+
+        use tracing::field::{Field, Visit};
+        use tracing::span::Attributes;
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::registry::LookupSpan;
+
+        // (span name, span level, captured field keys) for one created span.
+        type SpanRecord = (String, tracing::Level, Vec<String>);
+
+        #[derive(Clone, Default)]
+        struct Cap {
+            spans: Arc<Mutex<Vec<SpanRecord>>>,
+        }
+        struct V<'a>(&'a mut Vec<String>);
+        impl Visit for V<'_> {
+            fn record_debug(&mut self, f: &Field, _v: &dyn std::fmt::Debug) {
+                self.0.push(f.name().to_string());
+            }
+        }
+        impl<S> Layer<S> for Cap
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_new_span(&self, attrs: &Attributes<'_>, _id: &tracing::Id, _ctx: Context<'_, S>) {
+                let meta = attrs.metadata();
+                let mut keys = Vec::new();
+                attrs.record(&mut V(&mut keys));
+                if let Ok(mut spans) = self.spans.lock() {
+                    spans.push((meta.name().to_string(), *meta.level(), keys));
+                }
+            }
+        }
+
+        let mock_server = MockServer::start().await;
+        let envelope = serde_json::json!({
+            "version": "deneb",
+            "execution_optimistic": false,
+            "data": {
+                "slot": "777",
+                "proposer_index": "42",
+                "parent_root": format!("0x{}", "01".repeat(32)),
+                "state_root": format!("0x{}", "02".repeat(32)),
+                "body": "0xdead"
+            }
+        });
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/777"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(&envelope)
+                    .insert_header("Eth-Consensus-Version", "deneb"),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+
+        let cap = Cap::default();
+        let subscriber = tracing_subscriber::registry().with(cap.clone());
+        // `set_default` sets the thread-local dispatcher and returns a drop-guard, so it works
+        // inside this async test (unlike `with_default`, whose closure cannot `.await`).
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let _ = client.produce_block_v3(777, "0xrandao", None, None).await;
+        drop(_guard);
+
+        let spans = cap.spans.lock().unwrap();
+        let span = spans
+            .iter()
+            .find(|(name, ..)| name == "beacon.produce_block_v3")
+            .expect("beacon.produce_block_v3 span must be created");
+        assert_eq!(span.1, tracing::Level::DEBUG, "span must be at DEBUG level");
+        assert!(
+            span.2.iter().any(|k| k == "slot"),
+            "span must carry canonical `slot`: {:?}",
+            span.2
+        );
     }
 
     #[tokio::test]
@@ -5167,6 +5257,32 @@ mod tests {
         let result = client.get_validators(&pubkeys).await;
         assert!(result.is_ok(), "Small set should use GET: {:?}", result);
         assert_eq!(result.unwrap().data.len(), 3);
+    }
+
+    /// Issue 2.5: credentials embedded in the beacon endpoint must be redacted
+    /// in every emitted log field (bn_url + endpoint), never appearing raw.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_credentialed_endpoint_redacted_in_logs() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/states/head/validators"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(make_validators_response(1)))
+            .mount(&server)
+            .await;
+
+        // Embed basic-auth credentials in the configured endpoint URL.
+        let credentialed = server.uri().replace("http://", "http://user:secretpw@");
+        let config = BeaconClientConfig::new(credentialed).with_max_retries(0);
+        let client = BeaconClient::new(config).unwrap();
+
+        let pubkeys = vec![format!("0x{:096x}", 1)];
+        let result = client.get_validators(&pubkeys).await;
+        assert!(result.is_ok(), "credentialed request should still succeed: {result:?}");
+
+        // The emitted log fields show the redacted form, never the password.
+        assert!(logs_contain("***:***@"), "credentials must be redacted (bn_url/endpoint)");
+        assert!(!logs_contain("secretpw"), "the password must never appear in any log line");
     }
 
     #[tokio::test]

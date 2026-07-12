@@ -4,7 +4,7 @@ use builder::CircuitBreakerState;
 use tracing::{debug, error, info, warn, Instrument};
 use tree_hash::TreeHash;
 
-use crypto::logging::TruncatedPubkey;
+use crypto::logging::{TruncatedPubkey, TruncatedRoot};
 use crypto::PublicKey;
 use eth_types::{ForkSchedule, Root, Slot, SLOTS_PER_EPOCH};
 use signer::ValidatorSigner;
@@ -78,13 +78,14 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
     /// BN-reported head before calling the signer. On validation failure the
     /// duty is dropped with an `error!` log and no signer call is made (H-4).
     #[tracing::instrument(
-        name = "rvc.block.propose",
+        name = "block.propose",
+        level = "debug",
         skip_all,
         fields(
-            rvc.slot = slot,
-            rvc.block.blinded = tracing::field::Empty,
-            rvc.block.consensus_version = tracing::field::Empty,
-            rvc.block.value_wei = tracing::field::Empty,
+            slot = slot,
+            block.blinded = tracing::field::Empty,
+            block.consensus_version = tracing::field::Empty,
+            block.value_wei = tracing::field::Empty,
         )
     )]
     pub async fn propose_block(
@@ -131,7 +132,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let randao_bytes = self
             .signer
             .sign_randao_reveal(epoch, pubkey, &self.fork_schedule, &self.genesis_validators_root)
-            .instrument(tracing::info_span!("rvc.sign.randao"))
+            .instrument(tracing::info_span!("sign.randao"))
             .await
             .map_err(|e| {
                 let err = BlockServiceError::Signer(e.to_string());
@@ -198,7 +199,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let response = self
             .beacon
             .produce_block_v3(slot, &randao_hex, graffiti_hex.as_deref(), Some(boost))
-            .instrument(tracing::info_span!("rvc.beacon.produce_block_v3"))
+            .instrument(tracing::info_span!("beacon.produce_block_v3"))
             .await;
 
         // Handle block-production failure, tagging the error so the coordinator
@@ -246,10 +247,10 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
 
         // Record dynamic attributes after block production
         let span = tracing::Span::current();
-        span.record("rvc.block.blinded", response.is_blinded);
-        span.record("rvc.block.consensus_version", &response.consensus_version);
+        span.record("block.blinded", response.is_blinded);
+        span.record("block.consensus_version", &response.consensus_version);
         if let Some(ref value) = response.execution_payload_value {
-            span.record("rvc.block.value_wei", value.as_str());
+            span.record("block.value_wei", value.as_str());
         }
 
         // 4. Sign and publish based on block type
@@ -269,7 +270,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         info!(
             slot = slot,
             pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            block_root = %format!("0x{}", hex::encode(block_root)),
+            block_root = %TruncatedRoot::new(&block_root),
             is_blinded = is_blinded,
             duration_ms = proposal_start.elapsed().as_millis() as u64,
             "Block publication success"
@@ -340,7 +341,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     debug!(
                         slot = slot,
                         kzg_count = kzg_count,
-                        commitment_root = %format!("0x{}", hex::encode(commitment_root)),
+                        commitment_root = %TruncatedRoot::new(&commitment_root),
                         "SSZ BlockContents: internal KZG commitment binding (ISSUE-4.3)"
                     );
                 }
@@ -358,7 +359,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 &self.fork_schedule,
                 &self.genesis_validators_root,
             )
-            .instrument(tracing::info_span!("rvc.sign.block"))
+            .instrument(tracing::info_span!("sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
         debug!(
@@ -378,7 +379,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
 
         self.beacon
             .publish_block_ssz(&signed_ssz, &response.consensus_version, response.is_blinded)
-            .instrument(tracing::info_span!("rvc.beacon.publish_block"))
+            .instrument(tracing::info_span!("beacon.publish_block"))
             .await?;
 
         Ok((block_root, response.is_blinded))
@@ -422,7 +423,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     slot = slot,
                     blob_sidecars = blob_sidecars.len(),
                     kzg_in_body = kzg_commitments.len(),
-                    commitment_root = %format!("0x{}", hex::encode(commitment_root)),
+                    commitment_root = %TruncatedRoot::new(&commitment_root),
                     "BlockAndBlobs: internal KZG commitment binding (ISSUE-4.3)"
                 );
                 // Intentionally warn-only: the signing scope covers body bytes
@@ -452,7 +453,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 &self.fork_schedule,
                 &self.genesis_validators_root,
             )
-            .instrument(tracing::info_span!("rvc.sign.block"))
+            .instrument(tracing::info_span!("sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
         debug!(
@@ -464,7 +465,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let signed = eth_types::SignedBeaconBlock { message: block, signature: sig };
         self.beacon
             .publish_block(&signed, &response.consensus_version)
-            .instrument(tracing::info_span!("rvc.beacon.publish_block"))
+            .instrument(tracing::info_span!("beacon.publish_block"))
             .await?;
 
         Ok((block_root, false))
@@ -503,7 +504,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 &self.fork_schedule,
                 &self.genesis_validators_root,
             )
-            .instrument(tracing::info_span!("rvc.sign.block"))
+            .instrument(tracing::info_span!("sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
         debug!(
@@ -515,7 +516,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let signed = eth_types::SignedBlindedBeaconBlock { message: block, signature: sig };
         self.beacon
             .publish_blinded_block(&signed, &response.consensus_version)
-            .instrument(tracing::info_span!("rvc.beacon.publish_block"))
+            .instrument(tracing::info_span!("beacon.publish_block"))
             .await?;
 
         Ok((block_root, true))
@@ -1148,6 +1149,34 @@ mod tests {
         beacon_arc.assert_last_produce_slot(slot);
         beacon_arc.assert_last_published_block(slot, 42);
         signer_arc.assert_last_sign_block_domain(&fork, &gvr);
+    }
+
+    /// Issue 2.10: the "Block publication success" info milestone logs the
+    /// block_root TRUNCATED (0x{first10}...{last8}), never the full 64-hex.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn test_propose_block_publish_truncates_block_root() {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let block = test_block(slot);
+        let beacon = Arc::new(MockBeaconClient::unblinded(block));
+        let fork = test_fork_schedule();
+        let gvr: Root = [0xaa; 32];
+        let service = BlockService::new(
+            Arc::new(MockSigner::new()),
+            beacon,
+            Arc::new(test_validator_store(&pubkey)),
+            Arc::new(fork),
+            gvr,
+        );
+
+        let proposal = service.propose_block(slot, &pubkey, 42, None).await.unwrap();
+
+        let full = hex::encode(proposal.block_root);
+        let truncated = format!("0x{}...{}", &full[..10], &full[full.len() - 8..]);
+        assert!(logs_contain("Block publication success"), "publish milestone must fire");
+        assert!(logs_contain(&truncated), "publish line must show the truncated block_root");
+        assert!(!logs_contain(&full), "publish line must NOT show the full block root hex");
     }
 
     #[tokio::test]

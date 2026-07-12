@@ -19,7 +19,9 @@
 
 use std::os::unix::fs::PermissionsExt;
 
-use rvc_signer_bin::config::{merge_with_cli, CliOverrides, SignerConfig};
+use rvc_signer_bin::config::{
+    merge_with_cli, CliOverrides, SignerConfig, DEFAULT_HTTP_LISTEN_ADDRESS, DEFAULT_HTTP_TLS_MODE,
+};
 use tempfile::TempDir;
 
 /// Build a minimal CLI-overrides struct for `merge_with_cli` so the
@@ -47,6 +49,14 @@ fn cli(enable_hot_reload: bool, reload_interval: u64) -> CliOverrides<'static> {
         dvt_index: None,
         dvt_timeout: 2000,
         dvt_timeout_is_default: true,
+        http_enabled: false,
+        http_listen_address: DEFAULT_HTTP_LISTEN_ADDRESS,
+        http_listen_address_is_default: true,
+        http_tls_mode: DEFAULT_HTTP_TLS_MODE,
+        http_tls_mode_is_default: true,
+        http_tls_cert: None,
+        http_tls_key: None,
+        http_tls_ca_cert: None,
     }
 }
 

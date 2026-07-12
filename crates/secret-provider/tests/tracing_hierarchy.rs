@@ -64,18 +64,14 @@ async fn test_tracing_span_hierarchy_load_all_list_keys_fetch_key() {
     let captured = spans.lock().unwrap();
 
     let names: Vec<&str> = captured.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(names.contains(&"secret_provider.load_all"), "Missing load_all span, got: {:?}", names);
     assert!(
-        names.contains(&"rvc.secret_provider.load_all"),
-        "Missing load_all span, got: {:?}",
-        names
-    );
-    assert!(
-        names.contains(&"rvc.secret_provider.list_keys"),
+        names.contains(&"secret_provider.list_keys"),
         "Missing list_keys span, got: {:?}",
         names
     );
     assert!(
-        names.contains(&"rvc.secret_provider.fetch_key"),
+        names.contains(&"secret_provider.fetch_key"),
         "Missing fetch_key span, got: {:?}",
         names
     );
@@ -83,22 +79,22 @@ async fn test_tracing_span_hierarchy_load_all_list_keys_fetch_key() {
     // Verify hierarchy: list_keys is child of load_all
     let list_keys_entry = captured
         .iter()
-        .find(|(n, _)| n == "rvc.secret_provider.list_keys")
+        .find(|(n, _)| n == "secret_provider.list_keys")
         .expect("list_keys span should exist");
     assert_eq!(
         list_keys_entry.1.as_deref(),
-        Some("rvc.secret_provider.load_all"),
+        Some("secret_provider.load_all"),
         "list_keys should be child of load_all"
     );
 
     // Verify hierarchy: fetch_key is child of load_all
     let fetch_key_entry = captured
         .iter()
-        .find(|(n, _)| n == "rvc.secret_provider.fetch_key")
+        .find(|(n, _)| n == "secret_provider.fetch_key")
         .expect("fetch_key span should exist");
     assert_eq!(
         fetch_key_entry.1.as_deref(),
-        Some("rvc.secret_provider.load_all"),
+        Some("secret_provider.load_all"),
         "fetch_key should be child of load_all"
     );
 }

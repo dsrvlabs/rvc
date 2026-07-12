@@ -69,6 +69,8 @@ pub fn execute(args: SplitKeyArgs) -> Result<(), SplitKeyError> {
         "Splitting key"
     );
 
+    // Gate 1: key-splitting needs the raw SK bytes to build the blst scalar; never logged.
+    #[allow(clippy::disallowed_methods)]
     let blst_sk = blst::min_pk::SecretKey::from_bytes(&secret_key.to_bytes())
         .map_err(|_| SplitKeyError::ScalarConversion("invalid blst key bytes".to_string()))?;
     let secret_scalar =
@@ -161,6 +163,7 @@ fn validate_args(args: &SplitKeyArgs) -> Result<(), SplitKeyError> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
     use super::*;
     use crypto::SecretKey;
     use tempfile::TempDir;

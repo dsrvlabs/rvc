@@ -158,6 +158,17 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Diagnostics go to stderr (stdout is reserved for machine-readable deposit JSON).
+    // Default level `info`; operators raise detail with `RUST_LOG=rvc_keygen=debug`. The
+    // human-facing mnemonic/keystore output remains the eprintln/println lines below.
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
     let cli = Cli::parse();
 
     match cli.command {

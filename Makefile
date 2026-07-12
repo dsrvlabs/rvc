@@ -32,6 +32,7 @@ fmt-check:
 
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
+	cargo clippy -p rvc-signer-bin --all-targets --features dvt -- -D warnings
 
 # Test
 test:

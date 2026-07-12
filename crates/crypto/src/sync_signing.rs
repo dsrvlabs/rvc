@@ -7,10 +7,10 @@ use eth_types::{
 };
 
 #[tracing::instrument(
-    name = "rvc.crypto.sign_sync_message",
+    name = "crypto.sign_sync_message",
     level = "debug",
     skip_all,
-    fields(rvc.signing_type = "sync_committee_message"),
+    fields(signing_type = "sync_committee_message")
 )]
 pub fn sign_sync_committee_message(
     beacon_block_root: &Root,
@@ -28,10 +28,10 @@ pub fn sign_sync_committee_message(
 }
 
 #[tracing::instrument(
-    name = "rvc.crypto.sign_contribution_and_proof",
+    name = "crypto.sign_contribution_and_proof",
     level = "debug",
     skip_all,
-    fields(rvc.signing_type = "contribution_and_proof"),
+    fields(signing_type = "contribution_and_proof")
 )]
 pub fn sign_contribution_and_proof(
     contribution_and_proof: &ContributionAndProof,
@@ -49,10 +49,10 @@ pub fn sign_contribution_and_proof(
 }
 
 #[tracing::instrument(
-    name = "rvc.crypto.sign_sync_selection_proof",
+    name = "crypto.sign_sync_selection_proof",
     level = "debug",
     skip_all,
-    fields(rvc.signing_type = "sync_selection_proof"),
+    fields(signing_type = "sync_selection_proof")
 )]
 pub fn sign_sync_committee_selection_proof(
     slot: Slot,

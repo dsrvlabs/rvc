@@ -1,0 +1,794 @@
+openapi: 3.0.3
+info:
+  title: rvc Keymanager API
+  description: >
+    Ethereum Keymanager API (https://github.com/ethereum/keymanager-APIs)
+    implementation for the rvc Validator Client, plus rvc-specific extensions
+    under `/rvc/v1/*`. See docs/keymanager-api.md and docs/validators-config.md
+    for prose documentation.
+  version: "1.0.0"
+servers:
+  - url: http://127.0.0.1:5062
+    description: Default bind address (configurable via --keymanager-address)
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Local Keystores
+  - name: Remote Keys
+  - name: Fee Recipient
+  - name: Gas Limit
+  - name: Graffiti
+  - name: Voluntary Exit
+  - name: rvc Extensions
+
+paths:
+  /eth/v1/keystores:
+    get:
+      tags: [Local Keystores]
+      summary: List local keystores
+      operationId: listKeystores
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListKeystoresResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Local Keystores]
+      summary: Import one or more keystores
+      description: >
+        Slashing protection data (if provided) is imported first, before any
+        keys are activated. Newly imported keys enter a doppelganger-detection
+        window (see `doppelganger_safe` in KeystoreInfo) before they may attest.
+      operationId: importKeystores
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImportKeystoresRequest"
+      responses:
+        "200":
+          description: OK — one result per submitted keystore, in order
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportKeystoresResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+    delete:
+      tags: [Local Keystores]
+      summary: Delete one or more local keystores
+      description: Slashing protection data is exported before the keys are deleted.
+      operationId: deleteKeystores
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteKeystoresRequest"
+      responses:
+        "200":
+          description: OK — one result per requested pubkey, in order
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteKeystoresResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /eth/v1/remotekeys:
+    get:
+      tags: [Remote Keys]
+      summary: List remote validator keys (Web3Signer)
+      operationId: listRemoteKeys
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListRemoteKeysResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Remote Keys]
+      summary: Import remote keys
+      description: >
+        URLs must be HTTPS unless `--allow-insecure-remote-signer` is set on
+        the server.
+      operationId: importRemoteKeys
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImportRemoteKeysRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportRemoteKeysResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      tags: [Remote Keys]
+      summary: Delete one or more remote keys
+      operationId: deleteRemoteKeys
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DeleteRemoteKeysRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeleteRemoteKeysResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /eth/v1/validator/{pubkey}/feerecipient:
+    parameters:
+      - $ref: "#/components/parameters/PubkeyPath"
+    get:
+      tags: [Fee Recipient]
+      summary: Get the effective fee recipient for a validator
+      description: Returns the per-validator override if set, otherwise the global default from `validators_config`.
+      operationId: getFeeRecipient
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FeeRecipientResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [Fee Recipient]
+      summary: Set a per-validator fee recipient override
+      description: >
+        Persisted immediately to the `validators_config` TOML file (atomic
+        temp-file + rename). The zero address is rejected.
+      operationId: setFeeRecipient
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetFeeRecipientRequest"
+      responses:
+        "202":
+          description: Accepted (no body)
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Fee Recipient]
+      summary: Remove the per-validator fee recipient override
+      description: Reverts to the global default. Persisted immediately.
+      operationId: deleteFeeRecipient
+      responses:
+        "204":
+          description: No Content
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /eth/v1/validator/{pubkey}/gas_limit:
+    parameters:
+      - $ref: "#/components/parameters/PubkeyPath"
+    get:
+      tags: [Gas Limit]
+      summary: Get the effective gas limit for a validator
+      operationId: getGasLimit
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GasLimitResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [Gas Limit]
+      summary: Set a per-validator gas limit override
+      description: Persisted immediately. `gas_limit` must be a string-encoded decimal integer (Uint64 spec convention).
+      operationId: setGasLimit
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetGasLimitRequest"
+      responses:
+        "202":
+          description: Accepted (no body)
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Gas Limit]
+      summary: Remove the per-validator gas limit override
+      description: Reverts to the default (30000000). Persisted immediately.
+      operationId: deleteGasLimit
+      responses:
+        "204":
+          description: No Content
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /eth/v1/validator/{pubkey}/graffiti:
+    parameters:
+      - $ref: "#/components/parameters/PubkeyPath"
+    get:
+      tags: [Graffiti]
+      summary: Get the effective graffiti for a validator
+      operationId: getGraffiti
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GraffitiResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [Graffiti]
+      summary: Set a per-validator graffiti override
+      description: Persisted immediately. Rejected with 400 if it exceeds 32 bytes (contrast with the `validators_config` TOML loader, which silently truncates instead of rejecting).
+      operationId: setGraffiti
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetGraffitiRequest"
+      responses:
+        "202":
+          description: Accepted (no body)
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Graffiti]
+      summary: Remove the per-validator graffiti override
+      description: Reverts to the default. Persisted immediately.
+      operationId: deleteGraffiti
+      responses:
+        "204":
+          description: No Content
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /eth/v1/validator/{pubkey}/voluntary_exit:
+    parameters:
+      - $ref: "#/components/parameters/PubkeyPath"
+    post:
+      tags: [Voluntary Exit]
+      summary: Sign and return a voluntary exit message
+      description: >
+        **This operation is irreversible once the returned message is
+        submitted to the beacon chain.** A WARN-level log is emitted for
+        every request. Requires the server to have been started with a
+        beacon node connection.
+      operationId: signVoluntaryExit
+      parameters:
+        - $ref: "#/components/parameters/ExitEpochQuery"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VoluntaryExitResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /rvc/v1/validator/{pubkey}/prepare_exit:
+    parameters:
+      - $ref: "#/components/parameters/PubkeyPath"
+    post:
+      tags: [rvc Extensions]
+      summary: Sign a voluntary exit without submitting it (rvc-specific, non-spec)
+      description: >
+        Identical signing path and response shape to `voluntary_exit`, but
+        framed as a "prepare" step for operators who want the signed message
+        without it implying immediate submission intent. Logged at INFO
+        rather than WARN. Not part of the Ethereum Keymanager API spec.
+      operationId: prepareExit
+      parameters:
+        - $ref: "#/components/parameters/ExitEpochQuery"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VoluntaryExitResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /rvc/v1/attesting:
+    post:
+      tags: [rvc Extensions]
+      summary: Global attesting on/off kill switch (rvc-specific, non-spec)
+      description: >
+        Enables or disables attestation duties for **all** validators at
+        once (not per-validator). Rate-limited to one call per 60 seconds;
+        exceeding the limit returns 429. Every call is audit-logged with a
+        truncated (8-char) prefix of the caller's bearer token. This setting
+        is in-memory only and is not persisted to `validators_config`.
+      operationId: setAttestingEnabled
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetAttestingRequest"
+      responses:
+        "200":
+          description: OK — echoes the new effective state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SetAttestingResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >
+        64-character hex token (32 random bytes), generated on first run and
+        written to the file configured via --keymanager-token-file (0400
+        permissions). Compared in constant time.
+
+  parameters:
+    PubkeyPath:
+      name: pubkey
+      in: path
+      required: true
+      description: BLS public key, 48 bytes. `0x` prefix optional, case-insensitive.
+      schema:
+        type: string
+        pattern: '^(0x)?[0-9a-fA-F]{96}$'
+      example: "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a"
+    ExitEpochQuery:
+      name: epoch
+      in: query
+      required: false
+      description: >
+        Uint64 as a decimal string. If omitted, the current epoch is
+        auto-detected from the beacon node.
+      schema:
+        type: string
+      example: "300000"
+
+  responses:
+    BadRequest:
+      description: Malformed input, invalid pubkey, invalid address, or value exceeding a size limit
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorMessage"
+    Unauthorized:
+      description: Missing or invalid bearer token (empty body)
+    NotFound:
+      description: Unknown validator pubkey
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorMessage"
+    InternalError:
+      description: Beacon node unavailable, signing failure, or voluntary exit not configured
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorMessage"
+    RateLimited:
+      description: Too many requests
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds until the next request is accepted
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/RateLimitedError"
+
+  schemas:
+    ErrorMessage:
+      type: object
+      properties:
+        message:
+          type: string
+      required: [message]
+
+    RateLimitedError:
+      type: object
+      properties:
+        code:
+          type: integer
+          example: 429
+        message:
+          type: string
+          example: "rate limited"
+      required: [code, message]
+
+    KeystoreInfo:
+      type: object
+      properties:
+        validating_pubkey:
+          type: string
+        derivation_path:
+          type: string
+          nullable: true
+        readonly:
+          type: boolean
+        doppelganger_safe:
+          type: boolean
+          description: >
+            false while a recently-imported key is inside its post-import
+            doppelganger window (attestation not yet enabled); true once the
+            window has elapsed or for keys not imported via this API.
+      required: [validating_pubkey, readonly, doppelganger_safe]
+
+    ListKeystoresResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/KeystoreInfo"
+      required: [data]
+
+    ImportKeystoresRequest:
+      type: object
+      properties:
+        keystores:
+          type: array
+          items:
+            type: string
+          description: EIP-2335 keystore JSON, one string per key
+        passwords:
+          type: array
+          items:
+            type: string
+            format: password
+          description: Must be the same length as `keystores`
+        slashing_protection:
+          type: string
+          nullable: true
+          description: Optional EIP-3076 interchange JSON, imported before keys are activated
+      required: [keystores, passwords]
+
+    ImportStatus:
+      type: string
+      enum: [imported, duplicate, error]
+
+    ImportKeystoreResult:
+      type: object
+      properties:
+        status:
+          $ref: "#/components/schemas/ImportStatus"
+        message:
+          type: string
+      required: [status]
+
+    ImportKeystoresResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ImportKeystoreResult"
+      required: [data]
+
+    DeleteKeystoresRequest:
+      type: object
+      properties:
+        pubkeys:
+          type: array
+          items:
+            type: string
+      required: [pubkeys]
+
+    DeleteStatus:
+      type: string
+      enum: [deleted, not_active, not_found, error]
+      description: >
+        `not_active` is a defined value in the spec/schema but is not
+        currently produced by the handler implementation (dead in practice).
+
+    DeleteKeystoreResult:
+      type: object
+      properties:
+        status:
+          $ref: "#/components/schemas/DeleteStatus"
+        message:
+          type: string
+      required: [status]
+
+    DeleteKeystoresResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/DeleteKeystoreResult"
+        slashing_protection:
+          type: string
+          description: EIP-3076 interchange JSON exported before deletion
+      required: [data, slashing_protection]
+
+    RemoteKeyEntry:
+      type: object
+      properties:
+        pubkey:
+          type: string
+        url:
+          type: string
+        readonly:
+          type: boolean
+      required: [pubkey, url, readonly]
+
+    ListRemoteKeysResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/RemoteKeyEntry"
+      required: [data]
+
+    RemoteKeyImport:
+      type: object
+      properties:
+        pubkey:
+          type: string
+        url:
+          type: string
+          description: Web3Signer URL. Must be HTTPS unless the server allows insecure remote signers.
+      required: [pubkey, url]
+
+    ImportRemoteKeysRequest:
+      type: object
+      properties:
+        remote_keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/RemoteKeyImport"
+      required: [remote_keys]
+
+    ImportRemoteKeyStatus:
+      type: string
+      enum: [imported, duplicate, error]
+
+    ImportRemoteKeyResult:
+      type: object
+      properties:
+        status:
+          $ref: "#/components/schemas/ImportRemoteKeyStatus"
+        message:
+          type: string
+      required: [status]
+
+    ImportRemoteKeysResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ImportRemoteKeyResult"
+      required: [data]
+
+    DeleteRemoteKeysRequest:
+      type: object
+      properties:
+        pubkeys:
+          type: array
+          items:
+            type: string
+      required: [pubkeys]
+
+    DeleteRemoteKeyStatus:
+      type: string
+      enum: [deleted, not_found, error]
+
+    DeleteRemoteKeyResult:
+      type: object
+      properties:
+        status:
+          $ref: "#/components/schemas/DeleteRemoteKeyStatus"
+        message:
+          type: string
+      required: [status]
+
+    DeleteRemoteKeysResponse:
+      type: object
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/DeleteRemoteKeyResult"
+      required: [data]
+
+    FeeRecipientData:
+      type: object
+      properties:
+        pubkey:
+          type: string
+        ethaddress:
+          type: string
+          pattern: '^0x[0-9a-fA-F]{40}$'
+      required: [pubkey, ethaddress]
+
+    FeeRecipientResponse:
+      type: object
+      properties:
+        data:
+          $ref: "#/components/schemas/FeeRecipientData"
+      required: [data]
+
+    SetFeeRecipientRequest:
+      type: object
+      properties:
+        ethaddress:
+          type: string
+          pattern: '^0x[0-9a-fA-F]{40}$'
+          description: Zero address is rejected with 400
+      required: [ethaddress]
+
+    GasLimitData:
+      type: object
+      properties:
+        pubkey:
+          type: string
+        gas_limit:
+          type: string
+          description: Uint64 encoded as a decimal string
+          example: "30000000"
+      required: [pubkey, gas_limit]
+
+    GasLimitResponse:
+      type: object
+      properties:
+        data:
+          $ref: "#/components/schemas/GasLimitData"
+      required: [data]
+
+    SetGasLimitRequest:
+      type: object
+      properties:
+        gas_limit:
+          type: string
+          example: "35000000"
+      required: [gas_limit]
+
+    GraffitiData:
+      type: object
+      properties:
+        pubkey:
+          type: string
+        graffiti:
+          type: string
+      required: [pubkey, graffiti]
+
+    GraffitiResponse:
+      type: object
+      properties:
+        data:
+          $ref: "#/components/schemas/GraffitiData"
+      required: [data]
+
+    SetGraffitiRequest:
+      type: object
+      properties:
+        graffiti:
+          type: string
+          maxLength: 32
+      required: [graffiti]
+
+    SignedVoluntaryExitMessage:
+      type: object
+      properties:
+        epoch:
+          type: string
+          example: "300000"
+        validator_index:
+          type: string
+          example: "12345"
+      required: [epoch, validator_index]
+
+    SignedVoluntaryExit:
+      type: object
+      properties:
+        message:
+          $ref: "#/components/schemas/SignedVoluntaryExitMessage"
+        signature:
+          type: string
+          pattern: '^0x[0-9a-fA-F]{192}$'
+      required: [message, signature]
+
+    VoluntaryExitResponse:
+      type: object
+      properties:
+        data:
+          $ref: "#/components/schemas/SignedVoluntaryExit"
+      required: [data]
+
+    SetAttestingRequest:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+      required: [enabled]
+
+    SetAttestingResponse:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+      required: [enabled]

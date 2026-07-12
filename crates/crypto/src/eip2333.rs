@@ -74,7 +74,9 @@ fn parent_sk_to_lamport_pk(
 ) -> Result<Zeroizing<[u8; 32]>, Eip2333Error> {
     let salt = index.to_be_bytes();
 
-    // Parent SK as 32-byte big-endian
+    // Parent SK as 32-byte big-endian.
+    // Gate 1: key derivation needs the raw parent-SK bytes (kept in Zeroizing, never logged).
+    #[allow(clippy::disallowed_methods)]
     let ikm = Zeroizing::new(parent_sk.to_bytes());
 
     // lamport_0 = IKM_to_lamport_SK(IKM, salt)
@@ -142,6 +144,7 @@ pub fn derive_key_from_path(seed: &[u8], path: &str) -> Result<SecretKey, Eip233
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
     use super::*;
 
     /// Helper: convert a decimal string to 32-byte big-endian bytes.

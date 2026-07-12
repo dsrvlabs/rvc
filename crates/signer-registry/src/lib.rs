@@ -8,6 +8,14 @@
 //! Consumed by the PRD M4 enumeration test (Phase 2 Task 2.1) to assert every
 //! registered handler is either a non-slashable message type or routes through
 //! `SigningGate`.
+//!
+//! Logging disposition (Phase 4): this crate is **intentionally excluded** from the
+//! structured-logging breadth. It is a compile-time `const` table consumed only by
+//! enumeration tests — there is no runtime or hot path to instrument, so adding
+//! `info`/`debug` here would be noise. This is a documented, deliberate deviation from the
+//! PRD's "100% of near-silent crates get `info`+`debug`" metric (`plan/logging/prd.md`); the
+//! structured-logging standard the crate opts out of is `plan/logging/STANDARD.md`.
+//! No `tracing` dependency is added, preserving the zero-production-out-edge Gate-6 pin.
 #![forbid(unsafe_code)]
 
 /// Class of consensus message a signing method handles.

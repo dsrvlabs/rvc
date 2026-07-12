@@ -29,6 +29,42 @@ fn test_stage_block_discard_no_row_committed() {
     assert!(blocks.is_empty(), "discard must not commit any row; got: {blocks:?}");
 }
 
+/// Issue 2.7: a slashing violation is logged as a DECISION at debug inside the
+/// slashing crate (the terminal error is logged once by the terminal caller —
+/// signer/gate/DVT error!), and the signing root is never logged.
+#[test]
+#[tracing_test::traced_test]
+fn test_slashing_decision_logged_at_debug_without_root() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.stage_block(PUBKEY, 100, Some("0xroot_alpha_marker".into()), GVR)
+        .expect("first stage")
+        .commit()
+        .expect("first commit");
+    // A conflicting block at the same slot is a double proposal -> rejected.
+    let _ = db
+        .stage_block(PUBKEY, 100, Some("0xroot_beta_marker".into()), GVR)
+        .expect_err("double proposal must be rejected");
+
+    logs_assert(|lines: &[&str]| {
+        let decision = lines
+            .iter()
+            .find(|l| l.contains("double_block_proposal"))
+            .ok_or_else(|| "no slashing-decision line captured".to_string())?;
+        if decision.contains("ERROR") {
+            return Err(format!(
+                "slashing decision must not be ERROR (caller logs the terminal): {decision}"
+            ));
+        }
+        if !decision.contains("DEBUG") {
+            return Err(format!("slashing decision must be logged at DEBUG: {decision}"));
+        }
+        if decision.contains("root_alpha_marker") || decision.contains("root_beta_marker") {
+            return Err(format!("the signing root must never be logged: {decision}"));
+        }
+        Ok(())
+    });
+}
+
 /// Stage + commit a block; then attempt to stage the same (pubkey, slot) with a
 /// different signing root — the second stage must return `DoubleBlockProposal`.
 #[test]

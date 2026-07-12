@@ -21,6 +21,14 @@ pub struct SignerMetrics {
     pub sign_duration_seconds: HistogramVec,
     pub sign_errors_total: IntCounterVec,
     pub keys_loaded: GaugeVec,
+    /// HTTP (Web3Signer) sign requests, labeled by Web3Signer `type` and outcome
+    /// (Issue 4.5). A DISTINCT name from the gRPC `sign_total` so the two
+    /// transports' series never collide on label arity; both are scraped on the
+    /// single `:9101` listener.
+    pub http_sign_total: IntCounterVec,
+    /// HTTP (Web3Signer) sign latency in seconds (Issue 4.5), separate from the
+    /// gRPC `sign_duration_seconds` histogram.
+    pub http_sign_duration_seconds: HistogramVec,
     #[cfg(feature = "dvt")]
     pub dvt: DvtMetrics,
 }
@@ -74,6 +82,30 @@ impl SignerMetrics {
         registry
             .register(Box::new(keys_loaded.clone()))
             .expect("failed to register rvc_signer_keys_loaded");
+
+        // HTTP (Web3Signer) path series (Issue 4.5) — DISTINCT names from the
+        // gRPC vecs above so a single `:9101` scrape spans both transports.
+        let http_sign_total = IntCounterVec::new(
+            Opts::new("rvc_signer_http_sign_total", "Total number of HTTP sign requests"),
+            &["type", "result"],
+        )
+        .expect("failed to create rvc_signer_http_sign_total");
+        registry
+            .register(Box::new(http_sign_total.clone()))
+            .expect("failed to register rvc_signer_http_sign_total");
+
+        let http_sign_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "rvc_signer_http_sign_duration_seconds",
+                "Duration of HTTP sign requests in seconds",
+            )
+            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]),
+            &[],
+        )
+        .expect("failed to create rvc_signer_http_sign_duration_seconds");
+        registry
+            .register(Box::new(http_sign_duration_seconds.clone()))
+            .expect("failed to register rvc_signer_http_sign_duration_seconds");
 
         #[cfg(feature = "dvt")]
         let dvt = {
@@ -142,6 +174,8 @@ impl SignerMetrics {
             sign_duration_seconds,
             sign_errors_total,
             keys_loaded,
+            http_sign_total,
+            http_sign_duration_seconds,
             #[cfg(feature = "dvt")]
             dvt,
         }
@@ -224,6 +258,9 @@ mod tests {
         m.sign_duration_seconds.with_label_values(&["basic"]).observe(0.0);
         m.sign_errors_total.with_label_values(&["basic", "internal"]).inc();
         m.keys_loaded.with_label_values(&["basic"]).set(0.0);
+        // HTTP-path series (Issue 4.5) — registered in the same registry.
+        m.http_sign_total.with_label_values(&["ATTESTATION", "success"]).inc();
+        m.http_sign_duration_seconds.with_label_values(&[] as &[&str]).observe(0.0);
 
         let gathered = m.registry.gather();
         let names: Vec<&str> = gathered.iter().map(|mf| mf.name()).collect();
@@ -231,6 +268,8 @@ mod tests {
         assert!(names.contains(&"rvc_signer_sign_duration_seconds"));
         assert!(names.contains(&"rvc_signer_sign_errors_total"));
         assert!(names.contains(&"rvc_signer_keys_loaded"));
+        assert!(names.contains(&"rvc_signer_http_sign_total"));
+        assert!(names.contains(&"rvc_signer_http_sign_duration_seconds"));
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crypto::logging::TruncatedPubkey;
 /// ```
 pub fn audit_log(client_cn: &str, pubkey: &str, outcome: &str) {
     tracing::info!(
-        target: "rvc.slashing.audit",
+        target: "slashing.audit",
         client_cn,
         pubkey = %TruncatedPubkey::new(pubkey),
         outcome,
@@ -47,6 +47,16 @@ mod tests {
         audit_log("local-vc", "0xaabbccdd", "safe");
         audit_log("cn-dvt-peer", "0x1234", "blocked");
         audit_log("unknown", "0xfeed", "chain_swap");
+    }
+
+    /// Gate 3: the audit log truncates the pubkey — a full 48-byte key must never appear.
+    #[tracing_test::traced_test]
+    #[test]
+    fn audit_log_truncates_pubkey() {
+        let full_pubkey = format!("0x{}", "ab".repeat(48)); // 96 hex chars
+        audit_log("local-vc", &full_pubkey, "blocked");
+        assert!(!logs_contain(&full_pubkey), "full pubkey leaked into the slashing audit log");
+        assert!(logs_contain("slashing audit"), "audit event did not fire");
     }
 
     /// Verify that `audit_log` accepts non-ASCII inputs gracefully.

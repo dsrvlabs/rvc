@@ -44,7 +44,7 @@ impl AsRef<str> for ForkName {
 
 impl ForkName {
     pub fn from_epoch(epoch: Epoch, schedule: &ForkSchedule) -> Self {
-        if epoch >= schedule.fulu_fork_epoch {
+        let fork = if epoch >= schedule.fulu_fork_epoch {
             Self::Fulu
         } else if epoch >= schedule.electra_fork_epoch {
             Self::Electra
@@ -58,7 +58,13 @@ impl ForkName {
             Self::Altair
         } else {
             Self::Phase0
-        }
+        };
+        // Developer trace on the fork-selection path. eth-types is pinned to zero
+        // workspace out-edges (Gate 6) so it cannot use crypto's field consts — these are
+        // the bare canonical `epoch` / `fork_version` literals. The field expression is
+        // evaluated lazily by the macro, so it is free when `trace` is disabled.
+        tracing::trace!(epoch, fork_version = ?fork.fork_version(schedule), "selected fork by epoch");
+        fork
     }
 
     pub fn fork_version(&self, schedule: &ForkSchedule) -> Version {
@@ -121,6 +127,15 @@ mod tests {
     fn test_fork_name_from_epoch_phase0() {
         let schedule = test_schedule();
         assert_eq!(ForkName::from_epoch(0, &schedule), ForkName::Phase0);
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn from_epoch_traces_selected_fork() {
+        let schedule = test_schedule();
+        let _ = ForkName::from_epoch(schedule.electra_fork_epoch, &schedule);
+        assert!(logs_contain("selected fork by epoch"));
+        assert!(logs_contain("fork_version"));
     }
 
     #[test]

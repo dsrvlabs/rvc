@@ -67,7 +67,7 @@ impl BuilderService {
         }
     }
 
-    #[tracing::instrument(name = "rvc.builder.register", skip_all, fields(rvc.builder.batch_size))]
+    #[tracing::instrument(name = "builder.register", skip_all, fields(builder.batch_size))]
     pub async fn register_validators(&self) -> Result<(), BuilderServiceError> {
         let enabled_pubkeys = self.validator_store.list_enabled_pubkeys();
         let builder_pubkeys: Vec<[u8; 48]> = enabled_pubkeys
@@ -148,7 +148,7 @@ impl BuilderService {
         }
 
         let total_count = registrations.len();
-        tracing::Span::current().record("rvc.builder.batch_size", total_count);
+        tracing::Span::current().record("builder.batch_size", total_count);
 
         // Batch size 0 means send all at once (legacy behavior)
         let effective_batch_size = if self.registration_batch_size == 0 {
@@ -229,7 +229,7 @@ impl BuilderService {
         Ok(())
     }
 
-    #[tracing::instrument(name = "rvc.builder.prepare_proposers", skip_all)]
+    #[tracing::instrument(name = "builder.prepare_proposers", skip_all)]
     pub async fn prepare_proposers(
         &self,
         validator_indices: &HashMap<[u8; 48], u64>,

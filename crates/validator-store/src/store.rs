@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crypto::logging::TruncatedPubkey;
 use serde::{Deserialize, Serialize};
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::block_selection::BlockSelectionMode;
 use crate::config::{ValidatorConfig, ValidatorConfigUpdate};
@@ -84,7 +84,7 @@ impl ValidatorStore {
         }
     }
 
-    #[tracing::instrument(name = "rvc.validator_store.load_from_config", skip_all)]
+    #[tracing::instrument(name = "validator_store.load_from_config", skip_all)]
     pub fn load_from_config(path: &Path) -> Result<Self, ValidatorStoreError> {
         let content = std::fs::read_to_string(path)?;
         let toml_config: TomlConfig = toml::from_str(&content)?;
@@ -104,6 +104,13 @@ impl ValidatorStore {
                 default_graffiti = Some(parse_graffiti(g));
             }
         }
+
+        debug!(
+            default_gas_limit,
+            custom_fee_recipient = default_fee_recipient != [0u8; 20],
+            custom_graffiti = default_graffiti.is_some(),
+            "resolved effective validator defaults"
+        );
 
         let mut validators = HashMap::new();
         for v in &toml_config.validators {
@@ -203,7 +210,7 @@ impl ValidatorStore {
         *self.global_block_selection_mode.write() = mode;
     }
 
-    #[tracing::instrument(name = "rvc.validator_store.list_enabled_pubkeys", skip_all)]
+    #[tracing::instrument(name = "validator_store.list_enabled_pubkeys", skip_all)]
     pub fn list_enabled_pubkeys(&self) -> Vec<[u8; 48]> {
         self.validators.read().values().filter(|c| c.enabled).map(|c| c.pubkey).collect()
     }
@@ -295,7 +302,7 @@ impl ValidatorStore {
         self.validators.read().contains_key(pubkey)
     }
 
-    #[tracing::instrument(name = "rvc.validator_store.save_config", skip_all)]
+    #[tracing::instrument(name = "validator_store.save_config", skip_all)]
     pub fn save_config(&self) -> Result<(), ValidatorStoreError> {
         let config_path = self.config_path.as_ref().ok_or_else(|| {
             ValidatorStoreError::Config("no config path set for save".to_string())
@@ -351,7 +358,7 @@ impl ValidatorStore {
         Ok(())
     }
 
-    #[tracing::instrument(name = "rvc.validator_store.reload_config", skip_all)]
+    #[tracing::instrument(name = "validator_store.reload_config", skip_all)]
     pub fn reload_config(&self) -> Result<(), ValidatorStoreError> {
         let path = self.config_path.as_ref().ok_or_else(|| {
             ValidatorStoreError::Config("no config path set for reload".to_string())
@@ -745,6 +752,21 @@ mod tests {
     fn test_update_config_unknown_validator_is_noop() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         store.update_config(&test_pubkey(99), ValidatorConfigUpdate::default());
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn load_from_config_emits_canonical_breadth() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let _store = ValidatorStore::load_from_config(&config_path).unwrap();
+
+        // The renamed `validator_store.load_from_config` span's events fire with the
+        // new breadth (info milestone + the effective-defaults debug decision point).
+        assert!(logs_contain("validator config loaded"));
+        assert!(logs_contain("resolved effective validator defaults"));
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub fn scalar_to_blst_sk(scalar: &Scalar) -> Result<blst::min_pk::SecretKey, Bri
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
     use super::*;
 
     #[test]

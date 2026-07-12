@@ -17,3 +17,4 @@ tracing.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
+tracing-test = { workspace = true, features = ["no-env-filter"] }

@@ -23,6 +23,7 @@ tempfile.workspace = true
 proptest.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 tracing-subscriber = { workspace = true, features = ["registry"] }
+tracing-test = { workspace = true, features = ["no-env-filter"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

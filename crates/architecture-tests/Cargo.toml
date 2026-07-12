@@ -6,3 +6,6 @@ publish = false
 
 [dev-dependencies]
 serde_json.workspace = true
+crypto.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["registry"] }

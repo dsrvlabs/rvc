@@ -1,0 +1,37 @@
+# Gate 2 (structured-logging / observability initiative): gitleaks secret-scan config (SOURCE tree).
+#
+# Design (after two review rounds): keep ALL curated gitleaks default rules via `useDefault`.
+# The allow-list contains NO content/value regexes — only PATH allow-lists — because a value
+# regex (even an "obviously test" placeholder like `0xpubkey_`/`abcdef1234567890`) is matched as
+# a SUBSTRING of the detected secret, so it silently smuggles any secret that merely contains it
+# (e.g. `0xpubkey_<real-private-key>`). Instead, every intentional in-`src/` test finding is
+# baselined by EXACT fingerprint (`file:rule:line`) in `.gitleaksignore`. A new secret — even a
+# 64-hex key in one of those same files on a new line — is a new fingerprint and FAILS the gate.
+#
+# Path allow-lists:
+#   - `target/`: build artifacts, never source.
+#   - `tests/`: whole integration-test trees (published Eth2 slashing-interchange vectors, mock
+#     beacon responses, etc.). RISK-ACCEPT: a real secret committed under `tests/` would be
+#     ignored; mitigated by the fact these are fixtures, by Gate 1/Gate 3, and by review.
+#   (The single non-secret hex test input in crates/crypto/examples/log_sample.rs is baselined by
+#   fingerprint in .gitleaksignore — NOT a directory-wide path allow — so a NEW file added under
+#   crates/crypto/examples/ with a real secret is still scanned and caught.)
+#
+# What this gate does and does NOT catch: it catches keyworded secrets (PEM private keys, cloud
+# creds, PATs, `key/secret/token = <high-entropy>`). It does NOT catch a *bare* 64-hex literal
+# with no adjacent keyword (`const X = "…"`) — that residual is covered by Gate 1 (clippy
+# disallowed-methods) + the secrecy/Zeroizing type layer + Gate 3 (captured-subscriber tests).
+# The emitted-`trace`-sample scan uses a separate `.gitleaks-emitted.toml` (the only place the
+# `0x{10}...{8}` redaction shape is allow-listed, and only over our own generated output).
+
+title = "rs-vc secret-scan allowlist (source tree)"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Build artifacts and whole-test trees (path-scoped only; no value regexes)"
+paths = [
+  '''(^|/)target/''',
+  '''(^|/)tests/''',
+]

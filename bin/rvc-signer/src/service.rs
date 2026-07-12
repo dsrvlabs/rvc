@@ -126,7 +126,13 @@ pub struct SignerServiceImpl {
     /// Slashable sign requests fail-closed with `Status::internal` when the gate
     /// is absent (same `require_db` semantics as before).  The gate internally
     /// holds the `Arc<SlashingDb>` so the DB stays alive for the service lifetime.
-    gate: Option<SigningGate>,
+    ///
+    /// Stored as `Arc<SigningGate>` so the **same** gate instance can be shared
+    /// across transports (gRPC here, HTTP in Phase 3): the gate is built once at
+    /// the composition root (`run_serve`, ADR-003) and cloned into each transport,
+    /// keeping slashing protection and the in-memory `ValidatorLockMap` unified
+    /// (FR-26).
+    gate: Option<Arc<SigningGate>>,
 }
 
 impl SignerServiceImpl {
@@ -151,15 +157,46 @@ impl SignerServiceImpl {
         backend_name: String,
         slashing_db: Arc<SlashingDb>,
     ) -> Self {
-        let adapted_signer =
-            Arc::new(SigningBackendAsSigner(Arc::clone(&backend))) as Arc<dyn crypto::Signer>;
-        let gate = SigningGate::new_with_raw_signer(
-            Arc::clone(&slashing_db),
+        let gate = Arc::new(Self::build_gate(Arc::clone(&backend), slashing_db));
+        Self::new_v2_with_gate(backend, backend_name, gate)
+    }
+
+    /// Build the shared [`SigningGate`] from a backend + slashing DB.
+    ///
+    /// Hoisted out of `new_v2` (ADR-003) so the composition root (`run_serve`)
+    /// can build **one** gate and inject the same `Arc<SigningGate>` into every
+    /// transport (gRPC here, HTTP in Phase 3), keeping slashing protection and the
+    /// in-memory per-pubkey `ValidatorLockMap` unified across transports (FR-26).
+    ///
+    /// Construction is unchanged from the previous in-`new_v2` build:
+    /// - `SigningBackendAsSigner` adapter wraps the backend as `Arc<dyn crypto::Signer>`.
+    /// - `AlwaysEnabled` enablement (doppelganger is the calling VC's concern).
+    /// - A fresh `ValidatorLockMap` for per-pubkey serialization.
+    /// - Default 4-second sign timeout (BUG-003 mitigation).
+    pub fn build_gate(
+        backend: Arc<dyn SigningBackend>,
+        slashing_db: Arc<SlashingDb>,
+    ) -> SigningGate {
+        let adapted_signer = Arc::new(SigningBackendAsSigner(backend)) as Arc<dyn crypto::Signer>;
+        SigningGate::new_with_raw_signer(
+            slashing_db,
             Arc::new(AlwaysEnabled),
             adapted_signer,
             Arc::new(ValidatorLockMap::new()),
             DEFAULT_SIGN_TIMEOUT,
-        );
+        )
+    }
+
+    /// Create a v2-capable service from an already-built, shared `Arc<SigningGate>`.
+    ///
+    /// This is the injection point for the hoisted gate (ADR-003): `run_serve`
+    /// builds the gate once and passes a clone here and (Phase 3) into the HTTP
+    /// `Web3SignerState`, so both transports share one signing authority.
+    pub fn new_v2_with_gate(
+        backend: Arc<dyn SigningBackend>,
+        backend_name: String,
+        gate: Arc<SigningGate>,
+    ) -> Self {
         Self { backend, backend_name, metrics: None, gate: Some(gate) }
     }
 
@@ -174,7 +211,16 @@ impl SignerServiceImpl {
     /// Has no effect when no gate is present (i.e. `new()` path).
     pub fn with_sign_timeout(mut self, timeout: Duration) -> Self {
         if let Some(gate) = self.gate.take() {
-            self.gate = Some(gate.with_sign_timeout(timeout));
+            // The gate is shared via `Arc` (FR-26).  Re-timing only makes sense
+            // before the gate is cloned into another transport, i.e. while this
+            // `Arc` is the sole owner — in that case `try_unwrap` succeeds and the
+            // behavior is identical to the pre-hoist value-typed gate.  If the gate
+            // is already shared, leave the timeout untouched rather than break the
+            // shared-instance invariant.
+            match Arc::try_unwrap(gate) {
+                Ok(g) => self.gate = Some(Arc::new(g.with_sign_timeout(timeout))),
+                Err(shared) => self.gate = Some(shared),
+            }
         }
         self
     }
@@ -185,7 +231,7 @@ impl SignerServiceImpl {
     /// closed when no slashing DB is configured.
     #[allow(clippy::result_large_err)]
     fn require_gate(&self) -> Result<&SigningGate, Status> {
-        self.gate.as_ref().ok_or_else(|| {
+        self.gate.as_deref().ok_or_else(|| {
             Status::internal(
                 "slashing protection database is not configured; \
                  restart with a valid --data-dir or --disable-slashing-protection + \
@@ -400,7 +446,7 @@ impl SignerServiceV2 for SignerServiceImpl {
     // ── SignBeaconBlock ───────────────────────────────────────────────────────
 
     #[allow(clippy::result_large_err)]
-    #[tracing::instrument(name = "rvc.signer.v2.sign_beacon_block", skip_all, fields(pubkey, slot))]
+    #[tracing::instrument(name = "signer.v2.sign_beacon_block", skip_all, fields(pubkey, slot))]
     async fn sign_beacon_block(
         &self,
         req: Request<SignBeaconBlockRequest>,
@@ -444,7 +490,7 @@ impl SignerServiceV2 for SignerServiceImpl {
 
     #[allow(clippy::result_large_err)]
     #[tracing::instrument(
-        name = "rvc.signer.v2.sign_blinded_beacon_block",
+        name = "signer.v2.sign_blinded_beacon_block",
         skip_all,
         fields(pubkey, slot)
     )]
@@ -489,11 +535,7 @@ impl SignerServiceV2 for SignerServiceImpl {
 
     // ── SignRandaoReveal ──────────────────────────────────────────────────────
 
-    #[tracing::instrument(
-        name = "rvc.signer.v2.sign_randao_reveal",
-        skip_all,
-        fields(pubkey, epoch)
-    )]
+    #[tracing::instrument(name = "signer.v2.sign_randao_reveal", skip_all, fields(pubkey, epoch))]
     async fn sign_randao_reveal(
         &self,
         req: Request<SignRandaoRevealRequest>,
@@ -536,7 +578,7 @@ impl SignerServiceV2 for SignerServiceImpl {
 
     #[allow(clippy::result_large_err)]
     #[tracing::instrument(
-        name = "rvc.signer.v2.sign_attestation_data",
+        name = "signer.v2.sign_attestation_data",
         skip_all,
         fields(pubkey, source_epoch, target_epoch)
     )]
@@ -631,7 +673,7 @@ impl SignerServiceV2 for SignerServiceImpl {
 
     #[allow(clippy::result_large_err)]
     #[tracing::instrument(
-        name = "rvc.signer.v2.sign_aggregate_and_proof",
+        name = "signer.v2.sign_aggregate_and_proof",
         skip_all,
         fields(pubkey, source_epoch, target_epoch)
     )]
@@ -697,7 +739,7 @@ impl SignerServiceV2 for SignerServiceImpl {
     ///
     /// Per FR-P0-3 / NFR-1: sync messages are **not slashable** — no staging.
     #[tracing::instrument(
-        name = "rvc.signer.v2.sign_sync_committee_message",
+        name = "signer.v2.sign_sync_committee_message",
         skip_all,
         fields(pubkey, slot)
     )]
@@ -757,7 +799,7 @@ impl SignerServiceV2 for SignerServiceImpl {
     ///
     /// Per FR-P0-3 / NFR-1: not slashable — no staging.
     #[tracing::instrument(
-        name = "rvc.signer.v2.sign_sync_aggregator_selection_data",
+        name = "signer.v2.sign_sync_aggregator_selection_data",
         skip_all,
         fields(pubkey, slot)
     )]
@@ -814,7 +856,7 @@ impl SignerServiceV2 for SignerServiceImpl {
     ///
     /// Per FR-P0-3 / NFR-1: not slashable — no staging.
     #[tracing::instrument(
-        name = "rvc.signer.v2.sign_contribution_and_proof",
+        name = "signer.v2.sign_contribution_and_proof",
         skip_all,
         fields(pubkey, slot)
     )]
@@ -880,11 +922,7 @@ impl SignerServiceV2 for SignerServiceImpl {
     // validators root is a zero hash, NOT sourced from ForkInfo.
     //
     // Not slashable — no stage/commit calls.
-    #[tracing::instrument(
-        name = "rvc.signer.v2.sign_builder_registration",
-        skip_all,
-        fields(pubkey)
-    )]
+    #[tracing::instrument(name = "signer.v2.sign_builder_registration", skip_all, fields(pubkey))]
     async fn sign_builder_registration(
         &self,
         req: Request<SignBuilderRegistrationRequest>,
@@ -951,7 +989,7 @@ impl SignerServiceV2 for SignerServiceImpl {
     //
     // Not slashable — no stage/commit calls.
     #[tracing::instrument(
-        name = "rvc.signer.v2.sign_voluntary_exit",
+        name = "signer.v2.sign_voluntary_exit",
         skip_all,
         fields(pubkey, epoch, validator_index)
     )]
@@ -1429,6 +1467,43 @@ mod tests {
             err.code(),
             tonic::Code::Internal,
             "slashable op without DB must return Internal (fail-closed)"
+        );
+    }
+
+    // --- Issue 1.2: gate-hoist (ADR-003 / FR-26) ---
+
+    /// The gate is built ONCE at the composition root and injected via
+    /// `new_v2_with_gate`; the gRPC service must hold *that same* `Arc<SigningGate>`
+    /// instance, so a future HTTP transport sharing a clone shares the same slashing
+    /// DB + in-memory `ValidatorLockMap` (FR-26).  The no-DB path keeps `gate = None`.
+    #[tokio::test]
+    async fn test_gate_hoist_injects_shared_gate_and_no_db_is_none() {
+        // No-DB path: gate is None (the fail-closed path is preserved post-hoist).
+        let no_db = make_service(MockBackend::with_test_key());
+        assert!(no_db.gate.is_none(), "no-DB service must have gate = None");
+
+        // Hoisted path: build ONE gate at the composition root, inject a clone.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Arc::new(slashing::SlashingDb::open(tmp.path()).unwrap());
+        std::mem::forget(tmp); // keep the temp file alive for the DB's lifetime
+        let backend = Arc::new(MockBackend::with_test_key());
+        let shared_gate = Arc::new(SignerServiceImpl::build_gate(backend.clone(), db));
+
+        let svc = SignerServiceImpl::new_v2_with_gate(
+            backend,
+            "basic".to_string(),
+            Arc::clone(&shared_gate),
+        );
+
+        let svc_gate = svc.gate.as_ref().expect("v2 service must have a gate");
+        assert!(
+            Arc::ptr_eq(svc_gate, &shared_gate),
+            "new_v2_with_gate must inject the SAME Arc<SigningGate> (one shared gate, FR-26)"
+        );
+        assert_eq!(
+            Arc::strong_count(&shared_gate),
+            2,
+            "exactly the composition-root Arc + the injected clone share the gate"
         );
     }
 

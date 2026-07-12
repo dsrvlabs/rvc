@@ -104,6 +104,24 @@ enum Commands {
         #[arg(long, default_value = "info")]
         log_level: String,
 
+        /// Console log output format: `pretty` (default, human-readable) or
+        /// `json` (one structured object per event, for log-aggregation backends
+        /// such as Loki / Elasticsearch / a SIEM). Also settable via the
+        /// `RVC_LOG_FORMAT` env var; an explicit flag wins. Applies to the console
+        /// stream only — the file appender keeps its own format (issue 5.5).
+        #[arg(long, default_value = "pretty")]
+        log_format: String,
+
+        /// Enable runtime log-level reload on SIGHUP (opt-in; issue 5.4).
+        ///
+        /// When set, sending `SIGHUP` to the process re-reads `RUST_LOG` and
+        /// swaps the active log filter in place — raising or lowering verbosity
+        /// without a restart. Disabled by default so the steady-state log path is
+        /// unchanged; the always-on reload *layer* is free on the disabled hot
+        /// path either way. Unix only (a no-op on other platforms).
+        #[arg(long, default_value_t = false)]
+        enable_log_reload: bool,
+
         /// Enable the Keymanager API server
         #[arg(long)]
         keymanager_enabled: bool,
@@ -475,6 +493,8 @@ async fn main() -> anyhow::Result<()> {
             graffiti,
             no_doppelganger_detection,
             log_level,
+            log_format,
+            enable_log_reload,
             keymanager_enabled,
             no_keymanager,
             keymanager_address,
@@ -669,8 +689,13 @@ async fn main() -> anyhow::Result<()> {
 
             let tracing_config = build_tracing_config(&cfg);
             let file_layer_config = build_file_layer_config(&cfg);
-            let logging_guards =
-                init_logging(&log_level, tracing_config.as_ref(), file_layer_config.as_ref());
+            let log_format = telemetry::LogFormat::resolve(Some(&log_format));
+            let logging_guards = init_logging(
+                &log_level,
+                log_format,
+                tracing_config.as_ref(),
+                file_layer_config.as_ref(),
+            );
 
             info!(
                 version = env!("CARGO_PKG_VERSION"),
@@ -694,6 +719,7 @@ async fn main() -> anyhow::Result<()> {
                 strict_slashing_semantics,
                 timeouts,
                 logging_guards,
+                enable_log_reload,
             )
             .await?;
         }
@@ -709,7 +735,9 @@ async fn main() -> anyhow::Result<()> {
             genesis_validators_root,
             log_level,
         } => {
-            init_logging(&log_level, None, None);
+            // One-shot CLI commands have no `--log-format` flag; honor only the
+            // `RVC_LOG_FORMAT` env (default pretty) via `resolve(None)`.
+            init_logging(&log_level, telemetry::LogFormat::resolve(None), None, None);
 
             let args = commands::voluntary_exit::VoluntaryExitArgs {
                 pubkey,
@@ -737,7 +765,7 @@ async fn main() -> anyhow::Result<()> {
             genesis_validators_root,
             log_level,
         } => {
-            init_logging(&log_level, None, None);
+            init_logging(&log_level, telemetry::LogFormat::resolve(None), None, None);
 
             let args = commands::prepare_exit::PrepareExitArgs {
                 pubkey,
@@ -754,7 +782,7 @@ async fn main() -> anyhow::Result<()> {
             commands::prepare_exit::execute(args).await?;
         }
         Commands::SubmitExit { file, beacon_url, log_level } => {
-            init_logging(&log_level, None, None);
+            init_logging(&log_level, telemetry::LogFormat::resolve(None), None, None);
 
             let args = commands::submit_exit::SubmitExitArgs { file, beacon_url };
 
@@ -769,18 +797,29 @@ async fn main() -> anyhow::Result<()> {
 struct LoggingGuards {
     _tracing_guard: Option<telemetry::TracingGuard>,
     _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    /// Type-erased handle to the runtime-reloadable log filter (issue 5.4). The
+    /// opt-in `SIGHUP` trigger (gated behind `--enable-log-reload`) calls
+    /// `reload_from_env()` to re-read `RUST_LOG` without a restart.
+    reload_handle: telemetry::LogReloadHandle,
 }
 
 fn init_logging(
     level: &str,
+    log_format: telemetry::LogFormat,
     tracing_config: Option<&telemetry::TelemetryConfig>,
     file_config: Option<&telemetry::FileAppenderConfig>,
 ) -> LoggingGuards {
     use tracing_subscriber::layer::Layer;
     use tracing_subscriber::prelude::*;
-    use tracing_subscriber::EnvFilter;
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    // The reconciled filter is wrapped in a `reload::Layer` so verbosity can be
+    // changed at runtime (issue 5.4). The layer's INITIAL value is exactly
+    // `env_filter_or(level)` — identical to the bare filter this replaced — so
+    // the Phase-3 init reconciliation (unset/empty/malformed RUST_LOG → `level`)
+    // is unchanged. A disabled `debug!`/`trace!` callsite still short-circuits in
+    // the macro before reaching this layer, so the disabled hot path stays
+    // zero-allocation (Gate 4 / P0-6) whether or not the trigger is enabled.
+    let (filter, reload_filter_handle) = telemetry::reloadable_env_filter(level);
 
     let (file_layer, file_guard): (
         Option<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>>,
@@ -835,13 +874,22 @@ fn init_logging(
         boxed_layers.push(Box::new(tracing_subscriber::layer::Identity::new()));
     }
 
-    tracing_subscriber::registry()
-        .with(boxed_layers)
-        .with(tracing_subscriber::fmt::layer())
-        .with(filter)
-        .init();
+    // The CONSOLE fmt layer is built for the selected format (issue 5.5): `pretty`
+    // (default — byte-identical to the previous `fmt::layer()`) or `json`. Both
+    // arms return one boxed `dyn Layer<Registry>`, so the surrounding composition —
+    // the `boxed_layers` (OTLP/file, Identity-padded when empty) and the 5.4
+    // reload-wrapped `filter` as the outer global layer — is unchanged either way.
+    // The selector governs only this console leaf; the file appender keeps its own
+    // format.
+    let console_layer = telemetry::console_fmt_layer(log_format, std::io::stdout);
 
-    LoggingGuards { _tracing_guard: tracing_guard, _file_guard: file_guard }
+    tracing_subscriber::registry().with(boxed_layers).with(console_layer).with(filter).init();
+
+    // Erase the concrete reload handle (its subscriber type is the unspellable
+    // layered stack above) so it can be stored and moved into the SIGHUP task.
+    let reload_handle = telemetry::LogReloadHandle::new(level, reload_filter_handle);
+
+    LoggingGuards { _tracing_guard: tracing_guard, _file_guard: file_guard, reload_handle }
 }
 
 fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
@@ -951,7 +999,8 @@ async fn run_validator(
     strict_permissions: bool,
     strict_slashing_semantics: bool,
     timeouts: bn_manager::OperationTimeouts,
-    _logging_guards: LoggingGuards,
+    logging_guards: LoggingGuards,
+    enable_log_reload: bool,
 ) -> anyhow::Result<()> {
     let startup_time = std::time::Instant::now();
 
@@ -972,6 +1021,18 @@ async fn run_validator(
 
     let health_status = new_health_status();
     let shutdown_token = tokio_util::sync::CancellationToken::new();
+
+    // Runtime log-level reload (issue 5.4 / P2-2), opt-in via `--enable-log-reload`.
+    // Mirrors the keystore-hot-reload opt-in conventions (a `--enable-*` flag +
+    // a `CancellationToken`-scoped task): when enabled, `SIGHUP` re-reads
+    // `RUST_LOG` and swaps the active filter in place — no restart, no new network
+    // endpoint. The `LogReloadHandle` is held in `logging_guards` for the process
+    // lifetime; here we only clone it into the signal task.
+    spawn_log_reload_handler(
+        enable_log_reload,
+        logging_guards.reload_handle.clone(),
+        shutdown_token.clone(),
+    );
 
     let grpc_port = config.grpc_port;
     let metrics_address = config.metrics_address;
@@ -1738,8 +1799,9 @@ async fn run_validator(
 
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Logging guards (tracing + file) are held by _logging_guards and
-    // dropped at the end of the caller's scope, flushing pending data.
+    // Logging guards (tracing + file + the reload handle) are held by
+    // logging_guards and dropped at the end of this scope, flushing pending data.
+    let _ = &logging_guards;
 
     // Gracefully shut down metrics server with a brief timeout
     metrics_handle.abort();
@@ -1777,6 +1839,62 @@ async fn resolve_validator_indices(
     }
     info!(count = index_map.len(), "Resolved validator indices");
     Ok(index_map)
+}
+
+/// Spawn the opt-in `SIGHUP` log-reload handler (issue 5.4 / P2-2).
+///
+/// No-op unless `enabled` (the `--enable-log-reload` opt-in). When enabled on a
+/// Unix host, each `SIGHUP` re-reads `RUST_LOG` through the same
+/// [`telemetry::env_filter_or`] precedence used at startup and swaps the active
+/// filter, raising/lowering verbosity without a restart. The task is scoped to
+/// `shutdown_token`, so it exits cleanly on shutdown. On non-Unix targets there
+/// is no `SIGHUP`; the flag is accepted but inert (logged once).
+fn spawn_log_reload_handler(
+    enabled: bool,
+    reload_handle: telemetry::LogReloadHandle,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) {
+    if !enabled {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            let mut sighup =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(error = %e, "failed to install SIGHUP handler; log reload disabled");
+                        return;
+                    }
+                };
+            info!("Runtime log-level reload enabled (send SIGHUP to re-read RUST_LOG)");
+            loop {
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => break,
+                    sig = sighup.recv() => {
+                        if sig.is_none() {
+                            // Signal stream closed; stop listening.
+                            break;
+                        }
+                        match reload_handle.reload_from_env() {
+                            Ok(()) => info!("Reloaded log filter from RUST_LOG (SIGHUP)"),
+                            Err(e) => {
+                                warn!(error = %e, "log-filter reload failed (subscriber gone?)")
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (reload_handle, shutdown_token);
+        warn!("--enable-log-reload set, but SIGHUP-based reload is only supported on Unix");
+    }
 }
 
 async fn shutdown_signal() {
@@ -2248,5 +2366,157 @@ mod tests {
             captured.contains("init_logging regression marker"),
             "init_logging composition silently drops events; captured: {captured:?}"
         );
+    }
+
+    // ── Issue 5.5: opt-in JSON console log output profile ─────────────────────
+
+    /// `--log-format json` parses on `start` and resolves to `LogFormat::Json`;
+    /// the default (flag omitted) stays `Pretty` — the constraint that an unset
+    /// selector keeps today's behavior.
+    #[test]
+    fn test_log_format_flag_parses_and_defaults_to_pretty() {
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from(["rvc", "start", "--log-format", "json"])
+            .expect("--log-format json should parse");
+        match cli.command {
+            Commands::Start { log_format, .. } => {
+                assert_eq!(
+                    telemetry::LogFormat::resolve(Some(&log_format)),
+                    telemetry::LogFormat::Json
+                );
+            }
+            _ => panic!("expected Start command"),
+        }
+
+        let cli = Cli::try_parse_from(["rvc", "start"]).expect("default should parse");
+        match cli.command {
+            Commands::Start { log_format, .. } => {
+                assert_eq!(log_format, "pretty", "default --log-format must be pretty");
+                assert_eq!(
+                    telemetry::LogFormat::resolve(Some(&log_format)),
+                    telemetry::LogFormat::Pretty
+                );
+            }
+            _ => panic!("expected Start command"),
+        }
+    }
+
+    /// The JSON arm of `init_logging`'s composition — `Identity`-padded
+    /// `boxed_layers` + `console_fmt_layer(Json, …)` + the reconciled filter —
+    /// emits one parseable JSON object per event with canonical fields as
+    /// top-level keys. Mirrors `init_logging`'s shape exactly so this guards the
+    /// shipped JSON path (not just the telemetry helper in isolation).
+    #[test]
+    fn test_init_logging_json_arm_emits_parseable_json() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::Layer;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for SharedBuf {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = SharedBuf::default();
+        let filter = tracing_subscriber::EnvFilter::new("info");
+        // Same Identity-padded `boxed_layers` as the no-extras `init_logging` path.
+        let boxed_layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
+            vec![Box::new(tracing_subscriber::layer::Identity::new())];
+        let console_layer = telemetry::console_fmt_layer(telemetry::LogFormat::Json, buf.clone());
+
+        let subscriber =
+            tracing_subscriber::registry().with(boxed_layers).with(console_layer).with(filter);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(slot = 42u64, "json arm marker");
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = out.lines().find(|l| l.contains("json arm marker")).expect("event present");
+        let v: serde_json::Value =
+            serde_json::from_str(line).expect("JSON arm must emit parseable JSON");
+        assert_eq!(v["slot"], 42, "canonical field must be a top-level JSON key");
+        assert_eq!(v["message"], "json arm marker");
+    }
+
+    // Serializes the RUST_LOG-mutating parity tests below (process-global env).
+    // nextest runs each test in its own process, but guard anyway.
+    static RUST_LOG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_rust_log<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = RUST_LOG_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("RUST_LOG").ok();
+        match value {
+            Some(v) => std::env::set_var("RUST_LOG", v),
+            None => std::env::remove_var("RUST_LOG"),
+        }
+        let out = f();
+        match prev {
+            Some(p) => std::env::set_var("RUST_LOG", p),
+            None => std::env::remove_var("RUST_LOG"),
+        }
+        out
+    }
+
+    // Cross-binary init parity (P0-5 / M3): bin/rvc and bin/rvc-signer must share
+    // one default level (`info`) and one RUST_LOG precedence — both route their
+    // filter through `telemetry::env_filter_or("info")`. These assertions mirror
+    // the `rvc-signer` parity tests so an operator learns one behavior, not two.
+    #[test]
+    fn test_rvc_unset_rust_log_defaults_to_info() {
+        let rendered = with_rust_log(None, || format!("{}", telemetry::env_filter_or("info")));
+        assert_eq!(rendered, "info", "unset RUST_LOG must default to info, got: {rendered}");
+    }
+
+    #[test]
+    fn test_rvc_rust_log_overrides_default() {
+        let rendered =
+            with_rust_log(Some("debug"), || format!("{}", telemetry::env_filter_or("info")));
+        assert!(rendered.contains("debug"), "RUST_LOG=debug must override the default: {rendered}");
+    }
+
+    #[test]
+    fn test_rvc_per_module_directive_preserved() {
+        let rendered = with_rust_log(Some("warn,rvc=trace"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert!(rendered.contains("warn"), "global directive missing: {rendered}");
+        assert!(rendered.contains("rvc=trace"), "per-module directive missing: {rendered}");
+    }
+
+    #[test]
+    fn test_rvc_malformed_rust_log_falls_back_to_info() {
+        let rendered = with_rust_log(Some("rvc=invalidlevel"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert_eq!(
+            rendered, "info",
+            "malformed RUST_LOG must fall back to info (no panic, no silence): {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_rvc_whitespace_padded_rust_log_honored() {
+        let rendered = with_rust_log(Some("warn, rvc=trace"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert!(rendered.contains("warn"), "global directive missing: {rendered}");
+        assert!(rendered.contains("rvc=trace"), "padded per-module directive missing: {rendered}");
     }
 }

@@ -187,6 +187,44 @@ pub struct BeaconBlock {
     pub body: BeaconBlockBody,
 }
 
+/// SSZ `BeaconBlockHeader` container (FR-31, ADR-009).
+///
+/// From Bellatrix onward, the Web3Signer `BLOCK_V2` request carries the block
+/// **header** (`{slot, proposer_index, parent_root, state_root, body_root}`),
+/// not the full block. The handler computes the block signing root by hashing
+/// this header — reconstructing a full block is impossible (clients send only
+/// the header) and a slashing-safety hazard.
+///
+/// The five fields are in **spec order**; SSZ Merkleization is order-sensitive,
+/// so do not reorder. Field encodings mirror `AttestationData` (`quoted_u64`
+/// integers, `0x`+lowercase 32-byte hex roots). `#[derive(TreeHash)]`
+/// auto-generates the correct 5-leaf container `tree_hash_root` (no hand-written
+/// `MerkleHasher` is needed — that is only for the `Vec<u8>`-body cases like
+/// `BeaconBlock`).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    ssz_derive::Encode,
+    ssz_derive::Decode,
+    tree_hash_derive::TreeHash,
+)]
+pub struct BeaconBlockHeader {
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub slot: Slot,
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub proposer_index: u64,
+    #[serde(with = "bytes_32_hex")]
+    pub parent_root: Root,
+    #[serde(with = "bytes_32_hex")]
+    pub state_root: Root,
+    #[serde(with = "bytes_32_hex")]
+    pub body_root: Root,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindedBeaconBlock {
     #[serde(with = "serde_utils::quoted_u64")]
@@ -826,5 +864,155 @@ mod tests {
             Vec::<[u8; 48]>::new(),
             "Block variant must return empty commitments"
         );
+    }
+
+    // ── FR-31 (Issue 1.4): BeaconBlockHeader SSZ + tree_hash_root KAT ────────
+
+    use sha2::{Digest, Sha256};
+
+    /// SSZ `uint64` leaf: little-endian 8 bytes, right-zero-padded to 32.
+    fn u64_leaf(x: u64) -> [u8; 32] {
+        let mut leaf = [0u8; 32];
+        leaf[..8].copy_from_slice(&x.to_le_bytes());
+        leaf
+    }
+
+    fn sha256_pair(a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
+        let mut h = Sha256::new();
+        h.update(a);
+        h.update(b);
+        h.finalize().into()
+    }
+
+    /// Independent SSZ Merkleization of the 5-field `BeaconBlockHeader` container
+    /// (pad to 8 leaves), computed with raw `sha2` in spec field order —
+    /// deliberately NOT using `tree_hash_derive`, so it is an external oracle
+    /// that catches a field-order or leaf-count bug in the derived impl.
+    fn independent_header_root(h: &BeaconBlockHeader) -> [u8; 32] {
+        let zero = [0u8; 32];
+        let leaves = [
+            u64_leaf(h.slot),
+            u64_leaf(h.proposer_index),
+            h.parent_root,
+            h.state_root,
+            h.body_root,
+            zero,
+            zero,
+            zero,
+        ];
+        let n0 = sha256_pair(&leaves[0], &leaves[1]);
+        let n1 = sha256_pair(&leaves[2], &leaves[3]);
+        let n2 = sha256_pair(&leaves[4], &leaves[5]);
+        let n3 = sha256_pair(&leaves[6], &leaves[7]);
+        let m0 = sha256_pair(&n0, &n1);
+        let m1 = sha256_pair(&n2, &n3);
+        sha256_pair(&m0, &m1)
+    }
+
+    fn sample_header() -> BeaconBlockHeader {
+        BeaconBlockHeader {
+            slot: 3_000_000,
+            proposer_index: 12_345,
+            parent_root: [0x11u8; 32],
+            state_root: [0x22u8; 32],
+            body_root: [0x33u8; 32],
+        }
+    }
+
+    fn header_root(h: &BeaconBlockHeader) -> [u8; 32] {
+        h.tree_hash_root().as_slice().try_into().expect("Hash256 is 32 bytes")
+    }
+
+    /// An all-zero header hashes to the published SSZ zero-hash for a depth-3
+    /// tree (5 fields → 8 leaves): `zero_hashes[3]`. This is an independent,
+    /// published consensus-spec constant — it anchors the Merkleization
+    /// structure + sha256 backend and cross-validates `independent_header_root`.
+    #[test]
+    fn test_beacon_block_header_all_zero_kat() {
+        // zero_hashes[3] = sha256(z2 ‖ z2); z2 = sha256(z1 ‖ z1); z1 = sha256(0 ‖ 0).
+        const ZERO_HASH_3: [u8; 32] = [
+            0xc7, 0x80, 0x09, 0xfd, 0xf0, 0x7f, 0xc5, 0x6a, 0x11, 0xf1, 0x22, 0x37, 0x06, 0x58,
+            0xa3, 0x53, 0xaa, 0xa5, 0x42, 0xed, 0x63, 0xe4, 0x4c, 0x4b, 0xc1, 0x5f, 0xf4, 0xcd,
+            0x10, 0x5a, 0xb3, 0x3c,
+        ];
+        let zero = BeaconBlockHeader {
+            slot: 0,
+            proposer_index: 0,
+            parent_root: [0u8; 32],
+            state_root: [0u8; 32],
+            body_root: [0u8; 32],
+        };
+        assert_eq!(
+            header_root(&zero),
+            ZERO_HASH_3,
+            "all-zero BeaconBlockHeader must hash to zero_hashes[3]"
+        );
+        // The independent oracle must reproduce the published constant too.
+        assert_eq!(independent_header_root(&zero), ZERO_HASH_3);
+    }
+
+    /// KAT: the derived `tree_hash_root` matches an independent raw-sha256
+    /// Merkleization (spec field order) for a non-trivial header — the
+    /// load-bearing field-order + per-leaf-encoding check.
+    #[test]
+    fn test_beacon_block_header_tree_hash_matches_independent_oracle() {
+        let h = sample_header();
+        assert_eq!(
+            header_root(&h),
+            independent_header_root(&h),
+            "derived tree_hash_root must equal the independent sha256 oracle"
+        );
+    }
+
+    #[test]
+    fn test_beacon_block_header_serde_shape_roundtrip() {
+        let h = sample_header();
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&h).unwrap()).unwrap();
+        // quoted_u64 integers serialize as strings.
+        assert_eq!(v["slot"], serde_json::Value::String("3000000".to_string()));
+        assert_eq!(v["proposer_index"], serde_json::Value::String("12345".to_string()));
+        // 0x + lowercase hex roots.
+        assert_eq!(v["parent_root"], serde_json::Value::String(format!("0x{}", "11".repeat(32))));
+        // round-trip.
+        let back: BeaconBlockHeader = serde_json::from_value(v).unwrap();
+        assert_eq!(back, h);
+    }
+
+    #[test]
+    fn test_beacon_block_header_ssz_roundtrip_and_len() {
+        use ssz::{Decode, Encode};
+        let h = sample_header();
+        let bytes = h.as_ssz_bytes();
+        assert_eq!(bytes.len(), 8 + 8 + 32 + 32 + 32, "fixed SSZ length must be 112 bytes");
+        let back = BeaconBlockHeader::from_ssz_bytes(&bytes).unwrap();
+        assert_eq!(back, h);
+    }
+
+    #[test]
+    fn test_beacon_block_header_root_is_field_sensitive() {
+        let base = sample_header();
+        let base_root = header_root(&base);
+
+        let mut s = base.clone();
+        s.slot += 1;
+        let mut p = base.clone();
+        p.proposer_index += 1;
+        let mut pr = base.clone();
+        pr.parent_root[0] ^= 1;
+        let mut st = base.clone();
+        st.state_root[0] ^= 1;
+        let mut bo = base.clone();
+        bo.body_root[0] ^= 1;
+
+        for (label, v) in [
+            ("slot", s),
+            ("proposer_index", p),
+            ("parent_root", pr),
+            ("state_root", st),
+            ("body_root", bo),
+        ] {
+            assert_ne!(header_root(&v), base_root, "root must change when {label} changes");
+        }
     }
 }

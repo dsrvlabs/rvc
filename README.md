@@ -12,7 +12,7 @@ An Ethereum Validator Client built in Rust. Handles the full validator lifecycle
 - **Slashing protection** — EIP-3076 compliant SQLite-backed attestation and block checks with interchange import/export
 - **Doppelganger detection** — 2-epoch monitoring before activating signing (Lodestar pattern)
 - **MEV/builder integration** — Validator registration with jitter, blinded block support
-- **Keymanager API** — Full [Ethereum Keymanager API](docs/keymanager-api.md) with keystores, remote keys, per-validator fee recipient/gas limit/graffiti, and voluntary exit signing
+- **Keymanager API** — Full [Ethereum Keymanager API](docs/keymanager-api.md) ([OpenAPI spec](docs/keymanager-api.openapi.yaml)) with keystores, remote keys, per-validator fee recipient/gas limit/graffiti, and voluntary exit signing (see also [validators config reference](docs/validators-config.md) and [sample file](validators.example.toml))
 - **Remote signing** — Web3Signer support via CompositeSigner routing
 - **Key generation** — BIP-39 mnemonic generation, EIP-2333 HD derivation, deposit data, voluntary exits, BLS-to-execution changes
 - **Secret management** — Pluggable secret providers (GCP Secret Manager) with periodic key refresh, format auto-detection, and observability

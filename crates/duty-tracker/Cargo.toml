@@ -19,3 +19,4 @@ beacon.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
+tracing-test = { workspace = true, features = ["no-env-filter"] }

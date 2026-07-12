@@ -81,7 +81,7 @@ impl DutyTracker {
         }
     }
 
-    #[tracing::instrument(name = "rvc.duty_tracker.fetch_attester_duties", skip_all, fields(rvc.epoch = epoch))]
+    #[tracing::instrument(name = "duty_tracker.fetch_attester_duties", level = "debug", skip_all, fields(epoch =epoch))]
     pub async fn fetch_duties_for_epoch(
         &self,
         epoch: u64,
@@ -135,6 +135,7 @@ impl DutyTracker {
             };
 
             let key = DutyCacheKey { slot, committee_index, validator_index };
+            trace!(slot, epoch, validator_index, committee_index, "cached attester duty");
             epoch_cache.insert(key, duty.clone());
         }
 
@@ -163,16 +164,16 @@ impl DutyTracker {
 
         if let Some(epoch_cache) = cache.get(&epoch) {
             if let Some(duty) = epoch_cache.get(&key) {
-                trace!(slot, epoch, cache_type = "attester", "Cache hit");
+                debug!(slot, epoch, cache_type = "attester", "Cache hit");
                 return Ok(duty.clone());
             }
         }
 
-        trace!(slot, epoch, cache_type = "attester", "Cache miss");
+        debug!(slot, epoch, cache_type = "attester", "Cache miss");
         Err(DutyTrackerError::DutyNotFound { slot, committee_index, validator_index })
     }
 
-    #[tracing::instrument(name = "rvc.duty_tracker.check_attester_reorg", skip_all, fields(rvc.epoch = epoch))]
+    #[tracing::instrument(name = "duty_tracker.check_attester_reorg", level = "debug", skip_all, fields(epoch =epoch))]
     pub async fn check_and_refetch_if_root_changed(
         &self,
         epoch: u64,
@@ -224,6 +225,7 @@ impl DutyTracker {
                 }
             };
             let key = DutyCacheKey { slot, committee_index, validator_index };
+            trace!(slot, epoch, validator_index, committee_index, "cached attester duty");
             epoch_cache.insert(key, duty.clone());
         }
 
@@ -231,7 +233,7 @@ impl DutyTracker {
         Ok(true)
     }
 
-    #[tracing::instrument(name = "rvc.duty_tracker.evict_old_caches", skip_all, fields(rvc.epoch = current_epoch))]
+    #[tracing::instrument(name = "duty_tracker.evict_old_caches", level = "debug", skip_all, fields(epoch =current_epoch))]
     pub async fn evict_old_caches(&self, current_epoch: u64) {
         let retain_epoch = current_epoch.saturating_sub(2);
 
@@ -273,7 +275,7 @@ impl DutyTracker {
         let cache = self.cache.read().await;
 
         let Some(epoch_cache) = cache.get(&epoch) else {
-            trace!(slot, epoch, cache_type = "attester", "Cache miss for slot");
+            debug!(slot, epoch, cache_type = "attester", "Cache miss for slot");
             return Vec::new();
         };
 
@@ -284,7 +286,7 @@ impl DutyTracker {
             .map(|(_, duty)| duty.clone())
             .collect();
 
-        trace!(slot, epoch, cache_type = "attester", count = duties.len(), "Cache hit for slot");
+        debug!(slot, epoch, cache_type = "attester", count = duties.len(), "Cache hit for slot");
         duties
     }
 
@@ -310,7 +312,7 @@ impl DutyTracker {
         cache.get(&epoch).map(|c| c.dependent_root.clone())
     }
 
-    #[tracing::instrument(name = "rvc.duty_tracker.fetch_proposer_duties", skip_all, fields(rvc.epoch = epoch))]
+    #[tracing::instrument(name = "duty_tracker.fetch_proposer_duties", level = "debug", skip_all, fields(epoch =epoch))]
     pub async fn fetch_proposer_duties(
         &self,
         epoch: u64,
@@ -345,9 +347,9 @@ impl DutyTracker {
         let cache = self.proposer_cache.read().await;
         let result = cache.get(&epoch).and_then(|c| c.get(&slot)).cloned();
         if result.is_some() {
-            trace!(slot, epoch, cache_type = "proposer", "Cache hit");
+            debug!(slot, epoch, cache_type = "proposer", "Cache hit");
         } else {
-            trace!(slot, epoch, cache_type = "proposer", "Cache miss");
+            debug!(slot, epoch, cache_type = "proposer", "Cache miss");
         }
         result
     }
@@ -357,7 +359,7 @@ impl DutyTracker {
         cache.get(&epoch).map(|c| c.dependent_root.clone())
     }
 
-    #[tracing::instrument(name = "rvc.duty_tracker.check_proposer_reorg", skip_all, fields(rvc.epoch = epoch))]
+    #[tracing::instrument(name = "duty_tracker.check_proposer_reorg", level = "debug", skip_all, fields(epoch =epoch))]
     pub async fn check_and_refetch_proposer_if_root_changed(
         &self,
         epoch: u64,
@@ -408,7 +410,7 @@ impl DutyTracker {
         cache.contains_key(&epoch)
     }
 
-    #[tracing::instrument(name = "rvc.duty_tracker.fetch_sync_committee_duties", skip_all, fields(rvc.epoch = epoch))]
+    #[tracing::instrument(name = "duty_tracker.fetch_sync_committee_duties", level = "debug", skip_all, fields(epoch =epoch))]
     pub async fn fetch_sync_committee_duties(
         &self,
         epoch: u64,
@@ -441,11 +443,11 @@ impl DutyTracker {
         let cache = self.sync_committee_cache.read().await;
         match cache.get(&period) {
             Some(duties) => {
-                trace!(slot, epoch, cache_type = "sync", "Cache hit");
+                debug!(slot, epoch, cache_type = "sync", "Cache hit");
                 duties.clone()
             }
             None => {
-                trace!(slot, epoch, cache_type = "sync", "Cache miss");
+                debug!(slot, epoch, cache_type = "sync", "Cache miss");
                 Vec::new()
             }
         }
@@ -590,6 +592,52 @@ mod tests {
         assert_eq!(duty.slot, "320");
         assert_eq!(duty.committee_index, "1");
         assert_eq!(duty.validator_index, "1234");
+    }
+
+    /// Issue 2.8: the per-duty fetch-loop detail is `trace` with canonical
+    /// fields, and a cache hit is `debug` with the canonical `epoch` (not the
+    /// default INFO and not `rvc.epoch`).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_duty_logging_levels_and_canonical_fields() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+        let response = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xdeproot_abc123");
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        tracker.fetch_duties_for_epoch(10).await.unwrap();
+        let _ = tracker.get_duty(320, 1, 1234).await.unwrap();
+
+        logs_assert(|lines: &[&str]| {
+            // Per-duty fetch-loop detail is TRACE with canonical validator_index.
+            let cached = lines
+                .iter()
+                .find(|l| l.contains("cached attester duty"))
+                .ok_or_else(|| "no per-duty trace line captured".to_string())?;
+            if !cached.contains("TRACE") {
+                return Err(format!("per-duty loop detail must be TRACE: {cached}"));
+            }
+            if !cached.contains("validator_index=1234") {
+                return Err(format!("canonical validator_index missing: {cached}"));
+            }
+            // Cache hit is DEBUG with the canonical `epoch` key.
+            let hit = lines
+                .iter()
+                .find(|l| l.contains("Cache hit") && l.contains("attester"))
+                .ok_or_else(|| "no cache-hit line captured".to_string())?;
+            if !hit.contains("DEBUG") {
+                return Err(format!("cache hit must be DEBUG: {hit}"));
+            }
+            if !hit.contains("epoch=10") {
+                return Err(format!("canonical epoch missing on cache hit: {hit}"));
+            }
+            Ok(())
+        });
     }
 
     #[tokio::test]

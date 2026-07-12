@@ -75,9 +75,13 @@ pub fn create_metrics_router_with_health(health_status: SharedHealthStatus) -> R
 pub async fn serve_metrics(addr: IpAddr, port: u16) -> Result<(), std::io::Error> {
     let router = create_metrics_router();
     let socket_addr = SocketAddr::from((addr, port));
-    let listener = TcpListener::bind(socket_addr).await?;
+    let listener = TcpListener::bind(socket_addr)
+        .await
+        .inspect_err(|e| tracing::error!(error = %e, "metrics server failed to bind"))?;
     tracing::info!("Metrics server listening on {}", socket_addr);
-    axum::serve(listener, router).await
+    axum::serve(listener, router)
+        .await
+        .inspect_err(|e| tracing::error!(error = %e, "metrics server stopped serving"))
 }
 
 /// Starts the metrics HTTP server with health endpoint on the specified address and port.
@@ -96,9 +100,13 @@ pub async fn serve_metrics_with_health(
 ) -> Result<(), std::io::Error> {
     let router = create_metrics_router_with_health(health_status);
     let socket_addr = SocketAddr::from((addr, port));
-    let listener = TcpListener::bind(socket_addr).await?;
+    let listener = TcpListener::bind(socket_addr)
+        .await
+        .inspect_err(|e| tracing::error!(error = %e, "metrics server failed to bind"))?;
     tracing::info!("Metrics server with health endpoint listening on {}", socket_addr);
-    axum::serve(listener, router).await
+    axum::serve(listener, router)
+        .await
+        .inspect_err(|e| tracing::error!(error = %e, "metrics server stopped serving"))
 }
 
 async fn metrics_handler() -> impl IntoResponse {
@@ -149,6 +157,20 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::util::ServiceExt;
+
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn serve_metrics_logs_error_on_bind_failure() {
+        use std::net::Ipv4Addr;
+        // Occupy an ephemeral port, then ask serve_metrics to bind the same one.
+        let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = occupied.local_addr().unwrap().port();
+
+        let result = serve_metrics(IpAddr::V4(Ipv4Addr::LOCALHOST), port).await;
+
+        assert!(result.is_err(), "bind should fail on an already-occupied port");
+        assert!(logs_contain("metrics server failed to bind"));
+    }
 
     #[tokio::test]
     async fn test_metrics_endpoint_returns_200() {

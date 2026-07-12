@@ -28,7 +28,8 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tracing::{debug, error, warn};
 
-use crypto::logging::TruncatedPubkey;
+use crypto::logging::fields::Duty;
+use crypto::logging::{TruncatedPubkey, TruncatedRoot};
 use crypto::{CompositeSigner, PublicKey, Signature, Signer, SigningError};
 use eth_types::{
     AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
@@ -103,6 +104,13 @@ pub struct SignerService {
     validator_locks: ValidatorLockMap,
 }
 
+/// 1-in-N rate for the attestation-stage trace (issue 5.3). The site fires once per
+/// validator per slot; at 16 a 1000-validator load drops ~63 trace lines/slot to ~4
+/// while still proving the path is live. Per-call-site counter the sampler advances.
+const ATTESTATION_STAGE_TRACE_SAMPLE_N: u64 = 16;
+static ATTESTATION_STAGE_TRACE_CTR: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 impl SignerService {
     /// Creates a new SignerService with the provided composite signer and slashing database.
     pub fn new(signer: Arc<CompositeSigner>, slashing_db: Arc<SlashingDb>) -> Self {
@@ -123,7 +131,7 @@ impl SignerService {
     /// to completion via `Handle::current().block_on()` on the same blocking
     /// thread, which is the documented pattern for calling async code from a
     /// `spawn_blocking` closure.
-    #[tracing::instrument(name = "rvc.sign.attestation", skip_all, fields(rvc.operation = "attestation", rvc.slashing.result))]
+    #[tracing::instrument(name = "sign.attestation", skip_all, fields(slot = attestation_data.slot, duty = %Duty::Attestation.as_str(), slashing_result = tracing::field::Empty))]
     pub async fn sign_attestation(
         &self,
         attestation_data: &AttestationData,
@@ -158,9 +166,9 @@ impl SignerService {
 
         debug!(
             pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            fork_version_used = %format!("0x{}", hex::encode(fork_version)),
-            genesis_validators_root = %format!("0x{}", hex::encode(genesis_validators_root)),
-            domain = %format!("0x{}", hex::encode(domain)),
+            fork_version_used = %TruncatedRoot::new(&fork_version),
+            genesis_validators_root = %TruncatedRoot::new(genesis_validators_root),
+            domain = %TruncatedRoot::new(&domain),
             fork_name = ?fork_name,
             target_epoch = target_epoch,
             "Computed attestation domain"
@@ -171,7 +179,7 @@ impl SignerService {
 
         debug!(
             pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            signing_root = %format!("0x{}", &signing_root_hex),
+            signing_root = %TruncatedRoot::new(&signing_root),
             slot = attestation_data.slot,
             index = attestation_data.index,
             source_epoch = attestation_data.source.epoch,
@@ -183,10 +191,10 @@ impl SignerService {
         let lock = self.validator_locks.get(&pubkey_bytes);
         let _guard = lock.lock_owned().await;
 
-        // Emit the `rvc.slashing.check` span on the async task so that
+        // Emit the `slashing.check` span on the async task so that
         // tracing subscribers (including tests) can observe it.  The actual
         // SQLite work happens inside `spawn_blocking` below.
-        let _slashing_span = tracing::info_span!("rvc.slashing.check").entered();
+        let _slashing_span = tracing::info_span!("slashing.check").entered();
         drop(_slashing_span);
 
         // Clone the Arc handles needed inside the blocking closure.
@@ -196,6 +204,7 @@ impl SignerService {
         let pubkey_hex_clone = pubkey_hex.clone();
         let slot_for_log = attestation_data.slot;
         let gvr = *genesis_validators_root;
+        let span = tracing::Span::current();
 
         // Run the stage → sign → commit triple on a dedicated blocking thread.
         //
@@ -207,6 +216,24 @@ impl SignerService {
         // transaction so no phantom row is committed (M-1 fix, architecture A15).
         let inner_result =
             tokio::task::spawn_blocking(move || -> Result<Signature, SignerError> {
+                // Re-enter the parent sign span on the blocking OS thread so events
+                // emitted here are correlated with the duty trace (safe: no .await).
+                let _e = span.enter();
+                // Sampled 1-in-N: this trace fires once per attestation sign, i.e.
+                // once per validator per slot — the highest-volume trace site on the
+                // sign path (5.3). The `enabled!` guard keeps it zero-cost when TRACE is
+                // off (Gate 4): a disabled site never consults the sampler / bumps the
+                // counter. Documented in plan/logging/OPERATOR_GUIDE.md §8.
+                if tracing::enabled!(tracing::Level::TRACE)
+                    && crypto::logging::should_log_sampled(
+                        &ATTESTATION_STAGE_TRACE_CTR,
+                        ATTESTATION_STAGE_TRACE_SAMPLE_N,
+                    )
+                {
+                    tracing::trace!(
+                        "staging attestation slashing-protection record on blocking thread (sampled 1-in-{ATTESTATION_STAGE_TRACE_SAMPLE_N})"
+                    );
+                }
                 // Capture the start of the SQLite transaction hold (ISSUE-3.12).
                 let tx_start = Instant::now();
                 let staged = db
@@ -300,15 +327,19 @@ impl SignerService {
 
         // Now in async context — `Span::current()` refers to the
         // `#[tracing::instrument]` span declared on this method, so recording
-        // `rvc.slashing.result` actually lands on the instrument span.
+        // `slashing_result` actually lands on the instrument span.
         let outcome = inner_result.map_err(|e| {
             if matches!(e, SignerError::SlashingProtectionBlocked(_)) {
-                tracing::Span::current().record("rvc.slashing.result", "blocked");
+                crypto::logging::record_display(
+                    &tracing::Span::current(),
+                    "slashing_result",
+                    "blocked",
+                );
             }
             e
         })?;
 
-        tracing::Span::current().record("rvc.slashing.result", "safe");
+        crypto::logging::record_display(&tracing::Span::current(), "slashing_result", "safe");
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
         RVC_ATTESTATIONS_TOTAL.with_label_values(&["success"]).inc();
@@ -327,7 +358,7 @@ impl SignerService {
     /// Uses the same stage + commit-on-success pattern as `sign_attestation`
     /// (M-1 fix, architecture A15).  See `sign_attestation` for the full
     /// rationale on `spawn_blocking` + `Handle::block_on`.
-    #[tracing::instrument(name = "rvc.sign.block", skip_all, fields(rvc.operation = "block", rvc.slashing.result))]
+    #[tracing::instrument(name = "sign.block", skip_all, fields(slot = slot, duty = %Duty::Block.as_str(), slashing_result = tracing::field::Empty))]
     pub async fn sign_block(
         &self,
         block_root: &Root,
@@ -367,9 +398,14 @@ impl SignerService {
         let handle = tokio::runtime::Handle::current();
         let pubkey_hex_clone = pubkey_hex.clone();
         let gvr = *genesis_validators_root;
+        let span = tracing::Span::current();
 
         let inner_result =
             tokio::task::spawn_blocking(move || -> Result<Signature, SignerError> {
+                // Re-enter the parent sign span on the blocking OS thread so events
+                // emitted here are correlated with the duty trace (safe: no .await).
+                let _e = span.enter();
+                tracing::trace!("staging block slashing-protection record on blocking thread");
                 // Capture the start of the SQLite transaction hold (ISSUE-3.12).
                 let tx_start = Instant::now();
                 let staged = db
@@ -447,12 +483,16 @@ impl SignerService {
 
         let outcome = inner_result.map_err(|e| {
             if matches!(e, SignerError::SlashingProtectionBlocked(_)) {
-                tracing::Span::current().record("rvc.slashing.result", "blocked");
+                crypto::logging::record_display(
+                    &tracing::Span::current(),
+                    "slashing_result",
+                    "blocked",
+                );
             }
             e
         })?;
 
-        tracing::Span::current().record("rvc.slashing.result", "safe");
+        crypto::logging::record_display(&tracing::Span::current(), "slashing_result", "safe");
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
 
@@ -466,7 +506,7 @@ impl SignerService {
     }
 
     /// Signs a RANDAO reveal for the given epoch.
-    #[tracing::instrument(name = "rvc.sign.randao", skip_all, fields(rvc.operation = "randao"))]
+    #[tracing::instrument(name = "sign.randao", skip_all, fields(duty = %Duty::Block.as_str()))]
     pub async fn sign_randao_reveal(
         &self,
         epoch: Epoch,
@@ -516,7 +556,7 @@ impl SignerService {
     }
 
     /// Signs a sync committee message for the given beacon block root and slot.
-    #[tracing::instrument(name = "rvc.sign.sync_committee_message", skip_all, fields(rvc.operation = "sync_committee_message"))]
+    #[tracing::instrument(name = "sign.sync_committee_message", skip_all, fields(duty = %Duty::SyncCommittee.as_str()))]
     pub async fn sign_sync_committee_message(
         &self,
         beacon_block_root: &Root,
@@ -565,7 +605,7 @@ impl SignerService {
     }
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
-    #[tracing::instrument(name = "rvc.sign.selection_proof", skip_all, fields(rvc.operation = "selection_proof"))]
+    #[tracing::instrument(name = "sign.selection_proof", skip_all, fields(duty = %Duty::Aggregate.as_str()))]
     pub async fn sign_selection_proof(
         &self,
         slot: Slot,
@@ -616,7 +656,7 @@ impl SignerService {
     }
 
     /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
-    #[tracing::instrument(name = "rvc.sign.aggregate_and_proof", skip_all, fields(rvc.operation = "aggregate_and_proof"))]
+    #[tracing::instrument(name = "sign.aggregate_and_proof", skip_all, fields(duty = %Duty::Aggregate.as_str()))]
     pub async fn sign_aggregate_and_proof(
         &self,
         aggregate_and_proof: &AggregateAndProof,
@@ -668,7 +708,7 @@ impl SignerService {
     }
 
     /// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
-    #[tracing::instrument(name = "rvc.sign.electra_aggregate_and_proof", skip_all, fields(rvc.operation = "electra_aggregate_and_proof"))]
+    #[tracing::instrument(name = "sign.electra_aggregate_and_proof", skip_all, fields(duty = %Duty::Aggregate.as_str()))]
     pub async fn sign_electra_aggregate_and_proof(
         &self,
         aggregate_and_proof: &ElectraAggregateAndProof,
@@ -731,7 +771,7 @@ impl SignerService {
     /// The C2 error-handling invariant is still satisfied here: every signer
     /// failure is propagated directly to the caller via `Err(e.into())` — no
     /// error is swallowed or silently converted to `Ok`.
-    #[tracing::instrument(name = "rvc.sign.voluntary_exit", skip_all, fields(rvc.operation = "voluntary_exit"))]
+    #[tracing::instrument(name = "sign.voluntary_exit", skip_all, fields(duty = %Duty::VoluntaryExit.as_str()))]
     pub async fn sign_voluntary_exit(
         &self,
         voluntary_exit: &VoluntaryExit,
@@ -790,7 +830,7 @@ impl SignerService {
     /// Signs a builder registration with DOMAIN_APPLICATION_BUILDER.
     ///
     /// No slashing check is needed — builder registrations are not slashable.
-    #[tracing::instrument(name = "rvc.sign.builder_registration", skip_all, fields(rvc.operation = "builder_registration"))]
+    #[tracing::instrument(name = "sign.builder_registration", skip_all, fields(duty = %Duty::ValidatorRegistration.as_str()))]
     pub async fn sign_builder_registration(
         &self,
         registration: &ValidatorRegistrationV1,
@@ -834,7 +874,7 @@ impl SignerService {
     }
 
     /// Signs a sync committee selection proof for the given slot and subcommittee.
-    #[tracing::instrument(name = "rvc.sign.sync_committee_selection_proof", skip_all, fields(rvc.operation = "sync_committee_selection_proof"))]
+    #[tracing::instrument(name = "sign.sync_committee_selection_proof", skip_all, fields(duty = %Duty::SyncContribution.as_str()))]
     pub async fn sign_sync_committee_selection_proof(
         &self,
         slot: Slot,
@@ -888,7 +928,7 @@ impl SignerService {
     }
 
     /// Signs a ContributionAndProof with DOMAIN_CONTRIBUTION_AND_PROOF.
-    #[tracing::instrument(name = "rvc.sign.contribution_and_proof", skip_all, fields(rvc.operation = "contribution_and_proof"))]
+    #[tracing::instrument(name = "sign.contribution_and_proof", skip_all, fields(duty = %Duty::SyncContribution.as_str()))]
     pub async fn sign_contribution_and_proof(
         &self,
         contribution_and_proof: &ContributionAndProof,
@@ -1154,6 +1194,309 @@ impl ValidatorSigner for SignerService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A captured event: its level, message, the names of the spans in its scope
+    /// (to prove a `spawn_blocking`-thread event re-enters the sign span), and the
+    /// rendered text of all its non-message fields (to prove no raw secret leaks).
+    #[derive(Clone)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        message: String,
+        scope: Vec<String>,
+        fields_text: String,
+    }
+
+    /// A captured span: its name and the `(field, value)` pairs recorded on it —
+    /// both at creation (e.g. `slot`/`duty`) and late-bound via `record()` (e.g.
+    /// `slashing_result`). Keyed by span id so `on_record` merges onto the same
+    /// entry the late value was recorded against.
+    #[derive(Clone)]
+    struct CapturedSpan {
+        name: String,
+        fields: Vec<(String, String)>,
+    }
+
+    type Events = Arc<parking_lot::Mutex<Vec<CapturedEvent>>>;
+    type Spans = Arc<parking_lot::Mutex<std::collections::HashMap<u64, CapturedSpan>>>;
+
+    /// Visits field VALUES (not just names) so span-field landing and redaction
+    /// can both be asserted. `%`/`?` values arrive via `record_debug`.
+    struct ValueVisitor(Vec<(String, String)>);
+    impl tracing::field::Visit for ValueVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.push((field.name().to_string(), format!("{value:?}")));
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.0.push((field.name().to_string(), value.to_string()));
+        }
+    }
+
+    /// Splits an event's `message` from the rendered text of all other fields.
+    #[derive(Default)]
+    struct EventVisitor {
+        message: Option<String>,
+        fields_text: String,
+    }
+    impl tracing::field::Visit for EventVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.message = Some(format!("{value:?}"));
+            } else {
+                self.fields_text.push_str(&format!("{}={value:?} ", field.name()));
+            }
+        }
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.message = Some(value.to_string());
+            } else {
+                self.fields_text.push_str(&format!("{}={value} ", field.name()));
+            }
+        }
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields_text.push_str(&format!("{}={value} ", field.name()));
+        }
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields_text.push_str(&format!("{}={value} ", field.name()));
+        }
+    }
+
+    /// Test-only capturing layer (format-independent). Non-poisoning
+    /// `parking_lot::Mutex` buffers so a failed assertion in one test can never
+    /// poison the buffer and cascade into a concurrent test under `cargo test`.
+    struct Capture {
+        events: Events,
+        spans: Spans,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for Capture
+    where
+        S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut v = ValueVisitor(Vec::new());
+            attrs.record(&mut v);
+            self.spans.lock().insert(
+                id.into_u64(),
+                CapturedSpan { name: attrs.metadata().name().to_string(), fields: v.0 },
+            );
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut v = ValueVisitor(Vec::new());
+            values.record(&mut v);
+            if let Some(span) = self.spans.lock().get_mut(&id.into_u64()) {
+                span.fields.extend(v.0);
+            }
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut v = EventVisitor::default();
+            event.record(&mut v);
+            let scope: Vec<String> = ctx
+                .event_scope(event)
+                .into_iter()
+                .flatten()
+                .map(|span| span.name().to_string())
+                .collect();
+            self.events.lock().push(CapturedEvent {
+                level: *event.metadata().level(),
+                message: v.message.unwrap_or_default(),
+                scope,
+                fields_text: v.fields_text,
+            });
+        }
+    }
+
+    /// Issue 2.2 acceptance, in one test (one global subscriber per process):
+    /// (1) the `spawn_blocking` closure re-enters the parent sign span so a
+    ///     blocking-thread event stays correlated to the duty trace, and
+    /// (2) the `sign.block` span actually records `slot` (the bare `fields(slot)`
+    ///     form is a silent no-op under `skip_all`; the explicit `slot = slot`
+    ///     form is required).
+    ///
+    /// A global subscriber is required because `spawn_blocking` runs on a
+    /// separate OS thread the thread-local dispatcher would not reach. This is
+    /// the crate's only `set_global_default` caller, so it always wins the
+    /// one-shot install; buffers use a non-poisoning `parking_lot::Mutex` and
+    /// every assertion clones out before checking, so a failure stays local even
+    /// under `cargo test`'s shared-process, multi-thread model.
+    /// Gate 3 (signer): one global subscriber proves, across a representative
+    /// sign path, that
+    ///  (1) the `spawn_blocking` closure re-enters the parent sign span so a
+    ///      blocking-thread event stays correlated to the duty trace,
+    ///  (2) the canonical fields land on the span — `slot`/`duty` at creation and
+    ///      `slashing_result` late-bound via `record()` (the vanishing-attribute
+    ///      guard); the bare `fields(slot)` form is a silent no-op under
+    ///      `skip_all`, so the explicit `slot = slot` form is required,
+    ///  (3) the validator pubkey appears only truncated — no full pubkey hex
+    ///      reaches any event, including the `spawn_blocking`-thread rejection
+    ///      line, and
+    ///  (4) the per-signature success milestone fires at `debug` while a slashing
+    ///      rejection fires at `error`.
+    ///
+    /// A global subscriber is required because `spawn_blocking` runs on a separate
+    /// OS thread the thread-local dispatcher would not reach. This is the crate's
+    /// only `set_global_default` caller, so it always wins the one-shot install;
+    /// buffers use a non-poisoning `parking_lot::Mutex` and every assertion clones
+    /// out before checking, so a failure stays local even under `cargo test`'s
+    /// shared-process, multi-thread model.
+    #[tokio::test]
+    async fn test_sign_path_redaction_level_and_field_conformance() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let events: Events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let spans: Spans = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let subscriber = tracing_subscriber::registry::Registry::default()
+            .with(Capture { events: events.clone(), spans: spans.clone() });
+        let _ = tracing::subscriber::set_global_default(subscriber);
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let full_pubkey_hex = hex::encode(pubkey.to_bytes());
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(signer, slashing_db);
+        let fork_schedule = create_test_fork_schedule_for_attestation();
+        let genesis_root = [0xaa; 32];
+
+        // Attestation (slot 1000): exercises the first spawn_blocking closure and
+        // commits a record at target epoch 101.
+        let attestation_data = create_test_attestation_data(100, 101);
+        service
+            .sign_attestation(&attestation_data, &pubkey, &fork_schedule, &genesis_root)
+            .await
+            .expect("attestation sign should succeed");
+
+        // Block (slot 3200): exercises the second spawn_blocking closure.
+        service
+            .sign_block(&[0x11; 32], 3200, &pubkey, &fork_schedule, &genesis_root)
+            .await
+            .expect("block sign should succeed");
+
+        // Conflicting attestation: same target epoch 101, different data → a
+        // double-vote the slashing DB rejects, exercising the blocking-thread
+        // `error!` rejection line and `slashing_result = "blocked"`.
+        let conflicting = AttestationData {
+            slot: 1000,
+            index: 5,
+            beacon_block_root: [0x99; 32],
+            source: Checkpoint { epoch: 100, root: [0x22; 32] },
+            target: Checkpoint { epoch: 101, root: [0x44; 32] },
+        };
+        let blocked =
+            service.sign_attestation(&conflicting, &pubkey, &fork_schedule, &genesis_root).await;
+        assert!(
+            matches!(blocked, Err(SignerError::SlashingProtectionBlocked(_))),
+            "conflicting attestation must be slashing-blocked, got {blocked:?}"
+        );
+
+        let events = events.lock().clone();
+        let spans: Vec<CapturedSpan> = spans.lock().values().cloned().collect();
+
+        // (1) Re-entry: the attestation blocking-thread marker carries the span.
+        let att_scope = events
+            .iter()
+            .find(|e| e.message.contains("staging attestation slashing-protection record"))
+            .map(|e| e.scope.clone())
+            .expect("attestation blocking-section marker must be captured");
+        assert!(
+            att_scope.iter().any(|name| name == "sign.attestation"),
+            "blocking-section event must inherit the sign.attestation span; scope was {att_scope:?}"
+        );
+
+        // (2) Canonical fields land on the span (values, not just names).
+        let block =
+            spans.iter().find(|s| s.name == "sign.block").expect("sign.block span must be created");
+        assert!(
+            block.fields.iter().any(|(k, v)| k == "slot" && v == "3200"),
+            "sign.block must record slot=3200; fields were {:?}",
+            block.fields
+        );
+        assert!(
+            block.fields.iter().any(|(k, v)| k == "duty" && v == "block"),
+            "sign.block must record duty=block; fields were {:?}",
+            block.fields
+        );
+        assert!(
+            block.fields.iter().any(|(k, v)| k == "slashing_result" && v == "safe"),
+            "sign.block must late-bind slashing_result=safe; fields were {:?}",
+            block.fields
+        );
+
+        let att_spans: Vec<&CapturedSpan> =
+            spans.iter().filter(|s| s.name == "sign.attestation").collect();
+        assert!(
+            att_spans
+                .iter()
+                .any(|s| s.fields.iter().any(|(k, v)| k == "duty" && v == "attestation")),
+            "a sign.attestation span must record duty=attestation"
+        );
+        // The vanishing-attribute guard: both outcomes land late-bound.
+        assert!(
+            att_spans
+                .iter()
+                .any(|s| s.fields.iter().any(|(k, v)| k == "slashing_result" && v == "safe")),
+            "a committed attestation must late-bind slashing_result=safe"
+        );
+        assert!(
+            att_spans
+                .iter()
+                .any(|s| s.fields.iter().any(|(k, v)| k == "slashing_result" && v == "blocked")),
+            "the rejected attestation must late-bind slashing_result=blocked"
+        );
+
+        // (3) Redaction: the full pubkey hex never appears on ANY event...
+        for e in &events {
+            assert!(
+                !e.fields_text.contains(&full_pubkey_hex) && !e.message.contains(&full_pubkey_hex),
+                "full pubkey hex leaked into event {:?} / {}",
+                e.message,
+                e.fields_text
+            );
+        }
+        // ...and the blocking-thread rejection line carries the truncated pubkey.
+        let rejection = events
+            .iter()
+            .find(|e| e.message.contains("Slashing protection rejected attestation"))
+            .expect("rejection error line must be captured");
+        assert!(
+            rejection.fields_text.contains("..."),
+            "rejection line must render a truncated pubkey; fields were {}",
+            rejection.fields_text
+        );
+
+        // (4) Level conformance: success at debug, rejection at error.
+        let completed = events
+            .iter()
+            .find(|e| e.message.contains("Signing completed"))
+            .expect("success milestone must be captured");
+        assert_eq!(
+            completed.level,
+            tracing::Level::DEBUG,
+            "the per-signature success milestone must be debug, not info"
+        );
+        assert_eq!(rejection.level, tracing::Level::ERROR, "a slashing rejection must be error");
+    }
     use crypto::{
         compute_domain, compute_signing_root, KeyManager, LocalSigner, SecretKey,
         DOMAIN_BEACON_ATTESTER,

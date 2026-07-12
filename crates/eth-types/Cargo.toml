@@ -21,3 +21,7 @@ tree_hash_derive.workspace = true
 [dev-dependencies]
 proptest.workspace = true
 tracing-test = { workspace = true, features = ["no-env-filter"] }
+# Independent SSZ-Merkleization oracle for the BeaconBlockHeader KAT (FR-31).
+# Dev-only: not a production out-edge, so the architecture-tests
+# zero-out-edge invariant for rvc-eth-types is unaffected.
+sha2.workspace = true

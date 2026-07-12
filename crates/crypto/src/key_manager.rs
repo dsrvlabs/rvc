@@ -179,6 +179,8 @@ impl KeyManager {
                 }
             };
 
+            // Gate 1: decryption needs the exposed password bytes (never logged).
+            #[allow(clippy::disallowed_methods)]
             tasks.push(DecryptionTask {
                 file_path,
                 keystore,
@@ -406,6 +408,8 @@ impl KeyManager {
                 }
             };
 
+            // Gate 1: decryption needs the exposed password bytes (never logged).
+            #[allow(clippy::disallowed_methods)]
             let secret_key = match keystore.decrypt(password.expose_secret().as_bytes()) {
                 Ok(sk) => sk,
                 Err(e) => {
@@ -470,6 +474,7 @@ impl Default for KeyManager {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
     use std::fs::File;
     use std::io::Write;
 

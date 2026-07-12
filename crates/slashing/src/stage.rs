@@ -377,11 +377,14 @@ impl SlashingDb {
                     _ => false,
                 };
                 if !is_resign {
-                    tracing::error!(
+                    // The decision is logged at debug; the terminal rejection is
+                    // logged once by the terminal caller (signer/gate/DVT error!)
+                    // per "log once at the layer that decides it is terminal".
+                    tracing::debug!(
                         pubkey = %TruncatedPubkey::new(&pubkey),
                         slot,
                         rejection_reason = "double_block_proposal",
-                        "stage_block rejected"
+                        "stage_block slashing check blocked"
                     );
                     return Err(BlockSlashingViolation::DoubleBlockProposal { slot }.into());
                 }
@@ -534,7 +537,7 @@ impl SlashingDb {
                         (Some(er), Some(nr)) if er == nr => {
                             if source_epoch != *existing_source {
                                 tracing::warn!(
-                                    pubkey,
+                                    pubkey = %TruncatedPubkey::new(&pubkey),
                                     target_epoch,
                                     existing_source = *existing_source,
                                     new_source = source_epoch,
@@ -549,12 +552,12 @@ impl SlashingDb {
                             continue;
                         }
                         _ => {
-                            tracing::error!(
+                            tracing::debug!(
                                 pubkey = %TruncatedPubkey::new(&pubkey),
                                 source_epoch,
                                 target_epoch,
                                 rejection_reason = "double_vote",
-                                "stage_attestation rejected"
+                                "stage_attestation slashing check blocked"
                             );
                             return Err(
                                 AttestationSlashingViolation::DoubleVote { target_epoch }.into()
@@ -564,12 +567,12 @@ impl SlashingDb {
                 }
 
                 if source_epoch < *existing_source && target_epoch > *existing_target {
-                    tracing::error!(
+                    tracing::debug!(
                         pubkey = %TruncatedPubkey::new(&pubkey),
                         source_epoch,
                         target_epoch,
                         rejection_reason = "surrounding_vote",
-                        "stage_attestation rejected"
+                        "stage_attestation slashing check blocked"
                     );
                     return Err(AttestationSlashingViolation::SurroundingVote {
                         new_source: source_epoch,
@@ -581,12 +584,12 @@ impl SlashingDb {
                 }
 
                 if *existing_source < source_epoch && *existing_target > target_epoch {
-                    tracing::error!(
+                    tracing::debug!(
                         pubkey = %TruncatedPubkey::new(&pubkey),
                         source_epoch,
                         target_epoch,
                         rejection_reason = "surrounded_vote",
-                        "stage_attestation rejected"
+                        "stage_attestation slashing check blocked"
                     );
                     return Err(AttestationSlashingViolation::SurroundedVote {
                         new_source: source_epoch,

@@ -42,7 +42,7 @@ impl AggregationService {
         Self { signer, beacon, duty_tracker, pubkey_map, config, validator_store }
     }
 
-    #[tracing::instrument(name = "rvc.orchestrator.produce_aggregations", skip_all, fields(rvc.slot = slot, rvc.epoch = epoch))]
+    #[tracing::instrument(name = "orchestrator.produce_aggregations", level = "debug", skip_all, fields(slot = slot, epoch = epoch))]
     pub(crate) async fn maybe_produce_aggregations(&self, slot: Slot, epoch: u64) {
         let duties =
             match utils::get_duties_for_slot(&self.pubkey_map, &self.duty_tracker, slot).await {
@@ -71,11 +71,11 @@ impl AggregationService {
 
         for duty in &duties {
             let agg_span = info_span!(
-                "rvc.aggregation.produce",
-                rvc.slot = slot,
-                rvc.validator_index = %duty.validator_index,
-                rvc.pubkey = %TruncatedPubkey::new(&duty.pubkey),
-                rvc.aggregation.fork = fork_label,
+                "aggregation.produce",
+                slot = slot,
+                validator_index = %duty.validator_index,
+                pubkey = %TruncatedPubkey::new(&duty.pubkey),
+                aggregation.fork = fork_label,
             );
 
             let committee_length: u64 = match duty.committee_length.parse() {
@@ -370,10 +370,10 @@ impl AggregationService {
             let source_validators_str = source_validators.join(",");
 
             let submit_span = info_span!(
-                "rvc.aggregation.submit",
-                rvc.slot = slot,
-                rvc.aggregation.count = count,
-                rvc.aggregation.source_validators = %source_validators_str,
+                "aggregation.submit",
+                slot = slot,
+                aggregation.count = count,
+                aggregation.source_validators = %source_validators_str,
             );
 
             let versioned = VersionedSignedAggregateAndProof::PreElectra(pre_electra_aggregates);
@@ -414,10 +414,10 @@ impl AggregationService {
             let source_validators_str = source_validators.join(",");
 
             let submit_span = info_span!(
-                "rvc.aggregation.submit",
-                rvc.slot = slot,
-                rvc.aggregation.count = count,
-                rvc.aggregation.source_validators = %source_validators_str,
+                "aggregation.submit",
+                slot = slot,
+                aggregation.count = count,
+                aggregation.source_validators = %source_validators_str,
             );
 
             let versioned = if fork_name >= ForkName::Fulu {

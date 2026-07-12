@@ -77,6 +77,14 @@ mod tests {
             dvt_index: None,
             dvt_timeout: 2000,
             dvt_timeout_is_default: true,
+            http_enabled: false,
+            http_listen_address: config::DEFAULT_HTTP_LISTEN_ADDRESS,
+            http_listen_address_is_default: true,
+            http_tls_mode: config::DEFAULT_HTTP_TLS_MODE,
+            http_tls_mode_is_default: true,
+            http_tls_cert: None,
+            http_tls_key: None,
+            http_tls_ca_cert: None,
         }
     }
 

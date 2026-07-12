@@ -26,3 +26,4 @@ validator-store.workspace = true
 crypto = { workspace = true, features = ["test-utils"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
 toml.workspace = true
+tracing-test.workspace = true

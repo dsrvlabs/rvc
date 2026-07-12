@@ -187,6 +187,7 @@ impl Signer for CompositeSigner {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
     use super::*;
     use crate::bls::PublicKey;
     use crate::key_manager::KeyManager;

@@ -969,6 +969,7 @@ pub struct CliOverrides {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip secret material (passwords) for assertions; not a logging surface
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;

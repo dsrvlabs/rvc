@@ -46,7 +46,7 @@ impl SyncCommitteeService {
         Self { signer, beacon, duty_tracker, pubkey_map, config, validator_store }
     }
 
-    #[tracing::instrument(name = "rvc.orchestrator.produce_sync_messages", skip_all, fields(rvc.slot = slot))]
+    #[tracing::instrument(name = "orchestrator.produce_sync_messages", level = "debug", skip_all, fields(slot = slot))]
     pub(crate) async fn maybe_produce_sync_messages(
         &self,
         slot: Slot,
@@ -129,7 +129,7 @@ impl SyncCommitteeService {
         }
     }
 
-    #[tracing::instrument(name = "rvc.orchestrator.produce_sync_contributions", skip_all, fields(rvc.slot = slot))]
+    #[tracing::instrument(name = "orchestrator.produce_sync_contributions", level = "debug", skip_all, fields(slot = slot))]
     pub(crate) async fn maybe_produce_sync_contributions(
         &self,
         slot: Slot,

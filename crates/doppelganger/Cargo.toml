@@ -25,3 +25,4 @@ slashing = { workspace = true }
 hex = { workspace = true }
 tokio = { workspace = true }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
+tracing-subscriber = { workspace = true, features = ["registry"] }

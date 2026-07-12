@@ -120,7 +120,7 @@ where
     /// Validators are processed sequentially within each slot to work with
     /// the non-Send/Sync `SlashingDb`. For high validator counts, consider
     /// making `SlashingDb` thread-safe with proper locking for concurrent processing.
-    #[tracing::instrument(name = "rvc.orchestrator.process_slot", skip_all, fields(rvc.slot = slot))]
+    #[tracing::instrument(name = "orchestrator.process_slot", level = "debug", skip_all, fields(slot = slot))]
     pub(crate) async fn process_slot(
         &self,
         slot: Slot,
@@ -173,14 +173,17 @@ where
             let result = self.process_attestation_duty(duty).await;
 
             if result.success {
-                info!(
-                    validator = %result.validator_index,
+                // Per-validator completion is developer detail (scales with
+                // validator count); the per-slot "Batch attestation summary"
+                // below is the operator milestone at info.
+                debug!(
+                    validator_index = %result.validator_index,
                     slot = result.slot,
                     "Attestation completed successfully"
                 );
             } else {
                 warn!(
-                    validator = %result.validator_index,
+                    validator_index = %result.validator_index,
                     slot = result.slot,
                     error = ?result.error,
                     "Attestation failed"
@@ -249,16 +252,16 @@ where
         };
 
         let att_span = info_span!(
-            "rvc.attestation.produce",
-            rvc.slot = slot,
-            rvc.validator_index = %validator_index,
-            rvc.pubkey = %TruncatedPubkey::new(&duty.pubkey),
+            "attestation.produce",
+            slot = slot,
+            validator_index = %validator_index,
+            pubkey = %TruncatedPubkey::new(&duty.pubkey),
         );
 
         {
             let _guard = att_span.enter();
             debug!(
-                validator = %validator_index,
+                validator_index = %validator_index,
                 slot = slot,
                 committee_index = committee_index,
                 "Processing attestation duty"
@@ -282,7 +285,7 @@ where
             self.config.timeouts.attestation_fetch,
             self.beacon.get_attestation_data(slot, committee_index),
         )
-        .instrument(info_span!(parent: &att_span, "rvc.beacon.get_attestation_data"))
+        .instrument(info_span!(parent: &att_span, "beacon.get_attestation_data"))
         .await;
 
         let attestation_data_response = match attestation_data_result {
@@ -308,10 +311,10 @@ where
         let beacon_attestation_data = attestation_data_response.data;
 
         debug!(
-            validator = %validator_index,
+            validator_index = %validator_index,
             slot = %beacon_attestation_data.slot,
-            index = %beacon_attestation_data.index,
-            beacon_block_root = %beacon_attestation_data.beacon_block_root,
+            committee_index = %beacon_attestation_data.index,
+            head = %beacon_attestation_data.beacon_block_root,
             source_epoch = %beacon_attestation_data.source.epoch,
             source_root = %beacon_attestation_data.source.root,
             target_epoch = %beacon_attestation_data.target.epoch,
@@ -341,7 +344,7 @@ where
         let is_electra = fork_name >= ForkName::Electra;
 
         debug!(
-            validator = %validator_index,
+            validator_index = %validator_index,
             fork_name = ?fork_name,
             is_electra = is_electra,
             target_epoch = target_epoch,
@@ -367,7 +370,7 @@ where
         };
 
         debug!(
-            validator = %validator_index,
+            validator_index = %validator_index,
             slot = crypto_attestation_data.slot,
             index = crypto_attestation_data.index,
             target_epoch = target_epoch,
@@ -383,7 +386,7 @@ where
             Err(e) => {
                 tracing::error!(
                     error = %e,
-                    validator = %validator_index,
+                    validator_index = %validator_index,
                     slot,
                     "Failed to read clock slot for AttestationData sanity check; \
                      dropping duty"
@@ -401,7 +404,7 @@ where
         {
             tracing::error!(
                 error = %e,
-                validator = %validator_index,
+                validator_index = %validator_index,
                 pubkey = %crypto::logging::TruncatedPubkey::new(&duty.pubkey),
                 slot,
                 "AttestationData failed sanity check (M-2); dropping duty"
@@ -428,14 +431,14 @@ where
             Ok(sig) => {
                 let sig_bytes = sig.to_bytes();
                 debug!(
-                    validator = %validator_index,
+                    validator_index = %validator_index,
                     signature_prefix = %format!("0x{}", hex::encode(&sig_bytes[..8])),
                     "Attestation signed successfully"
                 );
                 sig
             }
             Err(e) => {
-                tracing::error!(error = %e, validator = %validator_index, slot, "Attestation signing failed");
+                tracing::error!(error = %e, validator_index = %validator_index, slot, "Attestation signing failed");
                 return AttestationResult {
                     validator_index,
                     slot,
@@ -483,7 +486,7 @@ where
                 Some(bits) => bits,
                 None => {
                     warn!(
-                        validator = %validator_index,
+                        validator_index = %validator_index,
                         slot,
                         "Skipping attestation: could not produce aggregation bits"
                     );
@@ -512,7 +515,7 @@ where
             VersionedAttestation::PreElectra(_) => "PreElectra",
         };
         debug!(
-            validator = %validator_index,
+            validator_index = %validator_index,
             versioned_type = versioned_type,
             "Propagating attestation"
         );
@@ -521,13 +524,13 @@ where
             self.config.timeouts.attestation_submit,
             self.propagator.propagate(&versioned),
         )
-        .instrument(info_span!(parent: &att_span, "rvc.beacon.submit_attestation"))
+        .instrument(info_span!(parent: &att_span, "beacon.submit_attestation"))
         .await;
 
         match submit_result {
             Ok(Ok(_)) => AttestationResult { validator_index, slot, success: true, error: None },
             Ok(Err(e)) => {
-                tracing::error!(error = %e, validator = %validator_index, slot, "Attestation submission failed");
+                tracing::error!(error = %e, validator_index = %validator_index, slot, "Attestation submission failed");
                 AttestationResult {
                     validator_index,
                     slot,
@@ -536,7 +539,7 @@ where
                 }
             }
             Err(_) => {
-                tracing::error!(validator = %validator_index, slot, "Attestation submission timed out");
+                tracing::error!(validator_index = %validator_index, slot, "Attestation submission timed out");
                 AttestationResult {
                     validator_index,
                     slot,

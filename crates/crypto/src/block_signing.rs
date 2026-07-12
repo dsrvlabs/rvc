@@ -6,10 +6,10 @@ use crate::bls::{SecretKey, Signature};
 use crate::signing::{compute_domain, compute_signing_root};
 
 #[tracing::instrument(
-    name = "rvc.crypto.sign_block",
+    name = "crypto.sign_block",
     level = "debug",
     skip_all,
-    fields(rvc.signing_type = "block"),
+    fields(signing_type = "block")
 )]
 /// Sign a beacon block with the correct fork-aware domain.
 ///
@@ -33,10 +33,10 @@ pub fn sign_block(
 }
 
 #[tracing::instrument(
-    name = "rvc.crypto.sign_randao",
+    name = "crypto.sign_randao",
     level = "debug",
     skip_all,
-    fields(rvc.signing_type = "randao"),
+    fields(signing_type = "randao")
 )]
 /// Sign a RANDAO reveal for a given epoch.
 pub fn sign_randao_reveal(
