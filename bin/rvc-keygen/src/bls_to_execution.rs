@@ -49,10 +49,10 @@ pub fn run(args: BlsToExecutionArgs) -> Result<()> {
         to_execution_address: execution_address,
     };
 
-    // Domain: DOMAIN_BLS_TO_EXECUTION_CHANGE with Capella fork version and actual genesis_validators_root
+    // Domain: DOMAIN_BLS_TO_EXECUTION_CHANGE with genesis fork version (EIP-7044) and genesis_validators_root
     let domain = compute_domain(
         DOMAIN_BLS_TO_EXECUTION_CHANGE,
-        network.capella_fork_version,
+        network.genesis_fork_version,
         network.genesis_validators_root,
     );
 
@@ -139,7 +139,7 @@ mod tests {
         let network = network::from_name("mainnet").unwrap();
         let domain = compute_domain(
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            network.capella_fork_version,
+            network.genesis_fork_version,
             network.genesis_validators_root,
         );
         let signing_root = compute_signing_root(&change, domain);
@@ -149,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bls_to_execution_uses_capella_fork_version() {
+    fn test_bls_to_execution_uses_genesis_fork_version() {
         let (withdrawal_key, withdrawal_pubkey) = test_withdrawal_key(0);
 
         let change = BLSToExecutionChange {
@@ -160,26 +160,26 @@ mod tests {
 
         let network = network::from_name("mainnet").unwrap();
 
-        // Sign with Capella fork version (correct)
-        let capella_domain = compute_domain(
-            DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            network.capella_fork_version,
-            network.genesis_validators_root,
-        );
-        let capella_root = compute_signing_root(&change, capella_domain);
-        let signature = withdrawal_key.sign(&capella_root);
-
-        // Verify with Capella succeeds
-        assert!(signature.verify(&withdrawal_pubkey, &capella_root).is_ok());
-
-        // Verify with genesis fork version fails (proves we use Capella)
+        // Sign with genesis fork version (correct per EIP-7044 / Capella process_bls_to_execution_change)
         let genesis_domain = compute_domain(
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
             network.genesis_fork_version,
             network.genesis_validators_root,
         );
         let genesis_root = compute_signing_root(&change, genesis_domain);
-        assert!(signature.verify(&withdrawal_pubkey, &genesis_root).is_err());
+        let signature = withdrawal_key.sign(&genesis_root);
+
+        // Verify with genesis succeeds
+        assert!(signature.verify(&withdrawal_pubkey, &genesis_root).is_ok());
+
+        // Verify with Capella fork version fails (proves we use genesis, not Capella)
+        let capella_domain = compute_domain(
+            DOMAIN_BLS_TO_EXECUTION_CHANGE,
+            network.capella_fork_version,
+            network.genesis_validators_root,
+        );
+        let capella_root = compute_signing_root(&change, capella_domain);
+        assert!(signature.verify(&withdrawal_pubkey, &capella_root).is_err());
     }
 
     #[test]
@@ -197,7 +197,7 @@ mod tests {
         // Sign with actual genesis_validators_root (correct)
         let correct_domain = compute_domain(
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            network.capella_fork_version,
+            network.genesis_fork_version,
             network.genesis_validators_root,
         );
         let correct_root = compute_signing_root(&change, correct_domain);
@@ -205,7 +205,7 @@ mod tests {
 
         // Verify with zeroed root fails (proves we use actual root)
         let zeroed_domain =
-            compute_domain(DOMAIN_BLS_TO_EXECUTION_CHANGE, network.capella_fork_version, [0u8; 32]);
+            compute_domain(DOMAIN_BLS_TO_EXECUTION_CHANGE, network.genesis_fork_version, [0u8; 32]);
         let zeroed_root = compute_signing_root(&change, zeroed_domain);
         assert!(signature.verify(&withdrawal_pubkey, &zeroed_root).is_err());
     }
@@ -242,7 +242,7 @@ mod tests {
         let network = network::from_name("mainnet").unwrap();
         let domain = compute_domain(
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            network.capella_fork_version,
+            network.genesis_fork_version,
             network.genesis_validators_root,
         );
         let signing_root = compute_signing_root(&change, domain);
@@ -292,7 +292,7 @@ mod tests {
         let network = network::from_name("mainnet").unwrap();
         let domain = compute_domain(
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            network.capella_fork_version,
+            network.genesis_fork_version,
             network.genesis_validators_root,
         );
         let signing_root = compute_signing_root(&change, domain);
@@ -345,7 +345,7 @@ mod tests {
         let network = network::from_name("hoodi").unwrap();
         let domain = compute_domain(
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
-            network.capella_fork_version,
+            network.genesis_fork_version,
             network.genesis_validators_root,
         );
         let signing_root = compute_signing_root(&change, domain);
