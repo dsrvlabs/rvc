@@ -464,6 +464,18 @@ impl KeyManager {
         }
         self.keys.insert(pubkey.to_bytes(), secret_key);
     }
+
+    /// Removes a secret key by public key bytes.
+    ///
+    /// Returns `true` if the key was present and removed.
+    pub fn remove(&mut self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
+        self.keys.remove(pubkey).is_some()
+    }
+
+    /// Returns `true` if a key with the given public key is present.
+    pub fn contains(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
+        self.keys.contains_key(pubkey)
+    }
 }
 
 impl Default for KeyManager {

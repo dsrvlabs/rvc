@@ -95,13 +95,43 @@ impl CompositeSigner {
         self.dynamic_local.write().insert(pubkey, secret_key);
     }
 
+    /// Removes a local key from the signing registry.
+    ///
+    /// Checks both the dynamically-added set (`add_local_key` / keymanager import)
+    /// and the boot-loaded `LocalSigner` / `KeyManager` set (keystore-dir and
+    /// secret-provider). Returns `true` if the key was present in either.
     pub fn remove_local_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
-        let removed = self.dynamic_local.write().remove(pubkey).is_some();
+        let dynamic_removed = self.dynamic_local.write().remove(pubkey).is_some();
+        let boot_removed = self.local.remove_key(pubkey);
+        let removed = dynamic_removed || boot_removed;
         if removed {
             let pubkey_hex = hex::encode(pubkey);
             warn!(pubkey = %TruncatedPubkey::new(&pubkey_hex), "Removed local signer key");
         }
         removed
+    }
+
+    /// Local (non-remote) public keys the VC can sign with.
+    ///
+    /// Canonical "local keystores" set for the Keymanager API: union of boot-loaded
+    /// keys (`LocalSigner` / keystore-dir / secret-provider) and keys added via
+    /// `add_local_key` (API import / secret-provider refresh). Does **not** include
+    /// HTTP or gRPC remote keys — those are managed via `RemoteKeyManager`.
+    pub fn local_public_keys(&self) -> Vec<[u8; PUBLIC_KEY_BYTES_LEN]> {
+        let mut keys = self.local.public_keys();
+        let dynamic = self.dynamic_local.read();
+        keys.extend(dynamic.keys());
+        keys.sort();
+        keys.dedup();
+        keys
+    }
+
+    /// Returns `true` if `pubkey` is a local (non-remote) signing key.
+    pub fn has_local_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
+        if self.dynamic_local.read().contains_key(pubkey) {
+            return true;
+        }
+        self.local.contains_key(pubkey)
     }
 }
 
@@ -326,6 +356,27 @@ mod tests {
         let removed = composite.remove_local_key(&pk_bytes);
         assert!(removed);
         assert!(composite.public_keys().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_composite_signer_remove_boot_loaded_local_key() {
+        let sk = SecretKey::generate();
+        let pk_bytes = sk.public_key().to_bytes();
+        let signing_root: Root = [0xcd; 32];
+
+        let composite = CompositeSigner::new(create_local_signer_with_key(sk));
+        assert!(composite.has_local_key(&pk_bytes));
+        assert!(composite.local_public_keys().contains(&pk_bytes));
+        assert!(composite.sign(&signing_root, &pk_bytes).await.is_ok());
+
+        let removed = composite.remove_local_key(&pk_bytes);
+        assert!(removed);
+        assert!(!composite.has_local_key(&pk_bytes));
+        assert!(composite.local_public_keys().is_empty());
+        assert!(matches!(
+            composite.sign(&signing_root, &pk_bytes).await,
+            Err(SigningError::KeyNotFound(_))
+        ));
     }
 
     #[tokio::test]

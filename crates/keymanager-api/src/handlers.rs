@@ -108,6 +108,10 @@ pub struct SetAttestingResponse {
 pub async fn list_keystores(State(state): State<Arc<AppState>>) -> Json<ListKeystoresResponse> {
     // Per Keymanager API spec, GET /eth/v1/keystores returns only local keys.
     // Remote keys are returned by GET /eth/v1/remotekeys.
+    //
+    // SEC-1a: `list_keys` is the full local signing registry (boot-loaded
+    // keystore-dir / secret-provider keys and API-imported keys), not only
+    // keys imported via this API.
     let local_keys = state.keystore_manager.list_keys();
 
     let data: Vec<KeystoreInfo> = local_keys
@@ -118,6 +122,9 @@ pub async fn list_keystores(State(state): State<Arc<AppState>>) -> Json<ListKeys
             KeystoreInfo {
                 validating_pubkey: format!("0x{}", hex::encode(pk)),
                 derivation_path: None,
+                // All local keys are deletable via DELETE /eth/v1/keystores
+                // (including boot-loaded keys after SEC-1a). Remote keys are
+                // listed on /remotekeys, not here.
                 readonly: false,
                 doppelganger_safe,
             }

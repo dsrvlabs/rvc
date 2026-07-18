@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use thiserror::Error;
 
 use super::bls::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
@@ -29,12 +30,24 @@ pub trait Signer: Send + Sync {
 }
 
 pub struct LocalSigner {
-    key_manager: KeyManager,
+    /// Boot-loaded keys (keystore-dir / secret-provider). `RwLock` so Keymanager
+    /// `DELETE` can remove a key without exclusive ownership of `CompositeSigner`.
+    key_manager: RwLock<KeyManager>,
 }
 
 impl LocalSigner {
     pub fn new(key_manager: KeyManager) -> Self {
-        Self { key_manager }
+        Self { key_manager: RwLock::new(key_manager) }
+    }
+
+    /// Removes a boot-loaded key. Returns `true` if the key was present.
+    pub fn remove_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
+        self.key_manager.write().remove(pubkey)
+    }
+
+    /// Returns `true` if the boot-loaded key set contains `pubkey`.
+    pub fn contains_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
+        self.key_manager.read().contains(pubkey)
     }
 }
 
@@ -47,15 +60,14 @@ impl Signer for LocalSigner {
     ) -> Result<Signature, SigningError> {
         let pk = PublicKey::from_bytes(pubkey)
             .map_err(|_| SigningError::KeyNotFound(hex::encode(pubkey)))?;
-        let sk = self
-            .key_manager
-            .get_secret_key(&pk)
-            .ok_or_else(|| SigningError::KeyNotFound(hex::encode(pubkey)))?;
+        let km = self.key_manager.read();
+        let sk =
+            km.get_secret_key(&pk).ok_or_else(|| SigningError::KeyNotFound(hex::encode(pubkey)))?;
         Ok(sk.sign(signing_root))
     }
 
     fn public_keys(&self) -> Vec<[u8; PUBLIC_KEY_BYTES_LEN]> {
-        self.key_manager.list_public_keys().iter().map(|pk| pk.to_bytes()).collect()
+        self.key_manager.read().list_public_keys().iter().map(|pk| pk.to_bytes()).collect()
     }
 }
 
