@@ -56,12 +56,15 @@ pub fn make_service_with_db_unknown_key() -> (SignerServiceImpl, PathBuf) {
     (svc, db_path)
 }
 
-/// Create a temporary file path for a slashing DB.
-/// The file is kept alive by leaking the `NamedTempFile` handle.
+/// Create a temporary path for a slashing DB that does **not** yet exist.
+///
+/// SEC-3 rejects pre-existing 0-byte files as corrupt; `SlashingDb::open` still
+/// creates a fresh DB when the path is missing (library/test convenience).
+/// Leak the parent `TempDir` so the path stays valid for the test lifetime.
 fn make_temp_db_path() -> PathBuf {
-    let tmp = tempfile::NamedTempFile::new().unwrap();
-    let path = tmp.path().to_path_buf();
-    std::mem::forget(tmp); // keep file alive for the test
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("slashing.db");
+    std::mem::forget(dir);
     path
 }
 

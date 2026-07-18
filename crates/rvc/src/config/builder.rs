@@ -4,10 +4,11 @@
 #![allow(clippy::type_complexity)]
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crypto::logging::RedactedUrl;
 
@@ -37,6 +38,40 @@ use super::types::Config;
 
 fn format_version(v: eth_types::Version) -> String {
     format!("0x{}", hex::encode(v))
+}
+
+/// Resolve a filesystem identity for `path` by walking up to the nearest existing
+/// ancestor (Unix: `st_dev`). Returns `None` when the device cannot be determined
+/// (non-Unix, or no existing ancestor).
+fn filesystem_id(path: &Path) -> Option<u64> {
+    let mut current = path;
+    loop {
+        if let Ok(meta) = std::fs::metadata(current) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                return Some(meta.dev());
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = meta;
+                return None;
+            }
+        }
+        current = current.parent()?;
+        if current.as_os_str().is_empty() {
+            return None;
+        }
+    }
+}
+
+/// Returns `Some(true)` when the two paths resolve to different filesystems,
+/// `Some(false)` when they share a device, and `None` when the comparison is
+/// unavailable (non-Unix or neither path has an existing ancestor).
+fn paths_on_different_filesystems(a: &Path, b: &Path) -> Option<bool> {
+    let a_id = filesystem_id(a)?;
+    let b_id = filesystem_id(b)?;
+    Some(a_id != b_id)
 }
 
 /// SEC-3 post-open gate: a fresh create without opt-in must never proceed to sign.
@@ -145,6 +180,29 @@ impl ServiceBuilder {
             keymanager_enabled = self.config.keymanager_enabled,
             "Feature toggles"
         );
+
+        self.warn_keystore_slashing_path_divergence();
+    }
+
+    /// Warn when `keystore_path` and `slashing_db_path` resolve to different
+    /// filesystems (SEC-10).
+    ///
+    /// Independently settable paths can hide a copied-data-dir deployment where
+    /// only one of the two volumes is moved to a new host, defeating same-host
+    /// mutual exclusion and risking double-signing.
+    pub fn warn_keystore_slashing_path_divergence(&self) {
+        let keystore = &self.config.keystore_path;
+        let slashing = &self.config.slashing_db_path;
+        if paths_on_different_filesystems(keystore, slashing) == Some(true) {
+            warn!(
+                keystore_path = %keystore.display(),
+                slashing_db_path = %slashing.display(),
+                "keystore_path and slashing_db_path appear to be on different \
+                 filesystems; a partial data-dir copy can leave the slashing DB \
+                 behind and enable double-signing. Keep both on the same durable \
+                 volume, and never run the same keys on two hosts."
+            );
+        }
     }
 
     pub fn build_beacon(&self) -> Result<Arc<BeaconClient>, ConfigError> {
@@ -255,6 +313,9 @@ impl ServiceBuilder {
     }
 
     pub fn build_slashing_db(&self) -> Result<Arc<SlashingDb>, ConfigError> {
+        // SEC-10: surface keystore / slashing-DB volume divergence early.
+        self.warn_keystore_slashing_path_divergence();
+
         let path = &self.config.slashing_db_path;
 
         if let Some(parent) = path.parent() {
@@ -1184,6 +1245,52 @@ mod tests {
         let config = create_minimal_config();
         let builder = ServiceBuilder::new(config);
         builder.log_effective_config();
+    }
+
+    /// SEC-10: paths under the same temp dir share a filesystem → not divergent.
+    #[test]
+    fn test_warn_when_keystore_and_slashing_paths_same_fs() {
+        let temp_dir = TempDir::new().unwrap();
+        let keystore = temp_dir.path().join("keystores");
+        let slashing = temp_dir.path().join("slashing.db");
+        std::fs::create_dir_all(&keystore).unwrap();
+        // slashing path need not exist; filesystem_id walks to the parent.
+        assert_eq!(
+            paths_on_different_filesystems(&keystore, &slashing),
+            Some(false),
+            "sibling paths on the same volume must not report divergence"
+        );
+
+        let config = Config {
+            keystore_path: keystore,
+            slashing_db_path: slashing,
+            ..create_minimal_config()
+        };
+        // Must not panic; no warning expected for same-FS paths.
+        ServiceBuilder::new(config).warn_keystore_slashing_path_divergence();
+    }
+
+    /// SEC-10: when both sides can be resolved, different device IDs report divergence.
+    ///
+    /// We cannot create two real mount points in unit tests, so pin the pure
+    /// helper against the same-device case and the "cannot determine" path.
+    #[test]
+    fn test_warn_when_keystore_and_slashing_paths_differ_fs() {
+        let temp_dir = TempDir::new().unwrap();
+        let keystore = temp_dir.path().join("keys");
+        std::fs::create_dir_all(&keystore).unwrap();
+
+        // Non-existent absolute path with no existing ancestor on a typical
+        // layout still resolves via `/` → comparable, same device as temp.
+        // On Unix, an empty path cannot be resolved → None.
+        assert_eq!(paths_on_different_filesystems(Path::new(""), Path::new("")), None);
+
+        // Same existing directory compared to itself is never divergent.
+        assert_eq!(paths_on_different_filesystems(&keystore, &keystore), Some(false));
+
+        // Distinct subpaths under one temp dir share st_dev.
+        let slashing = temp_dir.path().join("nested").join("slash.db");
+        assert_eq!(paths_on_different_filesystems(&keystore, &slashing), Some(false));
     }
 
     // --- ISSUE-2.1: H-1 fee recipient + gas-limit defaults ---

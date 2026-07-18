@@ -90,6 +90,9 @@ impl From<SigningError> for SignerError {
             SigningError::InvalidRemoteSignature => {
                 SignerError::SigningFailed("remote signer returned invalid signature".to_string())
             }
+            SigningError::UnsupportedSigningType(msg) => {
+                SignerError::SigningFailed(format!("unsupported remote signing type: {msg}"))
+            }
         }
     }
 }

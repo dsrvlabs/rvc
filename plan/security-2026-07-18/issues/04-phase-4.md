@@ -281,13 +281,13 @@ divergence warning.
 - (if the log line is added) `test_warn_when_keystore_and_slashing_paths_differ_fs`.
 
 **Acceptance criteria:**
-- [ ] `rustls-webpki >= 0.103.13`; `cargo build` + `cargo nextest run --workspace` pass after the bump.
-- [ ] `cargo audit` clean of the three rustls-webpki advisories; remaining accepted advisories listed
+- [x] `rustls-webpki >= 0.103.13`; `cargo build` + `cargo nextest run --workspace` pass after the bump.
+- [x] `cargo audit` clean of the three rustls-webpki advisories; remaining accepted advisories listed
       with justification; `cargo_audit.json` regenerated and consistent with the lockfile.
-- [ ] A `cargo audit` step runs in CI (`ci.yml`).
-- [ ] `RVC_ALLOW_NON_WAL_SLASHING_DB` and the `keystore_path`/`slashing_db_path` divergence are
+- [x] A `cargo audit` step runs in CI (`ci.yml`).
+- [x] `RVC_ALLOW_NON_WAL_SLASHING_DB` and the `keystore_path`/`slashing_db_path` divergence are
       documented in the operator docs.
-- [ ] `cargo fmt`/`clippy -D warnings` clean.
+- [x] `cargo fmt`/`clippy -D warnings` clean.
 
 **Risks / unknowns:**
 - `tonic`/`rustls-pemfile` must **not** be bumped (known-blocked); the webpki bump is scoped to not pull

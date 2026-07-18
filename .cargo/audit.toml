@@ -7,4 +7,11 @@ ignore = [
     # paste: unmaintained, transitive via ark-ff and alloy-primitives.
     # No direct upgrade path — multiple upstream crates depend on paste.
     "RUSTSEC-2024-0436",
+
+    # rustls-pemfile: unmaintained (RUSTSEC-2025-0134). Transitive via tonic 0.12
+    # (and related gRPC stack). Migration to rustls-pki-types is blocked until
+    # the workspace can move to tonic 0.13+; do not bump tonic solely for this.
+    # cargo-audit treats unmaintained as a non-fatal warning by default; this
+    # ignore documents the accepted residual for CI/policy clarity.
+    "RUSTSEC-2025-0134",
 ]
