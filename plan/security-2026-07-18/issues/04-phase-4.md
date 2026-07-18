@@ -144,11 +144,11 @@ camelCase `signingRoot` with a `signing_root` alias at `:172`). Docs: `docs/web3
 - `test_local_slashing_stage_ordering_unchanged`
 
 **Acceptance criteria:**
-- [ ] Serialized request bodies match the Web3Signer contract for every signing type the client
+- [x] Serialized request bodies match the Web3Signer contract for every signing type the client
       dispatches (exact JSON in tests).
-- [ ] Unsupported types return a typed error, never a malformed body.
-- [ ] The local slashing-stage-before-dispatch ordering is unchanged; the server-side feature untouched.
-- [ ] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
+- [x] Unsupported types return a typed error, never a malformed body.
+- [x] The local slashing-stage-before-dispatch ordering is unchanged; the server-side feature untouched.
+- [x] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
 
 **Risks / unknowns:**
 - The client `sign()` being generic over message type is the main lift — threading the concrete type +

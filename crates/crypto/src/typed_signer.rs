@@ -25,9 +25,9 @@ use eth_types::{ForkName, ForkSchedule, SyncAggregatorSelectionData};
 
 /// Low-level signing trait: signs a 32-byte root with a known keypair.
 ///
-/// [`LocalSigner`] and `RemoteSigner` (Web3Signer HTTP) implement this.
-/// `GrpcRemoteSigner` does **not** implement this (it only implements
-/// [`TypedSigner`]) because the v2 gRPC contract has no raw-root RPC.
+/// [`LocalSigner`] implements this. Web3Signer HTTP (`RemoteSigner`) and
+/// `GrpcRemoteSigner` do **not** — both require typed payloads (SEC-8 /
+/// C-2/C-3) and only implement [`TypedSigner`].
 #[async_trait]
 pub trait RawSigner: Send + Sync {
     async fn sign(

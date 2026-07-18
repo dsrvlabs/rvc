@@ -16,6 +16,11 @@ pub enum SigningError {
 
     #[error("remote signer returned invalid signature")]
     InvalidRemoteSignature,
+
+    /// The requested duty type cannot be encoded as a Web3Signer HTTP body
+    /// (SEC-8). Never falls back to a bare `{signing_root}` body.
+    #[error("unsupported remote signing type: {0}")]
+    UnsupportedSigningType(String),
 }
 
 #[async_trait]

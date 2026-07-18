@@ -41,7 +41,14 @@ pub use key_manager::{KeyManager, WILDCARD_KEY};
 pub use keystore::{EncryptionKdf, KdfParams, Keystore, Pbkdf2Params, ScryptParams};
 pub use pubkey::CanonicalPubkey;
 pub use remote_signer::{
-    check_remote_signer_url, RemoteSigner, RemoteSignerConfig, REMOTE_SIGNER_INSECURE_ENV_VAR,
+    build_aggregate_and_proof_request, build_aggregation_slot_request, build_attestation_request,
+    build_blinded_block_v2_request, build_block_v2_request, build_contribution_and_proof_request,
+    build_randao_reveal_request, build_sync_committee_message_request,
+    build_sync_selection_proof_request, build_validator_registration_request,
+    build_voluntary_exit_request, check_remote_signer_url, AggregationSlotPayload,
+    BeaconBlockEnvelope, RandaoRevealPayload, RemoteSigner, RemoteSignerConfig,
+    SyncSelectionPayload, Web3SignerPayload, Web3SignerSignRequest, WireForkInfo,
+    REMOTE_SIGNER_INSECURE_ENV_VAR,
 };
 pub use signer_trait::{LocalSigner, Signer, SigningError};
 pub use signing::{

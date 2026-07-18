@@ -222,8 +222,7 @@ mod tests {
     use crate::bls::PublicKey;
     use crate::key_manager::KeyManager;
     use crate::remote_signer::RemoteSignerConfig;
-    use wiremock::matchers::{method, path_regex};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::MockServer;
 
     fn create_empty_local_signer() -> LocalSigner {
         LocalSigner::new(KeyManager::new())
@@ -249,30 +248,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_composite_signer_remote_sign() {
+    async fn test_composite_signer_remote_raw_sign_returns_unsupported() {
+        // SEC-8: Web3Signer HTTP refuses raw-root signing (typed body required).
         let sk = SecretKey::generate();
         let pk_bytes = sk.public_key().to_bytes();
         let signing_root: Root = [0xab; 32];
-        let expected_sig = sk.sign(&signing_root);
-        let sig_hex = format!("0x{}", hex::encode(expected_sig.to_bytes()));
 
         let mock_server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path_regex(r"/api/v1/eth2/sign/.*"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"signature": sig_hex})),
-            )
-            .mount(&mock_server)
-            .await;
-
         let config = RemoteSignerConfig::new(mock_server.uri());
         let remote_signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
         let composite = CompositeSigner::new(create_empty_local_signer());
         composite.add_remote_key(pk_bytes, remote_signer);
 
-        let sig = composite.sign(&signing_root, &pk_bytes).await.unwrap();
-        assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
+        let result = composite.sign(&signing_root, &pk_bytes).await;
+        match result.unwrap_err() {
+            SigningError::UnsupportedSigningType(msg) => {
+                assert!(msg.contains("TypedSigner"), "msg={msg}");
+            }
+            other => panic!("expected UnsupportedSigningType, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -393,30 +388,20 @@ mod tests {
         let pk_bytes = sk.public_key().to_bytes();
         let signing_root: Root = [0xab; 32];
 
-        // Use the same key so the remote signature is valid for this pubkey
-        let expected_sig = sk.sign(&signing_root);
-        let sig_hex = format!("0x{}", hex::encode(expected_sig.to_bytes()));
-
         let mock_server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path_regex(r"/api/v1/eth2/sign/.*"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"signature": sig_hex})),
-            )
-            .expect(1) // Verifies the remote signer was called (not local)
-            .mount(&mock_server)
-            .await;
-
         let config = RemoteSignerConfig::new(mock_server.uri());
         let remote_signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
 
-        // Same key in both local and remote
+        // Same key in both local and remote — remote is consulted first and
+        // refuses raw-root (SEC-8). Local is never reached for this pubkey.
         let composite = CompositeSigner::new(create_local_signer_with_key(sk));
         composite.add_remote_key(pk_bytes, remote_signer);
 
-        let sig = composite.sign(&signing_root, &pk_bytes).await.unwrap();
-        // Mock expectation (expect(1)) verifies remote path was used
-        assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
+        let result = composite.sign(&signing_root, &pk_bytes).await;
+        match result.unwrap_err() {
+            SigningError::UnsupportedSigningType(_) => {}
+            other => panic!("expected UnsupportedSigningType from remote priority, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
