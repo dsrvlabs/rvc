@@ -4333,6 +4333,7 @@ name = "rvc-eth-types"
 version = "0.6.0"
 dependencies = [
  "ethereum_serde_utils 0.8.0",
+ "ethereum_ssz 0.8.3",
  "ethereum_ssz 0.9.1",
  "ethereum_ssz_derive",
  "hex",

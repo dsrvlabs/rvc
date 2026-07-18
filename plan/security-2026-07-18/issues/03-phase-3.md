@@ -203,10 +203,10 @@ deserializer. Sub-containers are shared with SEC-6d (blinded/Deneb), so build th
 - `test_beacon_block_body_electra_htr_matches_external_vector` (reuses the SEC-6a vector)
 
 **Acceptance criteria:**
-- [ ] `hash_tree_root(BeaconBlockBodyElectra)` matches the external vector exactly.
-- [ ] The `Vec<u8>` body deserializes into the typed container losslessly (round-trip test).
-- [ ] Any new dependency is justified in the summary with `cargo tree` impact.
-- [ ] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
+- [x] `hash_tree_root(BeaconBlockBodyElectra)` matches the external vector exactly.
+- [x] The `Vec<u8>` body deserializes into the typed container losslessly (round-trip test).
+- [x] Any new dependency is justified in the summary with `cargo tree` impact.
+- [x] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
 
 **Risks / unknowns:**
 - Sub-container breadth is the swing factor. If the spike chose a library, this is small (import +

@@ -5,7 +5,7 @@ use tree_hash_derive::TreeHash;
 mod aggregation;
 mod attestation;
 mod block;
-/// Typed BeaconBlockBody containers + SEC-6a body HTR prototype (seed for SEC-6b).
+/// Typed BeaconBlockBody containers + SSZ decode (SEC-6b; foundation for SEC-6c wire).
 pub mod block_body;
 mod builder;
 pub mod canonical;
@@ -28,6 +28,11 @@ pub use block::{
     body_fork_layout, kzg_commitment_list_root, BeaconBlock, BeaconBlockBody, BeaconBlockHeader,
     BlindedBeaconBlock, BlindedBeaconBlockBody, BlobSidecar, BlockContents, BodyForkLayout,
     ProducedBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
+};
+pub use block_body::{
+    decode_beacon_block_body_electra, decode_blinded_beacon_block_body_electra,
+    BeaconBlockBodyElectra, BlindedBeaconBlockBodyElectra, BodySszError, ExecutionPayload,
+    ExecutionPayloadHeader, ExecutionRequests, SyncAggregate,
 };
 pub use builder::{SignedValidatorRegistration, ValidatorRegistrationV1};
 pub use deposit::{BLSToExecutionChange, DepositData, DepositMessage, SignedBLSToExecutionChange};

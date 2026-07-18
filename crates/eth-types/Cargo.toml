@@ -13,6 +13,8 @@ ethereum_serde_utils.workspace = true
 hex.workspace = true
 ssz.workspace = true
 ssz_derive.workspace = true
+# Body-container SSZ Encode/Decode only (ssz_types VariableList/Bit* are 0.8 traits).
+ssz08.workspace = true
 ssz_types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
