@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use tree_hash::{mix_in_length, Hash256, MerkleHasher, TreeHash, TreeHashType};
 
 use crate::block_body::{
-    decode_beacon_block_body_electra, decode_blinded_beacon_block_body_electra,
+    blinded_body_tree_hash_root, blinded_body_tree_hash_root_for_layout, body_tree_hash_root,
+    body_tree_hash_root_for_layout,
 };
 use crate::hex_fixed::bytes_32_hex;
 use crate::tree_hash_utils::TreeHashError;
@@ -364,7 +365,8 @@ pub fn external_vector_electra_block() -> BeaconBlock {
     }
 }
 
-/// Electra blinded block for the SEC-6c external vector (same header fields).
+/// Electra blinded block for the SEC-6d external vector (distinct blinded
+/// graffiti; same header fields as the full Electra block vector).
 pub fn external_vector_electra_blinded_block() -> BlindedBeaconBlock {
     BlindedBeaconBlock {
         slot: 3_000_000,
@@ -372,6 +374,28 @@ pub fn external_vector_electra_blinded_block() -> BlindedBeaconBlock {
         parent_root: [0x11; 32],
         state_root: [0x22; 32],
         body: crate::block_body::external_vector_blinded_electra_body().as_ssz_bytes(),
+    }
+}
+
+/// Deneb `BeaconBlock` for the SEC-6d external block-level vector.
+pub fn external_vector_deneb_block() -> BeaconBlock {
+    BeaconBlock {
+        slot: 3_000_000,
+        proposer_index: 42,
+        parent_root: [0x11; 32],
+        state_root: [0x22; 32],
+        body: crate::block_body::external_vector_deneb_body().as_ssz_bytes(),
+    }
+}
+
+/// Deneb blinded block for the SEC-6d external vector.
+pub fn external_vector_deneb_blinded_block() -> BlindedBeaconBlock {
+    BlindedBeaconBlock {
+        slot: 3_000_000,
+        proposer_index: 42,
+        parent_root: [0x11; 32],
+        state_root: [0x22; 32],
+        body: crate::block_body::external_vector_blinded_deneb_body().as_ssz_bytes(),
     }
 }
 
@@ -395,23 +419,38 @@ impl BeaconBlock {
         extract_blob_kzg_commitments(&self.body, layout).len()
     }
 
-    /// Spec `hash_tree_root(BeaconBlock)` with Electra typed body leaf (SEC-6c).
+    /// Spec `hash_tree_root(BeaconBlock)` with typed body leaf (SEC-6c/6d).
     ///
-    /// Deserializes `self.body` as [`crate::BeaconBlockBodyElectra`] and uses
-    /// that container's `hash_tree_root` as the fifth merkle leaf — not a raw
-    /// `ByteList` over the SSZ body bytes (the pre-SEC-6 non-spec leaf).
+    /// Deserializes `self.body` as Electra or Deneb typed body (auto-detect)
+    /// and uses that container's `hash_tree_root` as the fifth merkle leaf —
+    /// not a raw `ByteList` over the SSZ body bytes (the pre-SEC-6 non-spec leaf).
     ///
     /// Returns [`TreeHashError::InvalidBody`] when the body bytes are not a
-    /// valid Electra `BeaconBlockBody` SSZ encoding (does not panic).
+    /// valid Electra/Deneb `BeaconBlockBody` SSZ encoding (does not panic).
     pub fn try_tree_hash_root(&self) -> Result<Hash256, TreeHashError> {
-        let body = decode_beacon_block_body_electra(&self.body)
+        let body_root = body_tree_hash_root(&self.body)
             .map_err(|e| TreeHashError::InvalidBody { reason: e.to_string() })?;
+        self.hash_with_body_root(body_root)
+    }
+
+    /// Spec block root with an explicit fork layout (when BN `consensus_version`
+    /// is known). Prefer this over auto-detect for production proposal paths.
+    pub fn try_tree_hash_root_for_layout(
+        &self,
+        layout: BodyForkLayout,
+    ) -> Result<Hash256, TreeHashError> {
+        let body_root = body_tree_hash_root_for_layout(&self.body, layout)
+            .map_err(|e| TreeHashError::InvalidBody { reason: e.to_string() })?;
+        self.hash_with_body_root(body_root)
+    }
+
+    fn hash_with_body_root(&self, body_root: Hash256) -> Result<Hash256, TreeHashError> {
         let mut hasher = MerkleHasher::with_leaves(5);
         hasher.write(self.slot.tree_hash_root().as_slice()).expect("valid leaf");
         hasher.write(self.proposer_index.tree_hash_root().as_slice()).expect("valid leaf");
         hasher.write(self.parent_root.tree_hash_root().as_slice()).expect("valid leaf");
         hasher.write(self.state_root.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(body.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(body_root.as_slice()).expect("valid leaf");
         Ok(hasher.finish().expect("valid root"))
     }
 }
@@ -429,36 +468,51 @@ impl TreeHash for BeaconBlock {
         1
     }
 
-    /// Trait surface for `compute_signing_root` / tests with **valid** Electra body SSZ.
+    /// Trait surface for `compute_signing_root` / tests with **valid** body SSZ.
     ///
     /// **Production paths must use [`Self::try_tree_hash_root`]** (or
     /// `block-service` `compute_block_root`), which return `Err` on malformed
-    /// body bytes. This method panics on invalid Electra body SSZ because
+    /// body bytes. This method panics on invalid Electra/Deneb body SSZ because
     /// `TreeHash` cannot express `Result` — same pattern as aggregation
     /// `TreeHash` vs `try_tree_hash_root`. Do not return a zero/default root
     /// here: that would be a silent wrong signing root.
     fn tree_hash_root(&self) -> Hash256 {
-        self.try_tree_hash_root().expect("valid Electra BeaconBlockBody SSZ for tree_hash_root")
+        self.try_tree_hash_root()
+            .expect("valid Electra/Deneb BeaconBlockBody SSZ for tree_hash_root")
     }
 }
 
 impl BlindedBeaconBlock {
-    /// Spec `hash_tree_root(BlindedBeaconBlock)` with Electra typed body leaf (SEC-6c).
+    /// Spec `hash_tree_root(BlindedBeaconBlock)` with typed body leaf (SEC-6c/6d).
     ///
-    /// Deserializes `self.body` as [`crate::BlindedBeaconBlockBodyElectra`] and
-    /// uses that container's `hash_tree_root` as the fifth merkle leaf.
+    /// Deserializes `self.body` as Electra or Deneb blinded body (auto-detect)
+    /// and uses that container's `hash_tree_root` as the fifth merkle leaf.
     ///
     /// Returns [`TreeHashError::InvalidBody`] when the body bytes are not a
-    /// valid Electra blinded body SSZ encoding (does not panic).
+    /// valid Electra/Deneb blinded body SSZ encoding (does not panic).
     pub fn try_tree_hash_root(&self) -> Result<Hash256, TreeHashError> {
-        let body = decode_blinded_beacon_block_body_electra(&self.body)
+        let body_root = blinded_body_tree_hash_root(&self.body)
             .map_err(|e| TreeHashError::InvalidBody { reason: e.to_string() })?;
+        self.hash_with_body_root(body_root)
+    }
+
+    /// Spec blinded block root with an explicit fork layout.
+    pub fn try_tree_hash_root_for_layout(
+        &self,
+        layout: BodyForkLayout,
+    ) -> Result<Hash256, TreeHashError> {
+        let body_root = blinded_body_tree_hash_root_for_layout(&self.body, layout)
+            .map_err(|e| TreeHashError::InvalidBody { reason: e.to_string() })?;
+        self.hash_with_body_root(body_root)
+    }
+
+    fn hash_with_body_root(&self, body_root: Hash256) -> Result<Hash256, TreeHashError> {
         let mut hasher = MerkleHasher::with_leaves(5);
         hasher.write(self.slot.tree_hash_root().as_slice()).expect("valid leaf");
         hasher.write(self.proposer_index.tree_hash_root().as_slice()).expect("valid leaf");
         hasher.write(self.parent_root.tree_hash_root().as_slice()).expect("valid leaf");
         hasher.write(self.state_root.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(body.tree_hash_root().as_slice()).expect("valid leaf");
+        hasher.write(body_root.as_slice()).expect("valid leaf");
         Ok(hasher.finish().expect("valid root"))
     }
 }
@@ -476,15 +530,15 @@ impl TreeHash for BlindedBeaconBlock {
         1
     }
 
-    /// Trait surface for `compute_signing_root` / tests with **valid** Electra body SSZ.
+    /// Trait surface for `compute_signing_root` / tests with **valid** body SSZ.
     ///
     /// **Production paths must use [`Self::try_tree_hash_root`]** (or
     /// `block-service` `compute_blinded_block_root`), which return `Err` on
-    /// malformed body bytes. Panics on invalid Electra blinded body SSZ (trait
-    /// cannot return `Result`). Prefer failing closed over a zero root.
+    /// malformed body bytes. Panics on invalid Electra/Deneb blinded body SSZ
+    /// (trait cannot return `Result`). Prefer failing closed over a zero root.
     fn tree_hash_root(&self) -> Hash256 {
         self.try_tree_hash_root()
-            .expect("valid Electra BlindedBeaconBlockBody SSZ for tree_hash_root")
+            .expect("valid Electra/Deneb BlindedBeaconBlockBody SSZ for tree_hash_root")
     }
 }
 
@@ -492,7 +546,9 @@ impl TreeHash for BlindedBeaconBlock {
 mod tests {
     use super::*;
     use crate::block_body::{
-        external_vector_blinded_electra_body, external_vector_electra_body,
+        external_vector_blinded_electra_body, external_vector_deneb_body,
+        external_vector_electra_body, EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX,
+        EXTERNAL_DENEB_BLOCK_ROOT_HEX, EXTERNAL_DENEB_BODY_ROOT_HEX,
         EXTERNAL_ELECTRA_BLOCK_ROOT_HEX, EXTERNAL_ELECTRA_BODY_ROOT_HEX,
     };
     use tree_hash::TreeHash;
@@ -755,15 +811,42 @@ mod tests {
 
     #[test]
     fn test_blinded_beacon_block_tree_hash_matches_external_electra_vector() {
-        // Empty-ops full/blinded bodies share the body HTR for this fixture, so
-        // the block root matches the same external block KAT.
+        // SEC-6d distinct-graffiti blinded Electra vector (not the full-body KAT).
         let block = external_vector_electra_blinded_block();
         let root = block.try_tree_hash_root().expect("valid external vector blinded body");
         assert_eq!(
             root.as_slice(),
-            &hex::decode(EXTERNAL_ELECTRA_BLOCK_ROOT_HEX).unwrap()[..],
+            &hex::decode(EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX).unwrap()[..],
             "BlindedBeaconBlock hash_tree_root must match remerkleable external vector"
         );
+        assert_ne!(root.as_slice(), &hex::decode(EXTERNAL_ELECTRA_BLOCK_ROOT_HEX).unwrap()[..],);
+    }
+
+    #[test]
+    fn test_beacon_block_tree_hash_matches_external_deneb_vector() {
+        let block = external_vector_deneb_block();
+        let root = block.try_tree_hash_root().expect("valid Deneb external vector body");
+        assert_eq!(
+            root.as_slice(),
+            &hex::decode(EXTERNAL_DENEB_BLOCK_ROOT_HEX).unwrap()[..],
+            "Deneb BeaconBlock hash_tree_root must match remerkleable external vector"
+        );
+        // Explicit layout path matches auto-detect.
+        assert_eq!(block.try_tree_hash_root_for_layout(BodyForkLayout::Deneb).unwrap(), root);
+        // Body leaf is the typed Deneb body root.
+        assert_eq!(
+            external_vector_deneb_body().tree_hash_root().as_slice(),
+            &hex::decode(EXTERNAL_DENEB_BODY_ROOT_HEX).unwrap()[..],
+        );
+    }
+
+    #[test]
+    fn test_blinded_beacon_block_tree_hash_matches_external_deneb_vector() {
+        let block = external_vector_deneb_blinded_block();
+        let root = block.try_tree_hash_root().expect("valid Deneb blinded body");
+        // Empty-ops full/blinded Deneb share body HTR → same block root KAT.
+        assert_eq!(root.as_slice(), &hex::decode(EXTERNAL_DENEB_BLOCK_ROOT_HEX).unwrap()[..],);
+        assert_eq!(block.try_tree_hash_root_for_layout(BodyForkLayout::Deneb).unwrap(), root);
     }
 
     #[test]
@@ -773,7 +856,7 @@ mod tests {
             proposer_index: 0,
             parent_root: [0u8; 32],
             state_root: [0u8; 32],
-            body: vec![0xde, 0xad], // not valid Electra body SSZ
+            body: vec![0xde, 0xad], // not valid Electra/Deneb body SSZ
         };
         let err = block.try_tree_hash_root().expect_err("malformed body must error");
         assert!(

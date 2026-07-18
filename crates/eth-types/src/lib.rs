@@ -25,17 +25,23 @@ pub use aggregation::{
 };
 pub use attestation::SingleAttestation;
 pub use block::{
-    body_fork_layout, external_vector_electra_blinded_block, external_vector_electra_block,
-    kzg_commitment_list_root, BeaconBlock, BeaconBlockBody, BeaconBlockHeader, BlindedBeaconBlock,
-    BlindedBeaconBlockBody, BlobSidecar, BlockContents, BodyForkLayout, ProducedBlock,
-    SignedBeaconBlock, SignedBlindedBeaconBlock,
+    body_fork_layout, external_vector_deneb_blinded_block, external_vector_deneb_block,
+    external_vector_electra_blinded_block, external_vector_electra_block, kzg_commitment_list_root,
+    BeaconBlock, BeaconBlockBody, BeaconBlockHeader, BlindedBeaconBlock, BlindedBeaconBlockBody,
+    BlobSidecar, BlockContents, BodyForkLayout, ProducedBlock, SignedBeaconBlock,
+    SignedBlindedBeaconBlock,
 };
 pub use block_body::{
-    decode_beacon_block_body_electra, decode_blinded_beacon_block_body_electra,
-    external_vector_blinded_electra_body, external_vector_electra_body,
-    external_vector_execution_payload_header, BeaconBlockBodyElectra,
-    BlindedBeaconBlockBodyElectra, BodySszError, ExecutionPayload, ExecutionPayloadHeader,
-    ExecutionRequests, SyncAggregate, EXTERNAL_ELECTRA_BLOCK_ROOT_HEX,
+    blinded_body_tree_hash_root, blinded_body_tree_hash_root_for_layout, body_tree_hash_root,
+    body_tree_hash_root_for_layout, decode_beacon_block_body_deneb,
+    decode_beacon_block_body_electra, decode_blinded_beacon_block_body_deneb,
+    decode_blinded_beacon_block_body_electra, external_vector_blinded_deneb_body,
+    external_vector_blinded_electra_body, external_vector_deneb_body, external_vector_electra_body,
+    external_vector_execution_payload_header, BeaconBlockBodyDeneb, BeaconBlockBodyElectra,
+    BlindedBeaconBlockBodyDeneb, BlindedBeaconBlockBodyElectra, BodySszError, ExecutionPayload,
+    ExecutionPayloadHeader, ExecutionRequests, SyncAggregate,
+    EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX, EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX,
+    EXTERNAL_DENEB_BLOCK_ROOT_HEX, EXTERNAL_DENEB_BODY_ROOT_HEX, EXTERNAL_ELECTRA_BLOCK_ROOT_HEX,
     EXTERNAL_ELECTRA_BODY_ROOT_HEX,
 };
 pub use builder::{SignedValidatorRegistration, ValidatorRegistrationV1};

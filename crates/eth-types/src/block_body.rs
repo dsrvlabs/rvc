@@ -1,23 +1,29 @@
 //! Typed SSZ `BeaconBlockBody` containers for body-leaf `hash_tree_root` (SEC-6).
 //!
-//! Production Electra full + blinded bodies and shared sub-containers with
+//! Production per-fork full + blinded bodies and shared sub-containers with
 //! `TreeHash` (via `tree_hash_derive`) and SSZ Encode/Decode (via `ssz08` =
 //! ethereum_ssz 0.8, matching `ssz_types` trait impls).
 //!
-//! Wire `Vec<u8>` bodies still live on [`crate::BeaconBlock`]; SEC-6c decodes
-//! them via [`BeaconBlockBodyElectra::from_ssz_bytes`] (and the blinded
-//! counterpart) inside `try_tree_hash_root` for the body leaf.
+//! Wire `Vec<u8>` bodies still live on [`crate::BeaconBlock`]; SEC-6c/6d decode
+//! them via the Electra or Deneb typed body (and blinded counterparts) inside
+//! `try_tree_hash_root` for the body leaf.
 //!
 //! Design (see `plan/security-2026-07-18/spike-sec6-block-body-htr.md`):
 //! hand-typed per-fork containers via `tree_hash_derive` + `ssz_types`
 //! (`VariableList` / `FixedVector` / `BitVector`) — not a full consensus-types
 //! library. Encode/Decode use ethereum_ssz **0.8** because `ssz_types` 0.10.1
 //! implements those traits against 0.8 only (workspace `ssz` remains 0.9).
+//!
+//! Body-variant matrix (SEC-6d):
+//! - [`BeaconBlockBodyElectra`] / [`BlindedBeaconBlockBodyElectra`] — 13 fields
+//! - [`BeaconBlockBodyDeneb`] / [`BlindedBeaconBlockBodyDeneb`] — 12 fields
+//!   (no `execution_requests`; pre-Electra attestation limits/types)
 
 use ssz08::{Decode, DecodeError, Encode, SszDecoderBuilder, SszEncoder, BYTES_PER_LENGTH_OFFSET};
 use ssz_types::{
     typenum::{
-        U1, U1048576, U1073741824, U131072, U16, U2, U256, U32, U33, U4096, U512, U64, U8, U8192,
+        U1, U1048576, U1073741824, U128, U131072, U16, U2, U2048, U256, U32, U33, U4096, U512, U64,
+        U8, U8192,
     },
     BitList, BitVector, FixedVector, VariableList,
 };
@@ -31,8 +37,12 @@ use tree_hash_derive::TreeHash;
 
 /// `MAX_PROPOSER_SLASHINGS`
 pub type MaxProposerSlashings = U16;
+/// `MAX_ATTESTER_SLASHINGS` (phase0–Deneb)
+pub type MaxAttesterSlashings = U2;
 /// `MAX_ATTESTER_SLASHINGS_ELECTRA`
 pub type MaxAttesterSlashingsElectra = U1;
+/// `MAX_ATTESTATIONS` (phase0–Deneb)
+pub type MaxAttestations = U128;
 /// `MAX_ATTESTATIONS_ELECTRA`
 pub type MaxAttestationsElectra = U8;
 /// `MAX_DEPOSITS`
@@ -63,6 +73,8 @@ pub type MaxWithdrawalRequestsPerPayload = U16;
 pub type MaxConsolidationRequestsPerPayload = U2;
 /// `DEPOSIT_CONTRACT_TREE_DEPTH + 1` (Deposit.proof length)
 pub type DepositProofLength = U33;
+/// `MAX_VALIDATORS_PER_COMMITTEE` (phase0–Deneb attestation bitlist / indices)
+pub type MaxValidatorsPerCommittee = U2048;
 /// `MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT` (= 131072)
 pub type MaxValidatorsPerSlot = U131072;
 /// `MAX_COMMITTEES_PER_SLOT`
@@ -297,6 +309,43 @@ pub struct ProposerSlashing {
 impl_ssz_container!(ProposerSlashing {
     signed_header_1: SignedBeaconBlockHeader,
     signed_header_2: SignedBeaconBlockHeader,
+});
+
+/// Pre-Electra (phase0–Deneb) `IndexedAttestation`.
+#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+pub struct IndexedAttestation {
+    pub attesting_indices: VariableList<u64, MaxValidatorsPerCommittee>,
+    pub data: AttestationData,
+    pub signature: [u8; 96],
+}
+impl_ssz_container!(IndexedAttestation {
+    attesting_indices: VariableList<u64, MaxValidatorsPerCommittee>,
+    data: AttestationData,
+    signature: [u8; 96],
+});
+
+/// Pre-Electra (phase0–Deneb) `AttesterSlashing`.
+#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+pub struct AttesterSlashing {
+    pub attestation_1: IndexedAttestation,
+    pub attestation_2: IndexedAttestation,
+}
+impl_ssz_container!(AttesterSlashing {
+    attestation_1: IndexedAttestation,
+    attestation_2: IndexedAttestation,
+});
+
+/// Pre-Electra (phase0–Deneb) `Attestation` (no `committee_bits`).
+#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+pub struct Attestation {
+    pub aggregation_bits: BitList<MaxValidatorsPerCommittee>,
+    pub data: AttestationData,
+    pub signature: [u8; 96],
+}
+impl_ssz_container!(Attestation {
+    aggregation_bits: BitList<MaxValidatorsPerCommittee>,
+    data: AttestationData,
+    signature: [u8; 96],
 });
 
 #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
@@ -652,7 +701,104 @@ impl BlindedBeaconBlockBodyElectra {
 }
 
 // ---------------------------------------------------------------------------
-// Convenience free functions (stable names for SEC-6c wiring)
+// Deneb body variants (SEC-6d)
+// ---------------------------------------------------------------------------
+
+/// Deneb `BeaconBlockBody` (12 fields; no `execution_requests`).
+///
+/// Attester/attestation list limits and element types are pre-Electra
+/// (`MAX_ATTESTER_SLASHINGS=2`, `MAX_ATTESTATIONS=128`, no `committee_bits`).
+/// Spec order is merkleization-sensitive — do not reorder.
+#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+pub struct BeaconBlockBodyDeneb {
+    pub randao_reveal: [u8; 96],
+    pub eth1_data: Eth1Data,
+    pub graffiti: [u8; 32],
+    pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
+    pub attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
+    pub attestations: VariableList<Attestation, MaxAttestations>,
+    pub deposits: VariableList<Deposit, MaxDeposits>,
+    pub voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
+    pub sync_aggregate: SyncAggregate,
+    pub execution_payload: ExecutionPayload,
+    pub bls_to_execution_changes:
+        VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
+    pub blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
+}
+impl_ssz_container!(BeaconBlockBodyDeneb {
+    randao_reveal: [u8; 96],
+    eth1_data: Eth1Data,
+    graffiti: [u8; 32],
+    proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
+    attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
+    attestations: VariableList<Attestation, MaxAttestations>,
+    deposits: VariableList<Deposit, MaxDeposits>,
+    voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
+    sync_aggregate: SyncAggregate,
+    execution_payload: ExecutionPayload,
+    bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
+    blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
+});
+
+impl BeaconBlockBodyDeneb {
+    /// Decode SSZ bytes into a typed Deneb `BeaconBlockBody`.
+    pub fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, BodySszError> {
+        <Self as Decode>::from_ssz_bytes(bytes).map_err(Into::into)
+    }
+
+    /// Encode this body to canonical SSZ bytes.
+    pub fn as_ssz_bytes(&self) -> Vec<u8> {
+        Encode::as_ssz_bytes(self)
+    }
+}
+
+/// Deneb blinded body: `execution_payload` → `ExecutionPayloadHeader`, no
+/// `execution_requests`.
+#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+pub struct BlindedBeaconBlockBodyDeneb {
+    pub randao_reveal: [u8; 96],
+    pub eth1_data: Eth1Data,
+    pub graffiti: [u8; 32],
+    pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
+    pub attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
+    pub attestations: VariableList<Attestation, MaxAttestations>,
+    pub deposits: VariableList<Deposit, MaxDeposits>,
+    pub voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
+    pub sync_aggregate: SyncAggregate,
+    pub execution_payload_header: ExecutionPayloadHeader,
+    pub bls_to_execution_changes:
+        VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
+    pub blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
+}
+impl_ssz_container!(BlindedBeaconBlockBodyDeneb {
+    randao_reveal: [u8; 96],
+    eth1_data: Eth1Data,
+    graffiti: [u8; 32],
+    proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
+    attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
+    attestations: VariableList<Attestation, MaxAttestations>,
+    deposits: VariableList<Deposit, MaxDeposits>,
+    voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
+    sync_aggregate: SyncAggregate,
+    execution_payload_header: ExecutionPayloadHeader,
+    bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
+    blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
+});
+
+impl BlindedBeaconBlockBodyDeneb {
+    /// Decode SSZ bytes into a typed Deneb blinded body.
+    pub fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, BodySszError> {
+        <Self as Decode>::from_ssz_bytes(bytes).map_err(Into::into)
+    }
+
+    /// Encode this blinded body to canonical SSZ bytes.
+    pub fn as_ssz_bytes(&self) -> Vec<u8> {
+        Encode::as_ssz_bytes(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Convenience free functions (stable names for SEC-6c/6d wiring)
 // ---------------------------------------------------------------------------
 
 /// Decode wire `Vec<u8>` / SSZ body bytes into [`BeaconBlockBodyElectra`].
@@ -669,8 +815,76 @@ pub fn decode_blinded_beacon_block_body_electra(
     BlindedBeaconBlockBodyElectra::from_ssz_bytes(bytes)
 }
 
+/// Decode wire SSZ body bytes into [`BeaconBlockBodyDeneb`].
+pub fn decode_beacon_block_body_deneb(bytes: &[u8]) -> Result<BeaconBlockBodyDeneb, BodySszError> {
+    BeaconBlockBodyDeneb::from_ssz_bytes(bytes)
+}
+
+/// Decode wire SSZ bytes into [`BlindedBeaconBlockBodyDeneb`].
+pub fn decode_blinded_beacon_block_body_deneb(
+    bytes: &[u8],
+) -> Result<BlindedBeaconBlockBodyDeneb, BodySszError> {
+    BlindedBeaconBlockBodyDeneb::from_ssz_bytes(bytes)
+}
+
+/// Spec body-leaf root for a full (unblinded) block: Electra then Deneb.
+///
+/// Production `BeaconBlock` wire bodies do not carry a fork tag; the two layouts
+/// differ in fixed-portion length and trailing fields, so decode is unambiguous
+/// for valid SSZ. Prefer [`crate::BodyForkLayout`] when the BN
+/// `consensus_version` is already known (see
+/// [`body_tree_hash_root_for_layout`]).
+pub fn body_tree_hash_root(bytes: &[u8]) -> Result<Hash256, BodySszError> {
+    match decode_beacon_block_body_electra(bytes) {
+        Ok(body) => Ok(body.tree_hash_root()),
+        Err(electra_err) => match decode_beacon_block_body_deneb(bytes) {
+            Ok(body) => Ok(body.tree_hash_root()),
+            Err(_) => Err(electra_err),
+        },
+    }
+}
+
+/// Spec body-leaf root for a blinded block: Electra then Deneb.
+pub fn blinded_body_tree_hash_root(bytes: &[u8]) -> Result<Hash256, BodySszError> {
+    match decode_blinded_beacon_block_body_electra(bytes) {
+        Ok(body) => Ok(body.tree_hash_root()),
+        Err(electra_err) => match decode_blinded_beacon_block_body_deneb(bytes) {
+            Ok(body) => Ok(body.tree_hash_root()),
+            Err(_) => Err(electra_err),
+        },
+    }
+}
+
+/// Body-leaf root with an explicit fork layout (when `consensus_version` is known).
+pub fn body_tree_hash_root_for_layout(
+    bytes: &[u8],
+    layout: crate::BodyForkLayout,
+) -> Result<Hash256, BodySszError> {
+    match layout {
+        crate::BodyForkLayout::Electra => {
+            Ok(decode_beacon_block_body_electra(bytes)?.tree_hash_root())
+        }
+        crate::BodyForkLayout::Deneb => Ok(decode_beacon_block_body_deneb(bytes)?.tree_hash_root()),
+    }
+}
+
+/// Blinded body-leaf root with an explicit fork layout.
+pub fn blinded_body_tree_hash_root_for_layout(
+    bytes: &[u8],
+    layout: crate::BodyForkLayout,
+) -> Result<Hash256, BodySszError> {
+    match layout {
+        crate::BodyForkLayout::Electra => {
+            Ok(decode_blinded_beacon_block_body_electra(bytes)?.tree_hash_root())
+        }
+        crate::BodyForkLayout::Deneb => {
+            Ok(decode_blinded_beacon_block_body_deneb(bytes)?.tree_hash_root())
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// External-vector fixtures (SEC-6a/b/c KATs; also usable as valid Electra bodies)
+// External-vector fixtures (SEC-6a/b/c/d KATs; also usable as valid bodies)
 // ---------------------------------------------------------------------------
 
 /// External known-good Electra body root from independent `remerkleable` oracle.
@@ -685,6 +899,64 @@ pub const EXTERNAL_ELECTRA_BODY_ROOT_HEX: &str =
 pub const EXTERNAL_ELECTRA_BLOCK_ROOT_HEX: &str =
     "b3f19bf190b0ab2466738ba06bbaf6e481041ca66db733c549975b27b53c92b9";
 
+/// Blinded Electra body root with SEC-6d distinct graffiti
+/// (`"rvc-sec6d-blinded-electra!!!!"`). Independent `remerkleable` KAT.
+pub const EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX: &str =
+    "e9e9fd39cc7fc4345e43bf31af21838d9389767cf62c0f8fdaf740b06d26f3e7";
+
+/// Blinded Electra **block** root for [`external_vector_blinded_electra_body`]
+/// (slot=3_000_000, proposer=42, parent=`0x11…`, state=`0x22…`).
+pub const EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX: &str =
+    "6bf364098fe8b865ffecc0b1d88c5b6edada937e5c9c3c69726d1d46cf2e1d24";
+
+/// Deneb full body root (`remerkleable`; graffiti `"rvc-sec6d-deneb-body!!!!!!!!!"`).
+pub const EXTERNAL_DENEB_BODY_ROOT_HEX: &str =
+    "6c74513b682d097373d9f9a962637d753a8f8d6af4efb0283ae5c4941308ec67";
+
+/// Deneb **block** root for [`external_vector_deneb_body`] (same header fields
+/// as the Electra block vector).
+pub const EXTERNAL_DENEB_BLOCK_ROOT_HEX: &str =
+    "86714640e5ee761d6ccc664996816f10ec496324bcac46a999f778abce1f906e";
+
+/// Shared scalar fields for external-vector bodies (eth1 / payload / sync).
+fn external_vector_eth1_data() -> Eth1Data {
+    Eth1Data { deposit_root: [0x22; 32], deposit_count: 7, block_hash: [0x33; 32] }
+}
+
+fn external_vector_sync_aggregate() -> SyncAggregate {
+    SyncAggregate { sync_committee_bits: BitVector::new(), sync_committee_signature: [0x44; 96] }
+}
+
+fn external_vector_execution_payload() -> ExecutionPayload {
+    ExecutionPayload {
+        parent_hash: [0x55; 32],
+        fee_recipient: [0x66; 20],
+        state_root: [0x77; 32],
+        receipts_root: [0x88; 32],
+        logs_bloom: FixedVector::from(vec![0u8; 256]),
+        prev_randao: [0x99; 32],
+        block_number: 12_345,
+        gas_limit: 30_000_000,
+        gas_used: 1_000_000,
+        timestamp: 1_700_000_000,
+        extra_data: VariableList::from(vec![]),
+        base_fee_per_gas: Uint256::from_u64(7),
+        block_hash: [0xaa; 32],
+        transactions: VariableList::from(vec![]),
+        withdrawals: VariableList::from(vec![]),
+        blob_gas_used: 0,
+        excess_blob_gas: 0,
+    }
+}
+
+fn external_vector_empty_execution_requests() -> ExecutionRequests {
+    ExecutionRequests {
+        deposits: VariableList::from(vec![]),
+        withdrawals: VariableList::from(vec![]),
+        consolidations: VariableList::from(vec![]),
+    }
+}
+
 /// Deterministic Electra body matching the external `remerkleable` vector:
 /// fixed non-zero leaves for signatures / eth1 / payload fields; empty op lists.
 pub fn external_vector_electra_body() -> BeaconBlockBodyElectra {
@@ -693,62 +965,37 @@ pub fn external_vector_electra_body() -> BeaconBlockBodyElectra {
 
     BeaconBlockBodyElectra {
         randao_reveal: [0x11; 96],
-        eth1_data: Eth1Data { deposit_root: [0x22; 32], deposit_count: 7, block_hash: [0x33; 32] },
+        eth1_data: external_vector_eth1_data(),
         graffiti,
         proposer_slashings: VariableList::from(vec![]),
         attester_slashings: VariableList::from(vec![]),
         attestations: VariableList::from(vec![]),
         deposits: VariableList::from(vec![]),
         voluntary_exits: VariableList::from(vec![]),
-        sync_aggregate: SyncAggregate {
-            sync_committee_bits: BitVector::new(),
-            sync_committee_signature: [0x44; 96],
-        },
-        execution_payload: ExecutionPayload {
-            parent_hash: [0x55; 32],
-            fee_recipient: [0x66; 20],
-            state_root: [0x77; 32],
-            receipts_root: [0x88; 32],
-            logs_bloom: FixedVector::from(vec![0u8; 256]),
-            prev_randao: [0x99; 32],
-            block_number: 12_345,
-            gas_limit: 30_000_000,
-            gas_used: 1_000_000,
-            timestamp: 1_700_000_000,
-            extra_data: VariableList::from(vec![]),
-            base_fee_per_gas: Uint256::from_u64(7),
-            block_hash: [0xaa; 32],
-            transactions: VariableList::from(vec![]),
-            withdrawals: VariableList::from(vec![]),
-            blob_gas_used: 0,
-            excess_blob_gas: 0,
-        },
+        sync_aggregate: external_vector_sync_aggregate(),
+        execution_payload: external_vector_execution_payload(),
         bls_to_execution_changes: VariableList::from(vec![]),
         blob_kzg_commitments: VariableList::from(vec![]),
-        execution_requests: ExecutionRequests {
-            deposits: VariableList::from(vec![]),
-            withdrawals: VariableList::from(vec![]),
-            consolidations: VariableList::from(vec![]),
-        },
+        execution_requests: external_vector_empty_execution_requests(),
     }
 }
 
-/// Execution payload header corresponding to [`external_vector_electra_body`]'s
-/// payload (empty txs/withdrawals → their empty-list roots).
+/// Execution payload header corresponding to the external-vector payload
+/// (empty txs/withdrawals → their empty-list roots).
 pub fn external_vector_execution_payload_header() -> ExecutionPayloadHeader {
-    let p = &external_vector_electra_body().execution_payload;
+    let p = external_vector_execution_payload();
     ExecutionPayloadHeader {
         parent_hash: p.parent_hash,
         fee_recipient: p.fee_recipient,
         state_root: p.state_root,
         receipts_root: p.receipts_root,
-        logs_bloom: p.logs_bloom.clone(),
+        logs_bloom: p.logs_bloom,
         prev_randao: p.prev_randao,
         block_number: p.block_number,
         gas_limit: p.gas_limit,
         gas_used: p.gas_used,
         timestamp: p.timestamp,
-        extra_data: p.extra_data.clone(),
+        extra_data: p.extra_data,
         base_fee_per_gas: p.base_fee_per_gas,
         block_hash: p.block_hash,
         // Empty list roots for transactions / withdrawals (spec empty List roots).
@@ -771,12 +1018,58 @@ pub fn external_vector_execution_payload_header() -> ExecutionPayloadHeader {
     }
 }
 
-/// Blinded Electra body matching the external vector (header instead of payload).
+/// Blinded Electra body external vector (SEC-6d distinct graffiti).
 ///
-/// With empty txs/withdrawals the body HTR equals [`EXTERNAL_ELECTRA_BODY_ROOT_HEX`].
+/// Uses header form of the payload and graffiti `rvc-sec6d-blinded-electra!!!!`
+/// so the body root is distinct from the full Electra vector.
 pub fn external_vector_blinded_electra_body() -> BlindedBeaconBlockBodyElectra {
-    let full = external_vector_electra_body();
+    let mut graffiti = [0u8; 32];
+    graffiti[..29].copy_from_slice(b"rvc-sec6d-blinded-electra!!!!");
+
     BlindedBeaconBlockBodyElectra {
+        randao_reveal: [0x11; 96],
+        eth1_data: external_vector_eth1_data(),
+        graffiti,
+        proposer_slashings: VariableList::from(vec![]),
+        attester_slashings: VariableList::from(vec![]),
+        attestations: VariableList::from(vec![]),
+        deposits: VariableList::from(vec![]),
+        voluntary_exits: VariableList::from(vec![]),
+        sync_aggregate: external_vector_sync_aggregate(),
+        execution_payload_header: external_vector_execution_payload_header(),
+        bls_to_execution_changes: VariableList::from(vec![]),
+        blob_kzg_commitments: VariableList::from(vec![]),
+        execution_requests: external_vector_empty_execution_requests(),
+    }
+}
+
+/// Deneb full body external vector (SEC-6d; no `execution_requests`).
+pub fn external_vector_deneb_body() -> BeaconBlockBodyDeneb {
+    let mut graffiti = [0u8; 32];
+    graffiti[..29].copy_from_slice(b"rvc-sec6d-deneb-body!!!!!!!!!");
+
+    BeaconBlockBodyDeneb {
+        randao_reveal: [0x11; 96],
+        eth1_data: external_vector_eth1_data(),
+        graffiti,
+        proposer_slashings: VariableList::from(vec![]),
+        attester_slashings: VariableList::from(vec![]),
+        attestations: VariableList::from(vec![]),
+        deposits: VariableList::from(vec![]),
+        voluntary_exits: VariableList::from(vec![]),
+        sync_aggregate: external_vector_sync_aggregate(),
+        execution_payload: external_vector_execution_payload(),
+        bls_to_execution_changes: VariableList::from(vec![]),
+        blob_kzg_commitments: VariableList::from(vec![]),
+    }
+}
+
+/// Deneb blinded body external vector (header instead of payload).
+///
+/// With empty txs/withdrawals the body HTR equals [`EXTERNAL_DENEB_BODY_ROOT_HEX`].
+pub fn external_vector_blinded_deneb_body() -> BlindedBeaconBlockBodyDeneb {
+    let full = external_vector_deneb_body();
+    BlindedBeaconBlockBodyDeneb {
         randao_reveal: full.randao_reveal,
         eth1_data: full.eth1_data,
         graffiti: full.graffiti,
@@ -789,7 +1082,6 @@ pub fn external_vector_blinded_electra_body() -> BlindedBeaconBlockBodyElectra {
         execution_payload_header: external_vector_execution_payload_header(),
         bls_to_execution_changes: full.bls_to_execution_changes,
         blob_kzg_commitments: full.blob_kzg_commitments,
-        execution_requests: full.execution_requests,
     }
 }
 
@@ -908,23 +1200,138 @@ mod tests {
     }
 
     #[test]
+    fn test_blinded_beacon_block_body_htr_matches_external_vector() {
+        let body = external_vector_blinded_electra_body();
+        assert_eq!(
+            body.tree_hash_root(),
+            hex32(EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX),
+            "Blinded Electra body hash_tree_root must match external remerkleable KAT"
+        );
+        // Distinct from the full Electra empty-ops vector (different graffiti).
+        assert_ne!(body.tree_hash_root(), hex32(EXTERNAL_ELECTRA_BODY_ROOT_HEX));
+    }
+
+    #[test]
+    fn test_deneb_body_htr_matches_external_vector() {
+        let body = external_vector_deneb_body();
+        assert_eq!(
+            body.tree_hash_root(),
+            hex32(EXTERNAL_DENEB_BODY_ROOT_HEX),
+            "Deneb BeaconBlockBody hash_tree_root must match external remerkleable KAT"
+        );
+        // Distinct from Electra (different layout + graffiti).
+        assert_ne!(body.tree_hash_root(), hex32(EXTERNAL_ELECTRA_BODY_ROOT_HEX));
+    }
+
+    #[test]
+    fn test_blinded_deneb_body_htr_matches_external_vector() {
+        let body = external_vector_blinded_deneb_body();
+        // Empty txs/withdrawals → header HTR == payload HTR → same as full Deneb body.
+        assert_eq!(body.tree_hash_root(), hex32(EXTERNAL_DENEB_BODY_ROOT_HEX));
+        assert_eq!(
+            body.execution_payload_header.tree_hash_root(),
+            external_vector_deneb_body().execution_payload.tree_hash_root(),
+        );
+    }
+
+    #[test]
+    fn test_blinded_and_full_bodies_share_subcontainers() {
+        // SEC-6d: sub-containers are shared type definitions (not duplicated per variant).
+        let full_e = external_vector_electra_body();
+        let blinded_e = external_vector_blinded_electra_body();
+        let full_d = external_vector_deneb_body();
+        let blinded_d = external_vector_blinded_deneb_body();
+
+        // Same Eth1Data / SyncAggregate / ExecutionPayload scalar construction.
+        assert_eq!(full_e.eth1_data, blinded_e.eth1_data);
+        assert_eq!(full_e.eth1_data, full_d.eth1_data);
+        assert_eq!(full_d.eth1_data, blinded_d.eth1_data);
+        assert_eq!(full_e.sync_aggregate, full_d.sync_aggregate);
+        assert_eq!(full_e.execution_payload, full_d.execution_payload);
+        assert_eq!(
+            blinded_e.execution_payload_header.tree_hash_root(),
+            full_e.execution_payload.tree_hash_root(),
+        );
+        assert_eq!(
+            blinded_d.execution_payload_header.tree_hash_root(),
+            full_d.execution_payload.tree_hash_root(),
+        );
+        // Type identity: Deneb attester/attestation lists use pre-Electra containers.
+        let _: VariableList<AttesterSlashing, MaxAttesterSlashings> = full_d.attester_slashings;
+        let _: VariableList<Attestation, MaxAttestations> = full_d.attestations;
+        let _: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra> =
+            full_e.attester_slashings;
+        let _: VariableList<AttestationElectra, MaxAttestationsElectra> = full_e.attestations;
+    }
+
+    #[test]
     fn test_blinded_beacon_block_body_electra_decode_roundtrip() {
         let original = external_vector_blinded_electra_body();
         let encoded = original.as_ssz_bytes();
         let decoded = BlindedBeaconBlockBodyElectra::from_ssz_bytes(&encoded)
             .expect("decode blinded Electra body");
         assert_eq!(decoded, original);
-        // When transactions/withdrawals are empty and the header stores those empty-list
-        // roots, htr(ExecutionPayload) == htr(ExecutionPayloadHeader), so full and
-        // blinded body roots coincide. That is correct SSZ — not a type confusion.
+        assert_eq!(decoded.tree_hash_root(), hex32(EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX));
+        // Payload header HTR matches full payload HTR (empty txs/withdrawals).
         let full = external_vector_electra_body();
         assert_eq!(
             original.execution_payload_header.tree_hash_root(),
             full.execution_payload.tree_hash_root(),
         );
-        assert_eq!(decoded.tree_hash_root(), full.tree_hash_root());
-        // Wire encodings still differ (payload bytes vs header roots).
+        // Wire encodings differ (payload bytes vs header roots) and graffiti differs
+        // from the full Electra external vector.
         assert_ne!(encoded, full.as_ssz_bytes());
+        assert_ne!(original.tree_hash_root(), full.tree_hash_root());
+    }
+
+    #[test]
+    fn test_deneb_body_decode_roundtrip() {
+        let original = external_vector_deneb_body();
+        let encoded = original.as_ssz_bytes();
+        let decoded = BeaconBlockBodyDeneb::from_ssz_bytes(&encoded).expect("decode Deneb body");
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.tree_hash_root(), hex32(EXTERNAL_DENEB_BODY_ROOT_HEX));
+        assert_eq!(decode_beacon_block_body_deneb(&encoded).unwrap(), original);
+
+        // Fixed portion: Deneb = 392 (no execution_requests offset).
+        const DENEB_FIXED_LEN: u32 = 392;
+        let first_var_offset = u32::from_le_bytes(encoded[200..204].try_into().unwrap());
+        assert_eq!(first_var_offset, DENEB_FIXED_LEN);
+
+        // Electra decode must reject a valid Deneb body (layout mismatch).
+        assert!(decode_beacon_block_body_electra(&encoded).is_err());
+    }
+
+    #[test]
+    fn test_deneb_empty_list_roots_match_pre_electra_limits() {
+        // remerkleable KATs for Deneb list limits (distinct from Electra 1 / 8).
+        assert_eq!(
+            VariableList::<AttesterSlashing, MaxAttesterSlashings>::from(vec![]).tree_hash_root(),
+            hex32("7a0501f5957bdf9cb3a8ff4966f02265f968658b7a9c62642cba1165e86642f5"),
+        );
+        assert_eq!(
+            VariableList::<Attestation, MaxAttestations>::from(vec![]).tree_hash_root(),
+            hex32("96559674a79656e540871e1f39c9b91e152aa8cddb71493e754827c4cc809d57"),
+        );
+    }
+
+    #[test]
+    fn test_body_tree_hash_root_auto_detects_fork() {
+        let electra = external_vector_electra_body().as_ssz_bytes();
+        let deneb = external_vector_deneb_body().as_ssz_bytes();
+        assert_eq!(body_tree_hash_root(&electra).unwrap(), hex32(EXTERNAL_ELECTRA_BODY_ROOT_HEX));
+        assert_eq!(body_tree_hash_root(&deneb).unwrap(), hex32(EXTERNAL_DENEB_BODY_ROOT_HEX));
+
+        let blinded_e = external_vector_blinded_electra_body().as_ssz_bytes();
+        let blinded_d = external_vector_blinded_deneb_body().as_ssz_bytes();
+        assert_eq!(
+            blinded_body_tree_hash_root(&blinded_e).unwrap(),
+            hex32(EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX),
+        );
+        assert_eq!(
+            blinded_body_tree_hash_root(&blinded_d).unwrap(),
+            hex32(EXTERNAL_DENEB_BODY_ROOT_HEX),
+        );
     }
 
     #[test]

@@ -307,9 +307,9 @@ Complete the body-variant matrix: the **blinded** body (`ExecutionPayloadHeader`
 - `test_blinded_and_full_bodies_share_subcontainers` (no duplication)
 
 **Acceptance criteria:**
-- [ ] Blinded body root and Deneb body root match external vectors exactly.
-- [ ] Sub-containers are shared with SEC-6b (no duplicated type definitions).
-- [ ] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
+- [x] Blinded body root and Deneb body root match external vectors exactly.
+- [x] Sub-containers are shared with SEC-6b (no duplicated type definitions).
+- [x] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
 
 **Risks / unknowns:**
 - If the spike scoped only Electra and Deneb coverage is deferred as "cheap if fixtures exist," and the

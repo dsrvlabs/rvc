@@ -522,7 +522,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
     }
 }
 
-/// Spec `hash_tree_root(BeaconBlock)` via typed Electra body leaf (SEC-6c).
+/// Spec `hash_tree_root(BeaconBlock)` via typed Electra/Deneb body leaf (SEC-6c/6d).
 ///
 /// **Production root path** for proposal signing (prefer this over
 /// `TreeHash::tree_hash_root`, which panics on malformed body SSZ).
@@ -533,7 +533,7 @@ fn compute_block_root(block: &eth_types::BeaconBlock) -> Result<Root, BlockServi
     })
 }
 
-/// Spec `hash_tree_root(BlindedBeaconBlock)` via typed Electra body leaf (SEC-6c).
+/// Spec `hash_tree_root(BlindedBeaconBlock)` via typed Electra/Deneb body leaf (SEC-6c/6d).
 ///
 /// **Production root path** for blinded proposal signing (prefer this over
 /// `TreeHash::tree_hash_root`). Malformed body → [`BlockServiceError::Parse`].
@@ -1160,11 +1160,35 @@ mod tests {
     fn test_compute_blinded_block_root_matches_external_vector() {
         let block = eth_types::external_vector_electra_blinded_block();
         let root = compute_blinded_block_root(&block).expect("valid external vector blinded body");
-        let expected = hex::decode(eth_types::EXTERNAL_ELECTRA_BLOCK_ROOT_HEX).unwrap();
+        let expected = hex::decode(eth_types::EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX).unwrap();
         assert_eq!(
             root.as_slice(),
             expected.as_slice(),
-            "compute_blinded_block_root must match remerkleable external Electra block root"
+            "compute_blinded_block_root must match remerkleable external blinded Electra block root"
+        );
+    }
+
+    #[test]
+    fn test_compute_block_root_matches_external_deneb_vector() {
+        let block = eth_types::external_vector_deneb_block();
+        let root = compute_block_root(&block).expect("valid Deneb external vector body");
+        let expected = hex::decode(eth_types::EXTERNAL_DENEB_BLOCK_ROOT_HEX).unwrap();
+        assert_eq!(
+            root.as_slice(),
+            expected.as_slice(),
+            "compute_block_root must match remerkleable external Deneb block root"
+        );
+    }
+
+    #[test]
+    fn test_compute_blinded_block_root_matches_external_deneb_vector() {
+        let block = eth_types::external_vector_deneb_blinded_block();
+        let root = compute_blinded_block_root(&block).expect("valid Deneb blinded body");
+        let expected = hex::decode(eth_types::EXTERNAL_DENEB_BLOCK_ROOT_HEX).unwrap();
+        assert_eq!(
+            root.as_slice(),
+            expected.as_slice(),
+            "compute_blinded_block_root must match remerkleable external Deneb block root"
         );
     }
 
