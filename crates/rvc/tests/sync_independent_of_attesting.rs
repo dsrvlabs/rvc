@@ -46,7 +46,7 @@ use eth_types::{
 };
 use propagator::{AttestationSubmitter, Propagator};
 use rvc::orchestrator::{DutyOrchestrator, OrchestratorConfig};
-use signer::SignerService;
+use signer::{always_enabled, SignerService};
 use slashing::SlashingDb;
 use timing::MockSlotClock;
 use validator_store::{ValidatorConfig, ValidatorStore};
@@ -337,7 +337,8 @@ async fn build_integration_orchestrator(
     km.insert(sk);
     let composite = Arc::new(CompositeSigner::new(LocalSigner::new(km)));
     let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-    let signer = Arc::new(SignerService::new(composite, slashing_db));
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
     let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
     // Pre-seed the sync-committee duty cache so the orchestrator doesn't need

@@ -305,16 +305,17 @@ isn't explicitly enabled — and every un-wired path fails *closed*.
 - `test_enablement_check_precedes_slashing_stage` (assert the stage step is not reached when blocked)
 
 **Acceptance criteria:**
-- [ ] A closed gate refuses to sign (block + attestation); the check runs before the slashing stage,
+- [x] A closed gate refuses to sign (block + attestation); the check runs before the slashing stage,
       never after commit.
-- [ ] The default (un-wired) `SignerService` fails closed for unknown keys.
-- [ ] All ~8 construction sites compile; a compile-time/inventory note lists them as audited.
-- [ ] The atomic slashing gate ordering is intact.
-- [ ] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
+- [x] The default (un-wired) `SignerService` fails closed for unknown keys.
+- [x] All ~8 construction sites compile; a compile-time/inventory note lists them as audited.
+- [x] The atomic slashing gate ordering is intact.
+- [x] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
 
 **Risks / unknowns:**
 - The orchestrator tests build `SignerService` directly and expect signing to succeed; they need an
   all-enabled test enablement. Budgeted in the 3 pts (this is the main test-fallout surface).
+  **Resolved:** `always_enabled()` behind cfg(test)/test-helpers; production fail-closed until SEC-2b.
 
 ---
 

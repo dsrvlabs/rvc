@@ -483,7 +483,7 @@ mod tests {
         Attestation as EthAttestation, AttestationData, Checkpoint, ForkName, ForkSchedule,
         SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
     };
-    use signer::SignerService;
+    use signer::{always_enabled, SignerService};
     use slashing::SlashingDb;
     use tree_hash::TreeHash;
     use validator_store::{ValidatorConfig, ValidatorStore};
@@ -711,7 +711,8 @@ mod tests {
         let local_signer = LocalSigner::new(key_manager);
         let composite = Arc::new(CompositeSigner::new(local_signer));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let beacon =
             Arc::new(TrackingBeacon { duty_pubkey: duty_pubkey.clone(), submit_agg_calls });

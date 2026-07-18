@@ -357,7 +357,7 @@ mod tests {
         ForkSchedule, Root, SignedBeaconBlock, SignedBlindedBeaconBlock,
         SignedValidatorRegistration,
     };
-    use signer::SignerService;
+    use signer::{always_enabled, SignerService};
     use slashing::SlashingDb;
     use validator_store::{ValidatorConfig, ValidatorStore};
 
@@ -600,7 +600,8 @@ mod tests {
         let local_signer = LocalSigner::new(key_manager);
         let composite = Arc::new(CompositeSigner::new(local_signer));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
         // Pre-populate sync committee duties for period 0 (epoch 0 / 256 = 0)
@@ -1039,7 +1040,8 @@ mod tests {
         let local_signer = LocalSigner::new(key_manager);
         let composite = Arc::new(CompositeSigner::new(local_signer));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
         duty_tracker.fetch_sync_committee_duties(0).await.unwrap();

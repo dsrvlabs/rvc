@@ -6,6 +6,12 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+default = []
+# Exposes AlwaysEnabled / always_enabled() for cross-crate tests. Never enable
+# in production binary dependency lines (SEC-2a Finding 2).
+test-helpers = []
+
 [dependencies]
 async-trait.workspace = true
 crypto.workspace = true

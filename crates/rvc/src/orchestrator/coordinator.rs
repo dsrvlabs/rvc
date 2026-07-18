@@ -756,6 +756,7 @@ mod tests {
         SyncCommitteeMessage as BeaconSyncCommitteeMessage, SyncingResponse, ValidatorsResponse,
         VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
     };
+    use signer::always_enabled;
     // block_service::ProduceBlockResponse is used in MockBlockBeacon / BadProposerBlockBeacon
     use block_service::ProduceBlockResponse;
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
@@ -1195,7 +1196,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1235,7 +1237,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1273,7 +1276,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1342,7 +1346,8 @@ mod tests {
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
 
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1379,7 +1384,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1420,7 +1426,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1460,7 +1467,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -1668,7 +1676,8 @@ mod tests {
         key_manager.insert(secret_key);
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2002,7 +2011,8 @@ mod tests {
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
 
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2060,7 +2070,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2133,7 +2144,8 @@ mod tests {
         key_manager.insert(secret_key);
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2218,7 +2230,8 @@ mod tests {
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
 
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2272,7 +2285,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2343,7 +2357,8 @@ mod tests {
         key_manager.insert(secret_key);
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -2440,7 +2455,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config();
@@ -2505,7 +2521,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config();
@@ -2582,7 +2599,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config().with_timeouts(timeouts.clone());
@@ -2630,7 +2648,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let config = create_test_config();
@@ -2831,7 +2850,8 @@ mod tests {
         key_manager.insert(secret_key);
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let capturing_submitter = Arc::new(CapturingSubmitter::new());
         let propagator = Arc::new(Propagator::new(capturing_submitter.clone()));
@@ -3689,7 +3709,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -3759,7 +3780,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -3975,7 +3997,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -4044,7 +4067,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -4097,7 +4121,7 @@ mod tests {
         manager.insert(secret_key);
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = SignerService::new(composite, slashing_db);
+        let signer = SignerService::new(composite, slashing_db).with_enablement(always_enabled());
 
         let attestation_data = AttestationData {
             slot: 1000,
@@ -4589,7 +4613,8 @@ mod tests {
         let mut key_manager = KeyManager::new();
         key_manager.insert(secret_key);
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let capturing_submitter = Arc::new(CapturingSubmitter::new());
         let propagator = Arc::new(Propagator::new(capturing_submitter.clone()));
@@ -4812,7 +4837,8 @@ mod tests {
         key_manager.insert(secret_key);
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -4915,7 +4941,8 @@ mod tests {
         key_manager.insert(secret_key);
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -4996,7 +5023,8 @@ mod tests {
         key_manager.insert(secret_key);
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -5080,7 +5108,8 @@ mod tests {
         // Empty KeyManager → sign_randao_reveal will return SignerError.
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
@@ -5143,7 +5172,8 @@ mod tests {
         key_manager.insert(sk);
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
         // Pre-populate sync committee duties for period 0 (epoch 0).
@@ -5195,7 +5225,8 @@ mod tests {
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
@@ -5232,7 +5263,8 @@ mod tests {
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
@@ -5409,7 +5441,8 @@ mod tests {
         key_manager.insert(secret_key);
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let propagator = Arc::new(Propagator::new(submitter.clone()));
         let config = create_test_config();
@@ -5574,7 +5607,8 @@ mod tests {
         key_manager.insert(secret_key);
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let submitter = Arc::new(MockSubmitter::new());
         let propagator = Arc::new(Propagator::new(submitter));

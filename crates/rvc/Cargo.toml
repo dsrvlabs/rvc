@@ -55,6 +55,8 @@ axum.workspace = true
 crypto = { workspace = true, features = ["test-utils"] }
 http-body-util = "0.1"
 serde_json.workspace = true
+# test-helpers: AlwaysEnabled for orchestrator unit/integration tests (SEC-2a).
+signer = { workspace = true, features = ["test-helpers"] }
 tempfile.workspace = true
 tower = { workspace = true, features = ["util"] }
 tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }

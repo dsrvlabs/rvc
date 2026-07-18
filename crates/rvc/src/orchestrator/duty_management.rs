@@ -445,7 +445,7 @@ mod tests {
     use crypto::{CompositeSigner, KeyManager, LocalSigner};
     use duty_tracker::DutyTracker;
     use eth_types::ForkSchedule;
-    use signer::SignerService;
+    use signer::{always_enabled, SignerService};
     use slashing::SlashingDb;
     use timing::MockSlotClock;
     use validator_store::ValidatorStore;
@@ -500,7 +500,8 @@ mod tests {
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
         let clock = Arc::new(MockSlotClock::new(1606824023, Duration::from_secs(12), 0));
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
@@ -604,7 +605,8 @@ mod tests {
         let duty_tracker = Arc::new(DutyTracker::new(beacon_client.clone(), vec!["1".to_string()]));
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
         let clock = Arc::new(MockSlotClock::new(1606824023, Duration::from_secs(12), 0));
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));

@@ -955,6 +955,7 @@ impl VoluntaryExitManager for VoluntaryExitManagerAdapter {
 mod tests {
     use super::*;
     use crypto::{KeyManager, LocalSigner, SecretKey, Signer};
+    use signer::always_enabled;
     use tempfile::TempDir;
 
     fn test_pubkey(id: u8) -> Pubkey {
@@ -1998,7 +1999,8 @@ mod tests {
         composite.add_local_key(secret_key);
 
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = Arc::new(SignerService::new(composite, slashing_db));
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
         let fork_schedule = Arc::new(ForkSchedule {
             genesis_fork_version: [0, 0, 0, 0],

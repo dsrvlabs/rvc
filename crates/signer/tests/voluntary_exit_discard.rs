@@ -34,10 +34,23 @@
 
 use std::sync::Arc;
 
-use crypto::{KeyManager, LocalSigner, SecretKey};
+use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey};
 use eth_types::{ForkSchedule, Root, VoluntaryExit};
 use rvc_signer::{SignerError, SignerService};
 use slashing::SlashingDb;
+
+use rvc_signer::SigningEnablement;
+
+/// Local always-on enablement for this integration test (lib helper is feature-gated).
+struct AlwaysEnabled;
+impl SigningEnablement for AlwaysEnabled {
+    fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
+        true
+    }
+}
+fn always_enabled() -> std::sync::Arc<dyn SigningEnablement> {
+    std::sync::Arc::new(AlwaysEnabled)
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -79,7 +92,8 @@ const GVR: Root = [0xaa; 32];
 async fn test_voluntary_exit_signer_error_is_propagated() {
     let empty_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let service = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db));
+    let service = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db))
+        .with_enablement(always_enabled());
 
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();
@@ -114,7 +128,8 @@ async fn test_voluntary_exit_signer_error_is_propagated() {
 async fn test_voluntary_exit_retry_after_signer_failure_succeeds() {
     let empty_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let service_fail = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db));
+    let service_fail = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db))
+        .with_enablement(always_enabled());
 
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();
@@ -131,7 +146,8 @@ async fn test_voluntary_exit_retry_after_signer_failure_succeeds() {
     let mut manager = KeyManager::new();
     manager.insert(sk);
     let real_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(manager)));
-    let service_ok = SignerService::new(Arc::clone(&real_signer), Arc::clone(&db));
+    let service_ok = SignerService::new(Arc::clone(&real_signer), Arc::clone(&db))
+        .with_enablement(always_enabled());
 
     let ok_result = service_ok.sign_voluntary_exit(&exit, &pubkey, &fs, &GVR).await;
     assert!(
