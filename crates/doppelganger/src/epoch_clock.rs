@@ -55,10 +55,20 @@ impl MonotonicEpochClock {
 
     /// Current epoch from the monotonic clock.
     pub fn current_epoch(&self) -> Epoch {
+        self.current_slot() / SLOTS_PER_EPOCH
+    }
+
+    /// Current slot from the monotonic clock (SEC-2c liveness loop).
+    pub fn current_slot(&self) -> u64 {
         let elapsed_secs = self.start_instant.elapsed().as_secs();
         let now_unix = self.start_unix_time.saturating_add(elapsed_secs);
         let secs_since_genesis = now_unix.saturating_sub(self.genesis_time);
-        secs_since_genesis / SECONDS_PER_SLOT / SLOTS_PER_EPOCH
+        secs_since_genesis / SECONDS_PER_SLOT
+    }
+
+    /// Slot index within the current epoch (`0..SLOTS_PER_EPOCH`).
+    pub fn slot_in_epoch(&self) -> u64 {
+        self.current_slot() % SLOTS_PER_EPOCH
     }
 
     pub fn genesis_time(&self) -> u64 {

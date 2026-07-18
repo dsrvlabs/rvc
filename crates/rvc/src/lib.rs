@@ -7,6 +7,7 @@ pub mod deletion_denylist;
 pub mod doppelganger_adapter;
 pub mod duty_tracker;
 pub mod keymanager_adapters;
+pub mod liveness_loop;
 pub mod monitoring;
 pub mod orchestrator;
 pub mod prepare_exit;

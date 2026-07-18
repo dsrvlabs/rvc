@@ -31,8 +31,8 @@ pub use beacon::{
     ProposerDutiesResponse, ProposerDuty, ProposerPreparation, SignedAggregateAndProof,
     SignedContributionAndProof, SingleAttestation, StateForkResponse, SubmitAttestationResult,
     SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingData, SyncingResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof,
+    SyncingData, SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 pub use eth_types::{
     ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,

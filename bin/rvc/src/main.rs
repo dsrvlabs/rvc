@@ -1291,12 +1291,17 @@ async fn run_validator(
     let beacon_for_resolve: &dyn BeaconNodeClient = bn_manager.as_ref();
     let validator_index_map = resolve_validator_indices(beacon_for_resolve, &pubkey_map).await;
 
-    // Step 6: Doppelganger detection (if enabled) + SEC-2b ForwardWindowMachine
+    // Step 6: SEC-2b/2c ForwardWindowMachine + liveness observation loop
     //
     // SEC-2b: construct ForwardWindowMachine (or operator opt-out) and wire it as
-    // the production SignerService SigningEnablement. Keys stay closed until the
-    // monitoring window elapses with complete liveness (SEC-2c drives observation;
-    // until then the gate is fail-safe closed except epoch-0 bypass / restart skip).
+    // the production SignerService SigningEnablement.
+    // SEC-2c: a background per-slot loop ticks the machine and feeds
+    // observe_liveness from POST /eth/v1/validator/liveness via bn-manager
+    // (multi-BN query_first failover). Detected liveness permanently closes the
+    // gate for that key; a clean fully-observed window opens it.
+    //
+    // The backward one-shot DoppelgangerService is no longer the production
+    // mechanism (subsumed by the forward-window loop).
     // Cost when on: ~2 epochs ≈ 12.8 min of withheld signing on mainnet.
     //
     // Shared monotonic epoch clock (M-7) for boot register + keymanager import
@@ -1306,65 +1311,37 @@ async fn run_validator(
         std::sync::Arc::new(doppelganger::MonotonicEpochClock::new(genesis_time_for_epoch));
     let enablement_epoch = epoch_clock.current_epoch();
 
-    if doppelganger_enabled && !pubkey_map.read().is_empty() {
-        let validator_index_map = match validator_index_map {
+    // Resolve index map for the liveness loop (fail closed if required and missing).
+    let resolved_index_map: std::collections::HashMap<String, String> = if doppelganger_enabled
+        && !pubkey_map.read().is_empty()
+    {
+        match validator_index_map {
             Ok(ref map) if !map.is_empty() => map.clone(),
             Ok(_) => {
                 warn!(
                     total = pubkey_map.read().len(),
                     "No validator indices resolved; validators may be pending activation. \
-                     Skipping doppelganger detection"
+                         Forward-window liveness loop will not start (gate stays fail-safe closed \
+                         for Pending keys)"
                 );
                 std::collections::HashMap::new()
             }
             Err(ref e) => {
                 error!("Failed to resolve validator indices: {}", e);
                 return Err(anyhow::anyhow!(
-                    "validator index resolution failed; doppelganger detection requires indices: {}", e
-                ));
-            }
-        };
-
-        if !validator_index_map.is_empty() {
-            let doppelganger_service =
-                builder.build_doppelganger_service(beacon_client.clone(), slashing_db.clone())?;
-
-            let pubkeys: Vec<String> = pubkey_map.read().keys().cloned().collect();
-
-            // Prefer the shared monotonic epoch_clock for enablement registration;
-            // one-shot service still uses its own clock for the legacy path.
-            let current_epoch = epoch_clock.current_epoch();
-
-            // S-3 (Issue 2.8): detection is always invoked — the epoch-0 case is
-            // handled inside startup::run_doppelganger_detection as an explicit,
-            // logged pre-genesis bypass that returns all validators Safe without
-            // issuing a beacon liveness query (so a pre-genesis BN error cannot
-            // abort startup).  Boot register still applies epoch-0 Safe on the
-            // machine; API import uses register_for_import (no Safe bypass).
-            if current_epoch == 0 {
-                info!(
-                    "Doppelganger detection: pre-genesis (epoch 0) startup — \
-                     validators will be marked Safe without a monitoring window"
-                );
-            }
-
-            match startup::run_doppelganger_detection(
-                &doppelganger_service,
-                &pubkeys,
-                &validator_index_map,
-                current_epoch,
-            )
-            .await
-            {
-                Ok(safe_validators) => {
-                    info!(safe_count = safe_validators.len(), "Doppelganger detection complete");
-                }
-                Err(e) => {
-                    error!("Doppelganger detection failed: {}", e);
-                    return Err(e.into());
-                }
+                        "validator index resolution failed; doppelganger detection requires indices: {}", e
+                    ));
             }
         }
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    if enablement_epoch == 0 && doppelganger_enabled {
+        info!(
+            "Doppelganger detection: pre-genesis (epoch 0) startup — \
+             validators will be marked Safe without a monitoring window (boot register)"
+        );
     } else if !doppelganger_enabled {
         warn!("Doppelganger detection is disabled");
     }
@@ -1383,6 +1360,21 @@ async fn run_validator(
         enablement_epoch,
         &pubkey_map,
     );
+
+    // SEC-2c: spawn the per-slot liveness observation loop (sole production mechanism).
+    // bn_manager is Arc; clone for the loop and keep the original for later duties.
+    // Pass pubkey_map so the loop re-resolves indices after keymanager import /
+    // delayed activation (review Finding 3).
+    if doppelganger_enabled {
+        let _liveness_loop_handle = rvc::liveness_loop::spawn_liveness_loop(
+            forward_window_machine.clone(),
+            std::sync::Arc::clone(&bn_manager) as std::sync::Arc<dyn BeaconNodeClient>,
+            &resolved_index_map,
+            Some(std::sync::Arc::clone(&pubkey_map)),
+            std::sync::Arc::clone(&epoch_clock),
+            shutdown_token.clone(),
+        );
+    }
 
     // Secret-provider refresh: after machine is available, register newly
     // discovered local keys (import-strict) so they are not permanently Unmonitored.

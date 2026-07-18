@@ -434,13 +434,13 @@ note it is fixed at this commit without rewriting the old note).
 - `test_single_doppelganger_mechanism_in_production` (one-shot service no longer wired)
 
 **Acceptance criteria:**
-- [ ] Detected liveness for a key during the window → gate stays closed for that key (or VC shuts down,
+- [x] Detected liveness for a key during the window → gate stays closed for that key (or VC shuts down,
       matching the machine's semantics) — no signing.
-- [ ] After a clean window, the gate opens and signing proceeds.
-- [ ] Liveness observation goes through the bn-manager (multi-BN failover respected).
-- [ ] The backward one-shot `DoppelgangerService` is no longer the production mechanism; tracker
+- [x] After a clean window, the gate opens and signing proceeds.
+- [x] Liveness observation goes through the bn-manager (multi-BN failover respected).
+- [x] The backward one-shot `DoppelgangerService` is no longer the production mechanism; tracker
       correction added.
-- [ ] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
+- [x] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
 
 **Risks / unknowns:**
 - **Multi-BN liveness wrapping** could be heavier than a single beacon call if bn-manager has no

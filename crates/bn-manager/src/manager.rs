@@ -9,8 +9,8 @@ use beacon::{
     BeaconError, BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
     ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof,
+    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use eth_types::{
     ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
@@ -1218,6 +1218,19 @@ impl BeaconNodeClient for BnManager {
         })
         .await
     }
+
+    // -- Doppelganger / liveness (SEC-2c): query_first failover, SmallLag --
+
+    async fn post_validator_liveness(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<ValidatorLivenessResponse, BeaconError> {
+        self.query_first("post_validator_liveness", BnRole::All, HealthTier::SmallLag, |c| {
+            Box::pin(c.post_validator_liveness(epoch, validator_indices))
+        })
+        .await
+    }
 }
 
 /// Implements `BeaconNodeClient` for `BeaconClient` directly, useful for tests
@@ -1375,6 +1388,14 @@ impl BeaconNodeClient for BeaconClient {
 
     async fn get_node_version(&self) -> Result<String, BeaconError> {
         self.get_node_version().await
+    }
+
+    async fn post_validator_liveness(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<ValidatorLivenessResponse, BeaconError> {
+        BeaconClient::post_validator_liveness(self, epoch, validator_indices).await
     }
 }
 
@@ -1962,6 +1983,37 @@ mod tests {
         let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
         let result = manager.get_genesis().await;
         assert!(result.is_err());
+    }
+
+    /// SEC-2c: post_validator_liveness uses query_first multi-BN failover.
+    #[tokio::test]
+    async fn test_post_validator_liveness_failover() {
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/liveness/42"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("primary down"))
+            .expect(1)
+            .mount(&primary)
+            .await;
+
+        let body = r#"{"data":[{"index":"1","is_live":false},{"index":"2","is_live":true}]}"#;
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/liveness/42"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .expect(1)
+            .mount(&secondary)
+            .await;
+
+        let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+        let indices = vec!["1".to_string(), "2".to_string()];
+        let result = manager.post_validator_liveness(42, &indices).await;
+        assert!(result.is_ok(), "failover must succeed: {result:?}");
+        let data = result.unwrap().data;
+        assert_eq!(data.len(), 2);
+        assert!(!data[0].is_live);
+        assert!(data[1].is_live);
     }
 
     #[tokio::test]

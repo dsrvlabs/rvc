@@ -7,8 +7,8 @@ use beacon::{
     BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
     ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof,
+    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use eth_types::{
     ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
@@ -146,6 +146,21 @@ pub trait BeaconNodeClient: Send + Sync {
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError>;
 
     async fn get_node_version(&self) -> Result<String, BeaconError>;
+
+    // -- Doppelganger / liveness (SEC-2c) --
+
+    /// Query validator liveness for the given epoch (POST /eth/v1/validator/liveness/{epoch}).
+    ///
+    /// Default returns `HttpError` so existing test mocks need not implement this method.
+    /// Production `BnManager` / `BeaconClient` provide real failover-aware implementations.
+    async fn post_validator_liveness(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<ValidatorLivenessResponse, BeaconError> {
+        let _ = (epoch, validator_indices);
+        Err(BeaconError::HttpError("post_validator_liveness not implemented".to_string()))
+    }
 }
 
 /// Per-operation timeout configuration for beacon node API calls.

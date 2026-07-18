@@ -155,9 +155,14 @@ impl ServiceBuilder {
         Ok(Some(Arc::new(manager)))
     }
 
+    /// Build the legacy one-shot [`DoppelgangerService`] (tests / non-production).
+    ///
+    /// SEC-2c: production `bin/rvc` no longer wires this service; the forward-window
+    /// liveness loop drives [`ForwardWindowMachine`] instead. Kept for unit tests
+    /// and `build_all` scaffolding.
     pub fn build_doppelganger_service(
         &self,
-        beacon: Arc<BeaconClient>,
+        beacon: Arc<dyn BeaconNodeClient>,
         slashing_db: Arc<SlashingDb>,
     ) -> Result<DoppelgangerService, ConfigError> {
         // M-7 (ISSUE-3.6 review): propagate the genesis_time error rather than
@@ -168,7 +173,7 @@ impl ServiceBuilder {
         let liveness_checker = Arc::new(BeaconLivenessAdapter::new(beacon));
         let slashing_reader = Arc::new(SlashingDbReaderAdapter::new(slashing_db));
         let service = DoppelgangerService::new(liveness_checker, slashing_reader, genesis_time);
-        info!(genesis_time, "Created doppelganger detection service");
+        info!(genesis_time, "Created legacy one-shot doppelganger service (non-production)");
         Ok(service)
     }
 
@@ -283,11 +288,11 @@ impl ServiceBuilder {
             monitoring_epochs = DEFAULT_MONITORING_EPOCHS,
             current_epoch,
             registered,
-            "ForwardWindowMachine constructed (SEC-2b). Keys stay closed until \
+            "ForwardWindowMachine constructed (SEC-2b/2c). Keys stay closed until \
              {DEFAULT_MONITORING_EPOCHS} epochs of network liveness are observed \
-             (~12.8 min on mainnet). Liveness observation loop lands in SEC-2c; \
-             until then the gate remains fail-safe closed (except epoch-0 bypass \
-             and restart-aware safe-skip)."
+             (~12.8 min on mainnet). The per-slot liveness loop (SEC-2c) feeds \
+             observe_liveness via bn-manager failover; epoch-0 bypass and \
+             restart-aware safe-skip still apply on boot register only."
         );
 
         (Arc::clone(&machine) as Arc<dyn SigningEnablement>, Some(machine))
@@ -1096,7 +1101,7 @@ mod tests {
     }
 
     /// A key registered at epoch E cannot sign before the window elapses when
-    /// no external liveness is observed (fail-safe until SEC-2c).
+    /// no external liveness is observed (D-2 fail-closed; SEC-2c loop supplies observations).
     #[test]
     fn test_registered_key_gate_closed_until_window_elapses() {
         let config = create_minimal_config();
