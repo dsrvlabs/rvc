@@ -5,6 +5,8 @@ use tree_hash_derive::TreeHash;
 mod aggregation;
 mod attestation;
 mod block;
+/// Typed BeaconBlockBody containers + SEC-6a body HTR prototype (seed for SEC-6b).
+pub mod block_body;
 mod builder;
 pub mod canonical;
 mod deposit;

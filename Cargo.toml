@@ -73,6 +73,11 @@ hex = "0.4"
 rand = "0.8"
 ssz = { package = "ethereum_ssz", version = "0.9" }
 ssz_derive = { package = "ethereum_ssz_derive", version = "0.9" }
+# VariableList / FixedVector / BitVector with compile-time limits. 0.10.1 is the
+# last release on tree_hash 0.9 / ethereum_ssz 0.8 (tree_hash 0.9 itself pins
+# ethereum_ssz 0.8 for Bitfield). Do not jump to 0.11+ without a workspace-wide
+# tree_hash upgrade — those pin tree_hash ≥ 0.10.
+ssz_types = "0.10.1"
 tree_hash = "0.9"
 tree_hash_derive = "0.9"
 sha2 = "0.10"

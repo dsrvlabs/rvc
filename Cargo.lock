@@ -4340,6 +4340,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "ssz_types",
  "thiserror 2.0.18",
  "tracing",
  "tracing-test",
@@ -5052,6 +5053,22 @@ checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
  "der",
+]
+
+[[package]]
+name = "ssz_types"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dad0fa7e9a85c06d0a6ba5100d733fff72e231eb6db2d86078225cf716fd2d95"
+dependencies = [
+ "ethereum_serde_utils 0.7.0",
+ "ethereum_ssz 0.8.3",
+ "itertools 0.13.0",
+ "serde",
+ "serde_derive",
+ "smallvec",
+ "tree_hash",
+ "typenum",
 ]
 
 [[package]]
