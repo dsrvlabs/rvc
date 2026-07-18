@@ -76,7 +76,7 @@ fn sample_block_ssz(slot: u64) -> Vec<u8> {
         proposer_index: 1,
         parent_root: [0x11; 32],
         state_root: [0x22; 32],
-        body: vec![0xde, 0xad, 0xbe, 0xef],
+        body: eth_types::external_vector_electra_body().as_ssz_bytes(),
     };
     encode_beacon_block_ssz(&block, 4)
 }

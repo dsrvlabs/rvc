@@ -86,7 +86,7 @@ async fn test_typed_signer_local_block_golden() {
         proposer_index: 12345,
         parent_root: [0x10; 32],
         state_root: [0x20; 32],
-        body: vec![0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+        body: eth_types::external_vector_electra_body().as_ssz_bytes(),
     };
     let signer = make_signer(sk);
 
@@ -120,7 +120,7 @@ async fn test_typed_signer_local_blinded_block_golden() {
         proposer_index: 42,
         parent_root: [0x30; 32],
         state_root: [0x40; 32],
-        body: vec![0xca, 0xfe, 0xba, 0xbe],
+        body: eth_types::external_vector_blinded_electra_body().as_ssz_bytes(),
     };
     let signer = make_signer(sk);
 
@@ -399,7 +399,7 @@ async fn test_typed_signer_local_signing_root_deterministic() {
         proposer_index: 1,
         parent_root: [0x11; 32],
         state_root: [0x22; 32],
-        body: vec![0xab; 8],
+        body: eth_types::external_vector_electra_body().as_ssz_bytes(),
     };
 
     let domain =

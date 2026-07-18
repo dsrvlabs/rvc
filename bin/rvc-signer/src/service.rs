@@ -509,7 +509,11 @@ impl SignerServiceV2 for SignerServiceImpl {
         Span::current().record("slot", slot);
 
         let domain = compute_domain(DOMAIN_BEACON_PROPOSER, current_version, gvr);
-        let signing_root = compute_signing_root(&block, domain);
+        // SEC-6c: typed body leaf — malformed Electra body SSZ must error, not panic.
+        let object_root = block.try_tree_hash_root().map_err(|e| {
+            Status::invalid_argument(format!("invalid block body for tree_hash_root: {e}"))
+        })?;
+        let signing_root = compute_signing_root(&object_root.0, domain);
 
         let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
         let gate = self.require_gate()?;
@@ -557,7 +561,11 @@ impl SignerServiceV2 for SignerServiceImpl {
         Span::current().record("slot", slot);
 
         let domain = compute_domain(DOMAIN_BEACON_PROPOSER, current_version, gvr);
-        let signing_root = compute_signing_root(&block, domain);
+        // SEC-6c: typed body leaf — malformed Electra body SSZ must error, not panic.
+        let object_root = block.try_tree_hash_root().map_err(|e| {
+            Status::invalid_argument(format!("invalid blinded block body for tree_hash_root: {e}"))
+        })?;
+        let signing_root = compute_signing_root(&object_root.0, domain);
 
         let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
         let gate = self.require_gate()?;
@@ -1222,7 +1230,7 @@ mod tests {
             proposer_index: 1,
             parent_root: [0x11; 32],
             state_root: [0x22; 32],
-            body: vec![0xde, 0xad],
+            body: eth_types::external_vector_electra_body().as_ssz_bytes(),
         };
         encode_beacon_block_ssz(&block, 4)
     }
@@ -1433,7 +1441,7 @@ mod tests {
             proposer_index: 1,
             parent_root: [0x33; 32],
             state_root: [0x44; 32],
-            body: vec![0xca, 0xfe],
+            body: eth_types::external_vector_blinded_electra_body().as_ssz_bytes(),
         };
         let ssz = encode_blinded_beacon_block_ssz(&blinded, 4);
 

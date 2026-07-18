@@ -92,7 +92,7 @@ impl SigningBackend for TestBackend {
 
 // ── SSZ helpers ───────────────────────────────────────────────────────────────
 
-/// Minimal valid SSZ-encoded `BeaconBlock` for testing.
+/// Minimal valid SSZ-encoded `BeaconBlock` for testing (Electra typed body, SEC-6c).
 pub fn sample_block_ssz(slot: u64) -> Vec<u8> {
     use eth_types::BeaconBlock;
     let block = BeaconBlock {
@@ -100,12 +100,12 @@ pub fn sample_block_ssz(slot: u64) -> Vec<u8> {
         proposer_index: 1,
         parent_root: [0x11; 32],
         state_root: [0x22; 32],
-        body: vec![0xde, 0xad, 0xbe, 0xef],
+        body: eth_types::external_vector_electra_body().as_ssz_bytes(),
     };
     encode_beacon_block_ssz(&block, 4)
 }
 
-/// Minimal valid SSZ-encoded `BlindedBeaconBlock` for testing.
+/// Minimal valid SSZ-encoded `BlindedBeaconBlock` for testing (Electra typed body).
 pub fn sample_blinded_block_ssz(slot: u64) -> Vec<u8> {
     use eth_types::{encode_blinded_beacon_block_ssz, BlindedBeaconBlock};
     let block = BlindedBeaconBlock {
@@ -113,7 +113,7 @@ pub fn sample_blinded_block_ssz(slot: u64) -> Vec<u8> {
         proposer_index: 1,
         parent_root: [0x33; 32],
         state_root: [0x44; 32],
-        body: vec![0xca, 0xfe],
+        body: eth_types::external_vector_blinded_electra_body().as_ssz_bytes(),
     };
     encode_blinded_beacon_block_ssz(&block, 4)
 }

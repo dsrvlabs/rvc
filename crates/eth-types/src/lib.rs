@@ -25,14 +25,18 @@ pub use aggregation::{
 };
 pub use attestation::SingleAttestation;
 pub use block::{
-    body_fork_layout, kzg_commitment_list_root, BeaconBlock, BeaconBlockBody, BeaconBlockHeader,
-    BlindedBeaconBlock, BlindedBeaconBlockBody, BlobSidecar, BlockContents, BodyForkLayout,
-    ProducedBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    body_fork_layout, external_vector_electra_blinded_block, external_vector_electra_block,
+    kzg_commitment_list_root, BeaconBlock, BeaconBlockBody, BeaconBlockHeader, BlindedBeaconBlock,
+    BlindedBeaconBlockBody, BlobSidecar, BlockContents, BodyForkLayout, ProducedBlock,
+    SignedBeaconBlock, SignedBlindedBeaconBlock,
 };
 pub use block_body::{
     decode_beacon_block_body_electra, decode_blinded_beacon_block_body_electra,
-    BeaconBlockBodyElectra, BlindedBeaconBlockBodyElectra, BodySszError, ExecutionPayload,
-    ExecutionPayloadHeader, ExecutionRequests, SyncAggregate,
+    external_vector_blinded_electra_body, external_vector_electra_body,
+    external_vector_execution_payload_header, BeaconBlockBodyElectra,
+    BlindedBeaconBlockBodyElectra, BodySszError, ExecutionPayload, ExecutionPayloadHeader,
+    ExecutionRequests, SyncAggregate, EXTERNAL_ELECTRA_BLOCK_ROOT_HEX,
+    EXTERNAL_ELECTRA_BODY_ROOT_HEX,
 };
 pub use builder::{SignedValidatorRegistration, ValidatorRegistrationV1};
 pub use deposit::{BLSToExecutionChange, DepositData, DepositMessage, SignedBLSToExecutionChange};

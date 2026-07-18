@@ -4,6 +4,9 @@ use tree_hash::{mix_in_length, Hash256, MerkleHasher};
 pub enum TreeHashError {
     #[error("invalid SSZ bitlist: {reason}")]
     InvalidBitlist { reason: String },
+    /// Body bytes failed SSZ decode into a typed `BeaconBlockBody` (SEC-6c).
+    #[error("invalid SSZ block body: {reason}")]
+    InvalidBody { reason: String },
 }
 
 pub(crate) fn vec_u8_tree_hash_root(bytes: &[u8]) -> Hash256 {

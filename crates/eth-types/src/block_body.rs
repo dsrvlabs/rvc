@@ -4,10 +4,9 @@
 //! `TreeHash` (via `tree_hash_derive`) and SSZ Encode/Decode (via `ssz08` =
 //! ethereum_ssz 0.8, matching `ssz_types` trait impls).
 //!
-//! Wire `Vec<u8>` bodies still live on [`crate::BeaconBlock`]; use
-//! [`BeaconBlockBodyElectra::from_ssz_bytes`] (and the blinded counterpart)
-//! to decode into these types. SEC-6c wires the body leaf in
-//! `tree_hash_root`; this module is the foundation.
+//! Wire `Vec<u8>` bodies still live on [`crate::BeaconBlock`]; SEC-6c decodes
+//! them via [`BeaconBlockBodyElectra::from_ssz_bytes`] (and the blinded
+//! counterpart) inside `try_tree_hash_root` for the body leaf.
 //!
 //! Design (see `plan/security-2026-07-18/spike-sec6-block-body-htr.md`):
 //! hand-typed per-fork containers via `tree_hash_derive` + `ssz_types`
@@ -670,134 +669,138 @@ pub fn decode_blinded_beacon_block_body_electra(
     BlindedBeaconBlockBodyElectra::from_ssz_bytes(bytes)
 }
 
+// ---------------------------------------------------------------------------
+// External-vector fixtures (SEC-6a/b/c KATs; also usable as valid Electra bodies)
+// ---------------------------------------------------------------------------
+
+/// External known-good Electra body root from independent `remerkleable` oracle.
+///
+/// Matches [`external_vector_electra_body`]'s field construction.
+pub const EXTERNAL_ELECTRA_BODY_ROOT_HEX: &str =
+    "58953d11e9b51a6e95c8c70ca51b7ad6b6e557a91caab298a71688dfab9e4870";
+
+/// External known-good Electra **block** root (`remerkleable` over the full
+/// `BeaconBlock` with slot=3_000_000, proposer=42, parent=`0x11…`, state=`0x22…`,
+/// body=[`external_vector_electra_body`]).
+pub const EXTERNAL_ELECTRA_BLOCK_ROOT_HEX: &str =
+    "b3f19bf190b0ab2466738ba06bbaf6e481041ca66db733c549975b27b53c92b9";
+
+/// Deterministic Electra body matching the external `remerkleable` vector:
+/// fixed non-zero leaves for signatures / eth1 / payload fields; empty op lists.
+pub fn external_vector_electra_body() -> BeaconBlockBodyElectra {
+    let mut graffiti = [0u8; 32];
+    graffiti[..28].copy_from_slice(b"rvc-sec6a-spike-electra!!!!!");
+
+    BeaconBlockBodyElectra {
+        randao_reveal: [0x11; 96],
+        eth1_data: Eth1Data { deposit_root: [0x22; 32], deposit_count: 7, block_hash: [0x33; 32] },
+        graffiti,
+        proposer_slashings: VariableList::from(vec![]),
+        attester_slashings: VariableList::from(vec![]),
+        attestations: VariableList::from(vec![]),
+        deposits: VariableList::from(vec![]),
+        voluntary_exits: VariableList::from(vec![]),
+        sync_aggregate: SyncAggregate {
+            sync_committee_bits: BitVector::new(),
+            sync_committee_signature: [0x44; 96],
+        },
+        execution_payload: ExecutionPayload {
+            parent_hash: [0x55; 32],
+            fee_recipient: [0x66; 20],
+            state_root: [0x77; 32],
+            receipts_root: [0x88; 32],
+            logs_bloom: FixedVector::from(vec![0u8; 256]),
+            prev_randao: [0x99; 32],
+            block_number: 12_345,
+            gas_limit: 30_000_000,
+            gas_used: 1_000_000,
+            timestamp: 1_700_000_000,
+            extra_data: VariableList::from(vec![]),
+            base_fee_per_gas: Uint256::from_u64(7),
+            block_hash: [0xaa; 32],
+            transactions: VariableList::from(vec![]),
+            withdrawals: VariableList::from(vec![]),
+            blob_gas_used: 0,
+            excess_blob_gas: 0,
+        },
+        bls_to_execution_changes: VariableList::from(vec![]),
+        blob_kzg_commitments: VariableList::from(vec![]),
+        execution_requests: ExecutionRequests {
+            deposits: VariableList::from(vec![]),
+            withdrawals: VariableList::from(vec![]),
+            consolidations: VariableList::from(vec![]),
+        },
+    }
+}
+
+/// Execution payload header corresponding to [`external_vector_electra_body`]'s
+/// payload (empty txs/withdrawals → their empty-list roots).
+pub fn external_vector_execution_payload_header() -> ExecutionPayloadHeader {
+    let p = &external_vector_electra_body().execution_payload;
+    ExecutionPayloadHeader {
+        parent_hash: p.parent_hash,
+        fee_recipient: p.fee_recipient,
+        state_root: p.state_root,
+        receipts_root: p.receipts_root,
+        logs_bloom: p.logs_bloom.clone(),
+        prev_randao: p.prev_randao,
+        block_number: p.block_number,
+        gas_limit: p.gas_limit,
+        gas_used: p.gas_used,
+        timestamp: p.timestamp,
+        extra_data: p.extra_data.clone(),
+        base_fee_per_gas: p.base_fee_per_gas,
+        block_hash: p.block_hash,
+        // Empty list roots for transactions / withdrawals (spec empty List roots).
+        transactions_root: {
+            let root = VariableList::<Transaction, MaxTransactionsPerPayload>::from(vec![])
+                .tree_hash_root();
+            let mut out = [0u8; 32];
+            out.copy_from_slice(root.as_slice());
+            out
+        },
+        withdrawals_root: {
+            let root =
+                VariableList::<Withdrawal, MaxWithdrawalsPerPayload>::from(vec![]).tree_hash_root();
+            let mut out = [0u8; 32];
+            out.copy_from_slice(root.as_slice());
+            out
+        },
+        blob_gas_used: p.blob_gas_used,
+        excess_blob_gas: p.excess_blob_gas,
+    }
+}
+
+/// Blinded Electra body matching the external vector (header instead of payload).
+///
+/// With empty txs/withdrawals the body HTR equals [`EXTERNAL_ELECTRA_BODY_ROOT_HEX`].
+pub fn external_vector_blinded_electra_body() -> BlindedBeaconBlockBodyElectra {
+    let full = external_vector_electra_body();
+    BlindedBeaconBlockBodyElectra {
+        randao_reveal: full.randao_reveal,
+        eth1_data: full.eth1_data,
+        graffiti: full.graffiti,
+        proposer_slashings: full.proposer_slashings,
+        attester_slashings: full.attester_slashings,
+        attestations: full.attestations,
+        deposits: full.deposits,
+        voluntary_exits: full.voluntary_exits,
+        sync_aggregate: full.sync_aggregate,
+        execution_payload_header: external_vector_execution_payload_header(),
+        bls_to_execution_changes: full.bls_to_execution_changes,
+        blob_kzg_commitments: full.blob_kzg_commitments,
+        execution_requests: full.execution_requests,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tree_hash::TreeHash;
 
-    /// External known-good body root from an independent SSZ oracle (`remerkleable`),
-    /// modelling Electra `BeaconBlockBody` with the field values constructed below.
-    ///
-    /// Generated offline (no network in tests):
-    /// ```text
-    /// remerkleable Container hash_tree_root over the same field values
-    /// ```
-    /// Source script: plan note + this test's field construction. Do not recompute
-    /// the expected root from rvc helpers — that would defeat the KAT.
-    const EXTERNAL_ELECTRA_BODY_ROOT_HEX: &str =
-        "58953d11e9b51a6e95c8c70ca51b7ad6b6e557a91caab298a71688dfab9e4870";
-
     fn hex32(s: &str) -> Hash256 {
         let bytes = hex::decode(s.trim_start_matches("0x")).expect("hex");
         Hash256::from_slice(&bytes)
-    }
-
-    /// Deterministic Electra body matching the external `remerkleable` vector:
-    /// fixed non-zero leaves for signatures / eth1 / payload header fields;
-    /// all operation lists and blob commitments empty.
-    fn external_vector_electra_body() -> BeaconBlockBodyElectra {
-        let mut graffiti = [0u8; 32];
-        graffiti[..28].copy_from_slice(b"rvc-sec6a-spike-electra!!!!!");
-
-        BeaconBlockBodyElectra {
-            randao_reveal: [0x11; 96],
-            eth1_data: Eth1Data {
-                deposit_root: [0x22; 32],
-                deposit_count: 7,
-                block_hash: [0x33; 32],
-            },
-            graffiti,
-            proposer_slashings: VariableList::from(vec![]),
-            attester_slashings: VariableList::from(vec![]),
-            attestations: VariableList::from(vec![]),
-            deposits: VariableList::from(vec![]),
-            voluntary_exits: VariableList::from(vec![]),
-            sync_aggregate: SyncAggregate {
-                sync_committee_bits: BitVector::new(),
-                sync_committee_signature: [0x44; 96],
-            },
-            execution_payload: ExecutionPayload {
-                parent_hash: [0x55; 32],
-                fee_recipient: [0x66; 20],
-                state_root: [0x77; 32],
-                receipts_root: [0x88; 32],
-                logs_bloom: FixedVector::from(vec![0u8; 256]),
-                prev_randao: [0x99; 32],
-                block_number: 12_345,
-                gas_limit: 30_000_000,
-                gas_used: 1_000_000,
-                timestamp: 1_700_000_000,
-                extra_data: VariableList::from(vec![]),
-                base_fee_per_gas: Uint256::from_u64(7),
-                block_hash: [0xaa; 32],
-                transactions: VariableList::from(vec![]),
-                withdrawals: VariableList::from(vec![]),
-                blob_gas_used: 0,
-                excess_blob_gas: 0,
-            },
-            bls_to_execution_changes: VariableList::from(vec![]),
-            blob_kzg_commitments: VariableList::from(vec![]),
-            execution_requests: ExecutionRequests {
-                deposits: VariableList::from(vec![]),
-                withdrawals: VariableList::from(vec![]),
-                consolidations: VariableList::from(vec![]),
-            },
-        }
-    }
-
-    fn external_vector_execution_payload_header() -> ExecutionPayloadHeader {
-        let p = &external_vector_electra_body().execution_payload;
-        ExecutionPayloadHeader {
-            parent_hash: p.parent_hash,
-            fee_recipient: p.fee_recipient,
-            state_root: p.state_root,
-            receipts_root: p.receipts_root,
-            logs_bloom: p.logs_bloom.clone(),
-            prev_randao: p.prev_randao,
-            block_number: p.block_number,
-            gas_limit: p.gas_limit,
-            gas_used: p.gas_used,
-            timestamp: p.timestamp,
-            extra_data: p.extra_data.clone(),
-            base_fee_per_gas: p.base_fee_per_gas,
-            block_hash: p.block_hash,
-            // Empty list roots for transactions / withdrawals (spec empty List roots).
-            transactions_root: {
-                let root = VariableList::<Transaction, MaxTransactionsPerPayload>::from(vec![])
-                    .tree_hash_root();
-                let mut out = [0u8; 32];
-                out.copy_from_slice(root.as_slice());
-                out
-            },
-            withdrawals_root: {
-                let root = VariableList::<Withdrawal, MaxWithdrawalsPerPayload>::from(vec![])
-                    .tree_hash_root();
-                let mut out = [0u8; 32];
-                out.copy_from_slice(root.as_slice());
-                out
-            },
-            blob_gas_used: p.blob_gas_used,
-            excess_blob_gas: p.excess_blob_gas,
-        }
-    }
-
-    fn external_vector_blinded_electra_body() -> BlindedBeaconBlockBodyElectra {
-        let full = external_vector_electra_body();
-        BlindedBeaconBlockBodyElectra {
-            randao_reveal: full.randao_reveal,
-            eth1_data: full.eth1_data,
-            graffiti: full.graffiti,
-            proposer_slashings: full.proposer_slashings,
-            attester_slashings: full.attester_slashings,
-            attestations: full.attestations,
-            deposits: full.deposits,
-            voluntary_exits: full.voluntary_exits,
-            sync_aggregate: full.sync_aggregate,
-            execution_payload_header: external_vector_execution_payload_header(),
-            bls_to_execution_changes: full.bls_to_execution_changes,
-            blob_kzg_commitments: full.blob_kzg_commitments,
-            execution_requests: full.execution_requests,
-        }
     }
 
     #[test]

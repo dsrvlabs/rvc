@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use builder::CircuitBreakerState;
 use tracing::{debug, error, info, warn, Instrument};
-use tree_hash::TreeHash;
 
 use crypto::logging::{TruncatedPubkey, TruncatedRoot};
 use crypto::PublicKey;
@@ -313,7 +312,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     e
                 })?;
             }
-            (compute_blinded_block_root(&block), offset)
+            (compute_blinded_block_root(&block)?, offset)
         } else {
             let (block, offset) =
                 beacon::ssz_deser::deserialize_beacon_block_from_ssz(ssz_bytes, format)
@@ -346,7 +345,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     );
                 }
             }
-            (compute_block_root(&block), offset)
+            (compute_block_root(&block)?, offset)
         };
 
         let sign_start = std::time::Instant::now();
@@ -409,9 +408,9 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
 
         // ISSUE-4.3 (L-3) defense-in-depth: bind blob KZG commitments canonically.
         //
-        // The signing scope (block_root) already opaquely covers the body bytes
-        // that contain blob_kzg_commitments. Here we additionally parse the
-        // commitments, compute a canonical SSZ list root, and verify that the
+        // The signing scope is the spec block root (`hash_tree_root` over the
+        // typed Electra body — SEC-6c). Here we additionally parse the
+        // commitments, compute an internal list fingerprint, and verify that the
         // commitment count in the body matches the number of blob sidecars.
         // This does NOT change the BN-facing signing scope; it is a rvc-internal
         // consistency check performed before the signature is created.
@@ -426,7 +425,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     commitment_root = %TruncatedRoot::new(&commitment_root),
                     "BlockAndBlobs: internal KZG commitment binding (ISSUE-4.3)"
                 );
-                // Intentionally warn-only: the signing scope covers body bytes
+                // Intentionally warn-only: the signing scope covers the typed body
                 // (self-consistent). Sidecar propagation is the BN's responsibility.
                 // Aborting here would drop proposals on legitimate BN inconsistencies
                 // during fork transitions.
@@ -441,7 +440,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             }
         }
 
-        let block_root = compute_block_root(&block);
+        let block_root = compute_block_root(&block)?;
 
         let sign_start = std::time::Instant::now();
         let sig = self
@@ -492,7 +491,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             })?;
         }
 
-        let block_root = compute_blinded_block_root(&block);
+        let block_root = compute_blinded_block_root(&block)?;
 
         let sign_start = std::time::Instant::now();
         let sig = self
@@ -523,12 +522,27 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
     }
 }
 
-fn compute_block_root(block: &eth_types::BeaconBlock) -> Root {
-    block.tree_hash_root().0
+/// Spec `hash_tree_root(BeaconBlock)` via typed Electra body leaf (SEC-6c).
+///
+/// **Production root path** for proposal signing (prefer this over
+/// `TreeHash::tree_hash_root`, which panics on malformed body SSZ).
+/// Malformed body SSZ returns [`BlockServiceError::Parse`] rather than panicking.
+fn compute_block_root(block: &eth_types::BeaconBlock) -> Result<Root, BlockServiceError> {
+    block.try_tree_hash_root().map(|h| h.0).map_err(|e| {
+        BlockServiceError::Parse(format!("invalid block body for tree_hash_root: {e}"))
+    })
 }
 
-fn compute_blinded_block_root(block: &eth_types::BlindedBeaconBlock) -> Root {
-    block.tree_hash_root().0
+/// Spec `hash_tree_root(BlindedBeaconBlock)` via typed Electra body leaf (SEC-6c).
+///
+/// **Production root path** for blinded proposal signing (prefer this over
+/// `TreeHash::tree_hash_root`). Malformed body → [`BlockServiceError::Parse`].
+fn compute_blinded_block_root(
+    block: &eth_types::BlindedBeaconBlock,
+) -> Result<Root, BlockServiceError> {
+    block.try_tree_hash_root().map(|h| h.0).map_err(|e| {
+        BlockServiceError::Parse(format!("invalid blinded block body for tree_hash_root: {e}"))
+    })
 }
 
 /// Determines the SSZ wire format based on block type and consensus version.
@@ -557,6 +571,7 @@ mod tests {
     use eth_types::{BeaconBlock, BlindedBeaconBlock, SignedBeaconBlock, SignedBlindedBeaconBlock};
     use signer::SignerError;
     use std::sync::{Arc, Mutex};
+    use tree_hash::TreeHash;
     use validator_store::ValidatorStore;
 
     // --- Captured call structs ---
@@ -1009,13 +1024,24 @@ mod tests {
         }
     }
 
+    fn test_body_ssz() -> Vec<u8> {
+        eth_types::external_vector_electra_body().as_ssz_bytes()
+    }
+
+    fn test_blinded_body_ssz() -> Vec<u8> {
+        // Distinct graffiti so full vs blinded roots differ when headers match.
+        let mut body = eth_types::external_vector_blinded_electra_body();
+        body.graffiti = [0xbe; 32];
+        body.as_ssz_bytes()
+    }
+
     fn test_block(slot: Slot) -> BeaconBlock {
         BeaconBlock {
             slot,
             proposer_index: 42,
             parent_root: [1u8; 32],
             state_root: [2u8; 32],
-            body: vec![0xde, 0xad],
+            body: test_body_ssz(),
         }
     }
 
@@ -1025,7 +1051,7 @@ mod tests {
             proposer_index: 42,
             parent_root: [3u8; 32],
             state_root: [4u8; 32],
-            body: vec![0xbe, 0xef],
+            body: test_blinded_body_ssz(),
         }
     }
 
@@ -1062,6 +1088,9 @@ mod tests {
     }
 
     /// Build synthetic SSZ bytes matching the expected wire format.
+    ///
+    /// Body is a valid Electra typed body (SEC-6c) so `compute_block_root` can
+    /// decode and merkleize the body leaf.
     fn build_ssz_bytes(
         slot: Slot,
         proposer_index: u64,
@@ -1070,7 +1099,7 @@ mod tests {
     ) -> Vec<u8> {
         let use_block_contents =
             !is_blinded && matches!(consensus_version, "deneb" | "electra" | "fulu");
-        let body = [0xab; 8];
+        let body = if is_blinded { test_blinded_body_ssz() } else { test_body_ssz() };
         let body_offset: u32 = 84; // fixed portion size
 
         let mut block_bytes = Vec::new();
@@ -1101,7 +1130,7 @@ mod tests {
     fn test_compute_block_root_matches_tree_hash() {
         use tree_hash::TreeHash;
         let block = test_block(100);
-        let root = compute_block_root(&block);
+        let root = compute_block_root(&block).unwrap();
         let expected = block.tree_hash_root();
         assert_eq!(root, expected.0);
     }
@@ -1110,9 +1139,56 @@ mod tests {
     fn test_compute_blinded_block_root_matches_tree_hash() {
         use tree_hash::TreeHash;
         let block = test_blinded_block(200);
-        let root = compute_blinded_block_root(&block);
+        let root = compute_blinded_block_root(&block).unwrap();
         let expected = block.tree_hash_root();
         assert_eq!(root, expected.0);
+    }
+
+    #[test]
+    fn test_compute_block_root_matches_external_electra_vector() {
+        let block = eth_types::external_vector_electra_block();
+        let root = compute_block_root(&block).expect("valid external vector body");
+        let expected = hex::decode(eth_types::EXTERNAL_ELECTRA_BLOCK_ROOT_HEX).unwrap();
+        assert_eq!(
+            root.as_slice(),
+            expected.as_slice(),
+            "compute_block_root must match remerkleable external Electra block root"
+        );
+    }
+
+    #[test]
+    fn test_compute_blinded_block_root_matches_external_vector() {
+        let block = eth_types::external_vector_electra_blinded_block();
+        let root = compute_blinded_block_root(&block).expect("valid external vector blinded body");
+        let expected = hex::decode(eth_types::EXTERNAL_ELECTRA_BLOCK_ROOT_HEX).unwrap();
+        assert_eq!(
+            root.as_slice(),
+            expected.as_slice(),
+            "compute_blinded_block_root must match remerkleable external Electra block root"
+        );
+    }
+
+    #[test]
+    fn test_malformed_body_returns_error_not_panic() {
+        let block = BeaconBlock {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: [0u8; 32],
+            state_root: [0u8; 32],
+            body: vec![0xde, 0xad],
+        };
+        let err = compute_block_root(&block).expect_err("malformed body must error");
+        assert!(matches!(err, BlockServiceError::Parse(_)), "expected Parse error, got {err:?}");
+
+        let blinded = BlindedBeaconBlock {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: [0u8; 32],
+            state_root: [0u8; 32],
+            body: vec![0xbe, 0xef],
+        };
+        let err = compute_blinded_block_root(&blinded).expect_err("malformed blinded body");
+        assert!(matches!(err, BlockServiceError::Parse(_)));
     }
 
     #[tokio::test]
@@ -1699,7 +1775,7 @@ mod tests {
             proposer_index: 42,
             parent_root: [0x11; 32],
             state_root: [0x22; 32],
-            body: vec![0xab; 8],
+            body: test_body_ssz(),
         };
 
         let tree_hash_root: [u8; 32] = block.tree_hash_root().0;
@@ -2693,8 +2769,8 @@ mod tests {
     fn test_ssz_propose_with_large_body_through_pipeline() {
         use beacon::ssz_deser::SszBlockFormat;
 
-        // Large body SSZ through the production deserialization path (no KZG data = no bug)
-        let body = vec![0xab; 4096];
+        // Valid Electra body SSZ through the production deserialization path (no KZG data).
+        let body = test_body_ssz();
         let ssz = build_ssz_bytes_with_kzg(100, 42, &body, &[], &[]);
 
         let format = ssz_block_format(false, "deneb");
@@ -2720,7 +2796,7 @@ mod tests {
             proposer_index: 1,
             parent_root: [0u8; 32],
             state_root: [0u8; 32],
-            body: vec![0xde, 0xad],
+            body: test_body_ssz(),
         };
         let beacon = MockBeaconClient::unblinded(block);
         let beacon_arc = Arc::new(beacon);
@@ -2754,7 +2830,7 @@ mod tests {
             proposer_index: 5,
             parent_root: [1u8; 32],
             state_root: [2u8; 32],
-            body: vec![0xca, 0xfe],
+            body: test_body_ssz(),
         };
         let beacon = MockBeaconClient::unblinded(block);
         let signer = MockSigner::new();
@@ -2930,19 +3006,19 @@ mod tests {
             proposer_index: 42,
             parent_root: [1u8; 32],
             state_root: [2u8; 32],
-            body: vec![0xde, 0xad],
+            body: test_body_ssz(),
         };
         let blinded_block = BlindedBeaconBlock {
             slot,
             proposer_index: 42,
             parent_root: [1u8; 32],
             state_root: [2u8; 32],
-            body: vec![0xbe, 0xef], // different body → different root
+            body: test_blinded_body_ssz(), // different body → different root
         };
 
         // Exercise the production root computation functions
-        let unblinded_root = compute_block_root(&unblinded_block);
-        let blinded_root = compute_blinded_block_root(&blinded_block);
+        let unblinded_root = compute_block_root(&unblinded_block).unwrap();
+        let blinded_root = compute_blinded_block_root(&blinded_block).unwrap();
 
         // Roots differ because body content differs
         assert_ne!(
@@ -2955,8 +3031,8 @@ mod tests {
         assert_ne!(blinded_root, [0u8; 32]);
 
         // Verify determinism: same input → same root
-        assert_eq!(compute_block_root(&unblinded_block), unblinded_root);
-        assert_eq!(compute_blinded_block_root(&blinded_block), blinded_root);
+        assert_eq!(compute_block_root(&unblinded_block).unwrap(), unblinded_root);
+        assert_eq!(compute_blinded_block_root(&blinded_block).unwrap(), blinded_root);
 
         // Now run through the full pipeline and confirm the signer receives these roots
         let beacon_unblinded = MockBeaconClient::unblinded(unblinded_block);
@@ -2986,15 +3062,15 @@ mod tests {
             proposer_index: 42,
             parent_root: [1u8; 32],
             state_root: [2u8; 32],
-            body: vec![0xab],
+            body: test_body_ssz(),
         };
-        let baseline_root = compute_block_root(&baseline);
+        let baseline_root = compute_block_root(&baseline).unwrap();
 
         // Changing slot
         let mut changed = baseline.clone();
         changed.slot = 101;
         assert_ne!(
-            compute_block_root(&changed),
+            compute_block_root(&changed).unwrap(),
             baseline_root,
             "root must change when slot changes"
         );
@@ -3003,7 +3079,7 @@ mod tests {
         let mut changed = baseline.clone();
         changed.proposer_index = 43;
         assert_ne!(
-            compute_block_root(&changed),
+            compute_block_root(&changed).unwrap(),
             baseline_root,
             "root must change when proposer_index changes"
         );
@@ -3012,7 +3088,7 @@ mod tests {
         let mut changed = baseline.clone();
         changed.parent_root = [99u8; 32];
         assert_ne!(
-            compute_block_root(&changed),
+            compute_block_root(&changed).unwrap(),
             baseline_root,
             "root must change when parent_root changes"
         );
@@ -3021,16 +3097,18 @@ mod tests {
         let mut changed = baseline.clone();
         changed.state_root = [99u8; 32];
         assert_ne!(
-            compute_block_root(&changed),
+            compute_block_root(&changed).unwrap(),
             baseline_root,
             "root must change when state_root changes"
         );
 
-        // Changing body
+        // Changing body (distinct Electra body SSZ)
         let mut changed = baseline.clone();
-        changed.body = vec![0xcd, 0xef];
+        let mut alt = eth_types::external_vector_electra_body();
+        alt.graffiti = [0xcd; 32];
+        changed.body = alt.as_ssz_bytes();
         assert_ne!(
-            compute_block_root(&changed),
+            compute_block_root(&changed).unwrap(),
             baseline_root,
             "root must change when body changes"
         );
@@ -3263,24 +3341,18 @@ mod tests {
     // ISSUE-4.3 (L-3): canonical blob KZG commitment binding — regression tests
     // -----------------------------------------------------------------------
 
-    /// Build a minimal Deneb `BeaconBlockBody` SSZ byte sequence that places
-    /// `commitments` at the correct offset (bytes 388–391 → byte 392).
-    fn deneb_body_with_kzg_commitments_for_test(commitments: &[[u8; 48]]) -> Vec<u8> {
-        const FIXED_LEN: usize = 392;
-        let mut body = vec![0u8; FIXED_LEN];
-        let kzg_offset = FIXED_LEN as u32;
-        body[388..392].copy_from_slice(&kzg_offset.to_le_bytes());
-        for c in commitments {
-            body.extend_from_slice(c.as_slice());
-        }
-        body
+    /// Electra body SSZ with the given `blob_kzg_commitments` (valid for SEC-6c HTR).
+    fn electra_body_with_kzg_commitments_for_test(commitments: &[[u8; 48]]) -> Vec<u8> {
+        let mut body = eth_types::external_vector_electra_body();
+        body.blob_kzg_commitments = commitments.to_vec().into();
+        body.as_ssz_bytes()
     }
 
-    /// Build a mock `ProduceBlockResponse` for a Deneb `BlockAndBlobs` payload
-    /// where the body contains `commitments` at the correct SSZ offset and the
-    /// `blob_sidecars` has one entry per commitment.
+    /// Build a mock `ProduceBlockResponse` for an Electra `BlockAndBlobs` payload
+    /// where the body contains `commitments` and the `blob_sidecars` has one entry
+    /// per commitment. Body is a valid Electra typed container (SEC-6c).
     fn block_and_blobs_response(slot: Slot, commitments: &[[u8; 48]]) -> ProduceBlockResponse {
-        let body = deneb_body_with_kzg_commitments_for_test(commitments);
+        let body = electra_body_with_kzg_commitments_for_test(commitments);
         let body_hex = format!("0x{}", hex::encode(&body));
         let blob_sidecars: Vec<serde_json::Value> = commitments
             .iter()
@@ -3305,7 +3377,7 @@ mod tests {
         ProduceBlockResponse {
             data,
             is_blinded: false,
-            consensus_version: "deneb".to_string(),
+            consensus_version: "electra".to_string(),
             execution_payload_value: Some("12345".to_string()),
             is_ssz: false,
             ssz_bytes: None,
@@ -3321,7 +3393,7 @@ mod tests {
         let commitments = [[0xaa; 48], [0xbb; 48]];
         let response = block_and_blobs_response(slot, &commitments);
         let contents = response.parse_full_block().unwrap();
-        let root = contents.kzg_commitment_root(BodyForkLayout::Deneb);
+        let root = contents.kzg_commitment_root(BodyForkLayout::Electra);
         assert_ne!(root, [0u8; 32], "commitment root must be nonzero for non-empty blobs");
     }
 
@@ -3334,7 +3406,7 @@ mod tests {
         let original_commits = [[0xcc; 48], [0xdd; 48]];
         let base_root = {
             let response = block_and_blobs_response(slot, &original_commits);
-            response.parse_full_block().unwrap().kzg_commitment_root(BodyForkLayout::Deneb)
+            response.parse_full_block().unwrap().kzg_commitment_root(BodyForkLayout::Electra)
         };
 
         // Mutate one byte in each commitment and verify the root changes.
@@ -3343,7 +3415,7 @@ mod tests {
             mutated[ci][0] ^= 0x01;
             let mutated_root = {
                 let response = block_and_blobs_response(slot, &mutated);
-                response.parse_full_block().unwrap().kzg_commitment_root(BodyForkLayout::Deneb)
+                response.parse_full_block().unwrap().kzg_commitment_root(BodyForkLayout::Electra)
             };
             assert_ne!(
                 base_root, mutated_root,
@@ -3392,7 +3464,7 @@ mod tests {
 
         // Body has 2 commitments but blob_sidecars will have 1 entry (mismatch).
         let two_commits = [[0x11; 48], [0x22; 48]];
-        let body = deneb_body_with_kzg_commitments_for_test(&two_commits);
+        let body = electra_body_with_kzg_commitments_for_test(&two_commits);
         let body_hex = format!("0x{}", hex::encode(&body));
 
         // Only one sidecar despite two commitments in the body.
@@ -3411,7 +3483,7 @@ mod tests {
         let response = ProduceBlockResponse {
             data,
             is_blinded: false,
-            consensus_version: "deneb".to_string(),
+            consensus_version: "electra".to_string(),
             execution_payload_value: Some("99".to_string()),
             is_ssz: false,
             ssz_bytes: None,

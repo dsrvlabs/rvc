@@ -260,11 +260,11 @@ that hard-coded the old root.
 - `test_malformed_body_returns_error_not_panic`
 
 **Acceptance criteria:**
-- [ ] `compute_block_root` (and the blinded root) match the external vector exactly for the production
+- [x] `compute_block_root` (and the blinded root) match the external vector exactly for the production
       fork.
-- [ ] Blob-KZG extraction tests pass; a malformed body errors rather than panics.
-- [ ] Fixtures that hard-coded the old root are updated and enumerated in the summary.
-- [ ] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
+- [x] Blob-KZG extraction tests pass; a malformed body errors rather than panics.
+- [x] Fixtures that hard-coded the old root are updated and enumerated in the summary.
+- [x] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
 
 **Risks / unknowns:**
 - The blinded path shares this issue's edit surface with SEC-6d; if the blinded body's typed container

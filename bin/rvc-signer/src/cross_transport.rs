@@ -54,7 +54,7 @@ async fn grpc_sign_block(
         proposer_index: 1,
         parent_root: [0x11; 32],
         state_root: [0x22; 32],
-        body: vec![0xde, 0xad],
+        body: eth_types::external_vector_electra_body().as_ssz_bytes(),
     };
     let svc = SignerServiceImpl::new_v2_with_gate(
         Arc::clone(backend),

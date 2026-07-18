@@ -186,8 +186,8 @@ Spike **narrowed** the range: type surface for Electra full + blinded is already
 - [x] Design go/no-go committed (this note)
 - [x] Container inventory (four variants + sub-containers)
 - [x] Electra full body HTR matches external vector
-- [ ] `Vec<u8>` SSZ decode → `BeaconBlockBodyElectra` (round-trip)
-- [ ] Replace `vec_u8_tree_hash_root(&body)` body leaf (SEC-6c)
+- [x] `Vec<u8>` SSZ decode → `BeaconBlockBodyElectra` (round-trip) — SEC-6b
+- [x] Replace `vec_u8_tree_hash_root(&body)` body leaf (SEC-6c)
 - [ ] Blinded + Deneb external vectors (SEC-6d)
 
 ---

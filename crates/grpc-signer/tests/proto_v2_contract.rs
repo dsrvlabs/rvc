@@ -401,7 +401,7 @@ async fn test_typed_block_round_trip() {
         proposer_index: 1,
         parent_root: [0x11; 32],
         state_root: [0x22; 32],
-        body: vec![0xde, 0xad],
+        body: eth_types::external_vector_electra_body().as_ssz_bytes(),
     };
 
     let ctx = test_ctx(pk.clone());
@@ -429,7 +429,7 @@ async fn test_typed_blinded_block_round_trip() {
         proposer_index: 2,
         parent_root: [0x33; 32],
         state_root: [0x44; 32],
-        body: vec![0xca, 0xfe],
+        body: eth_types::external_vector_blinded_electra_body().as_ssz_bytes(),
     };
 
     let ctx = test_ctx(pk.clone());

@@ -238,7 +238,11 @@ impl PeerSignerService for PeerSignerServiceImpl {
         Span::current().record("slot", slot);
 
         let domain = compute_domain(DOMAIN_BEACON_PROPOSER, current_version, gvr);
-        let signing_root = compute_signing_root(&block, domain);
+        // SEC-6c: typed body leaf — malformed Electra body SSZ must error, not panic.
+        let object_root = block.try_tree_hash_root().map_err(|e| {
+            Status::invalid_argument(format!("invalid block body for tree_hash_root: {e}"))
+        })?;
+        let signing_root = compute_signing_root(&object_root.0, domain);
         let signing_root_hex = Some(root_hex(&signing_root));
 
         // 4. Get share — clone to own, then explicitly drop the Arc<HashMap> so the
@@ -589,7 +593,7 @@ mod tests {
             proposer_index: 1,
             parent_root: [0x11; 32],
             state_root: [0x22; 32],
-            body: vec![0xde, 0xad, 0xbe, 0xef],
+            body: eth_types::external_vector_electra_body().as_ssz_bytes(),
         };
         encode_beacon_block_ssz(&block, 4)
     }
