@@ -3,6 +3,7 @@
 pub mod beacon_adapter;
 pub mod config;
 pub mod config_url;
+pub mod deletion_denylist;
 pub mod doppelganger_adapter;
 pub mod duty_tracker;
 pub mod keymanager_adapters;

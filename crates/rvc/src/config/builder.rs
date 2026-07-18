@@ -170,16 +170,25 @@ impl ServiceBuilder {
     }
 
     pub fn build_key_manager(&self) -> Result<Arc<KeyManager>, ConfigError> {
+        self.build_key_manager_filtered(None)
+    }
+
+    /// Load keystore-dir keys, skipping any pubkey in `denylist` (SEC-1b).
+    pub fn build_key_manager_filtered(
+        &self,
+        denylist: Option<&std::collections::HashSet<[u8; 48]>>,
+    ) -> Result<Arc<KeyManager>, ConfigError> {
         let passwords = self.config.load_passwords()?;
 
         if !self.config.keystore_path.exists() {
             return Err(ConfigError::KeystorePathNotFound(self.config.keystore_path.clone()));
         }
 
-        let key_manager = KeyManager::load_from_directory_with_threads(
+        let key_manager = KeyManager::load_from_directory_with_threads_filtered(
             &self.config.keystore_path,
             &passwords,
             self.config.key_decrypt_threads,
+            denylist,
         )?;
         info!(
             key_count = key_manager.len(),

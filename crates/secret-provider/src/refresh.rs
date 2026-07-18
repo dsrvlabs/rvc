@@ -10,9 +10,15 @@ use crate::key_source_manager::convert_key_material;
 use crate::SecretProvider;
 use crypto::SecretKey;
 
+/// Predicate: return `true` if a pubkey must not be loaded (Keymanager DELETE denylist).
+pub type DenylistCheck = Arc<dyn Fn(&[u8; 48]) -> bool + Send + Sync>;
+
 pub struct RefreshService {
     providers: Vec<Arc<dyn SecretProvider>>,
     known_pubkeys: HashSet<[u8; 48]>,
+    /// Live denylist check (SEC-1b). Consulted every refresh so a key deleted
+    /// mid-process is not re-added from the secret provider.
+    is_denied: Option<DenylistCheck>,
     interval: Duration,
     cancel_token: CancellationToken,
 }
@@ -24,7 +30,22 @@ impl RefreshService {
         interval: Duration,
         cancel_token: CancellationToken,
     ) -> Self {
-        Self { providers, known_pubkeys, interval, cancel_token }
+        Self::with_denylist(providers, known_pubkeys, None, interval, cancel_token)
+    }
+
+    /// Like [`new`], but never re-discovers pubkeys for which `is_denied` returns true.
+    pub fn with_denylist(
+        providers: Vec<Arc<dyn SecretProvider>>,
+        known_pubkeys: HashSet<[u8; 48]>,
+        is_denied: Option<DenylistCheck>,
+        interval: Duration,
+        cancel_token: CancellationToken,
+    ) -> Self {
+        Self { providers, known_pubkeys, is_denied, interval, cancel_token }
+    }
+
+    fn denied(&self, pubkey: &[u8; 48]) -> bool {
+        self.is_denied.as_ref().is_some_and(|f| f(pubkey))
     }
 
     pub async fn refresh(&mut self) -> Vec<SecretKey> {
@@ -52,14 +73,15 @@ impl RefreshService {
             };
 
             for entry in &entries {
-                // Skip entries whose pubkey_hex is already known (avoids unnecessary fetch)
+                // Skip entries whose pubkey_hex is already known or denylisted
+                // (avoids unnecessary fetch / resurrection after DELETE).
                 if let Some(ref hex_str) = entry.pubkey_hex {
                     let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
                     if let Ok(bytes) = hex::decode(hex_str) {
                         if bytes.len() == 48 {
                             let mut arr = [0u8; 48];
                             arr.copy_from_slice(&bytes);
-                            if self.known_pubkeys.contains(&arr) {
+                            if self.known_pubkeys.contains(&arr) || self.denied(&arr) {
                                 continue;
                             }
                         }
@@ -106,7 +128,7 @@ impl RefreshService {
                 };
 
                 let pubkey = sk.public_key().to_bytes();
-                if self.known_pubkeys.contains(&pubkey) {
+                if self.known_pubkeys.contains(&pubkey) || self.denied(&pubkey) {
                     continue;
                 }
 

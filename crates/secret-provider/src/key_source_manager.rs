@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crypto::logging::TruncatedPubkey;
@@ -23,14 +24,27 @@ impl KeySourceManager {
         Self { providers }
     }
 
+    /// Load every provider key into `key_manager` (no denylist).
+    pub async fn load_all(
+        &self,
+        key_manager: &mut KeyManager,
+    ) -> Result<LoadSummary, SecretProviderError> {
+        self.load_all_except(key_manager, None).await
+    }
+
+    /// Load provider keys, skipping any pubkey present in `denylist` (SEC-1b).
+    ///
+    /// Denylisted keys are counted as `skipped` and never inserted, so a key
+    /// deleted via the Keymanager API cannot resurrect from GCP/etc. on boot.
     #[tracing::instrument(
         name = "secret_provider.load_all",
         skip_all,
         fields(providers.count = self.providers.len())
     )]
-    pub async fn load_all(
+    pub async fn load_all_except(
         &self,
         key_manager: &mut KeyManager,
+        denylist: Option<&HashSet<[u8; 48]>>,
     ) -> Result<LoadSummary, SecretProviderError> {
         let mut summary = LoadSummary::default();
 
@@ -67,6 +81,27 @@ impl KeySourceManager {
 
             let mut join_set = tokio::task::JoinSet::new();
             for entry in &entries {
+                // Early skip when list_keys already provides the pubkey.
+                if let (Some(deny), Some(ref hex_str)) = (denylist, &entry.pubkey_hex) {
+                    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+                    if let Ok(bytes) = hex::decode(hex_str) {
+                        if bytes.len() == 48 {
+                            let mut arr = [0u8; 48];
+                            arr.copy_from_slice(&bytes);
+                            if deny.contains(&arr) {
+                                let pubkey_hex = format!("0x{}", hex::encode(arr));
+                                info!(
+                                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                                    source = %provider_name,
+                                    "Skipping denylisted secret-provider key"
+                                );
+                                provider_summary.skipped += 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 let id = entry.id.clone();
                 let prov = Arc::clone(provider);
                 let prov_name = provider_name.clone();
@@ -105,8 +140,18 @@ impl KeySourceManager {
                 match result {
                     Ok(material) => match convert_key_material(&entry_id, material) {
                         Ok(secret_key) => {
-                            let pubkey_hex =
-                                format!("0x{}", hex::encode(secret_key.public_key().to_bytes()));
+                            let pubkey_bytes = secret_key.public_key().to_bytes();
+                            if denylist.is_some_and(|d| d.contains(&pubkey_bytes)) {
+                                let pubkey_hex = format!("0x{}", hex::encode(pubkey_bytes));
+                                info!(
+                                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                                    source = %provider_name,
+                                    "Skipping denylisted secret-provider key"
+                                );
+                                provider_summary.skipped += 1;
+                                continue;
+                            }
+                            let pubkey_hex = format!("0x{}", hex::encode(pubkey_bytes));
                             info!(
                                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
                                 source = %provider_name,
@@ -822,5 +867,78 @@ mod tests {
         let value =
             RVC_SECRET_PROVIDER_KEYS_LOADED.with_label_values(&["metrics-test-empty"]).get();
         assert_eq!(value, 0.0, "Expected 0 keys loaded for empty provider");
+    }
+
+    // ── SEC-1b: deletion denylist ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_deleted_secret_provider_key_not_resurrected_on_reload() {
+        let sk_deleted = SecretKey::generate();
+        let sk_kept = SecretKey::generate();
+        let pk_deleted = sk_deleted.public_key().to_bytes();
+        let pk_kept = sk_kept.public_key().to_bytes();
+
+        let provider = MockSecretProvider {
+            name: "gcp-sim".to_string(),
+            keys: vec![
+                make_raw_key_entry("deleted-key", &sk_deleted),
+                make_raw_key_entry("kept-key", &sk_kept),
+            ],
+            list_error: None,
+        };
+
+        // First load: both keys present (no denylist)
+        let ksm = KeySourceManager::new(vec![Box::new(provider)]);
+        let mut km = KeyManager::new();
+        let summary = ksm.load_all(&mut km).await.expect("initial load");
+        assert_eq!(summary.per_provider[0].loaded, 2);
+        assert!(km.contains(&pk_deleted));
+        assert!(km.contains(&pk_kept));
+
+        // Simulate Keymanager DELETE: remove from registry + denylist the pubkey
+        assert!(km.remove(&pk_deleted));
+        let mut denylist = HashSet::new();
+        denylist.insert(pk_deleted);
+
+        // Simulated restart: same provider still lists both keys
+        let provider2 = MockSecretProvider {
+            name: "gcp-sim".to_string(),
+            keys: vec![
+                make_raw_key_entry("deleted-key", &sk_deleted),
+                make_raw_key_entry("kept-key", &sk_kept),
+            ],
+            list_error: None,
+        };
+        let ksm2 = KeySourceManager::new(vec![Box::new(provider2)]);
+        let mut km2 = KeyManager::new();
+        let summary2 =
+            ksm2.load_all_except(&mut km2, Some(&denylist)).await.expect("reload with denylist");
+
+        assert_eq!(summary2.per_provider[0].loaded, 1, "only the never-deleted key loads");
+        assert_eq!(summary2.per_provider[0].skipped, 1, "denylisted key is skipped");
+        assert!(!km2.contains(&pk_deleted), "deleted key must not resurrect");
+        assert!(km2.contains(&pk_kept), "never-deleted key must load normally");
+    }
+
+    #[tokio::test]
+    async fn test_never_deleted_key_loads_normally() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        let other = SecretKey::generate().public_key().to_bytes();
+
+        let provider = MockSecretProvider {
+            name: "gcp-sim".to_string(),
+            keys: vec![make_raw_key_entry("only-key", &sk)],
+            list_error: None,
+        };
+        let mut denylist = HashSet::new();
+        denylist.insert(other); // unrelated deleted key
+
+        let ksm = KeySourceManager::new(vec![Box::new(provider)]);
+        let mut km = KeyManager::new();
+        let summary = ksm.load_all_except(&mut km, Some(&denylist)).await.unwrap();
+        assert_eq!(summary.per_provider[0].loaded, 1);
+        assert_eq!(summary.per_provider[0].skipped, 0);
+        assert!(km.contains(&pk));
     }
 }

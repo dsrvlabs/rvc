@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -100,6 +100,19 @@ impl KeyManager {
         passwords: &HashMap<String, SecretString>,
         num_threads: Option<usize>,
     ) -> Result<Self, KeyManagerError> {
+        Self::load_from_directory_with_threads_filtered(path, passwords, num_threads, None)
+    }
+
+    /// Like [`load_from_directory_with_threads`], but skips pubkeys present in
+    /// `denylist` (SEC-1b: Keymanager DELETE persistence across restart).
+    ///
+    /// Denylisted keystores are not decrypted; they are logged and omitted.
+    pub fn load_from_directory_with_threads_filtered<P: AsRef<Path>>(
+        path: P,
+        passwords: &HashMap<String, SecretString>,
+        num_threads: Option<usize>,
+        denylist: Option<&HashSet<[u8; PUBLIC_KEY_BYTES_LEN]>>,
+    ) -> Result<Self, KeyManagerError> {
         let dir_path = path.as_ref();
 
         if !dir_path.exists() {
@@ -117,6 +130,7 @@ impl KeyManager {
         // ── Phase 1: Sequential scan ──────────────────────────────────────
         let mut tasks: Vec<DecryptionTask<'_>> = Vec::new();
         let mut found_any_keystore = false;
+        let mut denylist_skipped: usize = 0;
 
         let entries = fs::read_dir(&canonical_dir)?;
 
@@ -167,6 +181,26 @@ impl KeyManager {
                 }
             };
 
+            // SEC-1b: skip keys deleted via Keymanager API (do not decrypt / insert).
+            if let Some(deny) = denylist {
+                let hex_str = pubkey_hex.strip_prefix("0x").unwrap_or(&pubkey_hex);
+                if let Ok(bytes) = hex::decode(hex_str) {
+                    if bytes.len() == PUBLIC_KEY_BYTES_LEN {
+                        let mut arr = [0u8; PUBLIC_KEY_BYTES_LEN];
+                        arr.copy_from_slice(&bytes);
+                        if deny.contains(&arr) {
+                            info!(
+                                pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                                file = ?file_path,
+                                "Skipping denylisted keystore-dir key"
+                            );
+                            denylist_skipped += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+
             let password = match passwords.get(&pubkey_hex).or_else(|| passwords.get(WILDCARD_KEY))
             {
                 Some(p) => p,
@@ -189,8 +223,19 @@ impl KeyManager {
             });
         }
 
+        // All keystores were denylisted (or otherwise skipped) — empty manager is OK
+        // when at least one keystore file was seen and every remaining candidate was
+        // denylisted. If no keystore files existed at all, keep the hard error.
         if !found_any_keystore {
             return Err(KeyManagerError::NoKeystoreFiles);
+        }
+
+        if tasks.is_empty() && denylist_skipped > 0 {
+            info!(
+                denylist_skipped,
+                "All keystore-dir keys were denylisted; starting with empty local key set"
+            );
+            return Ok(Self::new());
         }
 
         // ── Phase 2: Parallel decryption ──────────────────────────────────

@@ -23,6 +23,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 use validator_store::{ValidatorConfigUpdate, ValidatorStore};
 
+use crate::deletion_denylist::DeletionDenylist;
 use crate::orchestrator::PubkeyMap;
 
 /// Adapts `CompositeSigner` local keys to the Keymanager `KeystoreManager` trait.
@@ -38,6 +39,12 @@ use crate::orchestrator::PubkeyMap;
 /// `tracked_keys` is retained only as an import serialization lock and a record of
 /// keys imported through this adapter (for concurrent import TOCTOU safety); it is
 /// **not** the registry for list/has/delete.
+///
+/// # Deletion denylist (SEC-1b)
+///
+/// On successful `delete_keystore`, the pubkey is recorded in
+/// [`DeletionDenylist`] so keystore-dir / secret-provider loaders skip it on
+/// the next boot. Intentional re-import via `import_keystore` clears the entry.
 pub struct KeystoreManagerAdapter {
     keystore_dir: PathBuf,
     composite_signer: Arc<CompositeSigner>,
@@ -45,6 +52,8 @@ pub struct KeystoreManagerAdapter {
     tracked_keys: Mutex<Vec<Pubkey>>,
     pubkey_map: Option<PubkeyMap>,
     key_gen_tx: Option<watch::Sender<u64>>,
+    /// Durable deletion denylist; `None` disables persistence (tests).
+    denylist: Option<Arc<DeletionDenylist>>,
 }
 
 impl KeystoreManagerAdapter {
@@ -55,6 +64,7 @@ impl KeystoreManagerAdapter {
             tracked_keys: Mutex::new(Vec::new()),
             pubkey_map: None,
             key_gen_tx: None,
+            denylist: None,
         }
     }
 
@@ -65,6 +75,12 @@ impl KeystoreManagerAdapter {
     ) -> Self {
         self.pubkey_map = Some(pubkey_map);
         self.key_gen_tx = Some(key_gen_tx);
+        self
+    }
+
+    /// Attach the process-wide deletion denylist (SEC-1b).
+    pub fn with_denylist(mut self, denylist: Arc<DeletionDenylist>) -> Self {
+        self.denylist = Some(denylist);
         self
     }
 
@@ -385,6 +401,17 @@ impl KeystoreManager for KeystoreManagerAdapter {
             self.notify_key_change();
         }
 
+        // SEC-1b: clear denylist only *after* successful persistence + registry
+        // add so a mid-import IO failure cannot un-delete a previously deleted
+        // key (restart would otherwise re-load it from secret-provider).
+        if let Some(ref denylist) = self.denylist {
+            if let Err(e) = denylist.remove(&pubkey_bytes) {
+                // Key is already loaded and signable; surface IO so operators
+                // can repair the denylist file. Do not roll back the import.
+                return Err(ImportKeystoreError::Io(e.to_string()));
+            }
+        }
+
         info!(
             pubkey = %TruncatedPubkey::new(&hex::encode(pubkey_bytes)),
             "Imported keystore"
@@ -397,10 +424,24 @@ impl KeystoreManager for KeystoreManagerAdapter {
         // cannot race. Registry membership is the real local signing set.
         let mut keys = self.tracked_keys.lock();
         if !self.composite_signer.has_local_key(pubkey) {
+            // Retry / break-glass: a prior DELETE may have removed the key from
+            // the registry before denylist durability failed. Allow authenticated
+            // DELETE of a non-local pubkey to force-insert the denylist entry so
+            // secret-provider keys cannot resurrect on the next boot.
+            if let Some(ref denylist) = self.denylist {
+                denylist.insert(pubkey).map_err(|e| DeleteKeystoreError::Io(e.to_string()))?;
+            }
             return Ok(false);
         }
 
-        // Delete file(s) FIRST — if IO fails, memory state remains consistent.
+        // Order (SEC-1b fail-closed for durability):
+        //   1. Unlink keystore files (IO failure leaves memory intact)
+        //   2. Durable denylist.insert (IO failure leaves key still local → retryable)
+        //   3. Remove from signing registry
+        //
+        // Writing the denylist *before* remove_local_key ensures a failed
+        // insert does not leave a non-signable key that cannot be re-deleted.
+
         // Matches any `*.json` whose EIP-2335 pubkey field equals this key
         // (API-import `0x{hex}.json` and boot-loaded names like `validator1.json`).
         // No matching file is OK (secret-provider / already removed).
@@ -411,7 +452,13 @@ impl KeystoreManager for KeystoreManagerAdapter {
         let meta_path = import_meta_path(&self.keystore_dir, pubkey);
         let _ = std::fs::remove_file(&meta_path);
 
-        // Drop bookkeeping after file delete succeeds (lock still held for
+        // SEC-1b: persist deletion *before* registry removal so durability
+        // failure leaves the key still present for DELETE retry.
+        if let Some(ref denylist) = self.denylist {
+            denylist.insert(pubkey).map_err(|e| DeleteKeystoreError::Io(e.to_string()))?;
+        }
+
+        // Drop bookkeeping after denylist succeeds (lock still held for
         // remove_local_key so concurrent deletes serialize cleanly).
         if let Some(pos) = keys.iter().position(|k| k == pubkey) {
             keys.remove(pos);
@@ -2507,5 +2554,175 @@ mod tests {
         ));
         // Canonical name must not have been created as a side effect
         assert!(!dir.path().join(format!("0x{}.json", hex::encode(pk))).exists());
+    }
+
+    // ── SEC-1b: persistent deletion denylist ──────────────────────────────
+
+    #[test]
+    fn test_delete_writes_denylist_entry() {
+        use crate::deletion_denylist::{deleted_keys_path, DeletionDenylist};
+
+        let (dir, composite, pk) = boot_load_keystore_dir_key();
+        let denylist = Arc::new(DeletionDenylist::load(dir.path()).unwrap());
+        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite)
+            .with_denylist(Arc::clone(&denylist));
+
+        assert!(adapter.delete_keystore(&pk).unwrap());
+        assert!(denylist.contains(&pk));
+        assert!(deleted_keys_path(dir.path()).exists());
+    }
+
+    #[tokio::test]
+    async fn test_deleted_keystore_dir_key_not_resurrected_on_restart() {
+        use std::collections::HashMap;
+
+        use crate::deletion_denylist::DeletionDenylist;
+        use crypto::EncryptionKdf;
+        use secrecy::SecretString;
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        let password = b"testpass";
+        let keystore = crypto::Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("encrypt");
+
+        let dir = TempDir::new().unwrap();
+        let filename = format!("0x{}.json", hex::encode(pk));
+        std::fs::write(dir.path().join(&filename), serde_json::to_string(&keystore).unwrap())
+            .unwrap();
+
+        // Boot load into composite + KeyManager
+        let mut passwords = HashMap::new();
+        passwords.insert("*".to_string(), SecretString::from("testpass".to_string()));
+        let km = KeyManager::load_from_directory(dir.path(), &passwords).unwrap();
+        assert!(km.contains(&pk));
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(km)));
+
+        let denylist = Arc::new(DeletionDenylist::load(dir.path()).unwrap());
+        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone())
+            .with_denylist(Arc::clone(&denylist));
+
+        // DELETE via API — file gone, denylist written, signing stopped
+        assert!(adapter.delete_keystore(&pk).unwrap());
+        assert!(!composite.has_local_key(&pk));
+        assert!(denylist.contains(&pk));
+
+        // Operator (or residual file) puts the keystore back — RockLogic pattern
+        std::fs::write(dir.path().join(&filename), serde_json::to_string(&keystore).unwrap())
+            .unwrap();
+
+        // Simulated restart: load_from_directory with denylist must skip the key
+        let deny_set = denylist.snapshot();
+        let km2 = KeyManager::load_from_directory_with_threads_filtered(
+            dir.path(),
+            &passwords,
+            Some(1),
+            Some(&deny_set),
+        )
+        .unwrap();
+        assert!(!km2.contains(&pk), "denylisted keystore-dir key must not resurrect on restart");
+        assert_eq!(km2.len(), 0);
+    }
+
+    #[test]
+    fn test_reimport_clears_denylist_and_allows_key_again() {
+        use crate::deletion_denylist::DeletionDenylist;
+        use crypto::EncryptionKdf;
+
+        let composite = create_empty_composite_signer();
+        let dir = TempDir::new().unwrap();
+        let denylist = Arc::new(DeletionDenylist::load(dir.path()).unwrap());
+        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone())
+            .with_denylist(Arc::clone(&denylist));
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        let password = b"testpass";
+        let keystore = crypto::Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("encrypt");
+        let keystore_json = serde_json::to_string(&keystore).unwrap();
+
+        adapter.import_keystore(&keystore_json, "testpass").unwrap();
+        assert!(adapter.delete_keystore(&pk).unwrap());
+        assert!(denylist.contains(&pk), "delete must denylist");
+
+        // Intentional re-import clears denylist so the key is allowed again
+        adapter.import_keystore(&keystore_json, "testpass").unwrap();
+        assert!(!denylist.contains(&pk), "re-import must clear denylist entry");
+        assert!(adapter.has_key(&pk));
+        assert!(composite.has_local_key(&pk));
+
+        // Persist across reload
+        let reloaded = DeletionDenylist::load(dir.path()).unwrap();
+        assert!(!reloaded.contains(&pk));
+    }
+
+    #[test]
+    fn test_delete_without_denylist_still_stops_signing() {
+        // SEC-1a preserved when denylist is not wired (unit tests / no data dir).
+        let (dir, composite, pk) = boot_load_keystore_dir_key();
+        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone());
+        assert!(adapter.delete_keystore(&pk).unwrap());
+        assert!(!composite.has_local_key(&pk));
+        assert!(!crate::deletion_denylist::deleted_keys_path(dir.path()).exists());
+    }
+
+    /// Denylist is written *before* registry removal: a failed insert leaves the
+    /// key still local so DELETE is retryable (Finding 1).
+    #[test]
+    fn test_delete_denylist_before_registry_removal_order() {
+        use crate::deletion_denylist::DeletionDenylist;
+
+        let (dir, composite, pk) = boot_load_keystore_dir_key();
+        let denylist = Arc::new(DeletionDenylist::load(dir.path()).unwrap());
+        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone())
+            .with_denylist(Arc::clone(&denylist));
+
+        assert!(adapter.delete_keystore(&pk).unwrap());
+        // After success both hold: denylist has key and registry does not.
+        assert!(denylist.contains(&pk));
+        assert!(!composite.has_local_key(&pk));
+
+        // Retry DELETE of non-local key still force-inserts denylist (idempotent)
+        // and returns Ok(false) → handler not_found.
+        assert!(!adapter.delete_keystore(&pk).unwrap());
+        assert!(denylist.contains(&pk));
+    }
+
+    /// Failed re-import must not clear the denylist (Finding 2).
+    #[test]
+    fn test_failed_reimport_leaves_denylist_intact() {
+        use crate::deletion_denylist::DeletionDenylist;
+
+        let composite = create_empty_composite_signer();
+        let dir = TempDir::new().unwrap();
+        let denylist = Arc::new(DeletionDenylist::load(dir.path()).unwrap());
+        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite)
+            .with_denylist(Arc::clone(&denylist));
+
+        let pk = test_pubkey(0xF1);
+        denylist.insert(&pk).unwrap();
+        assert!(denylist.contains(&pk));
+
+        // Invalid keystore JSON fails before any denylist mutation.
+        let err = adapter.import_keystore("not-valid-json", "password");
+        assert!(matches!(err, Err(ImportKeystoreError::InvalidKeystore(_))));
+
+        assert!(denylist.contains(&pk), "failed import must not clear denylist");
+        let reloaded = DeletionDenylist::load(dir.path()).unwrap();
+        assert!(
+            reloaded.contains(&pk),
+            "denylist on disk must still contain key after failed import"
+        );
     }
 }

@@ -234,11 +234,11 @@ adds durable denylist storage, writes to it on `DELETE`, and consults it in ever
 - `test_denylist_file_permissions_0600` (unix)
 
 **Acceptance criteria:**
-- [ ] After `DELETE`, a simulated restart (re-run key loading for both secret-provider and keystore-dir)
+- [x] After `DELETE`, a simulated restart (re-run key loading for both secret-provider and keystore-dir)
       does not re-activate the key.
-- [ ] Denylist storage survives process restart and is consulted for every key source.
-- [ ] A never-deleted key loads normally; the denylist is additive-only (no accidental un-delete).
-- [ ] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
+- [x] Denylist storage survives process restart and is consulted for every key source.
+- [x] A never-deleted key loads normally; the denylist is additive-only (no accidental un-delete).
+- [x] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
 
 **Risks / unknowns:**
 - A denylist is a new persistent artifact; an operator who *intends* to re-add a deleted key needs a

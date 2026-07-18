@@ -104,9 +104,16 @@ pub async fn execute(args: VoluntaryExitArgs) -> anyhow::Result<()> {
         config.network = network.parse().map_err(|e: String| anyhow::anyhow!("{}", e))?;
     }
 
+    let keystore_path = config.keystore_path.clone();
     let builder = ServiceBuilder::new(config);
 
-    let key_manager = builder.build_key_manager().context("Failed to load validator keys")?;
+    // SEC-1b: skip Keymanager-deleted pubkeys (same filter as daemon boot).
+    let denylist = rvc::deletion_denylist::DeletionDenylist::load(&keystore_path)
+        .context("Failed to load deletion denylist")?;
+    let denylist_snapshot = denylist.snapshot();
+    let key_manager = builder
+        .build_key_manager_filtered(Some(&denylist_snapshot))
+        .context("Failed to load validator keys")?;
 
     let slashing_db = builder.build_slashing_db().context("Failed to open slashing database")?;
 

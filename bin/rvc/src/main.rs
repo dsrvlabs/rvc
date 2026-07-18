@@ -1090,6 +1090,19 @@ async fn run_validator(
         }
     };
 
+    // Step 2d (SEC-1b): Load deletion denylist so keystore-dir / secret-provider
+    // loaders skip keys deleted via the Keymanager API on a prior boot.
+    // Path: <keystore_path>/.rvc.deleted_keys (shares the durable data volume).
+    let deletion_denylist =
+        match rvc::deletion_denylist::DeletionDenylist::load(&config.keystore_path) {
+            Ok(d) => std::sync::Arc::new(d),
+            Err(e) => {
+                error!("Failed to load deletion denylist: {}", e);
+                return Err(e.into());
+            }
+        };
+    let denylist_snapshot = deletion_denylist.snapshot();
+
     // Step 3: Create beacon client and BnManager
     let beacon_client = match builder.build_beacon() {
         Ok(client) => {
@@ -1148,8 +1161,8 @@ async fn run_validator(
         Err(e) => warn!(error = %e, "failed to fetch beacon node version"),
     }
 
-    // Load validator keys
-    let key_manager = match builder.build_key_manager() {
+    // Load validator keys (keystore-dir), consulting the deletion denylist.
+    let key_manager = match builder.build_key_manager_filtered(Some(&denylist_snapshot)) {
         Ok(km) => {
             let validator_count = km.len();
             update_health_validators(&health_status, validator_count).await;
@@ -1166,7 +1179,7 @@ async fn run_validator(
     // Initialize secret provider metrics eagerly so they appear in /metrics output
     secret_provider::metrics::init_secret_provider_metrics();
 
-    // Load keys from cloud secret providers (if configured)
+    // Load keys from cloud secret providers (if configured), consulting denylist.
     let secret_providers: Vec<std::sync::Arc<dyn secret_provider::SecretProvider>> =
         builder.build_secret_providers().await?.into_iter().map(std::sync::Arc::from).collect();
     let key_manager = {
@@ -1179,7 +1192,7 @@ async fn run_validator(
                 )
             })?;
             let ksm = secret_provider::KeySourceManager::from_arc(secret_providers.clone());
-            let summary = ksm.load_all(&mut km).await?;
+            let summary = ksm.load_all_except(&mut km, Some(&denylist_snapshot)).await?;
             let mut total_loaded = 0usize;
             let mut total_skipped = 0usize;
             let mut total_errors = 0usize;
@@ -1270,16 +1283,37 @@ async fn run_validator(
     // Spawn secret provider refresh task (if configured)
     let refresh_interval = config.secret_provider.refresh_interval.unwrap_or(0);
     if refresh_interval > 0 && !secret_providers.is_empty() {
-        let refresh_service = secret_provider::RefreshService::new(
+        // Live denylist check so a Keymanager DELETE mid-process is not undone
+        // by the next secret-provider refresh cycle (SEC-1b).
+        let denylist_for_refresh = std::sync::Arc::clone(&deletion_denylist);
+        let is_denied: secret_provider::DenylistCheck =
+            std::sync::Arc::new(move |pk: &[u8; 48]| denylist_for_refresh.contains(pk));
+        let refresh_service = secret_provider::RefreshService::with_denylist(
             secret_providers,
             known_pubkeys,
+            Some(is_denied),
             std::time::Duration::from_secs(refresh_interval),
             shutdown_token.clone(),
         );
         let signer_for_refresh = std::sync::Arc::clone(&composite_signer);
+        // Re-check denylist immediately before add_local_key so a concurrent
+        // DELETE that landed after refresh's post-convert check cannot
+        // re-activate the key (SEC-1b Finding 3 TOCTOU).
+        let denylist_for_callback = std::sync::Arc::clone(&deletion_denylist);
         tokio::spawn(async move {
             refresh_service
                 .run(move |sk| {
+                    let pk = sk.public_key().to_bytes();
+                    if denylist_for_callback.contains(&pk) {
+                        tracing::info!(
+                            pubkey = %crypto::logging::TruncatedPubkey::new(&format!(
+                                "0x{}",
+                                hex::encode(pk)
+                            )),
+                            "Skipping denylisted key at refresh callback (DELETE raced refresh)"
+                        );
+                        return;
+                    }
                     signer_for_refresh.add_local_key(sk);
                 })
                 .await;
@@ -1504,10 +1538,10 @@ async fn run_validator(
         }
 
         let km_composite = composite_signer.clone();
-        let keystore_mgr = std::sync::Arc::new(KeystoreManagerAdapter::new(
-            config.keystore_path.clone(),
-            km_composite.clone(),
-        ));
+        let keystore_mgr = std::sync::Arc::new(
+            KeystoreManagerAdapter::new(config.keystore_path.clone(), km_composite.clone())
+                .with_denylist(std::sync::Arc::clone(&deletion_denylist)),
+        );
         let slashing_prot = std::sync::Arc::new(SlashingProtectionAdapter::new(
             slashing_db.clone(),
             genesis_validators_root_hex.clone(),
