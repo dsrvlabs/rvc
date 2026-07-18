@@ -5,6 +5,14 @@
 //! `requester_index` field in every `Partial*` request matches the share index
 //! recorded for the authenticated CN.
 //!
+//! # Primary signer (SEC-4)
+//!
+//! The non-DVT primary path uses a separate CN-only allow-list
+//! ([`crate::audit::cn::ClientCnAllowList`]) with the **same exact,
+//! case-sensitive CN match** as [`AllowedPeers::lookup_by_cn`] /
+//! [`AllowedPeers::contains_cn`]. DVT continues to require CN + share-index
+//! binding via `authenticate_peer`; that behavior is unchanged by SEC-4.
+//!
 //! # File format
 //!
 //! ```toml
@@ -118,8 +126,17 @@ impl AllowedPeers {
     /// Look up a peer by its mTLS Common Name.
     ///
     /// Returns `None` if no entry with the given CN exists.
+    /// Match is exact and case-sensitive (same rule as primary SEC-4 allow-list).
     pub fn lookup_by_cn(&self, peer_cn: &str) -> Option<&AllowedPeer> {
         self.peers.iter().find(|p| p.peer_cn == peer_cn)
+    }
+
+    /// True if any peer entry has the given mTLS Common Name.
+    ///
+    /// Thin wrapper over [`Self::lookup_by_cn`] so DVT and the primary SEC-4
+    /// path share the same "is this CN listed?" predicate shape.
+    pub fn contains_cn(&self, peer_cn: &str) -> bool {
+        self.lookup_by_cn(peer_cn).is_some()
     }
 
     /// Look up a peer by its TCP address.
@@ -236,6 +253,16 @@ name = "test"
         };
         assert!(allowed.lookup_by_cn("peer-a").is_none());
         assert!(allowed.lookup_by_cn("Peer-A").is_some());
+    }
+
+    #[test]
+    fn test_contains_cn_mirrors_lookup() {
+        let allowed = AllowedPeers {
+            peers: vec![AllowedPeer { peer_cn: "peer-A".to_string(), share_index: 1, addr: None }],
+        };
+        assert!(allowed.contains_cn("peer-A"));
+        assert!(!allowed.contains_cn("peer-X"));
+        assert!(!allowed.contains_cn("unknown"));
     }
 
     // ── lookup_by_addr tests ────────────────────────────���─────────────────────

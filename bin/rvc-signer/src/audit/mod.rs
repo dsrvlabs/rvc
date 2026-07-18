@@ -16,7 +16,10 @@ pub mod log;
 
 // ── Backward-compat re-exports for the v1 handler ────────────────────────────
 
-pub use cn::extract_client_cn;
+pub use cn::{
+    authorize_client_cn, extract_client_cn, log_missing_client_cn_allow_list_warning,
+    ClientAllowListError, ClientCnAllowList,
+};
 pub use log::{log_audit, AuditEntry};
 
 /// Return the current UTC timestamp as an ISO-8601 string.

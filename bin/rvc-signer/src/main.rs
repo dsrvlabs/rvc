@@ -217,6 +217,21 @@ struct ServeArgs {
     #[cfg(feature = "dvt")]
     #[arg(long)]
     dvt_allowed_peers: Option<PathBuf>,
+
+    /// Path to the primary (non-DVT) client-CN allow-list TOML (SEC-4).
+    ///
+    /// Optional. When set, only listed mTLS Common Names may invoke signing
+    /// RPCs on the primary `SignerService`. Format:
+    ///
+    /// ```toml
+    /// [[client]]
+    /// client_cn = "validator-client-1.local"
+    /// ```
+    ///
+    /// When unset, a startup warning is logged and any CA-issued client cert is
+    /// accepted (backward compatible). mTLS remains mandatory either way.
+    #[arg(long)]
+    allowed_client_cns: Option<PathBuf>,
 }
 
 #[cfg(feature = "dvt")]
@@ -610,6 +625,23 @@ async fn run_serve(
         ))
     });
 
+    // SEC-4: optional primary-path client-CN allow-list. When unset, warn and
+    // accept any mTLS client (backward compatible). mTLS still mandatory.
+    let client_cn_allow_list: Option<Arc<rvc_signer_bin::audit::ClientCnAllowList>> =
+        if let Some(path) = args.allowed_client_cns.as_deref() {
+            let list = rvc_signer_bin::audit::ClientCnAllowList::load_from_path(path)
+                .map_err(|e| format!("failed to load client-CN allow-list: {e}"))?;
+            info!(
+                path = %path.display(),
+                client_count = list.len(),
+                "Loaded primary client-CN allow-list (SEC-4)"
+            );
+            Some(Arc::new(list))
+        } else {
+            rvc_signer_bin::audit::log_missing_client_cn_allow_list_warning();
+            None
+        };
+
     let svc_v2 = if let Some(ref shared_gate) = shared_gate {
         service::SignerServiceImpl::new_v2_with_gate(
             Arc::clone(&signing_backend),
@@ -617,9 +649,11 @@ async fn run_serve(
             Arc::clone(shared_gate),
         )
         .with_metrics(Arc::clone(&signer_metrics))
+        .with_client_cn_allow_list(client_cn_allow_list.clone())
     } else {
         service::SignerServiceImpl::new(Arc::clone(&signing_backend), resolved.backend.clone())
             .with_metrics(Arc::clone(&signer_metrics))
+            .with_client_cn_allow_list(client_cn_allow_list.clone())
     };
 
     // Build the PeerSignerService (DVT) now that we have the slashing DB.
@@ -721,6 +755,9 @@ async fn run_serve(
             // Share the one SignerMetrics registry so HTTP-path series land on the
             // same `:9101` scrape as the gRPC series (Issue 4.5).
             metrics: Arc::clone(&signer_metrics),
+            // SEC-4 residual F1: same primary client-CN allow-list as gRPC so
+            // HTTP cannot bypass `--allowed-client-cns` as a parallel oracle.
+            client_cn_allow_list: client_cn_allow_list.clone(),
         };
         let (bound, handle) = http_api::tls::spawn_https_listener(
             &resolved.http_listen_address,

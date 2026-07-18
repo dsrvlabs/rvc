@@ -64,12 +64,17 @@ impl Default for AuditCfg {
 /// transport (FR-26); `backend` serves `GET /publicKeys`; `audit` supplies the
 /// CN for audit entries; `metrics` records the HTTP-path series (Issue 4.5) on
 /// the same `SignerMetrics` registry the gRPC transport and `:9101` scrape share.
+///
+/// [`Self::client_cn_allow_list`] is the same optional SEC-4 list wired into
+/// gRPC `SignerServiceImpl` so both transports share one authorization policy.
 #[derive(Clone)]
 pub struct Web3SignerState {
     pub gate: Arc<SigningGate>,
     pub backend: Arc<dyn SigningBackend>,
     pub audit: AuditCfg,
     pub metrics: Arc<crate::metrics::SignerMetrics>,
+    /// Optional primary client-CN allow-list (SEC-4). Same Arc as gRPC when set.
+    pub client_cn_allow_list: Option<Arc<crate::audit::ClientCnAllowList>>,
 }
 
 /// Build the Web3Signer HTTP API `Router`.
@@ -220,6 +225,7 @@ pub(crate) mod test_support {
             backend,
             audit: AuditCfg::default(),
             metrics: Arc::new(crate::metrics::SignerMetrics::new()),
+            client_cn_allow_list: None,
         }
     }
 }

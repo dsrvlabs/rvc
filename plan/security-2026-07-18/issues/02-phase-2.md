@@ -157,10 +157,10 @@ field; every V2 handler extracts the CN and passes it to the gate purely as a la
 - `test_dvt_path_unchanged`
 
 **Acceptance criteria:**
-- [ ] Non-allow-listed CN → rejected before signing, no signature, audit-log entry.
-- [ ] Allow-listed CN → succeeds. No allow-list → succeeds + startup warning.
-- [ ] mTLS remains mandatory; DVT path unchanged.
-- [ ] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
+- [x] Non-allow-listed CN → rejected before signing, no signature, audit-log entry.
+- [x] Allow-listed CN → succeeds. No allow-list → succeeds + startup warning.
+- [x] mTLS remains mandatory; DVT path unchanged.
+- [x] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
 
 **Risks / unknowns:**
 - Eight handler enforcement sites is the main surface; because the DVT allow-list type is reusable, this

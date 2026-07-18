@@ -29,6 +29,10 @@ pub enum HttpSignError {
     BadRequest(String),
     /// Unknown / unloaded public key (pre-gate resolution). → `404`.
     UnknownKey,
+    /// Client CN not on the primary allow-list (SEC-4). → `401`.
+    ///
+    /// Mirrors gRPC `Status::unauthenticated` for the same check.
+    Unauthorized(String),
     /// A `SigningGate` result error, mapped per [`gate_err_to_http`].
     Gate(SigningGateError),
 }
@@ -41,6 +45,7 @@ impl HttpSignError {
         match self {
             HttpSignError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             HttpSignError::UnknownKey => (StatusCode::NOT_FOUND, "unknown public key".to_string()),
+            HttpSignError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             HttpSignError::Gate(e) => gate_err_to_http(e),
         }
     }
@@ -55,6 +60,7 @@ impl HttpSignError {
         match self {
             HttpSignError::BadRequest(_) => "bad_request",
             HttpSignError::UnknownKey => "key_not_found",
+            HttpSignError::Unauthorized(_) => "client_cn_not_allowed",
             HttpSignError::Gate(SigningGateError::BlockedByDoppelganger) => "doppelganger",
             HttpSignError::Gate(SigningGateError::BlockedBySlashingDb(inner)) => match inner {
                 SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => {
@@ -303,5 +309,18 @@ mod tests {
 
         let (status, _) = HttpSignError::UnknownKey.status_and_body();
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn sec4_unauthorized_cn_is_401() {
+        let (status, body) =
+            HttpSignError::Unauthorized("client CN 'x' is not on the allow-list".to_string())
+                .status_and_body();
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(body.contains("not on the allow-list"));
+        assert_eq!(
+            HttpSignError::Unauthorized("x".to_string()).audit_label(),
+            "client_cn_not_allowed"
+        );
     }
 }

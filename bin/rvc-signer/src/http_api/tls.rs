@@ -85,8 +85,12 @@ pub struct PeerCert(pub Option<CertificateDer<'static>>);
 /// Reuses `audit::cn::extract_cn_from_der` verbatim (first-CN-wins — identical
 /// CN semantics to the gRPC path) and degrades to `default`
 /// (`signer::AUDIT_CN_DEFAULT`) when there is no client cert (Prysm /
-/// server-TLS-only) or the leaf carries no parseable CN. The CN is for audit
-/// only and MUST NOT gate authorization — a `None` CN still signs.
+/// server-TLS-only) or the leaf carries no parseable CN.
+///
+/// When no primary client-CN allow-list is configured, the CN remains
+/// audit-only (a missing CN still signs). When `--allowed-client-cns` is set
+/// (SEC-4), the sign handler authorizes this CN against the shared list before
+/// any signing work — including the default fallback CN.
 pub(crate) fn audit_cn(peer: Option<&PeerCert>, default: &str) -> String {
     peer.and_then(|p| p.0.as_ref())
         .and_then(|der| crate::audit::cn::extract_cn_from_der(der.as_ref()))

@@ -127,8 +127,11 @@ async fn sign_traced(
     let accept = headers.get(ACCEPT).and_then(|v| v.to_str().ok());
     // Derive the audit CN from the TLS peer cert (Phase 3). `None` extension
     // (socket-free tests / no-TLS) or no client cert (Prysm / server-TLS-only)
-    // both degrade to the configured default (`AUDIT_CN_DEFAULT`). The CN is
-    // NEVER an authorization gate — a missing CN still signs.
+    // both degrade to the configured default (`AUDIT_CN_DEFAULT`).
+    //
+    // SEC-4: when `client_cn_allow_list` is configured, the CN *is* an
+    // authorization gate (same list as gRPC). When unset, missing/default CN
+    // still signs (backward compatible).
     let cn = audit_cn(peer.as_ref().map(|Extension(p)| p), &state.audit.default_cn);
 
     // Audit posture (Issue 4.4): emit exactly one structured entry per request —
@@ -139,14 +142,22 @@ async fn sign_traced(
     // `type` rather than a wrong one.
     let started = std::time::Instant::now();
     let mut rpc_type: Option<&'static str> = None;
-    let (response, result_label) =
+    let (response, result_label) = if let Err(status) =
+        audit::authorize_client_cn(state.client_cn_allow_list.as_deref(), &cn)
+    {
+        // Reject before any parse / gate / BLS work (mirrors gRPC SEC-4 order).
+        let err = HttpSignError::Unauthorized(status.message().to_string());
+        let label = err.audit_label();
+        (err.into_response(), label)
+    } else {
         match sign_inner(&state, &identifier, accept, &cn, body.as_ref(), &mut rpc_type).await {
             Ok(resp) => (resp, "success"),
             Err(e) => {
                 let label = e.audit_label();
                 (e.into_response(), label)
             }
-        };
+        }
+    };
     let elapsed = started.elapsed();
 
     // HTTP-path metrics (Issue 4.5): count by `type` × outcome and observe
@@ -1000,6 +1011,45 @@ mod tests {
         assert!(logs_contain("client_cn=signing-gate"));
         // The signature (hence no key material) must NOT appear in any log line.
         assert!(!logs_contain(&sig), "audit log leaked the signature");
+    }
+
+    /// SEC-4 residual F1: HTTP path shares the primary CN allow-list with gRPC.
+    /// Socket-free requests use `AUDIT_CN_DEFAULT` (`signing-gate`); a list that
+    /// does not include it must reject with 401 before any signature.
+    #[traced_test]
+    #[tokio::test]
+    async fn test_http_non_allowlisted_cn_rejected_before_sign() {
+        let (sk, pk_bytes) = test_keypair();
+        let mut state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        state.client_cn_allow_list =
+            Some(Arc::new(crate::audit::ClientCnAllowList::from_cns(["vc-A"])));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "non-allow-listed CN must not obtain a signature over HTTP"
+        );
+        let body = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert!(body.contains("not on the allow-list"), "body: {body}");
+        assert!(logs_contain("client_cn_not_allowed") || logs_contain("sign request audit"));
+    }
+
+    /// SEC-4: allow-listed default CN still signs over HTTP.
+    #[tokio::test]
+    async fn test_http_allowlisted_cn_succeeds() {
+        let (sk, pk_bytes) = test_keypair();
+        let mut state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+        // Socket-free path degrades to AUDIT_CN_DEFAULT ("signing-gate").
+        state.client_cn_allow_list =
+            Some(Arc::new(crate::audit::ClientCnAllowList::from_cns(["signing-gate"])));
+        let id = format!("0x{}", hex::encode(pk_bytes));
+
+        let resp = post_sign(state, &id, None, attestation_body(None)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(resp).await).unwrap();
+        assert!(body.contains("signature"), "body: {body}");
     }
 
     /// Gate 3 (:9000): a real sign over the HTTP frontend proves the exported

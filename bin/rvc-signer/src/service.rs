@@ -133,6 +133,13 @@ pub struct SignerServiceImpl {
     /// keeping slashing protection and the in-memory `ValidatorLockMap` unified
     /// (FR-26).
     gate: Option<Arc<SigningGate>>,
+    /// Optional client-CN allow-list for the primary (non-DVT) path (SEC-4).
+    ///
+    /// When `Some`, only listed mTLS CNs may invoke signing RPCs (exact,
+    /// case-sensitive match; `"unknown"` is rejected unless explicitly listed).
+    /// When `None`, all mTLS clients are accepted (backward compatible; startup
+    /// logs a warning). mTLS remains mandatory either way.
+    client_cn_allow_list: Option<Arc<audit::ClientCnAllowList>>,
 }
 
 impl SignerServiceImpl {
@@ -140,7 +147,7 @@ impl SignerServiceImpl {
     ///
     /// **Deprecated**: new callers should use `new_v2`.
     pub fn new(backend: Arc<dyn SigningBackend>, backend_name: String) -> Self {
-        Self { backend, backend_name, metrics: None, gate: None }
+        Self { backend, backend_name, metrics: None, gate: None, client_cn_allow_list: None }
     }
 
     /// Create a v2-capable service with an embedded slashing DB and `SigningGate`.
@@ -197,11 +204,22 @@ impl SignerServiceImpl {
         backend_name: String,
         gate: Arc<SigningGate>,
     ) -> Self {
-        Self { backend, backend_name, metrics: None, gate: Some(gate) }
+        Self { backend, backend_name, metrics: None, gate: Some(gate), client_cn_allow_list: None }
     }
 
     pub fn with_metrics(mut self, metrics: Arc<SignerMetrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Attach an optional primary-path client-CN allow-list (SEC-4).
+    ///
+    /// Builder-style; call after `new` / `new_v2` / `new_v2_with_gate`.
+    pub fn with_client_cn_allow_list(
+        mut self,
+        allow_list: Option<Arc<audit::ClientCnAllowList>>,
+    ) -> Self {
+        self.client_cn_allow_list = allow_list;
         self
     }
 
@@ -238,6 +256,28 @@ impl SignerServiceImpl {
                  RVC_ALLOW_INSECURE=true",
             )
         })
+    }
+
+    /// Reject the request when a client-CN allow-list is configured and `client_cn`
+    /// is not listed (SEC-4). Emits an audit-log entry on rejection so operators
+    /// can see denied sign attempts. Runs before any signing / staging logic.
+    #[allow(clippy::result_large_err)]
+    fn authorize_client_cn(&self, client_cn: &str) -> Result<(), Status> {
+        match audit::authorize_client_cn(self.client_cn_allow_list.as_deref(), client_cn) {
+            Ok(()) => Ok(()),
+            Err(status) => {
+                audit::log_audit(&audit::AuditEntry {
+                    timestamp: audit::now_rfc3339(),
+                    pubkey_hex: String::new(),
+                    client_cn: client_cn.to_string(),
+                    backend: self.backend_name.clone(),
+                    result: "client_cn_not_allowed".to_string(),
+                    duration_ms: 0,
+                    rpc: None,
+                });
+                Err(status)
+            }
+        }
     }
 }
 
@@ -452,6 +492,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         req: Request<SignBeaconBlockRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
         let client_cn = audit::cn::extract_client_cn(&req);
+        self.authorize_client_cn(&client_cn)?;
         let r = req.into_inner();
 
         let pubkey_bytes = validate_pubkey(&r.pubkey)?;
@@ -499,6 +540,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         req: Request<SignBlindedBeaconBlockRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
         let client_cn = audit::cn::extract_client_cn(&req);
+        self.authorize_client_cn(&client_cn)?;
         let r = req.into_inner();
 
         let pubkey_bytes = validate_pubkey(&r.pubkey)?;
@@ -540,7 +582,8 @@ impl SignerServiceV2 for SignerServiceImpl {
         &self,
         req: Request<SignRandaoRevealRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let _client_cn = audit::cn::extract_client_cn(&req);
+        let client_cn = audit::cn::extract_client_cn(&req);
+        self.authorize_client_cn(&client_cn)?;
         let r = req.into_inner();
 
         let pubkey_bytes = validate_pubkey(&r.pubkey)?;
@@ -587,6 +630,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         req: Request<SignAttestationDataRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
         let client_cn = audit::cn::extract_client_cn(&req);
+        self.authorize_client_cn(&client_cn)?;
         let r = req.into_inner();
 
         let pubkey_bytes = validate_pubkey(&r.pubkey)?;
@@ -682,6 +726,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         req: Request<SignAggregateAndProofRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
         let client_cn = audit::cn::extract_client_cn(&req);
+        self.authorize_client_cn(&client_cn)?;
         let r = req.into_inner();
 
         let pubkey_bytes = validate_pubkey(&r.pubkey)?;
@@ -748,6 +793,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         req: Request<SignSyncCommitteeMessageRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
         let client_cn = audit::cn::extract_client_cn(&req);
+        self.authorize_client_cn(&client_cn)?;
         let r = req.into_inner();
 
         let pubkey_bytes = validate_pubkey(&r.pubkey)?;
@@ -808,6 +854,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         req: Request<SignSyncAggregatorSelectionDataRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
         let client_cn = audit::cn::extract_client_cn(&req);
+        self.authorize_client_cn(&client_cn)?;
         let r = req.into_inner();
 
         let pubkey_bytes = validate_pubkey(&r.pubkey)?;
@@ -865,6 +912,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         req: Request<SignContributionAndProofRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
         let client_cn = audit::cn::extract_client_cn(&req);
+        self.authorize_client_cn(&client_cn)?;
         let r = req.into_inner();
 
         let pubkey_bytes = validate_pubkey(&r.pubkey)?;
@@ -927,7 +975,8 @@ impl SignerServiceV2 for SignerServiceImpl {
         &self,
         req: Request<SignBuilderRegistrationRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let _client_cn = audit::cn::extract_client_cn(&req);
+        let client_cn = audit::cn::extract_client_cn(&req);
+        self.authorize_client_cn(&client_cn)?;
         let r = req.into_inner();
 
         let pubkey_bytes = validate_pubkey(&r.pubkey)?;
@@ -997,7 +1046,8 @@ impl SignerServiceV2 for SignerServiceImpl {
         &self,
         req: Request<SignVoluntaryExitRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let _client_cn = audit::cn::extract_client_cn(&req);
+        let client_cn = audit::cn::extract_client_cn(&req);
+        self.authorize_client_cn(&client_cn)?;
         let r = req.into_inner();
 
         let pubkey_bytes = validate_pubkey(&r.pubkey)?;
@@ -1160,10 +1210,8 @@ mod tests {
     }
 
     fn make_service_v2(backend: MockBackend) -> SignerServiceImpl {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let db = Arc::new(slashing::SlashingDb::open(tmp.path()).unwrap());
-        // Keep temp file alive by leaking it
-        std::mem::forget(tmp);
+        // In-memory: avoids SEC-3 CorruptOrEmpty on 0-byte NamedTempFile paths.
+        let db = Arc::new(slashing::SlashingDb::open_in_memory().unwrap());
         SignerServiceImpl::new_v2(Arc::new(backend), "basic".to_string(), db)
     }
 
@@ -1282,10 +1330,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_v2_sign_beacon_block_unknown_key_returns_not_found() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let db_path = tmp.path().to_path_buf();
-        let db = Arc::new(slashing::SlashingDb::open(&db_path).unwrap());
-        std::mem::forget(tmp);
+        let db = Arc::new(slashing::SlashingDb::open_in_memory().unwrap());
         // Empty backend: sign will fail with KeyNotFound.
         let svc = SignerServiceImpl::new_v2(
             Arc::new(MockBackend::empty()),
@@ -1483,9 +1528,7 @@ mod tests {
         assert!(no_db.gate.is_none(), "no-DB service must have gate = None");
 
         // Hoisted path: build ONE gate at the composition root, inject a clone.
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        let db = Arc::new(slashing::SlashingDb::open(tmp.path()).unwrap());
-        std::mem::forget(tmp); // keep the temp file alive for the DB's lifetime
+        let db = Arc::new(slashing::SlashingDb::open_in_memory().unwrap());
         let backend = Arc::new(MockBackend::with_test_key());
         let shared_gate = Arc::new(SignerServiceImpl::build_gate(backend.clone(), db));
 
@@ -1566,5 +1609,121 @@ mod tests {
             metrics.sign_errors_total.with_label_values(&["basic", "key_not_found"]).get(),
             0
         );
+    }
+
+    // ── SEC-4: primary client-CN allow-list ───────────────────────────────────
+    //
+    // Without real TLS on the request, extract_client_cn returns "unknown".
+    // That matches production when a cert has no parseable CN and is the same
+    // harness the DVT peer_service tests use for unauth CN checks.
+
+    fn make_service_v2_with_allow_list(backend: MockBackend, cns: &[&str]) -> SignerServiceImpl {
+        let list = Arc::new(audit::ClientCnAllowList::from_cns(cns.iter().copied()));
+        make_service_v2(backend).with_client_cn_allow_list(Some(list))
+    }
+
+    /// Non-allow-listed CN is rejected before signing; no signature is returned
+    /// and an audit-log entry is emitted (`result=client_cn_not_allowed`).
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_non_allowlisted_cn_rejected_no_signature() {
+        let pubkey = test_pubkey_bytes();
+        // Allow-list does not include "unknown" (the no-TLS CN).
+        let svc = make_service_v2_with_allow_list(MockBackend::with_test_key(), &["vc-A"]);
+
+        let req = Request::new(SignBeaconBlockRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            block_ssz: sample_block_ssz(42),
+            fork_id: 4,
+        });
+        let err = svc.sign_beacon_block(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert!(
+            err.message().contains("not on the allow-list"),
+            "unexpected message: {}",
+            err.message()
+        );
+        assert!(
+            logs_contain("client_cn_not_allowed") || logs_contain("sign request audit"),
+            "expected audit-log entry on rejection"
+        );
+    }
+
+    /// Allow-listed CN succeeds (no-TLS harness lists `"unknown"` explicitly).
+    #[tokio::test]
+    async fn test_allowlisted_cn_succeeds() {
+        let pubkey = test_pubkey_bytes();
+        let svc = make_service_v2_with_allow_list(MockBackend::with_test_key(), &["unknown"]);
+
+        let req = Request::new(SignBeaconBlockRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            block_ssz: sample_block_ssz(42),
+            fork_id: 4,
+        });
+        let resp = svc.sign_beacon_block(req).await.expect("allow-listed CN must sign");
+        assert_eq!(resp.into_inner().signature.len(), 96);
+    }
+
+    /// No allow-list configured → request succeeds, and the startup warning
+    /// helper emits the SEC-4 operator message.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_no_allowlist_configured_succeeds_with_startup_warning() {
+        let pubkey = test_pubkey_bytes();
+        // Default constructors leave client_cn_allow_list = None.
+        let svc = make_service_v2(MockBackend::with_test_key());
+        assert!(svc.client_cn_allow_list.is_none());
+
+        let req = Request::new(SignBeaconBlockRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            block_ssz: sample_block_ssz(42),
+            fork_id: 4,
+        });
+        let resp = svc.sign_beacon_block(req).await.expect("no allow-list must accept");
+        assert_eq!(resp.into_inner().signature.len(), 96);
+
+        // Startup path (main.rs) calls this when --allowed-client-cns is unset.
+        audit::log_missing_client_cn_allow_list_warning();
+        assert!(
+            logs_contain("No client-CN allow-list configured")
+                || logs_contain("allowed-client-cns")
+                || logs_contain("SEC-4"),
+            "expected SEC-4 startup warning"
+        );
+    }
+
+    /// DVT allow-list semantics stay independent of the primary path (SEC-4).
+    /// Primary `ClientCnAllowList` and DVT `AllowedPeers` share exact CN match
+    /// only; DVT still binds CN → share_index via its own loader/API.
+    #[test]
+    fn test_dvt_path_unchanged() {
+        // Primary allow-list is CN-only and does not involve share_index.
+        let primary = audit::ClientCnAllowList::from_cns(["peer-A"]);
+        assert!(primary.contains("peer-A"));
+        assert!(!primary.contains("peer-X"));
+
+        // DVT AllowedPeers API (lookup + contains_cn) remains the authorization
+        // primitive for PeerSignerServiceImpl; SEC-4 does not alter it.
+        // When the dvt feature is off this still documents the contract via the
+        // primary type; with dvt on we exercise AllowedPeers directly.
+        #[cfg(feature = "dvt")]
+        {
+            use crate::dvt::allow_list::{AllowedPeer, AllowedPeers};
+            let dvt = AllowedPeers {
+                peers: vec![AllowedPeer {
+                    peer_cn: "peer-A".to_string(),
+                    share_index: 1,
+                    addr: None,
+                }],
+            };
+            assert!(dvt.contains_cn("peer-A"));
+            assert_eq!(dvt.lookup_by_cn("peer-A").map(|p| p.share_index), Some(1));
+            assert!(dvt.lookup_by_cn("peer-X").is_none());
+            // share_index binding is DVT-only — primary has no equivalent field.
+            assert_ne!(dvt.lookup_by_cn("peer-A").unwrap().share_index, 0);
+        }
     }
 }
