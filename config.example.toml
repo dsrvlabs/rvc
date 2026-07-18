@@ -43,8 +43,12 @@ keystore_path = "./keystores"
 # ---------------------------------------------------------------------------
 
 # SQLite database storing attestation/block history to prevent slashing.
-# Created automatically on first run.
+# SEC-3: a missing path aborts startup (fail closed) so a lost volume or path
+# typo cannot silently produce zero-history signing. For a genuine first-time
+# deploy, pass --init-slashing-db or set allow_fresh_db = true once, then remove
+# the opt-in. A 0-byte / corrupt DB always hard-fails (never treated as fresh).
 slashing_db_path = "./slashing_protection.sqlite"
+# allow_fresh_db = false
 
 # ---------------------------------------------------------------------------
 # Network

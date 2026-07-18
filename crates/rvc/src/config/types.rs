@@ -31,6 +31,17 @@ pub struct Config {
 
     pub slashing_db_path: PathBuf,
 
+    /// Allow creating a fresh empty slashing-protection DB when the path is
+    /// missing (SEC-3).
+    ///
+    /// Default `false`: a missing DB aborts startup so a lost volume, path typo,
+    /// or ephemeral container storage cannot silently produce zero-history
+    /// signing. Set via config `allow_fresh_db = true` or CLI
+    /// `--init-slashing-db`. A 0-byte / corrupt-header file is **always** a hard
+    /// error regardless of this flag. Never wipes a non-empty DB.
+    #[serde(default)]
+    pub allow_fresh_db: bool,
+
     pub metrics_address: IpAddr,
 
     pub metrics_port: u16,
@@ -315,6 +326,7 @@ impl Default for Config {
             keystore_path: PathBuf::from("./keystores"),
             password_file: None,
             slashing_db_path: PathBuf::from("./slashing_protection.sqlite"),
+            allow_fresh_db: false,
             metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             metrics_port: 8080,
             grpc_port: 50051,
@@ -639,6 +651,10 @@ impl Config {
             self.slashing_db_path = slashing_db_path.clone();
         }
 
+        if let Some(true) = cli.init_slashing_db {
+            self.allow_fresh_db = true;
+        }
+
         if let Some(metrics_address) = cli.metrics_address {
             self.metrics_address = metrics_address;
         }
@@ -907,6 +923,8 @@ pub struct CliOverrides {
     pub keystore_path: Option<PathBuf>,
     pub password_file: Option<PathBuf>,
     pub slashing_db_path: Option<PathBuf>,
+    /// When `Some(true)`, enables `Config::allow_fresh_db` (SEC-3 / `--init-slashing-db`).
+    pub init_slashing_db: Option<bool>,
     pub metrics_address: Option<IpAddr>,
     pub metrics_port: Option<u16>,
     pub grpc_port: Option<u16>,
@@ -1032,10 +1050,35 @@ log_level = "debug"
         assert_eq!(config.beacon_url, "http://beacon:5052");
         assert_eq!(config.keystore_path, PathBuf::from("/data/keystores"));
         assert_eq!(config.slashing_db_path, PathBuf::from("/data/slashing.db"));
+        assert!(!config.allow_fresh_db, "SEC-3: allow_fresh_db defaults false");
         assert_eq!(config.metrics_port, 9090);
         assert_eq!(config.grpc_port, 50052);
         assert_eq!(config.network, Network::Hoodi);
         assert_eq!(config.log_level, "debug");
+    }
+
+    /// SEC-3: `allow_fresh_db` parses from TOML and `--init-slashing-db` merges in.
+    #[test]
+    fn test_allow_fresh_db_toml_and_cli() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+allow_fresh_db = true
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert!(config.allow_fresh_db);
+
+        let mut config = Config::default();
+        assert!(!config.allow_fresh_db);
+        config.merge_with_cli(&CliOverrides { init_slashing_db: Some(true), ..Default::default() });
+        assert!(config.allow_fresh_db);
     }
 
     #[test]

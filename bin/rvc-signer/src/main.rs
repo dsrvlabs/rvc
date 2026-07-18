@@ -142,6 +142,14 @@ struct ServeArgs {
     #[arg(long)]
     disable_slashing_protection: bool,
 
+    /// Allow creating a fresh empty signer slashing DB when the path is missing
+    /// (SEC-3). DANGEROUS on a previously-active signer: the new DB has zero
+    /// signing history and can enable double-signing / slashing. Use only for
+    /// genuine first-time deployments. A 0-byte or corrupt DB is always a hard
+    /// error regardless of this flag.
+    #[arg(long, default_value_t = false)]
+    init_slashing_db: bool,
+
     /// Signing backend to use
     #[arg(long, value_enum, default_value_t = Backend::Basic)]
     backend: Backend,
@@ -532,8 +540,56 @@ async fn run_serve(
         None
     } else if let Some(ref db_path) = slashing_cfg.db_path {
         info!(path = %db_path.display(), "Opening slashing protection database");
-        let db = ::slashing::SlashingDb::open(db_path)
+        // SEC-3: fail closed on missing path without --init-slashing-db; 0-byte /
+        // corrupt header is always rejected inside open_with_create_info.
+        if db_path.exists() {
+            let meta = std::fs::metadata(db_path).map_err(|e| {
+                format!("failed to stat slashing DB at {}: {}", db_path.display(), e)
+            })?;
+            if meta.len() == 0 {
+                return Err(format!(
+                    "slashing protection database at {} is empty (0-byte). \
+                     This is corruption, not a fresh init — restore from backup. \
+                     --init-slashing-db cannot override this.",
+                    db_path.display()
+                )
+                .into());
+            }
+        } else if !args.init_slashing_db {
+            return Err(format!(
+                "slashing protection database does not exist at {}. \
+                 Refusing to create a fresh empty DB (would sign with zero history). \
+                 For a genuine new deployment, pass --init-slashing-db. \
+                 If this path should hold existing history, restore the DB from backup.",
+                db_path.display()
+            )
+            .into());
+        } else {
+            error!(
+                path = %db_path.display(),
+                "CREATING A NEW EMPTY SIGNER SLASHING PROTECTION DATABASE. \
+                 This DB has ZERO signing history. If this signer was previously \
+                 active, signing with a fresh DB can DOUBLE-SIGN and get validators \
+                 SLASHED. Only proceed for a genuine first-time deployment. \
+                 Opt-in was granted via --init-slashing-db."
+            );
+        }
+
+        let (db, created_fresh) = ::slashing::SlashingDb::open_with_create_info(db_path)
             .map_err(|e| format!("failed to open slashing DB at {}: {}", db_path.display(), e))?;
+        // TOCTOU close: refuse accidental create if path vanished mid-startup.
+        if created_fresh && !args.init_slashing_db {
+            drop(db);
+            let _ = std::fs::remove_file(db_path);
+            return Err(format!(
+                "slashing protection database was created at {} without \
+                 --init-slashing-db (possible TOCTOU / missing volume). \
+                 Refusing to sign with zero history. Restore from backup or \
+                 re-run with --init-slashing-db for a genuine first deploy.",
+                db_path.display()
+            )
+            .into());
+        }
         Some(Arc::new(db))
     } else {
         None

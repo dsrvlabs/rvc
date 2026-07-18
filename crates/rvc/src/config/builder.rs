@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::info;
+use tracing::{error, info};
 
 use crypto::logging::RedactedUrl;
 
@@ -37,6 +37,54 @@ use super::types::Config;
 
 fn format_version(v: eth_types::Version) -> String {
     format!("0x{}", hex::encode(v))
+}
+
+/// SEC-3 post-open gate: a fresh create without opt-in must never proceed to sign.
+///
+/// Closes the TOCTOU between the builder's pre-open `path.exists()` check and
+/// `SlashingDb::open_with_create_info` (volume unmount / concurrent delete).
+fn reject_accidental_fresh_create(
+    path: &std::path::Path,
+    created_fresh: bool,
+    allow_fresh_db: bool,
+) -> Result<(), ConfigError> {
+    if created_fresh && !allow_fresh_db {
+        error!(
+            path = %path.display(),
+            "Refusing accidental fresh slashing DB (created without allow_fresh_db / \
+             --init-slashing-db). Path was missing at open time — possible TOCTOU \
+             (volume unmounted, concurrent delete, or path race). Restore history \
+             from backup or re-run with explicit opt-in for a genuine first deploy."
+        );
+        return Err(ConfigError::SlashingDbMissing(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+/// Best-effort cleanup of a DB file created without opt-in (and SQLite sidecars).
+///
+/// SQLite WAL filenames use `-wal` / `-shm` suffixes (no separator dot).
+fn remove_accidental_fresh_db(path: &std::path::Path) {
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let candidates = [
+        path.to_path_buf(),
+        parent.join(format!("{stem}-wal")),
+        parent.join(format!("{stem}-shm")),
+    ];
+    for p in &candidates {
+        if !p.exists() {
+            continue;
+        }
+        if let Err(e) = std::fs::remove_file(p) {
+            error!(
+                path = %p.display(),
+                error = %e,
+                "failed to remove accidental fresh slashing DB artifact; \
+                 delete it manually before retrying"
+            );
+        }
+    }
 }
 
 /// Contains all the built services ready for use.
@@ -207,16 +255,71 @@ impl ServiceBuilder {
     }
 
     pub fn build_slashing_db(&self) -> Result<Arc<SlashingDb>, ConfigError> {
-        if let Some(parent) = self.config.slashing_db_path.parent() {
+        let path = &self.config.slashing_db_path;
+
+        if let Some(parent) = path.parent() {
             if !parent.exists() && parent != std::path::Path::new("") {
-                return Err(ConfigError::SlashingDbPathInvalid(
-                    self.config.slashing_db_path.clone(),
-                ));
+                return Err(ConfigError::SlashingDbPathInvalid(path.clone()));
             }
         }
 
-        let db = SlashingDb::open(&self.config.slashing_db_path)?;
-        info!(path = ?self.config.slashing_db_path, "Opened slashing protection database");
+        // SEC-3: fail closed on missing / 0-byte / corrupt-header DB.
+        //
+        // - Missing → require explicit opt-in (`allow_fresh_db` / `--init-slashing-db`).
+        // - Present-and-0-byte or bad SQLite header → hard error always (corruption).
+        // - Present-and-valid → normal open. Opt-in never wipes a non-empty DB.
+        if path.exists() {
+            let meta = std::fs::metadata(path).map_err(ConfigError::ReadError)?;
+            if meta.len() == 0 {
+                return Err(ConfigError::SlashingDbCorrupt(path.clone()));
+            }
+        } else if !self.config.allow_fresh_db {
+            return Err(ConfigError::SlashingDbMissing(path.clone()));
+        } else {
+            error!(
+                path = %path.display(),
+                "CREATING A NEW EMPTY SLASHING PROTECTION DATABASE. \
+                 This DB has ZERO signing history. If this validator was \
+                 previously active (or this path previously held a slashing \
+                 DB), signing with a fresh DB can DOUBLE-SIGN and get the \
+                 validator SLASHED. Only proceed for a genuine first-time \
+                 deployment. Opt-in was granted via allow_fresh_db / \
+                 --init-slashing-db."
+            );
+        }
+
+        let (db, created_fresh) = SlashingDb::open_with_create_info(path).map_err(|e| {
+            // Surface corrupt/empty as the dedicated config error for clearer
+            // operator guidance; other slashing errors pass through unchanged.
+            match e {
+                slashing::SlashingError::CorruptOrEmpty { .. } => {
+                    ConfigError::SlashingDbCorrupt(path.clone())
+                }
+                other => ConfigError::SlashingDbError(other),
+            }
+        })?;
+
+        // SEC-3 TOCTOU close: pre-open `path.exists()` can race with a disappearing
+        // volume / concurrent delete. `open_with_create_info` reports whether it
+        // actually created a fresh zero-history DB — refuse that outcome without
+        // opt-in so we never sign with accidental empty history.
+        if let Err(e) =
+            reject_accidental_fresh_create(path, created_fresh, self.config.allow_fresh_db)
+        {
+            // Drop the connection so the accidental file can be unlinked.
+            drop(db);
+            remove_accidental_fresh_db(path);
+            return Err(e);
+        }
+
+        if created_fresh {
+            error!(
+                path = %path.display(),
+                "Opened freshly created slashing protection database (zero history)"
+            );
+        } else {
+            info!(path = ?path, "Opened slashing protection database");
+        }
         Ok(Arc::new(db))
     }
 
@@ -687,6 +790,9 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("slashing.db");
 
+        // Pre-create a valid DB so open does not require the fresh-init opt-in.
+        SlashingDb::open(&db_path).unwrap();
+
         let config = Config { slashing_db_path: db_path.clone(), ..create_minimal_config() };
 
         let builder = ServiceBuilder::new(config);
@@ -707,6 +813,162 @@ mod tests {
         let result = builder.build_slashing_db();
 
         assert!(matches!(result, Err(ConfigError::SlashingDbPathInvalid(_))));
+    }
+
+    // ── SEC-3: slashing DB fails closed on missing / 0-byte file ───────────
+
+    /// Missing DB without opt-in must abort (never silently create).
+    #[test]
+    fn test_missing_db_without_optin_aborts_startup() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("missing.db");
+        assert!(!db_path.exists());
+
+        let config = Config {
+            slashing_db_path: db_path.clone(),
+            allow_fresh_db: false,
+            ..create_minimal_config()
+        };
+        let result = ServiceBuilder::new(config).build_slashing_db();
+
+        match result {
+            Err(ConfigError::SlashingDbMissing(_)) => {}
+            Ok(_) => panic!("expected SlashingDbMissing, got Ok"),
+            Err(e) => panic!("expected SlashingDbMissing, got: {e}"),
+        }
+        assert!(!db_path.exists(), "must not create the DB without opt-in");
+    }
+
+    /// Missing DB with opt-in creates the file and succeeds.
+    #[test]
+    fn test_missing_db_with_optin_creates_and_warns() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("fresh.db");
+        assert!(!db_path.exists());
+
+        let config = Config {
+            slashing_db_path: db_path.clone(),
+            allow_fresh_db: true,
+            ..create_minimal_config()
+        };
+        let result = ServiceBuilder::new(config).build_slashing_db();
+
+        if let Err(e) = result {
+            panic!("opt-in fresh create must succeed: {e}");
+        }
+        assert!(db_path.exists(), "opt-in must create the DB file");
+        // Fresh DB must be a real non-empty SQLite file (not left 0-byte).
+        assert!(std::fs::metadata(&db_path).unwrap().len() > 0);
+    }
+
+    /// 0-byte DB always aborts, with and without opt-in.
+    #[test]
+    fn test_zero_byte_db_always_aborts() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("zero.db");
+        std::fs::write(&db_path, b"").unwrap();
+
+        for allow_fresh_db in [false, true] {
+            let config = Config {
+                slashing_db_path: db_path.clone(),
+                allow_fresh_db,
+                ..create_minimal_config()
+            };
+            let result = ServiceBuilder::new(config).build_slashing_db();
+            match result {
+                Err(ConfigError::SlashingDbCorrupt(_)) => {}
+                Ok(_) => panic!("0-byte DB must abort (allow_fresh_db={allow_fresh_db}), got Ok"),
+                Err(e) => {
+                    panic!("0-byte DB must abort (allow_fresh_db={allow_fresh_db}), got: {e}")
+                }
+            }
+        }
+        // Must not have wiped/replaced the 0-byte file with a fresh DB.
+        assert_eq!(std::fs::metadata(&db_path).unwrap().len(), 0);
+    }
+
+    /// SEC-3 TOCTOU: post-open `created_fresh && !allow_fresh_db` must refuse.
+    #[test]
+    fn test_created_fresh_without_optin_is_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("race.db");
+
+        // Simulate the library outcome of a disappear-between-check race:
+        // open reports created_fresh without the builder opt-in flag.
+        let (db, created_fresh) = SlashingDb::open_with_create_info(&db_path).unwrap();
+        assert!(created_fresh);
+        drop(db);
+
+        assert!(
+            reject_accidental_fresh_create(&db_path, true, false).is_err(),
+            "created_fresh without opt-in must error"
+        );
+        assert!(
+            reject_accidental_fresh_create(&db_path, true, true).is_ok(),
+            "created_fresh with opt-in must be allowed"
+        );
+        assert!(
+            reject_accidental_fresh_create(&db_path, false, false).is_ok(),
+            "existing open without create is always ok"
+        );
+
+        // Cleanup path used after the gate fails.
+        remove_accidental_fresh_db(&db_path);
+        assert!(!db_path.exists(), "accidental fresh DB must be removed");
+    }
+
+    /// Builder maps corrupt-header open failures to `SlashingDbCorrupt`.
+    #[test]
+    fn test_corrupt_header_db_always_aborts() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("garbage.db");
+        std::fs::write(&db_path, b"not a sqlite database!!!!").unwrap();
+
+        for allow_fresh_db in [false, true] {
+            let config = Config {
+                slashing_db_path: db_path.clone(),
+                allow_fresh_db,
+                ..create_minimal_config()
+            };
+            let result = ServiceBuilder::new(config).build_slashing_db();
+            match result {
+                Err(ConfigError::SlashingDbCorrupt(_)) => {}
+                Ok(_) => panic!("corrupt header must abort (allow_fresh_db={allow_fresh_db})"),
+                Err(e) => panic!(
+                    "corrupt header must map to SlashingDbCorrupt \
+                     (allow_fresh_db={allow_fresh_db}), got: {e}"
+                ),
+            }
+        }
+        // Must not wipe the non-empty garbage file.
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"not a sqlite database!!!!");
+    }
+
+    /// Opt-in must never wipe or overwrite a non-empty existing DB.
+    #[test]
+    fn test_optin_never_wipes_nonempty_db() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("existing.db");
+
+        // Seed a real DB with one attestation so we can assert history survives.
+        {
+            let db = SlashingDb::open(&db_path).unwrap();
+            let gvr = [0u8; 32];
+            db.record_attestation("0xabcd", 1, 2, Some("0xdead".to_string()), &gvr).unwrap();
+        }
+        let size_before = std::fs::metadata(&db_path).unwrap().len();
+        assert!(size_before > 0);
+
+        let config = Config {
+            slashing_db_path: db_path.clone(),
+            allow_fresh_db: true, // opt-in set, but DB already exists
+            ..create_minimal_config()
+        };
+        let db = ServiceBuilder::new(config).build_slashing_db().expect("open existing");
+
+        let records = db.get_attestations("0xabcd").expect("read history");
+        assert_eq!(records.len(), 1, "opt-in must not wipe existing history");
+        assert_eq!(records[0].target_epoch, 2);
     }
 
     #[test]

@@ -60,6 +60,7 @@ rvc start [OPTIONS]
 | `--keystore-path <PATH>` | `./keystores` | Directory containing EIP-2335 keystore JSON files |
 | `--password-file <PATH>` | none | Password file for keystore decryption |
 | `--slashing-db-path <PATH>` | `./slashing_protection.sqlite` | Slashing protection SQLite database |
+| `--init-slashing-db` | false | Allow creating a **fresh empty** slashing DB if the path is missing (SEC-3). Dangerous on a previously-active validator (zero history → double-sign risk). Use only for genuine first deploy; 0-byte/corrupt files always abort. Config equivalent: `allow_fresh_db = true` |
 | `--network <NETWORK>` | `mainnet` | Network preset: `mainnet`, `sepolia`, `holesky`, `goerli`, `custom` |
 
 #### Server Options
@@ -180,6 +181,7 @@ Create a TOML file (see `config.example.toml`):
 beacon_url = "http://localhost:5052"
 keystore_path = "./keystores"
 slashing_db_path = "./slashing_protection.sqlite"
+# allow_fresh_db = true   # only for genuine first deploy (prefer --init-slashing-db once)
 metrics_port = 8080
 grpc_port = 50051
 network = "mainnet"

@@ -24,6 +24,29 @@ pub enum ConfigError {
     #[error("slashing db path parent directory does not exist: {0}")]
     SlashingDbPathInvalid(PathBuf),
 
+    /// Missing slashing DB without an explicit operator opt-in (SEC-3).
+    ///
+    /// Creating a fresh empty DB would let the process sign with **zero history**.
+    /// For a genuine new deployment, pass `--init-slashing-db` or set
+    /// `allow_fresh_db = true` in the config file.
+    #[error(
+        "slashing protection database does not exist at {0}. \
+         Refusing to create a fresh empty DB (would sign with zero history). \
+         For a genuine new deployment, pass --init-slashing-db or set \
+         allow_fresh_db = true in config. If this path should hold existing \
+         history, restore the DB from backup."
+    )]
+    SlashingDbMissing(PathBuf),
+
+    /// 0-byte or corrupt-header slashing DB (SEC-3). Always a hard error.
+    #[error(
+        "slashing protection database at {0} is empty or corrupt \
+         (0-byte or invalid SQLite header). This indicates truncation or \
+         corruption — never treated as a fresh init. Restore from backup; \
+         --init-slashing-db / allow_fresh_db cannot override this."
+    )]
+    SlashingDbCorrupt(PathBuf),
+
     #[error("invalid network: {0}")]
     InvalidNetwork(String),
 

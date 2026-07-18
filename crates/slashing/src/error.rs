@@ -64,6 +64,22 @@ pub enum SlashingError {
 
     #[error("Slashing DB refused to open with non-WAL journal mode: actual={actual}. {hint}")]
     JournalMode { actual: String, hint: String },
+
+    /// Empty (0-byte) or non-SQLite header at the configured path.
+    ///
+    /// SEC-3: a truncated/partial-write file is corruption, never a legitimate
+    /// fresh init. Operators must restore from backup; opt-in flags cannot
+    /// override this.
+    #[error(
+        "slashing protection database at {path} is empty or has a corrupt SQLite header \
+         (size={size} bytes). This is corruption, not a fresh init — restore from backup. \
+         Opt-in flags (--init-slashing-db / allow_fresh_db) cannot override this."
+    )]
+    CorruptOrEmpty { path: String, size: u64 },
+
+    /// File inspection failed before open (permissions, I/O).
+    #[error("failed to inspect slashing protection database at {path}: {message}")]
+    InspectFailed { path: String, message: String },
 }
 
 /// Specific types of attestation slashing violations per EIP-3076.

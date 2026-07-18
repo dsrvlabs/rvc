@@ -20,12 +20,19 @@
 //! A backup `<path>.bak.<UNIX_TS>` is written before any ALTER fires.
 
 use parking_lot::Mutex;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
+
+/// SQLite main-database file magic (`"SQLite format 3\0"`).
+///
+/// Used by SEC-3 preflight so a truncated/garbage file is rejected before
+/// `Connection::open` / `migrate()` would treat a 0-byte path as a fresh DB.
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
 use crate::error::{AttestationSlashingViolation, BlockSlashingViolation, SlashingError};
 use crate::migration;
@@ -78,11 +85,46 @@ impl SlashingDb {
     /// Schema v2 migration runs **eagerly** and is idempotent (re-opening a v2 DB is a no-op).
     /// A backup `<path>.bak.<UNIX_TS>` is written before any ALTER fires.
     ///
+    /// # SEC-3 fail-closed preflight
+    ///
+    /// A **0-byte** or **non-SQLite-header** file is always rejected as
+    /// [`SlashingError::CorruptOrEmpty`] — SQLite would otherwise treat a
+    /// truncated file as a brand-new empty DB and `migrate()` would populate
+    /// schema with zero history. Missing paths are still created here (library
+    /// / test convenience); production startup gates fresh create behind an
+    /// operator opt-in in `ServiceBuilder::build_slashing_db`.
+    ///
     /// # Errors
     /// Returns `SlashingError::MigrationFailed` if the backup or migration fails.
+    /// Returns `SlashingError::CorruptOrEmpty` for 0-byte / bad-header files.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, SlashingError> {
+        let (db, _created_fresh) = Self::open_with_create_info(path)?;
+        Ok(db)
+    }
+
+    /// Like [`Self::open`], but reports whether a new file was created.
+    ///
+    /// `created_fresh == true` means the path did not exist and a new empty DB
+    /// was initialized (zero history). Callers that care about fail-closed
+    /// startup (the VC builder) must gate that path on an explicit opt-in.
+    pub fn open_with_create_info<P: AsRef<Path>>(path: P) -> Result<(Self, bool), SlashingError> {
         let path = path.as_ref();
-        let conn = Connection::open(path)?;
+        let created_fresh = Self::preflight_path(path)?;
+
+        // Existing files: open without CREATE so we never silently re-create.
+        // Missing files: CREATE is required (caller already opted in, or this
+        // is a library/test path that still allows fresh create).
+        let flags = if created_fresh {
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI
+        } else {
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | OpenFlags::SQLITE_OPEN_URI
+        };
+        let conn = Connection::open_with_flags(path, flags)?;
 
         Self::configure_pragmas(&conn)?;
 
@@ -125,8 +167,52 @@ impl SlashingDb {
         #[cfg(unix)]
         Self::chmod_sidecars(path);
 
-        tracing::info!(path = %path.display(), "slashing protection database opened");
-        Ok(db)
+        if created_fresh {
+            tracing::info!(
+                path = %path.display(),
+                "slashing protection database created (fresh, zero history)"
+            );
+        } else {
+            tracing::info!(path = %path.display(), "slashing protection database opened");
+        }
+        Ok((db, created_fresh))
+    }
+
+    /// SEC-3: inspect `path` before SQLite open.
+    ///
+    /// Returns `true` if the path is missing (caller will create). Returns
+    /// `false` if a non-empty SQLite-header file is present. Rejects 0-byte
+    /// and corrupt-header files as [`SlashingError::CorruptOrEmpty`].
+    fn preflight_path(path: &Path) -> Result<bool, SlashingError> {
+        if !path.exists() {
+            return Ok(true);
+        }
+
+        let meta = std::fs::metadata(path).map_err(|e| SlashingError::InspectFailed {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?;
+        let size = meta.len();
+        if size == 0 {
+            return Err(SlashingError::CorruptOrEmpty {
+                path: path.display().to_string(),
+                size: 0,
+            });
+        }
+
+        let mut file = std::fs::File::open(path).map_err(|e| SlashingError::InspectFailed {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?;
+        let mut header = [0u8; 16];
+        let n = file.read(&mut header).map_err(|e| SlashingError::InspectFailed {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?;
+        if n < SQLITE_HEADER.len() || header != *SQLITE_HEADER {
+            return Err(SlashingError::CorruptOrEmpty { path: path.display().to_string(), size });
+        }
+        Ok(false)
     }
 
     /// Set 0o600 on the main slashing-DB file (Unix only). Failure is a
@@ -2101,6 +2187,53 @@ mod tests {
         let db = SlashingDb::open(&path);
         assert!(db.is_ok());
         assert!(path.exists());
+    }
+
+    /// SEC-3: a 0-byte file must never be treated as a fresh init.
+    #[test]
+    fn test_open_zero_byte_file_is_corrupt() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("zero.db");
+        std::fs::write(&path, b"").expect("write empty");
+
+        match SlashingDb::open(&path) {
+            Ok(_) => panic!("0-byte DB must fail closed"),
+            Err(SlashingError::CorruptOrEmpty { size, .. }) => assert_eq!(size, 0),
+            Err(other) => panic!("expected CorruptOrEmpty, got {other}"),
+        }
+        // File must not have been wiped/replaced with a valid DB.
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    }
+
+    /// SEC-3: a non-empty file without a SQLite header is corruption.
+    #[test]
+    fn test_open_corrupt_header_is_rejected() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("garbage.db");
+        std::fs::write(&path, b"not a sqlite database!!!!").expect("write garbage");
+
+        match SlashingDb::open(&path) {
+            Ok(_) => panic!("corrupt header must fail closed"),
+            Err(SlashingError::CorruptOrEmpty { .. }) => {}
+            Err(other) => panic!("expected CorruptOrEmpty, got {other}"),
+        }
+        // Must not wipe the non-empty garbage file.
+        let contents = std::fs::read(&path).unwrap();
+        assert_eq!(contents, b"not a sqlite database!!!!");
+    }
+
+    /// SEC-3: open_with_create_info reports created_fresh for a missing path.
+    #[test]
+    fn test_open_with_create_info_flags_fresh() {
+        let dir = tempdir().expect("failed to create temp dir");
+        let path = dir.path().join("fresh.db");
+
+        let (_db, created_fresh) = SlashingDb::open_with_create_info(&path).expect("create fresh");
+        assert!(created_fresh);
+
+        let (_db2, created_again) =
+            SlashingDb::open_with_create_info(&path).expect("re-open existing");
+        assert!(!created_again);
     }
 
     #[test]

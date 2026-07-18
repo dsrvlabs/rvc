@@ -65,6 +65,14 @@ enum Commands {
         #[arg(long)]
         slashing_db_path: Option<PathBuf>,
 
+        /// Allow creating a fresh empty slashing-protection DB when the path is
+        /// missing (SEC-3). DANGEROUS on a previously-active validator: the new
+        /// DB has zero signing history and can enable double-signing / slashing.
+        /// Use only for genuine first-time deployments. A 0-byte or corrupt DB
+        /// is always a hard error regardless of this flag.
+        #[arg(long, default_value_t = false)]
+        init_slashing_db: bool,
+
         /// Bind address for the metrics HTTP server (default: 127.0.0.1)
         #[arg(long, default_value_t = DEFAULT_METRICS_ADDRESS)]
         metrics_address: IpAddr,
@@ -490,6 +498,7 @@ async fn main() -> anyhow::Result<()> {
             keystore_path,
             password_file,
             slashing_db_path,
+            init_slashing_db,
             metrics_address,
             metrics_port,
             grpc_port,
@@ -608,6 +617,7 @@ async fn main() -> anyhow::Result<()> {
                 keystore_path,
                 password_file,
                 slashing_db_path,
+                init_slashing_db: if init_slashing_db { Some(true) } else { None },
                 metrics_address: Some(metrics_address),
                 metrics_port: Some(metrics_port),
                 grpc_port: Some(grpc_port),
