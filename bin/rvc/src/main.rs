@@ -13,8 +13,9 @@ use metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
 use rvc::config::{redact_url, CliOverrides, Config, Network, ServiceBuilder};
 use rvc::duty_tracker::DutyTrackerService;
 use rvc::keymanager_adapters::{
-    KeystoreManagerAdapter, RemoteKeyManagerAdapter, SlashingProtectionAdapter,
-    ValidatorConfigManagerAdapter, ValidatorManagerAdapter, VoluntaryExitManagerAdapter,
+    ForwardWindowMonitor, KeystoreManagerAdapter, RemoteKeyManagerAdapter,
+    SlashingProtectionAdapter, ValidatorConfigManagerAdapter, ValidatorManagerAdapter,
+    VoluntaryExitManagerAdapter,
 };
 use rvc::startup;
 use rvc::DutyTrackerServer;
@@ -96,7 +97,13 @@ enum Commands {
         #[arg(long)]
         graffiti: Option<String>,
 
-        /// Disable doppelganger detection (enabled by default)
+        /// Disable doppelganger / forward-window protection (enabled by default).
+        ///
+        /// When enabled (default), newly loaded and imported keys are withheld from
+        /// signing for ~2 epochs (~12.8 min on mainnet) while network liveness is
+        /// observed, mitigating double-signing if another live instance holds the
+        /// same keys. Opting out removes that safety cost but exposes the process
+        /// to the Staked 2021 / SSV-Ankr class of mass-slashing incidents.
         #[arg(long)]
         no_doppelganger_detection: bool,
 
@@ -1280,52 +1287,25 @@ async fn run_validator(
         None
     };
 
-    // Spawn secret provider refresh task (if configured)
-    let refresh_interval = config.secret_provider.refresh_interval.unwrap_or(0);
-    if refresh_interval > 0 && !secret_providers.is_empty() {
-        // Live denylist check so a Keymanager DELETE mid-process is not undone
-        // by the next secret-provider refresh cycle (SEC-1b).
-        let denylist_for_refresh = std::sync::Arc::clone(&deletion_denylist);
-        let is_denied: secret_provider::DenylistCheck =
-            std::sync::Arc::new(move |pk: &[u8; 48]| denylist_for_refresh.contains(pk));
-        let refresh_service = secret_provider::RefreshService::with_denylist(
-            secret_providers,
-            known_pubkeys,
-            Some(is_denied),
-            std::time::Duration::from_secs(refresh_interval),
-            shutdown_token.clone(),
-        );
-        let signer_for_refresh = std::sync::Arc::clone(&composite_signer);
-        // Re-check denylist immediately before add_local_key so a concurrent
-        // DELETE that landed after refresh's post-convert check cannot
-        // re-activate the key (SEC-1b Finding 3 TOCTOU).
-        let denylist_for_callback = std::sync::Arc::clone(&deletion_denylist);
-        tokio::spawn(async move {
-            refresh_service
-                .run(move |sk| {
-                    let pk = sk.public_key().to_bytes();
-                    if denylist_for_callback.contains(&pk) {
-                        tracing::info!(
-                            pubkey = %crypto::logging::TruncatedPubkey::new(&format!(
-                                "0x{}",
-                                hex::encode(pk)
-                            )),
-                            "Skipping denylisted key at refresh callback (DELETE raced refresh)"
-                        );
-                        return;
-                    }
-                    signer_for_refresh.add_local_key(sk);
-                })
-                .await;
-        });
-        info!(interval_secs = refresh_interval, "Secret provider refresh task started");
-    }
-
     // Resolve validator indices using BnManager (via trait)
     let beacon_for_resolve: &dyn BeaconNodeClient = bn_manager.as_ref();
     let validator_index_map = resolve_validator_indices(beacon_for_resolve, &pubkey_map).await;
 
-    // Step 6: Doppelganger detection (if enabled)
+    // Step 6: Doppelganger detection (if enabled) + SEC-2b ForwardWindowMachine
+    //
+    // SEC-2b: construct ForwardWindowMachine (or operator opt-out) and wire it as
+    // the production SignerService SigningEnablement. Keys stay closed until the
+    // monitoring window elapses with complete liveness (SEC-2c drives observation;
+    // until then the gate is fail-safe closed except epoch-0 bypass / restart skip).
+    // Cost when on: ~2 epochs ≈ 12.8 min of withheld signing on mainnet.
+    //
+    // Shared monotonic epoch clock (M-7) for boot register + keymanager import
+    // so NTP cannot compress the window and wall-clock alone cannot force epoch 0.
+    let genesis_time_for_epoch = config.effective_genesis_time().unwrap_or(0);
+    let epoch_clock =
+        std::sync::Arc::new(doppelganger::MonotonicEpochClock::new(genesis_time_for_epoch));
+    let enablement_epoch = epoch_clock.current_epoch();
+
     if doppelganger_enabled && !pubkey_map.read().is_empty() {
         let validator_index_map = match validator_index_map {
             Ok(ref map) if !map.is_empty() => map.clone(),
@@ -1351,19 +1331,16 @@ async fn run_validator(
 
             let pubkeys: Vec<String> = pubkey_map.read().keys().cloned().collect();
 
-            // M-7 (ISSUE-3.6): use the doppelganger service's monotonic clock,
-            // not the wall-clock slot_clock. The slot clock is wall-clock-derived
-            // and an NTP step can advance current_epoch enough to compress the
-            // doppelganger monitoring window. doppelganger_service.current_epoch()
-            // is anchored on a monotonic Instant captured at startup.
-            let current_epoch = doppelganger_service.current_epoch();
+            // Prefer the shared monotonic epoch_clock for enablement registration;
+            // one-shot service still uses its own clock for the legacy path.
+            let current_epoch = epoch_clock.current_epoch();
 
             // S-3 (Issue 2.8): detection is always invoked — the epoch-0 case is
             // handled inside startup::run_doppelganger_detection as an explicit,
             // logged pre-genesis bypass that returns all validators Safe without
             // issuing a beacon liveness query (so a pre-genesis BN error cannot
-            // abort startup).  ForwardWindowMachine also applies an epoch-0 bypass
-            // for the future production wiring path (Issue 2.10).
+            // abort startup).  Boot register still applies epoch-0 Safe on the
+            // machine; API import uses register_for_import (no Safe bypass).
             if current_epoch == 0 {
                 info!(
                     "Doppelganger detection: pre-genesis (epoch 0) startup — \
@@ -1392,8 +1369,68 @@ async fn run_validator(
         warn!("Doppelganger detection is disabled");
     }
 
+    // SEC-2b: construct enablement (ForwardWindowMachine or operator opt-out)
+    // and hand it to the production SignerService.
+    //
+    // Restart-aware safe-skip (boot register only): if local slashing history
+    // shows a recent attestation under this GVR, the key is marked Safe without
+    // network observation. Do NOT copy a live slashing DB to a second VC — that
+    // would open a dual-instance fail-open. API import uses register_for_import
+    // (always Pending).
+    let (signing_enablement, forward_window_machine) = builder.build_signing_enablement(
+        slashing_db.clone(),
+        genesis_validators_root,
+        enablement_epoch,
+        &pubkey_map,
+    );
+
+    // Secret-provider refresh: after machine is available, register newly
+    // discovered local keys (import-strict) so they are not permanently Unmonitored.
+    let refresh_interval = config.secret_provider.refresh_interval.unwrap_or(0);
+    if refresh_interval > 0 && !secret_providers.is_empty() {
+        let denylist_for_refresh = std::sync::Arc::clone(&deletion_denylist);
+        let is_denied: secret_provider::DenylistCheck =
+            std::sync::Arc::new(move |pk: &[u8; 48]| denylist_for_refresh.contains(pk));
+        let refresh_service = secret_provider::RefreshService::with_denylist(
+            secret_providers,
+            known_pubkeys,
+            Some(is_denied),
+            std::time::Duration::from_secs(refresh_interval),
+            shutdown_token.clone(),
+        );
+        let signer_for_refresh = std::sync::Arc::clone(&composite_signer);
+        let denylist_for_callback = std::sync::Arc::clone(&deletion_denylist);
+        let machine_for_refresh = forward_window_machine.clone();
+        let epoch_clock_for_refresh = std::sync::Arc::clone(&epoch_clock);
+        tokio::spawn(async move {
+            refresh_service
+                .run(move |sk| {
+                    let pk_bytes = sk.public_key().to_bytes();
+                    if denylist_for_callback.contains(&pk_bytes) {
+                        tracing::info!(
+                            pubkey = %crypto::logging::TruncatedPubkey::new(&format!(
+                                "0x{}",
+                                hex::encode(pk_bytes)
+                            )),
+                            "Skipping denylisted key at refresh callback (DELETE raced refresh)"
+                        );
+                        return;
+                    }
+                    let pk = sk.public_key();
+                    if let Some(ref machine) = machine_for_refresh {
+                        // Import-strict: no restart Safe-skip for dynamically added keys.
+                        machine.register_for_import(&pk, epoch_clock_for_refresh.current_epoch());
+                    }
+                    signer_for_refresh.add_local_key(sk);
+                })
+                .await;
+        });
+        info!(interval_secs = refresh_interval, "Secret provider refresh task started");
+    }
+
     // Step 7: Build remaining services
-    let signer = builder.build_signer(composite_signer.clone(), slashing_db.clone());
+    let signer =
+        builder.build_signer(composite_signer.clone(), slashing_db.clone(), signing_enablement);
     let propagator = builder.build_propagator(beacon_client.clone());
     let validator_store = builder.build_validator_store(config.validators_config.as_deref())?;
 
@@ -1548,30 +1585,49 @@ async fn run_validator(
         ));
         let validator_mgr =
             std::sync::Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
-        // M-12: use a time-based doppelganger gate for newly imported keys.
-        // When doppelganger detection is disabled (doppelganger_enabled = false)
-        // the window is Duration::ZERO so keys are immediately enabled.
+        // M-12: time-based window for the delayed set_enabled task. When
+        // doppelganger is disabled the window is Duration::ZERO so keys are
+        // immediately enabled. When on: 2 epochs × 32 slots × 12 s = 768 s.
         let doppelganger_window = if doppelganger_enabled {
-            // 2 epochs × 32 slots/epoch × 12 s/slot = 768 s (mainnet default)
             std::time::Duration::from_secs(
                 2 * eth_types::SLOTS_PER_EPOCH * eth_types::SECONDS_PER_SLOT,
             )
         } else {
             std::time::Duration::ZERO
         };
-        let doppelganger_mon =
-            std::sync::Arc::new(keymanager_api::gate::DoppelgangerGate::new(doppelganger_window));
 
-        // M-12 (Critical #2): after a restart, re-arm the gate for any key
-        // whose import-time sidecar shows the doppelganger window has not yet
-        // elapsed.  This prevents keys from bypassing the window on restart.
-        if !doppelganger_window.is_zero() {
-            rvc::keymanager_adapters::scan_and_rearm_gate(
-                &config.keystore_path,
-                doppelganger_mon.as_ref(),
-                doppelganger_window.as_secs(),
-            );
-        }
+        // SEC-2b: when a ForwardWindowMachine is wired, keymanager imports
+        // register with it (signing gate). Same monotonic epoch_clock as boot.
+        // Fall back to the time-based DoppelgangerGate when doppelganger is opted out.
+        let doppelganger_mon: std::sync::Arc<dyn keymanager_api::traits::DoppelgangerMonitor> =
+            if let Some(machine) = forward_window_machine.clone() {
+                let clock = std::sync::Arc::clone(&epoch_clock);
+                let epoch_provider: std::sync::Arc<dyn Fn() -> u64 + Send + Sync> =
+                    std::sync::Arc::new(move || clock.current_epoch());
+                let mon = std::sync::Arc::new(ForwardWindowMonitor::new(machine, epoch_provider));
+                // Re-arm recently imported keys against the machine after restart
+                // (register_for_import → Pending, not Safe).
+                if !doppelganger_window.is_zero() {
+                    rvc::keymanager_adapters::scan_and_rearm_gate(
+                        &config.keystore_path,
+                        mon.as_ref(),
+                        doppelganger_window.as_secs(),
+                    );
+                }
+                mon
+            } else {
+                let gate = std::sync::Arc::new(keymanager_api::gate::DoppelgangerGate::new(
+                    doppelganger_window,
+                ));
+                if !doppelganger_window.is_zero() {
+                    rvc::keymanager_adapters::scan_and_rearm_gate(
+                        &config.keystore_path,
+                        gate.as_ref(),
+                        doppelganger_window.as_secs(),
+                    );
+                }
+                gate
+            };
 
         let remote_key_mgr = std::sync::Arc::new(RemoteKeyManagerAdapter::new(
             km_composite,

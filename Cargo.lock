@@ -4168,6 +4168,7 @@ dependencies = [
  "rvc-bn-manager",
  "rvc-builder",
  "rvc-crypto",
+ "rvc-doppelganger",
  "rvc-eth-types",
  "rvc-grpc-signer",
  "rvc-keymanager-api",

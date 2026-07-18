@@ -54,7 +54,22 @@ pub trait ValidatorManager: Send + Sync {
 /// Triggers doppelganger detection for newly imported keys.
 pub trait DoppelgangerMonitor: Send + Sync {
     fn start_monitoring(&self, pubkey: Pubkey);
+    /// Signal that the wall-clock M-12 import window has elapsed (or prune a
+    /// time-based pending entry).
+    ///
+    /// **Must not** tear down forward-window enablement state that still needs
+    /// network liveness satisfaction (SEC-2b/2c). Production
+    /// `ForwardWindowMachine` adapters treat this as a no-op for machine state;
+    /// only [`Self::cancel_monitoring`] (DELETE) removes machine registration.
     fn stop_monitoring(&self, pubkey: &Pubkey);
+    /// DELETE / hard-remove path: drop all monitoring state so a re-import starts
+    /// a fresh window (`ForwardWindowMachine::cancel`).
+    ///
+    /// Default: same as [`Self::stop_monitoring`] (time-based gates where both
+    /// mean "prune pending").
+    fn cancel_monitoring(&self, pubkey: &Pubkey) {
+        self.stop_monitoring(pubkey);
+    }
     /// Returns `true` if the doppelganger window for this key has elapsed.
     ///
     /// Keys that are not under active monitoring (e.g. existing keys loaded at

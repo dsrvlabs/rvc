@@ -12,7 +12,11 @@ use crate::error::DoppelgangerError;
 use crate::traits::{LegacySlashingHistoryReader, LivenessChecker};
 use crate::{DoppelgangerResult, DoppelgangerStatus};
 
-const DEFAULT_MONITORING_EPOCHS: u64 = 2;
+/// Default forward-window length in epochs (≈ 2 epochs / ~12.8 min on mainnet).
+///
+/// Shared by [`crate::DoppelgangerService`] and [`crate::ForwardWindowMachine`]
+/// production wiring (SEC-2b).
+pub const DEFAULT_MONITORING_EPOCHS: u64 = 2;
 
 /// Service for detecting doppelganger validators.
 ///

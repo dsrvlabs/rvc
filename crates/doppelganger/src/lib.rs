@@ -5,16 +5,18 @@
 //! when a validator client restarts after recently signing attestations.
 
 mod enablement;
+mod epoch_clock;
 mod error;
 mod forward_window;
 mod service;
 mod state;
 mod traits;
 
-pub use enablement::SigningEnablement;
+pub use enablement::{DoppelgangerDisabledByOperator, SigningEnablement};
+pub use epoch_clock::MonotonicEpochClock;
 pub use error::DoppelgangerError;
 pub use forward_window::ForwardWindowMachine;
-pub use service::DoppelgangerService;
+pub use service::{DoppelgangerService, DEFAULT_MONITORING_EPOCHS};
 pub use state::{ForwardWindowStatus, ValidatorState};
 pub use traits::{LegacySlashingHistoryReader, LivenessChecker, ValidatorLivenessData};
 

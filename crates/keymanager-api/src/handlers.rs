@@ -260,7 +260,10 @@ pub async fn import_keystores(
                                     return;
                                 }
                                 vm.set_validator_enabled(&pubkey, true);
-                                dm.stop_monitoring(&pubkey); // SF-4: prune pending entry
+                                // SF-4 / SEC-2b: prune wall-clock pending only.
+                                // Must NOT cancel ForwardWindowMachine state —
+                                // M-12 elapsed ≠ forward-window satisfied.
+                                dm.stop_monitoring(&pubkey);
                                 // KM-2 (c): prune our OWN cancel-token entry now
                                 // that the window has elapsed.  We hold
                                 // `doppelganger_state_lock` here, consistent with
@@ -403,7 +406,9 @@ pub async fn delete_keystores(
                             "Keystore delete result"
                         );
                         state.validator_manager.remove_validator(pubkey);
-                        state.doppelganger_monitor.stop_monitoring(pubkey);
+                        // DELETE: hard-cancel forward-window / gate state so a
+                        // re-import starts a fresh monitoring window (KM-2).
+                        state.doppelganger_monitor.cancel_monitoring(pubkey);
                         results.push(DeleteKeystoreResult {
                             status: DeleteStatus::Deleted,
                             message: String::new(),
@@ -507,6 +512,9 @@ pub async fn import_remote_keys(
                 }
                 match state.remote_key_manager.import_remote_key(pubkey, key_import.url.clone()) {
                     Ok(()) => {
+                        // SEC-2b: register remote keys with the same enablement
+                        // gate as local imports (fail-closed until window).
+                        state.doppelganger_monitor.start_monitoring(pubkey);
                         info!(
                             pubkey = %TruncatedPubkey::new(&key_import.pubkey),
                             url = %RedactedUrl(&key_import.url),
@@ -573,6 +581,7 @@ pub async fn delete_remote_keys(
         match parse_pubkey(pubkey_str) {
             Ok(pubkey) => match state.remote_key_manager.delete_remote_key(&pubkey) {
                 Ok(true) => {
+                    state.doppelganger_monitor.cancel_monitoring(&pubkey);
                     warn!(
                         pubkey = %TruncatedPubkey::new(pubkey_str),
                         status = "deleted",

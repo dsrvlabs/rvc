@@ -18,9 +18,12 @@ use beacon::{BeaconClient, BeaconClientConfig};
 use bn_manager::{BeaconNodeClient, BnManager, BnManagerConfig};
 use builder::BuilderService;
 use crypto::{CompositeSigner, KeyManager, LocalSigner};
-use doppelganger::DoppelgangerService;
+use doppelganger::{
+    DoppelgangerDisabledByOperator, DoppelgangerService, ForwardWindowMachine, SigningEnablement,
+    DEFAULT_MONITORING_EPOCHS,
+};
 use duty_tracker::DutyTracker;
-use eth_types::{ForkSchedule, Root};
+use eth_types::{Epoch, ForkSchedule, Root};
 use propagator::{AttestationSubmitter, Propagator};
 use signer::SignerService;
 use slashing::SlashingDb;
@@ -212,14 +215,82 @@ impl ServiceBuilder {
         Ok(Arc::new(db))
     }
 
+    /// Build the production [`SignerService`] with the given signing enablement.
+    ///
+    /// Callers must supply the enablement produced by
+    /// [`Self::build_signing_enablement`] (or an equivalent). The enablement is
+    /// the doppelganger gate consulted on every duty-signing path (SEC-2a/2b).
     pub fn build_signer(
         &self,
         composite_signer: Arc<CompositeSigner>,
         slashing_db: Arc<SlashingDb>,
+        enablement: Arc<dyn SigningEnablement>,
     ) -> Arc<SignerService> {
-        let signer = SignerService::new(composite_signer, slashing_db);
-        info!("Created signer service");
+        let signer = SignerService::new(composite_signer, slashing_db).with_enablement(enablement);
+        info!("Created signer service with signing enablement (SEC-2b)");
         Arc::new(signer)
+    }
+
+    /// Construct the production [`SigningEnablement`] (SEC-2b).
+    ///
+    /// - When doppelganger detection is **enabled** (default): builds a
+    ///   [`ForwardWindowMachine`], registers every loaded key at
+    ///   `current_epoch`, and returns it as the enablement. Keys remain
+    ///   closed until the monitoring window elapses with complete liveness
+    ///   observations (driven by SEC-2c). Epoch-0 registration is immediately
+    ///   `Safe` (pre-genesis bypass). Cost: ~[`DEFAULT_MONITORING_EPOCHS`]
+    ///   epochs (~12.8 min on mainnet).
+    /// - When **disabled** (`--no-doppelganger-detection`): returns
+    ///   [`DoppelgangerDisabledByOperator`], which enables every key.
+    ///
+    /// The optional machine handle is returned so keymanager import /
+    /// secret-provider refresh can `register_for_import` against the same
+    /// instance (import-strict: no restart Safe-skip).
+    ///
+    /// # Restart-aware safe-skip (boot only)
+    ///
+    /// Boot `register` may mark a key `Safe` if local slashing history shows a
+    /// recent attestation under this GVR (same-host restart). **Do not copy a
+    /// live slashing DB to a second VC** — that would dual-open signing without
+    /// network liveness. API import uses `register_for_import` and never skips.
+    pub fn build_signing_enablement(
+        &self,
+        slashing_db: Arc<SlashingDb>,
+        gvr: Root,
+        current_epoch: Epoch,
+        pubkey_map: &PubkeyMap,
+    ) -> (Arc<dyn SigningEnablement>, Option<Arc<ForwardWindowMachine>>) {
+        if !self.config.doppelganger_detection {
+            tracing::warn!(
+                "Doppelganger detection disabled by operator (--no-doppelganger-detection). \
+                 Forward-window protection is off; a duplicate live instance can double-sign. \
+                 Default on costs ~{DEFAULT_MONITORING_EPOCHS} epochs of withheld signing \
+                 (~12.8 min on mainnet)."
+            );
+            return (Arc::new(DoppelgangerDisabledByOperator), None);
+        }
+
+        let reader: Arc<dyn slashing::SlashingDbReader> = slashing_db;
+        let machine = Arc::new(ForwardWindowMachine::new(reader, DEFAULT_MONITORING_EPOCHS, gvr));
+
+        let mut registered = 0usize;
+        for pubkey in pubkey_map.read().values() {
+            machine.register(pubkey, current_epoch);
+            registered += 1;
+        }
+
+        info!(
+            monitoring_epochs = DEFAULT_MONITORING_EPOCHS,
+            current_epoch,
+            registered,
+            "ForwardWindowMachine constructed (SEC-2b). Keys stay closed until \
+             {DEFAULT_MONITORING_EPOCHS} epochs of network liveness are observed \
+             (~12.8 min on mainnet). Liveness observation loop lands in SEC-2c; \
+             until then the gate remains fail-safe closed (except epoch-0 bypass \
+             and restart-aware safe-skip)."
+        );
+
+        (Arc::clone(&machine) as Arc<dyn SigningEnablement>, Some(machine))
     }
 
     pub fn build_propagator<S: AttestationSubmitter>(
@@ -488,7 +559,24 @@ impl ServiceBuilder {
             )
         })?;
         let composite_signer = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager_owned)));
-        let signer = self.build_signer(composite_signer.clone(), slashing_db.clone());
+
+        let genesis_validators_root = self.parse_genesis_validators_root()?;
+        info!(
+            genesis_validators_root = %format!("0x{}", hex::encode(genesis_validators_root)),
+            "Parsed genesis validators root"
+        );
+
+        // SEC-2b: wire ForwardWindowMachine (or operator opt-out) as enablement.
+        // Use a non-zero epoch so build_all does not accidentally apply the
+        // epoch-0 Safe bypass (not for production daemon — bin/rvc supplies
+        // the real monotonic epoch).
+        let (enablement, _machine) = self.build_signing_enablement(
+            slashing_db.clone(),
+            genesis_validators_root,
+            1,
+            &pubkey_map,
+        );
+        let signer = self.build_signer(composite_signer.clone(), slashing_db.clone(), enablement);
         let propagator = self.build_propagator(beacon_client.clone());
         let slot_clock = self.build_slot_clock()?;
         let validator_store =
@@ -507,12 +595,6 @@ impl ServiceBuilder {
         } else {
             None
         };
-
-        let genesis_validators_root = self.parse_genesis_validators_root()?;
-        info!(
-            genesis_validators_root = %format!("0x{}", hex::encode(genesis_validators_root)),
-            "Parsed genesis validators root"
-        );
 
         let genesis_fork_version = fork_schedule.genesis_fork_version;
         let builder_service = Some(self.build_builder_service(
@@ -689,7 +771,8 @@ mod tests {
 
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = builder.build_signer(composite, slashing_db);
+        let enablement: Arc<dyn SigningEnablement> = Arc::new(DoppelgangerDisabledByOperator);
+        let signer = builder.build_signer(composite, slashing_db, enablement);
 
         assert!(signer.signer().public_keys().is_empty());
     }
@@ -814,7 +897,8 @@ mod tests {
         let beacon = builder.build_beacon().unwrap();
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer = builder.build_signer(composite, slashing_db);
+        let enablement: Arc<dyn SigningEnablement> = Arc::new(DoppelgangerDisabledByOperator);
+        let signer = builder.build_signer(composite, slashing_db, enablement);
 
         // Build a temp validators config with a non-zero fee_recipient to satisfy the guard.
         let temp_dir = TempDir::new().unwrap();
@@ -975,5 +1059,108 @@ mod tests {
             !store.is_signing_enabled(&pk),
             "registration must not re-enable a validator already tracked as disabled"
         );
+    }
+
+    // ── SEC-2b: ForwardWindowMachine construction + wiring ─────────────────
+
+    /// Startup wiring: with doppelganger on, `build_signing_enablement` returns
+    /// a live `ForwardWindowMachine` (not the opt-out / fail-closed default).
+    #[test]
+    fn test_bin_rvc_constructs_forward_window_machine() {
+        let config = create_minimal_config(); // doppelganger_detection defaults true
+        assert!(config.doppelganger_detection);
+        let builder = ServiceBuilder::new(config);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let gvr = [0x11u8; 32];
+        let (_, pubkey_map) = loaded_key_manager(&builder, 1);
+
+        let (enablement, machine) =
+            builder.build_signing_enablement(slashing_db, gvr, 10, &pubkey_map);
+
+        let machine = machine.expect("doppelganger on must construct ForwardWindowMachine");
+        // Same object is both the enablement and the machine handle.
+        let pk = pubkey_map.read().values().next().unwrap().clone();
+        assert!(
+            !enablement.is_signing_enabled(&pk),
+            "registered key at epoch>0 must be gate-closed before liveness window"
+        );
+        assert!(
+            !machine.is_signing_enabled(&pk),
+            "machine handle must agree with enablement for the registered key"
+        );
+        assert_eq!(
+            machine.status(&pk),
+            doppelganger::ForwardWindowStatus::Pending,
+            "fresh registration at epoch 10 must be Pending"
+        );
+    }
+
+    /// A key registered at epoch E cannot sign before the window elapses when
+    /// no external liveness is observed (fail-safe until SEC-2c).
+    #[test]
+    fn test_registered_key_gate_closed_until_window_elapses() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let gvr = [0x22u8; 32];
+        let (key_manager, pubkey_map) = loaded_key_manager(&builder, 1);
+        let pk = key_manager.list_public_keys()[0].clone();
+
+        let (enablement, machine) =
+            builder.build_signing_enablement(slashing_db, gvr, 50, &pubkey_map);
+        let machine = machine.expect("machine present");
+
+        assert!(!enablement.is_signing_enabled(&pk));
+
+        // Tick well past the boundary WITHOUT observe_liveness → still closed.
+        let end_epoch = 50 + DEFAULT_MONITORING_EPOCHS;
+        machine.tick(end_epoch + 5, 0);
+        assert!(
+            !enablement.is_signing_enabled(&pk),
+            "without complete liveness observation the gate must stay closed (D-2 fail-closed)"
+        );
+    }
+
+    /// Epoch-0 (pre-genesis) bypass: registered keys are immediately Safe.
+    #[test]
+    fn test_epoch0_bypass_preserved() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let gvr = [0x33u8; 32];
+        let (key_manager, pubkey_map) = loaded_key_manager(&builder, 1);
+        let pk = key_manager.list_public_keys()[0].clone();
+
+        let (enablement, machine) =
+            builder.build_signing_enablement(slashing_db, gvr, 0, &pubkey_map);
+
+        assert!(machine.is_some());
+        assert!(
+            enablement.is_signing_enabled(&pk),
+            "epoch-0 register must immediately enable signing (pre-genesis bypass)"
+        );
+    }
+
+    /// Operator opt-out: no machine, every key enabled.
+    #[test]
+    fn test_doppelganger_opt_out_uses_disabled_by_operator() {
+        let config = Config { doppelganger_detection: false, ..create_minimal_config() };
+        let builder = ServiceBuilder::new(config);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let gvr = [0x44u8; 32];
+        let (key_manager, pubkey_map) = loaded_key_manager(&builder, 1);
+        let pk = key_manager.list_public_keys()[0].clone();
+
+        let (enablement, machine) =
+            builder.build_signing_enablement(slashing_db, gvr, 99, &pubkey_map);
+
+        assert!(machine.is_none(), "opt-out must not construct ForwardWindowMachine");
+        assert!(
+            enablement.is_signing_enabled(&pk),
+            "DoppelgangerDisabledByOperator must enable all keys"
+        );
+        // Untracked pubkey also enabled (opt-out is total).
+        let other = crypto::SecretKey::generate().public_key();
+        assert!(enablement.is_signing_enabled(&other));
     }
 }

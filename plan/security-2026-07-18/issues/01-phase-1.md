@@ -369,17 +369,18 @@ and make doppelganger on-by-default with the existing opt-out.
 - `test_epoch0_bypass_preserved`
 
 **Acceptance criteria:**
-- [ ] `bin/rvc` (not just `bin/rvc-signer`) constructs `ForwardWindowMachine`, verified by a startup or
+- [x] `bin/rvc` (not just `bin/rvc-signer`) constructs `ForwardWindowMachine`, verified by a startup or
       integration test.
-- [ ] A key added at epoch E cannot obtain a signature before the configured window elapses with no
+- [x] A key added at epoch E cannot obtain a signature before the configured window elapses with no
       external liveness.
-- [ ] A keymanager-imported key goes through the same window.
-- [ ] Doppelganger on-by-default with a working opt-out; the ~2-3 epoch missed-duty cost is documented.
-- [ ] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
+- [x] A keymanager-imported key goes through the same window.
+- [x] Doppelganger on-by-default with a working opt-out; the ~2-3 epoch missed-duty cost is documented.
+- [x] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
 
 **Risks / unknowns:**
 - The exact hand-off point (main.rs vs builder) depends on construction order (the signer is built in
   `builder.rs`, the beacon client / epoch are resolved in main.rs). Resolve in step 2; either works.
+  **Resolved:** machine built in builder/main wiring; liveness loop deferred to SEC-2c (fail-safe closed).
 
 ---
 

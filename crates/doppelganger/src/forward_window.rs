@@ -147,6 +147,46 @@ impl ForwardWindowMachine {
         );
     }
 
+    /// Register a **keymanager-imported** (or dynamically discovered) key.
+    ///
+    /// Unlike [`Self::register`], this path **never** applies:
+    /// - epoch-0 pre-genesis Safe bypass
+    /// - restart-aware Safe-skip from slashing-DB history
+    ///
+    /// Both bypasses are unsafe on the import path: a future/`mis-set`
+    /// genesis can yield epoch 0, and interchange import can plant recent
+    /// attestation history that would Safe-skip before any network liveness
+    /// is observed (SEC-2b review Finding 1 / 2). Imported keys always enter
+    /// `Pending` until SEC-2c observation + tick (or operator opt-out).
+    ///
+    /// Idempotent: existing non-`Unmonitored` state is left unchanged.
+    pub fn register_for_import(&self, pubkey: &crypto::PublicKey, current_epoch: Epoch) {
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let mut states = self.states.lock();
+
+        if let Some(state) = states.get(&pubkey_hex) {
+            if !matches!(state, ValidatorState::Unmonitored) {
+                return;
+            }
+        }
+
+        let end_epoch = current_epoch.saturating_add(self.monitoring_epochs);
+        tracing::info!(
+            pubkey = %crypto::logging::TruncatedPubkey::new(&pubkey_hex),
+            current_epoch,
+            end_epoch,
+            "doppelganger: import/register_for_import — forced Pending (no epoch-0 / restart safe-skip)"
+        );
+        states.insert(
+            pubkey_hex,
+            ValidatorState::Pending {
+                start_epoch: current_epoch,
+                end_epoch,
+                observed_epochs: BTreeSet::new(),
+            },
+        );
+    }
+
     /// Advance the state machine by one slot tick.
     ///
     /// A `Pending` validator transitions to `Safe` when ALL of the following hold:

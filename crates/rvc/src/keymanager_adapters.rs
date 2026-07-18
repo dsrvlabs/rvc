@@ -8,8 +8,10 @@ use async_trait::async_trait;
 use beacon::BeaconClient;
 use crypto::logging::TruncatedPubkey;
 use crypto::{CompositeSigner, Keystore, PublicKey, RemoteSigner, RemoteSignerConfig};
+use doppelganger::{ForwardWindowMachine, SigningEnablement};
 use eth_types::{
-    ForkSchedule, Root, SignedVoluntaryExit, VoluntaryExit, SECONDS_PER_SLOT, SLOTS_PER_EPOCH,
+    Epoch, ForkSchedule, Root, SignedVoluntaryExit, VoluntaryExit, SECONDS_PER_SLOT,
+    SLOTS_PER_EPOCH,
 };
 use keymanager_api::error::ApiError;
 use keymanager_api::traits::{
@@ -630,6 +632,125 @@ impl DoppelgangerMonitor for DoppelgangerMonitorAdapter {
     }
 }
 
+/// [`DoppelgangerMonitor`] that registers keymanager-imported keys with a
+/// production [`ForwardWindowMachine`] (SEC-2b).
+///
+/// | Call | Machine effect |
+/// |------|----------------|
+/// | `start_monitoring` | [`ForwardWindowMachine::register_for_import`] (always Pending) |
+/// | `stop_monitoring` | **no-op** — M-12 wall-clock elapsed must not cancel machine state |
+/// | `cancel_monitoring` | [`ForwardWindowMachine::cancel`] — DELETE / re-import fresh window |
+///
+/// Safety is the machine's `SigningEnablement` status (fail-closed for
+/// Pending/Detected/Unmonitored).
+pub struct ForwardWindowMonitor {
+    machine: Arc<ForwardWindowMachine>,
+    /// Supplies the current epoch for `register_for_import` (prefer
+    /// [`doppelganger::MonotonicEpochClock`] shared with boot registration).
+    epoch_provider: Arc<dyn Fn() -> Epoch + Send + Sync>,
+}
+
+impl ForwardWindowMonitor {
+    pub fn new(
+        machine: Arc<ForwardWindowMachine>,
+        epoch_provider: Arc<dyn Fn() -> Epoch + Send + Sync>,
+    ) -> Self {
+        Self { machine, epoch_provider }
+    }
+
+    /// Shared handle to the underlying machine (for tests / advanced wiring).
+    pub fn machine(&self) -> &Arc<ForwardWindowMachine> {
+        &self.machine
+    }
+
+    /// Register a newly discovered local key (secret-provider refresh, etc.)
+    /// with the same import-strict rules as keymanager import.
+    pub fn register_local_key(&self, pubkey: &PublicKey) {
+        let epoch = (self.epoch_provider)();
+        self.machine.register_for_import(pubkey, epoch);
+        info!(
+            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey.to_bytes())),
+            epoch,
+            "Registered dynamically discovered local key with ForwardWindowMachine (SEC-2b)"
+        );
+    }
+}
+
+impl DoppelgangerMonitor for ForwardWindowMonitor {
+    fn start_monitoring(&self, pubkey: Pubkey) {
+        match PublicKey::from_bytes(&pubkey) {
+            Ok(pk) => {
+                let epoch = (self.epoch_provider)();
+                // Import-strict: no restart safe-skip, no epoch-0 Safe bypass.
+                self.machine.register_for_import(&pk, epoch);
+                info!(
+                    pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                    epoch,
+                    "Registered keymanager-imported key with ForwardWindowMachine (SEC-2b)"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %hex::encode(pubkey),
+                    error = %e,
+                    "ForwardWindowMonitor: invalid pubkey on start_monitoring; key left unmonitored (fail-closed)"
+                );
+            }
+        }
+    }
+
+    fn stop_monitoring(&self, pubkey: &Pubkey) {
+        // SEC-2b review Finding 1: M-12 wall-clock elapsed calls stop_monitoring.
+        // That must NOT map to machine.cancel (which would drop Pending/Safe →
+        // Unmonitored and fight "window done → may sign" once SEC-2c opens).
+        // Validator-store enable is handled separately by the import handler.
+        info!(
+            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+            "ForwardWindowMonitor: stop_monitoring is a no-op for machine state \
+             (M-12 wall-clock ≠ forward-window cancel; use cancel_monitoring on DELETE)"
+        );
+    }
+
+    fn cancel_monitoring(&self, pubkey: &Pubkey) {
+        match PublicKey::from_bytes(pubkey) {
+            Ok(pk) => {
+                self.machine.cancel(&pk);
+                info!(
+                    pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                    "Cancelled ForwardWindowMachine monitoring for deleted key"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    pubkey = %hex::encode(pubkey),
+                    error = %e,
+                    "ForwardWindowMonitor: invalid pubkey on cancel_monitoring"
+                );
+            }
+        }
+    }
+
+    fn is_doppelganger_safe(&self, pubkey: &Pubkey) -> bool {
+        match PublicKey::from_bytes(pubkey) {
+            Ok(pk) => self.machine.is_signing_enabled(&pk),
+            // Invalid encoding → fail closed.
+            Err(_) => false,
+        }
+    }
+}
+
+/// Wall-clock epoch from genesis.
+///
+/// Prefer [`doppelganger::MonotonicEpochClock`] for production register paths
+/// (M-7). Kept for tests and non-critical fallbacks.
+pub fn wall_clock_epoch(genesis_time: u64) -> Epoch {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.saturating_sub(genesis_time) / SECONDS_PER_SLOT / SLOTS_PER_EPOCH
+}
+
 pub struct RemoteKeyManagerAdapter {
     composite_signer: Arc<CompositeSigner>,
     tracked_keys: Mutex<Vec<(Pubkey, String)>>,
@@ -1073,6 +1194,142 @@ mod tests {
         let adapter = DoppelgangerMonitorAdapter::new();
         adapter.start_monitoring(test_pubkey(1));
         adapter.stop_monitoring(&test_pubkey(1));
+    }
+
+    // --- SEC-2b: ForwardWindowMonitor (keymanager import → machine) ---
+
+    /// Keymanager import path registers the key with ForwardWindowMachine so
+    /// the production signing enablement gate applies to API-imported keys.
+    #[test]
+    fn test_keymanager_imported_key_registers_with_machine() {
+        use doppelganger::ForwardWindowStatus;
+
+        struct NoPrior;
+        impl slashing::SlashingDbReader for NoPrior {
+            fn last_signed_attestation(
+                &self,
+                _pubkey: &str,
+                _gvr: &Root,
+            ) -> Option<slashing::TargetEpoch> {
+                None
+            }
+        }
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+
+        let reader: Arc<dyn slashing::SlashingDbReader> = Arc::new(NoPrior);
+        let machine = Arc::new(ForwardWindowMachine::new(reader, 2, [0xabu8; 32]));
+        let epoch_provider: Arc<dyn Fn() -> Epoch + Send + Sync> = Arc::new(|| 42);
+        let monitor = ForwardWindowMonitor::new(Arc::clone(&machine), epoch_provider);
+
+        // Before import registration: unmonitored → not safe.
+        assert!(!monitor.is_doppelganger_safe(&pk_bytes));
+        assert_eq!(machine.status(&pk), ForwardWindowStatus::Unmonitored);
+
+        // Import handler calls start_monitoring → register_for_import at epoch 42.
+        monitor.start_monitoring(pk_bytes);
+
+        assert_eq!(
+            machine.status(&pk),
+            ForwardWindowStatus::Pending,
+            "imported key must be Pending on the ForwardWindowMachine"
+        );
+        assert!(
+            !monitor.is_doppelganger_safe(&pk_bytes),
+            "imported key must not be signing-safe until the window elapses"
+        );
+        assert!(!machine.is_signing_enabled(&pk));
+
+        // M-12 window elapsed: stop_monitoring must NOT cancel machine state.
+        monitor.stop_monitoring(&pk_bytes);
+        assert_eq!(
+            machine.status(&pk),
+            ForwardWindowStatus::Pending,
+            "stop_monitoring (M-12 elapsed) must leave machine Pending"
+        );
+
+        // DELETE path: cancel_monitoring drops state for re-import freshness.
+        monitor.cancel_monitoring(&pk_bytes);
+        assert_eq!(machine.status(&pk), ForwardWindowStatus::Unmonitored);
+    }
+
+    /// Import path never applies epoch-0 Safe bypass (SEC-2b Finding 2).
+    #[test]
+    fn test_keymanager_import_epoch0_stays_pending() {
+        use doppelganger::ForwardWindowStatus;
+
+        struct NoPrior;
+        impl slashing::SlashingDbReader for NoPrior {
+            fn last_signed_attestation(
+                &self,
+                _pubkey: &str,
+                _gvr: &Root,
+            ) -> Option<slashing::TargetEpoch> {
+                None
+            }
+        }
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+
+        let reader: Arc<dyn slashing::SlashingDbReader> = Arc::new(NoPrior);
+        let machine = Arc::new(ForwardWindowMachine::new(reader, 2, [0xacu8; 32]));
+        let epoch_provider: Arc<dyn Fn() -> Epoch + Send + Sync> = Arc::new(|| 0);
+        let monitor = ForwardWindowMonitor::new(Arc::clone(&machine), epoch_provider);
+
+        monitor.start_monitoring(pk_bytes);
+        assert_eq!(
+            machine.status(&pk),
+            ForwardWindowStatus::Pending,
+            "import at epoch 0 must stay Pending (no pre-genesis Safe bypass on import path)"
+        );
+        assert!(!monitor.is_doppelganger_safe(&pk_bytes));
+    }
+
+    /// Import + recent slashing history must NOT Safe-skip (interchange hazard).
+    #[test]
+    fn test_import_with_recent_history_stays_pending() {
+        use doppelganger::ForwardWindowStatus;
+
+        struct RecentPrior;
+        impl slashing::SlashingDbReader for RecentPrior {
+            fn last_signed_attestation(
+                &self,
+                _pubkey: &str,
+                _gvr: &Root,
+            ) -> Option<slashing::TargetEpoch> {
+                Some(98) // recent relative to epoch 100, monitoring=2
+            }
+        }
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let gvr = [0xadu8; 32];
+
+        let reader: Arc<dyn slashing::SlashingDbReader> = Arc::new(RecentPrior);
+        let machine = Arc::new(ForwardWindowMachine::new(reader, 2, gvr));
+        // Boot-style register WOULD safe-skip:
+        machine.register(&pk, 100);
+        assert_eq!(
+            machine.status(&pk),
+            ForwardWindowStatus::Safe,
+            "control: boot register with recent history is Safe"
+        );
+        machine.cancel(&pk);
+
+        let epoch_provider: Arc<dyn Fn() -> Epoch + Send + Sync> = Arc::new(|| 100);
+        let monitor = ForwardWindowMonitor::new(Arc::clone(&machine), epoch_provider);
+        monitor.start_monitoring(pk_bytes);
+        assert_eq!(
+            machine.status(&pk),
+            ForwardWindowStatus::Pending,
+            "import must not Safe-skip even with recent interchange history"
+        );
+        assert!(!machine.is_signing_enabled(&pk));
     }
 
     // --- RemoteKeyManagerAdapter tests ---
