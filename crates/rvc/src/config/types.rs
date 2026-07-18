@@ -42,6 +42,15 @@ pub struct Config {
     #[serde(default)]
     pub allow_fresh_db: bool,
 
+    /// Allow startup when the beacon node's current fork version is not in the
+    /// client's fork schedule (SEC-9 / M-15).
+    ///
+    /// Default `false`: an unknown fork aborts startup so the VC cannot produce
+    /// invalid signatures after a network upgrade. Set `true` only for testnets
+    /// or experimental forks where the schedule is intentionally incomplete.
+    #[serde(default)]
+    pub allow_unsupported_fork: bool,
+
     pub metrics_address: IpAddr,
 
     pub metrics_port: u16,
@@ -274,6 +283,14 @@ pub struct SecretProviderConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_interval: Option<u64>,
 
+    /// When true, any secret-provider `list_keys` failure aborts startup (SEC-9 / M-9).
+    ///
+    /// Default `false`: a single flaky provider is logged and skipped so healthy
+    /// providers can still load keys. A failure of **all** configured providers
+    /// remains fatal regardless of this flag.
+    #[serde(default)]
+    pub strict: bool,
+
     #[serde(default)]
     pub gcp: GcpSecretConfig,
 }
@@ -327,6 +344,7 @@ impl Default for Config {
             password_file: None,
             slashing_db_path: PathBuf::from("./slashing_protection.sqlite"),
             allow_fresh_db: false,
+            allow_unsupported_fork: false,
             metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             metrics_port: 8080,
             grpc_port: 50051,
@@ -655,6 +673,10 @@ impl Config {
             self.allow_fresh_db = true;
         }
 
+        if let Some(true) = cli.allow_unsupported_fork {
+            self.allow_unsupported_fork = true;
+        }
+
         if let Some(metrics_address) = cli.metrics_address {
             self.metrics_address = metrics_address;
         }
@@ -767,6 +789,10 @@ impl Config {
 
         if let Some(interval) = cli.secret_refresh_interval {
             self.secret_provider.refresh_interval = Some(interval);
+        }
+
+        if let Some(true) = cli.secret_provider_strict {
+            self.secret_provider.strict = true;
         }
 
         if let Some(allow) = cli.allow_insecure_remote_signer {
@@ -925,6 +951,8 @@ pub struct CliOverrides {
     pub slashing_db_path: Option<PathBuf>,
     /// When `Some(true)`, enables `Config::allow_fresh_db` (SEC-3 / `--init-slashing-db`).
     pub init_slashing_db: Option<bool>,
+    /// When `Some(true)`, enables `Config::allow_unsupported_fork` (SEC-9 / M-15).
+    pub allow_unsupported_fork: Option<bool>,
     pub metrics_address: Option<IpAddr>,
     pub metrics_port: Option<u16>,
     pub grpc_port: Option<u16>,
@@ -950,6 +978,8 @@ pub struct CliOverrides {
     pub gcp_project_id: Option<String>,
     pub gcp_secret_prefix: Option<String>,
     pub secret_refresh_interval: Option<u64>,
+    /// When `Some(true)`, enables `SecretProviderConfig::strict` (SEC-9 / M-9).
+    pub secret_provider_strict: Option<bool>,
     pub allow_insecure_remote_signer: Option<bool>,
     pub keymanager_cors_origins: Option<Vec<String>>,
     pub keymanager_body_limit: Option<usize>,

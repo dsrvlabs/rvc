@@ -213,12 +213,12 @@ separated changes + tests, one commit):
   (slashing)
 
 **Acceptance criteria:**
-- [ ] Fork mismatch → startup aborts; opt-out works; the `check_fork_compatibility` function is unchanged.
-- [ ] One failing provider + one healthy source → VC starts; strict mode → aborts; all sources failing →
+- [x] Fork mismatch → startup aborts; opt-out works; the `check_fork_compatibility` function is unchanged.
+- [x] One failing provider + one healthy source → VC starts; strict mode → aborts; all sources failing →
       aborts.
-- [ ] Watermark equality is blocked at the four block/attestation-target sites; the source-watermark and
+- [x] Watermark equality is blocked at the four block/attestation-target sites; the source-watermark and
       surround checks are untouched.
-- [ ] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
+- [x] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
 
 **Risks / unknowns:**
 - M-1 is latent (no production watermark writers), so its tests pin behavior for a future feature; keep

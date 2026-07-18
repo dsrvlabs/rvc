@@ -13,15 +13,24 @@ use crate::{KeyMaterial, LoadSummary, ProviderSummary, SecretProvider, SecretPro
 
 pub struct KeySourceManager {
     providers: Vec<Arc<dyn SecretProvider>>,
+    /// When true, any provider `list_keys` failure aborts the load (SEC-9 / M-9).
+    /// Default is resilient: log and continue so healthy providers still load.
+    strict: bool,
 }
 
 impl KeySourceManager {
     pub fn new(providers: Vec<Box<dyn SecretProvider>>) -> Self {
-        Self { providers: providers.into_iter().map(Arc::from).collect() }
+        Self { providers: providers.into_iter().map(Arc::from).collect(), strict: false }
     }
 
     pub fn from_arc(providers: Vec<Arc<dyn SecretProvider>>) -> Self {
-        Self { providers }
+        Self { providers, strict: false }
+    }
+
+    /// Fail-fast when any provider's `list_keys` fails (SEC-9 / M-9 strict mode).
+    pub fn with_strict(mut self, strict: bool) -> Self {
+        self.strict = strict;
+        self
     }
 
     /// Load every provider key into `key_manager` (no denylist).
@@ -36,6 +45,12 @@ impl KeySourceManager {
     ///
     /// Denylisted keys are counted as `skipped` and never inserted, so a key
     /// deleted via the Keymanager API cannot resurrect from GCP/etc. on boot.
+    ///
+    /// Provider resilience (SEC-9 / M-9): by default a single provider's
+    /// `list_keys` failure is logged and skipped so other providers can still
+    /// contribute keys. Enable [`Self::with_strict`] to restore fail-fast.
+    /// If every configured provider fails `list_keys`, the load still returns
+    /// `Err` (all sources failing remains fatal).
     #[tracing::instrument(
         name = "secret_provider.load_all",
         skip_all,
@@ -47,6 +62,8 @@ impl KeySourceManager {
         denylist: Option<&HashSet<[u8; 48]>>,
     ) -> Result<LoadSummary, SecretProviderError> {
         let mut summary = LoadSummary::default();
+        let mut list_successes = 0usize;
+        let mut last_list_error: Option<SecretProviderError> = None;
 
         for provider in &self.providers {
             let provider_name = provider.name().to_string();
@@ -58,7 +75,10 @@ impl KeySourceManager {
                 keys.count = tracing::field::Empty,
             );
             let entries = match provider.list_keys().instrument(list_span.clone()).await {
-                Ok(entries) => entries,
+                Ok(entries) => {
+                    list_successes += 1;
+                    entries
+                }
                 Err(err) => {
                     let elapsed = timer.elapsed().as_secs_f64();
                     RVC_SECRET_PROVIDER_ERRORS_TOTAL
@@ -67,7 +87,22 @@ impl KeySourceManager {
                     RVC_SECRET_PROVIDER_LOAD_DURATION_SECONDS
                         .with_label_values(&[provider_name.as_str()])
                         .observe(elapsed);
-                    return Err(err);
+                    if self.strict {
+                        return Err(err);
+                    }
+                    tracing::error!(
+                        provider = %provider_name,
+                        error = %err,
+                        "Failed to list keys from secret provider; continuing with remaining providers"
+                    );
+                    summary.per_provider.push(ProviderSummary {
+                        name: provider_name,
+                        loaded: 0,
+                        skipped: 0,
+                        errors: vec![err.to_string()],
+                    });
+                    last_list_error = Some(err);
+                    continue;
                 }
             };
             list_span.record("keys.count", entries.len());
@@ -200,6 +235,13 @@ impl KeySourceManager {
                 .observe(timer.elapsed().as_secs_f64());
 
             summary.per_provider.push(provider_summary);
+        }
+
+        // All configured providers failed list_keys — still fatal (SEC-9 / M-9).
+        if list_successes == 0 {
+            if let Some(err) = last_list_error {
+                return Err(err);
+            }
         }
 
         Ok(summary)
@@ -456,6 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_error_propagation() {
+        // A single provider that fails list_keys is "all sources failing" → still fatal.
         let provider = MockSecretProvider {
             name: "auth-fail".to_string(),
             keys: vec![],
@@ -467,6 +510,82 @@ mod tests {
         let result = ksm.load_all(&mut km).await;
 
         assert!(matches!(result, Err(SecretProviderError::Auth(_))));
+    }
+
+    // ── SEC-9 / M-9: provider resilience ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_one_failing_provider_starts_with_healthy_keys() {
+        let sk = SecretKey::generate();
+        let healthy = MockSecretProvider {
+            name: "healthy".to_string(),
+            keys: vec![make_raw_key_entry("good-key", &sk)],
+            list_error: None,
+        };
+        let failing = MockSecretProvider {
+            name: "failing".to_string(),
+            keys: vec![],
+            list_error: Some(SecretProviderError::Provider("network down".into())),
+        };
+
+        let ksm = KeySourceManager::new(vec![Box::new(failing), Box::new(healthy)]);
+        let mut km = KeyManager::new();
+        let summary = ksm.load_all(&mut km).await.expect("healthy provider should save the load");
+
+        assert_eq!(km.len(), 1, "healthy provider's key must load");
+        assert_eq!(summary.per_provider.len(), 2);
+        let failing_summary =
+            summary.per_provider.iter().find(|p| p.name == "failing").expect("failing summary");
+        assert_eq!(failing_summary.loaded, 0);
+        assert!(!failing_summary.errors.is_empty());
+        let healthy_summary =
+            summary.per_provider.iter().find(|p| p.name == "healthy").expect("healthy summary");
+        assert_eq!(healthy_summary.loaded, 1);
+    }
+
+    #[tokio::test]
+    async fn test_strict_mode_aborts_on_provider_failure() {
+        let sk = SecretKey::generate();
+        let healthy = MockSecretProvider {
+            name: "healthy".to_string(),
+            keys: vec![make_raw_key_entry("good-key", &sk)],
+            list_error: None,
+        };
+        let failing = MockSecretProvider {
+            name: "failing".to_string(),
+            keys: vec![],
+            list_error: Some(SecretProviderError::Provider("network down".into())),
+        };
+
+        // Failing provider first so strict mode aborts before healthy is reached.
+        let ksm =
+            KeySourceManager::new(vec![Box::new(failing), Box::new(healthy)]).with_strict(true);
+        let mut km = KeyManager::new();
+        let result = ksm.load_all(&mut km).await;
+
+        assert!(matches!(result, Err(SecretProviderError::Provider(_))));
+        assert!(km.is_empty(), "strict mode must not partially load after a failure");
+    }
+
+    #[tokio::test]
+    async fn test_all_sources_failing_aborts() {
+        let a = MockSecretProvider {
+            name: "a".to_string(),
+            keys: vec![],
+            list_error: Some(SecretProviderError::Auth("a forbidden".into())),
+        };
+        let b = MockSecretProvider {
+            name: "b".to_string(),
+            keys: vec![],
+            list_error: Some(SecretProviderError::Provider("b down".into())),
+        };
+
+        let ksm = KeySourceManager::new(vec![Box::new(a), Box::new(b)]);
+        let mut km = KeyManager::new();
+        let result = ksm.load_all(&mut km).await;
+
+        assert!(result.is_err(), "all providers failing must be fatal");
+        assert!(km.is_empty());
     }
 
     #[tokio::test]

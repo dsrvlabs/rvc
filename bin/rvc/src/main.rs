@@ -73,6 +73,12 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         init_slashing_db: bool,
 
+        /// Allow startup when the beacon node's current fork version is not in
+        /// the client's schedule (SEC-9 / M-15). For testnets / experimental
+        /// forks only; default is fatal on unknown fork.
+        #[arg(long, default_value_t = false)]
+        allow_unsupported_fork: bool,
+
         /// Bind address for the metrics HTTP server (default: 127.0.0.1)
         #[arg(long, default_value_t = DEFAULT_METRICS_ADDRESS)]
         metrics_address: IpAddr,
@@ -224,6 +230,12 @@ enum Commands {
         /// Interval in seconds to refresh keys from secret providers (0 = disabled)
         #[arg(long)]
         secret_refresh_interval: Option<u64>,
+
+        /// Fail startup if any secret provider fails to list keys (SEC-9 / M-9).
+        /// Default is resilient: one flaky provider is skipped; all providers
+        /// failing remains fatal regardless of this flag.
+        #[arg(long, default_value_t = false)]
+        secret_provider_strict: bool,
 
         // --- Keymanager API hardening flags (SEC-05, SEC-06, SEC-07) ---
         /// Allow HTTP (non-TLS) URLs for remote signer imports
@@ -499,6 +511,7 @@ async fn main() -> anyhow::Result<()> {
             password_file,
             slashing_db_path,
             init_slashing_db,
+            allow_unsupported_fork,
             metrics_address,
             metrics_port,
             grpc_port,
@@ -533,6 +546,7 @@ async fn main() -> anyhow::Result<()> {
             gcp_project_id,
             gcp_secret_prefix,
             secret_refresh_interval,
+            secret_provider_strict,
             allow_insecure_remote_signer,
             keymanager_cors_origins,
             keymanager_body_limit,
@@ -618,6 +632,7 @@ async fn main() -> anyhow::Result<()> {
                 password_file,
                 slashing_db_path,
                 init_slashing_db: if init_slashing_db { Some(true) } else { None },
+                allow_unsupported_fork: if allow_unsupported_fork { Some(true) } else { None },
                 metrics_address: Some(metrics_address),
                 metrics_port: Some(metrics_port),
                 grpc_port: Some(grpc_port),
@@ -652,6 +667,7 @@ async fn main() -> anyhow::Result<()> {
                 gcp_project_id,
                 gcp_secret_prefix,
                 secret_refresh_interval,
+                secret_provider_strict: if secret_provider_strict { Some(true) } else { None },
                 allow_insecure_remote_signer: if allow_insecure_remote_signer {
                     Some(true)
                 } else {
@@ -1011,6 +1027,31 @@ fn build_file_layer_config(config: &Config) -> Option<telemetry::FileAppenderCon
     })
 }
 
+/// Apply a fork-compatibility check result (SEC-9 / M-15).
+///
+/// Fatal by default so an unknown fork version cannot silently produce invalid
+/// signatures. When `allow_unsupported_fork` is set (testnets / experimental
+/// forks), the error is logged and startup continues.
+fn apply_fork_compatibility_result(
+    result: Result<(), rvc::startup::StartupError>,
+    allow_unsupported_fork: bool,
+) -> Result<(), rvc::startup::StartupError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if allow_unsupported_fork => {
+            warn!(
+                error = %e,
+                "Fork compatibility check failed; continuing because allow_unsupported_fork is set"
+            );
+            Ok(())
+        }
+        Err(e) => {
+            error!(error = %e, "Fork compatibility check failed");
+            Err(e)
+        }
+    }
+}
+
 async fn run_validator(
     config: Config,
     strict_permissions: bool,
@@ -1208,7 +1249,8 @@ async fn run_validator(
                     "cannot take ownership of key_manager: outstanding Arc references exist"
                 )
             })?;
-            let ksm = secret_provider::KeySourceManager::from_arc(secret_providers.clone());
+            let ksm = secret_provider::KeySourceManager::from_arc(secret_providers.clone())
+                .with_strict(config.secret_provider.strict);
             let summary = ksm.load_all_except(&mut km, Some(&denylist_snapshot)).await?;
             let mut total_loaded = 0usize;
             let mut total_skipped = 0usize;
@@ -1465,11 +1507,15 @@ async fn run_validator(
         }
     };
 
-    match startup::check_fork_compatibility(beacon.as_ref(), &fork_schedule).await {
+    // SEC-9 / M-15: fork mismatch is fatal by default (mirrors the GVR chain-swap
+    // gate). Opt out with `allow_unsupported_fork` for testnets / experimental forks.
+    // Do not change `startup::check_fork_compatibility` itself.
+    match apply_fork_compatibility_result(
+        startup::check_fork_compatibility(beacon.as_ref(), &fork_schedule).await,
+        config.allow_unsupported_fork,
+    ) {
         Ok(()) => {}
-        Err(e) => {
-            warn!("Fork compatibility check failed: {}", e);
-        }
+        Err(e) => return Err(e.into()),
     }
 
     let orchestrator_config = builder
@@ -2396,6 +2442,58 @@ mod tests {
 
         assert!(config.grpc_signer_url.is_none());
         assert!(config.grpc_signer_tls_cert.is_none());
+    }
+
+    // ── SEC-9 / M-15: fatal fork-compat with opt-out ──────────────────────
+
+    #[test]
+    fn test_fork_mismatch_aborts_startup_and_optout_allows() {
+        let err = rvc::startup::StartupError::UnsupportedForkVersion {
+            version: "0xdeadbeef".to_string(),
+        };
+
+        // Default: mismatch is fatal
+        let fatal = apply_fork_compatibility_result(Err(err), false);
+        assert!(fatal.is_err());
+        assert!(matches!(
+            fatal.unwrap_err(),
+            rvc::startup::StartupError::UnsupportedForkVersion { .. }
+        ));
+
+        // Opt-out: continue for testnets / experimental forks
+        let err = rvc::startup::StartupError::UnsupportedForkVersion {
+            version: "0xdeadbeef".to_string(),
+        };
+        let continued = apply_fork_compatibility_result(Err(err), true);
+        assert!(continued.is_ok());
+
+        // Ok always continues
+        assert!(apply_fork_compatibility_result(Ok(()), false).is_ok());
+        assert!(apply_fork_compatibility_result(Ok(()), true).is_ok());
+    }
+
+    #[test]
+    fn test_allow_unsupported_fork_cli_merge() {
+        let mut config = Config::default();
+        assert!(!config.allow_unsupported_fork);
+
+        config.merge_with_cli(&CliOverrides {
+            allow_unsupported_fork: Some(true),
+            ..Default::default()
+        });
+        assert!(config.allow_unsupported_fork);
+    }
+
+    #[test]
+    fn test_secret_provider_strict_cli_merge() {
+        let mut config = Config::default();
+        assert!(!config.secret_provider.strict);
+
+        config.merge_with_cli(&CliOverrides {
+            secret_provider_strict: Some(true),
+            ..Default::default()
+        });
+        assert!(config.secret_provider.strict);
     }
 
     /// Regression guard for the v0.4.0 logging silence bug.

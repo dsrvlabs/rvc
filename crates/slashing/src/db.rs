@@ -965,7 +965,8 @@ impl SlashingDb {
             )
             .optional()?;
         if let Some(wt) = wm_target {
-            if (target_epoch as i64) < wt {
+            // SEC-9 / M-1: equality is also blocked (strictly increasing target watermark).
+            if (target_epoch as i64) <= wt {
                 return Err(SlashingError::BelowAttestationWatermark {
                     target_epoch,
                     watermark_target: wt as Epoch,
@@ -1271,7 +1272,8 @@ impl SlashingDb {
             )
             .optional()?;
         if let Some(wm) = watermark {
-            if (slot as i64) < wm {
+            // SEC-9 / M-1: equality is also blocked (strictly increasing block watermark).
+            if (slot as i64) <= wm {
                 return Err(SlashingError::BelowBlockWatermark {
                     slot,
                     watermark_slot: wm as Slot,
@@ -1371,7 +1373,8 @@ impl SlashingDb {
             )
             .optional()?;
         if let Some(wm) = watermark {
-            if (slot as i64) < wm {
+            // SEC-9 / M-1: equality is also blocked (strictly increasing block watermark).
+            if (slot as i64) <= wm {
                 tracing::Span::current().record("slashing_result", "blocked");
                 tracing::error!(
                     pubkey = %TruncatedPubkey::new(&pubkey),
@@ -1575,7 +1578,8 @@ impl SlashingDb {
             )
             .optional()?;
         if let Some(wt) = wm_target {
-            if (target_epoch as i64) < wt {
+            // SEC-9 / M-1: equality is also blocked (strictly increasing target watermark).
+            if (target_epoch as i64) <= wt {
                 tracing::Span::current().record("slashing_result", "blocked");
                 tracing::error!(
                     pubkey = %TruncatedPubkey::new(&pubkey),
@@ -4477,8 +4481,8 @@ mod tests {
             other => panic!("expected BelowBlockWatermark, got: {other:?}"),
         }
 
-        // At watermark should be fine
-        assert!(db.is_safe_to_propose("0x1234", 1000, None).is_ok());
+        // At watermark is rejected (SEC-9 / M-1: strictly increasing)
+        assert!(db.is_safe_to_propose("0x1234", 1000, None).is_err());
         // Above watermark should be fine
         assert!(db.is_safe_to_propose("0x1234", 1001, None).is_ok());
     }
@@ -4499,8 +4503,59 @@ mod tests {
             other => panic!("expected BelowAttestationWatermark, got: {other:?}"),
         }
 
-        // At watermark should be fine
+        // Above watermark should be fine
         assert!(db.is_safe_to_sign("0x1234", 101, 102).is_ok());
+    }
+
+    #[test]
+    fn test_block_watermark_equal_is_rejected() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_block_watermark("0x1234", 1000).expect("set should succeed");
+
+        // Equality boundary (SEC-9 / M-1 / EIP-3076 strictly-increasing watermark)
+        let result = db.is_safe_to_propose("0x1234", 1000, None);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::BelowBlockWatermark { slot: 1000, watermark_slot: 1000 } => {}
+            other => panic!("expected BelowBlockWatermark at equality, got: {other:?}"),
+        }
+
+        let result = db.check_and_record_block("local-vc", "0x1234", 1000, None, &[0u8; 32]);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::BelowBlockWatermark { slot: 1000, watermark_slot: 1000 } => {}
+            other => panic!("expected BelowBlockWatermark at equality, got: {other:?}"),
+        }
+        assert!(db.get_blocks("0x1234").unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_attestation_target_watermark_equal_is_rejected() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.set_attestation_watermark("0x1234", 100, 101).expect("set should succeed");
+
+        // target == watermark_target must be rejected; source equality remains allowed
+        let result = db.is_safe_to_sign("0x1234", 100, 101);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::BelowAttestationWatermark {
+                target_epoch: 101,
+                watermark_target: 101,
+            } => {}
+            other => panic!("expected BelowAttestationWatermark at equality, got: {other:?}"),
+        }
+
+        let result =
+            db.check_and_record_attestation("local-vc", "0x1234", 100, 101, None, &[0u8; 32]);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            SlashingError::BelowAttestationWatermark {
+                target_epoch: 101,
+                watermark_target: 101,
+            } => {}
+            other => panic!("expected BelowAttestationWatermark at equality, got: {other:?}"),
+        }
+        assert!(db.get_attestations("0x1234").unwrap().is_empty());
     }
 
     #[test]
