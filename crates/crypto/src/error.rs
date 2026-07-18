@@ -52,6 +52,11 @@ pub enum KeystoreError {
     #[error("Decryption failed: {0}")]
     DecryptionFailed(String),
 
+    /// AES-128-CTR IV must be exactly 16 bytes (EIP-2335). A wrong-length IV
+    /// used to panic inside `GenericArray::from_slice`; return a typed error.
+    #[error("invalid cipher IV length: expected {expected} bytes, got {actual}")]
+    InvalidIvLength { expected: usize, actual: usize },
+
     #[error("Invalid secret key: {0}")]
     InvalidSecretKey(#[from] BlsError),
 
@@ -156,5 +161,11 @@ mod tests {
     fn test_keystore_rate_limit_exceeded() {
         let err = KeystoreError::RateLimitExceeded("abc123".to_string());
         assert_eq!(err.to_string(), "Rate limit exceeded for keystore decryption: abc123");
+    }
+
+    #[test]
+    fn test_keystore_invalid_iv_length_display() {
+        let err = KeystoreError::InvalidIvLength { expected: 16, actual: 8 };
+        assert_eq!(err.to_string(), "invalid cipher IV length: expected 16 bytes, got 8");
     }
 }

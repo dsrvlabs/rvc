@@ -221,10 +221,10 @@ stay `Err`/non-panicking.
 - `test_decrypt_valid_pbkdf2_vector_still_passes`
 
 **Acceptance criteria:**
-- [ ] Wrong-length IV (shorter and longer than 16) → `Err`, no panic.
-- [ ] Keymanager import of an IV-corrupted keystore → error status for that item, service keeps running.
-- [ ] Constant-time checksum-before-decrypt ordering intact; existing decrypt vector tests pass.
-- [ ] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
+- [x] Wrong-length IV (shorter and longer than 16) → `Err`, no panic.
+- [x] Keymanager import of an IV-corrupted keystore → error status for that item, service keeps running.
+- [x] Constant-time checksum-before-decrypt ordering intact; existing decrypt vector tests pass.
+- [x] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
 
 **Risks / unknowns:**
 - None material — the sweep is done and the fix is a single guard + error variant. If the keymanager

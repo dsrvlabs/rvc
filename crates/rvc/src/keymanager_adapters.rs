@@ -2984,4 +2984,45 @@ mod tests {
             "denylist on disk must still contain key after failed import"
         );
     }
+
+    /// SEC-5 / H-5: correctly-passworded keystore with a truncated IV must
+    /// surface as a per-item import error (`DecryptionFailed`), not panic.
+    /// The adapter stays usable afterward (service keeps running).
+    #[test]
+    fn test_keymanager_import_iv_corrupted_keystore_returns_item_error() {
+        use crypto::EncryptionKdf;
+
+        let dir = TempDir::new().unwrap();
+        let adapter =
+            KeystoreManagerAdapter::new(dir.path().to_path_buf(), create_empty_composite_signer());
+
+        let sk = SecretKey::generate();
+        let password = "sec5-import-password";
+        let mut keystore = Keystore::encrypt(
+            &sk,
+            password.as_bytes(),
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("encrypt");
+        // Corrupt IV to 8 bytes (16 hex chars). Checksum still matches so
+        // decrypt reaches the former panic site in decrypt_ciphertext.
+        keystore.crypto.cipher.params.iv = hex::encode([0u8; 8]);
+        let json = keystore.to_json().expect("serialize");
+
+        let err = adapter.import_keystore(&json, password);
+        match err {
+            Err(ImportKeystoreError::DecryptionFailed(msg)) => {
+                assert!(
+                    msg.contains("invalid cipher IV length") || msg.contains("IV length"),
+                    "expected InvalidIvLength surfaced as DecryptionFailed, got: {msg}"
+                );
+            }
+            other => panic!("expected DecryptionFailed item error, got: {other:?}"),
+        }
+
+        // Service/adapter still responsive after the failed item.
+        assert!(adapter.list_keys().is_empty());
+        assert!(!adapter.has_key(&sk.public_key().to_bytes()));
+    }
 }

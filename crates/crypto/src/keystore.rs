@@ -316,6 +316,13 @@ impl Keystore {
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, KeystoreError> {
         let iv = hex::decode(&self.crypto.cipher.params.iv)?;
+        // SEC-5 / H-5: `Aes128Ctr::new` panics via `GenericArray::from_slice`
+        // when the IV is not exactly 16 bytes. Validate before conversion so a
+        // correctly-passworded but IV-corrupted keystore returns a typed error
+        // (startup load + keymanager import) instead of panicking.
+        if iv.len() != IV_LEN {
+            return Err(KeystoreError::InvalidIvLength { expected: IV_LEN, actual: iv.len() });
+        }
         let aes_key = &derived_key[..AES_KEY_LEN];
 
         let mut cipher = Aes128Ctr::new(aes_key.into(), iv.as_slice().into());
@@ -1565,5 +1572,97 @@ mod tests {
             }
             _ => panic!("expected scrypt params"),
         }
+    }
+
+    // ========== SEC-5 / H-5: IV-length guard (no panic on corrupt IV) ==========
+
+    /// Build a valid keystore then overwrite `cipher.params.iv` with a hex
+    /// encoding of the given byte length. Checksum stays valid so decrypt
+    /// reaches `decrypt_ciphertext` (the former panic site).
+    fn keystore_with_iv_len(iv_byte_len: usize) -> (Keystore, Vec<u8>) {
+        let sk = SecretKey::generate();
+        let password = b"sec5-password";
+        let mut keystore = Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("should encrypt");
+        keystore.crypto.cipher.params.iv = hex::encode(vec![0xab; iv_byte_len]);
+        (keystore, password.to_vec())
+    }
+
+    #[test]
+    fn test_decrypt_wrong_length_iv_returns_err_not_panic() {
+        // Shorter than 16 bytes (8-byte IV → 16 hex chars).
+        let (ks_short, password) = keystore_with_iv_len(8);
+        let result = ks_short.decrypt(&password);
+        assert!(
+            matches!(result, Err(KeystoreError::InvalidIvLength { expected: 16, actual: 8 })),
+            "8-byte IV must return InvalidIvLength, got: {:?}",
+            result
+        );
+
+        // Longer than 16 bytes (24-byte IV → 48 hex chars).
+        let (ks_long, password) = keystore_with_iv_len(24);
+        let result = ks_long.decrypt(&password);
+        assert!(
+            matches!(result, Err(KeystoreError::InvalidIvLength { expected: 16, actual: 24 })),
+            "24-byte IV must return InvalidIvLength, got: {:?}",
+            result
+        );
+
+        // Empty IV.
+        let (ks_empty, password) = keystore_with_iv_len(0);
+        let result = ks_empty.decrypt(&password);
+        assert!(
+            matches!(result, Err(KeystoreError::InvalidIvLength { expected: 16, actual: 0 })),
+            "0-byte IV must return InvalidIvLength, got: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_decrypt_valid_scrypt_vector_still_passes() {
+        let keystore = Keystore::from_json(EIP2335_SCRYPT_TEST_VECTOR).expect("should parse");
+        let secret_key = keystore.decrypt(EIP2335_PASSWORD).expect("should decrypt");
+        let expected_secret = hex::decode(EIP2335_SECRET_HEX).expect("valid hex");
+        assert_eq!(secret_key.to_bytes().to_vec(), expected_secret);
+    }
+
+    #[test]
+    fn test_decrypt_valid_pbkdf2_vector_still_passes() {
+        let keystore = Keystore::from_json(EIP2335_PBKDF2_TEST_VECTOR).expect("should parse");
+        let secret_key = keystore.decrypt(EIP2335_PASSWORD).expect("should decrypt");
+        let expected_secret = hex::decode(EIP2335_SECRET_HEX).expect("valid hex");
+        assert_eq!(secret_key.to_bytes().to_vec(), expected_secret);
+    }
+
+    /// Sweep confirmation: salt/checksum length mismatches and wrong passwords
+    /// stay `Err` (non-panicking). Encrypt-side IV is fixed-length by construction.
+    #[test]
+    fn test_decrypt_salt_checksum_paths_remain_err_not_panic() {
+        // Wrong password → ChecksumMismatch (ct_eq, no panic).
+        let keystore = Keystore::from_json(EIP2335_SCRYPT_TEST_VECTOR).expect("should parse");
+        assert!(matches!(keystore.decrypt(b"wrong"), Err(KeystoreError::ChecksumMismatch)));
+
+        // Truncated checksum message still Err, not panic.
+        let mut ks = keystore.clone();
+        ks.crypto.checksum.message = "aa".to_string();
+        assert!(matches!(ks.decrypt(EIP2335_PASSWORD), Err(KeystoreError::ChecksumMismatch)));
+
+        // Encrypt always produces a 16-byte (32 hex char) IV.
+        let sk = SecretKey::generate();
+        let encrypted = Keystore::encrypt(
+            &sk,
+            b"pw",
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("encrypt");
+        let iv = hex::decode(&encrypted.crypto.cipher.params.iv).expect("hex");
+        assert_eq!(iv.len(), IV_LEN);
+        encrypted.decrypt(b"pw").expect("encrypt-side IV must decrypt cleanly");
     }
 }
