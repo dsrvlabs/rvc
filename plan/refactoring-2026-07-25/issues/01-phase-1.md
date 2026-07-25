@@ -719,13 +719,13 @@ tests against existing behavior — it does not build enablement.
    guards is a real double-sign.
 
 **Acceptance criteria:**
-- [ ] Importing a key via the keymanager adapter clears the orchestrator duty cache (`key_gen_rx` fires) —
+- [x] Importing a key via the keymanager adapter clears the orchestrator duty cache (`key_gen_rx` fires) —
       asserted end-to-end, no restart.
-- [ ] A newly imported key produces no attestation signatures until its doppelganger window / enablement
+- [x] A newly imported key produces no attestation signatures until its doppelganger window / enablement
       gate clears; after it clears, it signs.
-- [ ] The gate assertion is on emitted signatures, not on logs or internal state flags.
-- [ ] Test lives in `crates/rvc/tests/`, reusing RF1-02's fixture rather than duplicating it.
-- [ ] Standing invariant green.
+- [x] The gate assertion is on emitted signatures, not on logs or internal state flags.
+- [x] Test lives in `crates/rvc/tests/`, reusing RF1-02's fixture rather than duplicating it.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 1. **RED first:** `test_imported_key_clears_duty_cache_without_restart` — on pre-RF1-06/07 code this fails
