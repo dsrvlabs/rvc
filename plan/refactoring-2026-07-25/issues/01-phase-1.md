@@ -215,16 +215,16 @@ must not.
    old behavior — per assumption **P2**, none does.
 
 **Acceptance criteria:**
-- [ ] `stage.rs:356` and `stage.rs:506` use `<=`; `stage.rs:490` (source) still uses `<`.
-- [ ] Stage-path tests prove: block slot **equal** to the block watermark is rejected with
+- [x] `stage.rs:356` and `stage.rs:506` use `<=`; `stage.rs:490` (source) still uses `<`.
+- [x] Stage-path tests prove: block slot **equal** to the block watermark is rejected with
       `SlashingError::BelowBlockWatermark`; attestation target **equal** to the target watermark is
       rejected with `SlashingError::BelowAttestationWatermark`.
-- [ ] Stage and `check_and_record_*` return the same verdict for the same watermark inputs (a direct
+- [x] Stage and `check_and_record_*` return the same verdict for the same watermark inputs (a direct
       parity assertion, so the two paths cannot drift again before Phase 4's E1 unifies them).
-- [ ] A rejected stage leaves no row committed (the guard rolls back).
-- [ ] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+- [x] A rejected stage leaves no row committed (the guard rolls back).
+- [x] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
       `cargo nextest run --workspace` green.
-- [ ] Release note drafted: equality-at-watermark is now refused on the live signing path.
+- [x] Release note drafted: equality-at-watermark is now refused on the live signing path.
 
 **TDD test plan** (new, in `crates/slashing/tests/stage.rs`):
 1. **RED first:** `test_stage_block_at_block_watermark_is_rejected` — set watermark 1000, `stage_block`
