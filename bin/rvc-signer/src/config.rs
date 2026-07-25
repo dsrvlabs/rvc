@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 /// Default HTTP Remote Signing API listen address: **loopback** on the
 /// Web3Signer port 9000.
@@ -55,7 +56,6 @@ impl HttpTlsMode {
 pub struct SignerSection {
     pub listen_address: Option<String>,
     pub keystore_dir: Option<PathBuf>,
-    pub password_dir: Option<PathBuf>,
     pub password_file: Option<PathBuf>,
     pub backend: Option<String>,
     pub dry_run: Option<bool>,
@@ -106,7 +106,6 @@ pub struct DvtConfig {
 pub struct ResolvedConfig {
     pub listen_address: String,
     pub keystore_dir: PathBuf,
-    pub password_dir: Option<PathBuf>,
     pub password_file: Option<PathBuf>,
     pub backend: String,
     pub dry_run: bool,
@@ -134,7 +133,6 @@ pub struct CliOverrides<'a> {
     pub listen_address: &'a str,
     pub listen_address_is_default: bool,
     pub keystore_dir: Option<&'a Path>,
-    pub password_dir: Option<&'a Path>,
     pub password_file: Option<&'a Path>,
     pub backend: &'a str,
     pub backend_is_default: bool,
@@ -189,7 +187,6 @@ pub fn merge_with_cli(
         "keystore_dir is required (set via --keystore-dir or config [signer].keystore_dir)",
     )?;
 
-    let password_dir = cli.password_dir.map(PathBuf::from).or(section.password_dir);
     let password_file = cli.password_file.map(PathBuf::from).or(section.password_file);
 
     let backend = if !cli.backend_is_default {
@@ -263,7 +260,6 @@ pub fn merge_with_cli(
     Ok(ResolvedConfig {
         listen_address,
         keystore_dir,
-        password_dir,
         password_file,
         backend,
         dry_run,
@@ -285,6 +281,24 @@ pub fn merge_with_cli(
     })
 }
 
+/// Load the shared keystore password for `serve`.
+///
+/// Requires `--password-file` / `signer.password_file`. A missing source is a
+/// hard startup error (RF1-10): the previous empty-string fallback deferred
+/// failure into confusing per-keystore decrypt errors.
+pub fn load_serve_password(
+    resolved: &ResolvedConfig,
+) -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
+    let Some(ref file) = resolved.password_file else {
+        return Err(
+            "password source is required: set --password-file or [signer].password_file".into()
+        );
+    };
+    let content = std::fs::read_to_string(file)
+        .map_err(|e| format!("failed to read password file {}: {}", file.display(), e))?;
+    Ok(Zeroizing::new(content.trim_end_matches('\n').to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,7 +316,6 @@ mod tests {
             listen_address: "127.0.0.1:50052",
             listen_address_is_default: true,
             keystore_dir: None,
-            password_dir: None,
             password_file: None,
             backend: "basic",
             backend_is_default: true,
@@ -583,37 +596,67 @@ dry_run = true
         assert!(result.unwrap_err().to_string().contains("keystore_dir is required"));
     }
 
+    // RF1-10: deleted `test_merge_password_dir_from_config` and
+    // `test_merge_cli_password_dir_overrides_config` (plumbing for removed field).
+
     #[test]
-    fn test_merge_password_dir_from_config() {
-        let config = SignerConfig {
-            signer: Some(SignerSection {
-                keystore_dir: Some(PathBuf::from("/ks")),
-                password_dir: Some(PathBuf::from("/config/pwdir")),
-                ..Default::default()
-            }),
-        };
+    fn test_missing_password_source_is_startup_error() {
+        let cli = CliOverrides { keystore_dir: Some(Path::new("/ks")), ..default_cli_overrides() };
+        let resolved = merge_with_cli(SignerConfig::default(), &cli).unwrap();
+        assert!(resolved.password_file.is_none());
 
-        let resolved = merge_with_cli(config, &default_cli_overrides()).unwrap();
-
-        assert_eq!(resolved.password_dir.unwrap(), PathBuf::from("/config/pwdir"));
+        let err = load_serve_password(&resolved).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("--password-file") || msg.contains("password_file"),
+            "error should name --password-file; got: {msg}"
+        );
+        assert!(
+            msg.contains("password source is required"),
+            "error should be explicit about missing source; got: {msg}"
+        );
     }
 
     #[test]
-    fn test_merge_cli_password_dir_overrides_config() {
-        let config = SignerConfig {
-            signer: Some(SignerSection {
-                keystore_dir: Some(PathBuf::from("/ks")),
-                password_dir: Some(PathBuf::from("/config/pwdir")),
-                ..Default::default()
-            }),
+    fn test_password_file_still_resolves() {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"s3cret\n").unwrap();
+        let path = f.path().to_path_buf();
+
+        let cli = CliOverrides {
+            keystore_dir: Some(Path::new("/ks")),
+            password_file: Some(path.as_path()),
+            ..default_cli_overrides()
         };
+        let resolved = merge_with_cli(SignerConfig::default(), &cli).unwrap();
+        let password = load_serve_password(&resolved).unwrap();
+        // Trailing newline is trimmed (same behavior as pre-RF1-10).
+        assert_eq!(password.as_str(), "s3cret");
+    }
 
-        let cli =
-            CliOverrides { password_dir: Some(Path::new("/cli/pwdir")), ..default_cli_overrides() };
+    #[test]
+    fn test_config_with_legacy_password_dir_key() {
+        // Serde ignores unknown fields by default; a stale `password_dir` key
+        // must not break load, and must not be treated as a password source.
+        let f = write_toml(
+            r#"
+[signer]
+keystore_dir = "/ks"
+password_dir = "/legacy/pwdir"
+"#,
+        );
+        let cfg = load_config(f.path()).unwrap();
+        let section = cfg.signer.as_ref().unwrap();
+        assert_eq!(section.keystore_dir.as_ref().unwrap(), &PathBuf::from("/ks"));
+        assert!(section.password_file.is_none());
 
-        let resolved = merge_with_cli(config, &cli).unwrap();
-
-        assert_eq!(resolved.password_dir.unwrap(), PathBuf::from("/cli/pwdir"));
+        let resolved = merge_with_cli(cfg, &default_cli_overrides()).unwrap();
+        assert!(resolved.password_file.is_none());
+        let err = load_serve_password(&resolved).unwrap_err();
+        assert!(
+            err.to_string().contains("password source is required"),
+            "legacy password_dir must not satisfy the password source"
+        );
     }
 
     // --- [signer.http] config surface (Issue 1.3, FR-25/27/28/30) ---

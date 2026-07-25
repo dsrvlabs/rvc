@@ -873,16 +873,16 @@ scope.
    a missing password source is now a startup failure rather than a silent empty password.
 
 **Acceptance criteria:**
-- [ ] No occurrence of `password_dir` / `--password-dir` remains in `bin/rvc-signer`, its config parsing,
+- [x] No occurrence of `password_dir` / `--password-dir` remains in `bin/rvc-signer`, its config parsing,
       its tests, or the docs.
-- [ ] Starting with a keystore dir and no password source fails at startup with an actionable message
+- [x] Starting with a keystore dir and no password source fails at startup with an actionable message
       naming `--password-file`; it does not proceed with an empty password.
-- [ ] `--password-file` behavior (including the trailing-newline trim at `main.rs:1039`) is unchanged.
-- [ ] Config files that still contain `signer.password_dir` are handled per the crate's existing
+- [x] `--password-file` behavior (including the trailing-newline trim at `main.rs:1039`) is unchanged.
+- [x] Config files that still contain `signer.password_dir` are handled per the crate's existing
       unknown-field policy; whichever way that falls (ignore vs error), it is asserted by a test and stated
       in the release note.
-- [ ] Release note drafted covering both the removal and the new startup error.
-- [ ] Standing invariant green.
+- [x] Release note drafted covering both the removal and the new startup error.
+- [x] Standing invariant green.
 
 **TDD test plan** (in `bin/rvc-signer/src/config.rs` tests + a startup test):
 1. **RED first:** `test_missing_password_source_is_startup_error` — resolve a config with a keystore dir

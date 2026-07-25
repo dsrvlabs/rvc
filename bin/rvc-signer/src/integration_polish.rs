@@ -61,7 +61,6 @@ mod tests {
             listen_address: "127.0.0.1:50052",
             listen_address_is_default: true,
             keystore_dir: None,
-            password_dir: None,
             password_file: None,
             backend: "basic",
             backend_is_default: true,

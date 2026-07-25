@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use tracing::{error, info};
+#[cfg(feature = "dvt")]
 use zeroize::Zeroizing;
 
 const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:50052";
@@ -78,12 +79,8 @@ struct ServeArgs {
     #[arg(long)]
     keystore_dir: Option<PathBuf>,
 
-    /// Path to the directory containing per-keystore password files
-    #[arg(long, group = "password_source")]
-    password_dir: Option<PathBuf>,
-
     /// Path to a single password file used for all keystores
-    #[arg(long, group = "password_source")]
+    #[arg(long)]
     password_file: Option<PathBuf>,
 
     /// Path to the TLS certificate file (PEM)
@@ -377,7 +374,7 @@ async fn run_serve(
         "Starting rvc-signer"
     );
 
-    let password = load_serve_password(&resolved)?;
+    let password = config::load_serve_password(&resolved)?;
 
     let tls_config = match (
         resolved.tls_cert.as_ref(),
@@ -999,7 +996,6 @@ fn resolve_config(args: &ServeArgs) -> Result<config::ResolvedConfig, Box<dyn st
         listen_address: &args.listen_address,
         listen_address_is_default,
         keystore_dir: args.keystore_dir.as_deref(),
-        password_dir: args.password_dir.as_deref(),
         password_file: args.password_file.as_deref(),
         backend: &args.backend.to_string(),
         backend_is_default,
@@ -1026,20 +1022,6 @@ fn resolve_config(args: &ServeArgs) -> Result<config::ResolvedConfig, Box<dyn st
     };
 
     config::merge_with_cli(file_config, &cli)
-}
-
-fn load_serve_password(
-    resolved: &config::ResolvedConfig,
-) -> Result<Zeroizing<String>, Box<dyn std::error::Error>> {
-    if let Some(ref dir) = resolved.password_dir {
-        return Ok(Zeroizing::new(std::fs::read_to_string(dir)?));
-    }
-    if let Some(ref file) = resolved.password_file {
-        let content = std::fs::read_to_string(file)?;
-        return Ok(Zeroizing::new(content.trim_end_matches('\n').to_string()));
-    }
-    // No password source provided — prompt or use empty string.
-    Ok(Zeroizing::new(String::new()))
 }
 
 async fn shutdown_signal() {

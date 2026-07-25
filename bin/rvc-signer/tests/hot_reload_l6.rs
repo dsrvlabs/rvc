@@ -33,7 +33,6 @@ fn cli(enable_hot_reload: bool, reload_interval: u64) -> CliOverrides<'static> {
         listen_address: ADDR,
         listen_address_is_default: true,
         keystore_dir: None,
-        password_dir: None,
         password_file: None,
         backend: BACKEND,
         backend_is_default: true,

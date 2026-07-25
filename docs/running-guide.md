@@ -468,7 +468,7 @@ rvc start -c config.toml \
 # Start rvc-signer first
 rvc-signer serve \
   --keystore-dir ./signer-keystores \
-  --password-dir ./signer-passwords \
+  --password-file ./signer-password.txt \
   --tls-cert ./certs/server.pem \
   --tls-key ./certs/server-key.pem \
   --tls-ca-cert ./certs/ca.pem \
@@ -501,8 +501,7 @@ rvc-signer serve [OPTIONS]
 | `--config <PATH>` | none | TOML configuration file |
 | `--listen-address <ADDR>` | `127.0.0.1:50052` | gRPC listen address |
 | `--keystore-dir <PATH>` | none | Directory containing EIP-2335 keystore files |
-| `--password-dir <PATH>` | none | Directory with per-keystore password files |
-| `--password-file <PATH>` | none | Single password file for all keystores |
+| `--password-file <PATH>` | none | Password file for all keystores (required) |
 | `--tls-cert <PATH>` | none | Server TLS certificate (PEM) |
 | `--tls-key <PATH>` | none | Server TLS private key (PEM) |
 | `--tls-ca-cert <PATH>` | none | CA certificate for client authentication (PEM) |
@@ -562,7 +561,7 @@ rvc-signer split-key \
 rvc-signer serve \
   --backend dvt \
   --keystore-dir ./shares/node1 \
-  --password-dir ./passwords \
+  --password-file ./password.txt \
   --tls-cert ./certs/node1.pem \
   --tls-key ./certs/node1-key.pem \
   --tls-ca-cert ./certs/ca.pem \
