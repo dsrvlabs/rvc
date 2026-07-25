@@ -358,15 +358,15 @@ why the watermark regression in RF1-01 went unnoticed. Retargeting the `complete
    fate) has an explicit thing to delete or repoint rather than discovering silent coverage loss.
 
 **Acceptance criteria:**
-- [ ] `run_complete` drives `stage_* → commit()` on success paths and `discard()` (or guard drop) on
+- [x] `run_complete` drives `stage_* → commit()` on success paths and `discard()` (or guard drop) on
       rejection paths; no `check_and_record_*` call remains in `run_complete`.
-- [ ] All 38 conformance cases pass on the stage path under the `complete` runner. *(The plan's
+- [x] All 38 conformance cases pass on the stage path under the `complete` runner. *(The plan's
       "76 conformance cases" refers to 38 cases × 2 runners; the file today generates 38 × 3 = 114 test
       functions. RF1-04 retires the redundant runner, landing the phase at 38 × 2 = 76.)*
-- [ ] Every divergence found during retargeting is written into the PR description with its EIP-3076
+- [x] Every divergence found during retargeting is written into the PR description with its EIP-3076
       adjudication; none is silently absorbed by loosening an assertion.
-- [ ] One thin `check_and_record_*` smoke test remains, annotated with a pointer to Phase 2 B4.
-- [ ] Standing invariant green.
+- [x] One thin `check_and_record_*` smoke test remains, annotated with a pointer to Phase 2 B4.
+- [x] Standing invariant green.
 
 **TDD test plan:** this issue *is* test work, so RED is the retarget itself.
 1. **RED first:** flip one representative case — `single_validator_slashable_attestations_double_vote` —

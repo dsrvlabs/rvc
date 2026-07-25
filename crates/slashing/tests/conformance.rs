@@ -2,14 +2,59 @@
 //!
 //! Integrates all 38 test cases from the official
 //! `eth-clients/slashing-protection-interchange-tests` repository.
-//! Tests "complete", "minimal conservative" (HashMap-based), and
-//! "real watermarks" (SlashingDb watermark API) import strategies.
+//!
+//! Runners:
+//! - **complete** — full-history strategy on the production
+//!   `stage_* → commit()/discard()` path (RF1-03).
+//! - **minimal_conservative** — HashMap-based watermark decision (test-local;
+//!   RF1-04 moves the decision onto `stage_*`).
+//! - **real_watermarks** — real watermark storage with test-local decision
+//!   (retired by RF1-04 once minimal uses stage_*).
 
 use std::collections::HashMap;
 
 use serde::Deserialize;
 
-use rvc_slashing::{InterchangeFormat, SlashingDb};
+use rvc_slashing::{InterchangeFormat, SlashingDb, SlashingError};
+
+/// Zero GVR used by signing-path checks in the complete runner (matches the
+/// historical `check_and_record_*` harness; import pins the test-case GVR).
+const SIGN_GVR: &[u8; 32] = &[0u8; 32];
+
+// ---------------------------------------------------------------------------
+// Stage-path harness helpers (RF1-03)
+// ---------------------------------------------------------------------------
+
+/// Stage a block via the production path and commit on success.
+///
+/// On rejection, `stage_block` rolls back before returning `Err` (no guard is
+/// handed out). On accept, the guard is committed so the row is durable for
+/// subsequent checks in the same runner.
+fn stage_and_commit_block(
+    db: &SlashingDb,
+    pubkey: &str,
+    slot: u64,
+    signing_root: Option<String>,
+    gvr: &[u8; 32],
+) -> Result<(), SlashingError> {
+    let staged = db.stage_block(pubkey, slot, signing_root, gvr)?;
+    staged.commit()
+}
+
+/// Stage an attestation via the production path and commit on success.
+///
+/// See [`stage_and_commit_block`] for success/rejection semantics.
+fn stage_and_commit_attestation(
+    db: &SlashingDb,
+    pubkey: &str,
+    source_epoch: u64,
+    target_epoch: u64,
+    signing_root: Option<String>,
+    gvr: &[u8; 32],
+) -> Result<(), SlashingError> {
+    let staged = db.stage_attestation(pubkey, source_epoch, target_epoch, signing_root, gvr)?;
+    staged.commit()
+}
 
 // ---------------------------------------------------------------------------
 // Test fixture types
@@ -63,7 +108,7 @@ fn load_test_case(name: &str) -> TestCase {
 }
 
 // ---------------------------------------------------------------------------
-// Complete strategy runner
+// Complete strategy runner (production stage_* → commit/discard path)
 // ---------------------------------------------------------------------------
 
 fn run_complete(test: &TestCase) {
@@ -98,15 +143,15 @@ fn run_complete(test: &TestCase) {
             );
         }
 
-        // Run block checks
+        // Run block checks via production stage path
         for (i, block) in step.blocks.iter().enumerate() {
             let slot: u64 = block.slot.parse().unwrap();
-            let result = db.check_and_record_block(
-                "local-vc",
+            let result = stage_and_commit_block(
+                &db,
                 &block.pubkey,
                 slot,
                 block.signing_root.clone(),
-                &[0u8; 32],
+                SIGN_GVR,
             );
 
             if block.should_succeed_complete {
@@ -127,17 +172,17 @@ fn run_complete(test: &TestCase) {
             }
         }
 
-        // Run attestation checks
+        // Run attestation checks via production stage path
         for (i, att) in step.attestations.iter().enumerate() {
             let source: u64 = att.source_epoch.parse().unwrap();
             let target: u64 = att.target_epoch.parse().unwrap();
-            let result = db.check_and_record_attestation(
-                "local-vc",
+            let result = stage_and_commit_attestation(
+                &db,
                 &att.pubkey,
                 source,
                 target,
                 att.signing_root.clone(),
-                &[0u8; 32],
+                SIGN_GVR,
             );
 
             if att.should_succeed_complete {
@@ -458,3 +503,35 @@ conformance_test!(single_validator_two_blocks_no_signing_root);
 
 // Wrong genesis validators root (1)
 conformance_test!(wrong_genesis_validators_root);
+
+// ---------------------------------------------------------------------------
+// check_and_record_* smoke (Phase 2 B4 handoff)
+// ---------------------------------------------------------------------------
+//
+// RF1-03 retargeted the complete conformance runner at stage_* → commit/discard.
+// This single smoke test keeps the legacy check_and_record_* API exercised so
+// Phase 2 issue B4 (decide fate of check_and_record_*) has an explicit target
+// to delete or repoint rather than discovering silent coverage loss.
+//
+// Do not expand this into a second conformance suite.
+
+/// Thin residual coverage for `check_and_record_*` until Phase 2 B4.
+#[test]
+fn check_and_record_smoke_for_phase2_b4() {
+    let db = SlashingDb::open_in_memory().expect("open db");
+    let pubkey = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    // Accept a block, then reject a conflicting double proposal at the same slot.
+    db.check_and_record_block("local-vc", pubkey, 100, Some("0xroot_a".into()), SIGN_GVR)
+        .expect("first block must succeed");
+    let blocked =
+        db.check_and_record_block("local-vc", pubkey, 100, Some("0xroot_b".into()), SIGN_GVR);
+    assert!(blocked.is_err(), "conflicting block at same slot must be rejected");
+
+    // Accept an attestation, then reject a double vote at the same target.
+    db.check_and_record_attestation("local-vc", pubkey, 1, 2, Some("0xatt_a".into()), SIGN_GVR)
+        .expect("first attestation must succeed");
+    let blocked =
+        db.check_and_record_attestation("local-vc", pubkey, 1, 2, Some("0xatt_b".into()), SIGN_GVR);
+    assert!(blocked.is_err(), "double vote at same target must be rejected");
+}
