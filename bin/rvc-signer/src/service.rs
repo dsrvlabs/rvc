@@ -44,15 +44,17 @@
 //! per the Ethereum consensus spec.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tonic::{Request, Response, Status};
 use tracing::Span;
 
 use crate::audit;
 use crate::backend::signer_adapter::SigningBackendAsSigner;
-use crate::backend::SigningBackend;
-use crate::metrics::SignerMetrics;
+use crate::backend::{SigningBackend, SigningBackendError};
+use crate::metrics::{
+    classify_error, classify_gate_error, grpc_sign_type, record_sign, SignerMetrics,
+};
 
 // V1 imports (deprecated — kept until ISSUE-1.8)
 use crate::proto::signer::signer_service_server::SignerService;
@@ -293,26 +295,67 @@ impl SignerServiceImpl {
 // without a DB, correct.
 //
 // Non-slashable handlers must work without a DB.  When no gate is present they
-// fall through to the backend directly, preserving pre-2.10a semantics.
+// fall through to the backend via `finish_backend_sign` (which also records
+// RF1-09 metrics), preserving pre-2.10a semantics.
 
-/// Sign using the backend, mapping `SigningBackendError` to `tonic::Status`.
-///
-/// Used as the no-gate fallback for non-slashable handlers on the
-/// `--disable-slashing-protection` path.
-async fn sign_via_backend(
-    backend: &dyn crate::backend::SigningBackend,
-    signing_root: &[u8; 32],
-    pubkey: &[u8; 48],
-) -> Result<Vec<u8>, Status> {
-    backend.sign(signing_root, pubkey).await.map(|b| b.to_vec()).map_err(|e| match e {
-        crate::backend::SigningBackendError::KeyNotFound(_) => {
-            Status::not_found("unknown public key")
-        }
+/// Map a backend error to a gRPC `Status`.
+fn backend_err_to_status(e: SigningBackendError) -> Status {
+    match e {
+        SigningBackendError::KeyNotFound(_) => Status::not_found("unknown public key"),
         other => {
             tracing::error!(error = %other, "signing backend error");
             Status::internal("internal signing error")
         }
-    })
+    }
+}
+
+/// Record metrics for a gate sign result, then map the error to `Status`.
+///
+/// Errors are classified via [`classify_gate_error`] into a bounded
+/// `error_type` set (aligned with HTTP audit labels) before
+/// [`record_sign`] — no Display-string projection, no collapse to
+/// `internal` for slashing/doppelganger.
+#[allow(clippy::result_large_err)]
+fn finish_gate_sign(
+    metrics: Option<&SignerMetrics>,
+    backend_name: &str,
+    rpc_type: &'static str,
+    started: Instant,
+    result: Result<Vec<u8>, SigningGateError>,
+) -> Result<Vec<u8>, Status> {
+    match result {
+        Ok(sig) => {
+            record_sign(metrics, backend_name, rpc_type, started, Ok(()));
+            Ok(sig)
+        }
+        Err(e) => {
+            record_sign(metrics, backend_name, rpc_type, started, Err(classify_gate_error(&e)));
+            Err(gate_err_to_status(e))
+        }
+    }
+}
+
+/// Record metrics for a raw backend sign result, then map the error to `Status`.
+///
+/// Errors are classified via [`classify_error`] before [`record_sign`].
+#[allow(clippy::result_large_err)]
+fn finish_backend_sign(
+    metrics: Option<&SignerMetrics>,
+    backend_name: &str,
+    rpc_type: &'static str,
+    started: Instant,
+    result: Result<[u8; 96], SigningBackendError>,
+) -> Result<Vec<u8>, Status> {
+    match result {
+        Ok(sig) => {
+            record_sign(metrics, backend_name, rpc_type, started, Ok(()));
+            Ok(sig.to_vec())
+        }
+        Err(e) => {
+            record_sign(metrics, backend_name, rpc_type, started, Err(classify_error(&e)));
+            Err(backend_err_to_status(e))
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -517,10 +560,14 @@ impl SignerServiceV2 for SignerServiceImpl {
 
         let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
         let gate = self.require_gate()?;
-        let sig = gate
-            .sign_block(&pubkey, slot, signing_root, gvr, &client_cn)
-            .await
-            .map_err(gate_err_to_status)?;
+        let started = Instant::now();
+        let sig = finish_gate_sign(
+            self.metrics.as_deref(),
+            &self.backend_name,
+            grpc_sign_type::BEACON_BLOCK,
+            started,
+            gate.sign_block(&pubkey, slot, signing_root, gvr, &client_cn).await,
+        )?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -569,10 +616,14 @@ impl SignerServiceV2 for SignerServiceImpl {
 
         let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
         let gate = self.require_gate()?;
-        let sig = gate
-            .sign_block(&pubkey, slot, signing_root, gvr, &client_cn)
-            .await
-            .map_err(gate_err_to_status)?;
+        let started = Instant::now();
+        let sig = finish_gate_sign(
+            self.metrics.as_deref(),
+            &self.backend_name,
+            grpc_sign_type::BLINDED_BEACON_BLOCK,
+            started,
+            gate.sign_block(&pubkey, slot, signing_root, gvr, &client_cn).await,
+        )?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -610,11 +661,24 @@ impl SignerServiceV2 for SignerServiceImpl {
         let domain = compute_domain(DOMAIN_RANDAO, current_version, gvr);
         let signing_root = compute_signing_root(&epoch, domain);
 
+        let started = Instant::now();
         let sig = if let Some(gate) = &self.gate {
             let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-            gate.sign_randao_reveal(&pubkey, signing_root).await.map_err(gate_err_to_status)?
+            finish_gate_sign(
+                self.metrics.as_deref(),
+                &self.backend_name,
+                grpc_sign_type::RANDAO_REVEAL,
+                started,
+                gate.sign_randao_reveal(&pubkey, signing_root).await,
+            )?
         } else {
-            sign_via_backend(self.backend.as_ref(), &signing_root, &pubkey_bytes).await?
+            finish_backend_sign(
+                self.metrics.as_deref(),
+                &self.backend_name,
+                grpc_sign_type::RANDAO_REVEAL,
+                started,
+                self.backend.sign(&signing_root, &pubkey_bytes).await,
+            )?
         };
 
         tracing::info!(
@@ -700,10 +764,22 @@ impl SignerServiceV2 for SignerServiceImpl {
 
         let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
         let gate = self.require_gate()?;
-        let sig = gate
-            .sign_attestation(&pubkey, source_epoch, target_epoch, signing_root, gvr, &client_cn)
-            .await
-            .map_err(gate_err_to_status)?;
+        let started = Instant::now();
+        let sig = finish_gate_sign(
+            self.metrics.as_deref(),
+            &self.backend_name,
+            grpc_sign_type::ATTESTATION_DATA,
+            started,
+            gate.sign_attestation(
+                &pubkey,
+                source_epoch,
+                target_epoch,
+                signing_root,
+                gvr,
+                &client_cn,
+            )
+            .await,
+        )?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -767,13 +843,24 @@ impl SignerServiceV2 for SignerServiceImpl {
         // SS-2/SS-3: route through gate.sign_aggregate_and_proof which is non-slashable.
         // No attestation staging occurs here.  Also works without a slashing DB
         // (--disable-slashing-protection) since aggregates are non-slashable.
+        let started = Instant::now();
         let sig = if let Some(gate) = &self.gate {
             let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-            gate.sign_aggregate_and_proof(&pubkey, signing_root)
-                .await
-                .map_err(gate_err_to_status)?
+            finish_gate_sign(
+                self.metrics.as_deref(),
+                &self.backend_name,
+                grpc_sign_type::AGGREGATE_AND_PROOF,
+                started,
+                gate.sign_aggregate_and_proof(&pubkey, signing_root).await,
+            )?
         } else {
-            sign_via_backend(self.backend.as_ref(), &signing_root, &pubkey_bytes).await?
+            finish_backend_sign(
+                self.metrics.as_deref(),
+                &self.backend_name,
+                grpc_sign_type::AGGREGATE_AND_PROOF,
+                started,
+                self.backend.sign(&signing_root, &pubkey_bytes).await,
+            )?
         };
 
         tracing::info!(
@@ -829,13 +916,24 @@ impl SignerServiceV2 for SignerServiceImpl {
         let domain = compute_domain(DOMAIN_SYNC_COMMITTEE, current_version, gvr);
         let signing_root = compute_signing_root(&beacon_block_root, domain);
 
+        let started = Instant::now();
         let sig = if let Some(gate) = &self.gate {
             let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-            gate.sign_sync_committee_message(&pubkey, signing_root)
-                .await
-                .map_err(gate_err_to_status)?
+            finish_gate_sign(
+                self.metrics.as_deref(),
+                &self.backend_name,
+                grpc_sign_type::SYNC_COMMITTEE_MESSAGE,
+                started,
+                gate.sign_sync_committee_message(&pubkey, signing_root).await,
+            )?
         } else {
-            sign_via_backend(self.backend.as_ref(), &signing_root, &pubkey_bytes).await?
+            finish_backend_sign(
+                self.metrics.as_deref(),
+                &self.backend_name,
+                grpc_sign_type::SYNC_COMMITTEE_MESSAGE,
+                started,
+                self.backend.sign(&signing_root, &pubkey_bytes).await,
+            )?
         };
 
         tracing::info!(
@@ -884,11 +982,24 @@ impl SignerServiceV2 for SignerServiceImpl {
             SyncAggregatorSelectionData { slot, subcommittee_index: r.subcommittee_index };
         let signing_root = compute_signing_root(&selection_data, domain);
 
+        let started = Instant::now();
         let sig = if let Some(gate) = &self.gate {
             let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-            gate.sign_selection_proof(&pubkey, signing_root).await.map_err(gate_err_to_status)?
+            finish_gate_sign(
+                self.metrics.as_deref(),
+                &self.backend_name,
+                grpc_sign_type::SYNC_AGGREGATOR_SELECTION_DATA,
+                started,
+                gate.sign_selection_proof(&pubkey, signing_root).await,
+            )?
         } else {
-            sign_via_backend(self.backend.as_ref(), &signing_root, &pubkey_bytes).await?
+            finish_backend_sign(
+                self.metrics.as_deref(),
+                &self.backend_name,
+                grpc_sign_type::SYNC_AGGREGATOR_SELECTION_DATA,
+                started,
+                self.backend.sign(&signing_root, &pubkey_bytes).await,
+            )?
         };
 
         tracing::info!(
@@ -951,13 +1062,24 @@ impl SignerServiceV2 for SignerServiceImpl {
         let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, current_version, gvr);
         let signing_root = compute_signing_root(&cap, domain);
 
+        let started = Instant::now();
         let sig = if let Some(gate) = &self.gate {
             let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-            gate.sign_contribution_and_proof(&pubkey, signing_root)
-                .await
-                .map_err(gate_err_to_status)?
+            finish_gate_sign(
+                self.metrics.as_deref(),
+                &self.backend_name,
+                grpc_sign_type::CONTRIBUTION_AND_PROOF,
+                started,
+                gate.sign_contribution_and_proof(&pubkey, signing_root).await,
+            )?
         } else {
-            sign_via_backend(self.backend.as_ref(), &signing_root, &pubkey_bytes).await?
+            finish_backend_sign(
+                self.metrics.as_deref(),
+                &self.backend_name,
+                grpc_sign_type::CONTRIBUTION_AND_PROOF,
+                started,
+                self.backend.sign(&signing_root, &pubkey_bytes).await,
+            )?
         };
 
         tracing::info!(
@@ -1021,13 +1143,24 @@ impl SignerServiceV2 for SignerServiceImpl {
         let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_hash);
         let signing_root = compute_signing_root(&registration, domain);
 
+        let started = Instant::now();
         let sig = if let Some(gate) = &self.gate {
             let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-            gate.sign_builder_registration(&pubkey, signing_root)
-                .await
-                .map_err(gate_err_to_status)?
+            finish_gate_sign(
+                self.metrics.as_deref(),
+                &self.backend_name,
+                grpc_sign_type::BUILDER_REGISTRATION,
+                started,
+                gate.sign_builder_registration(&pubkey, signing_root).await,
+            )?
         } else {
-            sign_via_backend(self.backend.as_ref(), &signing_root, &pubkey_bytes).await?
+            finish_backend_sign(
+                self.metrics.as_deref(),
+                &self.backend_name,
+                grpc_sign_type::BUILDER_REGISTRATION,
+                started,
+                self.backend.sign(&signing_root, &pubkey_bytes).await,
+            )?
         };
 
         tracing::info!(
@@ -1078,11 +1211,24 @@ impl SignerServiceV2 for SignerServiceImpl {
         let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, current_version, gvr);
         let signing_root = compute_signing_root(&exit, domain);
 
+        let started = Instant::now();
         let sig = if let Some(gate) = &self.gate {
             let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-            gate.sign_voluntary_exit(&pubkey, signing_root).await.map_err(gate_err_to_status)?
+            finish_gate_sign(
+                self.metrics.as_deref(),
+                &self.backend_name,
+                grpc_sign_type::VOLUNTARY_EXIT,
+                started,
+                gate.sign_voluntary_exit(&pubkey, signing_root).await,
+            )?
         } else {
-            sign_via_backend(self.backend.as_ref(), &signing_root, &pubkey_bytes).await?
+            finish_backend_sign(
+                self.metrics.as_deref(),
+                &self.backend_name,
+                grpc_sign_type::VOLUNTARY_EXIT,
+                started,
+                self.backend.sign(&signing_root, &pubkey_bytes).await,
+            )?
         };
 
         tracing::info!(
@@ -1602,7 +1748,13 @@ mod tests {
             Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: pubkey.to_vec() });
         let err = svc.sign(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unimplemented);
-        assert_eq!(metrics.sign_total.with_label_values(&["basic", "success"]).get(), 0);
+        assert_eq!(
+            metrics
+                .sign_total
+                .with_label_values(&["basic", grpc_sign_type::BEACON_BLOCK, "success"])
+                .get(),
+            0
+        );
     }
 
     #[tokio::test]
@@ -1612,11 +1764,340 @@ mod tests {
         let req = Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: vec![2u8; 48] });
         let err = svc.sign(req).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unimplemented);
-        assert_eq!(metrics.sign_total.with_label_values(&["basic", "error"]).get(), 0);
+        assert_eq!(
+            metrics
+                .sign_total
+                .with_label_values(&["basic", grpc_sign_type::BEACON_BLOCK, "error"])
+                .get(),
+            0
+        );
         assert_eq!(
             metrics.sign_errors_total.with_label_values(&["basic", "key_not_found"]).get(),
             0
         );
+    }
+
+    // ── RF1-09: gRPC sign metrics via shared free-standing helper ─────────────
+
+    fn make_service_v2_with_metrics(
+        backend: MockBackend,
+    ) -> (SignerServiceImpl, Arc<SignerMetrics>) {
+        let metrics = Arc::new(SignerMetrics::new());
+        let svc = make_service_v2(backend).with_metrics(Arc::clone(&metrics));
+        (svc, metrics)
+    }
+
+    #[tokio::test]
+    async fn test_v2_sign_beacon_block_records_sign_total() {
+        let pubkey = test_pubkey_bytes();
+        let (svc, metrics) = make_service_v2_with_metrics(MockBackend::with_test_key());
+
+        let req = Request::new(SignBeaconBlockRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            block_ssz: sample_block_ssz(42),
+            fork_id: 4,
+        });
+        let resp = svc.sign_beacon_block(req).await.unwrap();
+        assert_eq!(resp.into_inner().signature.len(), 96);
+
+        assert_eq!(
+            metrics
+                .sign_total
+                .with_label_values(&["basic", grpc_sign_type::BEACON_BLOCK, "success"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .sign_duration_seconds
+                .with_label_values(&["basic", grpc_sign_type::BEACON_BLOCK])
+                .get_sample_count(),
+            1
+        );
+        assert_eq!(
+            metrics.sign_errors_total.with_label_values(&["basic", "key_not_found"]).get(),
+            0
+        );
+        // Encode scrape text after a real gRPC sign (RF1-09 scrape AC / L1).
+        let scrape = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(scrape.contains("rvc_signer_sign_total"), "scrape: {scrape}");
+        assert!(scrape.contains("beacon_block"), "scrape: {scrape}");
+        assert!(scrape.contains("success"), "scrape: {scrape}");
+    }
+
+    #[tokio::test]
+    async fn test_v2_sign_unknown_key_records_sign_error() {
+        let db = Arc::new(slashing::SlashingDb::open_in_memory().unwrap());
+        let metrics = Arc::new(SignerMetrics::new());
+        let svc = SignerServiceImpl::new_v2(
+            Arc::new(MockBackend::empty()),
+            "basic".to_string(),
+            Arc::clone(&db),
+        )
+        .with_metrics(Arc::clone(&metrics));
+
+        let pubkey = test_pubkey_bytes();
+        let req = Request::new(SignBeaconBlockRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            block_ssz: sample_block_ssz(42),
+            fork_id: 4,
+        });
+        let err = svc.sign_beacon_block(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        assert_eq!(
+            metrics
+                .sign_total
+                .with_label_values(&["basic", grpc_sign_type::BEACON_BLOCK, "error"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics.sign_errors_total.with_label_values(&["basic", "key_not_found"]).get(),
+            1,
+            "classify_gate_error must feed sign_errors_total for KeyNotFound"
+        );
+        // Encode scrape text after a failing gRPC sign (RF1-09 scrape AC / L1).
+        let scrape = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(scrape.contains("rvc_signer_sign_errors_total"), "scrape: {scrape}");
+        assert!(scrape.contains("key_not_found"), "scrape: {scrape}");
+    }
+
+    #[tokio::test]
+    async fn test_v2_sign_double_proposal_records_slashing_error_type() {
+        // M1: gate slashing rejections must not collapse to error_type=internal.
+        let pubkey = test_pubkey_bytes();
+        let (svc, metrics) = make_service_v2_with_metrics(MockBackend::with_test_key());
+
+        let req1 = Request::new(SignBeaconBlockRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            block_ssz: sample_block_ssz(100),
+            fork_id: 4,
+        });
+        svc.sign_beacon_block(req1).await.unwrap();
+
+        let mut different_ssz = sample_block_ssz(100);
+        for b in &mut different_ssz[16..48] {
+            *b ^= 0xFF;
+        }
+        let req2 = Request::new(SignBeaconBlockRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            block_ssz: different_ssz,
+            fork_id: 4,
+        });
+        let err = svc.sign_beacon_block(req2).await.unwrap_err();
+        assert!(
+            err.code() == tonic::Code::FailedPrecondition || err.code() == tonic::Code::Aborted,
+            "expected slashing rejection, got {:?}",
+            err.code()
+        );
+
+        assert_eq!(
+            metrics.sign_errors_total.with_label_values(&["basic", "slashing"]).get(),
+            1,
+            "slashable rejection must record error_type=slashing (not internal)"
+        );
+        assert_eq!(
+            metrics.sign_errors_total.with_label_values(&["basic", "internal"]).get(),
+            0,
+            "must not collapse slashing to internal"
+        );
+    }
+
+    #[test]
+    fn test_sign_recording_helper_no_ops_without_metrics() {
+        // Free-standing helper is safe with None (also covered in metrics unit tests).
+        record_sign(None, "basic", grpc_sign_type::BEACON_BLOCK, Instant::now(), Ok(()));
+        record_sign(
+            None,
+            "basic",
+            grpc_sign_type::BEACON_BLOCK,
+            Instant::now(),
+            Err("key_not_found"),
+        );
+    }
+
+    #[tokio::test]
+    async fn test_all_v2_handlers_record_sign_total() {
+        // Table-driven across all 10 RPCs so a future handler added without
+        // recording fails the test (RF1-09 / D4 safety net).
+        use eth_types::{
+            encode_attestation_ssz, encode_blinded_beacon_block_ssz,
+            encode_sync_committee_contribution_ssz, Attestation, BlindedBeaconBlock,
+            SyncCommitteeContribution,
+        };
+
+        let pubkey = test_pubkey_bytes();
+        let (svc, metrics) = make_service_v2_with_metrics(MockBackend::with_test_key());
+
+        // 1. beacon_block
+        svc.sign_beacon_block(Request::new(SignBeaconBlockRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            block_ssz: sample_block_ssz(1000),
+            fork_id: 4,
+        }))
+        .await
+        .expect("beacon_block");
+
+        // 2. blinded_beacon_block
+        let blinded = BlindedBeaconBlock {
+            slot: 1001,
+            proposer_index: 1,
+            parent_root: [0x33; 32],
+            state_root: [0x44; 32],
+            body: eth_types::external_vector_blinded_electra_body().as_ssz_bytes(),
+        };
+        svc.sign_blinded_beacon_block(Request::new(SignBlindedBeaconBlockRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            block_ssz: encode_blinded_beacon_block_ssz(&blinded, 4),
+            fork_id: 4,
+        }))
+        .await
+        .expect("blinded_beacon_block");
+
+        // 3. randao_reveal
+        svc.sign_randao_reveal(Request::new(SignRandaoRevealRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            epoch: 10,
+            fork_id: 4,
+        }))
+        .await
+        .expect("randao_reveal");
+
+        // 4. attestation_data
+        svc.sign_attestation_data(Request::new(SignAttestationDataRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            data: Some(crate::proto::signer_v2::AttestationData {
+                slot: 320,
+                index: 0,
+                beacon_block_root: vec![0x33u8; 32],
+                source: Some(crate::proto::signer_v2::Checkpoint {
+                    epoch: 9,
+                    root: vec![0x44u8; 32],
+                }),
+                target: Some(crate::proto::signer_v2::Checkpoint {
+                    epoch: 10,
+                    root: vec![0x55u8; 32],
+                }),
+            }),
+            fork_id: 4,
+        }))
+        .await
+        .expect("attestation_data");
+
+        // 5. aggregate_and_proof
+        let att = Attestation {
+            aggregation_bits: vec![0xff, 0x01],
+            data: AttestationData {
+                slot: 320,
+                index: 0,
+                beacon_block_root: [0x33u8; 32],
+                source: Checkpoint { epoch: 9, root: [0x44u8; 32] },
+                target: Checkpoint { epoch: 10, root: [0x55u8; 32] },
+            },
+            signature: vec![0xaa; 96],
+        };
+        svc.sign_aggregate_and_proof(Request::new(SignAggregateAndProofRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            aggregator_index: 42,
+            aggregate_ssz: encode_attestation_ssz(&att, 4),
+            selection_proof: vec![0xbb; 96],
+            fork_id: 4,
+        }))
+        .await
+        .expect("aggregate_and_proof");
+
+        // 6. sync_committee_message
+        svc.sign_sync_committee_message(Request::new(SignSyncCommitteeMessageRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            slot: 500,
+            beacon_block_root: vec![0xBB; 32],
+            fork_id: 4,
+        }))
+        .await
+        .expect("sync_committee_message");
+
+        // 7. sync_aggregator_selection_data
+        svc.sign_sync_aggregator_selection_data(Request::new(
+            SignSyncAggregatorSelectionDataRequest {
+                pubkey: pubkey.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                slot: 600,
+                subcommittee_index: 3,
+                fork_id: 4,
+            },
+        ))
+        .await
+        .expect("sync_aggregator_selection_data");
+
+        // 8. contribution_and_proof
+        let contrib = SyncCommitteeContribution {
+            slot: 700,
+            beacon_block_root: [0xBB; 32],
+            subcommittee_index: 2,
+            aggregation_bits: vec![0xff; 16],
+            signature: vec![0xcc; 96],
+        };
+        svc.sign_contribution_and_proof(Request::new(SignContributionAndProofRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            aggregator_index: 42,
+            contribution_ssz: encode_sync_committee_contribution_ssz(&contrib, 4),
+            selection_proof: vec![0xcc; 96],
+            fork_id: 4,
+        }))
+        .await
+        .expect("contribution_and_proof");
+
+        // 9. builder_registration
+        svc.sign_builder_registration(Request::new(SignBuilderRegistrationRequest {
+            pubkey: pubkey.to_vec(),
+            fee_recipient: vec![0x11; 20],
+            gas_limit: 30_000_000,
+            timestamp: 1_700_000_000,
+            genesis_fork_version: vec![],
+        }))
+        .await
+        .expect("builder_registration");
+
+        // 10. voluntary_exit
+        svc.sign_voluntary_exit(Request::new(SignVoluntaryExitRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            epoch: 100,
+            validator_index: 7,
+            fork_id: 4,
+        }))
+        .await
+        .expect("voluntary_exit");
+
+        // Every type in the bounded set must have recorded a success.
+        assert_eq!(grpc_sign_type::ALL.len(), 10, "bounded type set must list all 10 RPCs");
+        for rpc_type in grpc_sign_type::ALL {
+            assert_eq!(
+                metrics.sign_total.with_label_values(&["basic", rpc_type, "success"]).get(),
+                1,
+                "handler for type={rpc_type} must record sign_total success via shared helper"
+            );
+            assert!(
+                metrics
+                    .sign_duration_seconds
+                    .with_label_values(&["basic", rpc_type])
+                    .get_sample_count()
+                    >= 1,
+                "handler for type={rpc_type} must record duration"
+            );
+        }
     }
 
     // ── SEC-4: primary client-CN allow-list ───────────────────────────────────

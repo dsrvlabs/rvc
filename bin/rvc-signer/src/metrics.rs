@@ -1,10 +1,42 @@
 use std::net::SocketAddr;
+use std::time::Instant;
 
 use prometheus::{
     Encoder, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, Opts, Registry, TextEncoder,
 };
 use tokio::task::JoinHandle;
 use tracing::info;
+
+/// Bounded, code-derived gRPC sign `type` label values (RF1-09).
+///
+/// Never request-derived — keeps Prometheus series cardinality low (same
+/// reasoning as the HTTP path at `http_api/routes.rs`).
+pub mod grpc_sign_type {
+    pub const BEACON_BLOCK: &str = "beacon_block";
+    pub const BLINDED_BEACON_BLOCK: &str = "blinded_beacon_block";
+    pub const RANDAO_REVEAL: &str = "randao_reveal";
+    pub const ATTESTATION_DATA: &str = "attestation_data";
+    pub const AGGREGATE_AND_PROOF: &str = "aggregate_and_proof";
+    pub const SYNC_COMMITTEE_MESSAGE: &str = "sync_committee_message";
+    pub const SYNC_AGGREGATOR_SELECTION_DATA: &str = "sync_aggregator_selection_data";
+    pub const CONTRIBUTION_AND_PROOF: &str = "contribution_and_proof";
+    pub const BUILDER_REGISTRATION: &str = "builder_registration";
+    pub const VOLUNTARY_EXIT: &str = "voluntary_exit";
+
+    /// All ten v2 RPC type labels — used by the table-driven recording test.
+    pub const ALL: &[&str] = &[
+        BEACON_BLOCK,
+        BLINDED_BEACON_BLOCK,
+        RANDAO_REVEAL,
+        ATTESTATION_DATA,
+        AGGREGATE_AND_PROOF,
+        SYNC_COMMITTEE_MESSAGE,
+        SYNC_AGGREGATOR_SELECTION_DATA,
+        CONTRIBUTION_AND_PROOF,
+        BUILDER_REGISTRATION,
+        VOLUNTARY_EXIT,
+    ];
+}
 
 #[cfg(feature = "dvt")]
 #[derive(Clone)]
@@ -43,9 +75,12 @@ impl SignerMetrics {
     pub fn new() -> Self {
         let registry = Registry::new();
 
+        // gRPC collectors (RF1-09): type × outcome, plus backend dimension.
+        // Series were never emitted in production before RF1-09, so the arity
+        // change from {backend,result} / {backend} is dashboard-safe.
         let sign_total = IntCounterVec::new(
             Opts::new("rvc_signer_sign_total", "Total number of signing requests"),
-            &["backend", "result"],
+            &["backend", "type", "result"],
         )
         .expect("failed to create rvc_signer_sign_total");
         registry
@@ -58,7 +93,7 @@ impl SignerMetrics {
                 "Duration of signing operations in seconds",
             )
             .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0]),
-            &["backend"],
+            &["backend", "type"],
         )
         .expect("failed to create rvc_signer_sign_duration_seconds");
         registry
@@ -190,11 +225,79 @@ impl SignerMetrics {
     }
 }
 
+/// Map a backend error to a bounded `error_type` label for `sign_errors_total`.
 pub fn classify_error(err: &crate::backend::SigningBackendError) -> &'static str {
     match err {
         crate::backend::SigningBackendError::KeyNotFound(_) => "key_not_found",
         crate::backend::SigningBackendError::SigningFailed(_) => "internal",
         crate::backend::SigningBackendError::KeystoreLoadFailed(_) => "internal",
+    }
+}
+
+/// Map a gate error to a bounded `error_type` label for `sign_errors_total`.
+///
+/// Label vocabulary aligns with the HTTP audit labels
+/// (`http_api/response.rs::audit_label`) so operators can correlate transports:
+/// - `key_not_found` — unknown pubkey
+/// - `doppelganger` — signing enablement / doppelganger gate blocked
+/// - `slashing` — slashable conflict (double vote / double proposal / surround)
+/// - `slashing_db_error` — non-slashable slashing-DB staging failure (I/O, etc.)
+/// - `internal` — backend sign failure or post-sign commit failure
+///
+/// All values are code-derived constants (never request-derived); cardinality
+/// stays fixed regardless of error message content.
+pub fn classify_gate_error(err: &signer::SigningGateError) -> &'static str {
+    use signer::SigningGateError;
+    use slashing::SlashingError;
+    match err {
+        SigningGateError::BlockedByDoppelganger => "doppelganger",
+        SigningGateError::BlockedBySlashingDb(inner) => match inner {
+            SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => "slashing",
+            _ => "slashing_db_error",
+        },
+        SigningGateError::SlashingDbCommitFailed(_) => "internal",
+        SigningGateError::KeyNotFound | SigningGateError::UnknownPubkey => "key_not_found",
+        SigningGateError::SigningFailed(_) => "internal",
+    }
+}
+
+/// Record one gRPC sign attempt on the shared collectors (RF1-09).
+///
+/// Free-standing (not a method on `SignerServiceImpl`) so Phase 4's D4
+/// `SignPlan` dispatcher can absorb it unchanged.
+///
+/// - No-ops when `metrics` is `None`.
+/// - Always increments `sign_total{backend,type,result}` and observes
+///   `sign_duration_seconds{backend,type}`.
+/// - On `Err(error_type)`, increments `sign_errors_total{backend,error_type}`.
+///   Callers must pass a **bounded** label from [`classify_error`] (backend) or
+///   [`classify_gate_error`] (gate) — never request-derived text.
+///
+/// # Timer semantics
+///
+/// `started` is expected to be captured at the **gate/backend sign boundary**
+/// (after CN auth, SSZ decode, and signing-root computation). Duration therefore
+/// reflects pure sign latency, not full RPC wall time. Pre-sign validation
+/// failures do not call this helper at all (no series increment).
+///
+/// `rpc_type` must be one of the bounded [`grpc_sign_type`] constants — never
+/// request-derived.
+pub fn record_sign(
+    metrics: Option<&SignerMetrics>,
+    backend: &str,
+    rpc_type: &str,
+    started: Instant,
+    outcome: Result<(), &'static str>,
+) {
+    let Some(m) = metrics else {
+        return;
+    };
+    let elapsed = started.elapsed().as_secs_f64();
+    let result = if outcome.is_ok() { "success" } else { "error" };
+    m.sign_total.with_label_values(&[backend, rpc_type, result]).inc();
+    m.sign_duration_seconds.with_label_values(&[backend, rpc_type]).observe(elapsed);
+    if let Err(error_type) = outcome {
+        m.sign_errors_total.with_label_values(&[backend, error_type]).inc();
     }
 }
 
@@ -254,8 +357,8 @@ mod tests {
     fn test_metrics_new_creates_all_metrics() {
         let m = SignerMetrics::new();
         // Touch each metric so gather() returns them
-        m.sign_total.with_label_values(&["basic", "success"]).inc();
-        m.sign_duration_seconds.with_label_values(&["basic"]).observe(0.0);
+        m.sign_total.with_label_values(&["basic", "beacon_block", "success"]).inc();
+        m.sign_duration_seconds.with_label_values(&["basic", "beacon_block"]).observe(0.0);
         m.sign_errors_total.with_label_values(&["basic", "internal"]).inc();
         m.keys_loaded.with_label_values(&["basic"]).set(0.0);
         // HTTP-path series (Issue 4.5) — registered in the same registry.
@@ -275,17 +378,26 @@ mod tests {
     #[test]
     fn test_sign_total_counter_increments() {
         let m = SignerMetrics::new();
-        m.sign_total.with_label_values(&["basic", "success"]).inc();
-        assert_eq!(m.sign_total.with_label_values(&["basic", "success"]).get(), 1);
+        m.sign_total.with_label_values(&["basic", "beacon_block", "success"]).inc();
+        assert_eq!(m.sign_total.with_label_values(&["basic", "beacon_block", "success"]).get(), 1);
     }
 
     #[test]
     fn test_sign_duration_histogram_records() {
         let m = SignerMetrics::new();
-        m.sign_duration_seconds.with_label_values(&["basic"]).observe(0.05);
-        assert_eq!(m.sign_duration_seconds.with_label_values(&["basic"]).get_sample_count(), 1);
+        m.sign_duration_seconds.with_label_values(&["basic", "beacon_block"]).observe(0.05);
+        assert_eq!(
+            m.sign_duration_seconds
+                .with_label_values(&["basic", "beacon_block"])
+                .get_sample_count(),
+            1
+        );
         assert!(
-            (m.sign_duration_seconds.with_label_values(&["basic"]).get_sample_sum() - 0.05).abs()
+            (m.sign_duration_seconds
+                .with_label_values(&["basic", "beacon_block"])
+                .get_sample_sum()
+                - 0.05)
+                .abs()
                 < 1e-9
         );
     }
@@ -307,12 +419,13 @@ mod tests {
     #[test]
     fn test_encode_returns_prometheus_text() {
         let m = SignerMetrics::new();
-        m.sign_total.with_label_values(&["basic", "success"]).inc();
+        m.sign_total.with_label_values(&["basic", "beacon_block", "success"]).inc();
         let output = m.encode().unwrap();
         let text = String::from_utf8(output).unwrap();
         assert!(text.contains("rvc_signer_sign_total"));
         assert!(text.contains("basic"));
         assert!(text.contains("success"));
+        assert!(text.contains("beacon_block"));
     }
 
     #[test]
@@ -336,17 +449,101 @@ mod tests {
     #[test]
     fn test_different_backends_independent() {
         let m = SignerMetrics::new();
-        m.sign_total.with_label_values(&["basic", "success"]).inc();
-        m.sign_total.with_label_values(&["dvt", "success"]).inc();
-        m.sign_total.with_label_values(&["dvt", "success"]).inc();
-        assert_eq!(m.sign_total.with_label_values(&["basic", "success"]).get(), 1);
-        assert_eq!(m.sign_total.with_label_values(&["dvt", "success"]).get(), 2);
+        m.sign_total.with_label_values(&["basic", "beacon_block", "success"]).inc();
+        m.sign_total.with_label_values(&["dvt", "beacon_block", "success"]).inc();
+        m.sign_total.with_label_values(&["dvt", "beacon_block", "success"]).inc();
+        assert_eq!(m.sign_total.with_label_values(&["basic", "beacon_block", "success"]).get(), 1);
+        assert_eq!(m.sign_total.with_label_values(&["dvt", "beacon_block", "success"]).get(), 2);
+    }
+
+    #[test]
+    fn test_record_sign_success_increments_total_and_duration() {
+        let m = SignerMetrics::new();
+        let started = Instant::now();
+        record_sign(Some(&m), "basic", grpc_sign_type::BEACON_BLOCK, started, Ok(()));
+        assert_eq!(
+            m.sign_total
+                .with_label_values(&["basic", grpc_sign_type::BEACON_BLOCK, "success"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            m.sign_duration_seconds
+                .with_label_values(&["basic", grpc_sign_type::BEACON_BLOCK])
+                .get_sample_count(),
+            1
+        );
+        assert_eq!(m.sign_errors_total.with_label_values(&["basic", "key_not_found"]).get(), 0);
+    }
+
+    #[test]
+    fn test_record_sign_error_routes_through_classify_error() {
+        let m = SignerMetrics::new();
+        let err = crate::backend::SigningBackendError::KeyNotFound([0u8; 48]);
+        let started = Instant::now();
+        record_sign(
+            Some(&m),
+            "basic",
+            grpc_sign_type::ATTESTATION_DATA,
+            started,
+            Err(classify_error(&err)),
+        );
+        assert_eq!(
+            m.sign_total
+                .with_label_values(&["basic", grpc_sign_type::ATTESTATION_DATA, "error"])
+                .get(),
+            1
+        );
+        assert_eq!(m.sign_errors_total.with_label_values(&["basic", "key_not_found"]).get(), 1);
+    }
+
+    #[test]
+    fn test_classify_gate_error_bounded_taxonomy() {
+        use signer::SigningGateError;
+        use slashing::{BlockSlashingViolation, SlashingError};
+
+        assert_eq!(classify_gate_error(&SigningGateError::BlockedByDoppelganger), "doppelganger");
+        assert_eq!(
+            classify_gate_error(&SigningGateError::BlockedBySlashingDb(
+                SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal {
+                    slot: 1
+                })
+            )),
+            "slashing"
+        );
+        assert_eq!(
+            classify_gate_error(&SigningGateError::BlockedBySlashingDb(
+                SlashingError::MigrationError("io".into())
+            )),
+            "slashing_db_error"
+        );
+        assert_eq!(
+            classify_gate_error(&SigningGateError::SlashingDbCommitFailed(
+                SlashingError::MigrationError("io".into())
+            )),
+            "internal"
+        );
+        assert_eq!(classify_gate_error(&SigningGateError::KeyNotFound), "key_not_found");
+        assert_eq!(classify_gate_error(&SigningGateError::UnknownPubkey), "key_not_found");
+        assert_eq!(classify_gate_error(&SigningGateError::SigningFailed("x".into())), "internal");
+    }
+
+    #[test]
+    fn test_sign_recording_helper_no_ops_without_metrics() {
+        // Must not panic when metrics is None (RF1-09 acceptance).
+        record_sign(None, "basic", grpc_sign_type::RANDAO_REVEAL, Instant::now(), Ok(()));
+        record_sign(None, "basic", grpc_sign_type::RANDAO_REVEAL, Instant::now(), Err("internal"));
+    }
+
+    #[test]
+    fn test_grpc_sign_type_all_has_ten_handlers() {
+        assert_eq!(grpc_sign_type::ALL.len(), 10);
     }
 
     #[tokio::test]
     async fn test_serve_metrics_responds_to_http() {
         let m = std::sync::Arc::new(SignerMetrics::new());
-        m.sign_total.with_label_values(&["basic", "success"]).inc();
+        m.sign_total.with_label_values(&["basic", "beacon_block", "success"]).inc();
 
         let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (handle, bound_addr) = serve_metrics(addr, std::sync::Arc::clone(&m)).await.unwrap();

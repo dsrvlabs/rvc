@@ -1282,8 +1282,8 @@ mod tests {
         let metrics = Arc::clone(&state.metrics);
         let id = format!("0x{}", hex::encode(pk_bytes));
 
-        // gRPC-style increment on the shared registry...
-        metrics.sign_total.with_label_values(&["basic", "success"]).inc();
+        // gRPC-style increment on the shared registry (RF1-09 arity: backend,type,result)...
+        metrics.sign_total.with_label_values(&["basic", "beacon_block", "success"]).inc();
         // ...and a real HTTP sign on the same registry.
         let resp = post_sign(state, &id, None, attestation_body(None)).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1291,6 +1291,7 @@ mod tests {
         let scrape = String::from_utf8(metrics.encode().unwrap()).unwrap();
         assert!(scrape.contains("rvc_signer_sign_total"), "gRPC series present");
         assert!(scrape.contains("rvc_signer_http_sign_total"), "HTTP series present");
+        assert!(scrape.contains("beacon_block"), "gRPC type label present after arity change");
     }
 
     // ── Issue 5.1: VOLUNTARY_EXIT (P2, non-slashable, FR-13) ──────────────────

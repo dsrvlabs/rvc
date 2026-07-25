@@ -797,16 +797,16 @@ low-cardinality reasoning already documented at `http_api/routes.rs:165-167`.
 4. Leave `with_metrics` in place — the field stops being dead once the helper reads it.
 
 **Acceptance criteria:**
-- [ ] All 10 v2 sign handlers record `sign_total`, `sign_duration_seconds`, and (on error)
+- [x] All 10 v2 sign handlers record `sign_total`, `sign_duration_seconds`, and (on error)
       `sign_errors_total` through **one shared free-standing helper** — no per-handler inline recording.
-- [ ] The helper is not a method on `SignerServiceImpl`, so Phase 4's D4 `SignPlan` dispatcher can absorb
+- [x] The helper is not a method on `SignerServiceImpl`, so Phase 4's D4 `SignPlan` dispatcher can absorb
       it unchanged.
-- [ ] The helper no-ops safely when `metrics` is `None`.
-- [ ] `classify_error` is wired into `sign_errors_total` and is no longer test-only.
-- [ ] A scrape test asserts non-zero `rvc_signer_sign_total` after a successful gRPC sign, and a non-zero
+- [x] The helper no-ops safely when `metrics` is `None`.
+- [x] `classify_error` is wired into `sign_errors_total` and is no longer test-only.
+- [x] A scrape test asserts non-zero `rvc_signer_sign_total` after a successful gRPC sign, and a non-zero
       `rvc_signer_sign_errors_total` after a failing one.
-- [ ] `type` label values come from a bounded code-derived set.
-- [ ] Standing invariant green.
+- [x] `type` label values come from a bounded code-derived set.
+- [x] Standing invariant green.
 
 **TDD test plan** (in `bin/rvc-signer/src/service.rs` tests + the metrics scrape test):
 1. **RED first:** `test_v2_sign_beacon_block_records_sign_total` — sign through the v2 handler with metrics

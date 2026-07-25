@@ -321,14 +321,23 @@ reload_interval_secs = 60
         assert_eq!(err.code(), tonic::Code::Unimplemented);
 
         // Counters must remain at zero — Unimplemented path does not touch metrics
-        assert_eq!(metrics.sign_total.with_label_values(&["basic", "success"]).get(), 0);
-        assert_eq!(metrics.sign_total.with_label_values(&["basic", "error"]).get(), 0);
+        assert_eq!(
+            metrics.sign_total.with_label_values(&["basic", "beacon_block", "success"]).get(),
+            0
+        );
+        assert_eq!(
+            metrics.sign_total.with_label_values(&["basic", "beacon_block", "error"]).get(),
+            0
+        );
         assert_eq!(
             metrics.sign_errors_total.with_label_values(&["basic", "key_not_found"]).get(),
             0
         );
         assert_eq!(
-            metrics.sign_duration_seconds.with_label_values(&["basic"]).get_sample_count(),
+            metrics
+                .sign_duration_seconds
+                .with_label_values(&["basic", "beacon_block"])
+                .get_sample_count(),
             0,
             "Unimplemented path must not record duration"
         );
@@ -337,8 +346,8 @@ reload_interval_secs = 60
     #[tokio::test]
     async fn test_metrics_endpoint_serves_prometheus_text() {
         let metrics = Arc::new(SignerMetrics::new());
-        metrics.sign_total.with_label_values(&["basic", "success"]).inc();
-        metrics.sign_total.with_label_values(&["basic", "success"]).inc();
+        metrics.sign_total.with_label_values(&["basic", "beacon_block", "success"]).inc();
+        metrics.sign_total.with_label_values(&["basic", "beacon_block", "success"]).inc();
         metrics.keys_loaded.with_label_values(&["basic"]).set(3.0);
 
         let addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -607,8 +616,14 @@ keystore_dir = "{}"
         assert_eq!(err.code(), tonic::Code::Unimplemented);
 
         // v1 sign counters must remain at zero
-        assert_eq!(metrics.sign_total.with_label_values(&["basic", "success"]).get(), 0);
-        assert_eq!(metrics.sign_total.with_label_values(&["basic", "error"]).get(), 0);
+        assert_eq!(
+            metrics.sign_total.with_label_values(&["basic", "beacon_block", "success"]).get(),
+            0
+        );
+        assert_eq!(
+            metrics.sign_total.with_label_values(&["basic", "beacon_block", "error"]).get(),
+            0
+        );
 
         // keys_loaded gauge still works (set above)
         assert_eq!(metrics.keys_loaded.with_label_values(&["basic"]).get(), 1.0);
