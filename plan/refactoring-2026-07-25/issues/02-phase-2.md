@@ -425,15 +425,15 @@ could reach, and the four BPS constants with no consumers.
    `due_ms` + a two-variant `TimingError`.
 
 **Acceptance criteria:**
-- [ ] `crates/timing/src/timer.rs` does not exist; `crates/timing` is under ~300 production lines.
-- [ ] No `rvc_slot_timing_*` metric is registered anywhere — verified by grepping a running
+- [x] `crates/timing/src/timer.rs` does not exist; `crates/timing` is under ~300 production lines.
+- [x] No `rvc_slot_timing_*` metric is registered anywhere — verified by grepping a running
       `/metrics` scrape or `crates/metrics/src/definitions.rs`, whichever the timer used.
-- [ ] `TimingError` has exactly `BeforeGenesis` and `InvalidSlotDuration`.
-- [ ] `ATTESTATION_DUE_BPS`, `AGGREGATE_DUE_BPS`, `BASIS_POINTS`, `due_ms` survive; the coordinator's
+- [x] `TimingError` has exactly `BeforeGenesis` and `InvalidSlotDuration`.
+- [x] `ATTESTATION_DUE_BPS`, `AGGREGATE_DUE_BPS`, `BASIS_POINTS`, `due_ms` survive; the coordinator's
       slot timing is byte-identical (no `crates/rvc` file is modified).
-- [ ] **Test-count delta stated and justified:** expected ≈ −20 (timer.rs's own module, ~200 test
+- [x] **Test-count delta stated and justified:** expected ≈ −20 (timer.rs's own module, ~200 test
       lines, plus 2 error-display tests), all *deleted-with-the-dead-code*; zero ported.
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **Risks:**
 - The Gloas BPS constants encode a real future fork requirement. The plan permits keeping them "next

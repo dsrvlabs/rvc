@@ -59,9 +59,9 @@ mod tests {
 
     #[test]
     fn test_orchestrator_error_display_timing() {
-        let timing_err = TimingError::Cancelled;
+        let timing_err = TimingError::InvalidSlotDuration;
         let err = OrchestratorError::Timing(timing_err);
-        assert_eq!(err.to_string(), "Timing error: timer cancelled");
+        assert_eq!(err.to_string(), "Timing error: slot duration must be at least 1 second");
     }
 
     #[test]
