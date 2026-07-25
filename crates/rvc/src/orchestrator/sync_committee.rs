@@ -1077,4 +1077,358 @@ mod tests {
              validator (is_signing_enabled=false)"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // H-6 (RF2-01 port): multi-validator sign-failure isolation.
+    //
+    // Ported from the deleted `sync-service` twin suite
+    // (`test_one_signer_failure_does_not_abort_others` and related). One
+    // validator's KeyNotFound must not abort the slot: other validators still
+    // produce, and the phase returns (does not panic / propagate).
+    // -----------------------------------------------------------------------
+
+    /// Multi-validator beacon for H-6 isolation tests. Returns a fixed duty set
+    /// and records submitted message validator indices / contribution proof counts.
+    struct IsolationBeacon {
+        duties: Vec<SyncCommitteeDuty>,
+        submitted_message_indices: Arc<Mutex<Vec<u64>>>,
+        contrib_fetch_calls: Arc<AtomicUsize>,
+        submitted_proof_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl BeaconNodeClient for IsolationBeacon {
+        async fn get_block_root(&self, _: &str) -> Result<BlockRootResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+
+        async fn post_sync_committee_duties(
+            &self,
+            _epoch: u64,
+            _validator_indices: &[String],
+        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
+            Ok(ExecutionOptimisticResponse {
+                execution_optimistic: false,
+                data: self.duties.clone(),
+            })
+        }
+
+        async fn submit_sync_committee_messages(
+            &self,
+            messages: &[BeaconSyncCommitteeMessage],
+        ) -> Result<(), BeaconError> {
+            let mut indices = self.submitted_message_indices.lock().unwrap();
+            for msg in messages {
+                indices.push(msg.validator_index);
+            }
+            Ok(())
+        }
+
+        async fn get_sync_committee_contribution(
+            &self,
+            slot: u64,
+            subcommittee_index: u64,
+            _beacon_block_root: &str,
+        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
+            self.contrib_fetch_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(DataResponse {
+                data: eth_types::SyncCommitteeContribution {
+                    slot,
+                    beacon_block_root: [0xAA; 32],
+                    subcommittee_index,
+                    aggregation_bits: vec![0xFF, 0x01],
+                    signature: vec![0u8; 96],
+                },
+            })
+        }
+
+        async fn submit_contribution_and_proofs(
+            &self,
+            proofs: &[BeaconSignedContributionAndProof],
+        ) -> Result<(), BeaconError> {
+            self.submitted_proof_count.fetch_add(proofs.len(), Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_fork_schedule(&self) -> Result<eth_types::ForkSchedule, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_fork(&self, _: &str) -> Result<StateForkResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_validators(&self, _: &[String]) -> Result<ValidatorsResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_attester_duties(
+            &self,
+            _: u64,
+            _: &[String],
+        ) -> Result<AttesterDutiesResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_proposer_duties(&self, _: u64) -> Result<ProposerDutiesResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn produce_block_v3(
+            &self,
+            _: u64,
+            _: &str,
+            _: Option<&str>,
+            _: Option<u64>,
+        ) -> Result<ProduceBlockResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn publish_block(&self, _: &SignedBeaconBlock, _: &str) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn publish_blinded_block(
+            &self,
+            _: &SignedBlindedBeaconBlock,
+            _: &str,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_attestation_data(
+            &self,
+            _: u64,
+            _: u64,
+        ) -> Result<AttestationDataResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_attestation(
+            &self,
+            _: &VersionedAttestation,
+        ) -> Result<SubmitAttestationResult, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_aggregate_attestation(
+            &self,
+            _: u64,
+            _: &str,
+            _: Option<u64>,
+        ) -> Result<VersionedAggregateAttestation, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_aggregate_and_proofs(
+            &self,
+            _: &VersionedSignedAggregateAndProof,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn prepare_beacon_proposer(
+            &self,
+            _: &[ProposerPreparation],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn submit_beacon_committee_subscriptions(
+            &self,
+            _: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn register_validators(
+            &self,
+            _: &[SignedValidatorRegistration],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_version(&self) -> Result<String, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+    }
+
+    /// H-6: three validators A/B/C on the messages path; B's secret key is absent
+    /// from the KeyManager (KeyNotFound). A and C must still submit; the phase
+    /// must complete without aborting the remaining validators.
+    #[tokio::test]
+    async fn test_h6_one_signer_failure_does_not_abort_sync_messages() {
+        let sk_a = SecretKey::generate();
+        let sk_b = SecretKey::generate();
+        let sk_c = SecretKey::generate();
+        let pk_a = sk_a.public_key();
+        let pk_b = sk_b.public_key();
+        let pk_c = sk_c.public_key();
+        let hex_a = format!("0x{}", hex::encode(pk_a.to_bytes()));
+        let hex_b = format!("0x{}", hex::encode(pk_b.to_bytes()));
+        let hex_c = format!("0x{}", hex::encode(pk_c.to_bytes()));
+
+        let duties = vec![
+            SyncCommitteeDuty {
+                pubkey: hex_a.clone(),
+                validator_index: 10,
+                validator_sync_committee_indices: vec![0],
+            },
+            SyncCommitteeDuty {
+                pubkey: hex_b.clone(),
+                validator_index: 11,
+                validator_sync_committee_indices: vec![1],
+            },
+            SyncCommitteeDuty {
+                pubkey: hex_c.clone(),
+                validator_index: 12,
+                validator_sync_committee_indices: vec![2],
+            },
+        ];
+
+        let submitted_message_indices = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let beacon = Arc::new(IsolationBeacon {
+            duties,
+            submitted_message_indices: submitted_message_indices.clone(),
+            contrib_fetch_calls: Arc::new(AtomicUsize::new(0)),
+            submitted_proof_count: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        for pk in [&pk_a, &pk_b, &pk_c] {
+            store.add_validator(ValidatorConfig::new(pk.to_bytes()));
+        }
+
+        // KeyManager holds A and C only — B signs with KeyNotFound.
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(sk_a);
+        key_manager.insert(sk_c);
+        let local_signer = LocalSigner::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(local_signer));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+
+        let duty_tracker =
+            Arc::new(DutyTracker::new(beacon.clone(), vec!["10".into(), "11".into(), "12".into()]));
+        duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
+
+        let mut map = HashMap::new();
+        map.insert(hex_a, pk_a);
+        map.insert(hex_b, pk_b);
+        map.insert(hex_c, pk_c);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
+
+        let service = SyncCommitteeService::new(
+            signer,
+            beacon,
+            duty_tracker,
+            pubkey_map,
+            create_test_config(),
+            store,
+        );
+
+        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some([0xAA; 32]) };
+        // Must complete without panic / hang — isolation property.
+        service.maybe_produce_sync_messages(0, 0, &ctx).await;
+
+        let mut indices = submitted_message_indices.lock().unwrap().clone();
+        indices.sort_unstable();
+        assert_eq!(
+            indices,
+            vec![10, 12],
+            "H-6: A and C must submit messages; B (KeyNotFound) must be skipped"
+        );
+    }
+
+    /// H-6: three aggregator-eligible validators on the contributions path; B's
+    /// secret key is absent. Selection-proof signing fails for B with continue;
+    /// A and C must still fetch contributions and submit proofs.
+    #[tokio::test]
+    async fn test_h6_one_signer_failure_does_not_abort_sync_contributions() {
+        let (sk_a, pk_a) = find_aggregator_sk();
+        let sk_b = SecretKey::generate();
+        let pk_b = sk_b.public_key();
+        let (sk_c, pk_c) = find_aggregator_sk();
+        let hex_a = format!("0x{}", hex::encode(pk_a.to_bytes()));
+        let hex_b = format!("0x{}", hex::encode(pk_b.to_bytes()));
+        let hex_c = format!("0x{}", hex::encode(pk_c.to_bytes()));
+
+        // Distinct subcommittees (pos 0 / 128 / 256 → subnet 0 / 1 / 2). For A
+        // and C we still need aggregator selection on their subcommittee.
+        // find_aggregator_sk is for subcommittee 0 only — put A and C on
+        // subcommittee 0 (indices 0 and 1) and B on the same path so B's
+        // selection-proof KeyNotFound is the isolation fault.
+        let duties = vec![
+            SyncCommitteeDuty {
+                pubkey: hex_a.clone(),
+                validator_index: 10,
+                validator_sync_committee_indices: vec![0],
+            },
+            SyncCommitteeDuty {
+                pubkey: hex_b.clone(),
+                validator_index: 11,
+                validator_sync_committee_indices: vec![1],
+            },
+            SyncCommitteeDuty {
+                pubkey: hex_c.clone(),
+                validator_index: 12,
+                validator_sync_committee_indices: vec![2],
+            },
+        ];
+
+        let submitted_message_indices = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let contrib_fetch_calls = Arc::new(AtomicUsize::new(0));
+        let submitted_proof_count = Arc::new(AtomicUsize::new(0));
+        let beacon = Arc::new(IsolationBeacon {
+            duties,
+            submitted_message_indices,
+            contrib_fetch_calls: contrib_fetch_calls.clone(),
+            submitted_proof_count: submitted_proof_count.clone(),
+        });
+
+        let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        for pk in [&pk_a, &pk_b, &pk_c] {
+            store.add_validator(ValidatorConfig::new(pk.to_bytes()));
+        }
+
+        // KeyManager holds A and C only — B's selection proof fails KeyNotFound.
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(sk_a);
+        key_manager.insert(sk_c);
+        let local_signer = LocalSigner::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(local_signer));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+
+        let duty_tracker =
+            Arc::new(DutyTracker::new(beacon.clone(), vec!["10".into(), "11".into(), "12".into()]));
+        duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
+
+        let mut map = HashMap::new();
+        map.insert(hex_a, pk_a);
+        map.insert(hex_b, pk_b);
+        map.insert(hex_c, pk_c);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
+
+        let service = SyncCommitteeService::new(
+            signer,
+            beacon,
+            duty_tracker,
+            pubkey_map,
+            create_test_config(),
+            store,
+        );
+
+        let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some([0xAA; 32]) };
+        service.maybe_produce_sync_contributions(0, 0, &ctx).await;
+
+        // A and C are aggregators for subcommittee 0 → two contribution fetches
+        // and two submitted proofs. B skipped after selection-proof KeyNotFound.
+        assert_eq!(
+            contrib_fetch_calls.load(Ordering::SeqCst),
+            2,
+            "H-6: contribution fetch must run for A and C only"
+        );
+        assert_eq!(
+            submitted_proof_count.load(Ordering::SeqCst),
+            2,
+            "H-6: proofs from A and C must be submitted; B must not abort the loop"
+        );
+    }
 }

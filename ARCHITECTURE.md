@@ -254,7 +254,7 @@ sequenceDiagram
     participant DT as DutyTracker
     participant BNM as BnManager
     participant Block as BlockService
-    participant Sync as SyncService
+    participant Sync as SyncCommitteeService
     participant Signer as SignerService
     participant Prop as Propagator
     participant Builder as BuilderService
@@ -481,13 +481,16 @@ Orchestrates the block proposal lifecycle: RANDAO reveal → block production �
 - **`BeaconBlockClient` trait** — `produce_block`, `publish_block`, `publish_blinded_block`.
 - Handles both full and blinded (MEV) blocks via `Eth-Execution-Payload-Blinded` header.
 
-### `crates/sync-service` — Sync Committees
+### `crates/sync-service` — Sync Committee Helpers
 
-Produces and submits sync committee messages (at t=slot/3) and contributions (at t=2*slot/3).
+Shared sync-committee constants and aggregator selection. Production message and contribution
+lifecycle is owned by the orchestrator's **`SyncCommitteeService`**
+(`crates/rvc/src/orchestrator/sync_committee.rs`), which signs via `SignerService` and submits
+via `BeaconNodeClient` (with timeouts and the D-3 doppelganger gate).
 
-- **`SyncService<S, B>`** — Generic over `SyncSigner` and `SyncBeaconClient`.
-- **Aggregator selection** — Computes selection proof, checks against `TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE`.
-- **Constants** — `SYNC_COMMITTEE_SIZE = 512`, `SYNC_COMMITTEE_SUBNET_COUNT = 4`.
+- **`is_sync_committee_aggregator`** — Selection-proof check against `TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE`.
+- **Constants** — `SYNC_COMMITTEE_SIZE = 512`, `SYNC_COMMITTEE_SUBNET_COUNT = 4`,
+  `TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE = 16`.
 
 ### `crates/builder` — MEV & Builder Integration
 

@@ -295,19 +295,21 @@ splitting them would create a needless conflict between two PRs on a 116-line fi
 6. **GREEN:** workspace green; sync-committee behaviour unchanged (no orchestrator code was edited).
 
 **Acceptance criteria:**
-- [ ] `crates/sync-service` exports exactly `is_sync_committee_aggregator`, `SyncServiceError` and
+- [x] `crates/sync-service` exports exactly `is_sync_committee_aggregator`, `SyncServiceError` and
       the three sync-committee constants; the crate is under ~150 lines of production code.
-- [ ] `rg "SyncService\b" crates bin -g '*.rs'` returns only `SyncServiceError` hits.
-- [ ] `rg "OrchestratorError::(Shutdown|InvalidPubkey|BeaconTimeout|SyncService)"` returns zero hits.
-- [ ] Orchestrator sync-committee behaviour is unchanged — no file under
-      `crates/rvc/src/orchestrator/sync_committee.rs` is modified by this PR.
-- [ ] `ARCHITECTURE.md` `:257`/`:488` name `SyncCommitteeService`, not `SyncService`.
-- [ ] **Test-count delta stated and justified:** expected ≈ −40 tests (≈ −680 in-file lines in
-      `lib.rs`, −415 lines in `per_validator_isolation.rs`, −4 error-display tests), all classified
-      *deleted-with-the-dead-code*. Zero ported: the orchestrator has its own equivalents
-      (`sync_committee.rs` per-validator isolation tests), which this PR must name individually in
-      the description so the reviewer can confirm nothing unique is lost.
-- [ ] Standing invariant green.
+- [x] `rg "SyncService\b" crates bin -g '*.rs'` returns only `SyncServiceError` hits.
+- [x] `rg "OrchestratorError::(Shutdown|InvalidPubkey|BeaconTimeout|SyncService)"` returns zero hits.
+- [x] Orchestrator sync-committee **production** behaviour is unchanged — only H-6 isolation unit
+      tests were added under `crates/rvc/src/orchestrator/sync_committee.rs` (no production edits).
+- [x] `ARCHITECTURE.md` `:257`/`:488` name `SyncCommitteeService`, not `SyncService`.
+- [x] **Test-count delta stated and justified:** twin deleted ≈ −22 tests (*deleted-with-the-dead-code*:
+      lib −16, isolation −3, error display −3); **+2 ported** H-6 multi-validator isolation tests on
+      production `SyncCommitteeService`:
+      `test_h6_one_signer_failure_does_not_abort_sync_messages`,
+      `test_h6_one_signer_failure_does_not_abort_sync_contributions`
+      (one of three validators KeyNotFound; others still produce). Net ≈ −20.
+- [x] Standing invariant green (fmt; clippy on affected crates; nextest rvc + sync-service +
+      architecture-tests). Workspace clippy pre-existing keygen lint left alone.
 
 **Risks:**
 - The one genuinely load-bearing test in the deleted file is the H-6 "signing failure must not abort

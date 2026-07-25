@@ -7,7 +7,6 @@ use block_service::BlockServiceError;
 use duty_tracker::DutyTrackerError;
 use propagator::PropagatorError;
 use signer::SignerError;
-use sync_service::SyncServiceError;
 use timing::TimingError;
 
 /// Errors that can occur during duty orchestration.
@@ -31,26 +30,14 @@ pub enum OrchestratorError {
     #[error("Slot {slot} was missed (current slot is {current_slot})")]
     SlotMissed { slot: u64, current_slot: u64 },
 
-    #[error("Shutdown requested")]
-    Shutdown,
-
     #[error("No duties found for slot {slot}")]
     NoDutiesForSlot { slot: u64 },
 
     #[error("Block service error: {0}")]
     BlockService(#[from] BlockServiceError),
 
-    #[error("Sync service error: {0}")]
-    SyncService(#[from] SyncServiceError),
-
     #[error("Failed to parse attestation data: {0}")]
     ParseError(String),
-
-    #[error("Invalid validator pubkey: {0}")]
-    InvalidPubkey(String),
-
-    #[error("Beacon call timed out: {0}")]
-    BeaconTimeout(String),
 }
 
 #[cfg(test)]
@@ -71,12 +58,6 @@ mod tests {
     }
 
     #[test]
-    fn test_orchestrator_error_display_shutdown() {
-        let err = OrchestratorError::Shutdown;
-        assert_eq!(err.to_string(), "Shutdown requested");
-    }
-
-    #[test]
     fn test_orchestrator_error_display_no_duties() {
         let err = OrchestratorError::NoDutiesForSlot { slot: 42 };
         assert_eq!(err.to_string(), "No duties found for slot 42");
@@ -86,18 +67,6 @@ mod tests {
     fn test_orchestrator_error_display_parse_error() {
         let err = OrchestratorError::ParseError("invalid format".to_string());
         assert_eq!(err.to_string(), "Failed to parse attestation data: invalid format");
-    }
-
-    #[test]
-    fn test_orchestrator_error_display_invalid_pubkey() {
-        let err = OrchestratorError::InvalidPubkey("0xabc".to_string());
-        assert_eq!(err.to_string(), "Invalid validator pubkey: 0xabc");
-    }
-
-    #[test]
-    fn test_orchestrator_error_display_beacon_timeout() {
-        let err = OrchestratorError::BeaconTimeout("produce_block_v3".to_string());
-        assert_eq!(err.to_string(), "Beacon call timed out: produce_block_v3");
     }
 
     #[test]
