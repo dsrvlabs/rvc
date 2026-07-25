@@ -9,6 +9,9 @@ repository = "https://github.com/rootwarp/rvc"
 keywords = ["ethereum", "beacon", "consensus", "validator"]
 categories = ["cryptography::cryptocurrencies", "api-bindings"]
 
+[lints]
+workspace = true
+
 [dependencies]
 bytes = { workspace = true }
 crypto = { workspace = true }

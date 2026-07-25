@@ -6,7 +6,11 @@
 //! 3. Calls the appropriate `TypedSigner` method.
 //! 4. Verifies the returned signature is valid for the reconstructed signing root.
 
-#![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
+#![allow(clippy::disallowed_methods)]
+// Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
+
+// RF1-12: OnceLock init sets env vars via unsafe std::env::{set_var,remove_var}.
+#![allow(unsafe_code)]
 
 use std::net::SocketAddr;
 

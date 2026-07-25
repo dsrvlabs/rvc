@@ -54,7 +54,9 @@ pub fn lagrange_coefficient(x_i: u64, indices: &[u64]) -> Result<Scalar, Lagrang
 /// - Convert to projective coordinates for scalar multiplication
 /// - Accumulate λ_i · σ_i in projective space
 /// - Compress the result back to 96 bytes
+// RF1-12: pre-existing production blst FFI. Function-scoped allow — not crate-level.
 #[cfg(feature = "dvt")]
+#[allow(unsafe_code)]
 pub fn combine_partial_signatures(partials: &[(u64, [u8; 96])]) -> Result<[u8; 96], LagrangeError> {
     if partials.is_empty() {
         return Err(LagrangeError::EmptyPartials);

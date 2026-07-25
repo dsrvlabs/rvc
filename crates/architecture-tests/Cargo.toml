@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [dev-dependencies]
 serde_json.workspace = true
 crypto.workspace = true

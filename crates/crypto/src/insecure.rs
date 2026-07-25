@@ -206,6 +206,8 @@ pub fn is_loopback(addr: &SocketAddr) -> bool {
 // ─── Unit tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
+// RF1-12: unit tests mutate env via unsafe set_var/remove_var.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 

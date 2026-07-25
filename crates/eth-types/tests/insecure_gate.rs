@@ -1,3 +1,6 @@
+// RF1-12: Tests must set/clear env vars via unsafe std::env::{set_var,remove_var}.
+#![allow(unsafe_code)]
+
 use rvc_eth_types::insecure::{evaluate, from_env, Decision, InsecureGate};
 
 // ─── evaluate: condition_is_insecure = true ───────────────────────────────────

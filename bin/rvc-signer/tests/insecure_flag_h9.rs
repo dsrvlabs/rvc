@@ -7,6 +7,9 @@
 //! - In `Warn` mode (legacy, not the production default): any bind → `Ok` (but error log emitted).
 //! - Loopback + env var → silent `Ok` (fully opted-in).
 
+// RF1-12: Tests must set/clear env vars via unsafe std::env::{set_var,remove_var}.
+#![allow(unsafe_code)]
+
 use std::net::SocketAddr;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 

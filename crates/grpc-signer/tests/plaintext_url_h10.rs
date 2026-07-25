@@ -10,6 +10,9 @@
 //! Tests that mutate `RVC_REMOTE_SIGNER_ALLOW_INSECURE` hold `ENV_LOCK`
 //! so parallel test threads don't race on this global.
 
+// RF1-12: Tests must set/clear env vars via unsafe std::env::{set_var,remove_var}.
+#![allow(unsafe_code)]
+
 use std::sync::Mutex;
 
 use crypto::InsecureMode;

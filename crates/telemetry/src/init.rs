@@ -262,6 +262,8 @@ impl std::fmt::Debug for LogReloadHandle {
 }
 
 #[cfg(test)]
+// RF1-12: unit tests mutate env via unsafe set_var/remove_var.
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
     use std::sync::Mutex;

@@ -28,6 +28,9 @@
 //! ENABLED `info!` that DOES allocate over the same consuming layer. The counting
 //! allocator is global to this test binary only.
 
+// RF1-12: Counting GlobalAlloc for per-slot zero-alloc invariant requires unsafe impl.
+#![allow(unsafe_code)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 

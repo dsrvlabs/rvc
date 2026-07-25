@@ -983,12 +983,12 @@ touches one `.rs` file — different review shapes, and the split keeps both ins
    not silently allowing.
 
 **Acceptance criteria:**
-- [ ] `[workspace.lints.rust] unsafe_code = "deny"` present; all 25 members opt in via `[lints] workspace = true`.
-- [ ] The only `#![allow(unsafe_code)]` annotations are the three test files listed above, each with a
+- [x] `[workspace.lints.rust] unsafe_code = "deny"` present; all 25 members opt in via `[lints] workspace = true`.
+- [x] The only `#![allow(unsafe_code)]` annotations are the three test files listed above, each with a
       justification comment.
-- [ ] No production crate requires an allow.
-- [ ] `cargo clippy --workspace --all-targets -- -D warnings` green.
-- [ ] Standing invariant green.
+- [x] No production crate requires an allow.
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` green.
+- [x] Standing invariant green.
 
 **TDD test plan:** lint configuration, so the verification is a deliberate-violation check.
 1. **RED first:** add a throwaway `unsafe { }` block to a production crate (e.g. `crates/builder/src/service.rs`)

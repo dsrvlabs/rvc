@@ -68,7 +68,9 @@ fn read_process_metrics() -> (u64, u64) {
     }
 }
 
+// RF1-12: pre-existing production libc (sysconf). Function-scoped allow — not crate-level.
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn read_process_metrics_linux() -> (u64, u64) {
     let stat = match std::fs::read_to_string("/proc/self/stat") {
         Ok(s) => s,
@@ -92,7 +94,9 @@ fn read_process_metrics_linux() -> (u64, u64) {
     (cpu_seconds, memory_bytes)
 }
 
+// RF1-12: pre-existing production libc (getrusage/zeroed). Function-scoped allow — not crate-level.
 #[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
 fn read_process_metrics_macos() -> (u64, u64) {
     use std::mem;
 

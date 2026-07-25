@@ -33,6 +33,9 @@
 //! `COUNTING` flag makes it a transparent `System` passthrough outside the
 //! measured region.
 
+// RF1-12: Counting GlobalAlloc for zero-alloc invariant requires unsafe impl GlobalAlloc.
+#![allow(unsafe_code)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 

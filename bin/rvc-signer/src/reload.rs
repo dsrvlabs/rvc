@@ -203,7 +203,9 @@ impl KeystoreReloader {
 ///
 /// Returns `Ok(())` on success or a human-readable explanation on
 /// failure; the caller logs and skips the pass.
+// RF1-12: pre-existing production libc::geteuid. Function-scoped allow — not crate-level.
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn check_keystore_dir_perms(dir: &std::path::Path) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
 

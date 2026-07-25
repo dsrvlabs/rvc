@@ -1,5 +1,8 @@
 //! Integration tests for the validator client startup and shutdown.
 
+// RF1-12: Tests send SIGTERM to child processes via unsafe libc::kill (Unix).
+#![allow(unsafe_code)]
+
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
