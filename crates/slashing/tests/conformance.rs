@@ -32,6 +32,9 @@ use serde::Deserialize;
 
 use rvc_slashing::{InterchangeFormat, SlashingDb, SlashingError};
 
+mod common;
+use common::{stage_and_commit_attestation, stage_and_commit_block};
+
 /// Zero GVR used by signing-path checks in the complete runner (matches the
 /// historical `check_and_record_*` harness; import pins the test-case GVR).
 const SIGN_GVR: &[u8; 32] = &[0u8; 32];
@@ -45,31 +48,6 @@ const SIGN_GVR: &[u8; 32] = &[0u8; 32];
 /// On rejection, `stage_block` rolls back before returning `Err` (no guard is
 /// handed out). On accept, the guard is committed so the row is durable for
 /// subsequent checks in the same runner.
-fn stage_and_commit_block(
-    db: &SlashingDb,
-    pubkey: &str,
-    slot: u64,
-    signing_root: Option<String>,
-    gvr: &[u8; 32],
-) -> Result<(), SlashingError> {
-    let staged = db.stage_block(pubkey, slot, signing_root, gvr)?;
-    staged.commit()
-}
-
-/// Stage an attestation via the production path and commit on success.
-///
-/// See [`stage_and_commit_block`] for success/rejection semantics.
-fn stage_and_commit_attestation(
-    db: &SlashingDb,
-    pubkey: &str,
-    source_epoch: u64,
-    target_epoch: u64,
-    signing_root: Option<String>,
-    gvr: &[u8; 32],
-) -> Result<(), SlashingError> {
-    let staged = db.stage_attestation(pubkey, source_epoch, target_epoch, signing_root, gvr)?;
-    staged.commit()
-}
 
 // ---------------------------------------------------------------------------
 // Test fixture types

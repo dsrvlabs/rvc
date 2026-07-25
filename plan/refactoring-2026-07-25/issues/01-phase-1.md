@@ -496,13 +496,13 @@ they need to hold on the shipping path.
    monotonicity property.
 
 **Acceptance criteria:**
-- [ ] All existing properties drive `stage_* → commit/discard`; no `check_and_record_*` call remains in
+- [x] All existing properties drive `stage_* → commit/discard`; no `check_and_record_*` call remains in
       the file.
-- [ ] Existing invariants still hold at 256 cases per property.
-- [ ] New property: for any watermark W and candidate slot/target T, `stage_*` accepts **iff** `T > W`
+- [x] Existing invariants still hold at 256 cases per property.
+- [x] New property: for any watermark W and candidate slot/target T, `stage_*` accepts **iff** `T > W`
       (block slot and attestation target), pinning RF1-01's semantics under random input.
-- [ ] Suite runtime reported in the PR; no silent case-count reduction.
-- [ ] Standing invariant green.
+- [x] Suite runtime reported in the PR; no silent case-count reduction.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 1. **RED first:** `proptest_watermark_blocks_at_or_below` — the new property, written against the stage

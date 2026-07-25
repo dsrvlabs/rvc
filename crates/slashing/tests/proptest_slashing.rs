@@ -2,9 +2,19 @@
 //!
 //! Uses proptest to verify that the slashing DB enforces EIP-3076
 //! constraints under random input sequences.
+//!
+//! All properties drive the production `stage_* → commit()/discard()` path
+//! (RF1-05). Helpers always resolve the staged guard before returning so a
+//! property that stages repeatedly cannot deadlock on the connection mutex.
 
+mod common;
+
+use common::{stage_and_commit_attestation, stage_and_commit_block};
 use proptest::prelude::*;
-use rvc_slashing::SlashingDb;
+use rvc_slashing::{SlashingDb, SlashingError};
+
+/// Zero GVR for signing-path checks (matches the historical harness).
+const SIGN_GVR: &[u8; 32] = &[0u8; 32];
 
 /// Configuration for proptest: 256 cases per property for CI friendliness.
 const PROPTEST_CASES: u32 = 256;
@@ -27,6 +37,25 @@ fn signing_root_strategy() -> impl Strategy<Value = Option<String>> {
     prop_oneof![Just(None), (1u8..255).prop_map(|b| Some(hex_root(b))),]
 }
 
+/// Watermark W paired with candidate T, biased so equality is hit often.
+///
+/// Uniform independent draws of `(W, T)` over a large range almost never
+/// sample `T == W` (the RF1-01 boundary). Force roughly equal weight on:
+/// - `T == W` (equality blocked)
+/// - `T < W`  (strictly below blocked)
+/// - `T > W`  (strictly above accepted)
+///
+/// `W` is drawn from `1..10_000` so a strict-below candidate always exists.
+fn watermark_and_candidate_strategy() -> impl Strategy<Value = (u64, u64)> {
+    (1u64..10_000).prop_flat_map(|w| {
+        prop_oneof![
+            Just((w, w)),     // equal
+            Just((w, w - 1)), // strictly below
+            Just((w, w + 1)), // strictly above
+        ]
+    })
+}
+
 // =========================================================================
 // Property 1: No double proposals
 // Same (validator, slot) with different signing roots → exactly one success
@@ -46,12 +75,13 @@ proptest! {
 
         if root_a == root_b {
             // Same signing root — both should succeed (idempotent re-signing)
-            prop_assert!(db.check_and_record_block("local-vc", &pk, slot, root_a.clone(), &[0u8; 32]).is_ok());
-            prop_assert!(db.check_and_record_block("local-vc", &pk, slot, root_b, &[0u8; 32]).is_ok());
+            prop_assert!(stage_and_commit_block(&db, &pk, slot, root_a.clone(), SIGN_GVR).is_ok());
+            prop_assert!(stage_and_commit_block(&db, &pk, slot, root_b, SIGN_GVR).is_ok());
         } else {
             // Different signing roots — exactly one should succeed
-            let r1 = db.check_and_record_block("local-vc", &pk, slot, root_a, &[0u8; 32]);
-            let r2 = db.check_and_record_block("local-vc", &pk, slot, root_b, &[0u8; 32]);
+            // (guard from first call is committed before the second stage)
+            let r1 = stage_and_commit_block(&db, &pk, slot, root_a, SIGN_GVR);
+            let r2 = stage_and_commit_block(&db, &pk, slot, root_b, SIGN_GVR);
             prop_assert!(r1.is_ok());
             prop_assert!(r2.is_err());
         }
@@ -78,12 +108,16 @@ proptest! {
         let pk = pubkey(1);
 
         // First attestation should always succeed
-        let r1 = db.check_and_record_attestation("local-vc", &pk, source_a, target, root_a.clone(), &[0u8; 32]);
+        let r1 = stage_and_commit_attestation(
+            &db, &pk, source_a, target, root_a.clone(), SIGN_GVR,
+        );
         prop_assert!(r1.is_ok());
 
         if root_a == root_b {
             // Same signing root — idempotent, should succeed
-            let r2 = db.check_and_record_attestation("local-vc", &pk, source_b, target, root_b, &[0u8; 32]);
+            let r2 = stage_and_commit_attestation(
+                &db, &pk, source_b, target, root_b, SIGN_GVR,
+            );
             prop_assert!(r2.is_ok());
 
             // Verify only 1 record exists and original source is preserved
@@ -92,7 +126,9 @@ proptest! {
             prop_assert_eq!(atts[0].source_epoch, source_a, "re-sign must not overwrite source epoch");
         } else {
             // Different signing roots — must be rejected (double vote)
-            let r2 = db.check_and_record_attestation("local-vc", &pk, source_b, target, root_b, &[0u8; 32]);
+            let r2 = stage_and_commit_attestation(
+                &db, &pk, source_b, target, root_b, SIGN_GVR,
+            );
             prop_assert!(r2.is_err());
         }
     }
@@ -116,11 +152,14 @@ proptest! {
         let db = SlashingDb::open_in_memory().unwrap();
         let pk = pubkey(1);
 
-        // Submit attestations with unique roots per index to avoid collisions
+        // Submit attestations with unique roots per index to avoid collisions.
+        // Each stage_and_commit resolves the guard before the next iteration.
         for (i, (source, target_offset)) in attestations.iter().enumerate() {
             let target = source + target_offset; // Ensure target > source
             let root = Some(hex_root((i as u8).wrapping_add(1)));
-            let _ = db.check_and_record_attestation("local-vc", &pk, *source, target, root, &[0u8; 32]);
+            let _ = stage_and_commit_attestation(
+                &db, &pk, *source, target, root, SIGN_GVR,
+            );
         }
 
         // Query the ACTUAL DB records for the surround invariant check
@@ -164,7 +203,7 @@ proptest! {
 
         for (i, &slot) in slots.iter().enumerate() {
             let root = Some(hex_root(i as u8 + 1));
-            let _ = db.check_and_record_block("local-vc", &pk, slot, root, &[0u8; 32]);
+            let _ = stage_and_commit_block(&db, &pk, slot, root, SIGN_GVR);
 
             let current_max = db.last_signed_block_slot(&pk).unwrap();
             if let Some(prev) = max_slot {
@@ -196,7 +235,9 @@ proptest! {
         for (i, (source, target_offset)) in attestations.iter().enumerate() {
             let target = source + target_offset;
             let root = Some(hex_root(i as u8 + 1));
-            let _ = db.check_and_record_attestation("local-vc", &pk, *source, target, root, &[0u8; 32]);
+            let _ = stage_and_commit_attestation(
+                &db, &pk, *source, target, root, SIGN_GVR,
+            );
 
             let current_max = db.last_signed_attestation_epoch(&pk).unwrap();
             if let Some(prev) = max_target {
@@ -232,10 +273,10 @@ proptest! {
         let pk_b = pubkey(2);
 
         // Validator A records a block
-        db.check_and_record_block("local-vc", &pk_a, slot, root.clone(), &[0u8; 32]).unwrap();
+        stage_and_commit_block(&db, &pk_a, slot, root.clone(), SIGN_GVR).unwrap();
 
         // Validator B should still be able to propose at the same slot
-        let result = db.check_and_record_block("local-vc", &pk_b, slot, root, &[0u8; 32]);
+        let result = stage_and_commit_block(&db, &pk_b, slot, root, SIGN_GVR);
         prop_assert!(result.is_ok(), "validator B blocked by validator A's block at slot {}", slot);
     }
 
@@ -250,10 +291,15 @@ proptest! {
         let pk_b = pubkey(2);
 
         // Validator A records an attestation
-        db.check_and_record_attestation("local-vc", &pk_a, source, target, root.clone(), &[0u8; 32]).unwrap();
+        stage_and_commit_attestation(
+            &db, &pk_a, source, target, root.clone(), SIGN_GVR,
+        )
+        .unwrap();
 
         // Validator B should still be able to attest with the same epochs
-        let result = db.check_and_record_attestation("local-vc", &pk_b, source, target, root, &[0u8; 32]);
+        let result = stage_and_commit_attestation(
+            &db, &pk_b, source, target, root, SIGN_GVR,
+        );
         prop_assert!(
             result.is_ok(),
             "validator B blocked by validator A's attestation ({}, {})",
@@ -280,7 +326,8 @@ proptest! {
         let pk = pubkey(1);
 
         for _ in 0..repeat_count {
-            let result = db.check_and_record_block("local-vc", &pk, slot, root.clone(), &[0u8; 32]);
+            // Each call commits before the next stage (no overlapping guards)
+            let result = stage_and_commit_block(&db, &pk, slot, root.clone(), SIGN_GVR);
             prop_assert!(result.is_ok(), "re-signing block at slot {} with same root failed", slot);
         }
 
@@ -300,7 +347,9 @@ proptest! {
         let pk = pubkey(1);
 
         for _ in 0..repeat_count {
-            let result = db.check_and_record_attestation("local-vc", &pk, source, target, root.clone(), &[0u8; 32]);
+            let result = stage_and_commit_attestation(
+                &db, &pk, source, target, root.clone(), SIGN_GVR,
+            );
             prop_assert!(
                 result.is_ok(),
                 "re-signing attestation ({}, {}) with same root failed",
@@ -311,5 +360,83 @@ proptest! {
         // Should still only have one record
         let attestations = db.get_attestations(&pk).unwrap();
         prop_assert_eq!(attestations.len(), 1);
+    }
+}
+
+// =========================================================================
+// Property 7: Watermark blocks at-or-below (RF1-01 / RF1-05)
+// stage_* accepts a candidate T iff T > W for block slot and att target
+// =========================================================================
+
+proptest! {
+    #![proptest_config(config())]
+
+    /// For watermark W and candidate T (biased: ~1/3 equal / below / above),
+    /// the production stage path accepts block slot and attestation target
+    /// **iff** `T > W` (EIP-3076 equality blocking; pins RF1-01 under random
+    /// input). Reject path asserts the watermark error variants.
+    #[test]
+    fn proptest_watermark_blocks_at_or_below(
+        (w, t) in watermark_and_candidate_strategy(),
+    ) {
+        let pk = pubkey(1);
+        let root = Some(hex_root(1));
+
+        // --- Block slot watermark ---
+        {
+            let db = SlashingDb::open_in_memory().unwrap();
+            db.set_block_watermark(&pk, w).unwrap();
+
+            // Guard resolved before any subsequent stage (fresh DB here, but
+            // the helper still commits/errs without holding the mutex).
+            let result = stage_and_commit_block(&db, &pk, t, root.clone(), SIGN_GVR);
+            if t > w {
+                prop_assert!(
+                    result.is_ok(),
+                    "block slot T={t} > W={w} must be accepted, got {result:?}",
+                );
+            } else {
+                prop_assert!(
+                    matches!(
+                        result,
+                        Err(SlashingError::BelowBlockWatermark {
+                            slot,
+                            watermark_slot,
+                        }) if slot == t && watermark_slot == w
+                    ),
+                    "block slot T={t} <= W={w} must be BelowBlockWatermark, got {result:?}",
+                );
+            }
+        }
+
+        // --- Attestation target watermark ---
+        // Source watermark set to 0 so source-epoch comparison cannot reject
+        // independently of the target rule under test (source uses `<`, so
+        // source == 0 is allowed).
+        {
+            let db = SlashingDb::open_in_memory().unwrap();
+            db.set_attestation_watermark(&pk, 0, w).unwrap();
+
+            let result = stage_and_commit_attestation(
+                &db, &pk, 0, t, root, SIGN_GVR,
+            );
+            if t > w {
+                prop_assert!(
+                    result.is_ok(),
+                    "att target T={t} > W={w} must be accepted, got {result:?}",
+                );
+            } else {
+                prop_assert!(
+                    matches!(
+                        result,
+                        Err(SlashingError::BelowAttestationWatermark {
+                            target_epoch,
+                            watermark_target,
+                        }) if target_epoch == t && watermark_target == w
+                    ),
+                    "att target T={t} <= W={w} must be BelowAttestationWatermark, got {result:?}",
+                );
+            }
+        }
     }
 }
