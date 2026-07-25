@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,10 +15,12 @@ use crypto::logging::RedactedUrl;
 
 use crate::beacon_adapter::BeaconBlockAdapter;
 use crate::doppelganger_adapter::{BeaconLivenessAdapter, SlashingDbReaderAdapter};
-use crate::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle, PubkeyMap};
+use crate::orchestrator::{
+    DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorHandle, PubkeyMap,
+};
 use beacon::{BeaconClient, BeaconClientConfig};
 use bn_manager::{BeaconNodeClient, BnManager, BnManagerConfig};
-use builder::BuilderService;
+use builder::{BuilderService, CircuitBreakerState};
 use crypto::{CompositeSigner, KeyManager, LocalSigner};
 use doppelganger::{
     DoppelgangerDisabledByOperator, DoppelgangerService, ForwardWindowMachine, SigningEnablement,
@@ -799,18 +802,26 @@ impl ServiceBuilder {
 
             let block_beacon = Arc::new(BeaconBlockAdapter(services.beacon_client.clone()));
 
-            DutyOrchestrator::new(
-                services.slot_clock,
-                services.duty_tracker,
-                services.signer,
-                services.propagator,
-                services.beacon,
+            // Scaffolding path only — no in-tree production caller of build_all.
+            // Daemon wiring is in bin/rvc (real key_gen channel shared with adapters).
+            // Fabricate a channel here rather than OrchestratorDeps::for_test so the
+            // factory never looks like a silent test shortcut for production.
+            let (_key_gen_tx, key_gen_rx) = tokio::sync::watch::channel(0u64);
+            DutyOrchestrator::new(OrchestratorDeps {
+                clock: services.slot_clock,
+                duty_tracker: services.duty_tracker,
+                signer: services.signer,
+                propagator: services.propagator,
+                beacon: services.beacon,
                 block_beacon,
-                services.builder_service,
-                services.validator_store,
+                builder_service: services.builder_service,
+                validator_store: services.validator_store,
                 config,
-                services.pubkey_map,
-            )
+                pubkey_map: services.pubkey_map,
+                key_gen_rx,
+                circuit_breaker: Arc::new(CircuitBreakerState::new(0, 0)),
+                attesting_enabled: Arc::new(AtomicBool::new(true)),
+            })
         };
 
         Ok((services, orchestrator_factory))

@@ -1591,10 +1591,10 @@ async fn run_validator(
         warn!("Attestation duties disabled at startup (--disable-attesting)");
     }
 
-    // RF1-06: single key-generation watch channel shared by keymanager adapters.
-    // RF1-07 will pass `key_gen_rx` into DutyOrchestrator so import/delete clears
-    // the duty cache without a restart. Hold the receiver until that wiring lands.
-    let (key_gen_tx, _key_gen_rx) = tokio::sync::watch::channel(0u64);
+    // RF1-06/07: single key-generation watch channel shared by keymanager
+    // adapters (tx) and DutyOrchestrator (rx). Import/delete increments the
+    // generation so the orchestrator clears the duty cache without a restart.
+    let (key_gen_tx, key_gen_rx) = tokio::sync::watch::channel(0u64);
 
     // Step 7c: Optionally start Keymanager API server
     if config.keymanager_enabled {
@@ -1745,20 +1745,21 @@ async fn run_validator(
     let validator_count = pubkey_map.read().len();
     let bn_count = config.effective_beacon_nodes().len();
     let (mut orchestrator, orchestrator_handle) =
-        rvc::orchestrator::DutyOrchestrator::new_with_attesting_enabled(
-            slot_clock,
+        rvc::orchestrator::DutyOrchestrator::new(rvc::orchestrator::OrchestratorDeps {
+            clock: slot_clock,
             duty_tracker,
             signer,
             propagator,
-            beacon.clone(),
+            beacon: beacon.clone(),
             block_beacon,
             builder_service,
-            validator_store.clone(),
-            orchestrator_config,
-            pubkey_map.clone(),
+            validator_store: validator_store.clone(),
+            config: orchestrator_config,
+            pubkey_map: pubkey_map.clone(),
+            key_gen_rx,
             circuit_breaker,
-            attesting_enabled.clone(),
-        );
+            attesting_enabled: attesting_enabled.clone(),
+        });
 
     // Step 8b: Spawn slashing monitor background task
     {

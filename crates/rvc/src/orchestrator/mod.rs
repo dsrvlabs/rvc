@@ -14,6 +14,7 @@ pub(crate) mod utils;
 pub mod validation;
 
 pub use coordinator::{
-    AttestationResult, DutyOrchestrator, OrchestratorConfig, OrchestratorHandle, PubkeyMap,
+    AttestationResult, DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorHandle,
+    PubkeyMap,
 };
 pub use error::OrchestratorError;

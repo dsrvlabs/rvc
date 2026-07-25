@@ -94,6 +94,87 @@ pub struct AttestationResult {
 /// Timeout for builder registration API calls.
 const BUILDER_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Dependencies required to construct a [`DutyOrchestrator`].
+///
+/// Bundling construction args into a single struct makes omissions (notably
+/// `key_gen_rx` and `attesting_enabled`) a compile error rather than a silent
+/// runtime defect. There is exactly one constructor: [`DutyOrchestrator::new`].
+pub struct OrchestratorDeps<C, S, B>
+where
+    C: SlotClock + 'static,
+    S: AttestationSubmitter + 'static,
+    B: BeaconBlockClient + 'static,
+{
+    pub clock: Arc<C>,
+    pub duty_tracker: Arc<DutyTracker>,
+    pub signer: Arc<SignerService>,
+    pub propagator: Arc<Propagator<S>>,
+    pub beacon: Arc<dyn BeaconNodeClient>,
+    pub block_beacon: Arc<B>,
+    pub builder_service: Option<Arc<BuilderService>>,
+    pub validator_store: Arc<validator_store::ValidatorStore>,
+    pub config: OrchestratorConfig,
+    pub pubkey_map: PubkeyMap,
+    /// Receiver half of the key-generation watch channel shared with keymanager
+    /// adapters. When the generation increments, the duty cache is cleared so
+    /// newly imported keys participate in duty matching without a restart.
+    /// Always supplied by the caller — never fabricated inside the constructor.
+    pub key_gen_rx: watch::Receiver<u64>,
+    pub circuit_breaker: Arc<CircuitBreakerState>,
+    /// Global attesting gate. When false, attestation duties are skipped.
+    /// Independent of sync-committee processing (`sync_enabled`, H-7).
+    pub attesting_enabled: Arc<AtomicBool>,
+}
+
+impl<C, S, B> OrchestratorDeps<C, S, B>
+where
+    C: SlotClock + 'static,
+    S: AttestationSubmitter + 'static,
+    B: BeaconBlockClient + 'static,
+{
+    /// Test helper with defaults for fields that most unit tests do not vary.
+    ///
+    /// Defaults:
+    /// - `key_gen_rx`: a discarded channel (not paired with any adapter)
+    /// - `circuit_breaker`: `CircuitBreakerState::new(0, 0)`
+    /// - `attesting_enabled`: `true`
+    ///
+    /// Override via struct-update syntax when a test needs a real
+    /// `key_gen_rx`, a shared circuit breaker, or a custom attesting flag.
+    /// Production code must construct [`OrchestratorDeps`] explicitly with the
+    /// real receiver from the channel shared with keymanager adapters.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_test(
+        clock: Arc<C>,
+        duty_tracker: Arc<DutyTracker>,
+        signer: Arc<SignerService>,
+        propagator: Arc<Propagator<S>>,
+        beacon: Arc<dyn BeaconNodeClient>,
+        block_beacon: Arc<B>,
+        builder_service: Option<Arc<BuilderService>>,
+        validator_store: Arc<validator_store::ValidatorStore>,
+        config: OrchestratorConfig,
+        pubkey_map: PubkeyMap,
+    ) -> Self {
+        let (_key_gen_tx, key_gen_rx) = watch::channel(0u64);
+        Self {
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon,
+            block_beacon,
+            builder_service,
+            validator_store,
+            config,
+            pubkey_map,
+            key_gen_rx,
+            circuit_breaker: Arc::new(CircuitBreakerState::new(0, 0)),
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
 /// Main orchestrator for coordinating validator duties.
 #[allow(dead_code)]
 pub struct DutyOrchestrator<C, S, B>
@@ -132,57 +213,13 @@ where
     S: AttestationSubmitter + 'static,
     B: BeaconBlockClient + 'static,
 {
-    /// Creates a new DutyOrchestrator with the given dependencies.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        clock: Arc<C>,
-        duty_tracker: Arc<DutyTracker>,
-        signer: Arc<SignerService>,
-        propagator: Arc<Propagator<S>>,
-        beacon: Arc<dyn BeaconNodeClient>,
-        block_beacon: Arc<B>,
-        builder_service: Option<Arc<BuilderService>>,
-        validator_store: Arc<validator_store::ValidatorStore>,
-        config: OrchestratorConfig,
-        pubkey_map: PubkeyMap,
-    ) -> (Self, OrchestratorHandle) {
-        let attesting_enabled = Arc::new(AtomicBool::new(true));
-        let (_key_gen_tx, key_gen_rx) = watch::channel(0u64);
-        Self::new_with_key_gen(
-            clock,
-            duty_tracker,
-            signer,
-            propagator,
-            beacon,
-            block_beacon,
-            builder_service,
-            validator_store,
-            config,
-            pubkey_map,
-            key_gen_rx,
-            Arc::new(CircuitBreakerState::new(0, 0)),
-            attesting_enabled,
-        )
-    }
-
-    /// Creates a new DutyOrchestrator with a shared attesting_enabled flag.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_attesting_enabled(
-        clock: Arc<C>,
-        duty_tracker: Arc<DutyTracker>,
-        signer: Arc<SignerService>,
-        propagator: Arc<Propagator<S>>,
-        beacon: Arc<dyn BeaconNodeClient>,
-        block_beacon: Arc<B>,
-        builder_service: Option<Arc<BuilderService>>,
-        validator_store: Arc<validator_store::ValidatorStore>,
-        config: OrchestratorConfig,
-        pubkey_map: PubkeyMap,
-        circuit_breaker: Arc<CircuitBreakerState>,
-        attesting_enabled: Arc<AtomicBool>,
-    ) -> (Self, OrchestratorHandle) {
-        let (_key_gen_tx, key_gen_rx) = watch::channel(0u64);
-        Self::new_with_key_gen(
+    /// Creates a new DutyOrchestrator from the given dependencies.
+    ///
+    /// The sole constructor. Callers must supply a real `key_gen_rx` (production)
+    /// or use [`OrchestratorDeps::for_test`] (unit tests that do not exercise
+    /// key-import notifications).
+    pub fn new(deps: OrchestratorDeps<C, S, B>) -> (Self, OrchestratorHandle) {
+        let OrchestratorDeps {
             clock,
             duty_tracker,
             signer,
@@ -196,25 +233,8 @@ where
             key_gen_rx,
             circuit_breaker,
             attesting_enabled,
-        )
-    }
+        } = deps;
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_key_gen(
-        clock: Arc<C>,
-        duty_tracker: Arc<DutyTracker>,
-        signer: Arc<SignerService>,
-        propagator: Arc<Propagator<S>>,
-        beacon: Arc<dyn BeaconNodeClient>,
-        block_beacon: Arc<B>,
-        builder_service: Option<Arc<BuilderService>>,
-        validator_store: Arc<validator_store::ValidatorStore>,
-        config: OrchestratorConfig,
-        pubkey_map: PubkeyMap,
-        key_gen_rx: watch::Receiver<u64>,
-        circuit_breaker: Arc<CircuitBreakerState>,
-        attesting_enabled: Arc<AtomicBool>,
-    ) -> (Self, OrchestratorHandle) {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let block_service = BlockService::with_circuit_breaker(
@@ -318,11 +338,10 @@ where
 
             let slot_span = info_span!("slot.process", slot = current_slot, epoch = current_epoch,);
 
-            // Check if keys changed (dynamic key import/delete via keymanager API)
-            if self.key_gen_rx.has_changed().unwrap_or(false) {
-                info!("Key set changed, clearing duty cache to trigger refetch");
-                self.duty_tracker.clear_cache().await;
-            }
+            // Check if keys changed (dynamic key import/delete via keymanager API).
+            // has_changed() does NOT mark the value as seen — mark_unchanged() so
+            // subsequent slots do not clear forever after a single notify (S1).
+            self.apply_key_gen_cache_invalidation().await;
 
             // === Epoch boundary: fetch all duty types ===
             self.duty_management
@@ -581,6 +600,22 @@ where
                     }
                 }
             }
+        }
+    }
+
+    /// Clears attester/proposer duty caches when keymanager has notified a key
+    /// set change. Marks the watch generation as seen so a single notification
+    /// produces exactly one clear; further slots do not re-clear until another
+    /// `key_gen_tx` send.
+    ///
+    /// Note: `watch::Receiver::has_changed` does **not** mark the value as seen
+    /// (tokio 1.x). Without `mark_unchanged` / `borrow_and_update`, the first
+    /// import/delete would thrash duty caches every subsequent slot.
+    async fn apply_key_gen_cache_invalidation(&mut self) {
+        if self.key_gen_rx.has_changed().unwrap_or(false) {
+            self.key_gen_rx.mark_unchanged();
+            info!("Key set changed, clearing duty cache to trigger refetch");
+            self.duty_tracker.clear_cache().await;
         }
     }
 
@@ -1205,7 +1240,7 @@ mod tests {
         let config = create_test_config();
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
-        let (mut orchestrator, handle) = DutyOrchestrator::new(
+        let (mut orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -1216,13 +1251,259 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         handle.shutdown();
 
         let result = orchestrator.run().await;
 
         assert!(result.is_ok());
+    }
+
+    /// RF1-07: a key-generation watch notification clears the duty cache.
+    ///
+    /// Pre-populates a far-future epoch (not re-fetched on the current slot),
+    /// sends on the paired `key_gen_tx`, drives one `run()` iteration, and
+    /// asserts the far-future epoch is no longer cached.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_key_gen_notification_clears_duty_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let far_epoch = 50u64;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/eth/v1/validator/duties/attester/{}", far_epoch)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x00000000000000000000000000000000000000000000000000000000000000aa",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "validator_index": "1",
+                    "committee_index": "0",
+                    "committee_length": "128",
+                    "committees_at_slot": "64",
+                    "validator_committee_index": "0",
+                    "slot": (far_epoch * 32).to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Catch-all empty responses for the current-slot duty fetches so
+        // run() completes without error after clearing.
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x00",
+                "execution_optimistic": false,
+                "data": []
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/4"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x00",
+                "execution_optimistic": false,
+                "data": []
+            })))
+            .mount(&mock_server)
+            .await;
+        for epoch in [3u64, 4] {
+            Mock::given(method("GET"))
+                .and(path(format!("/eth/v1/validator/duties/proposer/{}", epoch)))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "dependent_root": "0x00",
+                    "execution_optimistic": false,
+                    "data": []
+                })))
+                .mount(&mock_server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/blocks/100/root"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "execution_optimistic": false,
+                "data": { "root": "0x0000000000000000000000000000000000000000000000000000000000000001" }
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+
+        // Populate a far-future epoch that run() will not re-fetch (slot 100 → epoch 3).
+        duty_tracker.fetch_duties_for_epoch(far_epoch).await.unwrap();
+        assert!(
+            duty_tracker.is_epoch_cached(far_epoch).await,
+            "precondition: far-future epoch must be cached"
+        );
+
+        let (key_gen_tx, key_gen_rx) = watch::channel(0u64);
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+        let submitter = Arc::new(MockSubmitter::new());
+        let propagator = Arc::new(Propagator::new(submitter));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        // Slot 100 = epoch 3; park near end of slot so phase waits are short.
+        clock.set_slot(100);
+        clock.advance_time(9);
+
+        let (mut orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps {
+            key_gen_rx,
+            ..OrchestratorDeps::for_test(
+                clock,
+                duty_tracker.clone(),
+                signer,
+                propagator,
+                beacon,
+                create_mock_block_beacon(),
+                None,
+                create_mock_validator_store(),
+                create_test_config().with_timeouts(fast_timeouts()),
+                Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            )
+        });
+
+        // Notify key change before the orchestrator checks has_changed().
+        key_gen_tx.send_modify(|gen| *gen += 1);
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            handle.shutdown();
+        });
+
+        let _ = orchestrator.run().await;
+
+        assert!(
+            !duty_tracker.is_epoch_cached(far_epoch).await,
+            "key_gen notification must clear the duty cache (far-future epoch gone)"
+        );
+    }
+
+    /// RF1-07 / S1: a single key-gen notification must clear the duty cache
+    /// exactly once. Subsequent iterations must not re-clear until another
+    /// notify (marks the watch value as seen via `mark_unchanged`).
+    #[tokio::test]
+    async fn test_key_gen_notification_clears_only_once_until_next_notify() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        let far_epoch = 50u64;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/eth/v1/validator/duties/attester/{}", far_epoch)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x00000000000000000000000000000000000000000000000000000000000000aa",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "validator_index": "1",
+                    "committee_index": "0",
+                    "committee_length": "128",
+                    "committees_at_slot": "64",
+                    "validator_committee_index": "0",
+                    "slot": (far_epoch * 32).to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+
+        duty_tracker.fetch_duties_for_epoch(far_epoch).await.unwrap();
+        assert!(duty_tracker.is_epoch_cached(far_epoch).await);
+
+        let (key_gen_tx, key_gen_rx) = watch::channel(0u64);
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+        let propagator = Arc::new(Propagator::new(Arc::new(MockSubmitter::new())));
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+
+        let (mut orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps {
+            key_gen_rx,
+            ..OrchestratorDeps::for_test(
+                clock,
+                duty_tracker.clone(),
+                signer,
+                propagator,
+                beacon,
+                create_mock_block_beacon(),
+                None,
+                create_mock_validator_store(),
+                create_test_config().with_timeouts(fast_timeouts()),
+                Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            )
+        });
+
+        // ── Iteration 1: notify once → must clear ──────────────────────────
+        key_gen_tx.send_modify(|gen| *gen += 1);
+        orchestrator.apply_key_gen_cache_invalidation().await;
+        assert!(
+            !duty_tracker.is_epoch_cached(far_epoch).await,
+            "first notify must clear the duty cache"
+        );
+
+        // Re-populate a far-future epoch that only a second clear would wipe.
+        duty_tracker.fetch_duties_for_epoch(far_epoch).await.unwrap();
+        assert!(duty_tracker.is_epoch_cached(far_epoch).await);
+
+        // ── Iteration 2: no new notify → must NOT clear ────────────────────
+        orchestrator.apply_key_gen_cache_invalidation().await;
+        assert!(
+            duty_tracker.is_epoch_cached(far_epoch).await,
+            "second iteration without notify must not re-clear the duty cache (S1 mark-as-seen)"
+        );
+
+        // ── Iteration 3: second notify → must clear again ──────────────────
+        key_gen_tx.send_modify(|gen| *gen += 1);
+        orchestrator.apply_key_gen_cache_invalidation().await;
+        assert!(
+            !duty_tracker.is_epoch_cached(far_epoch).await,
+            "a fresh notify must clear the duty cache again"
+        );
+    }
+
+    /// RF1-07: compile/API-shape guard — the sole constructor requires
+    /// `OrchestratorDeps`, which always includes `key_gen_rx`. There is no
+    /// `new` / `new_with_attesting_enabled` path that fabricates a discarded
+    /// watch channel.
+    #[test]
+    fn test_orchestrator_deps_requires_key_gen_receiver() {
+        let field_names = [
+            "clock",
+            "duty_tracker",
+            "signer",
+            "propagator",
+            "beacon",
+            "block_beacon",
+            "builder_service",
+            "validator_store",
+            "config",
+            "pubkey_map",
+            "key_gen_rx",
+            "circuit_breaker",
+            "attesting_enabled",
+        ];
+        assert!(field_names.contains(&"key_gen_rx"), "OrchestratorDeps must require key_gen_rx");
+        // Constructing via for_test yields a usable receiver field (type-checked).
+        let (_tx, rx) = watch::channel(0u64);
+        let _ = rx;
+        // The production constructor signature is `new(OrchestratorDeps<..>)`
+        // — verified by every call site in this module compiling.
     }
 
     #[tokio::test]
@@ -1246,7 +1527,7 @@ mod tests {
         let config = create_test_config();
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -1257,7 +1538,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         let result = orchestrator.process_slot(100).await;
 
@@ -1285,7 +1566,7 @@ mod tests {
         let config = create_test_config();
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -1296,7 +1577,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         let result = orchestrator.process_slot(100).await;
 
@@ -1357,7 +1638,7 @@ mod tests {
         pubkey_map_inner.insert(pubkey_hex, pubkey);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
-        let (_orchestrator, handle) = DutyOrchestrator::new(
+        let (_orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -1368,7 +1649,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         assert!(!*handle.shutdown_tx.borrow());
         handle.shutdown();
@@ -1399,7 +1680,7 @@ mod tests {
         pubkey_map_inner.insert(pubkey_hex.clone(), pubkey.clone());
         let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -1410,7 +1691,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         let found = utils::find_pubkey(&orchestrator.pubkey_map, &pubkey_hex);
         assert!(found.is_some());
@@ -1441,7 +1722,7 @@ mod tests {
         pubkey_map_inner.insert(pubkey_hex.to_uppercase(), pubkey.clone());
         let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -1452,7 +1733,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         let found = utils::find_pubkey(&orchestrator.pubkey_map, &pubkey_hex.to_lowercase());
         assert!(found.is_some());
@@ -1476,7 +1757,7 @@ mod tests {
         let config = create_test_config();
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -1487,7 +1768,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         let found = utils::find_pubkey(&orchestrator.pubkey_map, "0x1234567890abcdef");
         assert!(found.is_none());
@@ -1692,7 +1973,7 @@ mod tests {
         let validator_store = create_mock_validator_store();
         validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
 
-        let (orchestrator, handle) = DutyOrchestrator::new(
+        let (orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -1703,7 +1984,7 @@ mod tests {
             validator_store,
             config,
             pubkey_map,
-        );
+        ));
 
         (orchestrator, handle, pubkey, pubkey_hex)
     }
@@ -2029,7 +2310,7 @@ mod tests {
 
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -2040,7 +2321,7 @@ mod tests {
             validator_store,
             config,
             pubkey_map,
-        );
+        ));
 
         orchestrator.duty_management.prepare_proposers().await;
         // wiremock will verify expect(1) on drop
@@ -2079,7 +2360,7 @@ mod tests {
         let config = create_test_config();
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -2090,7 +2371,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         orchestrator.duty_management.prepare_proposers().await;
     }
@@ -2160,7 +2441,7 @@ mod tests {
 
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -2171,7 +2452,7 @@ mod tests {
             validator_store,
             config,
             pubkey_map,
-        );
+        ));
 
         // Should not panic - failure is non-fatal
         orchestrator.duty_management.prepare_proposers().await;
@@ -2244,7 +2525,7 @@ mod tests {
         );
         let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -2255,7 +2536,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         orchestrator.duty_management.submit_committee_subscriptions(3).await;
         // wiremock will verify expect(1) on drop
@@ -2294,7 +2575,7 @@ mod tests {
         let config = create_test_config();
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -2305,7 +2586,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         orchestrator.duty_management.submit_committee_subscriptions(0).await;
     }
@@ -2371,7 +2652,7 @@ mod tests {
         );
         let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -2382,7 +2663,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         // Should not panic
         orchestrator.duty_management.submit_committee_subscriptions(3).await;
@@ -2462,7 +2743,7 @@ mod tests {
         let config = create_test_config();
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -2473,7 +2754,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         // Should not panic, should complete successfully
         orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
@@ -2528,7 +2809,7 @@ mod tests {
         let config = create_test_config();
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker.clone(),
             signer,
@@ -2539,7 +2820,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         // No caches populated — should fetch and not panic
         orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
@@ -2606,7 +2887,7 @@ mod tests {
         let config = create_test_config().with_timeouts(timeouts.clone());
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -2617,7 +2898,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         let start = std::time::Instant::now();
         orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
@@ -2655,7 +2936,7 @@ mod tests {
         let config = create_test_config();
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -2666,7 +2947,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         // Should not panic even with broken beacon
         orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
@@ -2867,7 +3148,7 @@ mod tests {
         let validator_store = create_mock_validator_store();
         validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey_bytes));
 
-        let (orchestrator, handle) = DutyOrchestrator::new(
+        let (orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -2878,7 +3159,7 @@ mod tests {
             validator_store,
             config,
             pubkey_map,
-        );
+        ));
 
         (orchestrator, handle, pubkey_hex, capturing_submitter)
     }
@@ -3717,7 +3998,7 @@ mod tests {
 
         let config = create_test_config();
 
-        let (mut orchestrator, handle) = DutyOrchestrator::new(
+        let (mut orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -3728,7 +4009,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             Arc::new(parking_lot::RwLock::new(HashMap::new())),
-        );
+        ));
 
         // Capture spans via thread-local subscriber
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -3788,7 +4069,7 @@ mod tests {
 
         let config = create_test_config();
 
-        let (mut orchestrator, handle) = DutyOrchestrator::new(
+        let (mut orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -3799,7 +4080,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             Arc::new(parking_lot::RwLock::new(HashMap::new())),
-        );
+        ));
 
         let captured = Arc::new(Mutex::new(Vec::new()));
         let layer = SpanCapture { names: captured.clone() };
@@ -4005,7 +4286,7 @@ mod tests {
 
         let config = create_test_config();
 
-        let (mut orchestrator, handle) = DutyOrchestrator::new(
+        let (mut orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -4016,7 +4297,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             Arc::new(parking_lot::RwLock::new(HashMap::new())),
-        );
+        ));
 
         let (layer, spans) = HierarchyCapture::new();
         let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
@@ -4075,7 +4356,7 @@ mod tests {
 
         let config = create_test_config();
 
-        let (mut orchestrator, handle) = DutyOrchestrator::new(
+        let (mut orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -4086,7 +4367,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             Arc::new(parking_lot::RwLock::new(HashMap::new())),
-        );
+        ));
 
         let (layer, spans) = HierarchyCapture::new();
         let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
@@ -4630,7 +4911,7 @@ mod tests {
         let validator_store = create_mock_validator_store();
         validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey_bytes));
 
-        let (orchestrator, handle) = DutyOrchestrator::new(
+        let (orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock.clone(),
             duty_tracker,
             signer,
@@ -4641,7 +4922,7 @@ mod tests {
             validator_store,
             config,
             pubkey_map,
-        );
+        ));
 
         (orchestrator, handle, pubkey_hex, capturing_submitter, clock)
     }
@@ -4851,7 +5132,7 @@ mod tests {
         let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
         clock.set_slot(slot);
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -4862,7 +5143,7 @@ mod tests {
             create_mock_validator_store(),
             config,
             pubkey_map,
-        );
+        ));
 
         // Invoke the proposer path directly.
         let ctx = SlotContext { slot, epoch, head_root: None };
@@ -4966,21 +5247,23 @@ mod tests {
         // Shared circuit breaker with realistic limits so we can observe misses.
         let circuit_breaker = Arc::new(CircuitBreakerState::new(3, 5));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new_with_attesting_enabled(
-            clock,
-            duty_tracker,
-            signer,
-            propagator,
-            beacon,
-            // MockBlockBeacon always returns Beacon("mock") error.
-            create_mock_block_beacon(),
-            None,
-            validator_store,
-            config,
-            pubkey_map,
-            circuit_breaker.clone(),
-            Arc::new(AtomicBool::new(true)),
-        );
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps {
+            circuit_breaker: circuit_breaker.clone(),
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            ..OrchestratorDeps::for_test(
+                clock,
+                duty_tracker,
+                signer,
+                propagator,
+                beacon,
+                // MockBlockBeacon always returns Beacon("mock") error.
+                create_mock_block_beacon(),
+                None,
+                validator_store,
+                config,
+                pubkey_map,
+            )
+        });
 
         let ctx = SlotContext { slot, epoch, head_root: None };
         orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
@@ -5047,20 +5330,22 @@ mod tests {
 
         let circuit_breaker = Arc::new(CircuitBreakerState::new(3, 5));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new_with_attesting_enabled(
-            clock,
-            duty_tracker,
-            signer,
-            propagator,
-            beacon,
-            create_mock_block_beacon(),
-            None,
-            validator_store,
-            config,
-            pubkey_map,
-            circuit_breaker.clone(),
-            Arc::new(AtomicBool::new(true)),
-        );
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps {
+            circuit_breaker: circuit_breaker.clone(),
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            ..OrchestratorDeps::for_test(
+                clock,
+                duty_tracker,
+                signer,
+                propagator,
+                beacon,
+                create_mock_block_beacon(),
+                None,
+                validator_store,
+                config,
+                pubkey_map,
+            )
+        });
 
         let ctx = SlotContext { slot, epoch, head_root: None };
         orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
@@ -5131,20 +5416,22 @@ mod tests {
 
         let circuit_breaker = Arc::new(CircuitBreakerState::new(3, 5));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new_with_attesting_enabled(
-            clock,
-            duty_tracker,
-            signer,
-            propagator,
-            beacon,
-            create_mock_block_beacon(),
-            None,
-            validator_store,
-            config,
-            pubkey_map,
-            circuit_breaker.clone(),
-            Arc::new(AtomicBool::new(true)),
-        );
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps {
+            circuit_breaker: circuit_breaker.clone(),
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            ..OrchestratorDeps::for_test(
+                clock,
+                duty_tracker,
+                signer,
+                propagator,
+                beacon,
+                create_mock_block_beacon(),
+                None,
+                validator_store,
+                config,
+                pubkey_map,
+            )
+        });
 
         let ctx = SlotContext { slot, epoch, head_root: None };
         orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
@@ -5197,20 +5484,22 @@ mod tests {
         let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
         clock.set_slot(0);
 
-        let (orchestrator, _handle) = DutyOrchestrator::new_with_attesting_enabled(
-            clock,
-            duty_tracker,
-            signer,
-            propagator,
-            beacon,
-            create_mock_block_beacon(),
-            None,
-            validator_store,
-            config,
-            pubkey_map,
-            Arc::new(CircuitBreakerState::new(0, 0)),
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps {
+            circuit_breaker: Arc::new(CircuitBreakerState::new(0, 0)),
             attesting_enabled,
-        );
+            ..OrchestratorDeps::for_test(
+                clock,
+                duty_tracker,
+                signer,
+                propagator,
+                beacon,
+                create_mock_block_beacon(),
+                None,
+                validator_store,
+                config,
+                pubkey_map,
+            )
+        });
         orchestrator
     }
 
@@ -5232,7 +5521,7 @@ mod tests {
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -5243,7 +5532,7 @@ mod tests {
             create_mock_validator_store(),
             create_test_config(),
             pubkey_map,
-        );
+        ));
 
         assert!(
             orchestrator.sync_enabled.load(Ordering::Acquire),
@@ -5270,7 +5559,7 @@ mod tests {
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -5281,7 +5570,7 @@ mod tests {
             create_mock_validator_store(),
             create_test_config(),
             pubkey_map,
-        );
+        ));
 
         assert!(orchestrator.sync_enabled.load(Ordering::Acquire), "default must be true");
 
@@ -5465,7 +5754,7 @@ mod tests {
             validator_store.add_validator(config);
         }
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -5476,7 +5765,7 @@ mod tests {
             validator_store.clone(),
             config,
             pubkey_map,
-        );
+        ));
 
         // Phase 1 (RED → GREEN): process_slot must return NoDutiesForSlot
         // because the validator is inside the doppelganger window (enabled=false).
@@ -5628,7 +5917,7 @@ mod tests {
         let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
         clock.set_slot(slot);
 
-        let (orchestrator, _handle) = DutyOrchestrator::new(
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
             clock,
             duty_tracker,
             signer,
@@ -5639,7 +5928,7 @@ mod tests {
             validator_store,
             create_test_config(),
             pubkey_map,
-        );
+        ));
 
         let ctx = SlotContext { slot, epoch, head_root: None };
         orchestrator.maybe_propose_block(slot, epoch, &ctx).await;

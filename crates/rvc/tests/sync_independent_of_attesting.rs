@@ -45,7 +45,7 @@ use eth_types::{
     SyncCommitteeDuty,
 };
 use propagator::{AttestationSubmitter, Propagator};
-use rvc::orchestrator::{DutyOrchestrator, OrchestratorConfig};
+use rvc::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorDeps};
 use signer::{always_enabled, SignerService};
 use slashing::SlashingDb;
 use timing::MockSlotClock;
@@ -367,20 +367,22 @@ async fn build_integration_orchestrator(
 
     let circuit_breaker = Arc::new(CircuitBreakerState::new(0, 0));
 
-    DutyOrchestrator::new_with_attesting_enabled(
-        clock,
-        duty_tracker,
-        signer,
-        propagator,
-        beacon as Arc<dyn BeaconNodeClient>,
-        Arc::new(NoopBlockBeacon),
-        None,
-        validator_store,
-        config,
-        pubkey_map,
+    DutyOrchestrator::new(OrchestratorDeps {
         circuit_breaker,
         attesting_enabled,
-    )
+        ..OrchestratorDeps::for_test(
+            clock,
+            duty_tracker,
+            signer,
+            propagator,
+            beacon as Arc<dyn BeaconNodeClient>,
+            Arc::new(NoopBlockBeacon),
+            None,
+            validator_store,
+            config,
+            pubkey_map,
+        )
+    })
 }
 
 // ── test cases ────────────────────────────────────────────────────────────────

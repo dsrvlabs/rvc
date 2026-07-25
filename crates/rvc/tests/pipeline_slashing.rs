@@ -35,7 +35,9 @@ use eth_types::{
     ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration, Slot,
 };
 use propagator::{AttestationSubmitter, Propagator};
-use rvc::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorHandle};
+use rvc::orchestrator::{
+    DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorHandle,
+};
 use signer::{always_enabled, SignerService};
 use slashing::SlashingDb;
 use timing::MockSlotClock;
@@ -514,20 +516,22 @@ pub fn pipeline_fixture(opts: PipelineFixtureOpts) -> PipelineFixture {
     let circuit_breaker = Arc::new(CircuitBreakerState::new(0, 0));
     let attesting_enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
-    let (orchestrator, handle) = DutyOrchestrator::new_with_attesting_enabled(
-        Arc::clone(&clock),
-        duty_tracker,
-        signer,
-        propagator,
-        beacon.clone() as Arc<dyn BeaconNodeClient>,
-        Arc::new(NoopBlockBeacon),
-        None,
-        validator_store,
-        config,
-        pubkey_map,
+    let (orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps {
         circuit_breaker,
         attesting_enabled,
-    );
+        ..OrchestratorDeps::for_test(
+            Arc::clone(&clock),
+            duty_tracker,
+            signer,
+            propagator,
+            beacon.clone() as Arc<dyn BeaconNodeClient>,
+            Arc::new(NoopBlockBeacon),
+            None,
+            validator_store,
+            config,
+            pubkey_map,
+        )
+    });
 
     PipelineFixture {
         orchestrator,

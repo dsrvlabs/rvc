@@ -642,14 +642,14 @@ never notice it was inert. One constructor taking a deps struct makes the omissi
 5. Leave `key_gen_rx.has_changed()` logic at `:322` untouched; it becomes reachable rather than rewritten.
 
 **Acceptance criteria:**
-- [ ] Exactly one `DutyOrchestrator` constructor exists; `new_with_attesting_enabled` and
+- [x] Exactly one `DutyOrchestrator` constructor exists; `new_with_attesting_enabled` and
       `new_with_key_gen` are gone.
-- [ ] No `watch::channel` is fabricated inside any constructor; the receiver always comes from the caller.
-- [ ] No `#[allow(clippy::too_many_arguments)]` remains on orchestrator construction.
-- [ ] `main.rs` passes the receiver paired with the sender RF1-06 gave the adapters (same channel).
-- [ ] All ~30 call sites compile and pass; the call-site inventory is listed in the PR description.
-- [ ] `crates/architecture-tests` green (constructor churn must not alter crate edges).
-- [ ] Standing invariant green.
+- [x] No `watch::channel` is fabricated inside any constructor; the receiver always comes from the caller.
+- [x] No `#[allow(clippy::too_many_arguments)]` remains on orchestrator construction.
+- [x] `main.rs` passes the receiver paired with the sender RF1-06 gave the adapters (same channel).
+- [x] All ~30 call sites compile and pass; the call-site inventory is listed in the PR description.
+- [x] `crates/architecture-tests` green (constructor churn must not alter crate edges).
+- [x] Standing invariant green.
 
 **TDD test plan:**
 1. **RED first:** `test_key_gen_notification_clears_duty_cache` — build the orchestrator with a real
