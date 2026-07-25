@@ -2783,15 +2783,38 @@ mod tests {
         let signer = create_test_composite_signer_with_key(sk2);
         let corrupted_db = SlashingDb::open(&db_path);
 
-        if let Ok(db) = corrupted_db {
-            // SQLite may lazily open — error surfaces on first query
-            let service =
-                SignerService::new(signer, Arc::new(db)).with_enablement(always_enabled());
-            let data = create_test_attestation_data(60, 61);
-            let result = service.sign_attestation(&data, &pk2, &fork_schedule, &genesis_root).await;
-            assert!(result.is_err(), "DB error must propagate, not be swallowed");
+        // Fail-closed in BOTH branches — no vacuous pass (RF1-02 / F124).
+        match corrupted_db {
+            Ok(db) => {
+                // SQLite may open a corrupt file and surface the error on first query.
+                let service =
+                    SignerService::new(signer, Arc::new(db)).with_enablement(always_enabled());
+                let data = create_test_attestation_data(60, 61);
+                let result =
+                    service.sign_attestation(&data, &pk2, &fork_schedule, &genesis_root).await;
+                assert!(
+                    result.is_err(),
+                    "DB error on sign must propagate (fail-closed), not be swallowed; got {result:?}"
+                );
+            }
+            Err(open_err) => {
+                // Opening itself rejected the corrupt file — also fail-closed.
+                // Assert unconditionally so this branch cannot pass vacuously
+                // when open fails (the pre-RF1-02 form had an empty `if let Ok`
+                // else arm).
+                let msg = open_err.to_string().to_lowercase();
+                assert!(
+                    msg.contains("corrupt")
+                        || msg.contains("empty")
+                        || msg.contains("database")
+                        || msg.contains("sqlite")
+                        || msg.contains("header")
+                        || msg.contains("inspect"),
+                    "SlashingDb::open must fail closed on corrupted file with a \
+                     recognizable error; got: {open_err}"
+                );
+            }
         }
-        // If SlashingDb::open itself fails on corrupted file, that's also fail-closed behavior
     }
 
     // ── SEC-2a: production SignerService consults SigningEnablement ─────────

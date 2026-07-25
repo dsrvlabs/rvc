@@ -292,14 +292,14 @@ asserts nothing when `SlashingDb::open` fails — that is not a fail-closed test
    assert that explicitly; if it opens, assert the sign attempt errors. No vacuous pass.
 
 **Acceptance criteria:**
-- [ ] Two `process_slot` calls with conflicting `AttestationData`: the first signs, the second is
+- [x] Two `process_slot` calls with conflicting `AttestationData`: the first signs, the second is
       rejected by slashing protection; assertion is on the *absence of a signature*, not just on a log.
-- [ ] After the rejection the slashing DB contains exactly one attestation row for the pubkey.
-- [ ] A slashing-DB error during `process_slot` propagates fail-closed (no signature emitted).
-- [ ] The corrupted-DB test in `crates/signer/src/lib.rs` asserts unconditionally in both branches.
-- [ ] The fixture is a reusable module-level helper, not inline in one test fn (RF1-08 contract).
-- [ ] Additive only: no production code changes in this issue.
-- [ ] Standing invariant green.
+- [x] After the rejection the slashing DB contains exactly one attestation row for the pubkey.
+- [x] A slashing-DB error during `process_slot` propagates fail-closed (no signature emitted).
+- [x] The corrupted-DB test in `crates/signer/src/lib.rs` asserts unconditionally in both branches.
+- [x] The fixture is a reusable module-level helper, not inline in one test fn (RF1-08 contract).
+- [x] Additive only: no production code changes in this issue.
+- [x] Standing invariant green.
 
 **TDD test plan** (new, in `crates/rvc/tests/pipeline_slashing.rs`):
 1. **RED first:** `test_pipeline_rejects_double_vote_across_two_process_slot_calls` — written before the

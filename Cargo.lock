@@ -4105,6 +4105,7 @@ dependencies = [
  "parking_lot",
  "prost 0.13.5",
  "reqwest 0.12.28",
+ "rusqlite",
  "rvc-block-service",
  "rvc-bn-manager",
  "rvc-builder",
