@@ -492,7 +492,7 @@ fn pubkey_from_bytes(bytes: &[u8; 48]) -> Result<PublicKey, Status> {
 // The v1 raw-root `sign(signing_root, pubkey)` path has been removed from the
 // live listener (see `main.rs`).  Per ADR-010, the trait impl is kept compiled
 // so the proto types remain usable for a future separately-bound, off-by-default
-// insecure listener that would require `eth_types::insecure::InsecureGate::Allow`
+// insecure listener that would require `crypto::InsecureGate` (Allow/opt-in)
 // (NOT implemented here).  All methods return `Unimplemented` so any accidental
 // call produces a clear diagnostic rather than silent misbehavior.
 //

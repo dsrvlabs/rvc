@@ -477,14 +477,14 @@ var + predicate conjunction, `InsecureMode::Refuse`/`Warn`). Two gates with diff
    `insecure_startup.rs` and `bin/rvc`'s metrics gate (`main.rs:1822`) are untouched.
 
 **Acceptance criteria:**
-- [ ] `rg "insecure" crates/eth-types` returns zero hits.
-- [ ] Exactly one `InsecureGate` implementation exists workspace-wide, in `crates/crypto`.
-- [ ] The `bin/rvc-signer/src/service.rs` comment references the surviving gate.
-- [ ] **Test-count delta stated and justified:** expected ≈ −8 (the whole `insecure_gate.rs`
+- [x] `rg "insecure" crates/eth-types` returns zero hits.
+- [x] Exactly one `InsecureGate` implementation exists workspace-wide, in `crates/crypto`.
+- [x] The `bin/rvc-signer/src/service.rs` comment references the surviving gate.
+- [x] **Test-count delta stated and justified:** expected ≈ −8 (the whole `insecure_gate.rs`
       integration file), all *deleted-with-the-dead-code*. The behaviour those tests covered is
       already covered by `crates/crypto`'s own insecure-gate tests and
       `bin/rvc-signer/tests/insecure_refuse_mode.rs` / `insecure_flag_h9.rs` — name them in the PR.
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **Risks:** none identified.
 
