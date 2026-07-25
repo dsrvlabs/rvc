@@ -438,14 +438,14 @@ maxima"). Only the *decision* moves to production code here. Do not pull B5 forw
    for the projection.
 
 **Acceptance criteria:**
-- [ ] No test-local `HashMap` watermark tracking and no test-local watermark comparison remains in
+- [x] No test-local `HashMap` watermark tracking and no test-local watermark comparison remains in
       `conformance.rs`.
-- [ ] Every conformance verdict — both runners — comes from the production `stage_*` path.
-- [ ] `real_watermarks` is deleted; the suite generates 38 × 2 = 76 test functions, all green.
-- [ ] The minimal and complete runners still diverge on the cases that are strategy-sensitive (proving the
+- [x] Every conformance verdict — both runners — comes from the production `stage_*` path.
+- [x] `real_watermarks` is deleted; the suite generates 38 × 2 = 76 test functions, all green.
+- [x] The minimal and complete runners still diverge on the cases that are strategy-sensitive (proving the
       collapse did not turn one runner into a copy of the other).
-- [ ] A module-doc comment records the runner→strategy mapping and the B5 handoff for the projection.
-- [ ] Standing invariant green.
+- [x] A module-doc comment records the runner→strategy mapping and the B5 handoff for the projection.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 1. **RED first:** `single_validator_source_greater_than_target_sensible_iff_minified::minimal_conservative`
