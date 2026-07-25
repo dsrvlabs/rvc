@@ -661,13 +661,18 @@ mod tests {
     async fn test_register_validators_no_builder_enabled() {
         let pk = gen_pubkey_bytes();
         let store = test_store_with_builder_validators(&[(pk, false, None, None)]);
-        let service = build_service(MockSigner::new(), MockBn::new(), store);
+        let bn = Arc::new(MockBn::new());
+        let service = BuilderService::new(
+            Arc::new(MockSigner::new()),
+            bn.clone(),
+            Arc::new(store),
+            [0x00, 0x00, 0x00, 0x00],
+        );
 
         let result = service.register_validators().await;
         assert!(result.is_ok());
 
-        let bn = service.bn.as_ref() as *const dyn BeaconNodeClient as *const MockBn;
-        let calls = unsafe { &*bn }.register_calls.lock();
+        let calls = bn.register_calls.lock();
         assert!(calls.is_empty());
     }
 

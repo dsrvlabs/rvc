@@ -927,11 +927,11 @@ constructing the service (e.g. `:693-705`) and asserts through it.
    already imply rather than reshaping the helper for everyone.
 
 **Acceptance criteria:**
-- [ ] No `unsafe` remains anywhere in `crates/builder`.
-- [ ] The test still asserts that no registration call was made when no validator has the builder enabled
+- [x] No `unsafe` remains anywhere in `crates/builder`.
+- [x] The test still asserts that no registration call was made when no validator has the builder enabled
       (same assertion, sound access path).
-- [ ] The test matches the `Arc<MockBn>`-clone idiom used by its neighbors.
-- [ ] Standing invariant green.
+- [x] The test matches the `Arc<MockBn>`-clone idiom used by its neighbors.
+- [x] Standing invariant green.
 
 **TDD test plan:** this is a test rewrite, so the RED is a mutation check rather than a new failing test.
 1. **RED first:** `test_register_validators_no_builder_enabled` — after the rewrite, temporarily make
