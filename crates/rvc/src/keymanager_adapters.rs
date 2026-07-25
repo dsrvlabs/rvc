@@ -52,32 +52,29 @@ pub struct KeystoreManagerAdapter {
     composite_signer: Arc<CompositeSigner>,
     /// API-imported keys; also serializes concurrent `import_keystore` / `delete_keystore`.
     tracked_keys: Mutex<Vec<Pubkey>>,
-    pubkey_map: Option<PubkeyMap>,
-    key_gen_tx: Option<watch::Sender<u64>>,
+    /// Shared duty-matching map; always updated on import/delete (RF1-06).
+    pubkey_map: PubkeyMap,
+    /// Notifies the orchestrator that the key set changed (RF1-06 / RF1-07).
+    key_gen_tx: watch::Sender<u64>,
     /// Durable deletion denylist; `None` disables persistence (tests).
     denylist: Option<Arc<DeletionDenylist>>,
 }
 
 impl KeystoreManagerAdapter {
-    pub fn new(keystore_dir: PathBuf, composite_signer: Arc<CompositeSigner>) -> Self {
+    pub fn new(
+        keystore_dir: PathBuf,
+        composite_signer: Arc<CompositeSigner>,
+        pubkey_map: PubkeyMap,
+        key_gen_tx: watch::Sender<u64>,
+    ) -> Self {
         Self {
             keystore_dir,
             composite_signer,
             tracked_keys: Mutex::new(Vec::new()),
-            pubkey_map: None,
-            key_gen_tx: None,
+            pubkey_map,
+            key_gen_tx,
             denylist: None,
         }
-    }
-
-    pub fn with_pubkey_map(
-        mut self,
-        pubkey_map: PubkeyMap,
-        key_gen_tx: watch::Sender<u64>,
-    ) -> Self {
-        self.pubkey_map = Some(pubkey_map);
-        self.key_gen_tx = Some(key_gen_tx);
-        self
     }
 
     /// Attach the process-wide deletion denylist (SEC-1b).
@@ -87,9 +84,7 @@ impl KeystoreManagerAdapter {
     }
 
     fn notify_key_change(&self) {
-        if let Some(tx) = &self.key_gen_tx {
-            tx.send_modify(|gen| *gen += 1);
-        }
+        self.key_gen_tx.send_modify(|gen| *gen += 1);
     }
 }
 
@@ -396,12 +391,10 @@ impl KeystoreManager for KeystoreManagerAdapter {
         // Track the key (lock still held)
         keys.push(pubkey_bytes);
 
-        // Update shared pubkey_map
-        if let Some(ref map) = self.pubkey_map {
-            let pubkey_hex = format!("0x{}", hex::encode(pubkey_bytes));
-            map.write().insert(pubkey_hex, public_key);
-            self.notify_key_change();
-        }
+        // Update shared pubkey_map and notify orchestrator (required at construction).
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey_bytes));
+        self.pubkey_map.write().insert(pubkey_hex, public_key);
+        self.notify_key_change();
 
         // SEC-1b: clear denylist only *after* successful persistence + registry
         // add so a mid-import IO failure cannot un-delete a previously deleted
@@ -461,14 +454,22 @@ impl KeystoreManager for KeystoreManagerAdapter {
         }
 
         // Drop bookkeeping after denylist succeeds (lock still held for
-        // remove_local_key so concurrent deletes serialize cleanly).
+        // remove_local_key + map update so concurrent deletes/imports serialize).
         if let Some(pos) = keys.iter().position(|k| k == pubkey) {
             keys.remove(pos);
         }
 
         // Remove from the real signing registry (dynamic + boot-loaded).
         let removed = self.composite_signer.remove_local_key(pubkey);
+
+        // Map remove + notify under the same `tracked_keys` lock as registry
+        // mutation (S1). If we released the lock first, a concurrent re-import
+        // could re-insert the map entry and then be erased by our late remove.
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey));
+        self.pubkey_map.write().remove(&pubkey_hex);
+        self.notify_key_change();
         drop(keys);
+
         // After a positive membership check under this lock, `!removed` is an
         // inconsistency (or an external concurrent remover). Disk side effects
         // already happened — do not map this to dishonest `not_found`.
@@ -479,13 +480,6 @@ impl KeystoreManager for KeystoreManagerAdapter {
                 "remove_local_key returned false after positive membership; \
                  treating delete as success (key is not signable)"
             );
-        }
-
-        // Remove from shared pubkey_map
-        if let Some(ref map) = self.pubkey_map {
-            let pubkey_hex = format!("0x{}", hex::encode(pubkey));
-            map.write().remove(&pubkey_hex);
-            self.notify_key_change();
         }
 
         info!(
@@ -756,36 +750,31 @@ pub struct RemoteKeyManagerAdapter {
     tracked_keys: Mutex<Vec<(Pubkey, String)>>,
     allowed_hosts: Option<Vec<String>>,
     warned_no_allowlist: AtomicBool,
-    pubkey_map: Option<PubkeyMap>,
-    key_gen_tx: Option<watch::Sender<u64>>,
+    /// Shared duty-matching map; always updated on import/delete (RF1-06).
+    pubkey_map: PubkeyMap,
+    /// Notifies the orchestrator that the key set changed (RF1-06 / RF1-07).
+    key_gen_tx: watch::Sender<u64>,
 }
 
 impl RemoteKeyManagerAdapter {
-    pub fn new(composite_signer: Arc<CompositeSigner>, allowed_hosts: Option<Vec<String>>) -> Self {
+    pub fn new(
+        composite_signer: Arc<CompositeSigner>,
+        allowed_hosts: Option<Vec<String>>,
+        pubkey_map: PubkeyMap,
+        key_gen_tx: watch::Sender<u64>,
+    ) -> Self {
         Self {
             composite_signer,
             tracked_keys: Mutex::new(Vec::new()),
             allowed_hosts,
             warned_no_allowlist: AtomicBool::new(false),
-            pubkey_map: None,
-            key_gen_tx: None,
+            pubkey_map,
+            key_gen_tx,
         }
-    }
-
-    pub fn with_pubkey_map(
-        mut self,
-        pubkey_map: PubkeyMap,
-        key_gen_tx: watch::Sender<u64>,
-    ) -> Self {
-        self.pubkey_map = Some(pubkey_map);
-        self.key_gen_tx = Some(key_gen_tx);
-        self
     }
 
     fn notify_key_change(&self) {
-        if let Some(tx) = &self.key_gen_tx {
-            tx.send_modify(|gen| *gen += 1);
-        }
+        self.key_gen_tx.send_modify(|gen| *gen += 1);
     }
 }
 
@@ -838,14 +827,15 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
         self.composite_signer.add_remote_key(pubkey, remote_signer);
         keys.push((pubkey, url));
 
-        // Update shared pubkey_map
-        if let Some(ref map) = self.pubkey_map {
-            if let Ok(pk) = PublicKey::from_bytes(&pubkey) {
-                let pubkey_hex = format!("0x{}", hex::encode(pubkey));
-                map.write().insert(pubkey_hex, pk);
-            }
-            self.notify_key_change();
+        // Update shared pubkey_map and notify under `tracked_keys` (same lock
+        // as registry mutation). Invalid BLS bytes skip the map entry but still
+        // advance the generation counter; RF1-07 wires the orchestrator receiver
+        // that will clear the duty cache on this notification.
+        if let Ok(pk) = PublicKey::from_bytes(&pubkey) {
+            let pubkey_hex = format!("0x{}", hex::encode(pubkey));
+            self.pubkey_map.write().insert(pubkey_hex, pk);
         }
+        self.notify_key_change();
 
         info!(pubkey = %format!("0x{}", hex::encode(pubkey)), "Imported remote key");
         Ok(())
@@ -855,16 +845,13 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
         let mut keys = self.tracked_keys.lock();
         if let Some(pos) = keys.iter().position(|(pk, _)| pk == pubkey) {
             keys.remove(pos);
-            drop(keys);
-
             self.composite_signer.remove_remote_key(pubkey);
 
-            // Remove from shared pubkey_map
-            if let Some(ref map) = self.pubkey_map {
-                let pubkey_hex = format!("0x{}", hex::encode(pubkey));
-                map.write().remove(&pubkey_hex);
-                self.notify_key_change();
-            }
+            // Map remove + notify under the same lock as registry mutation (S1).
+            let pubkey_hex = format!("0x{}", hex::encode(pubkey));
+            self.pubkey_map.write().remove(&pubkey_hex);
+            self.notify_key_change();
+            drop(keys);
 
             info!(pubkey = %format!("0x{}", hex::encode(pubkey)), "Deleted remote key");
             Ok(true)
@@ -1089,37 +1076,63 @@ mod tests {
         Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())))
     }
 
+    fn create_pubkey_map() -> PubkeyMap {
+        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()))
+    }
+
+    /// Shared test helper: build a KeystoreManagerAdapter with required map + channel.
+    fn test_keystore_adapter(
+        dir: PathBuf,
+        signer: Arc<CompositeSigner>,
+    ) -> (KeystoreManagerAdapter, PubkeyMap, watch::Receiver<u64>) {
+        let (tx, rx) = watch::channel(0u64);
+        let pubkey_map = create_pubkey_map();
+        let adapter = KeystoreManagerAdapter::new(dir, signer, pubkey_map.clone(), tx);
+        (adapter, pubkey_map, rx)
+    }
+
+    /// Shared test helper: build a RemoteKeyManagerAdapter with required map + channel.
+    fn test_remote_adapter(
+        signer: Arc<CompositeSigner>,
+        allowed_hosts: Option<Vec<String>>,
+    ) -> (RemoteKeyManagerAdapter, PubkeyMap, watch::Receiver<u64>) {
+        let (tx, rx) = watch::channel(0u64);
+        let pubkey_map = create_pubkey_map();
+        let adapter = RemoteKeyManagerAdapter::new(signer, allowed_hosts, pubkey_map.clone(), tx);
+        (adapter, pubkey_map, rx)
+    }
+
     // --- KeystoreManagerAdapter tests ---
 
     #[test]
     fn test_keystore_manager_adapter_empty_list() {
         let dir = TempDir::new().unwrap();
-        let adapter =
-            KeystoreManagerAdapter::new(dir.path().to_path_buf(), create_empty_composite_signer());
+        let (adapter, _, _) =
+            test_keystore_adapter(dir.path().to_path_buf(), create_empty_composite_signer());
         assert!(adapter.list_keys().is_empty());
     }
 
     #[test]
     fn test_keystore_manager_adapter_has_key_false() {
         let dir = TempDir::new().unwrap();
-        let adapter =
-            KeystoreManagerAdapter::new(dir.path().to_path_buf(), create_empty_composite_signer());
+        let (adapter, _, _) =
+            test_keystore_adapter(dir.path().to_path_buf(), create_empty_composite_signer());
         assert!(!adapter.has_key(&test_pubkey(1)));
     }
 
     #[test]
     fn test_keystore_manager_adapter_delete_nonexistent() {
         let dir = TempDir::new().unwrap();
-        let adapter =
-            KeystoreManagerAdapter::new(dir.path().to_path_buf(), create_empty_composite_signer());
+        let (adapter, _, _) =
+            test_keystore_adapter(dir.path().to_path_buf(), create_empty_composite_signer());
         assert!(!adapter.delete_keystore(&test_pubkey(1)).unwrap());
     }
 
     #[test]
     fn test_keystore_manager_adapter_import_invalid_json() {
         let dir = TempDir::new().unwrap();
-        let adapter =
-            KeystoreManagerAdapter::new(dir.path().to_path_buf(), create_empty_composite_signer());
+        let (adapter, _, _) =
+            test_keystore_adapter(dir.path().to_path_buf(), create_empty_composite_signer());
         let result = adapter.import_keystore("not valid json", "password");
         assert!(matches!(result, Err(ImportKeystoreError::InvalidKeystore(_))));
     }
@@ -1336,20 +1349,20 @@ mod tests {
 
     #[test]
     fn test_remote_key_adapter_empty_list() {
-        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer(), None);
+        let (adapter, _, _) = test_remote_adapter(create_empty_composite_signer(), None);
         assert!(adapter.list_remote_keys().is_empty());
     }
 
     #[test]
     fn test_remote_key_adapter_has_key_false() {
-        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer(), None);
+        let (adapter, _, _) = test_remote_adapter(create_empty_composite_signer(), None);
         assert!(!adapter.has_remote_key(&test_pubkey(1)));
     }
 
     #[test]
     fn test_remote_key_adapter_import_and_list() {
         let composite = create_empty_composite_signer();
-        let adapter = RemoteKeyManagerAdapter::new(composite.clone(), None);
+        let (adapter, _, _) = test_remote_adapter(composite.clone(), None);
 
         let pk = test_pubkey(1);
         let url = "https://signer.example.com".to_string();
@@ -1366,7 +1379,7 @@ mod tests {
 
     #[test]
     fn test_remote_key_adapter_import_duplicate() {
-        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer(), None);
+        let (adapter, _, _) = test_remote_adapter(create_empty_composite_signer(), None);
         let pk = test_pubkey(1);
         adapter.import_remote_key(pk, "https://signer.example.com".to_string()).unwrap();
         let result = adapter.import_remote_key(pk, "https://signer.example.com".to_string());
@@ -1376,7 +1389,7 @@ mod tests {
     #[test]
     fn test_remote_key_adapter_delete() {
         let composite = create_empty_composite_signer();
-        let adapter = RemoteKeyManagerAdapter::new(composite.clone(), None);
+        let (adapter, _, _) = test_remote_adapter(composite.clone(), None);
 
         let pk = test_pubkey(1);
         adapter.import_remote_key(pk, "https://signer.example.com".to_string()).unwrap();
@@ -1390,13 +1403,13 @@ mod tests {
 
     #[test]
     fn test_remote_key_adapter_delete_nonexistent() {
-        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer(), None);
+        let (adapter, _, _) = test_remote_adapter(create_empty_composite_signer(), None);
         assert!(!adapter.delete_remote_key(&test_pubkey(99)).unwrap());
     }
 
     #[test]
     fn test_remote_key_adapter_import_rejects_invalid_url_scheme() {
-        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer(), None);
+        let (adapter, _, _) = test_remote_adapter(create_empty_composite_signer(), None);
         let pk = test_pubkey(1);
 
         // file:// scheme — SSRF risk
@@ -1423,7 +1436,7 @@ mod tests {
     fn test_keystore_manager_tracks_imported_key_in_composite_signer() {
         let composite = create_empty_composite_signer();
         let dir = TempDir::new().unwrap();
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone());
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
 
         let sk = SecretKey::generate();
         let pk_bytes = sk.public_key().to_bytes();
@@ -1450,14 +1463,14 @@ mod tests {
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 100));
 
-        let keystore_mgr = Arc::new(KeystoreManagerAdapter::new(dir.keep(), composite.clone()));
+        let keystore_mgr = Arc::new(test_keystore_adapter(dir.keep(), composite.clone()).0);
         let slashing_prot = Arc::new(SlashingProtectionAdapter::new(
             slashing_db,
             "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         ));
         let validator_mgr = Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
         let doppelganger_mon = Arc::new(DoppelgangerMonitorAdapter::new());
-        let remote_key_mgr = Arc::new(RemoteKeyManagerAdapter::new(composite, None));
+        let remote_key_mgr = Arc::new(test_remote_adapter(composite, None).0);
         let config_mgr = Arc::new(ValidatorConfigManagerAdapter::new(validator_store));
 
         let token = "deadbeef".repeat(8);
@@ -1565,14 +1578,14 @@ mod tests {
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 100));
 
-        let keystore_mgr = Arc::new(KeystoreManagerAdapter::new(dir.keep(), composite.clone()));
+        let keystore_mgr = Arc::new(test_keystore_adapter(dir.keep(), composite.clone()).0);
         let slashing_prot = Arc::new(SlashingProtectionAdapter::new(
             slashing_db,
             "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
         ));
         let validator_mgr = Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
         let doppelganger_mon = Arc::new(DoppelgangerMonitorAdapter::new());
-        let remote_key_mgr = Arc::new(RemoteKeyManagerAdapter::new(composite.clone(), None));
+        let remote_key_mgr = Arc::new(test_remote_adapter(composite.clone(), None).0);
         let config_mgr = Arc::new(ValidatorConfigManagerAdapter::new(validator_store));
 
         let token = "deadbeef".repeat(8);
@@ -1677,7 +1690,7 @@ mod tests {
 
     #[test]
     fn test_import_remote_key_allowed_host_accepted() {
-        let adapter = RemoteKeyManagerAdapter::new(
+        let (adapter, _, _) = test_remote_adapter(
             create_empty_composite_signer(),
             Some(vec!["signer.example.com".to_string()]),
         );
@@ -1688,7 +1701,7 @@ mod tests {
 
     #[test]
     fn test_import_remote_key_blocked_host_rejected() {
-        let adapter = RemoteKeyManagerAdapter::new(
+        let (adapter, _, _) = test_remote_adapter(
             create_empty_composite_signer(),
             Some(vec!["trusted.host".to_string()]),
         );
@@ -1701,7 +1714,7 @@ mod tests {
 
     #[test]
     fn test_import_remote_key_no_allowlist_allows_all() {
-        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer(), None);
+        let (adapter, _, _) = test_remote_adapter(create_empty_composite_signer(), None);
         let pk = test_pubkey(1);
         let result = adapter.import_remote_key(pk, "https://any.host.com".to_string());
         assert!(result.is_ok());
@@ -1709,7 +1722,7 @@ mod tests {
 
     #[test]
     fn test_import_remote_key_allowlist_multiple_hosts() {
-        let adapter = RemoteKeyManagerAdapter::new(
+        let (adapter, _, _) = test_remote_adapter(
             create_empty_composite_signer(),
             Some(vec!["signer1.example.com".to_string(), "signer2.example.com".to_string()]),
         );
@@ -1726,7 +1739,7 @@ mod tests {
 
     #[test]
     fn test_import_remote_key_invalid_url_parse_error() {
-        let adapter = RemoteKeyManagerAdapter::new(create_empty_composite_signer(), None);
+        let (adapter, _, _) = test_remote_adapter(create_empty_composite_signer(), None);
         let pk = test_pubkey(1);
         let result = adapter.import_remote_key(pk, "not a valid url".to_string());
         assert!(
@@ -1736,7 +1749,7 @@ mod tests {
 
     #[test]
     fn test_import_remote_key_allowlist_with_port() {
-        let adapter = RemoteKeyManagerAdapter::new(
+        let (adapter, _, _) = test_remote_adapter(
             create_empty_composite_signer(),
             Some(vec!["signer.example.com".to_string()]),
         );
@@ -1747,44 +1760,109 @@ mod tests {
         assert!(result.is_ok());
     }
 
-    // --- CON-03: Dynamic pubkey_map + generation counter tests ---
+    // --- CON-03 / RF1-06: Dynamic pubkey_map + generation counter tests ---
 
-    fn create_pubkey_map() -> PubkeyMap {
-        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()))
+    #[test]
+    fn test_import_updates_shared_pubkey_map_and_notifies() {
+        let composite = create_empty_composite_signer();
+        let dir = TempDir::new().unwrap();
+        let (adapter, pubkey_map, mut rx) =
+            test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
+
+        let sk = SecretKey::generate();
+        let password = b"testpass";
+        let keystore = crypto::Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            crypto::EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("encrypt");
+        let keystore_json = serde_json::to_string(&keystore).unwrap();
+        let pk_bytes = sk.public_key().to_bytes();
+        let pubkey_hex = format!("0x{}", hex::encode(pk_bytes));
+
+        // Mark changed so the next has_changed() reflects only this import.
+        rx.borrow_and_update();
+        assert!(!rx.has_changed().unwrap());
+
+        adapter.import_keystore(&keystore_json, "testpass").unwrap();
+
+        assert!(
+            pubkey_map.read().contains_key(&pubkey_hex),
+            "import must update the shared PubkeyMap"
+        );
+        assert!(rx.has_changed().unwrap(), "import must notify via key_gen_tx");
+        assert_eq!(*rx.borrow(), 1);
     }
 
     #[test]
-    fn test_keystore_adapter_import_updates_pubkey_map() {
+    fn test_delete_removes_from_shared_pubkey_map_and_notifies() {
         let composite = create_empty_composite_signer();
         let dir = TempDir::new().unwrap();
-        let (tx, _rx) = watch::channel(0u64);
-        let pubkey_map = create_pubkey_map();
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone())
-            .with_pubkey_map(pubkey_map.clone(), tx);
+        let (adapter, pubkey_map, mut rx) =
+            test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
 
         let sk = SecretKey::generate();
+        let password = b"testpass";
+        let keystore = crypto::Keystore::encrypt(
+            &sk,
+            password,
+            "m/12381/3600/0/0/0",
+            crypto::EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("encrypt");
+        let keystore_json = serde_json::to_string(&keystore).unwrap();
         let pk_bytes = sk.public_key().to_bytes();
-
-        // Manually add (real keystore import needs a proper keystore JSON)
-        composite.add_local_key(sk);
-        adapter.tracked_keys.lock().push(pk_bytes);
-
-        // Simulate pubkey_map update as import_keystore would
         let pubkey_hex = format!("0x{}", hex::encode(pk_bytes));
-        let pk = crypto::PublicKey::from_bytes(&pk_bytes).unwrap();
-        pubkey_map.write().insert(pubkey_hex.clone(), pk);
 
+        adapter.import_keystore(&keystore_json, "testpass").unwrap();
         assert!(pubkey_map.read().contains_key(&pubkey_hex));
+        rx.borrow_and_update();
+        assert!(!rx.has_changed().unwrap());
+
+        let deleted = adapter.delete_keystore(&pk_bytes).unwrap();
+        assert!(deleted);
+        assert!(
+            !pubkey_map.read().contains_key(&pubkey_hex),
+            "delete must remove the key from the shared PubkeyMap"
+        );
+        assert!(rx.has_changed().unwrap(), "delete must notify via key_gen_tx");
+        assert_eq!(*rx.borrow(), 2);
+    }
+
+    #[test]
+    fn test_remote_adapter_import_notifies_key_change() {
+        let composite = create_empty_composite_signer();
+        let (adapter, pubkey_map, mut rx) = test_remote_adapter(composite, None);
+
+        // Valid BLS pubkey so map insert and notify are both exercised.
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        let pubkey_hex = format!("0x{}", hex::encode(pk));
+
+        rx.borrow_and_update();
+        assert!(!rx.has_changed().unwrap());
+        assert_eq!(*rx.borrow(), 0);
+
+        adapter.import_remote_key(pk, "https://signer.example.com".to_string()).unwrap();
+
+        assert!(
+            pubkey_map.read().contains_key(&pubkey_hex),
+            "remote import of a valid BLS key must update the shared PubkeyMap"
+        );
+        assert!(rx.has_changed().unwrap(), "remote import must notify via key_gen_tx");
+        assert_eq!(*rx.borrow(), 1);
+        assert!(adapter.has_remote_key(&pk));
     }
 
     #[test]
     fn test_keystore_adapter_delete_removes_from_pubkey_map() {
+        // Regression: delete of a boot/manual-loaded local key clears the map entry.
         let composite = create_empty_composite_signer();
         let dir = TempDir::new().unwrap();
-        let (tx, _rx) = watch::channel(0u64);
-        let pubkey_map = create_pubkey_map();
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone())
-            .with_pubkey_map(pubkey_map.clone(), tx);
+        let (adapter, pubkey_map, mut rx) =
+            test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
 
         let sk = SecretKey::generate();
         let pk_bytes = sk.public_key().to_bytes();
@@ -1795,52 +1873,40 @@ mod tests {
         adapter.tracked_keys.lock().push(pk_bytes);
         pubkey_map.write().insert(pubkey_hex.clone(), pk);
 
-        // Delete the keystore
+        rx.borrow_and_update();
         let deleted = adapter.delete_keystore(&pk_bytes).unwrap();
         assert!(deleted);
         assert!(!pubkey_map.read().contains_key(&pubkey_hex));
-    }
-
-    #[test]
-    fn test_remote_key_adapter_import_updates_pubkey_map() {
-        let composite = create_empty_composite_signer();
-        let (tx, _rx) = watch::channel(0u64);
-        let pubkey_map = create_pubkey_map();
-        let adapter =
-            RemoteKeyManagerAdapter::new(composite, None).with_pubkey_map(pubkey_map.clone(), tx);
-
-        let pk = test_pubkey(42);
-        adapter.import_remote_key(pk, "https://signer.example.com".to_string()).unwrap();
-
-        // test_pubkey(42) has all zeros except first byte, which is not a valid BLS key
-        // so from_bytes will fail and pubkey_map won't be updated — this is expected
-        // The key is still tracked in tracked_keys regardless
-        assert!(adapter.has_remote_key(&pk));
+        assert!(rx.has_changed().unwrap());
     }
 
     #[test]
     fn test_remote_key_adapter_delete_removes_from_pubkey_map() {
         let composite = create_empty_composite_signer();
-        let (tx, _rx) = watch::channel(0u64);
-        let pubkey_map = create_pubkey_map();
-        let adapter =
-            RemoteKeyManagerAdapter::new(composite, None).with_pubkey_map(pubkey_map.clone(), tx);
+        let (adapter, pubkey_map, mut rx) = test_remote_adapter(composite, None);
 
-        let pk = test_pubkey(42);
+        // Use a real BLS pubkey so the map entry is written on import.
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        let pubkey_hex = format!("0x{}", hex::encode(pk));
+
         adapter.import_remote_key(pk, "https://signer.example.com".to_string()).unwrap();
+        assert!(pubkey_map.read().contains_key(&pubkey_hex));
+        rx.borrow_and_update();
+
         let deleted = adapter.delete_remote_key(&pk).unwrap();
         assert!(deleted);
         assert!(!adapter.has_remote_key(&pk));
+        assert!(!pubkey_map.read().contains_key(&pubkey_hex));
+        assert!(rx.has_changed().unwrap());
     }
 
     #[test]
     fn test_generation_counter_increments_on_keystore_delete() {
         let composite = create_empty_composite_signer();
         let dir = TempDir::new().unwrap();
-        let (tx, rx) = watch::channel(0u64);
-        let pubkey_map = create_pubkey_map();
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone())
-            .with_pubkey_map(pubkey_map, tx);
+        let (adapter, _map, rx) =
+            test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
 
         let sk = SecretKey::generate();
         let pk_bytes = sk.public_key().to_bytes();
@@ -1848,35 +1914,20 @@ mod tests {
         adapter.tracked_keys.lock().push(pk_bytes);
 
         assert_eq!(*rx.borrow(), 0);
-
         adapter.delete_keystore(&pk_bytes).unwrap();
-
         assert_eq!(*rx.borrow(), 1);
     }
 
     #[test]
     fn test_generation_counter_increments_on_remote_key_import() {
         let composite = create_empty_composite_signer();
-        let (tx, rx) = watch::channel(0u64);
-        let pubkey_map = create_pubkey_map();
-        let adapter = RemoteKeyManagerAdapter::new(composite, None).with_pubkey_map(pubkey_map, tx);
+        let (adapter, _map, rx) = test_remote_adapter(composite, None);
 
         assert_eq!(*rx.borrow(), 0);
         adapter
             .import_remote_key(test_pubkey(1), "https://signer.example.com".to_string())
             .unwrap();
-        // Generation increments even if PublicKey::from_bytes fails (key still added to signer)
         assert_eq!(*rx.borrow(), 1);
-    }
-
-    #[test]
-    fn test_adapter_without_pubkey_map_works() {
-        let composite = create_empty_composite_signer();
-        let dir = TempDir::new().unwrap();
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone());
-
-        // Should work fine without pubkey_map wiring
-        assert!(adapter.list_keys().is_empty());
     }
 
     // --- TOCTOU fix tests ---
@@ -1885,7 +1936,7 @@ mod tests {
         dir: &std::path::Path,
     ) -> (Arc<KeystoreManagerAdapter>, Pubkey, Arc<CompositeSigner>) {
         let composite = create_empty_composite_signer();
-        let adapter = Arc::new(KeystoreManagerAdapter::new(dir.to_path_buf(), composite.clone()));
+        let adapter = Arc::new(test_keystore_adapter(dir.to_path_buf(), composite.clone()).0);
 
         let sk = SecretKey::generate();
         let pk_bytes = sk.public_key().to_bytes();
@@ -1927,7 +1978,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let composite = create_empty_composite_signer();
         let adapter =
-            Arc::new(KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone()));
+            Arc::new(test_keystore_adapter(dir.path().to_path_buf(), composite.clone()).0);
 
         // Set up N keys, each will be deleted by two threads simultaneously
         let n = 10;
@@ -1984,7 +2035,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let composite = create_empty_composite_signer();
         let adapter =
-            Arc::new(KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone()));
+            Arc::new(test_keystore_adapter(dir.path().to_path_buf(), composite.clone()).0);
 
         let sk = SecretKey::generate();
         let password = b"testpass";
@@ -2021,11 +2072,13 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let composite = create_empty_composite_signer();
-        let adapter =
-            Arc::new(KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone()));
+        let (adapter, pubkey_map, _rx) =
+            test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
+        let adapter = Arc::new(adapter);
 
         let sk = SecretKey::generate();
         let pk_bytes = sk.public_key().to_bytes();
+        let pubkey_hex = format!("0x{}", hex::encode(pk_bytes));
         let password = b"testpass";
         let keystore = crypto::Keystore::encrypt(
             &sk,
@@ -2068,6 +2121,14 @@ mod tests {
         let keys = adapter.list_keys();
         let has_key = adapter.has_key(&pk_bytes);
         assert_eq!(keys.contains(&pk_bytes), has_key);
+
+        // S1: PubkeyMap must stay in sync with the signing registry after concurrent
+        // delete vs re-import (map remove runs under the same lock as registry ops).
+        let in_map = pubkey_map.read().contains_key(&pubkey_hex);
+        assert_eq!(
+            in_map, has_key,
+            "PubkeyMap membership must match CompositeSigner after concurrent delete/import"
+        );
     }
 
     // --- ValidatorConfigManagerAdapter tests ---
@@ -2510,7 +2571,7 @@ mod tests {
     fn test_import_keystore_writes_import_meta_sidecar() {
         let composite = create_empty_composite_signer();
         let dir = TempDir::new().unwrap();
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone());
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
 
         let sk = SecretKey::generate();
         let pk_bytes = sk.public_key().to_bytes();
@@ -2551,7 +2612,7 @@ mod tests {
     fn test_delete_keystore_removes_import_meta_sidecar() {
         let composite = create_empty_composite_signer();
         let dir = TempDir::new().unwrap();
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone());
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
 
         let sk = SecretKey::generate();
         let pk_bytes = sk.public_key().to_bytes();
@@ -2648,7 +2709,7 @@ mod tests {
     #[test]
     fn test_list_keys_includes_boot_loaded_keystore_dir_key() {
         let (dir, composite, pk) = boot_load_keystore_dir_key();
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite);
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite);
 
         let keys = adapter.list_keys();
         assert!(
@@ -2660,7 +2721,7 @@ mod tests {
     #[test]
     fn test_has_key_true_for_boot_loaded_key() {
         let (dir, composite, pk) = boot_load_keystore_dir_key();
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite);
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite);
 
         assert!(
             adapter.has_key(&pk),
@@ -2671,7 +2732,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_boot_loaded_key_returns_ok_true_and_stops_signing() {
         let (dir, composite, pk) = boot_load_keystore_dir_key();
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone());
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
         let signing_root: eth_types::Root = [0x11; 32];
 
         assert!(composite.sign(&signing_root, &pk).await.is_ok(), "precondition: key can sign");
@@ -2699,7 +2760,7 @@ mod tests {
         // boot-loaded key with real slashing rows must yield a non-empty history
         // in the interchange (not the empty interchange used for never-known keys).
         let (dir, composite, pk) = boot_load_keystore_dir_key();
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite);
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite);
 
         let gvr_hex = "0x0000000000000000000000000000000000000000000000000000000000000000";
         let gvr_root = [0u8; 32];
@@ -2736,7 +2797,7 @@ mod tests {
     #[test]
     fn test_delete_never_known_pubkey_returns_not_found_no_side_effects() {
         let (dir, composite, boot_pk) = boot_load_keystore_dir_key();
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone());
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
 
         let unknown = test_pubkey(0xEE);
         let before_keys = adapter.list_keys();
@@ -2761,7 +2822,7 @@ mod tests {
         let composite = create_empty_composite_signer();
         composite.add_local_key(sk);
         let dir = TempDir::new().unwrap();
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone());
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
 
         assert!(adapter.has_key(&pk));
         assert!(adapter.list_keys().contains(&pk));
@@ -2799,7 +2860,7 @@ mod tests {
         std::fs::write(&file_path, keystore_json.to_string()).unwrap();
         assert!(file_path.exists());
 
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone());
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
         let signing_root: eth_types::Root = [0x22; 32];
         assert!(composite.sign(&signing_root, &pk).await.is_ok());
 
@@ -2823,8 +2884,8 @@ mod tests {
 
         let (dir, composite, pk) = boot_load_keystore_dir_key();
         let denylist = Arc::new(DeletionDenylist::load(dir.path()).unwrap());
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite)
-            .with_denylist(Arc::clone(&denylist));
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite);
+        let adapter = adapter.with_denylist(Arc::clone(&denylist));
 
         assert!(adapter.delete_keystore(&pk).unwrap());
         assert!(denylist.contains(&pk));
@@ -2863,8 +2924,8 @@ mod tests {
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(km)));
 
         let denylist = Arc::new(DeletionDenylist::load(dir.path()).unwrap());
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone())
-            .with_denylist(Arc::clone(&denylist));
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
+        let adapter = adapter.with_denylist(Arc::clone(&denylist));
 
         // DELETE via API — file gone, denylist written, signing stopped
         assert!(adapter.delete_keystore(&pk).unwrap());
@@ -2896,8 +2957,8 @@ mod tests {
         let composite = create_empty_composite_signer();
         let dir = TempDir::new().unwrap();
         let denylist = Arc::new(DeletionDenylist::load(dir.path()).unwrap());
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone())
-            .with_denylist(Arc::clone(&denylist));
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
+        let adapter = adapter.with_denylist(Arc::clone(&denylist));
 
         let sk = SecretKey::generate();
         let pk = sk.public_key().to_bytes();
@@ -2930,7 +2991,7 @@ mod tests {
     fn test_delete_without_denylist_still_stops_signing() {
         // SEC-1a preserved when denylist is not wired (unit tests / no data dir).
         let (dir, composite, pk) = boot_load_keystore_dir_key();
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone());
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
         assert!(adapter.delete_keystore(&pk).unwrap());
         assert!(!composite.has_local_key(&pk));
         assert!(!crate::deletion_denylist::deleted_keys_path(dir.path()).exists());
@@ -2944,8 +3005,8 @@ mod tests {
 
         let (dir, composite, pk) = boot_load_keystore_dir_key();
         let denylist = Arc::new(DeletionDenylist::load(dir.path()).unwrap());
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite.clone())
-            .with_denylist(Arc::clone(&denylist));
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
+        let adapter = adapter.with_denylist(Arc::clone(&denylist));
 
         assert!(adapter.delete_keystore(&pk).unwrap());
         // After success both hold: denylist has key and registry does not.
@@ -2966,8 +3027,8 @@ mod tests {
         let composite = create_empty_composite_signer();
         let dir = TempDir::new().unwrap();
         let denylist = Arc::new(DeletionDenylist::load(dir.path()).unwrap());
-        let adapter = KeystoreManagerAdapter::new(dir.path().to_path_buf(), composite)
-            .with_denylist(Arc::clone(&denylist));
+        let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite);
+        let adapter = adapter.with_denylist(Arc::clone(&denylist));
 
         let pk = test_pubkey(0xF1);
         denylist.insert(&pk).unwrap();
@@ -2993,8 +3054,8 @@ mod tests {
         use crypto::EncryptionKdf;
 
         let dir = TempDir::new().unwrap();
-        let adapter =
-            KeystoreManagerAdapter::new(dir.path().to_path_buf(), create_empty_composite_signer());
+        let (adapter, _, _) =
+            test_keystore_adapter(dir.path().to_path_buf(), create_empty_composite_signer());
 
         let sk = SecretKey::generate();
         let password = "sec5-import-password";

@@ -1591,6 +1591,11 @@ async fn run_validator(
         warn!("Attestation duties disabled at startup (--disable-attesting)");
     }
 
+    // RF1-06: single key-generation watch channel shared by keymanager adapters.
+    // RF1-07 will pass `key_gen_rx` into DutyOrchestrator so import/delete clears
+    // the duty cache without a restart. Hold the receiver until that wiring lands.
+    let (key_gen_tx, _key_gen_rx) = tokio::sync::watch::channel(0u64);
+
     // Step 7c: Optionally start Keymanager API server
     if config.keymanager_enabled {
         let token_path = config
@@ -1624,8 +1629,13 @@ async fn run_validator(
 
         let km_composite = composite_signer.clone();
         let keystore_mgr = std::sync::Arc::new(
-            KeystoreManagerAdapter::new(config.keystore_path.clone(), km_composite.clone())
-                .with_denylist(std::sync::Arc::clone(&deletion_denylist)),
+            KeystoreManagerAdapter::new(
+                config.keystore_path.clone(),
+                km_composite.clone(),
+                pubkey_map.clone(),
+                key_gen_tx.clone(),
+            )
+            .with_denylist(std::sync::Arc::clone(&deletion_denylist)),
         );
         let slashing_prot = std::sync::Arc::new(SlashingProtectionAdapter::new(
             slashing_db.clone(),
@@ -1680,6 +1690,8 @@ async fn run_validator(
         let remote_key_mgr = std::sync::Arc::new(RemoteKeyManagerAdapter::new(
             km_composite,
             config.remote_signer_allowed_hosts.clone(),
+            pubkey_map.clone(),
+            key_gen_tx,
         ));
 
         let config_mgr =

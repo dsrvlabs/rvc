@@ -566,16 +566,16 @@ compile error.
    for tests); only the pubkey_map/key_gen pair becomes required.
 
 **Acceptance criteria:**
-- [ ] `with_pubkey_map` does not exist on either adapter; `pubkey_map` and `key_gen_tx` are non-`Option`
+- [x] `with_pubkey_map` does not exist on either adapter; `pubkey_map` and `key_gen_tx` are non-`Option`
       fields set at construction.
-- [ ] `main.rs` constructs both adapters with the real `pubkey_map` and a real `key_gen_tx` sourced from a
+- [x] `main.rs` constructs both adapters with the real `pubkey_map` and a real `key_gen_tx` sourced from a
       single startup channel.
-- [ ] Importing a key through the adapter updates the shared `PubkeyMap` and increments the watch value —
+- [x] Importing a key through the adapter updates the shared `PubkeyMap` and increments the watch value —
       asserted by a unit test, unconditionally (no `if let Some`).
-- [ ] Deleting a key through the adapter removes it from the shared `PubkeyMap` and increments the watch value.
-- [ ] SEC-1a/SEC-1b behavior is unchanged: `local_public_keys`-based list/has/delete and the deletion
+- [x] Deleting a key through the adapter removes it from the shared `PubkeyMap` and increments the watch value.
+- [x] SEC-1a/SEC-1b behavior is unchanged: `local_public_keys`-based list/has/delete and the deletion
       denylist still pass their existing tests.
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **TDD test plan** (in `crates/rvc/src/keymanager_adapters.rs`'s `#[cfg(test)]` module):
 1. **RED first:** `test_import_updates_shared_pubkey_map_and_notifies` — construct the adapter with a real
