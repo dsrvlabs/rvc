@@ -601,15 +601,15 @@ loop and correct the doc.
 5. **GREEN:** boot key loading through `builder.rs:301` is unchanged.
 
 **Acceptance criteria:**
-- [ ] Exactly one directory-scan loop remains in `key_manager.rs` (the three surviving entry points
+- [x] Exactly one directory-scan loop remains in `key_manager.rs` (the three surviving entry points
       share it), with traversal check + declared-vs-derived pubkey verification + truncated logging
       applied.
-- [ ] `rg "DecryptionAttemptTracker"` returns zero hits workspace-wide, `ARCHITECTURE.md` included.
-- [ ] Named tests exist and pass on the surviving loader for all three security properties.
-- [ ] **Test-count delta stated and justified:** expected ≈ −15 (tracker module tests + in-file
+- [x] `rg "DecryptionAttemptTracker"` returns zero hits workspace-wide, `ARCHITECTURE.md` included.
+- [x] Named tests exist and pass on the surviving loader for all three security properties.
+- [x] **Test-count delta stated and justified:** expected ≈ −15 (tracker module tests + in-file
       tracker loader tests), *deleted-with-the-dead-code*, offset by up to +3 *newly added*
       security-property tests on the surviving loader.
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **Risks:**
 - If a reviewer wants rate limiting preserved rather than deleted, the plan permits folding it into

@@ -531,7 +531,7 @@ Wraps the `blst` library for BLS12-381 operations and provides key generation:
 - **BIP-39 mnemonic** — Generation (24 words, 256-bit entropy) and seed derivation with optional passphrase.
 - **EIP-2335 keystore encryption** — Scrypt and PBKDF2 KDFs, AES-128-CTR cipher, checksum verification.
 - **Signing functions** — `sign_attestation`, `sign_block`, `sign_randao_reveal`, `sign_sync_committee_message`, `sign_contribution_and_proof`, `sign_aggregate_and_proof`, `sign_selection_proof`, `sign_voluntary_exit`, `sign_builder_registration`.
-- **`Zeroize` on drop**, `SecretString` for passwords, `DecryptionAttemptTracker` for brute-force protection.
+- **`Zeroize` on drop**, `SecretString` for passwords.
 
 ### `crates/signer` — Safe Signing with Slashing Protection
 

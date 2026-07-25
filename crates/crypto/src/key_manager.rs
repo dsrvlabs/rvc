@@ -8,7 +8,6 @@ use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, info, warn};
 
 use super::bls::{PublicKey, SecretKey, PUBLIC_KEY_BYTES_LEN};
-use super::decryption_tracker::DecryptionAttemptTracker;
 use super::error::KeyManagerError;
 use super::keystore::Keystore;
 use super::logging::TruncatedPubkey;
@@ -363,123 +362,6 @@ impl KeyManager {
         Ok(Self { keys })
     }
 
-    /// Loads all keystore files from a directory with decryption attempt tracking.
-    ///
-    /// This method is similar to `load_from_directory` but accepts a mutable reference
-    /// to a `DecryptionAttemptTracker` for rate limiting and auditing failed decryption
-    /// attempts.
-    ///
-    /// The tracker will:
-    /// - Record all decryption attempts
-    /// - Log warnings for failed attempts
-    /// - Block attempts when rate limit is exceeded
-    pub fn load_from_directory_with_tracker<P: AsRef<Path>>(
-        path: P,
-        passwords: &HashMap<String, SecretString>,
-        tracker: &mut DecryptionAttemptTracker,
-    ) -> Result<Self, KeyManagerError> {
-        let dir_path = path.as_ref();
-
-        if !dir_path.exists() {
-            return Err(KeyManagerError::DirectoryNotFound(dir_path.to_path_buf()));
-        }
-
-        if !dir_path.is_dir() {
-            return Err(KeyManagerError::DirectoryNotFound(dir_path.to_path_buf()));
-        }
-
-        let mut manager = Self::new();
-        let mut found_any_keystore = false;
-
-        let entries = fs::read_dir(dir_path)?;
-
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!("Failed to read directory entry: {}", e);
-                    continue;
-                }
-            };
-
-            let file_path = entry.path();
-
-            if !file_path.is_file() {
-                continue;
-            }
-
-            let extension = file_path.extension().and_then(|ext| ext.to_str());
-            if extension != Some("json") {
-                continue;
-            }
-
-            found_any_keystore = true;
-
-            let keystore = match Keystore::from_file(&file_path) {
-                Ok(k) => k,
-                Err(e) => {
-                    warn!("Failed to load keystore from {:?}: {}", file_path, e);
-                    continue;
-                }
-            };
-
-            let pubkey_hex = match &keystore.pubkey {
-                Some(pk) => pk.clone(),
-                None => {
-                    warn!("Keystore {:?} has no public key field, skipping", file_path);
-                    continue;
-                }
-            };
-
-            // Check rate limit before attempting decryption
-            if !tracker.check_and_record(&pubkey_hex) {
-                warn!(
-                    pubkey = %pubkey_hex,
-                    file = ?file_path,
-                    "Skipping keystore due to rate limit"
-                );
-                continue;
-            }
-
-            let password = match passwords.get(&pubkey_hex).or_else(|| passwords.get(WILDCARD_KEY))
-            {
-                Some(p) => p,
-                None => {
-                    warn!(
-                        "No password found for public key {} in {:?}, skipping",
-                        pubkey_hex, file_path
-                    );
-                    continue;
-                }
-            };
-
-            // Gate 1: decryption needs the exposed password bytes (never logged).
-            #[allow(clippy::disallowed_methods)]
-            let secret_key = match keystore.decrypt(password.expose_secret().as_bytes()) {
-                Ok(sk) => sk,
-                Err(e) => {
-                    tracker.record_failure(&pubkey_hex);
-                    warn!(
-                        pubkey = %pubkey_hex,
-                        file = ?file_path,
-                        error = %e,
-                        "Failed decryption attempt for keystore"
-                    );
-                    continue;
-                }
-            };
-
-            let public_key = secret_key.public_key();
-            manager.keys.insert(public_key.to_bytes(), secret_key);
-        }
-
-        if !found_any_keystore {
-            return Err(KeyManagerError::NoKeystoreFiles);
-        }
-
-        Ok(manager)
-    }
-
     pub fn get_secret_key(&self, pubkey: &PublicKey) -> Option<&SecretKey> {
         self.keys.get(&pubkey.to_bytes())
     }
@@ -786,79 +668,7 @@ mod tests {
         assert!(signature.verify(&pubkey, message).is_ok());
     }
 
-    #[test]
-    fn test_load_with_tracker_success() {
-        use std::time::Duration;
-
-        let temp_dir = TempDir::new().unwrap();
-        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
-
-        let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), SecretString::from(test_password_string()));
-
-        let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
-
-        let manager =
-            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker)
-                .unwrap();
-
-        assert_eq!(manager.len(), 1);
-        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 1);
-    }
-
-    #[test]
-    fn test_load_with_tracker_records_failure() {
-        use std::time::Duration;
-
-        let temp_dir = TempDir::new().unwrap();
-        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
-
-        let mut passwords = HashMap::new();
-        passwords
-            .insert(TEST_PUBKEY_HEX.to_string(), SecretString::from("wrong_password".to_string()));
-
-        let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
-
-        let manager =
-            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker)
-                .unwrap();
-
-        assert!(manager.is_empty());
-        // Attempt was recorded
-        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 1);
-    }
-
-    #[test]
-    fn test_load_with_tracker_rate_limit() {
-        use std::time::Duration;
-
-        let temp_dir = TempDir::new().unwrap();
-        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
-
-        let mut passwords = HashMap::new();
-        passwords
-            .insert(TEST_PUBKEY_HEX.to_string(), SecretString::from("wrong_password".to_string()));
-
-        // Only allow 2 attempts
-        let mut tracker = DecryptionAttemptTracker::new(2, Duration::from_secs(60));
-
-        // First load - will fail decryption but record attempt
-        let _ =
-            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker);
-        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 1);
-
-        // Second load - will fail decryption but record attempt
-        let _ =
-            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker);
-        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 2);
-
-        // Third load - should be rate limited, no new attempt recorded
-        let _ =
-            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker);
-        // Still 2 because the third attempt was blocked
-        assert_eq!(tracker.attempt_count(TEST_PUBKEY_HEX), 2);
-    }
-
+    /// RF2-06 security property: surviving loader rejects declared≠derived pubkey.
     #[test]
     fn test_keystore_with_mismatched_pubkey_is_skipped() {
         // This keystore has a WRONG pubkey field - it declares a different public key
@@ -977,6 +787,7 @@ mod tests {
             file.write_all(content.as_bytes()).unwrap();
         }
 
+        /// RF2-06 security property: surviving loader rejects path-traversal (symlink outside base).
         #[test]
         fn test_symlink_outside_directory_is_skipped() {
             let keystore_dir = TempDir::new().unwrap();
@@ -1393,69 +1204,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_tracker_wildcard_password_fallback_decrypts() {
-        use std::time::Duration;
-
-        let temp_dir = TempDir::new().unwrap();
-        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
-
-        // No per-key entry; only the wildcard is present, with the correct password.
-        let mut passwords = HashMap::new();
-        passwords.insert(WILDCARD_KEY.to_string(), SecretString::from(test_password_string()));
-
-        let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
-
-        let manager =
-            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker)
-                .unwrap();
-        assert_eq!(manager.len(), 1, "wildcard password should decrypt the keystore");
-    }
-
-    #[test]
-    fn test_tracker_per_key_password_overrides_wildcard() {
-        use std::time::Duration;
-
-        let temp_dir = TempDir::new().unwrap();
-        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
-
-        // Per-key entry has the correct password; wildcard has a wrong one.
-        let mut passwords = HashMap::new();
-        passwords.insert(TEST_PUBKEY_HEX.to_string(), SecretString::from(test_password_string()));
-        passwords
-            .insert(WILDCARD_KEY.to_string(), SecretString::from("wrong_password".to_string()));
-
-        let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
-
-        let manager =
-            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker)
-                .unwrap();
-        assert_eq!(manager.len(), 1, "per-key password must override the wildcard");
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn test_tracker_no_entry_and_no_wildcard_skips_and_warns() {
-        use std::time::Duration;
-
-        let temp_dir = TempDir::new().unwrap();
-        create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
-
-        // Neither a per-key entry nor a wildcard exists.
-        let passwords = HashMap::new();
-
-        let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
-
-        let manager =
-            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker)
-                .unwrap();
-        assert!(manager.is_empty(), "keystore must be skipped when no password matches");
-        assert!(
-            logs_contain("No password found"),
-            "expected warn log when neither per-key nor wildcard password exists"
-        );
-    }
-
     /// Helper mirroring `create_generated_keystore` but with an explicit password,
     /// so multiple keystores can deliberately share (or differ in) their password.
     /// Returns the keystore's pubkey hex.
@@ -1538,23 +1286,29 @@ mod tests {
         assert!(manager.is_empty(), "wrong wildcard password must not silently succeed");
     }
 
+    /// RF2-06 security property: surviving loader logs truncated pubkeys, never the full hex.
     #[test]
-    fn test_tracker_wrong_wildcard_no_per_key_skips() {
-        use std::time::Duration;
-
+    #[tracing_test::traced_test]
+    fn test_loader_logs_truncated_pubkey_not_full() {
         let temp_dir = TempDir::new().unwrap();
         create_test_keystore_file(&temp_dir, "validator1.json", TEST_KEYSTORE_PBKDF2);
 
-        // Only a wildcard entry, with the WRONG password, and no per-key entry.
         let mut passwords = HashMap::new();
         passwords
-            .insert(WILDCARD_KEY.to_string(), SecretString::from("wrong_password".to_string()));
+            .insert(TEST_PUBKEY_HEX.to_string(), SecretString::from("wrong_password".to_string()));
 
-        let mut tracker = DecryptionAttemptTracker::new(5, Duration::from_secs(60));
+        let manager = KeyManager::load_from_directory(temp_dir.path(), &passwords).unwrap();
+        assert!(manager.is_empty());
 
-        let manager =
-            KeyManager::load_from_directory_with_tracker(temp_dir.path(), &passwords, &mut tracker)
-                .unwrap();
-        assert!(manager.is_empty(), "wrong wildcard password must not silently succeed");
+        let truncated = TruncatedPubkey::new(TEST_PUBKEY_HEX).to_string();
+        assert!(
+            logs_contain(&truncated),
+            "decrypt-failure log must include truncated pubkey {truncated}"
+        );
+        assert!(
+            !logs_contain(TEST_PUBKEY_HEX),
+            "decrypt-failure log must not include full pubkey hex"
+        );
+        assert!(logs_contain("Failed to decrypt keystore"));
     }
 }

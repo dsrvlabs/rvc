@@ -5,7 +5,6 @@ mod block_signing;
 mod bls;
 mod builder_signing;
 mod composite_signer;
-mod decryption_tracker;
 pub mod eip2333;
 mod error;
 pub mod hex;
@@ -32,7 +31,6 @@ pub use bls::{
 };
 pub use builder_signing::sign_builder_registration;
 pub use composite_signer::CompositeSigner;
-pub use decryption_tracker::DecryptionAttemptTracker;
 pub use error::{BlsError, KeyManagerError, KeystoreError};
 pub use eth_types::{DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
 pub use hex::{strip_prefix_strict, HexError};
