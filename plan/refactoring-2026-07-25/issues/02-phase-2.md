@@ -1168,13 +1168,13 @@ calls this on startup for every monitored validator.
 5. **GREEN.**
 
 **Acceptance criteria:**
-- [ ] `SlashingError` has exactly one migration-failure variant, `MigrationFailed`.
-- [ ] `SlashingDbReader::last_signed_attestation` issues one `MAX` query and fetches no rows —
+- [x] `SlashingError` has exactly one migration-failure variant, `MigrationFailed`.
+- [x] `SlashingDbReader::last_signed_attestation` issues one `MAX` query and fetches no rows —
       verifiable by reading the diff.
-- [ ] The pinned-GVR fail-closed gate is unchanged (diff shows no edit above `reader.rs:79`).
-- [ ] Named tests: equivalent result on multi-row history; `None` on DB error.
-- [ ] **Test-count delta stated and justified:** expected ≈ 0, plus +2 *newly added* reader tests.
-- [ ] Standing invariant green.
+- [x] The pinned-GVR fail-closed gate is unchanged (diff shows no edit above `reader.rs:79`).
+- [x] Named tests: equivalent result on multi-row history; `None` on DB error.
+- [x] **Test-count delta stated and justified:** expected ≈ 0, plus +2 *newly added* reader tests.
+- [x] Standing invariant green.
 
 **Risks:** none identified. The GVR gate is the only sensitive part and it is explicitly untouched.
 

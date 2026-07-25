@@ -450,7 +450,7 @@ fn gate_err_to_status(e: SigningGateError) -> Status {
             SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => {
                 Status::failed_precondition(format!("slashing protection violation: {inner}"))
             }
-            // All other DB errors (DatabaseError, MigrationError, etc.) may contain
+            // All other DB errors (DatabaseError, MigrationFailed, etc.) may contain
             // rusqlite internals or file paths — log server-side, return generic.
             other => {
                 tracing::error!(error = %other, "slashing DB error during staging");

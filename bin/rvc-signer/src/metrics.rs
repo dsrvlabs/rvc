@@ -513,13 +513,13 @@ mod tests {
         );
         assert_eq!(
             classify_gate_error(&SigningGateError::BlockedBySlashingDb(
-                SlashingError::MigrationError("io".into())
+                SlashingError::MigrationFailed("io".into())
             )),
             "slashing_db_error"
         );
         assert_eq!(
             classify_gate_error(&SigningGateError::SlashingDbCommitFailed(
-                SlashingError::MigrationError("io".into())
+                SlashingError::MigrationFailed("io".into())
             )),
             "internal"
         );

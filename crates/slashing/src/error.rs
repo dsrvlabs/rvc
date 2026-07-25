@@ -10,9 +10,6 @@ pub enum SlashingError {
     #[error("database error: {0}")]
     DatabaseError(#[from] rusqlite::Error),
 
-    #[error("migration error: {0}")]
-    MigrationError(String),
-
     #[error("schema migration failed: {0}")]
     MigrationFailed(String),
 

@@ -263,7 +263,7 @@ mod tests {
     fn generic_db_error_is_412_without_leaking_internals() {
         let secret = "/var/lib/rvc/slashing.db lock contention";
         let err = HttpSignError::Gate(SigningGateError::BlockedBySlashingDb(
-            SlashingError::MigrationError(secret.to_string()),
+            SlashingError::MigrationFailed(secret.to_string()),
         ));
         let (status, body) = err.status_and_body();
         assert_eq!(status, StatusCode::PRECONDITION_FAILED);
@@ -275,7 +275,7 @@ mod tests {
     fn commit_failed_is_500_generic() {
         let secret = "/var/lib/rvc/slashing.db disk full";
         let (status, body) = HttpSignError::Gate(SigningGateError::SlashingDbCommitFailed(
-            SlashingError::MigrationError(secret.to_string()),
+            SlashingError::MigrationFailed(secret.to_string()),
         ))
         .status_and_body();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);

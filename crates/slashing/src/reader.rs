@@ -77,15 +77,75 @@ impl SlashingDbReader for SlashingDb {
             }
         }
 
-        match self.get_attestations(pubkey) {
-            Ok(v) => v.into_iter().map(|a| a.target_epoch).max(),
+        // Delegate to the SQL MAX query — do not materialise every attestation row.
+        match self.last_signed_attestation_epoch(pubkey) {
+            Ok(v) => v,
             Err(e) => {
                 tracing::error!(
                     error = %e,
-                    "SlashingDbReader: get_attestations failed; returning None (fail-closed)"
+                    "SlashingDbReader: last_signed_attestation_epoch failed; returning None (fail-closed)"
                 );
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SlashingDb;
+
+    const PUBKEY: &str =
+        "0xaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd";
+    const GVR: Root = [7u8; 32];
+
+    fn open_db_with_gvr() -> (SlashingDb, Root) {
+        let db = SlashingDb::open_in_memory().expect("open_in_memory");
+        let hex = format!("0x{}", hex::encode(GVR));
+        db.set_genesis_validators_root(&hex).expect("set_genesis_validators_root");
+        (db, GVR)
+    }
+
+    /// Multi-row history: reader answer must match `last_signed_attestation_epoch` (SQL MAX).
+    #[test]
+    fn last_signed_attestation_matches_sql_max_on_multi_row() {
+        let (db, gvr) = open_db_with_gvr();
+
+        db.stage_attestation(PUBKEY, 1, 3, None, &gvr)
+            .expect("stage 1")
+            .commit()
+            .expect("commit 1");
+        db.stage_attestation(PUBKEY, 3, 7, None, &gvr)
+            .expect("stage 2")
+            .commit()
+            .expect("commit 2");
+        db.stage_attestation(PUBKEY, 7, 12, None, &gvr)
+            .expect("stage 3")
+            .commit()
+            .expect("commit 3");
+
+        let via_reader = db.last_signed_attestation(PUBKEY, &gvr);
+        let via_sql = db.last_signed_attestation_epoch(PUBKEY).expect("sql max");
+        assert_eq!(via_reader, Some(12));
+        assert_eq!(via_reader, via_sql, "reader must delegate to SQL MAX result");
+    }
+
+    /// DB error after the GVR gate must fail closed (`None`), not panic or leak.
+    #[test]
+    fn last_signed_attestation_db_error_returns_none() {
+        let (db, gvr) = open_db_with_gvr();
+
+        // Destroy the table so the MAX query returns an error.
+        {
+            let conn = db.conn.lock();
+            conn.execute_batch("DROP TABLE attestations").expect("drop table");
+        }
+
+        assert_eq!(
+            db.last_signed_attestation(PUBKEY, &gvr),
+            None,
+            "query failure must yield None (fail-closed)"
+        );
     }
 }
