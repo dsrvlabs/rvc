@@ -1,11 +1,9 @@
 //! Service builder for constructing all services from configuration.
 
 #![allow(clippy::arc_with_non_send_sync)]
-#![allow(clippy::type_complexity)]
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,17 +11,13 @@ use tracing::{error, info, warn};
 
 use crypto::logging::RedactedUrl;
 
-use crate::beacon_adapter::BeaconBlockAdapter;
-use crate::doppelganger_adapter::{BeaconLivenessAdapter, SlashingDbReaderAdapter};
-use crate::orchestrator::{
-    DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorHandle, PubkeyMap,
-};
+use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
 use beacon::{BeaconClient, BeaconClientConfig};
 use bn_manager::{BeaconNodeClient, BnManager, BnManagerConfig};
-use builder::{BuilderService, CircuitBreakerState};
-use crypto::{CompositeSigner, KeyManager, LocalSigner};
+use builder::BuilderService;
+use crypto::{CompositeSigner, KeyManager};
 use doppelganger::{
-    DoppelgangerDisabledByOperator, DoppelgangerService, ForwardWindowMachine, SigningEnablement,
+    DoppelgangerDisabledByOperator, ForwardWindowMachine, SigningEnablement,
     DEFAULT_MONITORING_EPOCHS,
 };
 use duty_tracker::DutyTracker;
@@ -31,7 +25,7 @@ use eth_types::{Epoch, ForkSchedule, Root};
 use propagator::{AttestationSubmitter, Propagator};
 use signer::SignerService;
 use slashing::SlashingDb;
-use timing::{SlotClock, SystemSlotClock};
+use timing::SystemSlotClock;
 use validator_store::ValidatorStore;
 
 use secret_provider::SecretProvider;
@@ -123,28 +117,6 @@ fn remove_accidental_fresh_db(path: &std::path::Path) {
             );
         }
     }
-}
-
-/// Contains all the built services ready for use.
-pub struct BuiltServices<C, S>
-where
-    C: SlotClock + 'static,
-    S: AttestationSubmitter + 'static,
-{
-    pub beacon: Arc<dyn BeaconNodeClient>,
-    pub beacon_client: Arc<BeaconClient>,
-    pub composite_signer: Arc<CompositeSigner>,
-    pub slashing_db: Arc<SlashingDb>,
-    pub signer: Arc<SignerService>,
-    pub propagator: Arc<Propagator<S>>,
-    pub duty_tracker: Arc<DutyTracker>,
-    pub slot_clock: Arc<C>,
-    pub validator_store: Arc<ValidatorStore>,
-    pub pubkey_map: PubkeyMap,
-    pub genesis_validators_root: Root,
-    pub fork_schedule: Arc<ForkSchedule>,
-    pub doppelganger_service: Option<DoppelgangerService>,
-    pub builder_service: Option<Arc<BuilderService>>,
 }
 
 /// Builder for constructing services from configuration.
@@ -262,28 +234,6 @@ impl ServiceBuilder {
             endpoints.len()
         );
         Ok(Some(Arc::new(manager)))
-    }
-
-    /// Build the legacy one-shot [`DoppelgangerService`] (tests / non-production).
-    ///
-    /// SEC-2c: production `bin/rvc` no longer wires this service; the forward-window
-    /// liveness loop drives [`ForwardWindowMachine`] instead. Kept for unit tests
-    /// and `build_all` scaffolding.
-    pub fn build_doppelganger_service(
-        &self,
-        beacon: Arc<dyn BeaconNodeClient>,
-        slashing_db: Arc<SlashingDb>,
-    ) -> Result<DoppelgangerService, ConfigError> {
-        // M-7 (ISSUE-3.6 review): propagate the genesis_time error rather than
-        // silently defaulting to 0.  A genesis_time of 0 would compute
-        // current_epoch ≈ now_unix / 384 (meaninglessly large) and silently
-        // disable doppelganger monitoring for misconfigured custom networks.
-        let genesis_time = self.config.effective_genesis_time()?;
-        let liveness_checker = Arc::new(BeaconLivenessAdapter::new(beacon));
-        let slashing_reader = Arc::new(SlashingDbReaderAdapter::new(slashing_db));
-        let service = DoppelgangerService::new(liveness_checker, slashing_reader, genesis_time);
-        info!(genesis_time, "Created legacy one-shot doppelganger service (non-production)");
-        Ok(service)
     }
 
     pub fn build_key_manager(&self) -> Result<Arc<KeyManager>, ConfigError> {
@@ -694,145 +644,14 @@ impl ServiceBuilder {
         OrchestratorConfig::new(genesis_validators_root, fork_schedule)
             .with_shutdown_timeout(Duration::from_secs(30))
     }
-
-    /// Builds all services and returns them along with the orchestrator handle.
-    ///
-    /// The `validator_indices` parameter should contain numeric validator indices
-    /// resolved from the beacon node. Callers should use `BeaconClient::get_validators`
-    /// to resolve public keys to indices before calling this method.
-    ///
-    /// The `fork_schedule` must be fetched from the beacon node before calling
-    /// this method via `build_fork_schedule()`.
-    pub fn build_all(
-        self,
-        validator_indices: Vec<String>,
-        fork_schedule: Arc<ForkSchedule>,
-    ) -> Result<
-        (
-            BuiltServices<SystemSlotClock, BeaconClient>,
-            impl FnOnce(
-                BuiltServices<SystemSlotClock, BeaconClient>,
-            ) -> (
-                DutyOrchestrator<SystemSlotClock, BeaconClient, BeaconBlockAdapter>,
-                OrchestratorHandle,
-            ),
-        ),
-        ConfigError,
-    > {
-        self.log_effective_config();
-
-        let beacon_client = self.build_beacon()?;
-        let key_manager = self.build_key_manager()?;
-        let slashing_db = self.build_slashing_db()?;
-        let pubkey_map = self.build_pubkey_map(&key_manager);
-        let key_manager_owned = Arc::try_unwrap(key_manager).map_err(|_| {
-            ConfigError::MissingField(
-                "cannot take ownership of key_manager: outstanding Arc references".to_string(),
-            )
-        })?;
-        let composite_signer = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager_owned)));
-
-        let genesis_validators_root = self.parse_genesis_validators_root()?;
-        info!(
-            genesis_validators_root = %format!("0x{}", hex::encode(genesis_validators_root)),
-            "Parsed genesis validators root"
-        );
-
-        // SEC-2b: wire ForwardWindowMachine (or operator opt-out) as enablement.
-        // Use a non-zero epoch so build_all does not accidentally apply the
-        // epoch-0 Safe bypass (not for production daemon — bin/rvc supplies
-        // the real monotonic epoch).
-        let (enablement, _machine) = self.build_signing_enablement(
-            slashing_db.clone(),
-            genesis_validators_root,
-            1,
-            &pubkey_map,
-        );
-        let signer = self.build_signer(composite_signer.clone(), slashing_db.clone(), enablement);
-        let propagator = self.build_propagator(beacon_client.clone());
-        let slot_clock = self.build_slot_clock()?;
-        let validator_store =
-            self.build_validator_store(self.config.validators_config.as_deref())?;
-
-        // D-3 (Issue 2.11): with the fail-closed `is_signing_enabled` default,
-        // register every keystore-loaded validator in the store so the
-        // per-validator signing gate permits the keys the VC actually loaded.
-        self.register_loaded_validators(&validator_store, &pubkey_map);
-
-        let beacon: Arc<dyn BeaconNodeClient> = beacon_client.clone();
-        let duty_tracker = self.build_duty_tracker(beacon.clone(), validator_indices);
-
-        let doppelganger_service = if self.config.doppelganger_detection {
-            Some(self.build_doppelganger_service(beacon_client.clone(), slashing_db.clone())?)
-        } else {
-            None
-        };
-
-        let genesis_fork_version = fork_schedule.genesis_fork_version;
-        let builder_service = Some(self.build_builder_service(
-            signer.clone(),
-            beacon.clone(),
-            validator_store.clone(),
-            genesis_fork_version,
-        ));
-
-        let services = BuiltServices {
-            beacon,
-            beacon_client,
-            composite_signer,
-            slashing_db,
-            signer,
-            propagator,
-            duty_tracker,
-            slot_clock,
-            validator_store,
-            pubkey_map,
-            genesis_validators_root,
-            fork_schedule,
-            doppelganger_service,
-            builder_service,
-        };
-
-        let orchestrator_factory = move |services: BuiltServices<SystemSlotClock, BeaconClient>| {
-            let config = OrchestratorConfig::new(
-                services.genesis_validators_root,
-                services.fork_schedule.clone(),
-            )
-            .with_shutdown_timeout(Duration::from_secs(30));
-
-            let block_beacon = Arc::new(BeaconBlockAdapter(services.beacon_client.clone()));
-
-            // Scaffolding path only — no in-tree production caller of build_all.
-            // Daemon wiring is in bin/rvc (real key_gen channel shared with adapters).
-            // Fabricate a channel here rather than OrchestratorDeps::for_test so the
-            // factory never looks like a silent test shortcut for production.
-            let (_key_gen_tx, key_gen_rx) = tokio::sync::watch::channel(0u64);
-            DutyOrchestrator::new(OrchestratorDeps {
-                clock: services.slot_clock,
-                duty_tracker: services.duty_tracker,
-                signer: services.signer,
-                propagator: services.propagator,
-                beacon: services.beacon,
-                block_beacon,
-                builder_service: services.builder_service,
-                validator_store: services.validator_store,
-                config,
-                pubkey_map: services.pubkey_map,
-                key_gen_rx,
-                circuit_breaker: Arc::new(CircuitBreakerState::new(0, 0)),
-                attesting_enabled: Arc::new(AtomicBool::new(true)),
-            })
-        };
-
-        Ok((services, orchestrator_factory))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crypto::Signer as _;
+    use crypto::{LocalSigner, Signer as _};
     use tempfile::TempDir;
+    use timing::SlotClock;
 
     fn create_minimal_config() -> Config {
         Config {
@@ -1171,15 +990,6 @@ mod tests {
         let builder = ServiceBuilder::new(config);
         let result = builder.build_bn_manager();
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_build_doppelganger_service() {
-        let config = create_minimal_config();
-        let builder = ServiceBuilder::new(config);
-        let beacon = builder.build_beacon().unwrap();
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let _service = builder.build_doppelganger_service(beacon, slashing_db).unwrap();
     }
 
     #[tokio::test]

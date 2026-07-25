@@ -5,7 +5,7 @@ mod error;
 mod network;
 mod types;
 
-pub use builder::{BuiltServices, ServiceBuilder};
+pub use builder::ServiceBuilder;
 pub use error::ConfigError;
 pub use network::Network;
 pub use types::{redact_url, CliOverrides, Config, GcpSecretConfig, SecretProviderConfig};

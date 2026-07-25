@@ -367,16 +367,16 @@ are E8c's business in Phase 4, gated on SEC-2. This issue removes only the *buil
    untouched and still green.
 
 **Acceptance criteria:**
-- [ ] `crates/rvc/src/config/builder.rs` contains no `build_all`, `BuiltServices`,
+- [x] `crates/rvc/src/config/builder.rs` contains no `build_all`, `BuiltServices`,
       `orchestrator_factory` or `build_doppelganger_service`.
-- [ ] `crates/rvc/src/config/mod.rs` no longer re-exports `BuiltServices`.
-- [ ] Every remaining `build_*` method retains its unit test; the count of `build_*` methods is
+- [x] `crates/rvc/src/config/mod.rs` no longer re-exports `BuiltServices`.
+- [x] Every remaining `build_*` method retains its unit test; the count of `build_*` methods is
       unchanged minus one.
-- [ ] `crates/doppelganger` and `crates/rvc/src/startup.rs` are not modified.
-- [ ] **Test-count delta stated and justified:** expected exactly **−1** test
+- [x] `crates/doppelganger` and `crates/rvc/src/startup.rs` are not modified.
+- [x] **Test-count delta stated and justified:** expected exactly **−1** test
       (`test_build_doppelganger_service`), classified *deleted-with-the-dead-code*. Any other delta
       is a bug in the PR.
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **Risks:**
 - `run_doppelganger_detection` becomes production-unreachable once its only builder-side constructor
