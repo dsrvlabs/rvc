@@ -23,21 +23,21 @@
   (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo nextest run --workspace`).
 - **Exit criteria (phase gate):**
-  - [ ] `crates/slashing/src/stage.rs` block-slot and attestation-target watermark comparisons use
+  - [x] `crates/slashing/src/stage.rs` block-slot and attestation-target watermark comparisons use
         `<=`; stage-path watermark-equality tests prove equality is blocked.
-  - [ ] The EIP-3076 conformance suite is green **on the stage path** (`stage_* → commit()/discard()`),
+  - [x] The EIP-3076 conformance suite is green **on the stage path** (`stage_* → commit()/discard()`),
         and the property tests drive the same path.
-  - [ ] A pipeline double-vote test rejects the second of two conflicting `process_slot` calls; the
+  - [x] A pipeline double-vote test rejects the second of two conflicting `process_slot` calls; the
         slashing-DB-error path is asserted fail-closed unconditionally.
-  - [ ] `KeystoreManagerAdapter` / `RemoteKeyManagerAdapter` cannot be constructed without the
+  - [x] `KeystoreManagerAdapter` / `RemoteKeyManagerAdapter` cannot be constructed without the
         `PubkeyMap` + `key_gen_tx` pair; `DutyOrchestrator` has exactly one constructor; an
         integration test proves an API-imported key clears the duty cache, and a doppelganger gate
         test proves it produces no attestations until its window clears.
-  - [ ] No `unsafe` in `crates/builder`; workspace `unsafe_code` lint active with an explicit allow-list.
-  - [ ] `--password-dir` is gone from CLI, config, and docs; a missing password source is a startup error.
-  - [ ] All 10 rvc-signer gRPC v2 sign handlers record sign metrics through one shared helper; a scrape
+  - [x] No `unsafe` in `crates/builder`; workspace `unsafe_code` lint active with an explicit allow-list.
+  - [x] `--password-dir` is gone from CLI, config, and docs; a missing password source is a startup error.
+  - [x] All 10 rvc-signer gRPC v2 sign handlers record sign metrics through one shared helper; a scrape
         test asserts non-zero series after a sign.
-  - [ ] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  - [x] `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
         `cargo nextest run --workspace`, and `crates/architecture-tests` green.
 
 ## Assumptions (verified against HEAD `a7f8cdf`)
