@@ -1,9 +1,10 @@
 //! Response-size caps for BN-facing HTTP requests (A9 / H-12).
 //!
-//! `ResponseCaps` holds configurable ceilings for JSON body and SSE event
-//! sizes.  `read_body_capped` streams the response body in chunks, counting
-//! bytes, and returns `BeaconError::BodyTooLarge` before allocating more than
-//! the configured cap.
+//! `ResponseCaps` holds the configurable ceiling for JSON body sizes.
+//! SSE event size is capped in `bn-manager::sse::DEFAULT_MAX_SSE_EVENT_BYTES`
+//! (single source of truth). `read_body_capped` streams the response body in
+//! chunks, counting bytes, and returns `BeaconError::BodyTooLarge` before
+//! allocating more than the configured cap.
 
 use bytes::Bytes;
 
@@ -14,23 +15,16 @@ use crate::BeaconError;
 pub struct ResponseCaps {
     /// Maximum bytes allowed in a JSON response body (default 32 MiB).
     pub max_body_bytes: usize,
-    /// Maximum bytes allowed in a single SSE event (default 64 KiB).
-    pub max_sse_event_bytes: usize,
 }
 
 impl ResponseCaps {
     /// Default maximum JSON response body (32 MiB).
     pub const DEFAULT_MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
-    /// Default maximum SSE event payload (64 KiB).
-    pub const DEFAULT_MAX_SSE_EVENT_BYTES: usize = 64 * 1024;
 }
 
 impl Default for ResponseCaps {
     fn default() -> Self {
-        Self {
-            max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES,
-            max_sse_event_bytes: Self::DEFAULT_MAX_SSE_EVENT_BYTES,
-        }
+        Self { max_body_bytes: Self::DEFAULT_MAX_BODY_BYTES }
     }
 }
 
@@ -97,7 +91,6 @@ mod tests {
     fn test_default_caps_values() {
         let caps = ResponseCaps::default();
         assert_eq!(caps.max_body_bytes, 32 * 1024 * 1024);
-        assert_eq!(caps.max_sse_event_bytes, 64 * 1024);
     }
 
     #[test]
@@ -109,9 +102,8 @@ mod tests {
 
     #[test]
     fn test_response_caps_debug() {
-        let caps = ResponseCaps { max_body_bytes: 1024, max_sse_event_bytes: 512 };
+        let caps = ResponseCaps { max_body_bytes: 1024 };
         let s = format!("{caps:?}");
         assert!(s.contains("1024"));
-        assert!(s.contains("512"));
     }
 }

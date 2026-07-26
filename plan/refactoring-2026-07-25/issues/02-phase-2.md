@@ -541,16 +541,16 @@ advertising a control that does not exist.
 5. **GREEN:** failover behaviour unchanged — the existing manager strategy tests are the oracle.
 
 **Acceptance criteria:**
-- [ ] `rg "BnSelectionStrategy|selection_strategy"` returns zero hits workspace-wide.
-- [ ] `BnManager`'s doc comment states the per-operation selection policy explicitly.
-- [ ] `head_slot` is either populated (tests asserting `Some` now pass against real data) or removed
+- [x] `rg "BnSelectionStrategy|selection_strategy"` returns zero hits workspace-wide.
+- [x] `BnManager`'s doc comment states the per-operation selection policy explicitly.
+- [x] `head_slot` is either populated (tests asserting `Some` now pass against real data) or removed
       along with those assertions — one branch, stated in the PR.
-- [ ] Exactly one 64 KiB SSE-event-size constant exists workspace-wide.
-- [ ] `BnOutcome.latency` carries no `#[allow(dead_code)]`.
-- [ ] **Test-count delta stated and justified:** expected ≈ −5 to −7 (the `test_selection_strategy_*`
+- [x] Exactly one 64 KiB SSE-event-size constant exists workspace-wide.
+- [x] `BnOutcome.latency` carries no `#[allow(dead_code)]`.
+- [x] **Test-count delta stated and justified:** expected ≈ −5 to −7 (the `test_selection_strategy_*`
       cluster plus config-field assertions), *deleted-with-the-dead-code*; +0 to +2 if the `head_slot`
       population branch needs a new test.
-- [ ] Standing invariant green; bn-manager failover/strategy tests unchanged and green.
+- [x] Standing invariant green; bn-manager failover/strategy tests unchanged and green.
 
 **Risks:**
 - `BnSelectionStrategy` is in the public API (`lib.rs:20`). No external consumer exists in-workspace,

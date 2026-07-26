@@ -195,15 +195,6 @@ impl Default for OperationTimeouts {
     }
 }
 
-/// Strategy for selecting a beacon node when multiple are configured.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BnSelectionStrategy {
-    /// Use the first healthy BN; fail over to the next on error.
-    First,
-    /// Query all BNs in parallel and pick the best result.
-    Best,
-}
-
 /// Controls which message types are broadcast to all BNs vs sent to the first healthy BN.
 ///
 /// When a topic is `true`, the corresponding submission is broadcast to all BNs.
@@ -224,12 +215,14 @@ impl Default for BroadcastTopics {
 }
 
 /// Configuration for the beacon node manager.
+///
+/// BN selection is not configurable: strategy is fixed per operation on
+/// [`crate::BnManager`] (query-first for reads, broadcast for submissions,
+/// best-of for block production). See that type's docs.
 #[derive(Debug, Clone)]
 pub struct BnManagerConfig {
     /// Beacon node endpoint URLs.
     pub endpoints: Vec<String>,
-    /// Default selection strategy for query operations.
-    pub selection_strategy: BnSelectionStrategy,
     /// Per-BN request timeout.
     pub timeout: Duration,
     /// Which submission types are broadcast to all BNs.
@@ -250,7 +243,6 @@ impl BnManagerConfig {
         let count = endpoints.len();
         Self {
             endpoints,
-            selection_strategy: BnSelectionStrategy::First,
             timeout: Duration::from_secs(30),
             broadcast_topics: BroadcastTopics::default(),
             roles: vec![
@@ -317,39 +309,6 @@ mod tests {
         fn _assert_arc_dyn(_: Arc<dyn BeaconNodeClient>) {}
     }
 
-    // -- BnSelectionStrategy --
-
-    #[test]
-    fn test_selection_strategy_first() {
-        let strategy = BnSelectionStrategy::First;
-        assert_eq!(strategy, BnSelectionStrategy::First);
-    }
-
-    #[test]
-    fn test_selection_strategy_best() {
-        let strategy = BnSelectionStrategy::Best;
-        assert_eq!(strategy, BnSelectionStrategy::Best);
-    }
-
-    #[test]
-    fn test_selection_strategy_ne() {
-        assert_ne!(BnSelectionStrategy::First, BnSelectionStrategy::Best);
-    }
-
-    #[test]
-    fn test_selection_strategy_clone() {
-        let strategy = BnSelectionStrategy::Best;
-        let cloned = strategy;
-        assert_eq!(cloned, BnSelectionStrategy::Best);
-    }
-
-    #[test]
-    fn test_selection_strategy_debug() {
-        let strategy = BnSelectionStrategy::First;
-        let debug = format!("{:?}", strategy);
-        assert!(debug.contains("First"));
-    }
-
     // -- BnManagerConfig --
 
     #[test]
@@ -357,7 +316,6 @@ mod tests {
         let config = BnManagerConfig::new(vec!["http://localhost:5052".to_string()]);
         assert_eq!(config.endpoints.len(), 1);
         assert_eq!(config.endpoints[0], "http://localhost:5052");
-        assert_eq!(config.selection_strategy, BnSelectionStrategy::First);
         assert_eq!(config.timeout, Duration::from_secs(30));
     }
 
@@ -382,7 +340,6 @@ mod tests {
         let config = BnManagerConfig::new(vec!["http://localhost:5052".to_string()]);
         let cloned = config.clone();
         assert_eq!(cloned.endpoints, config.endpoints);
-        assert_eq!(cloned.selection_strategy, config.selection_strategy);
         assert_eq!(cloned.timeout, config.timeout);
     }
 

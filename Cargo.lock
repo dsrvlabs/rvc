@@ -4575,12 +4575,8 @@ dependencies = [
 name = "rvc-sync-service"
 version = "0.6.0"
 dependencies = [
- "async-trait",
- "rvc-eth-types",
  "sha2",
  "thiserror 2.0.18",
- "tokio",
- "tracing",
 ]
 
 [[package]]

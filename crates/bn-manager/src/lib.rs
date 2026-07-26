@@ -17,8 +17,7 @@ pub use sse::{
 };
 pub use sync_status::{BnSyncDetail, BnSyncStatus, SharedSyncStatuses};
 pub use traits::{
-    BeaconNodeClient, BnHealthScore, BnManagerConfig, BnSelectionStrategy, BroadcastTopics,
-    OperationTimeouts,
+    BeaconNodeClient, BnHealthScore, BnManagerConfig, BroadcastTopics, OperationTimeouts,
 };
 pub use types::{BnRole, HealthTier, TierThresholds};
 

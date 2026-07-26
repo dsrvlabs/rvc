@@ -41,12 +41,18 @@ type IndexedTimedResultFut<'a, T> =
 /// Default sync check interval: once per epoch (~384 seconds).
 const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 
-/// Beacon node manager with multi-BN support, strategy-based selection, and broadcast.
+/// Beacon node manager with multi-BN support, failover, and broadcast.
 ///
-/// Supports three operation modes:
-/// - **First**: Try synced BNs in order, fail over on error (used for duty fetching, attestation data)
-/// - **Best**: Query synced BNs in parallel, pick best result (used for block production)
-/// - **Broadcast**: Send to all BNs regardless of sync status, return first success (used for all submissions)
+/// # Per-operation selection policy
+///
+/// Selection is hard-coded per endpoint method (not a config knob):
+/// - **Query-first**: try healthy BNs in health-score order, fail over on error —
+///   duty fetches, attestation/aggregate data, genesis/config, sync status reads.
+/// - **Best-of**: query healthy BNs in parallel and pick the highest-value result —
+///   block production (`produce_block_v3`).
+/// - **Broadcast**: send to all BNs (subject to `BroadcastTopics`), succeed if any
+///   succeeds — attestations, blocks, sync committee messages, subscriptions,
+///   preparations, validator registrations.
 ///
 /// Tracks per-BN sync status and skips unsynced BNs for query operations.
 /// In single-BN mode, logs warnings but continues with the only available BN.
@@ -191,7 +197,7 @@ impl BnManager {
                     is_reachable: !matches!(detail.status, BnSyncStatus::Unreachable),
                     is_synced: matches!(detail.status, BnSyncStatus::Synced),
                     is_el_offline: matches!(detail.status, BnSyncStatus::ElOffline),
-                    head_slot: None,
+                    head_slot: detail.head_slot,
                     latency: t.latency_ema_ms().map(|ms| Duration::from_secs_f64(ms / 1000.0)),
                     latency_ms: t.latency_ema_ms().unwrap_or(0.0),
                     error_rate: t.error_rate(),
@@ -751,11 +757,18 @@ impl BnManager {
             // leak `user:pass@` credentials from the configured BN URLs.
             let failed_endpoints: Vec<String> =
                 broadcast.failures().into_iter().map(|(e, _)| RedactedUrl(e).to_string()).collect();
+            let failed_latency_ms: Vec<u64> = broadcast
+                .outcomes
+                .iter()
+                .filter(|o| o.result.is_err())
+                .map(|o| o.latency.as_millis() as u64)
+                .collect();
             warn!(
                 op = op_name,
                 successes = ok,
                 failures = fail,
                 failed_endpoints = ?failed_endpoints,
+                failed_latency_ms = ?failed_latency_ms,
                 "partial broadcast failure"
             );
         }
@@ -3283,6 +3296,7 @@ mod tests {
             statuses[0] = BnSyncDetail {
                 status: BnSyncStatus::Synced,
                 sync_distance: Some(0),
+                head_slot: Some(1000),
                 is_optimistic: false,
                 el_offline: false,
             };
@@ -3292,6 +3306,7 @@ mod tests {
         assert_eq!(scores.len(), 1);
         assert!(scores[0].is_reachable);
         assert!(scores[0].is_synced);
+        assert_eq!(scores[0].head_slot, Some(1000));
     }
 
     #[tokio::test]
@@ -3312,6 +3327,7 @@ mod tests {
             statuses[0] = BnSyncDetail {
                 status: BnSyncStatus::Syncing,
                 sync_distance: Some(100),
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             };
@@ -3340,6 +3356,7 @@ mod tests {
             statuses[0] = BnSyncDetail {
                 status: BnSyncStatus::Unreachable,
                 sync_distance: None,
+                head_slot: None,
                 is_optimistic: false,
                 el_offline: false,
             };
