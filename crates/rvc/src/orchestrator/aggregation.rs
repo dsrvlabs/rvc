@@ -467,22 +467,14 @@ mod tests {
         Arc,
     };
 
-    use async_trait::async_trait;
     use beacon::{
-        AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-        BlockRootData, BlockRootResponse, ConfigSpecResponse, DataResponse, DependentRootResponse,
-        GenesisResponse, ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
-        SignedContributionAndProof as BeaconSignedContributionAndProof, StateForkResponse,
-        SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-        SyncCommitteeMessage as BeaconSyncCommitteeMessage, SyncingResponse,
-        ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-        VersionedAttestation, VersionedSignedAggregateAndProof,
+        BlockRootData, DataResponse, DependentRootResponse, VersionedAggregateAttestation,
     };
+    use bn_manager::MockBeaconNodeClient;
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
     use duty_tracker::DutyTracker;
     use eth_types::{
         Attestation as EthAttestation, AttestationData, Checkpoint, ForkName, ForkSchedule,
-        SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
     };
     use signer::{always_enabled, SignerService};
     use slashing::SlashingDb;
@@ -514,218 +506,76 @@ mod tests {
         OrchestratorConfig::new([0u8; 32], create_test_fork_schedule())
     }
 
-    /// A minimal beacon mock that records submit_aggregate_and_proofs calls.
-    struct TrackingBeacon {
+    /// Shared mock that records submit_aggregate_and_proofs calls (RF4-24).
+    fn tracking_beacon(
         duty_pubkey: String,
         submit_agg_calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait]
-    impl bn_manager::NodeStatusApi for TrackingBeacon {
-        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_fork(&self, _: &str) -> Result<StateForkResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_validators(&self, _: &[String]) -> Result<ValidatorsResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-
-        async fn get_block_root(&self, _: &str) -> Result<BlockRootResponse, BeaconError> {
-            Ok(DataResponse {
-                data: BlockRootData {
-                    root: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                        .to_string(),
-                },
-            })
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
-
-    #[async_trait]
-    impl bn_manager::DutiesProvider for TrackingBeacon {
-        async fn get_attester_duties(
-            &self,
-            _epoch: u64,
-            _indices: &[String],
-        ) -> Result<AttesterDutiesResponse, BeaconError> {
-            Ok(DependentRootResponse {
-                dependent_root: "0xaabb".to_string(),
-                execution_optimistic: false,
-                data: vec![beacon::AttesterDuty {
-                    pubkey: self.duty_pubkey.clone(),
-                    validator_index: "1".to_string(),
-                    committee_index: "0".to_string(),
-                    committee_length: "8".to_string(), // small → always aggregator
-                    committees_at_slot: "1".to_string(),
-                    validator_committee_index: "0".to_string(),
-                    slot: "0".to_string(),
-                }],
-            })
-        }
-        async fn get_proposer_duties(&self, _: u64) -> Result<ProposerDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn post_sync_committee_duties(
-            &self,
-            _: u64,
-            _: &[String],
-        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
-
-    #[async_trait]
-    impl bn_manager::BlockProducer for TrackingBeacon {
-        async fn produce_block_v3(
-            &self,
-            _: u64,
-            _: &str,
-            _: Option<&str>,
-            _: Option<u64>,
-        ) -> Result<ProduceBlockResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn publish_block(&self, _: &SignedBeaconBlock, _: &str) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn publish_blinded_block(
-            &self,
-            _: &SignedBlindedBeaconBlock,
-            _: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn prepare_beacon_proposer(
-            &self,
-            _: &[ProposerPreparation],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn register_validators(
-            &self,
-            _: &[SignedValidatorRegistration],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
-
-    #[async_trait]
-    impl bn_manager::AttestationApi for TrackingBeacon {
-        async fn get_attestation_data(
-            &self,
-            slot: u64,
-            _committee_index: u64,
-        ) -> Result<AttestationDataResponse, BeaconError> {
-            Ok(DataResponse {
-                data: beacon::AttestationData {
-                    slot: slot.to_string(),
-                    index: "0".to_string(),
-                    beacon_block_root:
-                        "0x1111111111111111111111111111111111111111111111111111111111111111"
-                            .to_string(),
-                    source: beacon::Checkpoint {
-                        epoch: "0".to_string(),
-                        root: "0x0000000000000000000000000000000000000000000000000000000000000000"
+    ) -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new()
+            .with_get_block_root(|_id| {
+                Ok(DataResponse {
+                    data: BlockRootData {
+                        root: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                             .to_string(),
                     },
-                    target: beacon::Checkpoint {
-                        epoch: "0".to_string(),
-                        root: "0x0000000000000000000000000000000000000000000000000000000000000000"
-                            .to_string(),
-                    },
-                },
+                })
             })
-        }
-        async fn submit_attestation(
-            &self,
-            _: &VersionedAttestation,
-        ) -> Result<SubmitAttestationResult, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-
-        async fn get_aggregate_attestation(
-            &self,
-            slot: u64,
-            _root: &str,
-            _committee_index: Option<u64>,
-        ) -> Result<VersionedAggregateAttestation, BeaconError> {
-            Ok(VersionedAggregateAttestation::PreElectra(EthAttestation {
-                aggregation_bits: vec![0xff, 0x01],
-                data: AttestationData {
-                    slot,
-                    index: 0,
-                    beacon_block_root: [0x11; 32],
-                    source: eth_types::Checkpoint { epoch: 0, root: [0u8; 32] },
-                    target: eth_types::Checkpoint { epoch: 0, root: [0u8; 32] },
-                },
-                signature: vec![0xab; 96],
-            }))
-        }
-
-        async fn submit_aggregate_and_proofs(
-            &self,
-            _proofs: &VersionedSignedAggregateAndProof,
-        ) -> Result<(), BeaconError> {
-            self.submit_agg_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
+            .with_get_attester_duties(move |_epoch, _indices| {
+                Ok(DependentRootResponse {
+                    dependent_root: "0xaabb".to_string(),
+                    execution_optimistic: false,
+                    data: vec![beacon::AttesterDuty {
+                        pubkey: duty_pubkey.clone(),
+                        validator_index: "1".to_string(),
+                        committee_index: "0".to_string(),
+                        committee_length: "8".to_string(), // small → always aggregator
+                        committees_at_slot: "1".to_string(),
+                        validator_committee_index: "0".to_string(),
+                        slot: "0".to_string(),
+                    }],
+                })
+            })
+            .with_get_attestation_data(|slot, _committee_index| {
+                Ok(DataResponse {
+                    data: beacon::AttestationData {
+                        slot: slot.to_string(),
+                        index: "0".to_string(),
+                        beacon_block_root:
+                            "0x1111111111111111111111111111111111111111111111111111111111111111"
+                                .to_string(),
+                        source: beacon::Checkpoint {
+                            epoch: "0".to_string(),
+                            root:
+                                "0x0000000000000000000000000000000000000000000000000000000000000000"
+                                    .to_string(),
+                        },
+                        target: beacon::Checkpoint {
+                            epoch: "0".to_string(),
+                            root:
+                                "0x0000000000000000000000000000000000000000000000000000000000000000"
+                                    .to_string(),
+                        },
+                    },
+                })
+            })
+            .with_get_aggregate_attestation(|slot, _root, _idx| {
+                Ok(VersionedAggregateAttestation::PreElectra(EthAttestation {
+                    aggregation_bits: vec![0xff, 0x01],
+                    data: AttestationData {
+                        slot,
+                        index: 0,
+                        beacon_block_root: [0x11; 32],
+                        source: eth_types::Checkpoint { epoch: 0, root: [0u8; 32] },
+                        target: eth_types::Checkpoint { epoch: 0, root: [0u8; 32] },
+                    },
+                    signature: vec![0xab; 96],
+                }))
+            })
+            .with_submit_aggregate_and_proofs(move |_proofs| {
+                submit_agg_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
     }
-
-    #[async_trait]
-    impl bn_manager::SyncCommitteeApi for TrackingBeacon {
-        async fn submit_sync_committee_messages(
-            &self,
-            _: &[BeaconSyncCommitteeMessage],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_sync_committee_contribution(
-            &self,
-            _: u64,
-            _: u64,
-            _: &str,
-        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_contribution_and_proofs(
-            &self,
-            _: &[BeaconSignedContributionAndProof],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
-
-    #[async_trait]
-    impl bn_manager::LivenessApi for TrackingBeacon {
-        async fn post_validator_liveness(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<ValidatorLivenessResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
-
-    impl bn_manager::BeaconNodeClient for TrackingBeacon {}
 
     async fn setup_agg_service(
         duty_pubkey: String,
@@ -742,8 +592,7 @@ mod tests {
         let signer =
             Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
-        let beacon =
-            Arc::new(TrackingBeacon { duty_pubkey: duty_pubkey.clone(), submit_agg_calls });
+        let beacon = Arc::new(tracking_beacon(duty_pubkey.clone(), submit_agg_calls));
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
         duty_tracker.fetch_duties_for_epoch(0).await.unwrap();

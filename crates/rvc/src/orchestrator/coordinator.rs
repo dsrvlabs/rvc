@@ -781,25 +781,12 @@ where
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use beacon::{
-        AttestationDataResponse, AttesterDutiesResponse, AttesterDuty, BeaconClient,
-        BeaconClientConfig, BeaconCommitteeSubscription, BeaconError, BlockRootData,
-        BlockRootResponse, ConfigSpecResponse, DataResponse, ExecutionOptimisticResponse,
-        GenesisResponse, ProposerDutiesResponse, ProposerPreparation,
-        SignedContributionAndProof as BeaconSignedContributionAndProof, StateForkResponse,
-        SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-        SyncCommitteeMessage as BeaconSyncCommitteeMessage, SyncingResponse,
-        ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-        VersionedAttestation, VersionedSignedAggregateAndProof,
-    };
+    use beacon::{AttesterDuty, BeaconClient, BeaconClientConfig, VersionedAttestation};
     use signer::always_enabled;
     // block_service::ProduceBlockResponse is used in MockBlockBeacon / BadProposerBlockBeacon
     use block_service::ProduceBlockResponse;
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
-    use eth_types::{
-        ForkName, Root, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
-        SyncCommitteeDuty,
-    };
+    use eth_types::{ForkName, Root};
     use slashing::SlashingDb;
     use std::future::Future;
     use std::pin::Pin;
@@ -1007,205 +994,48 @@ mod tests {
         Arc::new(ValidatorStore::new([0u8; 20], 100))
     }
 
-    // ── H-7 mock: captures sync committee message submissions ────────────────
+    // ── H-7 mock: captures sync committee message submissions (shared mock, RF4-24)
     //
-    // Implements `BeaconNodeClient` with:
+    // Configurable MockBeaconNodeClient with:
     //   - `post_sync_committee_duties` → returns a duty for `duty_pubkey`
     //   - `submit_sync_committee_messages` → records beacon_block_root values
-    //   - All other methods → return `BeaconError::HttpError("mock")`
+    //   - All other methods → error by default (orchestrator handles gracefully)
     //
     // Used to test the `sync_enabled` guard without a real beacon node.
-    struct SyncGuardBeacon {
+    fn sync_guard_beacon(
         duty_pubkey: [u8; 48],
         submitted_roots: Arc<std::sync::Mutex<Vec<Root>>>,
-    }
-
-    #[async_trait]
-    impl bn_manager::NodeStatusApi for SyncGuardBeacon {
-        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_fork_schedule(&self) -> Result<eth_types::ForkSchedule, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_fork(&self, _state_id: &str) -> Result<StateForkResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_validators(
-            &self,
-            _pubkeys: &[String],
-        ) -> Result<ValidatorsResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-
-        async fn get_block_root(&self, _block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-            // Return a fixed root so SlotContext::capture succeeds.
-            Ok(DataResponse {
-                data: BlockRootData {
-                    root: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                        .to_string(),
-                },
+    ) -> bn_manager::MockBeaconNodeClient {
+        use beacon::{BlockRootData, DataResponse, ExecutionOptimisticResponse};
+        use eth_types::SyncCommitteeDuty;
+        bn_manager::MockBeaconNodeClient::new()
+            .with_get_block_root(|_block_id| {
+                Ok(DataResponse {
+                    data: BlockRootData {
+                        root: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                            .to_string(),
+                    },
+                })
             })
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
-
-    #[async_trait]
-    impl bn_manager::DutiesProvider for SyncGuardBeacon {
-        async fn get_attester_duties(
-            &self,
-            _epoch: u64,
-            _indices: &[String],
-        ) -> Result<AttesterDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_proposer_duties(
-            &self,
-            _epoch: u64,
-        ) -> Result<ProposerDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-
-        async fn post_sync_committee_duties(
-            &self,
-            _epoch: u64,
-            _indices: &[String],
-        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-            Ok(ExecutionOptimisticResponse {
-                execution_optimistic: false,
-                data: vec![SyncCommitteeDuty {
-                    pubkey: self.duty_pubkey,
-                    validator_index: 1,
-                    validator_sync_committee_indices: vec![0],
-                }],
+            .with_post_sync_committee_duties(move |_epoch, _indices| {
+                Ok(ExecutionOptimisticResponse {
+                    execution_optimistic: false,
+                    data: vec![SyncCommitteeDuty {
+                        pubkey: duty_pubkey,
+                        validator_index: 1,
+                        validator_sync_committee_indices: vec![0],
+                    }],
+                })
             })
-        }
+            .with_submit_sync_committee_messages(move |messages| {
+                let mut roots = submitted_roots.lock().unwrap();
+                for msg in messages {
+                    roots.push(msg.beacon_block_root);
+                }
+                Ok(())
+            })
+            .with_submit_contribution_and_proofs(|_proofs| Ok(()))
     }
-
-    #[async_trait]
-    impl bn_manager::BlockProducer for SyncGuardBeacon {
-        async fn produce_block_v3(
-            &self,
-            _slot: u64,
-            _randao_reveal: &str,
-            _graffiti: Option<&str>,
-            _builder_boost_factor: Option<u64>,
-        ) -> Result<beacon::ProduceBlockResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn publish_block(
-            &self,
-            _signed_block: &SignedBeaconBlock,
-            _consensus_version: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn publish_blinded_block(
-            &self,
-            _signed_block: &SignedBlindedBeaconBlock,
-            _consensus_version: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn prepare_beacon_proposer(
-            &self,
-            _preparations: &[ProposerPreparation],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn register_validators(
-            &self,
-            _registrations: &[SignedValidatorRegistration],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
-
-    #[async_trait]
-    impl bn_manager::AttestationApi for SyncGuardBeacon {
-        async fn get_attestation_data(
-            &self,
-            _slot: u64,
-            _committee_index: u64,
-        ) -> Result<AttestationDataResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_attestation(
-            &self,
-            _attestations: &VersionedAttestation,
-        ) -> Result<SubmitAttestationResult, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_aggregate_attestation(
-            &self,
-            _slot: u64,
-            _attestation_data_root: &str,
-            _committee_index: Option<u64>,
-        ) -> Result<VersionedAggregateAttestation, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_aggregate_and_proofs(
-            &self,
-            _proofs: &VersionedSignedAggregateAndProof,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _subscriptions: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
-
-    #[async_trait]
-    impl bn_manager::SyncCommitteeApi for SyncGuardBeacon {
-        async fn submit_sync_committee_messages(
-            &self,
-            messages: &[BeaconSyncCommitteeMessage],
-        ) -> Result<(), BeaconError> {
-            let mut roots = self.submitted_roots.lock().unwrap();
-            for msg in messages {
-                roots.push(msg.beacon_block_root);
-            }
-            Ok(())
-        }
-        async fn get_sync_committee_contribution(
-            &self,
-            _slot: u64,
-            _subcommittee_index: u64,
-            _beacon_block_root: &str,
-        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_contribution_and_proofs(
-            &self,
-            _proofs: &[BeaconSignedContributionAndProof],
-        ) -> Result<(), BeaconError> {
-            Ok(())
-        }
-    }
-
-    #[async_trait]
-    impl bn_manager::LivenessApi for SyncGuardBeacon {
-        async fn post_validator_liveness(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<ValidatorLivenessResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
-
-    impl bn_manager::BeaconNodeClient for SyncGuardBeacon {}
 
     #[test]
     fn test_orchestrator_config_new() {
@@ -5478,7 +5308,7 @@ mod tests {
     /// Minimal helper: build an orchestrator with a `SyncGuardBeacon` mock.
     /// Used to avoid repetition in the H-7 guard tests.
     async fn build_sync_test_orchestrator(
-        beacon: Arc<SyncGuardBeacon>,
+        beacon: Arc<dyn bn_manager::BeaconNodeClient>,
         pk_hex: String,
         pk: crypto::PublicKey,
         sk: crypto::SecretKey,
@@ -5634,10 +5464,8 @@ mod tests {
         let r_captured: Root = [0xAA; 32];
         let submitted_roots = Arc::new(std::sync::Mutex::new(Vec::<Root>::new()));
 
-        let beacon = Arc::new(SyncGuardBeacon {
-            submitted_roots: submitted_roots.clone(),
-            duty_pubkey: pk.to_bytes(),
-        });
+        let beacon: Arc<dyn bn_manager::BeaconNodeClient> =
+            Arc::new(sync_guard_beacon(pk.to_bytes(), submitted_roots.clone()));
 
         // attesting_enabled = false; sync_enabled = true (default)
         let attesting_enabled = Arc::new(AtomicBool::new(false));
@@ -5677,10 +5505,8 @@ mod tests {
         let r_captured: Root = [0xAA; 32];
         let submitted_roots = Arc::new(std::sync::Mutex::new(Vec::<Root>::new()));
 
-        let beacon = Arc::new(SyncGuardBeacon {
-            submitted_roots: submitted_roots.clone(),
-            duty_pubkey: pk.to_bytes(),
-        });
+        let beacon: Arc<dyn bn_manager::BeaconNodeClient> =
+            Arc::new(sync_guard_beacon(pk.to_bytes(), submitted_roots.clone()));
 
         // attesting_enabled = true; sync_enabled = false (explicit)
         let attesting_enabled = Arc::new(AtomicBool::new(true));
@@ -5833,10 +5659,8 @@ mod tests {
         let r_captured: Root = [0xAA; 32];
         let submitted_roots = Arc::new(std::sync::Mutex::new(Vec::<Root>::new()));
 
-        let beacon = Arc::new(SyncGuardBeacon {
-            submitted_roots: submitted_roots.clone(),
-            duty_pubkey: pk.to_bytes(),
-        });
+        let beacon: Arc<dyn bn_manager::BeaconNodeClient> =
+            Arc::new(sync_guard_beacon(pk.to_bytes(), submitted_roots.clone()));
 
         let attesting_enabled = Arc::new(AtomicBool::new(false));
         let orchestrator =

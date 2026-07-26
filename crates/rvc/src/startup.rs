@@ -255,247 +255,45 @@ pub fn acquire_keystore_lock(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
-    use beacon::{
-        AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-        BlockRootResponse, ConfigSpecResponse, DataResponse, GenesisData, GenesisResponse,
-        ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
-        SignedContributionAndProof, StateForkResponse, StateResponse, SubmitAttestationResult,
-        SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-        SyncingData, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
-        VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
-    };
-    use bn_manager::{
-        AttestationApi, BeaconNodeClient, BlockProducer, DutiesProvider, LivenessApi,
-        NodeStatusApi, SyncCommitteeApi,
-    };
-    use eth_types::{ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock};
+    use beacon::{BeaconError, DataResponse, GenesisData, StateFork, StateResponse};
+    use bn_manager::MockBeaconNodeClient;
+    use eth_types::ForkSchedule;
 
-    // -- Mock BeaconNodeClient for testing --
+    // Shared mock helpers (RF4-24): error-by-default MockBeaconNodeClient with overrides.
 
-    struct MockBeacon {
-        genesis_root: String,
-        fork_version: String,
-        should_fail: bool,
-    }
-
-    impl MockBeacon {
-        fn with_root(root: &str) -> Self {
-            Self {
-                genesis_root: root.to_string(),
-                fork_version: "0x05000000".to_string(),
-                should_fail: false,
-            }
-        }
-
-        fn with_fork_version(version: &str) -> Self {
-            Self {
-                genesis_root: "0xdead".to_string(),
-                fork_version: version.to_string(),
-                should_fail: false,
-            }
-        }
-
-        fn failing() -> Self {
-            Self { genesis_root: String::new(), fork_version: String::new(), should_fail: true }
-        }
-    }
-
-    #[async_trait]
-    impl NodeStatusApi for MockBeacon {
-        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-            if self.should_fail {
-                return Err(BeaconError::HttpError("mock failure".to_string()));
-            }
+    fn mock_with_root(root: &str) -> MockBeaconNodeClient {
+        let root = root.to_string();
+        MockBeaconNodeClient::new().with_get_genesis(move || {
             Ok(DataResponse {
                 data: GenesisData {
                     genesis_time: "1606824023".to_string(),
-                    genesis_validators_root: self.genesis_root.clone(),
+                    genesis_validators_root: root.clone(),
                     genesis_fork_version: "0x00000000".to_string(),
                 },
             })
-        }
-        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_fork(&self, _state_id: &str) -> Result<StateForkResponse, BeaconError> {
-            if self.should_fail {
-                return Err(BeaconError::HttpError("mock failure".to_string()));
-            }
+        })
+    }
+
+    fn mock_with_fork_version(version: &str) -> MockBeaconNodeClient {
+        let version = version.to_string();
+        MockBeaconNodeClient::new().with_get_fork(move |_state_id| {
             Ok(StateResponse {
                 execution_optimistic: false,
                 finalized: true,
-                data: beacon::StateFork {
+                data: StateFork {
                     previous_version: "0x04000000".to_string(),
-                    current_version: self.fork_version.clone(),
+                    current_version: version.clone(),
                     epoch: "0".to_string(),
                 },
             })
-        }
-        async fn get_validators(
-            &self,
-            _pubkeys: &[String],
-        ) -> Result<ValidatorsResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_block_root(&self, _block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Ok(DataResponse {
-                data: SyncingData {
-                    head_slot: "0".to_string(),
-                    sync_distance: "0".to_string(),
-                    is_syncing: false,
-                    is_optimistic: false,
-                    el_offline: false,
-                },
-            })
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
-            Ok("MockBeacon/v0.0.0".to_string())
-        }
+        })
     }
 
-    #[async_trait]
-    impl DutiesProvider for MockBeacon {
-        async fn get_attester_duties(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<AttesterDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_proposer_duties(
-            &self,
-            _epoch: u64,
-        ) -> Result<ProposerDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn post_sync_committee_duties(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
+    fn mock_failing() -> MockBeaconNodeClient {
+        MockBeaconNodeClient::new()
+            .with_get_genesis(|| Err(beacon::BeaconError::HttpError("mock failure".to_string())))
+            .with_get_fork(|_| Err(beacon::BeaconError::HttpError("mock failure".to_string())))
     }
-
-    #[async_trait]
-    impl BlockProducer for MockBeacon {
-        async fn produce_block_v3(
-            &self,
-            _slot: u64,
-            _randao_reveal: &str,
-            _graffiti: Option<&str>,
-            _builder_boost_factor: Option<u64>,
-        ) -> Result<ProduceBlockResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn publish_block(
-            &self,
-            _signed_block: &SignedBeaconBlock,
-            _consensus_version: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn publish_blinded_block(
-            &self,
-            _signed_blinded_block: &SignedBlindedBeaconBlock,
-            _consensus_version: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn prepare_beacon_proposer(
-            &self,
-            _preparations: &[ProposerPreparation],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn register_validators(
-            &self,
-            _registrations: &[bn_manager::SignedValidatorRegistration],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
-
-    #[async_trait]
-    impl AttestationApi for MockBeacon {
-        async fn get_attestation_data(
-            &self,
-            _slot: u64,
-            _committee_index: u64,
-        ) -> Result<AttestationDataResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_attestation(
-            &self,
-            _attestations: &VersionedAttestation,
-        ) -> Result<SubmitAttestationResult, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_aggregate_attestation(
-            &self,
-            _slot: u64,
-            _attestation_data_root: &str,
-            _committee_index: Option<u64>,
-        ) -> Result<VersionedAggregateAttestation, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_aggregate_and_proofs(
-            &self,
-            _proofs: &VersionedSignedAggregateAndProof,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _subscriptions: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
-
-    #[async_trait]
-    impl SyncCommitteeApi for MockBeacon {
-        async fn submit_sync_committee_messages(
-            &self,
-            _messages: &[SyncCommitteeMessage],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_sync_committee_contribution(
-            &self,
-            _slot: u64,
-            _subcommittee_index: u64,
-            _beacon_block_root: &str,
-        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_contribution_and_proofs(
-            &self,
-            _proofs: &[SignedContributionAndProof],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
-
-    #[async_trait]
-    impl LivenessApi for MockBeacon {
-        async fn post_validator_liveness(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<ValidatorLivenessResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
-
-    impl BeaconNodeClient for MockBeacon {}
 
     // -- Exit code tests --
 
@@ -556,7 +354,7 @@ mod tests {
     async fn test_validate_genesis_root_matching() {
         let root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
         let db = SlashingDb::open_in_memory().unwrap();
-        let beacon = MockBeacon::with_root(root);
+        let beacon = mock_with_root(root);
 
         let result = validate_genesis_root(&db, &beacon, root).await;
         assert!(result.is_ok());
@@ -567,7 +365,7 @@ mod tests {
         let root_lower = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
         let root_upper = "0x4B363DB94E286120D76EB905340FDD4E54BFE9F06BF33FF6CF5AD27F511BFE95";
         let db = SlashingDb::open_in_memory().unwrap();
-        let beacon = MockBeacon::with_root(root_upper);
+        let beacon = mock_with_root(root_upper);
 
         let result = validate_genesis_root(&db, &beacon, root_lower).await;
         assert!(result.is_ok());
@@ -578,7 +376,7 @@ mod tests {
         let local = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
         let remote = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let db = SlashingDb::open_in_memory().unwrap();
-        let beacon = MockBeacon::with_root(remote);
+        let beacon = mock_with_root(remote);
 
         let result = validate_genesis_root(&db, &beacon, local).await;
         assert!(result.is_err());
@@ -592,7 +390,7 @@ mod tests {
     async fn test_validate_genesis_root_beacon_unreachable() {
         let local = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
         let db = SlashingDb::open_in_memory().unwrap();
-        let beacon = MockBeacon::failing();
+        let beacon = mock_failing();
 
         let result = validate_genesis_root(&db, &beacon, local).await;
         assert!(result.is_err());
@@ -603,7 +401,7 @@ mod tests {
     async fn test_validate_genesis_root_stores_normalized_in_slashing_db() {
         let root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
         let db = SlashingDb::open_in_memory().unwrap();
-        let beacon = MockBeacon::with_root(root);
+        let beacon = mock_with_root(root);
 
         validate_genesis_root(&db, &beacon, root).await.unwrap();
 
@@ -620,14 +418,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_beacon_reachability_reachable() {
-        let beacon = MockBeacon::with_root("0xabc");
+        let beacon = mock_with_root("0xabc");
         // Should not panic, just log
         check_beacon_reachability(&beacon).await;
     }
 
     #[tokio::test]
     async fn test_check_beacon_reachability_unreachable() {
-        let beacon = MockBeacon::failing();
+        let beacon = mock_failing();
         // Should not panic, just warn
         check_beacon_reachability(&beacon).await;
     }
@@ -685,7 +483,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_fork_compatibility_known_version() {
-        let beacon = MockBeacon::with_fork_version("0x05000000");
+        let beacon = mock_with_fork_version("0x05000000");
         let schedule = test_fork_schedule();
         let result = check_fork_compatibility(&beacon, &schedule).await;
         assert!(result.is_ok());
@@ -693,7 +491,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_fork_compatibility_unknown_version() {
-        let beacon = MockBeacon::with_fork_version("0xdeadbeef");
+        let beacon = mock_with_fork_version("0xdeadbeef");
         let schedule = test_fork_schedule();
         let result = check_fork_compatibility(&beacon, &schedule).await;
         assert!(result.is_err());
@@ -704,7 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_fork_compatibility_fulu_version() {
-        let beacon = MockBeacon::with_fork_version("0x06000000");
+        let beacon = mock_with_fork_version("0x06000000");
         let schedule = test_fork_schedule();
         let result = check_fork_compatibility(&beacon, &schedule).await;
         assert!(result.is_ok());
@@ -712,7 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_fork_compatibility_genesis_version() {
-        let beacon = MockBeacon::with_fork_version("0x00000000");
+        let beacon = mock_with_fork_version("0x00000000");
         let schedule = test_fork_schedule();
         let result = check_fork_compatibility(&beacon, &schedule).await;
         assert!(result.is_ok());
@@ -720,7 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_fork_compatibility_beacon_unreachable() {
-        let beacon = MockBeacon::failing();
+        let beacon = mock_failing();
         let schedule = test_fork_schedule();
         let result = check_fork_compatibility(&beacon, &schedule).await;
         assert!(result.is_err());

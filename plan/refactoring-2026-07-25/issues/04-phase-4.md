@@ -1386,11 +1386,11 @@ scaffolding and makes every mock's behavior come from one place.
 3. Delete the hand impls.
 
 **Acceptance criteria:**
-- [ ] `rg 'impl BeaconNodeClient for' crates/rvc` == 0.
-- [ ] Every converted test asserts the **same behavior** as before — no test weakened to fit the mock
+- [x] `rg 'impl BeaconNodeClient for' crates/rvc` == 0.
+- [x] Every converted test asserts the **same behavior** as before — no test weakened to fit the mock
       (reviewer checks each conversion; the TOCTOU and failover tests are the ones to scrutinize).
-- [ ] Test count unchanged.
-- [ ] Standing invariant green.
+- [x] Test count unchanged.
+- [x] Standing invariant green.
 
 **TDD test plan:** conversion — the existing tests are the oracle.
 - **RED first:** for each mock, run the existing test against the shared mock *before* deleting the hand

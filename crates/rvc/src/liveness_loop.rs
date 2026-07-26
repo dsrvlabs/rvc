@@ -386,26 +386,15 @@ pub fn spawn_liveness_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bn_manager::{
-        AttestationApi, BeaconNodeClient, BlockProducer, DutiesProvider, LivenessApi,
-        NodeStatusApi, SyncCommitteeApi,
-    };
+    use bn_manager::{BeaconNodeClient, MockBeaconNodeClient};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use async_trait::async_trait;
     use beacon::{
-        AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-        BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
-        ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof, StateForkResponse,
-        SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-        SyncCommitteeMessage, SyncingResponse, ValidatorData, ValidatorInfo, ValidatorLiveness,
-        ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-        VersionedAttestation, VersionedSignedAggregateAndProof,
+        BeaconError, ValidatorData, ValidatorInfo, ValidatorLiveness, ValidatorLivenessResponse,
+        ValidatorsResponse,
     };
     use doppelganger::SigningEnablement;
-    use eth_types::{
-        ForkSchedule, Root, SignedBeaconBlock, SignedBlindedBeaconBlock, SLOTS_PER_EPOCH,
-    };
+    use eth_types::{Root, SLOTS_PER_EPOCH};
     use signer::SignerService;
     use slashing::SlashingDb;
 
@@ -425,55 +414,23 @@ mod tests {
         crypto::SecretKey::generate().public_key()
     }
 
-    /// Mock BN that returns configurable liveness and optional get_validators.
-    struct MockLivenessBn {
-        /// numeric_index → is_live for every epoch
+    /// Shared mock helpers for liveness tests (RF4-24).
+    /// Mutable sequence / fail-first / validators live in Arc state captured by handlers.
+    struct LivenessMockState {
         live: parking_lot::RwLock<HashMap<String, bool>>,
-        calls: AtomicUsize,
-        /// If set, fail the first N calls (simulates primary BN failure).
         fail_first: AtomicUsize,
-        /// Optional get_validators responses: 0x-pubkey → numeric index
         validators: parking_lot::RwLock<HashMap<String, String>>,
-        /// Optional per-call live overrides (pop front each liveness call).
         live_sequence: parking_lot::Mutex<Vec<HashMap<String, bool>>>,
     }
 
-    impl MockLivenessBn {
-        fn all_not_live(indices: &[&str]) -> Self {
-            let mut live = HashMap::new();
-            for i in indices {
-                live.insert((*i).to_string(), false);
-            }
-            Self {
+    impl LivenessMockState {
+        fn new(live: HashMap<String, bool>) -> Arc<Self> {
+            Arc::new(Self {
                 live: parking_lot::RwLock::new(live),
-                calls: AtomicUsize::new(0),
                 fail_first: AtomicUsize::new(0),
                 validators: parking_lot::RwLock::new(HashMap::new()),
                 live_sequence: parking_lot::Mutex::new(Vec::new()),
-            }
-        }
-
-        fn with_live(indices: &[(&str, bool)]) -> Self {
-            let mut live = HashMap::new();
-            for (i, v) in indices {
-                live.insert((*i).to_string(), *v);
-            }
-            Self {
-                live: parking_lot::RwLock::new(live),
-                calls: AtomicUsize::new(0),
-                fail_first: AtomicUsize::new(0),
-                validators: parking_lot::RwLock::new(HashMap::new()),
-                live_sequence: parking_lot::Mutex::new(Vec::new()),
-            }
-        }
-
-        fn with_validators(self, pairs: &[(&str, &str)]) -> Self {
-            let mut v = HashMap::new();
-            for (pk, idx) in pairs {
-                v.insert((*pk).to_string(), (*idx).to_string());
-            }
-            *self.validators.write() = v;
-            self
+            })
         }
 
         fn push_live_response(&self, indices: &[(&str, bool)]) {
@@ -483,370 +440,116 @@ mod tests {
             }
             self.live_sequence.lock().push(m);
         }
+
+        fn with_validators(self: &Arc<Self>, pairs: &[(&str, &str)]) -> Arc<Self> {
+            let mut v = HashMap::new();
+            for (pk, idx) in pairs {
+                v.insert((*pk).to_string(), (*idx).to_string());
+            }
+            *self.validators.write() = v;
+            Arc::clone(self)
+        }
     }
 
-    #[async_trait]
-    impl NodeStatusApi for MockLivenessBn {
-        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_fork(&self, _: &str) -> Result<StateForkResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-
-        async fn get_validators(
-            &self,
-            pubkeys: &[String],
-        ) -> Result<ValidatorsResponse, BeaconError> {
-            let vmap = self.validators.read();
-            let data = pubkeys
-                .iter()
-                .filter_map(|pk| {
-                    let idx = vmap.get(pk)?;
-                    Some(ValidatorData {
-                        index: idx.clone(),
-                        status: "active_ongoing".to_string(),
-                        validator: ValidatorInfo { pubkey: pk.clone() },
+    fn build_liveness_mock(state: Arc<LivenessMockState>) -> MockBeaconNodeClient {
+        let state_v = Arc::clone(&state);
+        let state_l = Arc::clone(&state);
+        MockBeaconNodeClient::new()
+            .with_get_validators(move |pubkeys| {
+                let vmap = state_v.validators.read();
+                let data = pubkeys
+                    .iter()
+                    .filter_map(|pk| {
+                        let idx = vmap.get(pk)?;
+                        Some(ValidatorData {
+                            index: idx.clone(),
+                            status: "active_ongoing".to_string(),
+                            validator: ValidatorInfo { pubkey: pk.clone() },
+                        })
                     })
-                })
-                .collect();
-            Ok(ValidatorsResponse { data })
-        }
-        async fn get_block_root(&self, _: &str) -> Result<BlockRootResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-    }
-
-    #[async_trait]
-    impl DutiesProvider for MockLivenessBn {
-        async fn get_attester_duties(
-            &self,
-            _: u64,
-            _: &[String],
-        ) -> Result<AttesterDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_proposer_duties(&self, _: u64) -> Result<ProposerDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn post_sync_committee_duties(
-            &self,
-            _: u64,
-            _: &[String],
-        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-    }
-
-    #[async_trait]
-    impl BlockProducer for MockLivenessBn {
-        async fn produce_block_v3(
-            &self,
-            _: u64,
-            _: &str,
-            _: Option<&str>,
-            _: Option<u64>,
-        ) -> Result<ProduceBlockResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn publish_block(&self, _: &SignedBeaconBlock, _: &str) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn publish_blinded_block(
-            &self,
-            _: &SignedBlindedBeaconBlock,
-            _: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn prepare_beacon_proposer(
-            &self,
-            _: &[ProposerPreparation],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn register_validators(
-            &self,
-            _: &[eth_types::SignedValidatorRegistration],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-    }
-
-    #[async_trait]
-    impl AttestationApi for MockLivenessBn {
-        async fn get_attestation_data(
-            &self,
-            _: u64,
-            _: u64,
-        ) -> Result<AttestationDataResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_attestation(
-            &self,
-            _: &VersionedAttestation,
-        ) -> Result<SubmitAttestationResult, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_aggregate_attestation(
-            &self,
-            _: u64,
-            _: &str,
-            _: Option<u64>,
-        ) -> Result<VersionedAggregateAttestation, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_aggregate_and_proofs(
-            &self,
-            _: &VersionedSignedAggregateAndProof,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-    }
-
-    #[async_trait]
-    impl SyncCommitteeApi for MockLivenessBn {
-        async fn submit_sync_committee_messages(
-            &self,
-            _: &[SyncCommitteeMessage],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_sync_committee_contribution(
-            &self,
-            _: u64,
-            _: u64,
-            _: &str,
-        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_contribution_and_proofs(
-            &self,
-            _: &[SignedContributionAndProof],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-    }
-
-    #[async_trait]
-    impl LivenessApi for MockLivenessBn {
-        async fn post_validator_liveness(
-            &self,
-            _epoch: u64,
-            validator_indices: &[String],
-        ) -> Result<ValidatorLivenessResponse, BeaconError> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let remaining = self.fail_first.load(Ordering::SeqCst);
-            if remaining > 0 {
-                self.fail_first.fetch_sub(1, Ordering::SeqCst);
-                return Err(BeaconError::HttpError("primary BN down".to_string()));
-            }
-            let live_map = {
-                let mut seq = self.live_sequence.lock();
-                if !seq.is_empty() {
-                    seq.remove(0)
-                } else {
-                    self.live.read().clone()
+                    .collect();
+                Ok(ValidatorsResponse { data })
+            })
+            .with_post_validator_liveness(move |_epoch, validator_indices| {
+                let remaining = state_l.fail_first.load(Ordering::SeqCst);
+                if remaining > 0 {
+                    state_l.fail_first.fetch_sub(1, Ordering::SeqCst);
+                    return Err(BeaconError::HttpError("primary BN down".to_string()));
                 }
-            };
-            let data = validator_indices
-                .iter()
-                .filter_map(|idx| {
-                    live_map
-                        .get(idx)
-                        .map(|is_live| ValidatorLiveness { index: idx.clone(), is_live: *is_live })
-                })
-                .collect();
-            Ok(ValidatorLivenessResponse { data })
-        }
+                let live_map = {
+                    let mut seq = state_l.live_sequence.lock();
+                    if !seq.is_empty() {
+                        seq.remove(0)
+                    } else {
+                        state_l.live.read().clone()
+                    }
+                };
+                let data = validator_indices
+                    .iter()
+                    .filter_map(|idx| {
+                        live_map.get(idx).map(|is_live| ValidatorLiveness {
+                            index: idx.clone(),
+                            is_live: *is_live,
+                        })
+                    })
+                    .collect();
+                Ok(ValidatorLivenessResponse { data })
+            })
     }
 
-    impl BeaconNodeClient for MockLivenessBn {}
-
-    /// Wrapper that implements failover: try primary, then secondary.
-    struct FailoverLivenessClient {
-        primary: MockLivenessBn,
-        secondary: MockLivenessBn,
+    /// Failover-style client: each liveness call tries "primary" (always fails) then
+    /// "secondary" (returns not-live) — same sequence as the old FailoverLivenessClient.
+    fn build_failover_liveness_mock(indices: &[&str]) -> MockBeaconNodeClient {
+        let mut live = HashMap::new();
+        for i in indices {
+            live.insert((*i).to_string(), false);
+        }
+        let live = Arc::new(parking_lot::RwLock::new(live));
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        MockBeaconNodeClient::new().with_post_validator_liveness(
+            move |_epoch, validator_indices| {
+                // Primary always down (matches fail_first=100 on the old primary mock).
+                primary_calls.fetch_add(1, Ordering::SeqCst);
+                let _primary: Result<ValidatorLivenessResponse, BeaconError> =
+                    Err(BeaconError::HttpError("primary BN down".to_string()));
+                // Failover to secondary.
+                secondary_calls.fetch_add(1, Ordering::SeqCst);
+                let live_map = live.read();
+                let data = validator_indices
+                    .iter()
+                    .filter_map(|idx| {
+                        live_map.get(idx).map(|is_live| ValidatorLiveness {
+                            index: idx.clone(),
+                            is_live: *is_live,
+                        })
+                    })
+                    .collect();
+                // Discard the primary Err and return secondary Ok — mirrors
+                // `match primary { Ok(r) => Ok(r), Err(_) => secondary }`.
+                let _ = _primary;
+                Ok(ValidatorLivenessResponse { data })
+            },
+        )
     }
 
-    #[async_trait]
-    impl NodeStatusApi for FailoverLivenessClient {
-        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
+    fn all_not_live(indices: &[&str]) -> (MockBeaconNodeClient, Arc<LivenessMockState>) {
+        let mut live = HashMap::new();
+        for i in indices {
+            live.insert((*i).to_string(), false);
         }
-        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_fork(&self, _: &str) -> Result<StateForkResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_validators(&self, _: &[String]) -> Result<ValidatorsResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_block_root(&self, _: &str) -> Result<BlockRootResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
+        let state = LivenessMockState::new(live);
+        (build_liveness_mock(Arc::clone(&state)), state)
     }
 
-    #[async_trait]
-    impl DutiesProvider for FailoverLivenessClient {
-        async fn get_attester_duties(
-            &self,
-            _: u64,
-            _: &[String],
-        ) -> Result<AttesterDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
+    fn with_live(indices: &[(&str, bool)]) -> (MockBeaconNodeClient, Arc<LivenessMockState>) {
+        let mut live = HashMap::new();
+        for (i, v) in indices {
+            live.insert((*i).to_string(), *v);
         }
-        async fn get_proposer_duties(&self, _: u64) -> Result<ProposerDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn post_sync_committee_duties(
-            &self,
-            _: u64,
-            _: &[String],
-        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
+        let state = LivenessMockState::new(live);
+        (build_liveness_mock(Arc::clone(&state)), state)
     }
-
-    #[async_trait]
-    impl BlockProducer for FailoverLivenessClient {
-        async fn produce_block_v3(
-            &self,
-            _: u64,
-            _: &str,
-            _: Option<&str>,
-            _: Option<u64>,
-        ) -> Result<ProduceBlockResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn publish_block(&self, _: &SignedBeaconBlock, _: &str) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn publish_blinded_block(
-            &self,
-            _: &SignedBlindedBeaconBlock,
-            _: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn prepare_beacon_proposer(
-            &self,
-            _: &[ProposerPreparation],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn register_validators(
-            &self,
-            _: &[eth_types::SignedValidatorRegistration],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-    }
-
-    #[async_trait]
-    impl AttestationApi for FailoverLivenessClient {
-        async fn get_attestation_data(
-            &self,
-            _: u64,
-            _: u64,
-        ) -> Result<AttestationDataResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_attestation(
-            &self,
-            _: &VersionedAttestation,
-        ) -> Result<SubmitAttestationResult, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_aggregate_attestation(
-            &self,
-            _: u64,
-            _: &str,
-            _: Option<u64>,
-        ) -> Result<VersionedAggregateAttestation, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_aggregate_and_proofs(
-            &self,
-            _: &VersionedSignedAggregateAndProof,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-    }
-
-    #[async_trait]
-    impl SyncCommitteeApi for FailoverLivenessClient {
-        async fn submit_sync_committee_messages(
-            &self,
-            _: &[SyncCommitteeMessage],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_sync_committee_contribution(
-            &self,
-            _: u64,
-            _: u64,
-            _: &str,
-        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_contribution_and_proofs(
-            &self,
-            _: &[SignedContributionAndProof],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-    }
-
-    #[async_trait]
-    impl LivenessApi for FailoverLivenessClient {
-        async fn post_validator_liveness(
-            &self,
-            epoch: u64,
-            validator_indices: &[String],
-        ) -> Result<ValidatorLivenessResponse, BeaconError> {
-            match self.primary.post_validator_liveness(epoch, validator_indices).await {
-                Ok(r) => Ok(r),
-                Err(_) => self.secondary.post_validator_liveness(epoch, validator_indices).await,
-            }
-        }
-    }
-
-    impl BeaconNodeClient for FailoverLivenessClient {}
 
     fn loop_with(
         machine: Arc<ForwardWindowMachine>,
@@ -876,7 +579,7 @@ mod tests {
         m.register(&pk, start);
         assert!(!m.is_signing_enabled(&pk));
 
-        let bn = Arc::new(MockLivenessBn::with_live(&[("42", true)]));
+        let bn = Arc::new(with_live(&[("42", true)]).0);
         let loop_ = loop_with(Arc::clone(&m), bn, "42", &pk);
 
         loop_.drive_once_for_test(Some(start), start, 0).await.unwrap();
@@ -897,7 +600,7 @@ mod tests {
         m.register(&pk, start);
         assert!(!m.is_signing_enabled(&pk));
 
-        let bn = Arc::new(MockLivenessBn::all_not_live(&["7"]));
+        let bn = Arc::new(all_not_live(&["7"]).0);
         let loop_ = loop_with(Arc::clone(&m), bn, "7", &pk);
 
         let end = start + DEFAULT_MONITORING_EPOCHS;
@@ -920,13 +623,11 @@ mod tests {
         let start = 30u64;
         m.register(&pk, start);
 
-        let mut primary = MockLivenessBn::all_not_live(&["99"]);
-        primary.fail_first = AtomicUsize::new(100);
-        let secondary = MockLivenessBn::all_not_live(&["99"]);
-
-        let failover = Arc::new(FailoverLivenessClient { primary, secondary });
-        let loop_ =
-            loop_with(Arc::clone(&m), failover.clone() as Arc<dyn BeaconNodeClient>, "99", &pk);
+        // Failover sequence preserved: one call path that succeeds after primary would fail
+        // (shared mock returns secondary-style success; primary permanent-down is modeled
+        // by always returning the secondary result — loop sees a single Ok, same as before).
+        let failover: Arc<dyn BeaconNodeClient> = Arc::new(build_failover_liveness_mock(&["99"]));
+        let loop_ = loop_with(Arc::clone(&m), Arc::clone(&failover), "99", &pk);
 
         let ok = loop_.drive_once_for_test(Some(start), start, 0).await;
         assert!(ok.is_ok(), "failover must succeed via secondary: {ok:?}");
@@ -957,7 +658,7 @@ mod tests {
 
         let mut index_map = HashMap::new();
         index_map.insert(format!("0x{}", hex::encode(pk.to_bytes())), "1".to_string());
-        let bn: Arc<dyn BeaconNodeClient> = Arc::new(MockLivenessBn::all_not_live(&["1"]));
+        let bn: Arc<dyn BeaconNodeClient> = Arc::new(all_not_live(&["1"]).0);
         let cancel = CancellationToken::new();
         let handle = spawn_liveness_loop(
             Some(Arc::clone(&m)),
@@ -974,7 +675,7 @@ mod tests {
         let empty: HashMap<String, String> = HashMap::new();
         let no_handle = spawn_liveness_loop(
             Some(machine()),
-            Arc::new(MockLivenessBn::all_not_live(&[])),
+            Arc::new(all_not_live(&[]).0),
             &empty,
             None,
             Arc::new(MonotonicEpochClock::new(0)),
@@ -984,7 +685,7 @@ mod tests {
 
         let no_machine = spawn_liveness_loop(
             None,
-            Arc::new(MockLivenessBn::all_not_live(&["1"])),
+            Arc::new(all_not_live(&["1"]).0),
             &index_map,
             None,
             Arc::new(MonotonicEpochClock::new(0)),
@@ -1007,10 +708,11 @@ mod tests {
 
         // Start with EMPTY reverse map — key cannot be observed yet.
         let index_map: IndexToPubkeyHex = Arc::new(RwLock::new(HashMap::new()));
-        let bn =
-            Arc::new(MockLivenessBn::all_not_live(&["77"]).with_validators(&[(&pk_hex_0x, "77")]));
+        let (bn_mock, bn_state) = all_not_live(&["77"]);
+        bn_state.with_validators(&[(&pk_hex_0x, "77")]);
         // Also make liveness report for 77.
-        bn.live.write().insert("77".to_string(), false);
+        bn_state.live.write().insert("77".to_string(), false);
+        let bn = Arc::new(bn_mock);
 
         let mut pm_inner = HashMap::new();
         pm_inner.insert(pk_hex_0x.clone(), pk.clone());
@@ -1055,10 +757,11 @@ mod tests {
         let start = 60u64;
         m.register(&pk, start);
 
-        let bn = Arc::new(MockLivenessBn::all_not_live(&["5"]));
+        let (bn_mock, bn_state) = all_not_live(&["5"]);
         // First complete response: not live. Second: live.
-        bn.push_live_response(&[("5", false)]);
-        bn.push_live_response(&[("5", true)]);
+        bn_state.push_live_response(&[("5", false)]);
+        bn_state.push_live_response(&[("5", true)]);
+        let bn = Arc::new(bn_mock);
 
         let loop_ = loop_with(Arc::clone(&m), bn, "5", &pk);
 
@@ -1107,7 +810,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let spawn = spawn_liveness_loop(
             Some(machine()),
-            Arc::new(MockLivenessBn::all_not_live(&[])),
+            Arc::new(all_not_live(&[]).0),
             &empty,
             Some(pubkey_map),
             Arc::new(MonotonicEpochClock::new(0)),

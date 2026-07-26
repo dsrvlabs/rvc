@@ -14,28 +14,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use beacon::{
-    AttestationData as BeaconAttestationData, AttestationDataResponse, AttesterDutiesResponse,
-    AttesterDuty, BeaconCommitteeSubscription, BeaconError, BlockRootData, BlockRootResponse,
-    Checkpoint as BeaconCheckpoint, ConfigSpecResponse, DataResponse, GenesisResponse,
-    ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
-    SignedContributionAndProof as BeaconSignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage as BeaconSyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse,
-    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
-    VersionedSignedAggregateAndProof,
+    AttestationData as BeaconAttestationData, AttesterDuty, BeaconError, BlockRootData,
+    Checkpoint as BeaconCheckpoint, DataResponse, SubmitAttestationResult, VersionedAttestation,
 };
 use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse as BlockProdResp};
-use bn_manager::{
-    AttestationApi, BeaconNodeClient, BlockProducer, DutiesProvider, LivenessApi, NodeStatusApi,
-    SyncCommitteeApi,
-};
+use bn_manager::{BeaconNodeClient, MockBeaconNodeClient};
 use builder::CircuitBreakerState;
 use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
 use doppelganger::SigningEnablement;
 use duty_tracker::DutyTracker;
-use eth_types::{
-    ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration, Slot,
-};
+use eth_types::{ForkSchedule, Slot};
 use propagator::{AttestationSubmitter, Propagator};
 use rvc::orchestrator::{
     DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorHandle, PubkeyMap,
@@ -207,22 +195,16 @@ impl BeaconBlockClient for NoopBlockBeacon {
     }
 }
 
-// ── mock beacon with per-slot attestation data ───────────────────────────────
+// ── mock beacon with per-slot attestation data (shared mock, RF4-24) ─────────
 
-/// Mock BN that serves attester duties for a (mutable) duty pubkey and returns
-/// per-slot [`BeaconAttestationData`] from a shared map.
+/// Control handle + shared state for the pipeline mock BN.
 ///
-/// `duty_pubkey` is behind a mutex so RF1-08 can seed a **stale** pre-import
-/// duty set, then switch the BN response to the imported identity. That couples
-/// duty-cache invalidation to participation: a cached epoch that only has the
-/// stale pubkey will not match the imported key until `clear_cache` forces a
-/// refetch.
+/// Mutable knobs (`set_duty_pubkey`, `set_attestation_data`) update Arc state
+/// read by the [`MockBeaconNodeClient`] handlers built in [`Self::into_client`].
 pub struct PipelineBeacon {
-    duty_pubkey: Mutex<String>,
-    /// Slots for which `get_attester_duties` should return a duty.
-    duty_slots: Vec<Slot>,
-    /// Attestation data returned by `get_attestation_data`, keyed by slot.
-    attestation_data_by_slot: Mutex<HashMap<Slot, BeaconAttestationData>>,
+    duty_pubkey: Arc<Mutex<String>>,
+    duty_slots: Arc<Vec<Slot>>,
+    attestation_data_by_slot: Arc<Mutex<HashMap<Slot, BeaconAttestationData>>>,
 }
 
 impl PipelineBeacon {
@@ -232,9 +214,9 @@ impl PipelineBeacon {
         attestation_data_by_slot: HashMap<Slot, BeaconAttestationData>,
     ) -> Self {
         Self {
-            duty_pubkey: Mutex::new(duty_pubkey),
-            duty_slots,
-            attestation_data_by_slot: Mutex::new(attestation_data_by_slot),
+            duty_pubkey: Arc::new(Mutex::new(duty_pubkey)),
+            duty_slots: Arc::new(duty_slots),
+            attestation_data_by_slot: Arc::new(Mutex::new(attestation_data_by_slot)),
         }
     }
 
@@ -252,191 +234,43 @@ impl PipelineBeacon {
     pub fn set_duty_pubkey(&self, duty_pubkey: String) {
         *self.duty_pubkey.lock().unwrap() = duty_pubkey;
     }
-}
 
-#[async_trait]
-impl NodeStatusApi for PipelineBeacon {
-    // ── unused endpoints ─────────────────────────────────────────────────────
-
-    async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-    async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-    async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-    async fn get_fork(&self, _state_id: &str) -> Result<StateForkResponse, BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-    async fn get_validators(&self, _pubkeys: &[String]) -> Result<ValidatorsResponse, BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-
-    async fn get_block_root(&self, _block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-        Ok(DataResponse { data: BlockRootData { root: root_hex(0xbb) } })
-    }
-    async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-    async fn get_node_version(&self) -> Result<String, BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-}
-
-#[async_trait]
-impl DutiesProvider for PipelineBeacon {
-    async fn get_attester_duties(
-        &self,
-        epoch: u64,
-        _indices: &[String],
-    ) -> Result<AttesterDutiesResponse, BeaconError> {
-        let duty_pubkey = self.duty_pubkey.lock().unwrap().clone();
-        let data: Vec<AttesterDuty> = self
-            .duty_slots
-            .iter()
-            .copied()
-            .filter(|s| s / SLOTS_PER_EPOCH == epoch)
-            .map(|s| make_attester_duty(&duty_pubkey, s))
-            .collect();
-        Ok(beacon::DependentRootResponse {
-            dependent_root: root_hex(0xdd),
-            execution_optimistic: false,
-            data,
-        })
-    }
-    async fn get_proposer_duties(
-        &self,
-        _epoch: u64,
-    ) -> Result<ProposerDutiesResponse, BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-    async fn post_sync_committee_duties(
-        &self,
-        _epoch: u64,
-        _indices: &[String],
-    ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
+    /// Build the shared configurable mock wired to this control state.
+    pub fn into_client(&self) -> MockBeaconNodeClient {
+        let duty_pubkey = Arc::clone(&self.duty_pubkey);
+        let duty_slots = Arc::clone(&self.duty_slots);
+        let att_map = Arc::clone(&self.attestation_data_by_slot);
+        MockBeaconNodeClient::new()
+            .with_get_block_root(|_block_id| {
+                Ok(DataResponse { data: BlockRootData { root: root_hex(0xbb) } })
+            })
+            .with_get_attester_duties(move |epoch, _indices| {
+                let duty_pubkey = duty_pubkey.lock().unwrap().clone();
+                let data: Vec<AttesterDuty> = duty_slots
+                    .iter()
+                    .copied()
+                    .filter(|s| s / SLOTS_PER_EPOCH == epoch)
+                    .map(|s| make_attester_duty(&duty_pubkey, s))
+                    .collect();
+                Ok(beacon::DependentRootResponse {
+                    dependent_root: root_hex(0xdd),
+                    execution_optimistic: false,
+                    data,
+                })
+            })
+            .with_get_attestation_data(move |slot, _committee_index| {
+                let map = att_map.lock().unwrap();
+                let data = map.get(&slot).cloned().ok_or_else(|| {
+                    BeaconError::HttpError(format!(
+                        "no attestation data configured for slot {slot}"
+                    ))
+                })?;
+                Ok(DataResponse { data })
+            })
+            .with_submit_sync_committee_messages(|_messages| Ok(()))
+            .with_submit_contribution_and_proofs(|_proofs| Ok(()))
     }
 }
-
-#[async_trait]
-impl BlockProducer for PipelineBeacon {
-    async fn produce_block_v3(
-        &self,
-        _slot: u64,
-        _randao_reveal: &str,
-        _graffiti: Option<&str>,
-        _builder_boost_factor: Option<u64>,
-    ) -> Result<ProduceBlockResponse, BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-    async fn publish_block(
-        &self,
-        _signed_block: &SignedBeaconBlock,
-        _consensus_version: &str,
-    ) -> Result<(), BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-    async fn publish_blinded_block(
-        &self,
-        _signed_block: &SignedBlindedBeaconBlock,
-        _consensus_version: &str,
-    ) -> Result<(), BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-    async fn prepare_beacon_proposer(
-        &self,
-        _preparations: &[ProposerPreparation],
-    ) -> Result<(), BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-    async fn register_validators(
-        &self,
-        _registrations: &[SignedValidatorRegistration],
-    ) -> Result<(), BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-}
-
-#[async_trait]
-impl AttestationApi for PipelineBeacon {
-    async fn get_attestation_data(
-        &self,
-        slot: u64,
-        _committee_index: u64,
-    ) -> Result<AttestationDataResponse, BeaconError> {
-        let map = self.attestation_data_by_slot.lock().unwrap();
-        let data = map.get(&slot).cloned().ok_or_else(|| {
-            BeaconError::HttpError(format!("no attestation data configured for slot {slot}"))
-        })?;
-        Ok(DataResponse { data })
-    }
-    async fn submit_attestation(
-        &self,
-        _attestations: &VersionedAttestation,
-    ) -> Result<SubmitAttestationResult, BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-    async fn get_aggregate_attestation(
-        &self,
-        _slot: u64,
-        _attestation_data_root: &str,
-        _committee_index: Option<u64>,
-    ) -> Result<VersionedAggregateAttestation, BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-    async fn submit_aggregate_and_proofs(
-        &self,
-        _proofs: &VersionedSignedAggregateAndProof,
-    ) -> Result<(), BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-    async fn submit_beacon_committee_subscriptions(
-        &self,
-        _subscriptions: &[BeaconCommitteeSubscription],
-    ) -> Result<(), BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-}
-
-#[async_trait]
-impl SyncCommitteeApi for PipelineBeacon {
-    async fn submit_sync_committee_messages(
-        &self,
-        _messages: &[BeaconSyncCommitteeMessage],
-    ) -> Result<(), BeaconError> {
-        Ok(())
-    }
-    async fn get_sync_committee_contribution(
-        &self,
-        _slot: u64,
-        _subcommittee_index: u64,
-        _beacon_block_root: &str,
-    ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-    async fn submit_contribution_and_proofs(
-        &self,
-        _proofs: &[BeaconSignedContributionAndProof],
-    ) -> Result<(), BeaconError> {
-        Ok(())
-    }
-}
-
-#[async_trait]
-impl LivenessApi for PipelineBeacon {
-    async fn post_validator_liveness(
-        &self,
-        _epoch: u64,
-        _validator_indices: &[String],
-    ) -> Result<ValidatorLivenessResponse, BeaconError> {
-        Err(BeaconError::HttpError("mock".to_string()))
-    }
-}
-
-impl BeaconNodeClient for PipelineBeacon {}
 
 // ── fixture options + fixture ────────────────────────────────────────────────
 
@@ -587,11 +421,10 @@ fn finish_fixture(
         opts.duty_slots,
         opts.attestation_data_by_slot,
     ));
+    let beacon_client: Arc<dyn BeaconNodeClient> = Arc::new(beacon.into_client());
 
-    let duty_tracker = Arc::new(DutyTracker::new(
-        beacon.clone() as Arc<dyn BeaconNodeClient>,
-        vec![VALIDATOR_INDEX.to_string()],
-    ));
+    let duty_tracker =
+        Arc::new(DutyTracker::new(Arc::clone(&beacon_client), vec![VALIDATOR_INDEX.to_string()]));
 
     let submitter = Arc::new(RecordingSubmitter::new());
     let propagator = Arc::new(Propagator::new(Arc::clone(&submitter) as Arc<RecordingSubmitter>));
@@ -622,7 +455,7 @@ fn finish_fixture(
         Arc::clone(&duty_tracker),
         signer,
         propagator,
-        beacon.clone() as Arc<dyn BeaconNodeClient>,
+        Arc::clone(&beacon_client),
         Arc::new(NoopBlockBeacon),
         None,
         Arc::clone(&validator_store),

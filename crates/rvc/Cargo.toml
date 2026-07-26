@@ -55,6 +55,8 @@ tonic-build.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+# test-utils: shared MockBeaconNodeClient for unit/integration tests (RF4-24).
+bn-manager = { workspace = true, features = ["test-utils"] }
 crypto.workspace = true
 http-body-util.workspace = true
 # Used by pipeline_slashing.rs to poison a file-backed SlashingDb (DROP TABLE)
