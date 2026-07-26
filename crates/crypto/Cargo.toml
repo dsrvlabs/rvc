@@ -10,6 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+observability = { workspace = true }
 aes.workspace = true
 async-trait.workspace = true
 blst.workspace = true
