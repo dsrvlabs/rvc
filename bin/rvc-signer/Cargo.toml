@@ -32,12 +32,16 @@ prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 signer.workspace = true
+# RF3-14 incomplete on develop: lib.rs re-exports signer_proto without a dep.
+# Required for rvc-signer-bin to compile; features match the former local build.rs.
+signer-proto = { workspace = true, features = ["server", "client"] }
 slashing.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 toml.workspace = true
 tonic = { workspace = true, features = ["tls"] }
+web3signer-wire.workspace = true
 # rustls reached via the `tokio_rustls::rustls` re-export so the HTTP transport
 # binds the same rustls as the gRPC/tonic stack (single CertificateDer type,
 # enforced by 1.5's guard test). Pinned to the versions already in Cargo.lock.
