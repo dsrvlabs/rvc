@@ -1606,16 +1606,16 @@ just duplication.
 2. Extend `clear_cache` to clear the sync cache too.
 
 **Acceptance criteria:**
-- [ ] The four parse loops are replaced by `from_response` constructors.
-- [ ] **`clear_cache` clears the sync-committee cache** (test asserts `get_sync_committee_duties`
+- [x] The four parse loops are replaced by `from_response` constructors.
+- [x] **`clear_cache` clears the sync-committee cache** (test asserts `get_sync_committee_duties`
       returns empty afterwards).
-- [ ] Existing duty-tracker tests pass unchanged.
-- [ ] Standing invariant green.
+- [x] Existing duty-tracker tests pass unchanged.
+- [x] Standing invariant green.
 
 **TDD test plan:**
-- **RED first:** `test_clear_cache_clears_sync_committee_cache` — fails today.
-- `test_from_response_constructors_produce_identical_caches` (differential against the old loops)
-- `test_clear_epoch_cache_still_scoped_to_one_epoch`
+- **RED first:** `test_clear_cache_clears_sync_committee_cache` — fails today. ✅
+- `test_from_response_constructors_produce_identical_caches` (differential against the old loops) ✅
+- `test_clear_epoch_cache_still_scoped_to_one_epoch` ✅
 
 **Risks:** None.
 

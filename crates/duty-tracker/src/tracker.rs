@@ -31,6 +31,42 @@ impl EpochDutyCache {
         Self { duties: HashMap::new(), dependent_root }
     }
 
+    /// Parse attester duties from a BN response into a keyed epoch cache.
+    ///
+    /// Duties with unparseable slot / committee_index / validator_index are
+    /// skipped (with a warn log). Per-duty cache inserts are traced.
+    fn from_response(dependent_root: String, duties: &[AttesterDuty], epoch: u64) -> Self {
+        let mut epoch_cache = Self::new(dependent_root);
+        for duty in duties {
+            let slot: u64 = match duty.slot.parse() {
+                Ok(s) => s,
+                Err(_) => {
+                    warn!(raw_slot = %duty.slot, "Skipping duty with unparseable slot");
+                    continue;
+                }
+            };
+            let committee_index: u64 = match duty.committee_index.parse() {
+                Ok(c) => c,
+                Err(_) => {
+                    warn!(raw_committee_index = %duty.committee_index, "Skipping duty with unparseable committee_index");
+                    continue;
+                }
+            };
+            let validator_index: u64 = match duty.validator_index.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    warn!(raw_validator_index = %duty.validator_index, "Skipping duty with unparseable validator_index");
+                    continue;
+                }
+            };
+
+            let key = DutyCacheKey { slot, committee_index, validator_index };
+            trace!(slot, epoch, validator_index, committee_index, "cached attester duty");
+            epoch_cache.insert(key, duty.clone());
+        }
+        epoch_cache
+    }
+
     fn insert(&mut self, key: DutyCacheKey, duty: AttesterDuty) {
         self.duties.insert(key, duty);
     }
@@ -51,12 +87,43 @@ impl ProposerEpochDutyCache {
         Self { duties: HashMap::new(), dependent_root }
     }
 
+    /// Parse proposer duties from a BN response into a slot-keyed epoch cache.
+    ///
+    /// Duties with an unparseable slot are skipped (with a warn log).
+    fn from_response(dependent_root: String, duties: &[ProposerDuty]) -> Self {
+        let mut epoch_cache = Self::new(dependent_root);
+        for duty in duties {
+            let slot: u64 = match duty.slot.parse() {
+                Ok(s) => s,
+                Err(_) => {
+                    warn!(raw_slot = %duty.slot, "Skipping proposer duty with unparseable slot");
+                    continue;
+                }
+            };
+            epoch_cache.insert(slot, duty.clone());
+        }
+        epoch_cache
+    }
+
     fn insert(&mut self, slot: u64, duty: ProposerDuty) {
         self.duties.insert(slot, duty);
     }
 
     fn get(&self, slot: &u64) -> Option<&ProposerDuty> {
         self.duties.get(slot)
+    }
+}
+
+/// Sync-committee duties for one sync committee period.
+#[derive(Debug)]
+struct SyncPeriodDutyCache {
+    duties: Vec<SyncCommitteeDuty>,
+}
+
+impl SyncPeriodDutyCache {
+    /// Construct a period cache from a BN sync-committee duties response body.
+    fn from_response(duties: Vec<SyncCommitteeDuty>) -> Self {
+        Self { duties }
     }
 }
 
@@ -67,7 +134,7 @@ pub struct DutyTracker {
     /// Proposer duties keyed by epoch -> ProposerEpochDutyCache.
     proposer_cache: RwLock<HashMap<u64, ProposerEpochDutyCache>>,
     /// Sync committee duties keyed by sync committee period.
-    sync_committee_cache: RwLock<HashMap<u64, Vec<SyncCommitteeDuty>>>,
+    sync_committee_cache: RwLock<HashMap<u64, SyncPeriodDutyCache>>,
 }
 
 impl DutyTracker {
@@ -109,35 +176,8 @@ impl DutyTracker {
             }
         }
 
-        let mut epoch_cache = EpochDutyCache::new(response.dependent_root.clone());
-
-        for duty in &response.data {
-            let slot: u64 = match duty.slot.parse() {
-                Ok(s) => s,
-                Err(_) => {
-                    warn!(raw_slot = %duty.slot, "Skipping duty with unparseable slot");
-                    continue;
-                }
-            };
-            let committee_index: u64 = match duty.committee_index.parse() {
-                Ok(c) => c,
-                Err(_) => {
-                    warn!(raw_committee_index = %duty.committee_index, "Skipping duty with unparseable committee_index");
-                    continue;
-                }
-            };
-            let validator_index: u64 = match duty.validator_index.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    warn!(raw_validator_index = %duty.validator_index, "Skipping duty with unparseable validator_index");
-                    continue;
-                }
-            };
-
-            let key = DutyCacheKey { slot, committee_index, validator_index };
-            trace!(slot, epoch, validator_index, committee_index, "cached attester duty");
-            epoch_cache.insert(key, duty.clone());
-        }
+        let epoch_cache =
+            EpochDutyCache::from_response(response.dependent_root.clone(), &response.data, epoch);
 
         info!(
             epoch = epoch,
@@ -200,34 +240,8 @@ impl DutyTracker {
             "Dependent root changed, refetching duties"
         );
 
-        let mut epoch_cache = EpochDutyCache::new(response.dependent_root.clone());
-
-        for duty in &response.data {
-            let slot: u64 = match duty.slot.parse() {
-                Ok(s) => s,
-                Err(_) => {
-                    warn!(raw_slot = %duty.slot, "Skipping duty with unparseable slot");
-                    continue;
-                }
-            };
-            let committee_index: u64 = match duty.committee_index.parse() {
-                Ok(c) => c,
-                Err(_) => {
-                    warn!(raw_committee_index = %duty.committee_index, "Skipping duty with unparseable committee_index");
-                    continue;
-                }
-            };
-            let validator_index: u64 = match duty.validator_index.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    warn!(raw_validator_index = %duty.validator_index, "Skipping duty with unparseable validator_index");
-                    continue;
-                }
-            };
-            let key = DutyCacheKey { slot, committee_index, validator_index };
-            trace!(slot, epoch, validator_index, committee_index, "cached attester duty");
-            epoch_cache.insert(key, duty.clone());
-        }
+        let epoch_cache =
+            EpochDutyCache::from_response(response.dependent_root.clone(), &response.data, epoch);
 
         cache.insert(epoch, epoch_cache);
         Ok(true)
@@ -299,6 +313,7 @@ impl DutyTracker {
     pub async fn clear_cache(&self) {
         self.cache.write().await.clear();
         self.proposer_cache.write().await.clear();
+        self.sync_committee_cache.write().await.clear();
         debug!("Cleared all duty caches");
     }
 
@@ -322,17 +337,8 @@ impl DutyTracker {
         let response =
             self.beacon.get_proposer_duties(epoch).await.map_err(DutyTrackerError::BeaconError)?;
 
-        let mut epoch_cache = ProposerEpochDutyCache::new(response.dependent_root.clone());
-        for duty in &response.data {
-            let slot: u64 = match duty.slot.parse() {
-                Ok(s) => s,
-                Err(_) => {
-                    warn!(raw_slot = %duty.slot, "Skipping proposer duty with unparseable slot");
-                    continue;
-                }
-            };
-            epoch_cache.insert(slot, duty.clone());
-        }
+        let epoch_cache =
+            ProposerEpochDutyCache::from_response(response.dependent_root.clone(), &response.data);
 
         info!(epoch = epoch, count = response.data.len(), "Cached proposer duties for epoch");
 
@@ -385,17 +391,10 @@ impl DutyTracker {
                 "Proposer dependent root changed, refetching duties"
             );
 
-            let mut epoch_cache = ProposerEpochDutyCache::new(response.dependent_root.clone());
-            for duty in &response.data {
-                let slot: u64 = match duty.slot.parse() {
-                    Ok(s) => s,
-                    Err(_) => {
-                        warn!(raw_slot = %duty.slot, "Skipping proposer duty with unparseable slot");
-                        continue;
-                    }
-                };
-                epoch_cache.insert(slot, duty.clone());
-            }
+            let epoch_cache = ProposerEpochDutyCache::from_response(
+                response.dependent_root.clone(),
+                &response.data,
+            );
 
             let mut cache = self.proposer_cache.write().await;
             cache.insert(epoch, epoch_cache);
@@ -431,8 +430,9 @@ impl DutyTracker {
             "Cached sync committee duties for period"
         );
 
+        let period_cache = SyncPeriodDutyCache::from_response(response.data.clone());
         let mut cache = self.sync_committee_cache.write().await;
-        cache.insert(period, response.data.clone());
+        cache.insert(period, period_cache);
 
         Ok(response.data)
     }
@@ -442,9 +442,9 @@ impl DutyTracker {
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
         let cache = self.sync_committee_cache.read().await;
         match cache.get(&period) {
-            Some(duties) => {
+            Some(period_cache) => {
                 debug!(slot, epoch, cache_type = "sync", "Cache hit");
-                duties.clone()
+                period_cache.duties.clone()
             }
             None => {
                 debug!(slot, epoch, cache_type = "sync", "Cache miss");
@@ -480,7 +480,8 @@ impl DutyTracker {
         let proposer_count =
             self.proposer_cache.read().await.get(&epoch).map_or(0, |c| c.duties.len());
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
-        let sync_count = self.sync_committee_cache.read().await.get(&period).map_or(0, |c| c.len());
+        let sync_count =
+            self.sync_committee_cache.read().await.get(&period).map_or(0, |c| c.duties.len());
         (attester_count, proposer_count, sync_count)
     }
 }
@@ -493,7 +494,8 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use beacon::{BeaconClient, BeaconClientConfig};
-    use bn_manager::BeaconNodeClient;
+    use bn_manager::{AttesterDuty, BeaconNodeClient, ProposerDuty};
+    use eth_types::SyncCommitteeDuty;
 
     use super::*;
 
@@ -1158,11 +1160,8 @@ mod tests {
         let (mock_server, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string()];
 
-        let response = create_mock_sync_committee_response(vec![(
-            1234,
-            mock_sync_pubkey_hex(),
-            vec![10, 20],
-        )]);
+        let response =
+            create_mock_sync_committee_response(vec![(1234, mock_sync_pubkey_hex(), vec![10, 20])]);
 
         Mock::given(method("POST"))
             .and(path("/eth/v1/validator/duties/sync/10"))
@@ -1184,11 +1183,8 @@ mod tests {
         let (mock_server, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string()];
 
-        let response = create_mock_sync_committee_response(vec![(
-            1234,
-            mock_sync_pubkey_hex(),
-            vec![10, 20],
-        )]);
+        let response =
+            create_mock_sync_committee_response(vec![(1234, mock_sync_pubkey_hex(), vec![10, 20])]);
 
         Mock::given(method("POST"))
             .and(path("/eth/v1/validator/duties/sync/10"))
@@ -1514,5 +1510,186 @@ mod tests {
 
         tracker.clear_cache().await;
         assert!(!tracker.is_epoch_cached(0).await);
+    }
+
+    /// RF4-29: `clear_cache` must clear the sync-committee cache as well as
+    /// attester/proposer caches. Key-gen invalidation and reorg recovery call
+    /// this path; leaving sync duties live after a key removal is a correctness bug.
+    #[tokio::test]
+    async fn test_clear_cache_clears_sync_committee_cache() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        let attester = create_mock_duty_response(10, vec![(320, 1, "1234")], "0xdeproot");
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&attester))
+            .mount(&mock_server)
+            .await;
+
+        let proposer = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/duties/proposer/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&proposer))
+            .mount(&mock_server)
+            .await;
+
+        let sync =
+            create_mock_sync_committee_response(vec![(1234, mock_sync_pubkey_hex(), vec![10, 20])]);
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/sync/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&sync))
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        tracker.fetch_duties_for_epoch(10).await.unwrap();
+        tracker.fetch_proposer_duties(10).await.unwrap();
+        tracker.fetch_sync_committee_duties(10).await.unwrap();
+
+        assert!(tracker.is_epoch_cached(10).await);
+        assert!(tracker.is_proposer_epoch_cached(10).await);
+        assert!(tracker.is_sync_period_cached(10).await);
+        assert!(!tracker.get_sync_committee_duties(320).await.is_empty());
+
+        tracker.clear_cache().await;
+
+        assert!(!tracker.is_epoch_cached(10).await);
+        assert!(!tracker.is_proposer_epoch_cached(10).await);
+        assert!(!tracker.is_sync_period_cached(10).await);
+        assert!(
+            tracker.get_sync_committee_duties(320).await.is_empty(),
+            "clear_cache must empty the sync-committee cache"
+        );
+    }
+
+    /// RF4-29: `from_response` constructors produce the same cache contents
+    /// as the previous inline parse loops (keyed by parsed fields, skip bad rows).
+    #[test]
+    fn test_from_response_constructors_produce_identical_caches() {
+        let attester_duties = vec![
+            AttesterDuty {
+                pubkey: "0xpk1".into(),
+                validator_index: "10".into(),
+                committee_index: "2".into(),
+                committee_length: "128".into(),
+                committees_at_slot: "64".into(),
+                validator_committee_index: "0".into(),
+                slot: "320".into(),
+            },
+            AttesterDuty {
+                pubkey: "0xpk2".into(),
+                validator_index: "not_a_number".into(),
+                committee_index: "1".into(),
+                committee_length: "128".into(),
+                committees_at_slot: "64".into(),
+                validator_committee_index: "0".into(),
+                slot: "321".into(),
+            },
+            AttesterDuty {
+                pubkey: "0xpk3".into(),
+                validator_index: "11".into(),
+                committee_index: "bad".into(),
+                committee_length: "128".into(),
+                committees_at_slot: "64".into(),
+                validator_committee_index: "0".into(),
+                slot: "322".into(),
+            },
+            AttesterDuty {
+                pubkey: "0xpk4".into(),
+                validator_index: "12".into(),
+                committee_index: "3".into(),
+                committee_length: "128".into(),
+                committees_at_slot: "64".into(),
+                validator_committee_index: "0".into(),
+                slot: "not_a_slot".into(),
+            },
+        ];
+
+        let attester_cache = EpochDutyCache::from_response("0xroot".into(), &attester_duties, 10);
+        assert_eq!(attester_cache.dependent_root, "0xroot");
+        assert_eq!(attester_cache.duties.len(), 1);
+        let key = DutyCacheKey { slot: 320, committee_index: 2, validator_index: 10 };
+        assert_eq!(attester_cache.get(&key).map(|d| d.pubkey.as_str()), Some("0xpk1"));
+
+        let proposer_duties = vec![
+            ProposerDuty {
+                pubkey: "0xpk1".into(),
+                validator_index: "10".into(),
+                slot: "320".into(),
+            },
+            ProposerDuty {
+                pubkey: "0xpk2".into(),
+                validator_index: "11".into(),
+                slot: "invalid".into(),
+            },
+            ProposerDuty {
+                pubkey: "0xpk3".into(),
+                validator_index: "12".into(),
+                slot: "325".into(),
+            },
+        ];
+        let proposer_cache =
+            ProposerEpochDutyCache::from_response("0xproot".into(), &proposer_duties);
+        assert_eq!(proposer_cache.dependent_root, "0xproot");
+        assert_eq!(proposer_cache.duties.len(), 2);
+        assert!(proposer_cache.get(&320).is_some());
+        assert!(proposer_cache.get(&325).is_some());
+        assert!(proposer_cache.get(&321).is_none());
+
+        let sync_duties = vec![SyncCommitteeDuty {
+            pubkey: [0x11; 48],
+            validator_index: 1234,
+            validator_sync_committee_indices: vec![1, 2],
+        }];
+        let sync_cache = SyncPeriodDutyCache::from_response(sync_duties.clone());
+        assert_eq!(sync_cache.duties, sync_duties);
+    }
+
+    /// RF4-29: `clear_epoch_cache` remains scoped to a single attester epoch
+    /// and does not touch proposer or sync caches.
+    #[tokio::test]
+    async fn test_clear_epoch_cache_still_scoped_to_one_epoch() {
+        let (mock_server, beacon) = setup_mock_beacon().await;
+        let validator_indices = vec!["1234".to_string()];
+
+        for epoch in [10u64, 11] {
+            let response =
+                create_mock_duty_response(epoch, vec![(epoch * 32, 1, "1234")], "0xdeproot");
+            Mock::given(method("POST"))
+                .and(path(format!("/eth/v1/validator/duties/attester/{epoch}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+                .mount(&mock_server)
+                .await;
+        }
+
+        let proposer = create_mock_proposer_response(vec![(320, "1234", "0xpubkey_1234")]);
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/duties/proposer/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&proposer))
+            .mount(&mock_server)
+            .await;
+
+        let sync =
+            create_mock_sync_committee_response(vec![(1234, mock_sync_pubkey_hex(), vec![10])]);
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/sync/10"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&sync))
+            .mount(&mock_server)
+            .await;
+
+        let tracker = DutyTracker::new(beacon, validator_indices);
+        tracker.fetch_duties_for_epoch(10).await.unwrap();
+        tracker.fetch_duties_for_epoch(11).await.unwrap();
+        tracker.fetch_proposer_duties(10).await.unwrap();
+        tracker.fetch_sync_committee_duties(10).await.unwrap();
+
+        tracker.clear_epoch_cache(10).await;
+
+        assert!(!tracker.is_epoch_cached(10).await);
+        assert!(tracker.is_epoch_cached(11).await);
+        assert!(tracker.is_proposer_epoch_cached(10).await);
+        assert!(tracker.is_sync_period_cached(10).await);
+        assert!(!tracker.get_sync_committee_duties(320).await.is_empty());
     }
 }
