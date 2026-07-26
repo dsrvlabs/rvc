@@ -1087,11 +1087,11 @@ modules are thin and belong next to their only consumers.
 3. Pure motion: the diff should be recognized by git's move detection.
 
 **Acceptance criteria:**
-- [ ] No module-name collision remains between `crates/rvc` and `bin/rvc/src/commands`.
-- [ ] `rg` proof of zero external consumers attached to the PR (or the alternative rename path taken,
+- [x] No module-name collision remains between `crates/rvc` and `bin/rvc/src/commands`.
+- [x] `rg` proof of zero external consumers attached to the PR (or the alternative rename path taken,
       with the reason stated).
-- [ ] Diff is a pure move plus module declarations.
-- [ ] Workspace green.
+- [x] Diff is a pure move plus module declarations.
+- [x] Workspace green.
 
 **TDD test plan** (RED first):
 - `test_exit_command_modules_resolve_from_bin_crate` — **RED**: fails to compile before the move (new

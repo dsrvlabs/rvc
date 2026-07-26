@@ -6,7 +6,7 @@
 //! - FR-2: Health tiers (sync distance → tier classification)
 //! - FR-3: Role-based BN assignment (duty-type filtering)
 //! - FR-4: Registration batching (chunked builder registration)
-//! - FR-5: Pre-signed exits (prepare + submit round-trip)
+//! - FR-5: Pre-signed exits (unit-tested on the rvc bin target after RF5-17)
 
 // =============================================================================
 // FR-1: Block Selection Modes
@@ -470,82 +470,11 @@ mod registration_batching {
 // =============================================================================
 // FR-5: Pre-Signed Exits
 // =============================================================================
-
-mod pre_signed_exits {
-    use eth_types::{SignedVoluntaryExit, VoluntaryExit};
-    use rvc::prepare_exit::write_exit_to_file;
-    use rvc::submit_exit::read_exit_from_file;
-
-    fn sample_signed_exit() -> SignedVoluntaryExit {
-        SignedVoluntaryExit {
-            message: VoluntaryExit { epoch: 300_000, validator_index: 12345 },
-            signature: vec![0xaa; 96],
-        }
-    }
-
-    #[test]
-    fn prepare_creates_valid_json_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let signed = sample_signed_exit();
-
-        let path = write_exit_to_file(&signed, dir.path(), "0xdeadbeef1234").unwrap();
-
-        assert!(path.exists());
-        assert_eq!(path.file_name().unwrap(), "deadbeef1234_exit.json");
-
-        let content = std::fs::read_to_string(&path).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
-
-        assert!(json.get("message").is_some());
-        assert!(json.get("signature").is_some());
-        assert_eq!(json["message"]["epoch"], "300000");
-        assert_eq!(json["message"]["validator_index"], "12345");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn file_has_0o600_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let signed = sample_signed_exit();
-
-        let path = write_exit_to_file(&signed, dir.path(), "0xpermtest").unwrap();
-
-        let metadata = std::fs::metadata(&path).unwrap();
-        let mode = metadata.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "exit file should have 0o600 permissions");
-    }
-
-    #[test]
-    fn submit_reads_prepared_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let signed = sample_signed_exit();
-
-        // Write using prepare_exit
-        let path = write_exit_to_file(&signed, dir.path(), "0xsubmittest").unwrap();
-
-        // Read using submit_exit
-        let loaded = read_exit_from_file(&path).unwrap();
-
-        assert_eq!(loaded.message.epoch, 300_000);
-        assert_eq!(loaded.message.validator_index, 12345);
-        assert_eq!(loaded.signature, vec![0xaa; 96]);
-    }
-
-    #[test]
-    fn roundtrip_prepare_to_submit() {
-        let dir = tempfile::tempdir().unwrap();
-        let original = sample_signed_exit();
-
-        let path = write_exit_to_file(&original, dir.path(), "0xroundtrip").unwrap();
-        let loaded = read_exit_from_file(&path).unwrap();
-
-        assert_eq!(loaded.message.epoch, original.message.epoch);
-        assert_eq!(loaded.message.validator_index, original.message.validator_index);
-        assert_eq!(loaded.signature, original.signature);
-    }
-}
+//
+// prepare/submit exit file I/O now lives next to the CLI consumers under
+// `bin/rvc/src/commands/{prepare_exit,submit_exit}.rs` (RF5-17). Coverage
+// moved with the modules as unit tests on the `rvc` binary target — see
+// `commands::prepare_exit::tests` and `commands::submit_exit::tests`.
 
 // =============================================================================
 // Composition: features work together
