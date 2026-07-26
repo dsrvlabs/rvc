@@ -677,10 +677,10 @@ file's private helpers (`escape_log_control_chars:801`, `sanitize_internal:815`,
    exactly those inline — do not make the helper `pub`.
 
 **Acceptance criteria:**
-- [ ] `handlers.rs` < 40% test lines; the four `tests/` files import only `keymanager_api`'s public surface.
-- [ ] One `TestApp` harness; no test rebuilds the router by hand.
-- [ ] No `pub` added to `handlers.rs`.
-- [ ] Test count before == after. Workspace green.
+- [x] `handlers.rs` < 40% test lines; the four `tests/` files import only `keymanager_api`'s public surface.
+- [x] One `TestApp` harness; no test rebuilds the router by hand.
+- [x] No `pub` added to `handlers.rs`.
+- [x] Test count before == after. Workspace green.
 
 **Risks:** F5 (Phase 5) and SEC-1 both rewrote `handlers.rs`; start from HEAD-of-Phase-5, not from the
 line numbers in this document, and re-derive the 980 boundary.
