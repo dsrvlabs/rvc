@@ -10,7 +10,6 @@ use rvc_slashing::{
     AttestationSlashingViolation, BlockSlashingViolation, SlashingDb, SlashingError,
 };
 
-const CN: &str = "test-cn";
 const PUBKEY: &str = "0xdeadbeef01";
 const PUBKEY2: &str = "0xdeadbeef02";
 const GVR: &[u8; 32] = &[0u8; 32];
@@ -211,7 +210,7 @@ fn test_stage_block_keeps_existing_check_and_record_unchanged() {
     let db = SlashingDb::open_in_memory().expect("open");
 
     // Use check_and_record for the first block.
-    db.check_and_record_block(CN, PUBKEY, 200, Some("0xcheck_root".into()), GVR)
+    db.check_and_record_block(PUBKEY, 200, Some("0xcheck_root".into()), GVR)
         .expect("check_and_record_block");
 
     // Stage a different slot — should work fine.
@@ -225,7 +224,7 @@ fn test_stage_block_keeps_existing_check_and_record_unchanged() {
 
     // Attempting to check_and_record at slot 200 with a different root must fail.
     let err = db
-        .check_and_record_block(CN, PUBKEY, 200, Some("0xdifferent".into()), GVR)
+        .check_and_record_block(PUBKEY, 200, Some("0xdifferent".into()), GVR)
         .expect_err("double proposal must be rejected by check_and_record");
     assert!(
         matches!(
@@ -241,7 +240,7 @@ fn test_stage_block_keeps_existing_check_and_record_unchanged() {
 fn test_stage_attestation_keeps_existing_check_and_record_unchanged() {
     let db = SlashingDb::open_in_memory().expect("open");
 
-    db.check_and_record_attestation(CN, PUBKEY2, 5, 15, Some("0xatt_check".into()), GVR)
+    db.check_and_record_attestation(PUBKEY2, 5, 15, Some("0xatt_check".into()), GVR)
         .expect("check_and_record_attestation");
 
     // Stage a non-conflicting attestation.
@@ -255,7 +254,7 @@ fn test_stage_attestation_keeps_existing_check_and_record_unchanged() {
 
     // Attempt a double vote via check_and_record — must be rejected.
     let err = db
-        .check_and_record_attestation(CN, PUBKEY2, 5, 15, Some("0xatt_conflict".into()), GVR)
+        .check_and_record_attestation(PUBKEY2, 5, 15, Some("0xatt_conflict".into()), GVR)
         .expect_err("double vote must be rejected");
     assert!(
         matches!(
@@ -587,7 +586,7 @@ fn test_stage_and_check_and_record_agree_on_watermark_equality() {
             .stage_block(PUBKEY, 1000, Some("0xparity_b".into()), GVR)
             .expect_err("stage must err at equality");
         let check_err = db
-            .check_and_record_block(CN, PUBKEY, 1000, Some("0xparity_b".into()), GVR)
+            .check_and_record_block(PUBKEY, 1000, Some("0xparity_b".into()), GVR)
             .expect_err("check_and_record must err at equality");
 
         assert!(
@@ -615,7 +614,7 @@ fn test_stage_and_check_and_record_agree_on_watermark_equality() {
             .stage_attestation(PUBKEY, 100, 200, Some("0xparity_a".into()), GVR)
             .expect_err("stage must err at target equality");
         let check_err = db
-            .check_and_record_attestation(CN, PUBKEY, 100, 200, Some("0xparity_a".into()), GVR)
+            .check_and_record_attestation(PUBKEY, 100, 200, Some("0xparity_a".into()), GVR)
             .expect_err("check_and_record must err at target equality");
 
         assert!(

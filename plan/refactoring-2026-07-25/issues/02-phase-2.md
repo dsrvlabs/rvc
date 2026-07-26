@@ -891,18 +891,18 @@ removed at ~127 sites, and leaving it means the next reader still has to ask wha
    assertion changes — only argument-list edits.
 
 **Acceptance criteria:**
-- [ ] `check_and_record_block` / `check_and_record_attestation` bodies are each under ~15 lines and
+- [x] `check_and_record_block` / `check_and_record_attestation` bodies are each under ~15 lines and
       contain no rule logic — a reviewer can see they only call `stage_*` and `commit`.
-- [ ] Exactly **one** EIP-3076 rule implementation remains in `crates/slashing` (`stage.rs`),
+- [x] Exactly **one** EIP-3076 rule implementation remains in `crates/slashing` (`stage.rs`),
       demonstrated by grep for the surround/surrounded/double-vote SQL.
-- [ ] `rg "_client_cn"` returns zero hits in `crates/slashing`.
-- [ ] The FU-32/FU-33 doc block appears once.
-- [ ] Transaction atomicity is unchanged — named test asserting check-and-write remain a single
+- [x] `rg "_client_cn"` returns zero hits in `crates/slashing`.
+- [x] The FU-32/FU-33 doc block appears once.
+- [x] Transaction atomicity is unchanged — named test asserting check-and-write remain a single
       `Immediate` transaction.
-- [ ] **Test-count delta stated and justified:** expected ≈ 0 (call-site argument edits only), plus
+- [x] **Test-count delta stated and justified:** expected ≈ 0 (call-site argument edits only), plus
       +1 to +3 *newly added* equivalence/atomicity tests. Any negative delta must be justified
       individually.
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **Risks:**
 - **Atomicity regression is the failure mode to fear.** If `stage_* → commit` does not hold the same

@@ -488,7 +488,7 @@ fn test_migration_failure_preserves_original() {
 /// Verifies that runtime writes via `check_and_record_block` and
 /// `check_and_record_attestation` store the correct `client_cn` (not `__legacy__`).
 #[test]
-fn test_new_rows_store_client_cn() {
+fn test_new_rows_store_cn_column() {
     let dir = tempdir().expect("tempdir");
     let db_path = dir.path().join("slashing.db");
     let gvr = [0u8; 32];
@@ -497,18 +497,11 @@ fn test_new_rows_store_client_cn() {
 
     let pubkey = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    db.check_and_record_block("local-vc", pubkey, 42, Some("0xdeadbeef".to_string()), &gvr)
+    db.check_and_record_block(pubkey, 42, Some("0xdeadbeef".to_string()), &gvr)
         .expect("block should be recorded");
 
-    db.check_and_record_attestation(
-        "local-vc",
-        pubkey,
-        100,
-        101,
-        Some("0xcafe1234".to_string()),
-        &gvr,
-    )
-    .expect("attestation should be recorded");
+    db.check_and_record_attestation(pubkey, 100, 101, Some("0xcafe1234".to_string()), &gvr)
+        .expect("attestation should be recorded");
 
     let conn = Connection::open(&db_path).unwrap();
 
@@ -548,11 +541,11 @@ fn test_cross_cn_double_sign_rejected_v3() {
     let pubkey = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     // peer-A records slot 42 with root R1.
-    db.check_and_record_block("peer-A", pubkey, 42, Some("0x1111".to_string()), &gvr)
+    db.check_and_record_block(pubkey, 42, Some("0x1111".to_string()), &gvr)
         .expect("peer-A block should succeed");
 
     // peer-B attempts the same slot 42 with a DIFFERENT root — MUST be rejected (v3 pubkey-scoped).
-    let result = db.check_and_record_block("peer-B", pubkey, 42, Some("0x2222".to_string()), &gvr);
+    let result = db.check_and_record_block(pubkey, 42, Some("0x2222".to_string()), &gvr);
     assert!(
         result.is_err(),
         "peer-B conflicting block must be rejected in v3 pubkey-scoped schema (DVT-1 / CN-1 fix)"
@@ -580,10 +573,9 @@ fn test_cn_scoped_double_proposal_rejected() {
     let db = SlashingDb::open_in_memory().expect("open in-memory db");
     let pubkey = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    db.check_and_record_block("local-vc", pubkey, 42, Some("0x1111".to_string()), &gvr)
+    db.check_and_record_block(pubkey, 42, Some("0x1111".to_string()), &gvr)
         .expect("first block should succeed");
 
-    let result =
-        db.check_and_record_block("local-vc", pubkey, 42, Some("0x2222".to_string()), &gvr);
+    let result = db.check_and_record_block(pubkey, 42, Some("0x2222".to_string()), &gvr);
     assert!(result.is_err(), "second block with different root from same CN should be rejected");
 }

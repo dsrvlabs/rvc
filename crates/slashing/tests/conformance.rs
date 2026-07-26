@@ -422,16 +422,14 @@ fn check_and_record_smoke_for_phase2_b4() {
     let pubkey = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     // Accept a block, then reject a conflicting double proposal at the same slot.
-    db.check_and_record_block("local-vc", pubkey, 100, Some("0xroot_a".into()), SIGN_GVR)
+    db.check_and_record_block(pubkey, 100, Some("0xroot_a".into()), SIGN_GVR)
         .expect("first block must succeed");
-    let blocked =
-        db.check_and_record_block("local-vc", pubkey, 100, Some("0xroot_b".into()), SIGN_GVR);
+    let blocked = db.check_and_record_block(pubkey, 100, Some("0xroot_b".into()), SIGN_GVR);
     assert!(blocked.is_err(), "conflicting block at same slot must be rejected");
 
     // Accept an attestation, then reject a double vote at the same target.
-    db.check_and_record_attestation("local-vc", pubkey, 1, 2, Some("0xatt_a".into()), SIGN_GVR)
+    db.check_and_record_attestation(pubkey, 1, 2, Some("0xatt_a".into()), SIGN_GVR)
         .expect("first attestation must succeed");
-    let blocked =
-        db.check_and_record_attestation("local-vc", pubkey, 1, 2, Some("0xatt_b".into()), SIGN_GVR);
+    let blocked = db.check_and_record_attestation(pubkey, 1, 2, Some("0xatt_b".into()), SIGN_GVR);
     assert!(blocked.is_err(), "double vote at same target must be rejected");
 }

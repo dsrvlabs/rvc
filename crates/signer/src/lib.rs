@@ -2924,13 +2924,7 @@ mod tests {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let gvr = [0xaa; 32];
         slashing_db
-            .check_and_record_block(
-                "sec-2a-test",
-                &pubkey_hex,
-                50,
-                Some(hex::encode([0xaa; 32])),
-                &gvr,
-            )
+            .check_and_record_block(&pubkey_hex, 50, Some(hex::encode([0xaa; 32])), &gvr)
             .expect("seed block row");
 
         let service = SignerService::new(signer, Arc::clone(&slashing_db))

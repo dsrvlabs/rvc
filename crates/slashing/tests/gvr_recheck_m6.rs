@@ -12,7 +12,6 @@ use tempfile::tempdir;
 
 use rvc_slashing::{SlashingDb, SlashingError};
 
-const CN: &str = "local-vc";
 const PUBKEY: &str = "0xabababababababababababababababababababababababababababababababababababababababababababababababababababab";
 
 // R1: first chain root (pinned in metadata).
@@ -48,7 +47,7 @@ fn test_check_and_record_block_chain_swap_rejected() {
     let db = open_memory_db_with_pinned_gvr(R1);
 
     let err = db
-        .check_and_record_block(CN, PUBKEY, 100, Some("0xroot".into()), R2)
+        .check_and_record_block(PUBKEY, 100, Some("0xroot".into()), R2)
         .expect_err("chain swap must be rejected");
 
     match err {
@@ -68,7 +67,7 @@ fn test_check_and_record_block_matching_gvr_succeeds_and_writes_row_column() {
     let db_path = dir.path().join("slashing.db");
     let db = open_file_db_with_pinned_gvr(&db_path, R1);
 
-    db.check_and_record_block(CN, PUBKEY, 200, Some("0xroot_ok".into()), R1)
+    db.check_and_record_block(PUBKEY, 200, Some("0xroot_ok".into()), R1)
         .expect("matching gvr must succeed");
     drop(db);
 
@@ -95,7 +94,7 @@ fn test_check_and_record_attestation_chain_swap_rejected() {
     let db = open_memory_db_with_pinned_gvr(R1);
 
     let err = db
-        .check_and_record_attestation(CN, PUBKEY, 1, 2, Some("0xatt_root".into()), R2)
+        .check_and_record_attestation(PUBKEY, 1, 2, Some("0xatt_root".into()), R2)
         .expect_err("chain swap must be rejected");
 
     match err {
@@ -115,7 +114,7 @@ fn test_check_and_record_attestation_matching_gvr_succeeds_and_writes_row_column
     let db_path = dir.path().join("slashing.db");
     let db = open_file_db_with_pinned_gvr(&db_path, R1);
 
-    db.check_and_record_attestation(CN, PUBKEY, 3, 5, Some("0xatt_ok".into()), R1)
+    db.check_and_record_attestation(PUBKEY, 3, 5, Some("0xatt_ok".into()), R1)
         .expect("matching gvr must succeed");
     drop(db);
 
@@ -315,7 +314,7 @@ fn test_legacy_row_no_per_row_gvr_does_not_break_violation_checks() {
     // Step 3: A double-vote attempt (same target_epoch=5, different signing_root) must
     // still be caught by the violation check even though the existing row has NULL gvr.
     let err = db
-        .check_and_record_attestation(CN, PUBKEY, 2, 5, Some("0xdifferent_root".into()), R1)
+        .check_and_record_attestation(PUBKEY, 2, 5, Some("0xdifferent_root".into()), R1)
         .expect_err("double-vote must be rejected");
 
     assert!(
@@ -333,7 +332,7 @@ fn test_no_pinned_gvr_check_is_skipped() {
     let db = SlashingDb::open_in_memory().expect("open");
 
     // Even with an arbitrary gvr, the call must succeed (no pinned value to compare).
-    db.check_and_record_block(CN, PUBKEY, 1, Some("0xroot".into()), R2)
+    db.check_and_record_block(PUBKEY, 1, Some("0xroot".into()), R2)
         .expect("no pinned gvr → check is skipped → must succeed");
 }
 
@@ -346,12 +345,12 @@ fn test_gvr_cache_populated_after_first_check() {
     let db = open_memory_db_with_pinned_gvr(R1);
 
     // First call: populates cache from DB, passes (matching gvr).
-    db.check_and_record_block(CN, PUBKEY, 500, Some("0xfirst".into()), R1)
+    db.check_and_record_block(PUBKEY, 500, Some("0xfirst".into()), R1)
         .expect("first call must succeed");
 
     // Second call: cache is already populated; mismatch must still be caught.
     let err = db
-        .check_and_record_block(CN, PUBKEY, 501, Some("0xsecond".into()), R2)
+        .check_and_record_block(PUBKEY, 501, Some("0xsecond".into()), R2)
         .expect_err("cached mismatch must be rejected");
 
     assert!(
@@ -370,7 +369,7 @@ fn test_gvr_cache_none_not_poisoned_after_set() {
     let db = SlashingDb::open_in_memory().expect("open");
 
     // First call: no pinned GVR → check is skipped (returns Ok).
-    db.check_and_record_block(CN, PUBKEY, 100, Some("0xfirst".into()), R1)
+    db.check_and_record_block(PUBKEY, 100, Some("0xfirst".into()), R1)
         .expect("no pinned gvr: skipped → must succeed");
 
     // Now pin GVR R1.
@@ -379,7 +378,7 @@ fn test_gvr_cache_none_not_poisoned_after_set() {
     // Next call with a DIFFERENT gvr must now be rejected — the cache must
     // have re-read from DB rather than use the stale "no pinned gvr → skip".
     let err = db
-        .check_and_record_block(CN, PUBKEY, 101, Some("0xsecond".into()), R2)
+        .check_and_record_block(PUBKEY, 101, Some("0xsecond".into()), R2)
         .expect_err("after pinning, mismatch must be rejected");
     assert!(
         matches!(err, SlashingError::GenesisRootMismatch { .. }),
@@ -387,6 +386,6 @@ fn test_gvr_cache_none_not_poisoned_after_set() {
     );
 
     // Same call with the matching gvr must succeed (and the cache is now sealed).
-    db.check_and_record_block(CN, PUBKEY, 102, Some("0xthird".into()), R1)
+    db.check_and_record_block(PUBKEY, 102, Some("0xthird".into()), R1)
         .expect("matching gvr after pinning must succeed");
 }
