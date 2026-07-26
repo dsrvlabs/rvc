@@ -6,6 +6,9 @@
 //! - `timeout(Duration::from_secs(10))` — per-request timeout via Tower
 //!
 //! And that per-service `max_decoding_message_size(1 MiB)` blocks oversized requests.
+//!
+//! RF2-15: ported from v1 raw-root `Sign` onto v2 `SignBeaconBlock` so this suite
+//! does not depend on the retiring v1 SignerService surface.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -17,30 +20,31 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Channel;
 use tonic::{Code, Request, Response, Status};
 
-// Server-side: use types generated inside rvc-signer-bin so the trait impl types match.
-use rvc_signer_bin::{
+// V2 service types from rvc-grpc-signer (external dep name `grpc-signer` → `grpc_signer`).
+// Using the client crate's v2 types keeps this test free of rvc-signer-bin's v1 surface
+// so RF2-17 can delete that surface without revisiting these assertions.
+use grpc_signer::proto::signer_v2::{
     GetStatusRequest, GetStatusResponse, ListPublicKeysRequest, ListPublicKeysResponse,
-    SignRequest, SignResponse,
+    SignAggregateAndProofRequest, SignAttestationDataRequest, SignBeaconBlockRequest,
+    SignBlindedBeaconBlockRequest, SignBuilderRegistrationRequest, SignContributionAndProofRequest,
+    SignRandaoRevealRequest, SignResponse, SignSyncAggregatorSelectionDataRequest,
+    SignSyncCommitteeMessageRequest, SignVoluntaryExitRequest,
 };
-use rvc_signer_bin::{SignerService, SignerServiceServer};
-
-// Client from rvc-grpc-signer (always builds the client code; rvc-signer-bin only
-// builds the client when the `dvt` feature is enabled).
-// Both crates compile the same .proto so the wire format is identical, even though
-// the Rust types are distinct.
-use grpc_signer::SignerServiceClient;
+use grpc_signer::{SignerServiceClientV2, SignerServiceServerV2, SignerServiceV2};
 
 use rvc_signer_bin::tls::server_builder::hardened_server_builder;
 
 // ── TestService ────────────────────────────────────────────────────────────────
 
-/// Minimal gRPC v1 service for testing server-level limits.
+/// Minimal gRPC v2 service for testing server-level limits.
 ///
-/// The `sign` handler:
+/// The `sign_beacon_block` handler:
 /// - increments `concurrent`, updates `peak_concurrent`
 /// - notifies `handler_started` (so the timeout test can synchronize)
 /// - sleeps for `handler_sleep` before returning
 /// - decrements `concurrent`
+///
+/// Other RPCs are stubs (unused by the limit assertions).
 struct TestService {
     handler_sleep: Duration,
     concurrent: Arc<AtomicI32>,
@@ -61,11 +65,8 @@ impl TestService {
     fn handler_started_notifier(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.handler_started)
     }
-}
 
-#[tonic::async_trait]
-impl SignerService for TestService {
-    async fn sign(&self, _request: Request<SignRequest>) -> Result<Response<SignResponse>, Status> {
+    async fn run_instrumented_handler(&self) -> Result<Response<SignResponse>, Status> {
         let prev = self.concurrent.fetch_add(1, Ordering::SeqCst);
         let cur = prev + 1;
 
@@ -91,6 +92,79 @@ impl SignerService for TestService {
 
         self.concurrent.fetch_sub(1, Ordering::SeqCst);
         Ok(Response::new(SignResponse { signature: vec![0u8; 96] }))
+    }
+}
+
+#[tonic::async_trait]
+impl SignerServiceV2 for TestService {
+    async fn sign_beacon_block(
+        &self,
+        _request: Request<SignBeaconBlockRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        self.run_instrumented_handler().await
+    }
+
+    async fn sign_blinded_beacon_block(
+        &self,
+        _request: Request<SignBlindedBeaconBlockRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("test mock"))
+    }
+
+    async fn sign_attestation_data(
+        &self,
+        _request: Request<SignAttestationDataRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("test mock"))
+    }
+
+    async fn sign_aggregate_and_proof(
+        &self,
+        _request: Request<SignAggregateAndProofRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("test mock"))
+    }
+
+    async fn sign_sync_committee_message(
+        &self,
+        _request: Request<SignSyncCommitteeMessageRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("test mock"))
+    }
+
+    async fn sign_sync_aggregator_selection_data(
+        &self,
+        _request: Request<SignSyncAggregatorSelectionDataRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("test mock"))
+    }
+
+    async fn sign_contribution_and_proof(
+        &self,
+        _request: Request<SignContributionAndProofRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("test mock"))
+    }
+
+    async fn sign_builder_registration(
+        &self,
+        _request: Request<SignBuilderRegistrationRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("test mock"))
+    }
+
+    async fn sign_randao_reveal(
+        &self,
+        _request: Request<SignRandaoRevealRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("test mock"))
+    }
+
+    async fn sign_voluntary_exit(
+        &self,
+        _request: Request<SignVoluntaryExitRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("test mock"))
     }
 
     async fn list_public_keys(
@@ -125,7 +199,7 @@ async fn spawn_test_server(svc: TestService) -> (SocketAddr, tokio::task::JoinHa
     let handle = tokio::spawn(async move {
         hardened_server_builder()
             .add_service(
-                SignerServiceServer::new(svc).max_decoding_message_size(1 << 20), // 1 MiB
+                SignerServiceServerV2::new(svc).max_decoding_message_size(1 << 20), // 1 MiB
             )
             .serve_with_incoming(TcpListenerStream::new(listener))
             .await
@@ -144,11 +218,24 @@ fn make_channel(addr: SocketAddr) -> Channel {
     Channel::from_shared(format!("http://{addr}")).unwrap().connect_lazy()
 }
 
+fn small_sign_beacon_block_request() -> SignBeaconBlockRequest {
+    SignBeaconBlockRequest {
+        pubkey: vec![0u8; 48],
+        fork_info: None,
+        block_ssz: vec![0u8; 84],
+        fork_id: 4, // Deneb
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 /// Sending a message larger than `max_decoding_message_size` (1 MiB) must be
 /// rejected by the server.  Tonic 0.12 returns `OutOfRange` (gRPC status 11)
 /// for codec-level size violations (see `tonic::codec::decode`).
+///
+/// Oversized payload is carried in `SignBeaconBlockRequest.block_ssz` (raw
+/// `bytes`) so the rejection still happens at the decode layer, matching the
+/// former v1 `signing_root` oversized case.
 #[tokio::test]
 async fn test_oversized_message_refused() {
     let svc = TestService::new(Duration::ZERO);
@@ -156,15 +243,17 @@ async fn test_oversized_message_refused() {
 
     // Client must be able to SEND a 2 MiB message (raise client encoding cap).
     let mut client =
-        SignerServiceClient::new(make_channel(addr)).max_encoding_message_size(8 * 1024 * 1024); // 8 MiB — well above 2 MiB
+        SignerServiceClientV2::new(make_channel(addr)).max_encoding_message_size(8 * 1024 * 1024); // 8 MiB — well above 2 MiB
 
-    // SignRequest with a 2 MiB signing_root (exceeds server's 1 MiB decode limit).
-    let req = grpc_signer::SignRequest {
-        signing_root: vec![0xAB; 2 * 1024 * 1024],
+    // SignBeaconBlockRequest with a 2 MiB block_ssz (exceeds server's 1 MiB decode limit).
+    let req = SignBeaconBlockRequest {
         pubkey: vec![0u8; 48],
+        fork_info: None,
+        block_ssz: vec![0xAB; 2 * 1024 * 1024],
+        fork_id: 4,
     };
 
-    let result = client.sign(req).await;
+    let result = client.sign_beacon_block(req).await;
     let err = result.expect_err("server must reject 2 MiB message");
 
     // Tonic 0.12 maps decode-size violations to OutOfRange (code 11); the
@@ -192,14 +281,13 @@ async fn test_request_timeout() {
     let notifier = svc.handler_started_notifier();
     let (addr, _handle) = spawn_test_server(svc).await;
 
-    let mut client = SignerServiceClient::new(make_channel(addr));
+    let mut client = SignerServiceClientV2::new(make_channel(addr));
 
     // Spawn the request so we can interleave time advancement.
-    let req_task = tokio::spawn(async move {
-        client
-            .sign(grpc_signer::SignRequest { signing_root: vec![0u8; 32], pubkey: vec![0u8; 48] })
-            .await
-    });
+    let req_task =
+        tokio::spawn(
+            async move { client.sign_beacon_block(small_sign_beacon_block_request()).await },
+        );
 
     // Wait until the server handler has started (its sleep timer is running).
     notifier.notified().await;
@@ -264,13 +352,8 @@ async fn test_concurrent_stream_surge_bounded() {
     for _ in 0..NUM_REQUESTS {
         let ch = base_channel.clone();
         handles.push(tokio::spawn(async move {
-            let mut client = SignerServiceClient::new(ch);
-            client
-                .sign(grpc_signer::SignRequest {
-                    signing_root: vec![0u8; 32],
-                    pubkey: vec![0u8; 48],
-                })
-                .await
+            let mut client = SignerServiceClientV2::new(ch);
+            client.sign_beacon_block(small_sign_beacon_block_request()).await
         }));
     }
 

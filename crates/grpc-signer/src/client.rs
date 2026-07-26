@@ -27,8 +27,8 @@ use crate::proto::signer_v2::{
     SignVoluntaryExitRequest,
 };
 
-// SS-1 (Issue 2.2): v1 SignerServiceClient removed from connect path.
-// The v2 client handles ListPublicKeys via SignerServiceClientV2.
+// RF2-15: v1 SignerService surface fully retired from this crate; connect and
+// all signing RPCs use SignerServiceClientV2 only.
 
 /// The proto package name emitted by the v2 `GetStatus` response.
 /// `bin/rvc` checks this at startup to refuse a v1 signer.

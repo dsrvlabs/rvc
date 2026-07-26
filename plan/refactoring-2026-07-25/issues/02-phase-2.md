@@ -1232,17 +1232,17 @@ prevent. Delete it, and drop the v1 `tonic_build` invocation from the crate's `b
    RPCs unchanged.
 
 **Acceptance criteria:**
-- [ ] `crates/grpc-signer` compiles exactly one proto file (`signer.v2.proto`); `build.rs` has one
+- [x] `crates/grpc-signer` compiles exactly one proto file (`signer.v2.proto`); `build.rs` has one
       `tonic_build` invocation.
-- [ ] `rg "grpc_signer::.*Sign(Request|Response)\b"` returns zero hits workspace-wide.
-- [ ] `tonic_limits_m10.rs` exercises a v2 RPC and still asserts the decode-size limit; it no longer
+- [x] `rg "grpc_signer::.*Sign(Request|Response)\b"` returns zero hits workspace-wide.
+- [x] `tonic_limits_m10.rs` exercises a v2 RPC and still asserts the decode-size limit; it no longer
       references `grpc_signer`'s v1 exports **or** `rvc_signer_bin`'s v1 `SignerService`/`Server`
       (so RF2-17 does not have to touch it).
-- [ ] `GrpcRemoteSigner::connect` behaviour is unchanged — existing connect tests green, unmodified.
-- [ ] **Test-count delta stated and justified:** expected ≈ −3 (the v1 type-accessibility unit tests
+- [x] `GrpcRemoteSigner::connect` behaviour is unchanged — existing connect tests green, unmodified.
+- [x] **Test-count delta stated and justified:** expected ≈ −3 (the v1 type-accessibility unit tests
       in `lib.rs`, *deleted-with-the-dead-code*) and ≈ 0 for `tonic_limits_m10` (ported, same
       assertion count).
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **Risks:**
 - The v2 substitute for the decode-limit test must actually exceed the limit at the same layer.
