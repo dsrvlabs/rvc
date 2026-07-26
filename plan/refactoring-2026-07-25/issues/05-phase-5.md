@@ -1226,13 +1226,13 @@ and backend construction (including the once-only allow-list read that closes a 
 3. Keep the crypto-provider install idempotent and first, with its ADR-006 comment intact.
 
 **Acceptance criteria:**
-- [ ] The insecure gate still requires **both** the CLI flag and the env var (test both single
+- [x] The insecure gate still requires **both** the CLI flag and the env var (test both single
       conditions).
-- [ ] Missing DB path without `--init-slashing-db` fails closed; corrupt header always fails.
-- [ ] The CN allow-list file is read exactly once per startup (assert via a counting fixture or a
+- [x] Missing DB path without `--init-slashing-db` fails closed; corrupt header always fails.
+- [x] The CN allow-list file is read exactly once per startup (assert via a counting fixture or a
       read-once wrapper).
-- [ ] DVT and non-DVT builds both green; DVT backend construction is covered by a test.
-- [ ] RF5-18 tests green.
+- [x] DVT and non-DVT builds both green; DVT backend construction is covered by a test.
+- [x] RF5-18 tests green.
 
 **TDD test plan** (RED first):
 - `test_open_slashing_db_refuses_without_both_insecure_conditions` — **RED**: no such function; today

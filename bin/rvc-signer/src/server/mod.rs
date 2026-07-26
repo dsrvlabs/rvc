@@ -1,36 +1,41 @@
 //! Signer server composition root (`server::run`).
 //!
-//! Extracted from `main.rs` as a **verbatim body move** (RF5-19) so the
-//! assembly is reachable from the library target. Follow-up issues (RF5-20+)
-//! decompose this god function; keep the body intact here.
+//! RF5-19 moved the former `main::run_serve` body into the library target.
+//! RF5-20 decomposes the first two phases into [`open_slashing_db`] and
+//! [`build_backend`]; further decomposition (gRPC / HTTP) is RF5-21+.
+
+mod backend;
+mod slashing;
+
+pub(crate) use backend::build_backend;
+pub(crate) use slashing::open_slashing_db;
+
+/// Process-global env mutations in server unit tests must take this lock so
+/// concurrent tests do not clobber each other's `RVC_*` variables.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner())
+}
 
 use std::sync::Arc;
 
 use tracing::{error, info};
-#[cfg(feature = "dvt")]
-use zeroize::Zeroizing;
 
 use crate::error::ServerError;
 use crate::{
-    backend, config, http_api, insecure_startup, metrics, reload, service, slashing, tls,
-    SignerServiceServerV2,
+    config, http_api, insecure_startup, metrics, reload, service, tls, SignerServiceServerV2,
 };
 #[cfg(feature = "dvt")]
 use crate::{dvt, PeerSignerServiceServerV2};
 
-/// Signing backend type (mirrors the CLI enum; string-parsed from `ResolvedConfig`).
-#[cfg(feature = "dvt")]
-#[derive(Clone, Debug)]
-enum BackendKind {
-    Basic,
-    Dvt,
-}
-
 /// Run the signer server until `shutdown` is cancelled.
 ///
-/// Body is the former `main::run_serve` composition root, moved verbatim into
-/// the library target so tests can drive it in-process (RF5-19). Decomposition
-/// into `open_slashing_db` / `build_backend` / etc. is RF5-20+.
+/// Composition root: crypto-provider install → password → TLS material →
+/// [`build_backend`] → hot-reload / metrics → [`open_slashing_db`] → gate +
+/// services → serve until `shutdown` is cancelled.
 pub async fn run(
     resolved: crate::config::ResolvedConfig,
     shutdown: tokio_util::sync::CancellationToken,
@@ -68,76 +73,15 @@ pub async fn run(
 
     // Build the signing backend and optional share-map for the PeerSignerService.
     // The PeerSignerService is constructed later (after the slashing DB is opened),
-    // so build_dvt_backend returns the raw share_map rather than a complete service.
-    //
-    // The allow-list is loaded ONCE here (DVT arm only) and shared between the
-    // client-side SNI derivation (build_dvt_backend) and the server-side
-    // PeerSignerService (constructed below).  This avoids a TOCTOU double-read
-    // and ensures both paths see the same allow-list snapshot (ISSUE-4.1 / L-1).
+    // so build_backend returns the raw share_map / allow-list rather than a complete
+    // service. Allow-list is loaded ONCE inside build_backend (ISSUE-4.1 / L-1).
+    let built = build_backend(&resolved, &signer_metrics, &password, tls_config.as_ref()).await?;
+    let signing_backend = built.signing_backend;
+    let basic_signer_ref = built.basic_signer;
     #[cfg(feature = "dvt")]
-    type ShareMap = Arc<std::collections::HashMap<[u8; 48], dvt::types::ShareInfo>>;
-
-    // Separate variable to capture the allow-list from the DVT arm without
-    // pushing the match binding into clippy::type_complexity territory.
+    let dvt_share_map_opt = built.dvt_share_map;
     #[cfg(feature = "dvt")]
-    let mut dvt_allow_list_opt: Option<Arc<dvt::allow_list::AllowedPeers>> = None;
-
-    #[cfg(feature = "dvt")]
-    let (signing_backend, dvt_share_map_opt, basic_signer_ref): (
-        Arc<dyn crate::backend::SigningBackend>,
-        Option<ShareMap>,
-        Option<Arc<crate::backend::basic::BasicSigner>>,
-    ) = match parse_backend(&resolved.backend)? {
-        BackendKind::Basic => {
-            let signer = Arc::new(
-                backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)
-                    .map_err(|e| ServerError::backend(e.to_string()))?,
-            );
-            (Arc::clone(&signer) as Arc<dyn crate::backend::SigningBackend>, None, Some(signer))
-        }
-        BackendKind::Dvt => {
-            // Load allow-list once; shared by client SNI pinning + server peer service.
-            let allow_list: Option<Arc<dvt::allow_list::AllowedPeers>> =
-                if let Some(path) = resolved.dvt_allowed_peers.as_deref() {
-                    let al = dvt::allow_list::AllowedPeers::load_from_path(path).map_err(|e| {
-                        ServerError::config(format!("failed to load DVT allow-list: {e}"))
-                    })?;
-                    info!(
-                        path = %path.display(),
-                        peer_count = al.peers.len(),
-                        "Loaded DVT allow-list"
-                    );
-                    Some(Arc::new(al))
-                } else {
-                    None
-                };
-
-            let (backend, share_map) = build_dvt_backend(
-                &resolved,
-                &password,
-                tls_config.as_ref(),
-                Arc::new(signer_metrics.dvt.clone()),
-                allow_list.clone(),
-            )
-            .await?;
-
-            dvt_allow_list_opt = allow_list;
-            (backend, Some(share_map), None)
-        }
-    };
-
-    #[cfg(not(feature = "dvt"))]
-    let (signing_backend, _peer_signer_service, basic_signer_ref): (
-        Arc<dyn crate::backend::SigningBackend>,
-        Option<()>,
-        Option<Arc<crate::backend::basic::BasicSigner>>,
-    ) = {
-        let signer = Arc::new(
-            backend::basic::BasicSigner::load(&resolved.keystore_dir, &password)
-                .map_err(|e| ServerError::backend(e.to_string()))?,
-        );
-        (Arc::clone(&signer) as Arc<dyn crate::backend::SigningBackend>, None, Some(signer))
-    };
+    let dvt_allow_list_opt = built.dvt_allow_list;
 
     // Validate TLS certificates if provided
     if let Some(ref tls) = tls_config {
@@ -215,89 +159,7 @@ pub async fn run(
             .map_err(|e| ServerError::bind(e.to_string()))?;
     info!(address = %metrics_bound_addr, "Prometheus metrics server listening");
 
-    // ── Slashing protection gate (OQ-A4 binding decision) ────────────────────
-    //
-    // rvc-signer refuses to start without a SlashingDb unless:
-    //   (a) --disable-slashing-protection is on the CLI, AND
-    //   (b) RVC_ALLOW_INSECURE=true is set in the environment.
-    //
-    // Both checks are required so a stray env-var leak cannot silently disable
-    // slashing protection.
-    let data_dir = resolved.data_dir.as_deref().or_else(|| resolved.keystore_dir.parent());
-
-    let slashing_cfg =
-        slashing::SlashingDbConfig::from_env(data_dir, resolved.disable_slashing_protection);
-    slashing_cfg.validate().map_err(|e| {
-        error!(error = %e, "slashing protection configuration error");
-        ServerError::slashing_db(e)
-    })?;
-
-    let slashing_db_opt: Option<Arc<::slashing::SlashingDb>> =
-        if slashing_cfg.mode == slashing::SlashingProtectionMode::DisabledBothFlags {
-            None
-        } else if let Some(ref db_path) = slashing_cfg.db_path {
-            info!(path = %db_path.display(), "Opening slashing protection database");
-            // SEC-3: fail closed on missing path without --init-slashing-db; 0-byte /
-            // corrupt header is always rejected inside open_with_create_info.
-            if db_path.exists() {
-                let meta = std::fs::metadata(db_path).map_err(|e| {
-                    ServerError::slashing_db(format!(
-                        "failed to stat slashing DB at {}: {}",
-                        db_path.display(),
-                        e
-                    ))
-                })?;
-                if meta.len() == 0 {
-                    return Err(ServerError::slashing_db(format!(
-                        "slashing protection database at {} is empty (0-byte). \
-                     This is corruption, not a fresh init — restore from backup. \
-                     --init-slashing-db cannot override this.",
-                        db_path.display()
-                    )));
-                }
-            } else if !resolved.init_slashing_db {
-                return Err(ServerError::slashing_db(format!(
-                    "slashing protection database does not exist at {}. \
-                 Refusing to create a fresh empty DB (would sign with zero history). \
-                 For a genuine new deployment, pass --init-slashing-db. \
-                 If this path should hold existing history, restore the DB from backup.",
-                    db_path.display()
-                )));
-            } else {
-                error!(
-                    path = %db_path.display(),
-                    "CREATING A NEW EMPTY SIGNER SLASHING PROTECTION DATABASE. \
-                     This DB has ZERO signing history. If this signer was previously \
-                     active, signing with a fresh DB can DOUBLE-SIGN and get validators \
-                     SLASHED. Only proceed for a genuine first-time deployment. \
-                     Opt-in was granted via --init-slashing-db."
-                );
-            }
-
-            let (db, created_fresh) = ::slashing::SlashingDb::open_with_create_info(db_path)
-                .map_err(|e| {
-                    ServerError::slashing_db(format!(
-                        "failed to open slashing DB at {}: {}",
-                        db_path.display(),
-                        e
-                    ))
-                })?;
-            // TOCTOU close: refuse accidental create if path vanished mid-startup.
-            if created_fresh && !resolved.init_slashing_db {
-                drop(db);
-                let _ = std::fs::remove_file(db_path);
-                return Err(ServerError::slashing_db(format!(
-                    "slashing protection database was created at {} without \
-                 --init-slashing-db (possible TOCTOU / missing volume). \
-                 Refusing to sign with zero history. Restore from backup or \
-                 re-run with --init-slashing-db for a genuine first deploy.",
-                    db_path.display()
-                )));
-            }
-            Some(Arc::new(db))
-        } else {
-            None
-        };
+    let slashing_db_opt = open_slashing_db(&resolved)?;
 
     // Build the v2 service implementation (RF2-17: v1 proto surface is gone).
     // Hoist (ADR-003, FR-26): build the ONE shared `SigningGate` at the
@@ -354,7 +216,7 @@ pub async fn run(
     ) =
         dvt_share_map_opt
     {
-        // Reuse the Arc loaded in the BackendKind::Dvt arm above.
+        // Reuse the Arc loaded in build_backend.
         let allow_list = dvt_allow_list_opt.ok_or_else(|| {
                 ServerError::config(
                     "DVT is enabled but --dvt-allowed-peers was not provided. \
@@ -515,108 +377,6 @@ pub async fn run(
     Ok(())
 }
 
-/// Returns the DVT signing backend AND the share map (for `PeerSignerService`).
-/// The share map is returned separately so the caller can build `PeerSignerServiceImpl`
-/// AFTER the slashing DB is opened (allowing CN-scoped slashing for DVT peers).
-///
-/// `allow_list`: the pre-loaded allow-list (hoisted from `run_serve` to avoid a
-/// double file-read).  When TLS is enabled, `build_peer_connect_infos` requires
-/// this to be `Some` and every `dvt_peers` address to have a matching entry —
-/// any gap is a startup error (ISSUE-4.1 / L-1: no silent SNI bypass).
-#[cfg(feature = "dvt")]
-pub(crate) async fn build_dvt_backend(
-    resolved: &crate::config::ResolvedConfig,
-    password: &Zeroizing<String>,
-    tls_config: Option<&crate::tls::TlsConfig>,
-    dvt_metrics: Arc<crate::metrics::DvtMetrics>,
-    allow_list: Option<Arc<crate::dvt::allow_list::AllowedPeers>>,
-) -> Result<
-    (
-        Arc<dyn crate::backend::SigningBackend>,
-        Arc<std::collections::HashMap<[u8; 48], crate::dvt::types::ShareInfo>>,
-    ),
-    ServerError,
-> {
-    use std::collections::HashMap;
-    use std::time::Duration;
-
-    let dvt_index = resolved
-        .dvt_index
-        .ok_or_else(|| ServerError::config("dvt_index is required when using backend dvt"))?;
-
-    let timeout = Duration::from_millis(resolved.dvt_timeout_ms);
-
-    let shares = dvt::types::load_shares(&resolved.keystore_dir, password)
-        .map_err(|e| ServerError::backend(format!("failed to load DVT shares: {e}")))?;
-
-    if shares.is_empty() {
-        return Err(ServerError::backend("no DVT shares found in keystore directory"));
-    }
-
-    info!(
-        share_count = shares.len(),
-        dvt_index,
-        peer_count = resolved.dvt_peers.len(),
-        "Loaded DVT shares"
-    );
-
-    let share_map: HashMap<[u8; 48], dvt::types::ShareInfo> =
-        shares.iter().map(|s| (s.aggregate_pubkey, s.clone())).collect();
-    let share_map = Arc::new(share_map);
-
-    // ── L-1 SNI pinning: build per-peer connection info ──────────────────────
-    //
-    // `build_peer_connect_infos` enforces a hard invariant: when TLS is active,
-    // every dvt_peers address must have a matching `addr=` entry in the
-    // allow-list.  Missing entries are startup errors — there is no silent
-    // fallback to un-pinned TLS (ISSUE-4.1 / L-1 review fix).
-    let peer_infos: Vec<dvt::peer_client::PeerConnectInfo> =
-        dvt::peer_client::build_peer_connect_infos(
-            &resolved.dvt_peers,
-            allow_list.as_deref(),
-            tls_config.is_some(),
-        )
-        .map_err(|e| ServerError::config(format!("DVT peer SNI configuration error: {e}")))?;
-
-    let peer_requester = if !peer_infos.is_empty() {
-        let requester =
-            dvt::peer_client::GrpcPeerRequester::connect(&peer_infos, tls_config, timeout)
-                .await
-                .map_err(|e| {
-                    ServerError::backend(format!("failed to connect to DVT peers: {e}"))
-                })?;
-
-        info!(peers = ?requester.peer_addrs(), "Connected to DVT peers");
-        Some(Arc::new(requester) as Arc<dyn backend::dvt::PeerRequester>)
-    } else {
-        info!("No DVT peers configured; running in standalone mode");
-        None
-    };
-
-    let dvt_signer = backend::dvt::DvtSigner::new(
-        shares,
-        dvt_index,
-        resolved.dvt_peers.clone(),
-        peer_requester,
-        timeout,
-    )
-    .with_metrics(dvt_metrics);
-
-    Ok((Arc::new(dvt_signer), share_map))
-}
-
-/// Parse the backend string into a `BackendKind` enum.
-#[cfg(feature = "dvt")]
-fn parse_backend(backend: &str) -> Result<BackendKind, ServerError> {
-    match backend {
-        "basic" => Ok(BackendKind::Basic),
-        "dvt" => Ok(BackendKind::Dvt),
-        other => {
-            Err(ServerError::config(format!("unknown backend: {other}; expected 'basic' or 'dvt'")))
-        }
-    }
-}
-
 #[cfg(test)]
 // RF1-12: unit tests may mutate env via unsafe set_var/remove_var.
 // await_holding_lock: ENV_LOCK intentionally serializes process-global env
@@ -626,17 +386,9 @@ mod tests {
     use super::*;
     use crate::config::{HttpTlsMode, ResolvedConfig};
     use crate::error::ServerError;
-    use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
-
-    /// Serialize env mutations across these tests.
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|p| p.into_inner())
-    }
 
     fn free_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
