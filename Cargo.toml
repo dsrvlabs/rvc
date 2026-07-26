@@ -3,8 +3,7 @@ members = ["bin/rvc", "bin/rvc-keygen", "bin/rvc-signer", "crates/architecture-t
 default-members = ["bin/rvc", "crates/architecture-tests"]
 resolver = "2"
 
-# Use `deny` (not `forbid`) so file-level `#![allow(unsafe_code)]
-` remains possible for
+# Use `deny` (not `forbid`) so file-level `#![allow(unsafe_code)]` remains possible for
 # the reviewed test-only allow-list (GlobalAlloc counters, env::set_var in tests).
 # `forbid` cannot be overridden and would break that allow-list.
 [workspace.lints.rust]
