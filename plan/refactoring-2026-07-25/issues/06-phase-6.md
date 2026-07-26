@@ -596,12 +596,12 @@ would require widening visibility — which the H1 rule forbids. The submodule f
    it currently hides genuinely unused fields, and it is in the production half this issue is isolating.
 
 **Acceptance criteria:**
-- [ ] `coordinator/mod.rs` is production-only and **< 800 lines**; no topic test file exceeds ~900 lines.
-- [ ] Commit 1 is a pure move (`git diff -M` = renames + `mod` declaration); mock dedup, if any, is
+- [x] `coordinator/mod.rs` is production-only and **< 800 lines**; no topic test file exceeds ~900 lines.
+- [x] Commit 1 is a pure move (`git diff -M` = renames + `mod` declaration); mock dedup, if any, is
       commit 2 with its own justification.
-- [ ] Test count before == after.
-- [ ] The struct-level `#[allow(dead_code)]` is gone (per-field or fields deleted).
-- [ ] Workspace green, including `crates/rvc/tests/sync_independent_of_attesting.rs`.
+- [x] Test count before == after.
+- [x] The struct-level `#[allow(dead_code)]` is gone (per-field or fields deleted).
+- [x] Workspace green, including `crates/rvc/tests/sync_independent_of_attesting.rs`.
 
 **Risks:** **Cross-track conflict** — test-audit issues **3.10** and **4.1** both list `coordinator.rs`
 under "Shared File Edits". Land them first or rebase; coordinate at kickoff. This is the single most
