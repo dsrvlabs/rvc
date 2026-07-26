@@ -15,11 +15,13 @@
 mod beacon;
 mod enablement;
 mod keys;
+mod services;
 mod slashing;
 
 pub use beacon::{connect_beacon, BeaconHandles};
 pub use enablement::{wire_signing_enablement, EnablementHandles};
 pub use keys::{load_signing_keys, LoadedKeys};
+pub use services::{build_services, ServiceHandles};
 pub use slashing::{open_slashing_db, KeystoreLockGuard, SlashingDbHandles};
 
 use std::sync::Arc;

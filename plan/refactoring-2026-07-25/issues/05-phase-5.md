@@ -587,11 +587,11 @@ the awkward "create a new `BeaconClient` from the first proposer endpoint" comme
 4. Keep the attesting toggle `Arc<AtomicBool>` shared with the orchestrator and the keymanager API.
 
 **Acceptance criteria:**
-- [ ] Unknown-fork startup is still fatal by default and still opt-out-able via `allow_unsupported_fork`.
-- [ ] Every keystore-loaded validator is registered in the validator store (regression test).
-- [ ] The proposer path uses the proposer `BnManager` (E7 semantics), not a hand-built client.
-- [ ] The attesting toggle is one `Arc<AtomicBool>` shared by orchestrator and keymanager.
-- [ ] RF5-01 smoke tests green, including the fork-mismatch case from `MockBn::with_fork`.
+- [x] Unknown-fork startup is still fatal by default and still opt-out-able via `allow_unsupported_fork`.
+- [x] Every keystore-loaded validator is registered in the validator store (regression test).
+- [x] The proposer path uses the proposer `BnManager` (E7 semantics), not a hand-built client.
+- [x] The attesting toggle is one `Arc<AtomicBool>` shared by orchestrator and keymanager.
+- [x] RF5-01 smoke tests green, including the fork-mismatch case from `MockBn::with_fork`.
 
 **TDD test plan** (RED first):
 - `test_build_services_registers_all_loaded_validators` — **RED**: no phase function; the D-3 rule is

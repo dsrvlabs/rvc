@@ -48,9 +48,6 @@ impl MockBnBuilder {
     }
 
     /// Select which known fork the head state reports.
-    ///
-    /// Used by later issues (e.g. RF5-07) to exercise the fork-compat gate.
-    #[allow(dead_code)] // RF5-07 fork-compat smoke extension
     pub fn with_fork(mut self, fork: ForkName) -> Self {
         self.head_fork = fork;
         self.head_fork_version_override = None;
@@ -58,7 +55,6 @@ impl MockBnBuilder {
     }
 
     /// Force an arbitrary head fork version hex (e.g. unsupported `0xdeadbeef`).
-    #[allow(dead_code)] // RF5-07 fork-compat smoke extension
     pub fn with_head_fork_version(mut self, version_hex: impl Into<String>) -> Self {
         self.head_fork_version_override = Some(version_hex.into());
         self
@@ -93,7 +89,7 @@ impl MockBn {
     }
 
     /// Convenience: builder with a known fork (see [`MockBnBuilder::with_fork`]).
-    #[allow(dead_code)] // RF5-07 fork-compat smoke extension
+    #[allow(dead_code)] // known-fork ready path still covered by default Electra
     pub fn with_fork(fork: ForkName) -> MockBnBuilder {
         MockBnBuilder::default().with_fork(fork)
     }

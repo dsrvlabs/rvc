@@ -577,3 +577,44 @@ async fn test_startup_fails_closed_on_genesis_root_mismatch() {
     // Keep mock alive until child has exited.
     drop(mock_bn);
 }
+
+/// SEC-9 / RF5-07: unknown head fork version is fatal by default (MockBn fork APIs).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_startup_fails_closed_on_unsupported_fork() {
+    let mock_bn = MockBn::builder().with_head_fork_version("0xdeadbeef").start().await;
+
+    let keystore_dir = TempDir::new().expect("keystore dir");
+    let password_file = install_smoke_keystore(&keystore_dir);
+    let slashing_db_dir = TempDir::new().expect("slashing db dir");
+    let slashing_db_path = slashing_db_dir.path().join("slashing.db");
+    let validators_config = create_validators_config(&keystore_dir);
+    let ports = TestPorts::allocate();
+    let config_file = create_test_config(
+        &keystore_dir,
+        &slashing_db_path,
+        &validators_config,
+        &password_file,
+        &mock_bn.uri(),
+        &ports,
+    );
+
+    let mut child = spawn_validator(config_file.path(), &ports);
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut capture = LogCapture::start(stdout);
+
+    let status = wait_for_exit(&mut child, READY_TIMEOUT);
+    let logs = capture.finish();
+
+    assert!(
+        !status.success(),
+        "unsupported fork must exit non-zero, got {status}\n--- stdout ---\n{logs}"
+    );
+    assert!(
+        logs.contains("Fork compatibility")
+            || logs.contains("unsupported")
+            || logs.contains("fork"),
+        "expected fork-compat diagnostics in logs.\n--- stdout ---\n{logs}"
+    );
+
+    drop(mock_bn);
+}

@@ -7,10 +7,9 @@ mod commands;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
-use bn_manager::BeaconNodeClient;
 use clap::{Parser, Subcommand};
 use metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
-use rvc::config::{redact_url, CliOverrides, Config, Network, ServiceBuilder};
+use rvc::config::{redact_url, CliOverrides, Config, Network};
 use rvc::duty_tracker::DutyTrackerService;
 use rvc::keymanager_adapters::{
     ForwardWindowMonitor, KeystoreManagerAdapter, RemoteKeyManagerAdapter,
@@ -1073,31 +1072,6 @@ fn build_file_layer_config(config: &Config) -> Option<telemetry::FileAppenderCon
     })
 }
 
-/// Apply a fork-compatibility check result (SEC-9 / M-15).
-///
-/// Fatal by default so an unknown fork version cannot silently produce invalid
-/// signatures. When `allow_unsupported_fork` is set (testnets / experimental
-/// forks), the error is logged and startup continues.
-fn apply_fork_compatibility_result(
-    result: Result<(), rvc::startup::StartupError>,
-    allow_unsupported_fork: bool,
-) -> Result<(), rvc::startup::StartupError> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(e) if allow_unsupported_fork => {
-            warn!(
-                error = %e,
-                "Fork compatibility check failed; continuing because allow_unsupported_fork is set"
-            );
-            Ok(())
-        }
-        Err(e) => {
-            error!(error = %e, "Fork compatibility check failed");
-            Err(e)
-        }
-    }
-}
-
 async fn run_validator(
     config: Config,
     strict_permissions: bool,
@@ -1142,8 +1116,6 @@ async fn run_validator(
     let metrics_address = config.metrics_address;
     let metrics_port = config.metrics_port;
     let doppelganger_enabled = config.doppelganger_detection;
-
-    let builder = ServiceBuilder::new(config.clone());
 
     // Steps 1–2d: open slashing DB, integrity, permissions, keystore lock, denylist.
     // Health updates stay in the binary (see `rvc::bootstrap` health-status policy).
@@ -1218,9 +1190,25 @@ async fn run_validator(
         Err(e) => return Err(e.into()),
     };
 
+    // Step 7: Build remaining services (signer, D-3 registration, fork gate,
+    // proposer adapters, attesting toggle). Health updates stay in the binary.
+    let services = match rvc::bootstrap::build_services(
+        &config,
+        &loaded_keys,
+        &enablement,
+        &beacon_handles,
+        std::sync::Arc::clone(&slashing_db),
+        timeouts,
+    )
+    .await
+    {
+        Ok(handles) => handles,
+        Err(e) => return Err(e.into()),
+    };
+
     let rvc::bootstrap::BeaconHandles {
         beacon_client,
-        bn_manager,
+        bn_manager: _,
         genesis_validators_root,
         genesis_validators_root_hex: _,
         genesis_time: _,
@@ -1236,127 +1224,27 @@ async fn run_validator(
     } = loaded_keys;
 
     let rvc::bootstrap::EnablementHandles {
-        signing_enablement,
+        signing_enablement: _,
         forward_window_machine,
         epoch_clock,
         pubkey_map: _,
         liveness_task: _liveness_loop_handle,
-        validator_index_map,
+        validator_index_map: _,
     } = enablement;
 
-    // Step 7: Build remaining services
-    let signer =
-        builder.build_signer(composite_signer.clone(), slashing_db.clone(), signing_enablement);
-    let validator_store = builder.build_validator_store(config.validators_config.as_deref())?;
-
-    // D-3 (Issue 2.11): register every keystore-loaded validator so the
-    // fail-closed per-validator signing gate permits the keys the VC loaded.
-    // Without this, the common no-validators_config deployment would have every
-    // loaded validator silently blocked from signing.
-    builder.register_loaded_validators(&validator_store, &pubkey_map);
-
-    // Attestation submit path uses the main-pool BnManager (failover-aware).
-    // `build_beacon` remains only for single-client exit tooling
-    // (keymanager voluntary exit). Propagator needs a Sized submitter, so keep
-    // the concrete BnManager here rather than `dyn BeaconNodeClient`.
-    let propagator = builder.build_propagator(bn_manager.clone());
-    // Main-pool trait object for duties and (when no dedicated proposer pool)
-    // block production.
-    let beacon: std::sync::Arc<dyn BeaconNodeClient> = bn_manager;
-    let validator_indices: Vec<String> = validator_index_map.values().cloned().collect();
-    let duty_tracker = builder.build_duty_tracker(beacon.clone(), validator_indices);
-
-    let slot_clock = match builder.build_slot_clock() {
-        Ok(clock) => clock,
-        Err(e) => {
-            error!("Failed to create slot clock: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    let fork_schedule = match builder.build_fork_schedule(beacon.as_ref()).await {
-        Ok(schedule) => schedule,
-        Err(e) => {
-            error!("Failed to fetch fork schedule from beacon node: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    // SEC-9 / M-15: fork mismatch is fatal by default (mirrors the GVR chain-swap
-    // gate). Opt out with `allow_unsupported_fork` for testnets / experimental forks.
-    // Do not change `startup::check_fork_compatibility` itself.
-    match apply_fork_compatibility_result(
-        startup::check_fork_compatibility(beacon.as_ref(), &fork_schedule).await,
-        config.allow_unsupported_fork,
-    ) {
-        Ok(()) => {}
-        Err(e) => return Err(e.into()),
-    }
-
-    let orchestrator_config = builder
-        .build_orchestrator_config(genesis_validators_root, fork_schedule)
-        .with_timeouts(timeouts);
-
-    // Build proposer BnManager if proposer nodes are configured (T3.1)
-    let proposer_bn_manager = match builder.build_proposer_bn_manager() {
-        Ok(Some(mgr)) => {
-            info!(
-                proposer_nodes = ?config.proposer_nodes,
-                "Proposer nodes configured — block production will use dedicated pool"
-            );
-            Some(mgr)
-        }
-        Ok(None) => None,
-        Err(e) => {
-            error!("Failed to create proposer BnManager: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    // Block production goes through BnManager so multi-node failover applies.
-    // Prefer the dedicated proposer pool when configured; otherwise the main pool.
-    let block_beacon = match &proposer_bn_manager {
-        Some(proposer_mgr) => std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(
-            proposer_mgr.clone() as std::sync::Arc<dyn BeaconNodeClient>,
-        )),
-        None => std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(beacon.clone())),
-    };
-
-    #[allow(clippy::arc_with_non_send_sync)]
-    let builder_service = {
-        // Bridge full trait objects onto the narrow builder seams.
-        let signer_dyn: std::sync::Arc<dyn signer::ValidatorSigner> = signer.clone();
-        Some(std::sync::Arc::new(builder::BuilderService::new(
-            std::sync::Arc::new(signer_dyn),
-            std::sync::Arc::new(beacon.clone()),
-            validator_store.clone(),
-            orchestrator_config.fork_schedule.genesis_fork_version,
-        )))
-    };
-
-    // Step 7b: Configure remote signer if URL provided
-    if let Some(ref url) = config.remote_signer_url {
-        if !config.keymanager_enabled {
-            warn!(
-                url = %url,
-                "Remote signer URL configured but Keymanager API is disabled; \
-                 enable --keymanager-enabled to manage remote keys at runtime"
-            );
-        }
-        info!(url = %url, "Remote signer URL configured");
-    }
-
-    // Step 7b2: Create attesting_enabled toggle (shared with orchestrator + API)
-    let attesting_enabled =
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(!config.disable_attesting));
-    metrics::definitions::RVC_ATTESTING_ENABLED.set(if config.disable_attesting {
-        0.0
-    } else {
-        1.0
-    });
-    if config.disable_attesting {
-        warn!("Attestation duties disabled at startup (--disable-attesting)");
-    }
+    let rvc::bootstrap::ServiceHandles {
+        signer,
+        validator_store,
+        propagator,
+        beacon,
+        duty_tracker,
+        slot_clock,
+        orchestrator_config,
+        proposer_bn_manager: _,
+        block_beacon,
+        builder_service,
+        attesting_enabled,
+    } = services;
 
     // RF1-06/07: single key-generation watch channel shared by keymanager
     // adapters (tx) and DutyOrchestrator (rx). Import/delete increments the
@@ -2201,33 +2089,7 @@ mod tests {
         assert!(config.grpc_signer_tls_cert.is_none());
     }
 
-    // ── SEC-9 / M-15: fatal fork-compat with opt-out ──────────────────────
-
-    #[test]
-    fn test_fork_mismatch_aborts_startup_and_optout_allows() {
-        let err = rvc::startup::StartupError::UnsupportedForkVersion {
-            version: "0xdeadbeef".to_string(),
-        };
-
-        // Default: mismatch is fatal
-        let fatal = apply_fork_compatibility_result(Err(err), false);
-        assert!(fatal.is_err());
-        assert!(matches!(
-            fatal.unwrap_err(),
-            rvc::startup::StartupError::UnsupportedForkVersion { .. }
-        ));
-
-        // Opt-out: continue for testnets / experimental forks
-        let err = rvc::startup::StartupError::UnsupportedForkVersion {
-            version: "0xdeadbeef".to_string(),
-        };
-        let continued = apply_fork_compatibility_result(Err(err), true);
-        assert!(continued.is_ok());
-
-        // Ok always continues
-        assert!(apply_fork_compatibility_result(Ok(()), false).is_ok());
-        assert!(apply_fork_compatibility_result(Ok(()), true).is_ok());
-    }
+    // ── SEC-9 / M-15: allow_unsupported_fork CLI merge ────────────────────
 
     #[test]
     fn test_allow_unsupported_fork_cli_merge() {
