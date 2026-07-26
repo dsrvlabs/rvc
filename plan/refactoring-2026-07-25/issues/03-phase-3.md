@@ -21,16 +21,16 @@
   (`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo nextest run --workspace`, `cargo test -p rvc-architecture-tests`).
 - **Exit criteria (phase gate):**
-  - [ ] Workspace green on the standing invariant.
-  - [ ] `crates/architecture-tests` green with `rvc-observability` added to `ZERO_OUT_EDGE_IF_PRESENT`
+  - [x] Workspace green on the standing invariant.
+  - [x] `crates/architecture-tests` green with `rvc-observability` added to `ZERO_OUT_EDGE_IF_PRESENT`
         and its own `crypto` dev-dependency replaced.
-  - [ ] `beacon`, `bn-manager`, `validator-store`, `propagator`, `keymanager-api` no longer declare a
+  - [x] `beacon`, `bn-manager`, `validator-store`, `propagator`, `keymanager-api` no longer declare a
         production `crypto` dependency; `cargo tree -p rvc-beacon` shows no `blst`/`scrypt`/`reqwest`
         arriving via `crypto`.
-  - [ ] The mainnet GVR literal appears exactly once in non-test workspace source.
-  - [ ] `tonic_build` compiles `signer.v2.proto` exactly once in the workspace.
-  - [ ] Web3Signer serde round-trip conformance test green against recorded production bodies.
-  - [ ] `cargo machete` (or `cargo udeps`) clean for the crates listed in RF3-06.
+  - [x] The mainnet GVR literal appears exactly once in non-test workspace source.
+  - [x] `tonic_build` compiles `signer.v2.proto` exactly once in the workspace.
+  - [x] Web3Signer serde round-trip conformance test green against recorded production bodies.
+  - [x] `cargo machete` (or `cargo udeps`) clean for the crates listed in RF3-06.
 
 ## Assumptions (recorded; not separately approved — autonomous run)
 
@@ -210,12 +210,12 @@ a temporary facade. Splitting it this way is what lets RF3-02 be a pure `use`-pa
 4. Update the two architecture-test tables.
 
 **Acceptance criteria.**
-- [ ] `crates/observability` exists with `logging`, `hex`, `pubkey` and no workspace-internal
+- [x] `crates/observability` exists with `logging`, `hex`, `pubkey` and no workspace-internal
       dependency (`cargo tree -p rvc-observability --edges normal` shows no `rvc-*`).
-- [ ] `rvc-observability` is pinned in `ZERO_OUT_EDGE_IF_PRESENT` and the acyclicity gate is green.
-- [ ] `no_rvc_prefix` gate green with the corrected `EXCLUDE` path.
-- [ ] Zero call sites changed outside the moved files, the two Cargo.tomls, and the two gate tables.
-- [ ] Standing invariant green.
+- [x] `rvc-observability` is pinned in `ZERO_OUT_EDGE_IF_PRESENT` and the acyclicity gate is green.
+- [x] `no_rvc_prefix` gate green with the corrected `EXCLUDE` path.
+- [x] Zero call sites changed outside the moved files, the two Cargo.tomls, and the two gate tables.
+- [x] Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `observability_crate_has_no_workspace_internal_out_edges` — the new crate is added
@@ -323,9 +323,9 @@ form so no hex literal is ever written twice. `Custom` is *not* modelled here �
 `crates/rvc`-side `Option`-returning concern and stays there (RF3-04).
 
 **Acceptance criteria.**
-- [ ] All four networks present with all five fields; no consumer changed in this issue.
-- [ ] Every hex accessor is derived from the byte constant (no second literal in the file).
-- [ ] Standing invariant green.
+- [x] All four networks present with all five fields; no consumer changed in this issue.
+- [x] Every hex accessor is derived from the byte constant (no second literal in the file).
+- [x] Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_preset_hex_accessor_matches_keygen_byte_literal` — for each network, assert
@@ -365,11 +365,11 @@ existing files, never by retyping.
   the independent check that delegation did not change the value) but add a comment saying so.
 
 **Acceptance criteria.**
-- [ ] `rg '4b363db94e286120' crates bin --glob '!*test*'` matches exactly one non-test line
+- [x] `rg '4b363db94e286120' crates bin --glob '!*test*'` matches exactly one non-test line
       (the `eth-types` table).
-- [ ] Both binaries' network resolution is byte-identical to before (proven by the tests below).
-- [ ] `Network::Custom` still yields `None` for `genesis_time`/`genesis_validators_root`.
-- [ ] Standing invariant green.
+- [x] Both binaries' network resolution is byte-identical to before (proven by the tests below).
+- [x] `Network::Custom` still yields `None` for `genesis_time`/`genesis_validators_root`.
+- [x] Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_keygen_network_values_unchanged_after_delegation` — assert
@@ -423,12 +423,12 @@ follow-on issues repoint each consumer.
    `insecure.rs` is already gone (B6, Phase 2) — otherwise leave the dependency and note it.
 
 **Acceptance criteria.**
-- [ ] `from_epoch`, `fork_version`, `activation_epoch`, `previous_fork` all read `entries()`; no
+- [x] `from_epoch`, `fork_version`, `activation_epoch`, `previous_fork` all read `entries()`; no
       per-fork match arm remains outside `entries()`, `AsRef<str>`, `FromStr`, `id()`, `body_layout()`.
-- [ ] `ForkName::from_str(name.as_ref()) == Ok(name)` for all seven variants (round-trip).
-- [ ] `ForkName::try_from(name.id()) == Ok(name)` for all seven; `try_from(7)` is an error.
-- [ ] `from_epoch` is free of `tracing` calls.
-- [ ] No consumer changed in this issue; standing invariant green.
+- [x] `ForkName::from_str(name.as_ref()) == Ok(name)` for all seven variants (round-trip).
+- [x] `ForkName::try_from(name.id()) == Ok(name)` for all seven; `try_from(7)` is an error.
+- [x] `from_epoch` is free of `tracing` calls.
+- [x] No consumer changed in this issue; standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_from_epoch_table_matches_legacy_if_else_for_every_boundary` — a table of
@@ -530,10 +530,10 @@ edit to a string match and a magic-number bound.
   pointer to `ForkName::id`.
 
 **Acceptance criteria.**
-- [ ] `body_fork_layout` contains no string literal fork name.
-- [ ] `validate_fork_id` contains no numeric bound.
-- [ ] Behavior identical: same `Some`/`None` and same `Ok`/`Err` for every input the old code saw.
-- [ ] Standing invariant green.
+- [x] `body_fork_layout` contains no string literal fork name.
+- [x] `validate_fork_id` contains no numeric bound.
+- [x] Behavior identical: same `Some`/`None` and same `Ok`/`Err` for every input the old code saw.
+- [x] Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_body_fork_layout_unchanged_for_all_known_and_unknown_versions` — a table over
@@ -580,12 +580,12 @@ resolved name proves invasive, the fallback within budget is
 with an explicit `warn!` + typed error (never a silent `4`) when the version is unknown.
 
 **Acceptance criteria.**
-- [ ] No hardcoded mainnet version bytes remain in `grpc-signer`.
-- [ ] A non-mainnet Electra fork version yields `id() == 5`, not `4`.
-- [ ] An unresolvable fork version produces a `warn!`-logged, typed outcome — never a silent Deneb
+- [x] No hardcoded mainnet version bytes remain in `grpc-signer`.
+- [x] A non-mainnet Electra fork version yields `id() == 5`, not `4`.
+- [x] An unresolvable fork version produces a `warn!`-logged, typed outcome — never a silent Deneb
       default.
-- [ ] Mainnet behavior byte-identical for all seven forks.
-- [ ] Release note: non-mainnet SSZ fork tagging changes. Standing invariant green.
+- [x] Mainnet behavior byte-identical for all seven forks.
+- [x] Release note: non-mainnet SSZ fork tagging changes. Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_hoodi_electra_fork_version_maps_to_electra_not_deneb` — build a `SignContext`
@@ -713,11 +713,11 @@ from in the new crate's module doc.
 4. One `type_name()`.
 
 **Acceptance criteria.**
-- [ ] All eleven variants present; each serializes and deserializes.
-- [ ] `type_name()` exists once and matches every `#[serde(rename)]` tag.
-- [ ] Server leniency preserved (alias, empty-root, optional fork_info, unknown-type rejection).
-- [ ] No consumer changed in this issue; the crate depends only on `eth-types`, `serde`, `hex`.
-- [ ] Standing invariant green.
+- [x] All eleven variants present; each serializes and deserializes.
+- [x] `type_name()` exists once and matches every `#[serde(rename)]` tag.
+- [x] Server leniency preserved (alias, empty-root, optional fork_info, unknown-type rejection).
+- [x] No consumer changed in this issue; the crate depends only on `eth-types`, `serde`, `hex`.
+- [x] Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_recorded_production_bodies_roundtrip_byte_identical` — take the recorded JSON
@@ -804,11 +804,11 @@ drift is a compile error rather than a runtime 400.
 - `bin/rvc-signer/Cargo.toml` — add `web3signer-wire`.
 
 **Acceptance criteria.**
-- [ ] `request.rs` defines no wire type (it may remain as a re-export + test module, or be deleted
+- [x] `request.rs` defines no wire type (it may remain as a re-export + test module, or be deleted
       with its tests moved).
-- [ ] Every existing `http_api` decoder test passes unmodified except for import paths.
-- [ ] The `electra_v2_frozen_fixture` (FR-31) still decodes and produces the same signing root.
-- [ ] Standing invariant green.
+- [x] Every existing `http_api` decoder test passes unmodified except for import paths.
+- [x] The `electra_v2_frozen_fixture` (FR-31) still decodes and produces the same signing root.
+- [x] Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_lighthouse_and_prysm_bodies_still_decode` — the existing recorded bodies from
@@ -853,12 +853,12 @@ a documented requirement.
 - `crates/eth-types/src/canonical/mod.rs:1-43` — close or update the stalled migration note.
 
 **Acceptance criteria.**
-- [ ] `canonical` is the only place performing prefix-strip + hex-decode in `eth-types`.
-- [ ] `0X`-prefixed input is accepted uniformly; `0x0x`/`0x0X` still rejected as `DoublePrefix`.
-- [ ] `hex_fixed`'s API-facing strictness (`0x` required) is preserved and documented as a deliberate
+- [x] `canonical` is the only place performing prefix-strip + hex-decode in `eth-types`.
+- [x] `0X`-prefixed input is accepted uniformly; `0x0x`/`0x0X` still rejected as `DoublePrefix`.
+- [x] `hex_fixed`'s API-facing strictness (`0x` required) is preserved and documented as a deliberate
       per-seam policy, not an accident.
-- [ ] Error messages still omit the raw offending character (the existing scrubbing behavior).
-- [ ] Standing invariant green.
+- [x] Error messages still omit the raw offending character (the existing scrubbing behavior).
+- [x] Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_canonical_accepts_uppercase_0x_prefix` — `parse_pubkey_hex("0X" + 96 hex)`
@@ -908,15 +908,15 @@ criterion below is restated for `signer.v2.proto` only.
 - `bin/rvc-signer/src/service.rs`, `crates/grpc-signer/src/client.rs` — generated-type import paths.
 
 **Acceptance criteria.**
-- [ ] `signer.v2.proto` is compiled exactly once (`rg 'compile_protos' --glob 'build.rs'` shows the
+- [x] `signer.v2.proto` is compiled exactly once (`rg 'compile_protos' --glob 'build.rs'` shows the
       new crate and `crates/rvc/build.rs`'s duty_tracker only).
-- [ ] Both consumers use the same generated types; a cross-crate test can pass a `SignRequest` from
+- [x] Both consumers use the same generated types; a cross-crate test can pass a `SignRequest` from
       the client to the server without conversion.
-- [ ] `bin/rvc-signer`'s `dvt`-gated client build still works (`--features dvt` and default both
+- [x] `bin/rvc-signer`'s `dvt`-gated client build still works (`--features dvt` and default both
       compile).
-- [ ] Compile-time impact measured and recorded (feature unification builds both stubs when both
+- [x] Compile-time impact measured and recorded (feature unification builds both stubs when both
       crates are in one graph).
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_client_and_server_share_one_sign_request_type` — an integration test that
@@ -959,12 +959,12 @@ caused by exactly this drift.
   to migrate only because RF3-13 widened canonical.
 
 **Acceptance criteria.**
-- [ ] All six sites call `eth_types::canonical::parse_pubkey_hex`; no local strip+decode+length
+- [x] All six sites call `eth_types::canonical::parse_pubkey_hex`; no local strip+decode+length
       pattern remains at those sites.
-- [ ] `0X` prefix and mixed case are accepted uniformly at every site.
-- [ ] `rvc-signer`'s FR-18 case-insensitivity behavior is unchanged (still accepts what it accepted).
-- [ ] The keymanager and secret-provider sites now accept `0X` — a documented, deliberate widening.
-- [ ] Standing invariant green.
+- [x] `0X` prefix and mixed case are accepted uniformly at every site.
+- [x] `rvc-signer`'s FR-18 case-insensitivity behavior is unchanged (still accepts what it accepted).
+- [x] The keymanager and secret-provider sites now accept `0X` — a documented, deliberate widening.
+- [x] Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_keymanager_accepts_uppercase_0x_pubkey` — post a `0X`-prefixed pubkey to the
@@ -1067,12 +1067,12 @@ canonical `0x`-lowercase form. On a match where the stored form is non-canonical
 canonical in the same transaction (idempotent, one-time). Keep the all-zeros rejection.
 
 **Acceptance criteria.**
-- [ ] Comparison is byte-based; `0x`-prefixed, bare, and mixed-case stored values all match the same
+- [x] Comparison is byte-based; `0x`-prefixed, bare, and mixed-case stored values all match the same
       chain.
-- [ ] An existing DB with bare-hex metadata boots successfully and ends up with canonical metadata.
-- [ ] A genuinely different chain still produces `GenesisValidatorsRootMismatch`.
-- [ ] All-zeros is still rejected.
-- [ ] Standing invariant green.
+- [x] An existing DB with bare-hex metadata boots successfully and ends up with canonical metadata.
+- [x] A genuinely different chain still produces `GenesisValidatorsRootMismatch`.
+- [x] All-zeros is still rejected.
+- [x] Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_existing_bare_hex_metadata_matches_canonical_prefixed_root` — open a DB whose
@@ -1118,14 +1118,14 @@ the uniqueness backstop silently**. That is a slashing-protection hole, not just
   type change.
 
 **Acceptance criteria.**
-- [ ] `import`/`export`/`set_genesis_validators_root` take a typed GVR.
-- [ ] Interchange metadata comparison is byte-based: a `0x`-prefixed interchange imports against a
+- [x] `import`/`export`/`set_genesis_validators_root` take a typed GVR.
+- [x] Interchange metadata comparison is byte-based: a `0x`-prefixed interchange imports against a
       bare-hex config (and vice versa) without error.
-- [ ] Every row written — by import or at runtime — carries the identical canonical encoding, so the
+- [x] Every row written — by import or at runtime — carries the identical canonical encoding, so the
       v3 unique index actually fires across both paths.
-- [ ] A row-encoding normalization test proves import-written and runtime-written rows for the same
+- [x] A row-encoding normalization test proves import-written and runtime-written rows for the same
       chain collide on the unique index.
-- [ ] Release note: previously-rejected interchange files now import. Standing invariant green.
+- [x] Release note: previously-rejected interchange files now import. Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_import_with_0x_prefixed_metadata_against_bare_config_succeeds` — the
@@ -1187,14 +1187,14 @@ only if someone edits both sites. The genuinely useful invariants — `test_all_
 - `crates/eth-types/src/domains.rs:20-82`, `lib.rs:197-205,336-340` — delete the echo tests.
 
 **Acceptance criteria.**
-- [ ] `cargo build -p rvc-eth-types` (no features) compiles no fixture code; the symbols are absent
+- [x] `cargo build -p rvc-eth-types` (no features) compiles no fixture code; the symbols are absent
       from the default public API.
-- [ ] All five consumer crates' tests pass with the dev-dependency feature.
-- [ ] `cargo build --release --workspace` produces no fixture symbols (spot-check with `nm`/`strings`
+- [x] All five consumer crates' tests pass with the dev-dependency feature.
+- [x] `cargo build --release --workspace` produces no fixture symbols (spot-check with `nm`/`strings`
       on one binary, or assert the module is `cfg`-gated).
-- [ ] The twelve per-domain echo tests and the three constant echoes are gone; uniqueness and size
+- [x] The twelve per-domain echo tests and the three constant echoes are gone; uniqueness and size
       invariants remain; one table-driven spec-pin test replaces them.
-- [ ] Test-count delta explained in the PR (≈15 removed, 1 added).
+- [x] Test-count delta explained in the PR (≈15 removed, 1 added).
 
 **TDD test plan.**
 - **RED first:** `test_fixtures_absent_without_feature` — a compile-fail check (a `trybuild`-style
@@ -1247,12 +1247,12 @@ B1 (or as its follow-up PR).
 - `crates/eth-types/Cargo.toml` — add `sha2` (external, so the zero-workspace-out-edge pin holds).
 
 **Acceptance criteria.**
-- [ ] The three constants and both helpers exist only in `eth-types`.
-- [ ] `rg 'SYNC_COMMITTEE_SIZE'` shows one definition.
-- [ ] `eth-types` still has zero workspace-internal out-edges (`sha2` is external) and the
+- [x] The three constants and both helpers exist only in `eth-types`.
+- [x] `rg 'SYNC_COMMITTEE_SIZE'` shows one definition.
+- [x] `eth-types` still has zero workspace-internal out-edges (`sha2` is external) and the
       architecture gate is green.
-- [ ] The sync-service KAT collapses to one canonical location with no loss of coverage.
-- [ ] Standing invariant green.
+- [x] The sync-service KAT collapses to one canonical location with no loss of coverage.
+- [x] Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_subcommittee_index_matches_both_legacy_closures` — placed in `eth-types`,
