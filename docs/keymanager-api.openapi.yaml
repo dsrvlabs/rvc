@@ -310,12 +310,15 @@ paths:
       - $ref: "#/components/parameters/PubkeyPath"
     post:
       tags: [Voluntary Exit]
-      summary: Sign and return a voluntary exit message
+      summary: Sign and return a voluntary exit message (does not submit)
       description: >
-        **This operation is irreversible once the returned message is
-        submitted to the beacon chain.** A WARN-level log is emitted for
-        every request. Requires the server to have been started with a
-        beacon node connection.
+        Signs a voluntary exit and returns the signed message. **The API does
+        not submit the exit to the beacon chain**; submission is a separate
+        operator step. Behavior is identical to `prepare_exit` (same signing
+        path and response shape); only the log level differs (WARN here, with
+        an irreversibility warning once the returned message is later
+        submitted). Requires the server to have been started with a beacon
+        node connection.
       operationId: signVoluntaryExit
       parameters:
         - $ref: "#/components/parameters/ExitEpochQuery"
@@ -342,10 +345,11 @@ paths:
       tags: [rvc Extensions]
       summary: Sign a voluntary exit without submitting it (rvc-specific, non-spec)
       description: >
-        Identical signing path and response shape to `voluntary_exit`, but
-        framed as a "prepare" step for operators who want the signed message
-        without it implying immediate submission intent. Logged at INFO
-        rather than WARN. Not part of the Ethereum Keymanager API spec.
+        Identical signing path and response shape to `voluntary_exit`: signs
+        and returns the message only; **does not submit** to the beacon chain.
+        Framed as a "prepare" step for operators who want the signed message
+        without implying immediate submission intent. Logged at INFO rather
+        than WARN. Not part of the Ethereum Keymanager API spec.
       operationId: prepareExit
       parameters:
         - $ref: "#/components/parameters/ExitEpochQuery"

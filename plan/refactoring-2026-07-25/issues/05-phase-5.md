@@ -1623,10 +1623,10 @@ differ. One function plus an explicit intent parameter makes the answer visible 
 3. Keep the differing log line, driven by `intent`.
 
 **Acceptance criteria:**
-- [ ] One handler body; two routes.
-- [ ] The `VoluntaryExitManager` trait documents the submit semantics explicitly.
-- [ ] Both endpoints return exactly what they returned before (response-shape test).
-- [ ] The OpenAPI description matches actual behavior.
+- [x] One handler body; two routes.
+- [x] The `VoluntaryExitManager` trait documents the submit semantics explicitly.
+- [x] Both endpoints return exactly what they returned before (response-shape test).
+- [x] The OpenAPI description matches actual behavior.
 
 **TDD test plan** (RED first):
 - `test_both_exit_routes_return_identical_response_for_same_input` — **RED**: written first to pin the

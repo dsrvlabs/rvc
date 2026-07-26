@@ -142,9 +142,22 @@ pub trait ValidatorConfigManager: Send + Sync {
     fn delete_graffiti(&self, pubkey: &Pubkey) -> Result<(), ApiError>;
 }
 
-/// Manages voluntary exit signing for validators.
+/// Manages voluntary exit **signing** for validators.
+///
+/// # Submit semantics
+///
+/// `sign_voluntary_exit` only constructs and signs a [`eth_types::SignedVoluntaryExit`].
+/// It does **not** broadcast or submit the exit to the beacon chain. Both
+/// Keymanager routes that use this trait
+/// (`POST /eth/v1/validator/:pubkey/voluntary_exit` and
+/// `POST /rvc/v1/validator/:pubkey/prepare_exit`) therefore return the signed
+/// message for the operator to submit separately; they differ only in log
+/// framing, not in submit behavior.
 #[async_trait]
 pub trait VoluntaryExitManager: Send + Sync {
+    /// Sign a voluntary exit for `pubkey` at `epoch` (or current epoch when `None`).
+    ///
+    /// Returns the signed message only; does not submit it to the beacon chain.
     async fn sign_voluntary_exit(
         &self,
         pubkey: &Pubkey,

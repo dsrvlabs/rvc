@@ -580,10 +580,36 @@ pub async fn delete_graffiti(
 
 // --- Voluntary Exit ---
 
-pub async fn sign_voluntary_exit(
+/// Route-level framing for voluntary-exit signing.
+///
+/// Both intents share one signing path: the signed exit is returned to the
+/// caller and is **not** submitted to the beacon chain. Variants only select
+/// the log line / operator-facing framing of the two public routes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitIntent {
+    /// `POST /eth/v1/validator/:pubkey/voluntary_exit` — WARN log.
+    ///
+    /// Name reflects the eth-spec route framing ("voluntary exit requested");
+    /// the API still only signs and returns the message.
+    SignAndSubmit,
+    /// `POST /rvc/v1/validator/:pubkey/prepare_exit` — INFO log.
+    SignOnly,
+}
+
+/// Static log message selected by [`ExitIntent`] (pure for unit tests).
+pub(crate) fn exit_intent_log_message(intent: ExitIntent) -> &'static str {
+    match intent {
+        ExitIntent::SignAndSubmit => "Voluntary exit requested — THIS IS IRREVERSIBLE",
+        ExitIntent::SignOnly => "Preparing pre-signed voluntary exit (not submitting)",
+    }
+}
+
+/// Shared body for both exit routes. Does not submit to the beacon chain.
+async fn handle_exit(
     State(state): State<Arc<AppState>>,
     Path(pubkey_hex): Path<String>,
     Query(query): Query<VoluntaryExitQuery>,
+    intent: ExitIntent,
 ) -> Result<Json<VoluntaryExitResponse>, ApiError> {
     let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
 
@@ -597,38 +623,48 @@ pub async fn sign_voluntary_exit(
         ApiError::Internal("voluntary exit not available: beacon node not configured".into())
     })?;
 
-    warn!(pubkey = %pubkey_hex, epoch = ?epoch, "Voluntary exit requested — THIS IS IRREVERSIBLE");
+    let msg = exit_intent_log_message(intent);
+    match intent {
+        ExitIntent::SignAndSubmit => {
+            warn!(pubkey = %pubkey_hex, epoch = ?epoch, "{}", msg);
+        }
+        ExitIntent::SignOnly => {
+            info!(pubkey = %pubkey_hex, epoch = ?epoch, "{}", msg);
+        }
+    }
 
     let signed_exit = exit_manager.sign_voluntary_exit(&pubkey, epoch).await?;
 
     Ok(Json(VoluntaryExitResponse { data: signed_exit }))
 }
 
-/// Pre-signed exit: signs the voluntary exit and returns it without submitting.
+/// Sign a voluntary exit and return it (does **not** submit to the beacon chain).
+///
+/// `POST /eth/v1/validator/:pubkey/voluntary_exit`
+///
+/// Identical signing path and response shape to [`prepare_exit`]; differs only
+/// in log level (WARN) and operator-facing framing. Submission of the returned
+/// message is a separate operator step.
+pub async fn sign_voluntary_exit(
+    state: State<Arc<AppState>>,
+    path: Path<String>,
+    query: Query<VoluntaryExitQuery>,
+) -> Result<Json<VoluntaryExitResponse>, ApiError> {
+    handle_exit(state, path, query, ExitIntent::SignAndSubmit).await
+}
+
+/// Sign a voluntary exit and return it without submitting.
 ///
 /// `POST /rvc/v1/validator/:pubkey/prepare_exit`
+///
+/// Identical signing path and response shape to [`sign_voluntary_exit`]; differs
+/// only in log level (INFO) and operator-facing framing.
 pub async fn prepare_exit(
-    State(state): State<Arc<AppState>>,
-    Path(pubkey_hex): Path<String>,
-    Query(query): Query<VoluntaryExitQuery>,
+    state: State<Arc<AppState>>,
+    path: Path<String>,
+    query: Query<VoluntaryExitQuery>,
 ) -> Result<Json<VoluntaryExitResponse>, ApiError> {
-    let pubkey = parse_pubkey(&pubkey_hex).map_err(ApiError::BadRequest)?;
-
-    let epoch = query
-        .epoch
-        .map(|e| e.parse::<u64>())
-        .transpose()
-        .map_err(|_| ApiError::BadRequest("invalid epoch".into()))?;
-
-    let exit_manager = state.exit_manager.as_ref().ok_or_else(|| {
-        ApiError::Internal("voluntary exit not available: beacon node not configured".into())
-    })?;
-
-    info!(pubkey = %pubkey_hex, epoch = ?epoch, "Preparing pre-signed voluntary exit (not submitting)");
-
-    let signed_exit = exit_manager.sign_voluntary_exit(&pubkey, epoch).await?;
-
-    Ok(Json(VoluntaryExitResponse { data: signed_exit }))
+    handle_exit(state, path, query, ExitIntent::SignOnly).await
 }
 
 fn parse_pubkey(s: &str) -> Result<Pubkey, String> {
@@ -3547,6 +3583,127 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Both public exit routes share one handler body and must return the same
+    /// response shape for the same input (sign-only; no submit).
+    fn both_exit_routes_router(exit_manager: Option<Arc<dyn VoluntaryExitManager>>) -> Router {
+        let app = TestApp::new();
+        let state = Arc::new(AppState {
+            keystore_manager: app.keystore_manager.clone(),
+            slashing_protection: app.slashing_protection.clone(),
+            validator_manager: app.validator_manager.clone(),
+            doppelganger: Arc::new(crate::DoppelgangerLifecycle::new(
+                std::time::Duration::ZERO,
+                app.doppelganger_monitor.clone(),
+                app.validator_manager.clone(),
+            )),
+            remote_key_manager: app.remote_key_manager.clone(),
+            config_manager: app.config_manager.clone(),
+            exit_manager,
+            allow_insecure_remote_signer: true,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: std::sync::Mutex::new(None),
+            import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
+        });
+        Router::new()
+            .route(
+                "/eth/v1/validator/:pubkey/voluntary_exit",
+                axum::routing::post(sign_voluntary_exit),
+            )
+            .route("/rvc/v1/validator/:pubkey/prepare_exit", axum::routing::post(prepare_exit))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn test_both_exit_routes_return_identical_response_for_same_input() {
+        let pk = test_pubkey(1);
+        let mock = Arc::new(MockVoluntaryExitManager::with_validator(pk));
+        let router = both_exit_routes_router(Some(mock));
+
+        let hex = test_pubkey_hex(1);
+        let eth_uri = format!("/eth/v1/validator/0x{hex}/voluntary_exit?epoch=300000");
+        let rvc_uri = format!("/rvc/v1/validator/0x{hex}/prepare_exit?epoch=300000");
+
+        let eth_resp = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&eth_uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let rvc_resp = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(&rvc_uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(eth_resp.status(), StatusCode::OK);
+        assert_eq!(rvc_resp.status(), StatusCode::OK);
+
+        let eth_bytes = BodyExt::collect(eth_resp.into_body()).await.unwrap().to_bytes();
+        let rvc_bytes = BodyExt::collect(rvc_resp.into_body()).await.unwrap().to_bytes();
+        let eth: VoluntaryExitResponse = serde_json::from_slice(&eth_bytes).unwrap();
+        let rvc: VoluntaryExitResponse = serde_json::from_slice(&rvc_bytes).unwrap();
+
+        assert_eq!(eth.data.message.epoch, rvc.data.message.epoch);
+        assert_eq!(eth.data.message.validator_index, rvc.data.message.validator_index);
+        assert_eq!(eth.data.signature, rvc.data.signature);
+        assert_eq!(eth_bytes, rvc_bytes);
+    }
+
+    #[test]
+    fn test_exit_intent_selects_log_line() {
+        assert_eq!(
+            exit_intent_log_message(ExitIntent::SignAndSubmit),
+            "Voluntary exit requested — THIS IS IRREVERSIBLE"
+        );
+        assert_eq!(
+            exit_intent_log_message(ExitIntent::SignOnly),
+            "Preparing pre-signed voluntary exit (not submitting)"
+        );
+        assert_ne!(
+            exit_intent_log_message(ExitIntent::SignAndSubmit),
+            exit_intent_log_message(ExitIntent::SignOnly)
+        );
+    }
+
+    #[test]
+    fn test_exit_route_docs_match_openapi_description() {
+        let openapi = include_str!("../../../docs/keymanager-api.openapi.yaml");
+        assert!(
+            openapi.contains("/eth/v1/validator/{pubkey}/voluntary_exit"),
+            "OpenAPI must document the eth voluntary_exit path"
+        );
+        assert!(
+            openapi.contains("/rvc/v1/validator/{pubkey}/prepare_exit"),
+            "OpenAPI must document the rvc prepare_exit path"
+        );
+        // Both routes: API signs only; does not submit.
+        assert!(
+            openapi.contains("does not submit") || openapi.contains("does **not** submit"),
+            "OpenAPI must state the API does not submit exits"
+        );
+        assert!(
+            openapi.contains("Identical signing path and response shape"),
+            "OpenAPI must document identical signing path for both routes"
+        );
+        // Intent-driven log framing remains documented.
+        assert!(
+            openapi.contains("WARN")
+                || openapi.contains("WARN-level")
+                || openapi.contains("log level differs (WARN")
+        );
+        assert!(openapi.contains("INFO"));
     }
 
     // ================================================================
