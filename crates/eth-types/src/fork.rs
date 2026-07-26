@@ -1,5 +1,10 @@
+use std::fmt;
+use std::str::FromStr;
+
+use crate::block::BodyForkLayout;
 use crate::{Epoch, Version};
 
+/// All known consensus forks, in activation order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ForkName {
     Phase0,
@@ -11,6 +16,7 @@ pub enum ForkName {
     Fulu,
 }
 
+/// Network fork schedule: activation epoch and version per fork.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkSchedule {
     pub genesis_fork_version: Version,
@@ -28,6 +34,49 @@ pub struct ForkSchedule {
     pub fulu_fork_version: Version,
 }
 
+/// Error returned when parsing an unknown fork name string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseForkNameError;
+
+impl fmt::Display for ParseForkNameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("unknown fork name")
+    }
+}
+
+impl std::error::Error for ParseForkNameError {}
+
+/// Error returned when converting an unknown numeric fork id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnknownForkIdError(pub u32);
+
+impl fmt::Display for UnknownForkIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "unknown fork id: {}", self.0)
+    }
+}
+
+impl std::error::Error for UnknownForkIdError {}
+
+impl ForkSchedule {
+    /// Fork table in ascending fork order (Phase0 … Fulu).
+    ///
+    /// When several forks share an activation epoch, reverse iteration over this
+    /// table selects the latest fork — matching the historical descending
+    /// if-else chain (including keygen's EIP-7044 Capella-cap schedule).
+    pub fn entries(&self) -> [(ForkName, Epoch, Version); 7] {
+        [
+            (ForkName::Phase0, 0, self.genesis_fork_version),
+            (ForkName::Altair, self.altair_fork_epoch, self.altair_fork_version),
+            (ForkName::Bellatrix, self.bellatrix_fork_epoch, self.bellatrix_fork_version),
+            (ForkName::Capella, self.capella_fork_epoch, self.capella_fork_version),
+            (ForkName::Deneb, self.deneb_fork_epoch, self.deneb_fork_version),
+            (ForkName::Electra, self.electra_fork_epoch, self.electra_fork_version),
+            (ForkName::Fulu, self.fulu_fork_epoch, self.fulu_fork_version),
+        ]
+    }
+}
+
 impl AsRef<str> for ForkName {
     fn as_ref(&self) -> &str {
         match self {
@@ -42,53 +91,107 @@ impl AsRef<str> for ForkName {
     }
 }
 
+impl FromStr for ForkName {
+    type Err = ParseForkNameError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "phase0" => Ok(Self::Phase0),
+            "altair" => Ok(Self::Altair),
+            "bellatrix" => Ok(Self::Bellatrix),
+            "capella" => Ok(Self::Capella),
+            "deneb" => Ok(Self::Deneb),
+            "electra" => Ok(Self::Electra),
+            "fulu" => Ok(Self::Fulu),
+            _ => Err(ParseForkNameError),
+        }
+    }
+}
+
+impl TryFrom<u32> for ForkName {
+    type Error = UnknownForkIdError;
+
+    fn try_from(id: u32) -> Result<Self, Self::Error> {
+        match id {
+            0 => Ok(Self::Phase0),
+            1 => Ok(Self::Altair),
+            2 => Ok(Self::Bellatrix),
+            3 => Ok(Self::Capella),
+            4 => Ok(Self::Deneb),
+            5 => Ok(Self::Electra),
+            6 => Ok(Self::Fulu),
+            other => Err(UnknownForkIdError(other)),
+        }
+    }
+}
+
 impl ForkName {
+    /// All fork variants in ascending order.
+    pub const ALL: [Self; 7] = [
+        Self::Phase0,
+        Self::Altair,
+        Self::Bellatrix,
+        Self::Capella,
+        Self::Deneb,
+        Self::Electra,
+        Self::Fulu,
+    ];
+
+    /// Stable numeric id (PHASE0=0 … FULU=6), matching signer SSZ `fork_id`.
+    pub fn id(self) -> u32 {
+        match self {
+            Self::Phase0 => 0,
+            Self::Altair => 1,
+            Self::Bellatrix => 2,
+            Self::Capella => 3,
+            Self::Deneb => 4,
+            Self::Electra => 5,
+            Self::Fulu => 6,
+        }
+    }
+
+    /// Body SSZ layout for KZG extraction, if the fork has blob commitments.
+    ///
+    /// Mirrors [`body_fork_layout`]: Deneb → Deneb layout; Electra/Fulu → Electra
+    /// layout; pre-Deneb → `None`.
+    pub fn body_layout(self) -> Option<BodyForkLayout> {
+        match self {
+            Self::Deneb => Some(BodyForkLayout::Deneb),
+            Self::Electra | Self::Fulu => Some(BodyForkLayout::Electra),
+            Self::Phase0 | Self::Altair | Self::Bellatrix | Self::Capella => None,
+        }
+    }
+
+    /// Resolve the active fork at `epoch` from `schedule.entries()`.
+    ///
+    /// Scans the table in reverse so equal activation epochs pick the latest
+    /// fork (same as the historical descending if-else).
     pub fn from_epoch(epoch: Epoch, schedule: &ForkSchedule) -> Self {
-        let fork = if epoch >= schedule.fulu_fork_epoch {
-            Self::Fulu
-        } else if epoch >= schedule.electra_fork_epoch {
-            Self::Electra
-        } else if epoch >= schedule.deneb_fork_epoch {
-            Self::Deneb
-        } else if epoch >= schedule.capella_fork_epoch {
-            Self::Capella
-        } else if epoch >= schedule.bellatrix_fork_epoch {
-            Self::Bellatrix
-        } else if epoch >= schedule.altair_fork_epoch {
-            Self::Altair
-        } else {
-            Self::Phase0
-        };
-        // Developer trace on the fork-selection path. eth-types is pinned to zero
-        // workspace out-edges (Gate 6) so it cannot use crypto's field consts — these are
-        // the bare canonical `epoch` / `fork_version` literals. The field expression is
-        // evaluated lazily by the macro, so it is free when `trace` is disabled.
-        tracing::trace!(epoch, fork_version = ?fork.fork_version(schedule), "selected fork by epoch");
-        fork
+        schedule
+            .entries()
+            .into_iter()
+            .rev()
+            .find(|(_, activation, _)| *activation <= epoch)
+            .map(|(name, _, _)| name)
+            .expect("Phase0 activates at epoch 0; at least one entry always matches")
     }
 
     pub fn fork_version(&self, schedule: &ForkSchedule) -> Version {
-        match self {
-            Self::Phase0 => schedule.genesis_fork_version,
-            Self::Altair => schedule.altair_fork_version,
-            Self::Bellatrix => schedule.bellatrix_fork_version,
-            Self::Capella => schedule.capella_fork_version,
-            Self::Deneb => schedule.deneb_fork_version,
-            Self::Electra => schedule.electra_fork_version,
-            Self::Fulu => schedule.fulu_fork_version,
-        }
+        schedule
+            .entries()
+            .into_iter()
+            .find(|(name, _, _)| name == self)
+            .map(|(_, _, version)| version)
+            .expect("all ForkName variants appear in entries()")
     }
 
     pub fn activation_epoch(&self, schedule: &ForkSchedule) -> Epoch {
-        match self {
-            Self::Phase0 => 0,
-            Self::Altair => schedule.altair_fork_epoch,
-            Self::Bellatrix => schedule.bellatrix_fork_epoch,
-            Self::Capella => schedule.capella_fork_epoch,
-            Self::Deneb => schedule.deneb_fork_epoch,
-            Self::Electra => schedule.electra_fork_epoch,
-            Self::Fulu => schedule.fulu_fork_epoch,
-        }
+        schedule
+            .entries()
+            .into_iter()
+            .find(|(name, _, _)| name == self)
+            .map(|(_, epoch, _)| epoch)
+            .expect("all ForkName variants appear in entries()")
     }
 
     pub fn previous_fork(&self, schedule: &ForkSchedule) -> ForkName {
@@ -104,6 +207,7 @@ impl ForkName {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::block::body_fork_layout;
 
     fn test_schedule() -> ForkSchedule {
         ForkSchedule {
@@ -123,19 +227,30 @@ mod tests {
         }
     }
 
+    /// EIP-7044-style schedule used by rvc-keygen: pre-Capella at epoch 0,
+    /// post-Capella at `u64::MAX`.
+    fn exit_cap_schedule() -> ForkSchedule {
+        ForkSchedule {
+            genesis_fork_version: [0x00, 0x00, 0x00, 0x00],
+            altair_fork_epoch: 0,
+            altair_fork_version: [0x00, 0x00, 0x00, 0x00],
+            bellatrix_fork_epoch: 0,
+            bellatrix_fork_version: [0x00, 0x00, 0x00, 0x00],
+            capella_fork_epoch: 0,
+            capella_fork_version: [0x03, 0x00, 0x00, 0x00],
+            deneb_fork_epoch: u64::MAX,
+            deneb_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
+            electra_fork_epoch: u64::MAX,
+            electra_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
+            fulu_fork_epoch: u64::MAX,
+            fulu_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
+        }
+    }
+
     #[test]
     fn test_fork_name_from_epoch_phase0() {
         let schedule = test_schedule();
         assert_eq!(ForkName::from_epoch(0, &schedule), ForkName::Phase0);
-    }
-
-    #[tracing_test::traced_test]
-    #[test]
-    fn from_epoch_traces_selected_fork() {
-        let schedule = test_schedule();
-        let _ = ForkName::from_epoch(schedule.electra_fork_epoch, &schedule);
-        assert!(logs_contain("selected fork by epoch"));
-        assert!(logs_contain("fork_version"));
     }
 
     #[test]
@@ -340,5 +455,98 @@ mod tests {
         let mut schedule = test_schedule();
         schedule.altair_fork_epoch = 0;
         assert_eq!(ForkName::Altair.previous_fork(&schedule), ForkName::Phase0);
+    }
+
+    /// Pin boundary behaviour of the entries()-backed lookup for a realistic
+    /// mainnet-like schedule and the keygen Capella-cap degenerate schedule.
+    #[test]
+    fn test_from_epoch_table_matches_legacy_if_else_for_every_boundary() {
+        let schedule = test_schedule();
+        let boundaries = [
+            (0u64, ForkName::Phase0),
+            (74239, ForkName::Phase0),
+            (74240, ForkName::Altair),
+            (144895, ForkName::Altair),
+            (144896, ForkName::Bellatrix),
+            (194047, ForkName::Bellatrix),
+            (194048, ForkName::Capella),
+            (269567, ForkName::Capella),
+            (269568, ForkName::Deneb),
+            (364543, ForkName::Deneb),
+            (364544, ForkName::Electra),
+            (499999, ForkName::Electra),
+            (500000, ForkName::Fulu),
+            (u64::MAX, ForkName::Fulu),
+        ];
+        for (epoch, expected) in boundaries {
+            assert_eq!(ForkName::from_epoch(epoch, &schedule), expected, "epoch {epoch}");
+        }
+
+        // Degenerate: several forks at epoch 0, post-Capella at MAX — latest wins.
+        let cap = exit_cap_schedule();
+        assert_eq!(ForkName::from_epoch(0, &cap), ForkName::Capella);
+        assert_eq!(ForkName::from_epoch(1, &cap), ForkName::Capella);
+        assert_eq!(ForkName::from_epoch(u64::MAX - 1, &cap), ForkName::Capella);
+        // At u64::MAX every post-Capella entry activates; reverse scan picks Fulu.
+        assert_eq!(ForkName::from_epoch(u64::MAX, &cap), ForkName::Fulu);
+    }
+
+    #[test]
+    fn test_fork_name_str_roundtrip_all_variants() {
+        for name in ForkName::ALL {
+            assert_eq!(ForkName::from_str(name.as_ref()), Ok(name));
+        }
+        assert!(ForkName::from_str("Deneb").is_err());
+        assert!(ForkName::from_str("").is_err());
+        assert!(ForkName::from_str("electra ").is_err());
+    }
+
+    #[test]
+    fn test_fork_name_id_roundtrip_all_variants() {
+        for name in ForkName::ALL {
+            assert_eq!(ForkName::try_from(name.id()), Ok(name));
+        }
+    }
+
+    #[test]
+    fn test_fork_id_7_is_rejected() {
+        assert_eq!(ForkName::try_from(7u32), Err(UnknownForkIdError(7)));
+        assert!(ForkName::try_from(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn test_body_layout_matches_body_fork_layout_string_mapping() {
+        for s in ["phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu"] {
+            let name = ForkName::from_str(s).unwrap();
+            assert_eq!(name.body_layout(), body_fork_layout(s), "layout mismatch for {s}");
+        }
+        assert_eq!(ForkName::Phase0.body_layout(), None);
+        assert_eq!(ForkName::Deneb.body_layout(), Some(BodyForkLayout::Deneb));
+        assert_eq!(ForkName::Electra.body_layout(), Some(BodyForkLayout::Electra));
+        assert_eq!(ForkName::Fulu.body_layout(), Some(BodyForkLayout::Electra));
+    }
+
+    #[test]
+    fn test_fork_version_and_activation_epoch_unchanged_for_all_seven() {
+        let schedule = test_schedule();
+        let expected = [
+            (ForkName::Phase0, 0u64, [0u8, 0, 0, 0]),
+            (ForkName::Altair, 74240, [1, 0, 0, 0]),
+            (ForkName::Bellatrix, 144896, [2, 0, 0, 0]),
+            (ForkName::Capella, 194048, [3, 0, 0, 0]),
+            (ForkName::Deneb, 269568, [4, 0, 0, 0]),
+            (ForkName::Electra, 364544, [5, 0, 0, 0]),
+            (ForkName::Fulu, 500000, [6, 0, 0, 0]),
+        ];
+        for (name, epoch, version) in expected {
+            assert_eq!(name.activation_epoch(&schedule), epoch);
+            assert_eq!(name.fork_version(&schedule), version);
+        }
+
+        let entries = schedule.entries();
+        assert_eq!(entries.len(), 7);
+        for (i, (name, epoch, version)) in expected.into_iter().enumerate() {
+            assert_eq!(entries[i], (name, epoch, version));
+        }
     }
 }

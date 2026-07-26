@@ -4344,8 +4344,6 @@ dependencies = [
  "sha2",
  "ssz_types",
  "thiserror 2.0.18",
- "tracing",
- "tracing-test",
  "tree_hash",
  "tree_hash_derive",
 ]

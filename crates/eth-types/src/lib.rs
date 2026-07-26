@@ -52,7 +52,7 @@ pub use domains::{
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 pub use duties::{ProposerDuty, SignedVoluntaryExit, VoluntaryExit};
-pub use fork::{ForkName, ForkSchedule};
+pub use fork::{ForkName, ForkSchedule, ParseForkNameError, UnknownForkIdError};
 pub use ssz_helpers::{
     decode_attestation_ssz, decode_beacon_block_ssz, decode_blinded_beacon_block_ssz,
     decode_sync_committee_contribution_ssz, encode_attestation_ssz, encode_beacon_block_ssz,
