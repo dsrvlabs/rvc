@@ -4276,6 +4276,7 @@ dependencies = [
  "rayon",
  "reqwest 0.12.28",
  "rvc-eth-types",
+ "rvc-observability",
  "scrypt",
  "secrecy",
  "serde",
@@ -4437,6 +4438,20 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-test",
+]
+
+[[package]]
+name = "rvc-observability"
+version = "0.6.0"
+dependencies = [
+ "hex",
+ "proptest",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-test",
+ "url",
+ "uuid",
 ]
 
 [[package]]

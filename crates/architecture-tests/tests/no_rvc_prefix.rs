@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 /// they are excluded outright rather than tracked in `KNOWN_REMAINING`.
 const EXCLUDE: &[&str] = &[
     // Conformance helper's test inputs ("rvc.slot", "rvc.foo") exercising the Gate-5 diff.
-    "crates/crypto/src/logging.rs",
+    "crates/observability/src/logging.rs",
     // The product's rotating log file is literally named "rvc.log" (a filename, not a key).
     "crates/telemetry/src/file_appender.rs",
     // Likewise: bin/rvc's only rvc. hit is the default `"rvc.log"` log filename.

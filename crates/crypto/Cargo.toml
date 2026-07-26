@@ -16,6 +16,7 @@ blst.workspace = true
 ctr.workspace = true
 eth-types.workspace = true
 hex.workspace = true
+observability.workspace = true
 pbkdf2.workspace = true
 rand.workspace = true
 reqwest = { workspace = true }

@@ -55,8 +55,10 @@ const FORBIDDEN: &[(&str, &str)] =
 /// - `rvc-telemetry`: a zero-internal-dependency leaf sink. Pinning it here locks the
 ///   acyclicity of the Phase-2 `rvc-signer-bin -> rvc-telemetry` edge (`EXPECTED_EDGE`):
 ///   attaching an edge *to* a zero-out-edge node can never create a cycle.
+/// - `rvc-observability`: logging/hex/pubkey leaf sink (RF3-01); zero workspace out-edges so
+///   dependents can take the light path without pulling BLS/KDF/HTTP via crypto.
 const ZERO_OUT_EDGE_IF_PRESENT: &[&str] =
-    &["rvc-eth-types", "rvc-signer-registry", "rvc-telemetry"];
+    &["rvc-eth-types", "rvc-signer-registry", "rvc-telemetry", "rvc-observability"];
 
 /// Edge that MUST be present (Issue 1.5 regression guard).
 const REQUIRED_EDGE: (&str, &str) = ("rvc-signer", "rvc-doppelganger");

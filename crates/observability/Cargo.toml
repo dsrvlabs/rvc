@@ -1,0 +1,23 @@
+[package]
+name = "rvc-observability"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared logging, hex-prefix, and pubkey display primitives (zero workspace out-edges)"
+
+[lints]
+workspace = true
+
+[dependencies]
+hex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tracing-subscriber.workspace = true
+tracing-test.workspace = true

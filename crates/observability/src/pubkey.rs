@@ -11,7 +11,7 @@
 //! # Examples
 //!
 //! ```
-//! use rvc_crypto::pubkey::CanonicalPubkey;
+//! use rvc_observability::pubkey::CanonicalPubkey;
 //!
 //! let a: CanonicalPubkey = "0xABCD".parse().unwrap();
 //! let b: CanonicalPubkey = "abcd".parse().unwrap();
@@ -46,7 +46,7 @@ impl FromStr for CanonicalPubkey {
     /// # Examples
     ///
     /// ```
-    /// use rvc_crypto::pubkey::CanonicalPubkey;
+    /// use rvc_observability::pubkey::CanonicalPubkey;
     ///
     /// let pk: CanonicalPubkey = "0XDeAdBeEf".parse().unwrap();
     /// assert_eq!(pk.to_string(), "0xdeadbeef");

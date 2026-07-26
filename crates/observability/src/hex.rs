@@ -11,7 +11,7 @@
 //! # Examples
 //!
 //! ```
-//! use rvc_crypto::hex::{strip_prefix_strict, HexError};
+//! use rvc_observability::hex::{strip_prefix_strict, HexError};
 //!
 //! assert_eq!(strip_prefix_strict("0xabcd"), Ok("abcd"));
 //! assert_eq!(strip_prefix_strict("0Xabcd"), Ok("abcd"));
