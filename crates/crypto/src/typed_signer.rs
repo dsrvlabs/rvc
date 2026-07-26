@@ -153,20 +153,21 @@ pub trait TypedSigner: Send + Sync {
 
     /// Sign a voluntary exit (DOMAIN_VOLUNTARY_EXIT).
     ///
-    /// # EIP-7044 caller responsibility
+    /// # EIP-7044 caller responsibility (residual until RF4-02)
     ///
-    /// Per EIP-7044, voluntary-exit signatures must use the **Capella fork
-    /// version** for any post-Capella exit so that signatures remain valid
-    /// across hard forks.  This trait does **not** apply that cap internally:
-    /// `ctx.fork_info.current_version` is used as-is.  The caller MUST pass
-    /// a `SignContext` whose `fork_info.current_version` is the Capella-capped
-    /// version when the exit's `epoch` is at or after the Capella fork.
+    /// This trait method does **not** apply the Capella cap: it uses
+    /// `ctx.fork_info.current_version` as-is. Callers **MUST** pass a
+    /// `SignContext` whose `fork_info.current_version` is Capella-capped when
+    /// the exit's `epoch` is at or after Capella, or the BN will reject the
+    /// signature after a post-Capella fork.
     ///
-    /// Use [`capella_capped_fork_version`] to compute the correct version
-    /// before constructing the `SignContext`. The server-side dispatch in
-    /// `bin/rvc-signer` (ISSUE-1.6d) is the canonical caller; any new caller
-    /// must mirror that logic to avoid producing signatures the BN will
-    /// reject after a fork transition.
+    /// Use [`crate::capella_capped_fork_version`] before building the context,
+    /// or prefer the auto-capped paths:
+    /// - [`crate::signing_root_for`] with [`crate::DutyRef::VoluntaryExit`]
+    /// - [`crate::sign_voluntary_exit`] (free helper)
+    ///
+    /// RF4-02 repoints this method through `signing_root_for` and removes this
+    /// obligation.
     async fn sign_voluntary_exit(
         &self,
         exit: &VoluntaryExit,
@@ -322,9 +323,9 @@ impl TypedSigner for LocalSigner {
         exit: &VoluntaryExit,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
-        // EIP-7044: voluntary exit signatures are perpetually valid by capping at Capella.
-        // The fork_info.current_version is passed in — the caller must supply the
-        // Capella-capped version for exits at or after Capella.
+        // EIP-7044: no Capella cap here — caller MUST supply a Capella-capped
+        // current_version (see trait docs). RF4-02 routes this through
+        // signing_root_for, which applies the cap automatically.
         let domain = compute_domain(
             DOMAIN_VOLUNTARY_EXIT,
             ctx.fork_info.current_version,
@@ -336,18 +337,11 @@ impl TypedSigner for LocalSigner {
     }
 }
 
-// EIP-7044 helper: resolve the Capella-capped fork version for voluntary exits.
-// Used by tests and callers who don't want to compute it themselves.
-pub fn capella_capped_fork_version(epoch: Epoch, schedule: &ForkSchedule) -> [u8; 4] {
-    let fork_name = ForkName::from_epoch(epoch, schedule);
-    let capped = if fork_name >= ForkName::Capella { ForkName::Capella } else { fork_name };
-    capped.fork_version(schedule)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::bls::SecretKey;
+    use crate::capella_capped_fork_version;
     use crate::key_manager::KeyManager;
 
     fn make_local_signer(sk: SecretKey) -> LocalSigner {

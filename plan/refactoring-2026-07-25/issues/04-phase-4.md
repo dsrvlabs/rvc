@@ -250,14 +250,14 @@ old sites *before* anything moves.
    against `compute_domain`/`compute_signing_root`.
 
 **Acceptance criteria:**
-- [ ] `signing_root_for` covers all ten duties and is the only place `capella_capped_fork_version` logic
+- [x] `signing_root_for` covers all ten duties and is the only place `capella_capped_fork_version` logic
       lives inside `crates/crypto`.
-- [ ] EIP-7044 KATs (pre-Capella, Capella, Deneb, Electra epochs) produce byte-identical roots to the
+- [x] EIP-7044 KATs (pre-Capella, Capella, Deneb, Electra epochs) produce byte-identical roots to the
       current `voluntary_exit_signing.rs` output.
-- [ ] Fork-boundary KATs for attestation and block roots are byte-identical to
+- [x] Fork-boundary KATs for attestation and block roots are byte-identical to
       `crates/signer/src/lib.rs:265-283` / `:496-503` output at each fork transition epoch.
-- [ ] The caller-obligation doc block on the old cap helper is deleted (the obligation no longer exists).
-- [ ] Standing invariant green.
+- [x] The caller-obligation doc block on the old cap helper is deleted (the obligation no longer exists).
+- [x] Standing invariant green.
 
 **TDD test plan** (`crates/crypto/src/signing_root.rs` `#[cfg(test)]`):
 - **RED first:** `test_signing_root_for_voluntary_exit_deneb_epoch_uses_capella_fork_version` — fails

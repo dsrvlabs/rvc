@@ -12,6 +12,7 @@ pub mod mnemonic;
 mod remote_signer;
 mod signer_trait;
 mod signing;
+mod signing_root;
 pub mod typed_signer;
 mod voluntary_exit_signing;
 
@@ -38,5 +39,6 @@ pub use remote_signer::{
 };
 pub use signer_trait::{LocalSigner, Signer, SigningError};
 pub use signing::{compute_domain, compute_fork_data_root, compute_signing_root};
-pub use typed_signer::{capella_capped_fork_version, SignContext, TypedSigner};
+pub use signing_root::{capella_capped_fork_version, signing_root_for, DutyRef, SigningCtx};
+pub use typed_signer::{SignContext, TypedSigner};
 pub use voluntary_exit_signing::sign_voluntary_exit;

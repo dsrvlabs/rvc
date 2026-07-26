@@ -1,10 +1,9 @@
-//! RF2-07: domain / signing-root known-answer tests for every free `sign_*` duty.
+//! RF2-07 / RF4-01: domain / signing-root known-answer tests for every duty.
 //!
-//! These KATs re-home the coverage that today lives under the free `sign_*` functions
-//! (deleted by RF2-08) onto the helpers that survive: [`compute_domain`] and
-//! [`compute_signing_root`]. Phase 4 D1 later re-points these same vectors at
-//! `signing_root_for` — keep each assertion as a single root/domain equality so that
-//! move is a call-site change, not a rewrite.
+//! These KATs re-home free-function coverage onto [`signing_root_for`] (RF4-01),
+//! with primitive vectors still pinned via [`compute_domain`] /
+//! [`compute_signing_root`]. Each duty root assertion is a single byte-vector
+//! equality against the shared helper.
 //!
 //! # Provenance
 //!
@@ -39,7 +38,8 @@ use eth_types::{
 };
 use rvc_crypto::{
     capella_capped_fork_version, compute_domain, compute_fork_data_root, compute_signing_root,
-    KeyManager, LocalSigner, SecretKey, SignContext, TypedSigner,
+    signing_root_for, DutyRef, KeyManager, LocalSigner, SecretKey, SignContext, SigningCtx,
+    TypedSigner,
 };
 
 // ============================================================
@@ -77,6 +77,10 @@ fn make_local_signer(sk: SecretKey) -> LocalSigner {
     let mut km = KeyManager::new();
     km.insert(sk);
     LocalSigner::new(km)
+}
+
+fn signing_ctx(schedule: &ForkSchedule) -> SigningCtx<'_> {
+    SigningCtx { fork_schedule: schedule, genesis_validators_root: GVR }
 }
 
 // ============================================================
@@ -158,10 +162,13 @@ fn kat_block_signing_root_phase0() {
         0x1b, 0xb7, 0x8f, 0xc4, 0xba, 0x26, 0x9b, 0x51, 0x3a, 0x38, 0xd6, 0xfd, 0xf3, 0xf7, 0x9d,
         0xad, 0x8c,
     ];
+    let schedule = compressed_schedule();
     let block_root: Root = [0x11; 32];
-    let domain = compute_domain(DOMAIN_BEACON_PROPOSER, PHASE0, GVR);
-    assert_eq!(&domain[..4], &DOMAIN_BEACON_PROPOSER);
-    assert_eq!(compute_signing_root(&block_root, domain), EXPECTED);
+    let slot = 0u64; // Phase0 epoch
+    assert_eq!(
+        signing_root_for(&DutyRef::BlockRoot { root: &block_root, slot }, &signing_ctx(&schedule)),
+        EXPECTED
+    );
 }
 
 // Altair fork-boundary root for the same block_root (covers
@@ -174,15 +181,20 @@ fn kat_block_signing_root_altair() {
         0xf0, 0xaf, 0xa6, 0xd1, 0x12, 0x53, 0xa8, 0xaf, 0xa1, 0x9b, 0x81, 0xef, 0x25, 0xa8, 0xeb,
         0xe3, 0xdf,
     ];
+    let schedule = compressed_schedule();
     let block_root: Root = [0x11; 32];
-    let domain = compute_domain(DOMAIN_BEACON_PROPOSER, ALTAIR, GVR);
-    assert_eq!(compute_signing_root(&block_root, domain), EXPECTED);
-    // Fork boundary: Phase0 and Altair domains differ for the same object.
-    let phase0_domain = compute_domain(DOMAIN_BEACON_PROPOSER, PHASE0, GVR);
-    assert_ne!(
-        compute_signing_root(&block_root, domain),
-        compute_signing_root(&block_root, phase0_domain)
+    let altair_slot = 10 * SLOTS_PER_EPOCH;
+    let phase0_slot = 0u64;
+    let altair_root = signing_root_for(
+        &DutyRef::BlockRoot { root: &block_root, slot: altair_slot },
+        &signing_ctx(&schedule),
     );
+    let phase0_root = signing_root_for(
+        &DutyRef::BlockRoot { root: &block_root, slot: phase0_slot },
+        &signing_ctx(&schedule),
+    );
+    assert_eq!(altair_root, EXPECTED);
+    assert_ne!(altair_root, phase0_root);
 }
 
 // Port of `block_signing::tests::test_randao_signing_root_known_answer` (same bytes).
@@ -194,10 +206,9 @@ fn kat_randao_signing_root_phase0() {
         0x45, 0xb8, 0xcb, 0xa1, 0x34, 0xe6, 0x85, 0xae, 0x26, 0x2e, 0x17, 0x8e, 0x3f, 0x76, 0xbe,
         0xda, 0x4c,
     ];
+    let schedule = compressed_schedule();
     let epoch: Epoch = 5;
-    let domain = compute_domain(DOMAIN_RANDAO, PHASE0, GVR);
-    assert_eq!(&domain[..4], &DOMAIN_RANDAO);
-    assert_eq!(compute_signing_root(&epoch, domain), EXPECTED);
+    assert_eq!(signing_root_for(&DutyRef::Randao(epoch), &signing_ctx(&schedule)), EXPECTED);
 }
 
 // Deneb-era RANDAO (covers test_sign_randao_reveal_fork_aware domain half).
@@ -209,9 +220,9 @@ fn kat_randao_signing_root_deneb() {
         0x72, 0x51, 0x5c, 0x23, 0x28, 0x2a, 0x2f, 0x54, 0x52, 0x93, 0x36, 0x18, 0xd4, 0x75, 0xf2,
         0xe3, 0xea,
     ];
+    let schedule = compressed_schedule();
     let epoch: Epoch = 45;
-    let domain = compute_domain(DOMAIN_RANDAO, DENEB, GVR);
-    assert_eq!(compute_signing_root(&epoch, domain), EXPECTED);
+    assert_eq!(signing_root_for(&DutyRef::Randao(epoch), &signing_ctx(&schedule)), EXPECTED);
 }
 
 // ============================================================
@@ -233,6 +244,9 @@ fn kat_attestation_signing_root_phase0() {
         0x01, 0xc1, 0x60, 0x0e, 0xd9, 0x18, 0x1c, 0xeb, 0x37, 0x45, 0x2b, 0x68, 0x1b, 0x73, 0xb9,
         0xdb, 0x9d,
     ];
+    // Phase0 target epoch must be < altair_fork_epoch (10) for Phase0 domain.
+    // Historical KAT used target epoch 100 with an explicit Phase0 fork version;
+    // under signing_root_for that epoch is Fulu — keep domain pin + use epoch 5 for root_for.
     let data = AttestationData {
         slot: 1000,
         index: 5,
@@ -243,6 +257,20 @@ fn kat_attestation_signing_root_phase0() {
     let domain = compute_domain(DOMAIN_BEACON_ATTESTER, PHASE0, GVR);
     assert_eq!(domain, EXPECTED_DOMAIN);
     assert_eq!(compute_signing_root(&data, domain), EXPECTED_ROOT);
+
+    // Same object under Phase0-forced domain via helper needs a Phase0 target epoch.
+    // The EXPECTED_ROOT above is the legacy Phase0 domain pin (unchanged).
+    let schedule = compressed_schedule();
+    let phase0_data = AttestationData {
+        slot: 5 * SLOTS_PER_EPOCH,
+        index: 5,
+        beacon_block_root: [0x11; 32],
+        source: Checkpoint { epoch: 4, root: [0x22; 32] },
+        target: Checkpoint { epoch: 5, root: [0x33; 32] },
+    };
+    let via_for = signing_root_for(&DutyRef::Attestation(&phase0_data), &signing_ctx(&schedule));
+    let domain_p0 = compute_domain(DOMAIN_BEACON_ATTESTER, PHASE0, GVR);
+    assert_eq!(via_for, compute_signing_root(&phase0_data, domain_p0));
 }
 
 // Electra boundary − 1 → Deneb fork version (test_sign_attestation_at_electra_boundary_minus_one).
@@ -253,6 +281,7 @@ fn kat_attestation_signing_root_electra_boundary_minus_one_deneb() {
         0x25, 0x24, 0xf3, 0x54, 0x35, 0x6a, 0x67, 0xed, 0xd3, 0xe9, 0x41, 0xfc, 0xbc, 0x37, 0xb9,
         0xb1, 0x24,
     ];
+    let schedule = compressed_schedule();
     let target_epoch = 49u64; // electra_fork_epoch - 1 on compressed schedule
     let data = AttestationData {
         slot: target_epoch * SLOTS_PER_EPOCH,
@@ -261,9 +290,7 @@ fn kat_attestation_signing_root_electra_boundary_minus_one_deneb() {
         source: Checkpoint { epoch: target_epoch - 1, root: [0x22; 32] },
         target: Checkpoint { epoch: target_epoch, root: [0x33; 32] },
     };
-    let domain = compute_domain(DOMAIN_BEACON_ATTESTER, DENEB, GVR);
-    assert_eq!(&domain[..4], &DOMAIN_BEACON_ATTESTER);
-    assert_eq!(compute_signing_root(&data, domain), EXPECTED);
+    assert_eq!(signing_root_for(&DutyRef::Attestation(&data), &signing_ctx(&schedule)), EXPECTED);
 }
 
 // Electra boundary → Electra fork version.
@@ -274,6 +301,7 @@ fn kat_attestation_signing_root_electra_boundary() {
         0xae, 0x7b, 0x3c, 0x9a, 0x2f, 0x90, 0xf8, 0xa2, 0x12, 0x53, 0x1b, 0x93, 0x8e, 0x7b, 0xe7,
         0xcb, 0x5c,
     ];
+    let schedule = compressed_schedule();
     let target_epoch = 50u64;
     let data = AttestationData {
         slot: target_epoch * SLOTS_PER_EPOCH,
@@ -282,11 +310,17 @@ fn kat_attestation_signing_root_electra_boundary() {
         source: Checkpoint { epoch: target_epoch - 1, root: [0x22; 32] },
         target: Checkpoint { epoch: target_epoch, root: [0x33; 32] },
     };
-    let domain = compute_domain(DOMAIN_BEACON_ATTESTER, ELECTRA, GVR);
-    assert_eq!(compute_signing_root(&data, domain), EXPECTED);
-    // Boundary: Deneb domain must not yield the same root.
-    let deneb_domain = compute_domain(DOMAIN_BEACON_ATTESTER, DENEB, GVR);
-    assert_ne!(compute_signing_root(&data, domain), compute_signing_root(&data, deneb_domain));
+    let root = signing_root_for(&DutyRef::Attestation(&data), &signing_ctx(&schedule));
+    assert_eq!(root, EXPECTED);
+    // Boundary: epoch 49 (Deneb) must not yield the same root as epoch 50.
+    let pre = AttestationData {
+        slot: 49 * SLOTS_PER_EPOCH,
+        index: 0,
+        beacon_block_root: [0x11; 32],
+        source: Checkpoint { epoch: 48, root: [0x22; 32] },
+        target: Checkpoint { epoch: 49, root: [0x33; 32] },
+    };
+    assert_ne!(root, signing_root_for(&DutyRef::Attestation(&pre), &signing_ctx(&schedule)));
 }
 
 // ============================================================
@@ -301,13 +335,15 @@ fn kat_selection_proof_signing_root_phase0() {
         0xa8, 0x92, 0x14, 0xee, 0xd0, 0x54, 0x0e, 0x3c, 0x28, 0x3c, 0x8a, 0xd0, 0x4c, 0x8f, 0x4d,
         0xb7, 0xaf,
     ];
+    let schedule = compressed_schedule();
     let slot: Slot = 100;
-    let domain = compute_domain(DOMAIN_SELECTION_PROOF, PHASE0, GVR);
-    assert_eq!(&domain[..4], &DOMAIN_SELECTION_PROOF);
-    assert_eq!(compute_signing_root(&slot, domain), EXPECTED);
+    assert_eq!(signing_root_for(&DutyRef::SelectionProof(slot), &signing_ctx(&schedule)), EXPECTED);
 }
 
 // Altair fork-aware selection proof (test_sign_selection_proof_fork_aware).
+// Historical KAT used slot = 74240 * SPE with an explicit Altair domain; under
+// compressed schedule that epoch is far past Fulu. Pin via compute_domain and
+// assert signing_root_for parity on a compressed-schedule Altair slot.
 #[test]
 fn kat_selection_proof_signing_root_altair() {
     const EXPECTED: Root = [
@@ -318,6 +354,12 @@ fn kat_selection_proof_signing_root_altair() {
     let slot: Slot = 74240 * SLOTS_PER_EPOCH;
     let domain = compute_domain(DOMAIN_SELECTION_PROOF, ALTAIR, GVR);
     assert_eq!(compute_signing_root(&slot, domain), EXPECTED);
+
+    let schedule = compressed_schedule();
+    let altair_slot = 10 * SLOTS_PER_EPOCH;
+    let via_for = signing_root_for(&DutyRef::SelectionProof(altair_slot), &signing_ctx(&schedule));
+    let domain_altair = compute_domain(DOMAIN_SELECTION_PROOF, ALTAIR, GVR);
+    assert_eq!(via_for, compute_signing_root(&altair_slot, domain_altair));
 }
 
 // AggregateAndProof sample from aggregation_signing::sample_aggregate_and_proof(100).
@@ -329,6 +371,7 @@ fn kat_aggregate_and_proof_signing_root_phase0() {
         0xf9, 0xa0, 0x60, 0x1d, 0xc4, 0xe3, 0x53, 0xc9, 0x85, 0x58, 0x83, 0x25, 0x6a, 0xd4, 0x4b,
         0xf3, 0x84,
     ];
+    let schedule = compressed_schedule();
     let slot: Slot = 100;
     let agg = AggregateAndProof {
         aggregator_index: 42,
@@ -345,9 +388,10 @@ fn kat_aggregate_and_proof_signing_root_phase0() {
         },
         selection_proof: vec![0xbb; 96],
     };
-    let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, PHASE0, GVR);
-    assert_eq!(&domain[..4], &DOMAIN_AGGREGATE_AND_PROOF);
-    assert_eq!(compute_signing_root(&agg, domain), EXPECTED);
+    assert_eq!(
+        signing_root_for(&DutyRef::AggregateAndProof(&agg), &signing_ctx(&schedule)),
+        EXPECTED
+    );
 }
 
 // ElectraAggregateAndProof at electra epoch (test_sign_electra_aggregate_and_proof_valid).
@@ -358,6 +402,7 @@ fn kat_electra_aggregate_and_proof_signing_root() {
         0xb7, 0xc9, 0xfc, 0x57, 0x1a, 0xa1, 0x0a, 0xa6, 0xe4, 0xc0, 0x52, 0xe4, 0x6e, 0x0e, 0x0f,
         0x5b, 0xe2,
     ];
+    let schedule = compressed_schedule();
     let slot = 50 * SLOTS_PER_EPOCH;
     let agg = ElectraAggregateAndProof {
         aggregator_index: 42,
@@ -375,8 +420,10 @@ fn kat_electra_aggregate_and_proof_signing_root() {
         },
         selection_proof: vec![0xbb; 96],
     };
-    let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, ELECTRA, GVR);
-    assert_eq!(compute_signing_root(&agg, domain), EXPECTED);
+    assert_eq!(
+        signing_root_for(&DutyRef::ElectraAggregateAndProof(&agg), &signing_ctx(&schedule)),
+        EXPECTED
+    );
 }
 
 // ============================================================
@@ -391,10 +438,16 @@ fn kat_sync_committee_message_signing_root_phase0() {
         0x7a, 0xf9, 0xec, 0x54, 0xe1, 0x09, 0x88, 0x8d, 0xf1, 0xab, 0x21, 0x84, 0x1a, 0x97, 0x0f,
         0xb0, 0x74,
     ];
+    let schedule = compressed_schedule();
     let beacon_block_root: Root = [0x11; 32];
-    let domain = compute_domain(DOMAIN_SYNC_COMMITTEE, PHASE0, GVR);
-    assert_eq!(&domain[..4], &DOMAIN_SYNC_COMMITTEE);
-    assert_eq!(compute_signing_root(&beacon_block_root, domain), EXPECTED);
+    let slot: Slot = 100; // Phase0
+    assert_eq!(
+        signing_root_for(
+            &DutyRef::SyncMessage { beacon_block_root: &beacon_block_root, slot },
+            &signing_ctx(&schedule)
+        ),
+        EXPECTED
+    );
 }
 
 // Altair vs Phase0 fork-aware (test_sign_sync_committee_message_fork_aware).
@@ -405,14 +458,20 @@ fn kat_sync_committee_message_signing_root_altair() {
         0x53, 0x31, 0x74, 0xe7, 0xab, 0x20, 0xee, 0x4e, 0xde, 0xcf, 0x48, 0xad, 0x23, 0x2a, 0x76,
         0x69, 0xf3,
     ];
+    let schedule = compressed_schedule();
     let beacon_block_root: Root = [0x11; 32];
-    let domain = compute_domain(DOMAIN_SYNC_COMMITTEE, ALTAIR, GVR);
-    assert_eq!(compute_signing_root(&beacon_block_root, domain), EXPECTED);
-    let phase0 = compute_domain(DOMAIN_SYNC_COMMITTEE, PHASE0, GVR);
-    assert_ne!(
-        compute_signing_root(&beacon_block_root, domain),
-        compute_signing_root(&beacon_block_root, phase0)
+    let altair_slot = 10 * SLOTS_PER_EPOCH;
+    let phase0_slot = 0u64;
+    let altair_root = signing_root_for(
+        &DutyRef::SyncMessage { beacon_block_root: &beacon_block_root, slot: altair_slot },
+        &signing_ctx(&schedule),
     );
+    let phase0_root = signing_root_for(
+        &DutyRef::SyncMessage { beacon_block_root: &beacon_block_root, slot: phase0_slot },
+        &signing_ctx(&schedule),
+    );
+    assert_eq!(altair_root, EXPECTED);
+    assert_ne!(altair_root, phase0_root);
 }
 
 // ContributionAndProof at Altair (test_sign_contribution_and_proof_altair).
@@ -424,6 +483,7 @@ fn kat_contribution_and_proof_signing_root_altair() {
         0x7c, 0x33, 0x21, 0x8b, 0x88, 0x56, 0xcc, 0x56, 0xa3, 0x92, 0x52, 0x22, 0xef, 0x6d, 0xa5,
         0x34, 0x93,
     ];
+    let schedule = compressed_schedule();
     let cap = ContributionAndProof {
         aggregator_index: 42,
         contribution: SyncCommitteeContribution {
@@ -435,15 +495,17 @@ fn kat_contribution_and_proof_signing_root_altair() {
         },
         selection_proof: vec![0xcc; 96],
     };
-    let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, ALTAIR, GVR);
-    assert_eq!(&domain[..4], &DOMAIN_CONTRIBUTION_AND_PROOF);
-    assert_eq!(compute_signing_root(&cap, domain), EXPECTED);
+    assert_eq!(
+        signing_root_for(&DutyRef::ContributionAndProof(&cap), &signing_ctx(&schedule)),
+        EXPECTED
+    );
 }
 
 // Fork-boundary contribution: pre-Altair vs Altair must differ
 // (test_sign_contribution_and_proof_fork_boundary domain half).
 #[test]
 fn kat_contribution_and_proof_fork_boundary_domains_differ() {
+    let schedule = compressed_schedule();
     let pre = ContributionAndProof {
         aggregator_index: 42,
         contribution: SyncCommitteeContribution {
@@ -466,10 +528,9 @@ fn kat_contribution_and_proof_fork_boundary_domains_differ() {
         },
         selection_proof: vec![0xcc; 96],
     };
-    let pre_root =
-        compute_signing_root(&pre, compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, PHASE0, GVR));
+    let pre_root = signing_root_for(&DutyRef::ContributionAndProof(&pre), &signing_ctx(&schedule));
     let post_root =
-        compute_signing_root(&post, compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, ALTAIR, GVR));
+        signing_root_for(&DutyRef::ContributionAndProof(&post), &signing_ctx(&schedule));
     assert_ne!(pre_root, post_root);
 }
 
@@ -480,13 +541,18 @@ fn kat_sync_selection_proof_signing_root_phase0() {
         0x30, 0x14, 0x55, 0xad, 0xb8, 0x60, 0xe9, 0x09, 0xe5, 0xfc, 0xc8, 0xcc, 0x57, 0x07, 0x13,
         0x78, 0xd3,
     ];
-    let selection_data = SyncAggregatorSelectionData { slot: 100, subcommittee_index: 2 };
-    let domain = compute_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, PHASE0, GVR);
-    assert_eq!(&domain[..4], &DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF);
-    assert_eq!(compute_signing_root(&selection_data, domain), EXPECTED);
+    let schedule = compressed_schedule();
+    assert_eq!(
+        signing_root_for(
+            &DutyRef::SyncSelection { slot: 100, subcommittee_index: 2 },
+            &signing_ctx(&schedule)
+        ),
+        EXPECTED
+    );
 }
 
 // Deneb fork-aware selection (test_sign_sync_committee_selection_proof_fork_aware).
+// Historical slot is mainnet-scale; keep compute_domain pin + parity on compressed Deneb.
 #[test]
 fn kat_sync_selection_proof_signing_root_deneb() {
     const EXPECTED: Root = [
@@ -498,19 +564,29 @@ fn kat_sync_selection_proof_signing_root_deneb() {
         SyncAggregatorSelectionData { slot: 269568 * SLOTS_PER_EPOCH, subcommittee_index: 1 };
     let domain = compute_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DENEB, GVR);
     assert_eq!(compute_signing_root(&selection_data, domain), EXPECTED);
+
+    let schedule = compressed_schedule();
+    let deneb_slot = 40 * SLOTS_PER_EPOCH;
+    let via_for = signing_root_for(
+        &DutyRef::SyncSelection { slot: deneb_slot, subcommittee_index: 1 },
+        &signing_ctx(&schedule),
+    );
+    let domain_deneb = compute_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DENEB, GVR);
+    let selection = SyncAggregatorSelectionData { slot: deneb_slot, subcommittee_index: 1 };
+    assert_eq!(via_for, compute_signing_root(&selection, domain_deneb));
 }
 
 // Subcommittee index binds into the root (test_selection_proof_binds_to_subcommittee_index).
 #[test]
 fn kat_sync_selection_proof_binds_subcommittee_index() {
-    let domain = compute_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, PHASE0, GVR);
-    let r0 = compute_signing_root(
-        &SyncAggregatorSelectionData { slot: 100, subcommittee_index: 0 },
-        domain,
+    let schedule = compressed_schedule();
+    let r0 = signing_root_for(
+        &DutyRef::SyncSelection { slot: 100, subcommittee_index: 0 },
+        &signing_ctx(&schedule),
     );
-    let r1 = compute_signing_root(
-        &SyncAggregatorSelectionData { slot: 100, subcommittee_index: 1 },
-        domain,
+    let r1 = signing_root_for(
+        &DutyRef::SyncSelection { slot: 100, subcommittee_index: 1 },
+        &signing_ctx(&schedule),
     );
     assert_ne!(r0, r1);
 }
@@ -520,7 +596,8 @@ fn kat_sync_selection_proof_binds_subcommittee_index() {
 // ============================================================
 
 // Zeroed gvr + DOMAIN_APPLICATION_BUILDER (test_sign_builder_registration_uses_zeroed_genesis_root).
-// remerkleable-derived.
+// remerkleable-derived. Historical vector uses ALTAIR as the explicit fork version
+// (builder path takes it as a parameter; RF4-10 pins genesis).
 #[test]
 fn kat_builder_registration_signing_root() {
     const EXPECTED_DOMAIN: Domain = [
@@ -533,6 +610,7 @@ fn kat_builder_registration_signing_root() {
         0xb4, 0xfc, 0x10, 0x8b, 0x1f, 0x01, 0xc4, 0xc9, 0x51, 0x97, 0xeb, 0x7f, 0xc5, 0x6e, 0xeb,
         0x44, 0x89,
     ];
+    let schedule = compressed_schedule();
     let registration = ValidatorRegistrationV1 {
         fee_recipient: [0xab; 20],
         gas_limit: 30_000_000,
@@ -542,7 +620,16 @@ fn kat_builder_registration_signing_root() {
     let zeroed_gvr = [0u8; 32];
     let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, ALTAIR, zeroed_gvr);
     assert_eq!(domain, EXPECTED_DOMAIN);
-    assert_eq!(compute_signing_root(&registration, domain), EXPECTED_ROOT);
+    assert_eq!(
+        signing_root_for(
+            &DutyRef::BuilderRegistration {
+                registration: &registration,
+                genesis_fork_version: ALTAIR,
+            },
+            &signing_ctx(&schedule)
+        ),
+        EXPECTED_ROOT
+    );
     // Non-zero gvr must produce a different domain (zeroed-gvr contract).
     let nonzero = compute_domain(DOMAIN_APPLICATION_BUILDER, ALTAIR, GVR);
     assert_ne!(domain, nonzero);
@@ -565,7 +652,7 @@ fn kat_eip7044_capella_capped_fork_version_boundaries() {
     assert_eq!(capella_capped_fork_version(55, &schedule), CAPELLA);
 }
 
-// Post-Capella exit root uses Capella fork version (EIP-7044).
+// Post-Capella exit root uses Capella fork version (EIP-7044) inside signing_root_for.
 // remerkleable-derived. Mirrors test_sign_voluntary_exit_eip7044_caps_at_capella.
 #[test]
 fn kat_voluntary_exit_signing_root_eip7044_deneb_capped() {
@@ -585,11 +672,12 @@ fn kat_voluntary_exit_signing_root_eip7044_deneb_capped() {
     assert_eq!(version, CAPELLA);
     let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, version, GVR);
     assert_eq!(domain, EXPECTED_DOMAIN);
-    assert_eq!(compute_signing_root(&exit, domain), EXPECTED_ROOT);
+    let root = signing_root_for(&DutyRef::VoluntaryExit(&exit), &signing_ctx(&schedule));
+    assert_eq!(root, EXPECTED_ROOT);
     // Uncapped Deneb domain must differ.
     let deneb_domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, DENEB, GVR);
     assert_ne!(domain, deneb_domain);
-    assert_ne!(compute_signing_root(&exit, domain), compute_signing_root(&exit, deneb_domain));
+    assert_ne!(root, compute_signing_root(&exit, deneb_domain));
 }
 
 // Pre-Capella exit uses Bellatrix, not Capella.
@@ -602,12 +690,11 @@ fn kat_voluntary_exit_signing_root_pre_capella_not_capped() {
     ];
     let schedule = compressed_schedule();
     let exit = VoluntaryExit { epoch: 25, validator_index: 42 };
-    let version = capella_capped_fork_version(exit.epoch, &schedule);
-    assert_eq!(version, BELLATRIX);
-    let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, version, GVR);
-    assert_eq!(compute_signing_root(&exit, domain), EXPECTED);
+    assert_eq!(capella_capped_fork_version(exit.epoch, &schedule), BELLATRIX);
+    let root = signing_root_for(&DutyRef::VoluntaryExit(&exit), &signing_ctx(&schedule));
+    assert_eq!(root, EXPECTED);
     let capella_domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, CAPELLA, GVR);
-    assert_ne!(compute_signing_root(&exit, domain), compute_signing_root(&exit, capella_domain));
+    assert_ne!(root, compute_signing_root(&exit, capella_domain));
 }
 
 // ============================================================

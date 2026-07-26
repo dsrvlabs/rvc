@@ -21,10 +21,10 @@ use eth_types::{
     DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
-use rvc_crypto::typed_signer::capella_capped_fork_version;
 use rvc_crypto::KeyManager;
 use rvc_crypto::{
-    compute_domain, compute_signing_root, LocalSigner, SecretKey, SignContext, TypedSigner,
+    capella_capped_fork_version, compute_domain, compute_signing_root, LocalSigner, SecretKey,
+    SignContext, TypedSigner,
 };
 
 // ============================================================
