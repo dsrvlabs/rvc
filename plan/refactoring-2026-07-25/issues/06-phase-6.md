@@ -875,12 +875,12 @@ wiremock round-trips** as explicit `tests/beacon_roundtrip.rs` integration cover
 pair — do not delete the HTTP path entirely. Drop `beacon`/`wiremock` dev-deps if nothing else needs them.
 
 **Acceptance criteria:**
-- [ ] ≤ 2 wiremock tests remain, in `tests/`, documented as deliberate integration coverage.
-- [ ] No test in `tracker.rs` constructs a `MockServer`.
-- [ ] Test count before == after (rewrites, not deletions — each of the 39 has a named successor; attach
+- [x] ≤ 2 wiremock tests remain, in `tests/`, documented as deliberate integration coverage.
+- [x] No test in `tracker.rs` constructs a `MockServer`.
+- [x] Test count before == after (rewrites, not deletions — each of the 39 has a named successor; attach
       the mapping table to the PR).
-- [ ] `cargo tree -p duty-tracker -e dev` no longer lists `wiremock` (or the retained dep is justified).
-- [ ] Workspace green.
+- [x] `cargo tree -p duty-tracker -e dev` no longer lists `wiremock` (or the retained dep is justified).
+- [x] Workspace green.
 
 **Test/verification plan:** This is a *rewrite*, not a move, so the pure-move oracle does not apply and a
 test-count match alone would not prove coverage was preserved. Build a 39-row successor table (old test

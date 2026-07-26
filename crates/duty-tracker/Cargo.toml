@@ -18,6 +18,9 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# test-utils: shared MockBeaconNodeClient for unit tests (RF6-17).
+bn-manager = { workspace = true, features = ["test-utils"] }
+# beacon + wiremock: deliberate HTTP round-trips in tests/beacon_roundtrip.rs only.
 beacon.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
