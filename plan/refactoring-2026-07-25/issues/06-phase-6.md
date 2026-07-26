@@ -637,11 +637,11 @@ and drift between the three beacon mocks is already visible (F95).
    the follow-up rather than blocking.
 
 **Acceptance criteria:**
-- [ ] `service/mod.rs` < 40% test lines (production ~565 lines, no inline test module).
-- [ ] Exactly one beacon mock in the crate (`rg "impl BeaconBlockClient for" -c` = 1).
-- [ ] Every assertion that was content-based stays content-based (no capture field dropped).
-- [ ] Test count before == after; pure-move commit separated from the merge commits.
-- [ ] Workspace green.
+- [x] `service/mod.rs` < 40% test lines (production ~565 lines, no inline test module).
+- [x] Exactly one beacon mock in the crate (`rg "impl BeaconBlockClient for" -c` = 1).
+- [x] Every assertion that was content-based stays content-based (no capture field dropped).
+- [x] Test count before == after; pure-move commit separated from the merge commits.
+- [x] Workspace green.
 
 **Risks:** Merging three mocks is where a silently weakened assertion hides. Require the reviewer to diff
 the three old mocks' captured fields against the merged one's field-by-field, and say so in the PR
