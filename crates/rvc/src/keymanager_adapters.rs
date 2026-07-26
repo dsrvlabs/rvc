@@ -377,18 +377,19 @@ fn select_and_rearm_doppelganger_monitor(
 
 /// Assemble Keymanager adapters, settings, and server without spawning the bind loop.
 ///
-/// Returns `Ok(None)` when `config.keymanager_enabled` is false — nothing is
+/// Returns `Ok(None)` when `config.keymanager.enabled` is false — nothing is
 /// constructed (no token file, no adapters, no re-arm).
 pub fn build_keymanager_api(
     config: &Config,
     deps: KeymanagerApiDeps,
 ) -> Result<Option<BuiltKeymanagerApi>, SpawnKeymanagerApiError> {
-    if !config.keymanager_enabled {
+    if !config.keymanager.enabled {
         return Ok(None);
     }
 
     let token_path = config
-        .keymanager_token_file
+        .keymanager
+        .token_file
         .clone()
         .unwrap_or_else(|| PathBuf::from("./keymanager-api-token.txt"));
     let token = match keymanager_api::auth::ensure_token(&token_path) {
@@ -400,7 +401,7 @@ pub fn build_keymanager_api(
     };
 
     let km_addr: std::net::SocketAddr =
-        config.keymanager_address.as_deref().unwrap_or("127.0.0.1:5062").parse().map_err(
+        config.keymanager.address.as_deref().unwrap_or("127.0.0.1:5062").parse().map_err(
             |e: std::net::AddrParseError| SpawnKeymanagerApiError::InvalidAddress(e.to_string()),
         )?;
 
@@ -446,7 +447,7 @@ pub fn build_keymanager_api(
 
     let remote_key_mgr = Arc::new(RemoteKeyManagerAdapter::new(
         km_composite,
-        config.remote_signer_allowed_hosts.clone(),
+        config.keymanager.remote_signer_allowed_hosts.clone(),
         deps.pubkey_map,
         deps.key_gen_tx,
     ));
@@ -474,9 +475,9 @@ pub fn build_keymanager_api(
         keymanager_api::KeymanagerSettings {
             token: token.to_string(),
             addr: km_addr,
-            cors_origins: config.keymanager_cors_origins.clone(),
-            body_limit: config.keymanager_body_limit,
-            allow_insecure_remote_signer: config.allow_insecure_remote_signer,
+            cors_origins: config.keymanager.cors_origins.clone(),
+            body_limit: config.keymanager.body_limit,
+            allow_insecure_remote_signer: config.keymanager.allow_insecure_remote_signer,
             attesting_enabled: deps.attesting_enabled,
             doppelganger_window,
         },
@@ -494,7 +495,7 @@ pub fn build_keymanager_api(
 
 /// Bootstrap phase: optionally assemble and spawn the Keymanager API server.
 ///
-/// When `config.keymanager_enabled` is false, returns immediately without
+/// When `config.keymanager.enabled` is false, returns immediately without
 /// constructing adapters or touching the token file.
 pub fn spawn_keymanager_api(
     config: &Config,
@@ -3387,9 +3388,12 @@ mod tests {
 
     fn spawn_test_config(dir: &TempDir, enabled: bool, address: &str) -> Config {
         Config {
-            keymanager_enabled: enabled,
-            keymanager_address: Some(address.to_string()),
-            keymanager_token_file: Some(dir.path().join("km-token.txt")),
+            keymanager: crate::config::KeymanagerConfig {
+                enabled,
+                address: Some(address.to_string()),
+                token_file: Some(dir.path().join("km-token.txt")),
+                ..Default::default()
+            },
             keystore_path: dir.path().to_path_buf(),
             doppelganger_detection: true,
             disable_keystore_locking: true,
@@ -3408,7 +3412,7 @@ mod tests {
         let built = build_keymanager_api(&config, deps).expect("disabled must succeed");
         assert!(built.is_none(), "disabled keymanager must construct nothing");
         assert!(
-            !config.keymanager_token_file.as_ref().unwrap().exists(),
+            !config.keymanager.token_file.as_ref().unwrap().exists(),
             "token file must not be created when disabled"
         );
 

@@ -781,7 +781,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 return Err(e.into());
             }
 
-            if cfg.allow_insecure_remote_signer {
+            if cfg.keymanager.allow_insecure_remote_signer {
                 warn!("INSECURE MODE: HTTP remote signer URLs are allowed. Use only for development/testing.");
             }
 

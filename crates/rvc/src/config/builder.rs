@@ -144,7 +144,7 @@ impl ServiceBuilder {
             features = %format!(
                 "doppelganger={}, builder=true, keymanager={}",
                 self.config.doppelganger_detection,
-                self.config.keymanager_enabled
+                self.config.keymanager.enabled
             ),
             "Effective configuration"
         );
@@ -152,7 +152,7 @@ impl ServiceBuilder {
         info!(
             doppelganger_enabled = self.config.doppelganger_detection,
             builder_enabled = true,
-            keymanager_enabled = self.config.keymanager_enabled,
+            keymanager_enabled = self.config.keymanager.enabled,
             "Feature toggles"
         );
 
@@ -1549,5 +1549,74 @@ mod tests {
         // Untracked pubkey also enabled (opt-out is total).
         let other = crypto::SecretKey::generate().public_key();
         assert!(enablement.is_signing_enabled(&other));
+    }
+
+    /// RF5-13: ServiceBuilder / config readers observe nested sub-struct knobs
+    /// (one representative field per nested group).
+    #[test]
+    fn test_builder_reads_nested_config_sections() {
+        use super::super::types::{
+            BuilderLimits, GrpcSignerConfig, KeymanagerConfig, LogfileConfig, MonitoringConfig,
+            ProposerConfigSource, TracingConfig, TracingExporter,
+        };
+
+        let config = Config {
+            keymanager: KeymanagerConfig {
+                enabled: true,
+                address: Some("127.0.0.1:5062".to_string()),
+                ..Default::default()
+            },
+            tracing: TracingConfig {
+                endpoint: Some("http://otel:4318".to_string()),
+                exporter: TracingExporter::Gcp,
+                sample_rate: 0.25,
+                ..Default::default()
+            },
+            logfile: LogfileConfig {
+                path: Some(std::path::PathBuf::from("/tmp/rvc.log")),
+                max_size: 50,
+                max_number: 3,
+                compress: true,
+                level: Some("debug".to_string()),
+            },
+            grpc_signer: GrpcSignerConfig {
+                url: Some("https://signer:50051".to_string()),
+                ..Default::default()
+            },
+            monitoring: MonitoringConfig {
+                endpoint: Some("https://mon.example/metrics".to_string()),
+                interval: 60,
+                endpoint_insecure: true,
+            },
+            proposer_config: ProposerConfigSource {
+                url: Some("https://cfg.example/p.json".to_string()),
+                refresh_interval: 120,
+                ..Default::default()
+            },
+            builder_limits: BuilderLimits {
+                circuit_breaker_consecutive_limit: 9,
+                circuit_breaker_epoch_limit: 11,
+            },
+            ..Default::default()
+        };
+
+        assert!(config.keymanager.enabled);
+        assert_eq!(config.keymanager.address.as_deref(), Some("127.0.0.1:5062"));
+        assert_eq!(config.tracing.endpoint.as_deref(), Some("http://otel:4318"));
+        assert_eq!(config.tracing.exporter, TracingExporter::Gcp);
+        assert!((config.tracing.sample_rate - 0.25).abs() < f64::EPSILON);
+        assert_eq!(config.logfile.max_size, 50);
+        assert_eq!(config.logfile.max_number, 3);
+        assert!(config.logfile.compress);
+        assert_eq!(config.grpc_signer.url.as_deref(), Some("https://signer:50051"));
+        assert_eq!(config.monitoring.interval, 60);
+        assert!(config.monitoring.endpoint_insecure);
+        assert_eq!(config.proposer_config.refresh_interval, 120);
+        assert_eq!(config.builder_limits.circuit_breaker_consecutive_limit, 9);
+        assert_eq!(config.builder_limits.circuit_breaker_epoch_limit, 11);
+
+        // Builder constructs and reads nested keymanager.enabled for feature logging.
+        let builder = ServiceBuilder::new(config);
+        builder.log_effective_config();
     }
 }

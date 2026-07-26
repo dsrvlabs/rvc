@@ -396,8 +396,8 @@ mod config_integration {
         let config = Config::default();
 
         // FR-1: circuit breaker defaults
-        assert_eq!(config.builder_circuit_breaker_consecutive_limit, 3);
-        assert_eq!(config.builder_circuit_breaker_epoch_limit, 5);
+        assert_eq!(config.builder_limits.circuit_breaker_consecutive_limit, 3);
+        assert_eq!(config.builder_limits.circuit_breaker_epoch_limit, 5);
 
         // FR-2: attestation enabled by default
         assert!(!config.disable_attesting);
@@ -441,8 +441,8 @@ disable_attesting = true
 slashed_validators_action = "shutdown"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.builder_circuit_breaker_consecutive_limit, 7);
-        assert_eq!(config.builder_circuit_breaker_epoch_limit, 12);
+        assert_eq!(config.builder_limits.circuit_breaker_consecutive_limit, 7);
+        assert_eq!(config.builder_limits.circuit_breaker_epoch_limit, 12);
         assert!(config.disable_keystore_locking);
         assert!(config.disable_attesting);
         assert_eq!(config.slashed_validators_action, SlashedAction::Shutdown);
@@ -466,8 +466,8 @@ slashed_validators_action = "shutdown"
 
         assert!(config.disable_attesting);
         assert_eq!(config.slashed_validators_action, SlashedAction::Shutdown);
-        assert_eq!(config.builder_circuit_breaker_consecutive_limit, 10);
-        assert_eq!(config.builder_circuit_breaker_epoch_limit, 20);
+        assert_eq!(config.builder_limits.circuit_breaker_consecutive_limit, 10);
+        assert_eq!(config.builder_limits.circuit_breaker_epoch_limit, 20);
         assert!(config.disable_keystore_locking);
     }
 }

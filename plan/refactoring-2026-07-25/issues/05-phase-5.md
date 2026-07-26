@@ -888,11 +888,11 @@ delivers the "one place per knob" property.
 4. Re-run the RF5-12 fixture test unchanged; it must not need edits.
 
 **Acceptance criteria:**
-- [ ] No accessor shim remains (`rg 'removed in RF5-13'` is empty).
-- [ ] `rg` finds no reference to a moved flat field name outside serde aliases.
-- [ ] RF5-12's fixture test passes **without modification**.
-- [ ] RF5-01 smoke tests green.
-- [ ] Workspace green including `--all-targets`.
+- [x] No accessor shim remains (`rg 'removed in RF5-13'` is empty).
+- [x] `rg` finds no reference to a moved flat field name outside serde aliases.
+- [x] RF5-12's fixture test passes **without modification**.
+- [x] RF5-01 smoke tests green.
+- [x] Workspace green including `--all-targets`.
 
 **TDD test plan** (RED first):
 - `test_no_flat_field_accessors_remain` — **RED**: a source-grep test that fails while the shims exist.

@@ -495,9 +495,9 @@ mod monitoring {
     #[test]
     fn monitoring_config_fields_default() {
         let config = rvc::config::Config::default();
-        assert!(config.monitoring_endpoint.is_none());
-        assert_eq!(config.monitoring_interval, 384);
-        assert!(!config.monitoring_endpoint_insecure);
+        assert!(config.monitoring.endpoint.is_none());
+        assert_eq!(config.monitoring.interval, 384);
+        assert!(!config.monitoring.endpoint_insecure);
     }
 
     #[test]
@@ -512,11 +512,11 @@ monitoring_endpoint_insecure = true
 "#;
         let config: rvc::config::Config = toml::from_str(toml_str).unwrap();
         assert_eq!(
-            config.monitoring_endpoint.as_deref(),
+            config.monitoring.endpoint.as_deref(),
             Some("https://beaconcha.in/api/v1/client/metrics")
         );
-        assert_eq!(config.monitoring_interval, 60);
-        assert!(config.monitoring_endpoint_insecure);
+        assert_eq!(config.monitoring.interval, 60);
+        assert!(config.monitoring.endpoint_insecure);
     }
 }
 
@@ -593,10 +593,10 @@ mod log_rotation {
     fn logfile_config_defaults() {
         let config = rvc::config::Config::default();
         assert!(config.logfile.path.is_none());
-        assert_eq!(config.logfile_max_size, 200);
-        assert_eq!(config.logfile_max_number, 5);
-        assert!(!config.logfile_compress);
-        assert!(config.logfile_level.is_none());
+        assert_eq!(config.logfile.max_size, 200);
+        assert_eq!(config.logfile.max_number, 5);
+        assert!(!config.logfile.compress);
+        assert!(config.logfile.level.is_none());
     }
 
     #[test]
@@ -613,10 +613,10 @@ logfile_level = "debug"
 "#;
         let config: rvc::config::Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.logfile.path.as_ref().unwrap().to_str().unwrap(), "/var/log/rvc/rvc.log");
-        assert_eq!(config.logfile_max_size, 100);
-        assert_eq!(config.logfile_max_number, 10);
-        assert!(config.logfile_compress);
-        assert_eq!(config.logfile_level.as_deref(), Some("debug"));
+        assert_eq!(config.logfile.max_size, 100);
+        assert_eq!(config.logfile.max_number, 10);
+        assert!(config.logfile.compress);
+        assert_eq!(config.logfile.level.as_deref(), Some("debug"));
     }
 
     #[test]
@@ -636,10 +636,10 @@ logfile_level = "debug"
         config.merge_with_cli(&cli);
 
         assert_eq!(config.logfile.path.as_ref().unwrap().to_str().unwrap(), "/tmp/test.log");
-        assert_eq!(config.logfile_max_size, 50);
-        assert_eq!(config.logfile_max_number, 3);
-        assert!(config.logfile_compress);
-        assert_eq!(config.logfile_level.as_deref(), Some("warn"));
+        assert_eq!(config.logfile.max_size, 50);
+        assert_eq!(config.logfile.max_number, 3);
+        assert!(config.logfile.compress);
+        assert_eq!(config.logfile.level.as_deref(), Some("warn"));
     }
 }
 
@@ -822,10 +822,10 @@ mod config_url {
     #[test]
     fn config_url_fields_default() {
         let config = rvc::config::Config::default();
-        assert!(config.proposer_config_url.is_none());
-        assert_eq!(config.proposer_config_refresh_interval, 384);
-        assert!(config.proposer_config_url_token.is_none());
-        assert!(!config.proposer_config_url_insecure);
+        assert!(config.proposer_config.url.is_none());
+        assert_eq!(config.proposer_config.refresh_interval, 384);
+        assert!(config.proposer_config.url_token.is_none());
+        assert!(!config.proposer_config.url_insecure);
     }
 
     #[test]
@@ -840,11 +840,11 @@ proposer_config_url_insecure = true
 "#;
         let config: rvc::config::Config = toml::from_str(toml_str).unwrap();
         assert_eq!(
-            config.proposer_config_url.as_deref(),
+            config.proposer_config.url.as_deref(),
             Some("https://example.com/proposer-config")
         );
-        assert_eq!(config.proposer_config_refresh_interval, 120);
-        assert!(config.proposer_config_url_insecure);
+        assert_eq!(config.proposer_config.refresh_interval, 120);
+        assert!(config.proposer_config.url_insecure);
     }
 }
 
@@ -950,20 +950,20 @@ mod composition {
         );
 
         // Monitoring
-        assert!(config.monitoring_endpoint.is_none());
-        assert_eq!(config.monitoring_interval, 384);
-        assert!(!config.monitoring_endpoint_insecure);
+        assert!(config.monitoring.endpoint.is_none());
+        assert_eq!(config.monitoring.interval, 384);
+        assert!(!config.monitoring.endpoint_insecure);
 
         // Log rotation
         assert!(config.logfile.path.is_none());
-        assert_eq!(config.logfile_max_size, 200);
-        assert_eq!(config.logfile_max_number, 5);
-        assert!(!config.logfile_compress);
+        assert_eq!(config.logfile.max_size, 200);
+        assert_eq!(config.logfile.max_number, 5);
+        assert!(!config.logfile.compress);
 
         // URL config
-        assert!(config.proposer_config_url.is_none());
-        assert_eq!(config.proposer_config_refresh_interval, 384);
-        assert!(!config.proposer_config_url_insecure);
+        assert!(config.proposer_config.url.is_none());
+        assert_eq!(config.proposer_config.refresh_interval, 384);
+        assert!(!config.proposer_config.url_insecure);
     }
 
     #[test]
@@ -991,18 +991,18 @@ proposer_config_url_insecure = false
         assert_eq!(config.proposer_nodes, vec!["http://proposer:5052"]);
         assert_eq!(config.broadcast, vec![BroadcastTopic::Attestations, BroadcastTopic::Blocks]);
         assert_eq!(
-            config.monitoring_endpoint.as_deref(),
+            config.monitoring.endpoint.as_deref(),
             Some("https://beaconcha.in/api/v1/client/metrics")
         );
-        assert_eq!(config.monitoring_interval, 60);
-        assert_eq!(config.logfile_max_size, 100);
-        assert_eq!(config.logfile_max_number, 10);
-        assert!(config.logfile_compress);
+        assert_eq!(config.monitoring.interval, 60);
+        assert_eq!(config.logfile.max_size, 100);
+        assert_eq!(config.logfile.max_number, 10);
+        assert!(config.logfile.compress);
         assert_eq!(
-            config.proposer_config_url.as_deref(),
+            config.proposer_config.url.as_deref(),
             Some("https://config.example.com/proposer")
         );
-        assert_eq!(config.proposer_config_refresh_interval, 120);
+        assert_eq!(config.proposer_config.refresh_interval, 120);
     }
 
     #[test]
@@ -1031,15 +1031,15 @@ proposer_config_url_insecure = false
 
         assert_eq!(config.proposer_nodes, vec!["http://p:5052"]);
         assert_eq!(config.broadcast, vec![BroadcastTopic::Blocks]);
-        assert_eq!(config.monitoring_endpoint.as_deref(), Some("https://monitor.test"));
-        assert_eq!(config.monitoring_interval, 30);
-        assert!(config.monitoring_endpoint_insecure);
-        assert_eq!(config.logfile_max_size, 50);
-        assert_eq!(config.logfile_max_number, 3);
-        assert!(config.logfile_compress);
-        assert_eq!(config.logfile_level.as_deref(), Some("warn"));
-        assert_eq!(config.proposer_config_url.as_deref(), Some("https://config.test"));
-        assert_eq!(config.proposer_config_refresh_interval, 60);
-        assert!(config.proposer_config_url_insecure);
+        assert_eq!(config.monitoring.endpoint.as_deref(), Some("https://monitor.test"));
+        assert_eq!(config.monitoring.interval, 30);
+        assert!(config.monitoring.endpoint_insecure);
+        assert_eq!(config.logfile.max_size, 50);
+        assert_eq!(config.logfile.max_number, 3);
+        assert!(config.logfile.compress);
+        assert_eq!(config.logfile.level.as_deref(), Some("warn"));
+        assert_eq!(config.proposer_config.url.as_deref(), Some("https://config.test"));
+        assert_eq!(config.proposer_config.refresh_interval, 60);
+        assert!(config.proposer_config.url_insecure);
     }
 }

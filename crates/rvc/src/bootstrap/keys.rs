@@ -134,7 +134,7 @@ async fn connect_grpc_remote_signer(
     config: &Config,
     composite_signer: &CompositeSigner,
 ) -> Result<Option<Arc<GrpcRemoteSigner>>, BootstrapError> {
-    let Some(ref grpc_url) = config.grpc_signer_url else {
+    let Some(ref grpc_url) = config.grpc_signer.url else {
         return Ok(None);
     };
 
@@ -143,7 +143,7 @@ async fn connect_grpc_remote_signer(
     let mut grpc_config = GrpcRemoteSignerConfig::new(grpc_url.clone());
 
     if let (Some(ref cert_path), Some(ref key_path), Some(ref ca_path)) =
-        (&config.grpc_signer_tls_cert, &config.grpc_signer_tls_key, &config.grpc_signer_tls_ca_cert)
+        (&config.grpc_signer.tls_cert, &config.grpc_signer.tls_key, &config.grpc_signer.tls_ca_cert)
     {
         let cert = std::fs::read(cert_path).map_err(|e| {
             crate::config::ConfigError::PasswordReadError(format!(
@@ -353,7 +353,7 @@ mod tests {
         drop(listener);
 
         let mut config = base_config(ks_dir, password_file);
-        config.grpc_signer_url = Some(format!("http://{addr}"));
+        config.grpc_signer.url = Some(format!("http://{addr}"));
 
         // Plaintext http requires the insecure env gate (Refuse mode).
         // SAFETY: test-only env mutation for the plaintext gRPC gate.
@@ -493,7 +493,7 @@ mod tests {
         let password_file = write_password_file(&dir);
 
         let mut config = base_config(ks_dir, password_file);
-        config.grpc_signer_url = Some(format!("http://{addr}"));
+        config.grpc_signer.url = Some(format!("http://{addr}"));
 
         // SAFETY: test-only env mutation for the plaintext gRPC gate.
         unsafe {

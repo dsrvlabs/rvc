@@ -137,9 +137,6 @@ impl FromStr for TracingExporter {
 /// `keymanager`, `grpc_signer`, `proposer_config`, `monitoring`,
 /// `builder_limits`). Existing operator TOML may still use the pre-nesting
 /// **flat** keys; both spellings are accepted (see `ConfigWire`).
-///
-/// Flat public fields with the old names are temporary compatibility shims
-/// kept in sync by [`Config::sync_flat_shims`]. They are removed in RF5-13.
 #[derive(Debug, Clone, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -273,135 +270,6 @@ pub struct Config {
     /// the full body is allocated.  Default: 32 MiB.
     #[serde(default = "default_beacon_max_body_bytes")]
     pub beacon_max_body_bytes: usize,
-
-    // -----------------------------------------------------------------------
-    // Flat-field shims (removed in RF5-13). Kept in sync by `sync_flat_shims`.
-    // Prefer the nested fields above for new code.
-    // -----------------------------------------------------------------------
-    /// removed in RF5-13 — use `keymanager.enabled`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub keymanager_enabled: bool,
-    /// removed in RF5-13 — use `keymanager.address`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub keymanager_address: Option<String>,
-    /// removed in RF5-13 — use `keymanager.token_file`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub keymanager_token_file: Option<PathBuf>,
-    /// removed in RF5-13 — use `keymanager.remote_signer_url`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub remote_signer_url: Option<String>,
-    /// removed in RF5-13 — use `keymanager.remote_signer_allowed_hosts`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub remote_signer_allowed_hosts: Option<Vec<String>>,
-    /// removed in RF5-13 — use `keymanager.allow_insecure_remote_signer`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub allow_insecure_remote_signer: bool,
-    /// removed in RF5-13 — use `keymanager.cors_origins`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub keymanager_cors_origins: Vec<String>,
-    /// removed in RF5-13 — use `keymanager.body_limit`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub keymanager_body_limit: usize,
-    /// removed in RF5-13 — use `tracing.endpoint`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub tracing_endpoint: Option<String>,
-    /// removed in RF5-13 — use `tracing.exporter`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub tracing_exporter: TracingExporter,
-    /// removed in RF5-13 — use `tracing.sample_rate`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub tracing_sample_rate: f64,
-    /// removed in RF5-13 — use `tracing.max_queue_size`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub tracing_max_queue_size: Option<usize>,
-    /// removed in RF5-13 — use `tracing.max_export_batch_size`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub tracing_max_export_batch_size: Option<usize>,
-    /// removed in RF5-13 — use `grpc_signer.url`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub grpc_signer_url: Option<String>,
-    /// removed in RF5-13 — use `grpc_signer.tls_cert`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub grpc_signer_tls_cert: Option<PathBuf>,
-    /// removed in RF5-13 — use `grpc_signer.tls_key`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub grpc_signer_tls_key: Option<PathBuf>,
-    /// removed in RF5-13 — use `grpc_signer.tls_ca_cert`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub grpc_signer_tls_ca_cert: Option<PathBuf>,
-    /// removed in RF5-13 — use `builder_limits.circuit_breaker_consecutive_limit`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub builder_circuit_breaker_consecutive_limit: u32,
-    /// removed in RF5-13 — use `builder_limits.circuit_breaker_epoch_limit`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub builder_circuit_breaker_epoch_limit: u32,
-    /// removed in RF5-13 — use `monitoring.endpoint`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub monitoring_endpoint: Option<String>,
-    /// removed in RF5-13 — use `monitoring.interval`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub monitoring_interval: u64,
-    /// removed in RF5-13 — use `monitoring.endpoint_insecure`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub monitoring_endpoint_insecure: bool,
-    /// removed in RF5-13 — use `proposer_config.url`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub proposer_config_url: Option<String>,
-    /// removed in RF5-13 — use `proposer_config.file`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub proposer_config_file: Option<String>,
-    /// removed in RF5-13 — use `proposer_config.refresh_interval`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub proposer_config_refresh_interval: u64,
-    /// removed in RF5-13 — use `proposer_config.url_token`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub proposer_config_url_token: Option<String>,
-    /// removed in RF5-13 — use `proposer_config.url_insecure`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub proposer_config_url_insecure: bool,
-    /// removed in RF5-13 — use `logfile.max_size`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub logfile_max_size: u64,
-    /// removed in RF5-13 — use `logfile.max_number`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub logfile_max_number: usize,
-    /// removed in RF5-13 — use `logfile.compress`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub logfile_compress: bool,
-    /// removed in RF5-13 — use `logfile.level`
-    #[serde(skip)]
-    #[doc(hidden)]
-    pub logfile_level: Option<String>,
 }
 
 fn default_beacon_max_body_bytes() -> usize {
@@ -502,8 +370,7 @@ fn default_tracing_sample_rate() -> f64 {
 }
 
 // ---------------------------------------------------------------------------
-// Nested config groups (RF5-12). Flat field names remain as temporary shims
-// on `Config` (see `sync_flat_shims`) and are removed in RF5-13.
+// Nested config groups (RF5-12/RF5-13).
 // ---------------------------------------------------------------------------
 
 /// Log-file rotation settings.
@@ -685,7 +552,7 @@ impl Default for BuilderLimits {
 
 impl Default for Config {
     fn default() -> Self {
-        let mut cfg = Self {
+        Self {
             beacon_url: "http://localhost:5052".to_string(),
             beacon_nodes: Vec::new(),
             keystore_path: PathBuf::from("./keystores"),
@@ -724,41 +591,7 @@ impl Default for Config {
             validator_registration_batch_delay: default_validator_registration_batch_delay(),
             validators_config: None,
             beacon_max_body_bytes: default_beacon_max_body_bytes(),
-            // Flat shims — filled by sync_flat_shims below
-            keymanager_enabled: false,
-            keymanager_address: None,
-            keymanager_token_file: None,
-            remote_signer_url: None,
-            remote_signer_allowed_hosts: None,
-            allow_insecure_remote_signer: false,
-            keymanager_cors_origins: Vec::new(),
-            keymanager_body_limit: default_keymanager_body_limit(),
-            tracing_endpoint: None,
-            tracing_exporter: TracingExporter::default(),
-            tracing_sample_rate: default_tracing_sample_rate(),
-            tracing_max_queue_size: None,
-            tracing_max_export_batch_size: None,
-            grpc_signer_url: None,
-            grpc_signer_tls_cert: None,
-            grpc_signer_tls_key: None,
-            grpc_signer_tls_ca_cert: None,
-            builder_circuit_breaker_consecutive_limit: default_circuit_breaker_consecutive_limit(),
-            builder_circuit_breaker_epoch_limit: default_circuit_breaker_epoch_limit(),
-            monitoring_endpoint: None,
-            monitoring_interval: default_monitoring_interval(),
-            monitoring_endpoint_insecure: false,
-            proposer_config_url: None,
-            proposer_config_file: None,
-            proposer_config_refresh_interval: default_proposer_config_refresh_interval(),
-            proposer_config_url_token: None,
-            proposer_config_url_insecure: false,
-            logfile_max_size: default_logfile_max_size(),
-            logfile_max_number: default_logfile_max_number(),
-            logfile_compress: false,
-            logfile_level: None,
-        };
-        cfg.sync_flat_shims();
-        cfg
+        }
     }
 }
 
@@ -962,7 +795,7 @@ impl From<ConfigWire> for Config {
         }
 
         let def = Config::default();
-        let mut cfg = Config {
+        Config {
             beacon_url: if w.beacon_url.is_empty() { def.beacon_url } else { w.beacon_url },
             beacon_nodes: w.beacon_nodes,
             keystore_path: if w.keystore_path.as_os_str().is_empty() {
@@ -1013,41 +846,7 @@ impl From<ConfigWire> for Config {
                 .unwrap_or(def.validator_registration_batch_delay),
             validators_config: w.validators_config,
             beacon_max_body_bytes: w.beacon_max_body_bytes.unwrap_or(def.beacon_max_body_bytes),
-            // shims filled below
-            keymanager_enabled: false,
-            keymanager_address: None,
-            keymanager_token_file: None,
-            remote_signer_url: None,
-            remote_signer_allowed_hosts: None,
-            allow_insecure_remote_signer: false,
-            keymanager_cors_origins: Vec::new(),
-            keymanager_body_limit: 0,
-            tracing_endpoint: None,
-            tracing_exporter: TracingExporter::default(),
-            tracing_sample_rate: 0.0,
-            tracing_max_queue_size: None,
-            tracing_max_export_batch_size: None,
-            grpc_signer_url: None,
-            grpc_signer_tls_cert: None,
-            grpc_signer_tls_key: None,
-            grpc_signer_tls_ca_cert: None,
-            builder_circuit_breaker_consecutive_limit: 0,
-            builder_circuit_breaker_epoch_limit: 0,
-            monitoring_endpoint: None,
-            monitoring_interval: 0,
-            monitoring_endpoint_insecure: false,
-            proposer_config_url: None,
-            proposer_config_file: None,
-            proposer_config_refresh_interval: 0,
-            proposer_config_url_token: None,
-            proposer_config_url_insecure: false,
-            logfile_max_size: 0,
-            logfile_max_number: 0,
-            logfile_compress: false,
-            logfile_level: None,
-        };
-        cfg.sync_flat_shims();
-        cfg
+        }
     }
 }
 
@@ -1091,126 +890,11 @@ impl<'de> Deserialize<'de> for Config {
         if let Some(path) = flat_logfile_path {
             cfg.logfile.path = Some(path);
         }
-        cfg.sync_flat_shims();
         Ok(cfg)
     }
 }
 
 impl Config {
-    /// Copy nested group values into the temporary flat field shims.
-    ///
-    /// Call after any mutation of nested groups so existing call sites that
-    /// still read the flat names observe the update. Removed in RF5-13 with
-    /// the shims themselves.
-    pub fn sync_flat_shims(&mut self) {
-        self.keymanager_enabled = self.keymanager.enabled;
-        self.keymanager_address = self.keymanager.address.clone();
-        self.keymanager_token_file = self.keymanager.token_file.clone();
-        self.remote_signer_url = self.keymanager.remote_signer_url.clone();
-        self.remote_signer_allowed_hosts = self.keymanager.remote_signer_allowed_hosts.clone();
-        self.allow_insecure_remote_signer = self.keymanager.allow_insecure_remote_signer;
-        self.keymanager_cors_origins = self.keymanager.cors_origins.clone();
-        self.keymanager_body_limit = self.keymanager.body_limit;
-
-        self.tracing_endpoint = self.tracing.endpoint.clone();
-        self.tracing_exporter = self.tracing.exporter;
-        self.tracing_sample_rate = self.tracing.sample_rate;
-        self.tracing_max_queue_size = self.tracing.max_queue_size;
-        self.tracing_max_export_batch_size = self.tracing.max_export_batch_size;
-
-        self.grpc_signer_url = self.grpc_signer.url.clone();
-        self.grpc_signer_tls_cert = self.grpc_signer.tls_cert.clone();
-        self.grpc_signer_tls_key = self.grpc_signer.tls_key.clone();
-        self.grpc_signer_tls_ca_cert = self.grpc_signer.tls_ca_cert.clone();
-
-        self.builder_circuit_breaker_consecutive_limit =
-            self.builder_limits.circuit_breaker_consecutive_limit;
-        self.builder_circuit_breaker_epoch_limit = self.builder_limits.circuit_breaker_epoch_limit;
-
-        self.monitoring_endpoint = self.monitoring.endpoint.clone();
-        self.monitoring_interval = self.monitoring.interval;
-        self.monitoring_endpoint_insecure = self.monitoring.endpoint_insecure;
-
-        self.proposer_config_url = self.proposer_config.url.clone();
-        self.proposer_config_file = self.proposer_config.file.clone();
-        self.proposer_config_refresh_interval = self.proposer_config.refresh_interval;
-        self.proposer_config_url_token = self.proposer_config.url_token.clone();
-        self.proposer_config_url_insecure = self.proposer_config.url_insecure;
-
-        self.logfile_max_size = self.logfile.max_size;
-        self.logfile_max_number = self.logfile.max_number;
-        self.logfile_compress = self.logfile.compress;
-        self.logfile_level = self.logfile.level.clone();
-    }
-
-    /// Copy flat shim values back into nested groups.
-    ///
-    /// Used when call sites mutate a flat shim field in place (transitional).
-    /// Removed in RF5-13.
-    pub fn sync_nested_from_flat_shims(&mut self) {
-        self.keymanager.enabled = self.keymanager_enabled;
-        self.keymanager.address = self.keymanager_address.clone();
-        self.keymanager.token_file = self.keymanager_token_file.clone();
-        self.keymanager.remote_signer_url = self.remote_signer_url.clone();
-        self.keymanager.remote_signer_allowed_hosts = self.remote_signer_allowed_hosts.clone();
-        self.keymanager.allow_insecure_remote_signer = self.allow_insecure_remote_signer;
-        self.keymanager.cors_origins = self.keymanager_cors_origins.clone();
-        self.keymanager.body_limit = self.keymanager_body_limit;
-
-        self.tracing.endpoint = self.tracing_endpoint.clone();
-        self.tracing.exporter = self.tracing_exporter;
-        self.tracing.sample_rate = self.tracing_sample_rate;
-        self.tracing.max_queue_size = self.tracing_max_queue_size;
-        self.tracing.max_export_batch_size = self.tracing_max_export_batch_size;
-
-        self.grpc_signer.url = self.grpc_signer_url.clone();
-        self.grpc_signer.tls_cert = self.grpc_signer_tls_cert.clone();
-        self.grpc_signer.tls_key = self.grpc_signer_tls_key.clone();
-        self.grpc_signer.tls_ca_cert = self.grpc_signer_tls_ca_cert.clone();
-
-        self.builder_limits.circuit_breaker_consecutive_limit =
-            self.builder_circuit_breaker_consecutive_limit;
-        self.builder_limits.circuit_breaker_epoch_limit = self.builder_circuit_breaker_epoch_limit;
-
-        self.monitoring.endpoint = self.monitoring_endpoint.clone();
-        self.monitoring.interval = self.monitoring_interval;
-        self.monitoring.endpoint_insecure = self.monitoring_endpoint_insecure;
-
-        self.proposer_config.url = self.proposer_config_url.clone();
-        self.proposer_config.file = self.proposer_config_file.clone();
-        self.proposer_config.refresh_interval = self.proposer_config_refresh_interval;
-        self.proposer_config.url_token = self.proposer_config_url_token.clone();
-        self.proposer_config.url_insecure = self.proposer_config_url_insecure;
-
-        self.logfile.max_size = self.logfile_max_size;
-        self.logfile.max_number = self.logfile_max_number;
-        self.logfile.compress = self.logfile_compress;
-        self.logfile.level = self.logfile_level.clone();
-    }
-
-    // ----- Flat accessor methods (removed in RF5-13) -----
-
-    /// removed in RF5-13 — use `keymanager.enabled`
-    #[doc(hidden)]
-    pub fn keymanager_enabled(&self) -> bool {
-        self.keymanager.enabled
-    }
-    /// removed in RF5-13 — use `tracing.sample_rate`
-    #[doc(hidden)]
-    pub fn tracing_sample_rate(&self) -> f64 {
-        self.tracing.sample_rate
-    }
-    /// removed in RF5-13 — use `logfile.max_size`
-    #[doc(hidden)]
-    pub fn logfile_max_size(&self) -> u64 {
-        self.logfile.max_size
-    }
-    /// removed in RF5-13 — use `logfile.path`
-    #[doc(hidden)]
-    pub fn logfile_path(&self) -> &Option<PathBuf> {
-        &self.logfile.path
-    }
-
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         if !path.exists() {
@@ -1706,8 +1390,6 @@ impl Config {
         if let Some(v) = cli.beacon_max_body_bytes {
             self.beacon_max_body_bytes = v;
         }
-
-        self.sync_flat_shims();
     }
 }
 
@@ -2266,10 +1948,10 @@ doppelganger_detection = false
     #[test]
     fn test_default_config_keymanager_disabled() {
         let config = Config::default();
-        assert!(!config.keymanager_enabled);
-        assert!(config.keymanager_address.is_none());
-        assert!(config.keymanager_token_file.is_none());
-        assert!(config.remote_signer_url.is_none());
+        assert!(!config.keymanager.enabled);
+        assert!(config.keymanager.address.is_none());
+        assert!(config.keymanager.token_file.is_none());
+        assert!(config.keymanager.remote_signer_url.is_none());
     }
 
     #[test]
@@ -2285,10 +1967,13 @@ doppelganger_detection = false
 
         config.merge_with_cli(&cli);
 
-        assert!(config.keymanager_enabled);
-        assert_eq!(config.keymanager_address.as_deref(), Some("0.0.0.0:5062"));
-        assert_eq!(config.keymanager_token_file, Some(PathBuf::from("/data/token.txt")));
-        assert_eq!(config.remote_signer_url.as_deref(), Some("https://signer.example.com"));
+        assert!(config.keymanager.enabled);
+        assert_eq!(config.keymanager.address.as_deref(), Some("0.0.0.0:5062"));
+        assert_eq!(config.keymanager.token_file, Some(PathBuf::from("/data/token.txt")));
+        assert_eq!(
+            config.keymanager.remote_signer_url.as_deref(),
+            Some("https://signer.example.com")
+        );
     }
 
     #[test]
@@ -2311,10 +1996,13 @@ remote_signer_url = "https://signer.example.com"
         .unwrap();
 
         let config = Config::from_file(file.path()).unwrap();
-        assert!(config.keymanager_enabled);
-        assert_eq!(config.keymanager_address.as_deref(), Some("0.0.0.0:5062"));
-        assert_eq!(config.keymanager_token_file, Some(PathBuf::from("/data/token.txt")));
-        assert_eq!(config.remote_signer_url.as_deref(), Some("https://signer.example.com"));
+        assert!(config.keymanager.enabled);
+        assert_eq!(config.keymanager.address.as_deref(), Some("0.0.0.0:5062"));
+        assert_eq!(config.keymanager.token_file, Some(PathBuf::from("/data/token.txt")));
+        assert_eq!(
+            config.keymanager.remote_signer_url.as_deref(),
+            Some("https://signer.example.com")
+        );
     }
 
     #[test]
@@ -2324,10 +2012,10 @@ remote_signer_url = "https://signer.example.com"
 
         config.merge_with_cli(&cli);
 
-        assert!(!config.keymanager_enabled);
-        assert!(config.keymanager_address.is_none());
-        assert!(config.keymanager_token_file.is_none());
-        assert!(config.remote_signer_url.is_none());
+        assert!(!config.keymanager.enabled);
+        assert!(config.keymanager.address.is_none());
+        assert!(config.keymanager.token_file.is_none());
+        assert!(config.keymanager.remote_signer_url.is_none());
     }
 
     // -- key_decrypt_threads tests --
@@ -2381,9 +2069,9 @@ key_decrypt_threads = 4
     #[test]
     fn test_default_config_tracing_fields() {
         let config = Config::default();
-        assert!(config.tracing_endpoint.is_none());
-        assert_eq!(config.tracing_exporter, TracingExporter::Otlp);
-        assert!((config.tracing_sample_rate - 0.01).abs() < f64::EPSILON);
+        assert!(config.tracing.endpoint.is_none());
+        assert_eq!(config.tracing.exporter, TracingExporter::Otlp);
+        assert!((config.tracing.sample_rate - 0.01).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2394,7 +2082,7 @@ key_decrypt_threads = 4
             ..Default::default()
         };
         config.merge_with_cli(&cli);
-        assert_eq!(config.tracing_endpoint.as_deref(), Some("http://collector:4318"));
+        assert_eq!(config.tracing.endpoint.as_deref(), Some("http://collector:4318"));
     }
 
     #[test]
@@ -2403,7 +2091,7 @@ key_decrypt_threads = 4
         let cli =
             CliOverrides { tracing_exporter: Some(TracingExporter::Gcp), ..Default::default() };
         config.merge_with_cli(&cli);
-        assert_eq!(config.tracing_exporter, TracingExporter::Gcp);
+        assert_eq!(config.tracing.exporter, TracingExporter::Gcp);
     }
 
     #[test]
@@ -2411,7 +2099,7 @@ key_decrypt_threads = 4
         let mut config = Config::default();
         let cli = CliOverrides { tracing_sample_rate: Some(0.5), ..Default::default() };
         config.merge_with_cli(&cli);
-        assert!((config.tracing_sample_rate - 0.5).abs() < f64::EPSILON);
+        assert!((config.tracing.sample_rate - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2419,9 +2107,9 @@ key_decrypt_threads = 4
         let mut config = Config::default();
         let cli = CliOverrides::default();
         config.merge_with_cli(&cli);
-        assert!(config.tracing_endpoint.is_none());
-        assert_eq!(config.tracing_exporter, TracingExporter::Otlp);
-        assert!((config.tracing_sample_rate - 0.01).abs() < f64::EPSILON);
+        assert!(config.tracing.endpoint.is_none());
+        assert_eq!(config.tracing.exporter, TracingExporter::Otlp);
+        assert!((config.tracing.sample_rate - 0.01).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2443,9 +2131,9 @@ tracing_sample_rate = 0.1
         .unwrap();
 
         let config = Config::from_file(file.path()).unwrap();
-        assert_eq!(config.tracing_endpoint.as_deref(), Some("http://otel-collector:4318"));
-        assert_eq!(config.tracing_exporter, TracingExporter::Otlp);
-        assert!((config.tracing_sample_rate - 0.1).abs() < f64::EPSILON);
+        assert_eq!(config.tracing.endpoint.as_deref(), Some("http://otel-collector:4318"));
+        assert_eq!(config.tracing.exporter, TracingExporter::Otlp);
+        assert!((config.tracing.sample_rate - 0.1).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2464,9 +2152,9 @@ log_level = "info"
         .unwrap();
 
         let config = Config::from_file(file.path()).unwrap();
-        assert!(config.tracing_endpoint.is_none());
-        assert_eq!(config.tracing_exporter, TracingExporter::Otlp);
-        assert!((config.tracing_sample_rate - 0.01).abs() < f64::EPSILON);
+        assert!(config.tracing.endpoint.is_none());
+        assert_eq!(config.tracing.exporter, TracingExporter::Otlp);
+        assert!((config.tracing.sample_rate - 0.01).abs() < f64::EPSILON);
     }
 
     // -- tracing batch config tests --
@@ -2474,8 +2162,8 @@ log_level = "info"
     #[test]
     fn test_default_config_tracing_batch_fields_none() {
         let config = Config::default();
-        assert!(config.tracing_max_queue_size.is_none());
-        assert!(config.tracing_max_export_batch_size.is_none());
+        assert!(config.tracing.max_queue_size.is_none());
+        assert!(config.tracing.max_export_batch_size.is_none());
     }
 
     #[test]
@@ -2483,7 +2171,7 @@ log_level = "info"
         let mut config = Config::default();
         let cli = CliOverrides { tracing_max_queue_size: Some(4096), ..Default::default() };
         config.merge_with_cli(&cli);
-        assert_eq!(config.tracing_max_queue_size, Some(4096));
+        assert_eq!(config.tracing.max_queue_size, Some(4096));
     }
 
     #[test]
@@ -2491,7 +2179,7 @@ log_level = "info"
         let mut config = Config::default();
         let cli = CliOverrides { tracing_max_export_batch_size: Some(1024), ..Default::default() };
         config.merge_with_cli(&cli);
-        assert_eq!(config.tracing_max_export_batch_size, Some(1024));
+        assert_eq!(config.tracing.max_export_batch_size, Some(1024));
     }
 
     #[test]
@@ -2499,8 +2187,8 @@ log_level = "info"
         let mut config = Config::default();
         let cli = CliOverrides::default();
         config.merge_with_cli(&cli);
-        assert!(config.tracing_max_queue_size.is_none());
-        assert!(config.tracing_max_export_batch_size.is_none());
+        assert!(config.tracing.max_queue_size.is_none());
+        assert!(config.tracing.max_export_batch_size.is_none());
     }
 
     #[test]
@@ -2521,8 +2209,8 @@ tracing_max_export_batch_size = 1024
         .unwrap();
 
         let config = Config::from_file(file.path()).unwrap();
-        assert_eq!(config.tracing_max_queue_size, Some(4096));
-        assert_eq!(config.tracing_max_export_batch_size, Some(1024));
+        assert_eq!(config.tracing.max_queue_size, Some(4096));
+        assert_eq!(config.tracing.max_export_batch_size, Some(1024));
     }
 
     #[test]
@@ -2541,8 +2229,8 @@ log_level = "info"
         .unwrap();
 
         let config = Config::from_file(file.path()).unwrap();
-        assert!(config.tracing_max_queue_size.is_none());
-        assert!(config.tracing_max_export_batch_size.is_none());
+        assert!(config.tracing.max_queue_size.is_none());
+        assert!(config.tracing.max_export_batch_size.is_none());
     }
 
     // -- redact_url tests --
@@ -2607,7 +2295,7 @@ log_level = "info"
     #[test]
     fn test_default_config_remote_signer_allowed_hosts_none() {
         let config = Config::default();
-        assert!(config.remote_signer_allowed_hosts.is_none());
+        assert!(config.keymanager.remote_signer_allowed_hosts.is_none());
     }
 
     #[test]
@@ -2619,7 +2307,7 @@ log_level = "info"
         };
         config.merge_with_cli(&cli);
         assert_eq!(
-            config.remote_signer_allowed_hosts,
+            config.keymanager.remote_signer_allowed_hosts,
             Some(vec!["host1.com".to_string(), "host2.com".to_string()])
         );
     }
@@ -2633,7 +2321,7 @@ log_level = "info"
         };
         config.merge_with_cli(&cli);
         assert_eq!(
-            config.remote_signer_allowed_hosts,
+            config.keymanager.remote_signer_allowed_hosts,
             Some(vec!["host1.com".to_string(), "host2.com".to_string()])
         );
     }
@@ -2643,7 +2331,7 @@ log_level = "info"
         let mut config = Config::default();
         let cli = CliOverrides::default();
         config.merge_with_cli(&cli);
-        assert!(config.remote_signer_allowed_hosts.is_none());
+        assert!(config.keymanager.remote_signer_allowed_hosts.is_none());
     }
 
     #[test]
@@ -2664,7 +2352,7 @@ remote_signer_allowed_hosts = ["signer1.com", "signer2.com"]
 
         let config = Config::from_file(file.path()).unwrap();
         assert_eq!(
-            config.remote_signer_allowed_hosts,
+            config.keymanager.remote_signer_allowed_hosts,
             Some(vec!["signer1.com".to_string(), "signer2.com".to_string()])
         );
     }
@@ -2948,7 +2636,7 @@ log_level = "info"
         // Case 1: insecure flag false skips env check
         std::env::remove_var("RVC_ALLOW_INSECURE");
         let config = Config::default();
-        assert!(!config.allow_insecure_remote_signer);
+        assert!(!config.keymanager.allow_insecure_remote_signer);
         assert!(config.validate().is_ok(), "Should pass when insecure flag is false");
 
         // Case 2: insecure flag true without env var fails
@@ -2994,8 +2682,8 @@ log_level = "info"
     #[test]
     fn test_default_circuit_breaker_limits() {
         let config = Config::default();
-        assert_eq!(config.builder_circuit_breaker_consecutive_limit, 3);
-        assert_eq!(config.builder_circuit_breaker_epoch_limit, 5);
+        assert_eq!(config.builder_limits.circuit_breaker_consecutive_limit, 3);
+        assert_eq!(config.builder_limits.circuit_breaker_epoch_limit, 5);
     }
 
     #[test]
@@ -3013,8 +2701,8 @@ log_level = "info"
             ..Default::default()
         };
         config.merge_with_cli(&cli);
-        assert_eq!(config.builder_circuit_breaker_consecutive_limit, 10);
-        assert_eq!(config.builder_circuit_breaker_epoch_limit, 20);
+        assert_eq!(config.builder_limits.circuit_breaker_consecutive_limit, 10);
+        assert_eq!(config.builder_limits.circuit_breaker_epoch_limit, 20);
     }
 
     #[test]
@@ -3043,8 +2731,8 @@ disable_keystore_locking = true
         let config = Config::from_file(f.path()).unwrap();
         assert_eq!(config.builder_limits.circuit_breaker_consecutive_limit, 7);
         assert_eq!(config.builder_limits.circuit_breaker_epoch_limit, 12);
-        assert_eq!(config.builder_circuit_breaker_consecutive_limit, 7);
-        assert_eq!(config.builder_circuit_breaker_epoch_limit, 12);
+        assert_eq!(config.builder_limits.circuit_breaker_consecutive_limit, 7);
+        assert_eq!(config.builder_limits.circuit_breaker_epoch_limit, 12);
         assert!(config.disable_keystore_locking);
     }
 
@@ -3160,9 +2848,8 @@ broadcast = ["invalid-topic"]
         assert_eq!(config.proposer_config.refresh_interval, 384);
         assert!(config.proposer_config.url_token.is_none());
         assert!(!config.proposer_config.url_insecure);
-        // Flat shims stay in sync with nested defaults
-        assert!(config.proposer_config_url.is_none());
-        assert_eq!(config.proposer_config_refresh_interval, 384);
+        assert!(config.proposer_config.url.is_none());
+        assert_eq!(config.proposer_config.refresh_interval, 384);
     }
 
     #[test]
@@ -3212,8 +2899,8 @@ broadcast = ["blocks", "attestations"]
         assert_eq!(config.proposer_config.refresh_interval, 60);
         assert_eq!(config.proposer_config.url_token, Some("my-token".to_string()));
         assert!(config.proposer_config.url_insecure);
-        assert_eq!(config.proposer_config_url, Some("https://example.com/config".to_string()));
-        assert!(config.proposer_config_url_insecure);
+        assert_eq!(config.proposer_config.url, Some("https://example.com/config".to_string()));
+        assert!(config.proposer_config.url_insecure);
     }
 
     // -- RF5-11: typed config enums (fail-early deserialize) --
@@ -3323,7 +3010,6 @@ tracing_exporter = "{literal}"
                 panic!("accepted tracing_exporter {literal:?} must still parse: {e}")
             });
             assert_eq!(config.tracing.exporter, expected);
-            assert_eq!(config.tracing_exporter, expected);
             assert_eq!(literal.parse::<TracingExporter>().unwrap(), expected);
             let json = serde_json::to_string(&expected).unwrap();
             let back: TracingExporter = serde_json::from_str(&json).unwrap();
@@ -3403,5 +3089,93 @@ roles = ["not-a-role"]
             "valid entry must be present (prefix stripped)"
         );
         assert!(logs_contain("double 0x prefix"), "expected warn log about double prefix");
+    }
+
+    // -- RF5-13: nested call sites; flat shims deleted --
+
+    /// Source-level guard: flat field shims must not reappear on `Config`.
+    ///
+    /// `CliOverrides` / `ConfigWire` still use the historical flat key names for CLI and
+    /// serde alias compatibility — only the public `Config` shims are forbidden.
+    #[test]
+    fn test_no_flat_field_accessors_remain() {
+        let full = include_str!("types.rs");
+        // Exclude this test module so assertion strings do not self-match.
+        let src = full.split("#[cfg(test)]").next().expect("production source before tests");
+
+        assert!(
+            !src.contains("removed in RF5-13"),
+            "shim markers must be gone from production source"
+        );
+        assert!(!src.contains("sync_flat_shims"), "sync_flat_shims must be deleted");
+        assert!(
+            !src.contains("sync_nested_from_flat_shims"),
+            "sync_nested_from_flat_shims must be deleted"
+        );
+
+        let start = src.find("pub struct Config {").expect("Config struct");
+        let after = &src[start..];
+        let end = after.find("\nfn default_").expect("end of Config struct region");
+        let config_struct = &after[..end];
+
+        for nested in [
+            "pub logfile: LogfileConfig",
+            "pub tracing: TracingConfig",
+            "pub keymanager: KeymanagerConfig",
+            "pub grpc_signer: GrpcSignerConfig",
+            "pub proposer_config: ProposerConfigSource",
+            "pub monitoring: MonitoringConfig",
+            "pub builder_limits: BuilderLimits",
+        ] {
+            assert!(config_struct.contains(nested), "nested group missing from Config: {nested}");
+        }
+
+        for field in [
+            "keymanager_enabled",
+            "keymanager_address",
+            "keymanager_token_file",
+            "remote_signer_url",
+            "remote_signer_allowed_hosts",
+            "allow_insecure_remote_signer",
+            "keymanager_cors_origins",
+            "keymanager_body_limit",
+            "tracing_endpoint",
+            "tracing_exporter",
+            "tracing_sample_rate",
+            "tracing_max_queue_size",
+            "tracing_max_export_batch_size",
+            "grpc_signer_url",
+            "grpc_signer_tls_cert",
+            "grpc_signer_tls_key",
+            "grpc_signer_tls_ca_cert",
+            "builder_circuit_breaker_consecutive_limit",
+            "builder_circuit_breaker_epoch_limit",
+            "monitoring_endpoint",
+            "monitoring_interval",
+            "monitoring_endpoint_insecure",
+            "proposer_config_url",
+            "proposer_config_file",
+            "proposer_config_refresh_interval",
+            "proposer_config_url_token",
+            "proposer_config_url_insecure",
+            "logfile_max_size",
+            "logfile_max_number",
+            "logfile_compress",
+            "logfile_level",
+        ] {
+            assert!(
+                !config_struct.contains(field),
+                "flat Config field shim must be deleted: {field}"
+            );
+        }
+
+        for method in [
+            "fn keymanager_enabled(",
+            "fn tracing_sample_rate(",
+            "fn logfile_max_size(",
+            "fn logfile_path(",
+        ] {
+            assert!(!src.contains(method), "flat accessor method must be deleted: {method}");
+        }
     }
 }

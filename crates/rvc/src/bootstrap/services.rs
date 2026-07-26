@@ -192,8 +192,8 @@ pub async fn build_services(
     ));
 
     // Step 7b: Configure remote signer if URL provided
-    if let Some(ref url) = config.remote_signer_url {
-        if !config.keymanager_enabled {
+    if let Some(ref url) = config.keymanager.remote_signer_url {
+        if !config.keymanager.enabled {
             warn!(
                 url = %url,
                 "Remote signer URL configured but Keymanager API is disabled; \

@@ -120,11 +120,12 @@ pub fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
 
 pub fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfig> {
     let endpoint = config
-        .tracing_endpoint
+        .tracing
+        .endpoint
         .clone()
         .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())?;
 
-    let mut sample_rate = config.tracing_sample_rate;
+    let mut sample_rate = config.tracing.sample_rate;
     // If sample_rate is still at default, check env var
     if (sample_rate - 0.01).abs() < f64::EPSILON {
         if let Ok(env_rate) = std::env::var("OTEL_TRACES_SAMPLER_ARG") {
@@ -153,7 +154,7 @@ pub fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfi
         }
     }
 
-    let exporter = match config.tracing_exporter {
+    let exporter = match config.tracing.exporter {
         rvc::config::TracingExporter::Otlp => telemetry::ExporterKind::Otlp,
         #[cfg(feature = "gcp-trace")]
         rvc::config::TracingExporter::Gcp => telemetry::ExporterKind::Gcp,
@@ -173,8 +174,8 @@ pub fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfi
         sample_rate,
         network: config.network.to_string(),
         service_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        max_queue_size: config.tracing_max_queue_size,
-        max_export_batch_size: config.tracing_max_export_batch_size,
+        max_queue_size: config.tracing.max_queue_size,
+        max_export_batch_size: config.tracing.max_export_batch_size,
     })
 }
 
@@ -190,14 +191,14 @@ pub fn build_file_layer_config(config: &Config) -> Option<telemetry::FileAppende
         .map(|f| f.to_string_lossy().to_string())
         .unwrap_or_else(|| "rvc.log".to_string());
 
-    let level = config.logfile_level.clone().unwrap_or_else(|| config.log_level.clone());
+    let level = config.logfile.level.clone().unwrap_or_else(|| config.log_level.clone());
 
     Some(telemetry::FileAppenderConfig {
         directory,
         filename,
-        max_size_mb: config.logfile_max_size,
-        max_files: config.logfile_max_number,
-        compress: config.logfile_compress,
+        max_size_mb: config.logfile.max_size,
+        max_files: config.logfile.max_number,
+        compress: config.logfile.compress,
         level,
     })
 }
@@ -261,6 +262,7 @@ pub fn spawn_log_reload_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rvc::config::TracingConfig;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
     use clap::Parser;
@@ -292,7 +294,10 @@ mod tests {
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
         let config = Config {
-            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            tracing: TracingConfig {
+                endpoint: Some("http://localhost:4318".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let tc = build_tracing_config(&config).expect("should return Some");
@@ -320,7 +325,10 @@ mod tests {
         std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://env-collector:4318");
 
         let config = Config {
-            tracing_endpoint: Some("http://cli-collector:4318".to_string()),
+            tracing: TracingConfig {
+                endpoint: Some("http://cli-collector:4318".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let tc = build_tracing_config(&config).expect("should use config value");
@@ -336,8 +344,11 @@ mod tests {
         std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.5");
 
         let config = Config {
-            tracing_endpoint: Some("http://localhost:4318".to_string()),
-            // sample_rate at default 0.01, so env var should be checked
+            tracing: TracingConfig {
+                endpoint: Some("http://localhost:4318".to_string()),
+                // sample_rate at default 0.01, so env var should be checked
+                ..Default::default()
+            },
             ..Default::default()
         };
         let tc = build_tracing_config(&config).expect("should return Some");
@@ -352,8 +363,11 @@ mod tests {
         std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.5");
 
         let config = Config {
-            tracing_endpoint: Some("http://localhost:4318".to_string()),
-            tracing_sample_rate: 0.75, // non-default, so env var should NOT be checked
+            tracing: TracingConfig {
+                endpoint: Some("http://localhost:4318".to_string()),
+                sample_rate: 0.75, // non-default, so env var should NOT be checked
+                ..Default::default()
+            },
             ..Default::default()
         };
         let tc = build_tracing_config(&config).expect("should return Some");
@@ -369,8 +383,11 @@ mod tests {
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
         let config = Config {
-            tracing_endpoint: Some("http://localhost:4318".to_string()),
-            tracing_sample_rate: 2.0,
+            tracing: TracingConfig {
+                endpoint: Some("http://localhost:4318".to_string()),
+                sample_rate: 2.0,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let tc = build_tracing_config(&config).expect("should return Some");
@@ -384,8 +401,11 @@ mod tests {
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
         let config = Config {
-            tracing_endpoint: Some("http://localhost:4318".to_string()),
-            tracing_sample_rate: -0.5,
+            tracing: TracingConfig {
+                endpoint: Some("http://localhost:4318".to_string()),
+                sample_rate: -0.5,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let tc = build_tracing_config(&config).expect("should return Some");
@@ -399,7 +419,10 @@ mod tests {
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
         let config = Config {
-            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            tracing: TracingConfig {
+                endpoint: Some("http://localhost:4318".to_string()),
+                ..Default::default()
+            },
             network: rvc::config::Network::Hoodi,
             ..Default::default()
         };
@@ -414,8 +437,11 @@ mod tests {
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
         let config = Config {
-            tracing_endpoint: Some("http://localhost:4318".to_string()),
-            tracing_exporter: rvc::config::TracingExporter::Otlp,
+            tracing: TracingConfig {
+                endpoint: Some("http://localhost:4318".to_string()),
+                exporter: rvc::config::TracingExporter::Otlp,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let tc = build_tracing_config(&config).expect("should return Some");
@@ -429,9 +455,12 @@ mod tests {
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
         let config = Config {
-            tracing_endpoint: Some("http://localhost:4318".to_string()),
-            tracing_max_queue_size: Some(4096),
-            tracing_max_export_batch_size: Some(1024),
+            tracing: TracingConfig {
+                endpoint: Some("http://localhost:4318".to_string()),
+                max_queue_size: Some(4096),
+                max_export_batch_size: Some(1024),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let tc = build_tracing_config(&config).expect("should return Some");
@@ -446,7 +475,10 @@ mod tests {
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
         let config = Config {
-            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            tracing: TracingConfig {
+                endpoint: Some("http://localhost:4318".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let tc = build_tracing_config(&config).expect("should return Some");
@@ -477,7 +509,10 @@ mod tests {
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
         let config = Config {
-            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            tracing: TracingConfig {
+                endpoint: Some("http://localhost:4318".to_string()),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let tc = build_tracing_config(&config).expect("should return Some");
@@ -575,10 +610,10 @@ mod tests {
     #[test]
     fn test_grpc_signer_config_defaults_none() {
         let config = Config::default();
-        assert!(config.grpc_signer_url.is_none());
-        assert!(config.grpc_signer_tls_cert.is_none());
-        assert!(config.grpc_signer_tls_key.is_none());
-        assert!(config.grpc_signer_tls_ca_cert.is_none());
+        assert!(config.grpc_signer.url.is_none());
+        assert!(config.grpc_signer.tls_cert.is_none());
+        assert!(config.grpc_signer.tls_key.is_none());
+        assert!(config.grpc_signer.tls_ca_cert.is_none());
     }
 
     #[test]
@@ -594,10 +629,10 @@ mod tests {
 
         config.merge_with_cli(&cli);
 
-        assert_eq!(config.grpc_signer_url.as_deref(), Some("https://signer:50051"));
-        assert_eq!(config.grpc_signer_tls_cert, Some(PathBuf::from("/cert.pem")));
-        assert_eq!(config.grpc_signer_tls_key, Some(PathBuf::from("/key.pem")));
-        assert_eq!(config.grpc_signer_tls_ca_cert, Some(PathBuf::from("/ca.pem")));
+        assert_eq!(config.grpc_signer.url.as_deref(), Some("https://signer:50051"));
+        assert_eq!(config.grpc_signer.tls_cert, Some(PathBuf::from("/cert.pem")));
+        assert_eq!(config.grpc_signer.tls_key, Some(PathBuf::from("/key.pem")));
+        assert_eq!(config.grpc_signer.tls_ca_cert, Some(PathBuf::from("/ca.pem")));
     }
 
     #[test]
@@ -607,8 +642,8 @@ mod tests {
 
         config.merge_with_cli(&cli);
 
-        assert!(config.grpc_signer_url.is_none());
-        assert!(config.grpc_signer_tls_cert.is_none());
+        assert!(config.grpc_signer.url.is_none());
+        assert!(config.grpc_signer.tls_cert.is_none());
     }
 
     // ── SEC-9 / M-15: allow_unsupported_fork CLI merge ────────────────────

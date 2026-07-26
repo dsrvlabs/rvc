@@ -13,7 +13,7 @@ fn production_fixture_path() -> PathBuf {
 }
 
 fn expected_production_config() -> Config {
-    let mut cfg = Config {
+    let cfg = Config {
         beacon_url: "http://bn.example:5052".to_string(),
         beacon_nodes: vec![
             "http://bn1.example:5052".to_string(),
@@ -86,11 +86,10 @@ fn expected_production_config() -> Config {
         validator_registration_batch_delay: 500,
         ..Config::default()
     };
-    cfg.sync_flat_shims();
     cfg
 }
 
-/// Assert nested groups and flat shims match between two configs for moved fields.
+/// Assert nested groups match between two configs for moved fields.
 fn assert_moved_fields_eq(a: &Config, b: &Config) {
     assert_eq!(a.keymanager, b.keymanager);
     assert_eq!(a.tracing.endpoint, b.tracing.endpoint);
@@ -103,18 +102,6 @@ fn assert_moved_fields_eq(a: &Config, b: &Config) {
     assert_eq!(a.monitoring, b.monitoring);
     assert_eq!(a.proposer_config, b.proposer_config);
     assert_eq!(a.logfile, b.logfile);
-
-    // Flat shims
-    assert_eq!(a.keymanager_enabled, b.keymanager_enabled);
-    assert_eq!(a.tracing_sample_rate, b.tracing_sample_rate);
-    assert_eq!(a.logfile_max_size, b.logfile_max_size);
-    assert_eq!(a.grpc_signer_url, b.grpc_signer_url);
-    assert_eq!(a.monitoring_endpoint, b.monitoring_endpoint);
-    assert_eq!(a.proposer_config_url, b.proposer_config_url);
-    assert_eq!(
-        a.builder_circuit_breaker_consecutive_limit,
-        b.builder_circuit_breaker_consecutive_limit
-    );
 }
 
 #[test]
@@ -129,12 +116,11 @@ fn test_production_config_fixture_loads_with_flat_keys() {
     assert_eq!(loaded.graffiti, expected.graffiti);
     assert_moved_fields_eq(&loaded, &expected);
 
-    // Method shims agree with nested + flat fields
-    assert!(loaded.keymanager_enabled());
-    assert!((loaded.tracing_sample_rate() - 0.05).abs() < f64::EPSILON);
-    assert_eq!(loaded.logfile_max_size(), 100);
+    assert!(loaded.keymanager.enabled);
+    assert!((loaded.tracing.sample_rate - 0.05).abs() < f64::EPSILON);
+    assert_eq!(loaded.logfile.max_size, 100);
     assert_eq!(
-        loaded.logfile_path().as_ref().map(|p| p.to_str().unwrap()),
+        loaded.logfile.path.as_ref().map(|p| p.to_str().unwrap()),
         Some("/var/log/rvc/rvc.log")
     );
 }
@@ -218,11 +204,8 @@ fn test_default_config_field_values_unchanged() {
     assert_eq!(c.network, Network::Mainnet);
     assert!(c.doppelganger_detection);
     assert!(!c.keymanager.enabled);
-    assert!(!c.keymanager_enabled);
     assert!((c.tracing.sample_rate - 0.01).abs() < f64::EPSILON);
-    assert!((c.tracing_sample_rate - 0.01).abs() < f64::EPSILON);
     assert_eq!(c.logfile.max_size, 200);
-    assert_eq!(c.logfile_max_size, 200);
     assert_eq!(c.logfile.max_number, 5);
     assert_eq!(c.monitoring.interval, 384);
     assert_eq!(c.proposer_config.refresh_interval, 384);

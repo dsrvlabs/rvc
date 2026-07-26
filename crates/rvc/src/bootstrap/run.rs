@@ -211,12 +211,12 @@ pub async fn run(
 
     // Step 8: duty orchestrator.
     let circuit_breaker = std::sync::Arc::new(builder::CircuitBreakerState::new(
-        config.builder_circuit_breaker_consecutive_limit,
-        config.builder_circuit_breaker_epoch_limit,
+        config.builder_limits.circuit_breaker_consecutive_limit,
+        config.builder_limits.circuit_breaker_epoch_limit,
     ));
     info!(
-        consecutive_limit = config.builder_circuit_breaker_consecutive_limit,
-        epoch_limit = config.builder_circuit_breaker_epoch_limit,
+        consecutive_limit = config.builder_limits.circuit_breaker_consecutive_limit,
+        epoch_limit = config.builder_limits.circuit_breaker_epoch_limit,
         "Builder circuit breaker configured"
     );
 

@@ -88,16 +88,16 @@ pub fn spawn_background_tasks(
         tokio::spawn(serve_metrics_with_health(metrics_address, metrics_port, health_status));
 
     // Spawn monitoring push task if endpoint is configured (T3.6)
-    if let Some(ref monitoring_endpoint) = config.monitoring_endpoint {
+    if let Some(ref monitoring_endpoint) = config.monitoring.endpoint {
         let monitoring_config = crate::monitoring::MonitoringConfig {
             endpoint: monitoring_endpoint.clone(),
-            interval: Duration::from_secs(config.monitoring_interval),
-            insecure: config.monitoring_endpoint_insecure,
+            interval: Duration::from_secs(config.monitoring.interval),
+            insecure: config.monitoring.endpoint_insecure,
         };
         let monitoring_shutdown = shutdown.clone();
         info!(
             endpoint = %redact_url(monitoring_endpoint),
-            interval_secs = config.monitoring_interval,
+            interval_secs = config.monitoring.interval,
             "Starting monitoring push task"
         );
         tokio::spawn(crate::monitoring::start_monitoring_push(
@@ -108,17 +108,17 @@ pub fn spawn_background_tasks(
     }
 
     // Spawn proposer config URL refresh task if configured (T3.12)
-    if let Some(ref proposer_config_url) = config.proposer_config_url {
+    if let Some(ref proposer_config_url) = config.proposer_config.url {
         let settings = crate::config_url::ProposerConfigUrlSettings {
             url: proposer_config_url.clone(),
-            refresh_interval: Duration::from_secs(config.proposer_config_refresh_interval),
-            token: config.proposer_config_url_token.clone(),
-            insecure: config.proposer_config_url_insecure,
+            refresh_interval: Duration::from_secs(config.proposer_config.refresh_interval),
+            token: config.proposer_config.url_token.clone(),
+            insecure: config.proposer_config.url_insecure,
         };
         let config_refresh_shutdown = shutdown.clone();
         info!(
             url = %redact_url(proposer_config_url),
-            refresh_interval_secs = config.proposer_config_refresh_interval,
+            refresh_interval_secs = config.proposer_config.refresh_interval,
             "Starting proposer config URL refresh task"
         );
         tokio::spawn(crate::config_url::start_proposer_config_refresh(
@@ -217,8 +217,7 @@ mod tests {
         let config = Config {
             metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             metrics_port: 0, // OS-assigned; serve binds ephemeral
-            monitoring_endpoint: None,
-            proposer_config_url: None,
+            // monitoring / proposer_config left at nested defaults (disabled)
             ..Config::default()
         };
         let health = metrics::new_health_status();
