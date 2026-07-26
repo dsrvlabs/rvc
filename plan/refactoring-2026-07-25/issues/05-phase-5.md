@@ -1574,13 +1574,13 @@ prescribes thiserror for library error types.
 4. Update the adapters in `crates/rvc` to produce typed variants.
 
 **Acceptance criteria:**
-- [ ] No `Result<_, String>` remains in `crates/keymanager-api/src/traits.rs` or `url_validator.rs`.
-- [ ] No internal detail (path, socket, hostname) appears in any HTTP response body — assert with a
+- [x] No `Result<_, String>` remains in `crates/keymanager-api/src/traits.rs` or `url_validator.rs`.
+- [x] No internal detail (path, socket, hostname) appears in any HTTP response body — assert with a
       test that feeds a backend error containing a filesystem path.
-- [ ] `sanitize_*` is called from at most one place.
-- [ ] HTTP status codes and response shapes for every existing error case are unchanged (table-driven
+- [x] `sanitize_*` is called from at most one place.
+- [x] HTTP status codes and response shapes for every existing error case are unchanged (table-driven
       test against the OpenAPI spec in `docs/keymanager-api.openapi.yaml`).
-- [ ] Workspace green.
+- [x] Workspace green.
 
 **TDD test plan** (RED first):
 - `test_backend_error_containing_path_is_not_leaked_in_response` — **RED**: today a

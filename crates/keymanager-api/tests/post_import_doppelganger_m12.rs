@@ -20,8 +20,8 @@ use rvc_keymanager_api::gate::DoppelgangerGate;
 use rvc_keymanager_api::handlers::{import_keystores, list_keystores, AppState};
 use rvc_keymanager_api::traits::{
     DeleteKeystoreError, DeleteRemoteKeyError, ImportKeystoreError, ImportRemoteKeyError,
-    KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection, ValidatorConfigManager,
-    ValidatorManager,
+    KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection, SlashingProtectionError,
+    ValidatorConfigManager, ValidatorManager,
 };
 
 // ── Mock implementations ─────────────────────────────────────────────────────
@@ -84,10 +84,10 @@ impl KeystoreManager for TrackingKeystoreManager {
 
 struct NoopSlashingProtection;
 impl SlashingProtection for NoopSlashingProtection {
-    fn import_interchange(&self, _: &str) -> Result<(), String> {
+    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
-    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, String> {
+    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
         Ok(String::new())
     }
 }

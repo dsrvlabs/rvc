@@ -19,7 +19,7 @@ use rvc_keymanager_api::handlers::{set_attesting_enabled, AppState};
 use rvc_keymanager_api::traits::{
     DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ImportKeystoreError,
     ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection,
-    ValidatorConfigManager, ValidatorManager,
+    SlashingProtectionError, ValidatorConfigManager, ValidatorManager,
 };
 
 // ── Minimal mock implementations ──────────────────────────────────────────
@@ -42,10 +42,10 @@ impl KeystoreManager for NoopKeystoreManager {
 
 struct NoopSlashingProtection;
 impl SlashingProtection for NoopSlashingProtection {
-    fn import_interchange(&self, _: &str) -> Result<(), String> {
+    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
-    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, String> {
+    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
         Ok(String::new())
     }
 }

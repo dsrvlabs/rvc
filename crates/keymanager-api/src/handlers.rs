@@ -7,10 +7,13 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use observability::logging::{RedactedUrl, TruncatedPubkey};
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, warn};
-use uuid::Uuid;
+use tracing::{info, warn};
 
-use crate::error::ApiError;
+use crate::error::{
+    map_delete_keystore_item_error, map_delete_remote_key_item_error,
+    map_import_keystore_item_error, map_import_remote_key_item_error, map_slashing_export_error,
+    map_slashing_protection_error, map_url_validation_error, ApiError,
+};
 use crate::lifecycle::{DoppelgangerLifecycle, ImportKind};
 use crate::traits::{
     ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager,
@@ -124,7 +127,7 @@ pub async fn import_keystores(
     // This prevents a window where signing keys exist without slashing records.
     if let Some(ref slashing_json) = request.slashing_protection {
         if let Err(e) = state.slashing_protection.import_interchange(slashing_json) {
-            return Err(sanitize_internal(e, "slashing protection import failed"));
+            return Err(map_slashing_protection_error(e, "slashing protection import failed"));
         }
     }
 
@@ -160,7 +163,7 @@ pub async fn import_keystores(
             Err(e) => {
                 results.push(ImportKeystoreResult {
                     status: ImportStatus::Error,
-                    message: sanitize_item_err(e, "keystore import failed"),
+                    message: map_import_keystore_item_error(e),
                 });
             }
         }
@@ -207,18 +210,10 @@ pub async fn delete_keystores(
     let slashing_protection = if existing_keys.is_empty() {
         empty_interchange()
     } else {
-        state.slashing_protection.export_interchange(&existing_keys).map_err(|e| {
-            let req_id = Uuid::new_v4();
-            let safe = escape_log_control_chars(&e);
-            tracing::error!(
-                request_id = %req_id,
-                error = %safe,
-                "DELETE aborted: slashing-protection export failed; no keystores deleted"
-            );
-            ApiError::Internal(
-                "slashing protection export failed; no keystores deleted".to_string(),
-            )
-        })?
+        state
+            .slashing_protection
+            .export_interchange(&existing_keys)
+            .map_err(map_slashing_export_error)?
     };
 
     // Now process deletions
@@ -262,10 +257,8 @@ pub async fn delete_keystores(
                         });
                     }
                     Err(e) => {
-                        // M-8: sanitize underlying error (paths, errno, etc.) before
-                        // returning to the client. The full chain is logged inside
-                        // sanitize_item_err with a request_id correlator.
-                        let message = sanitize_item_err(&e, "keystore delete failed");
+                        // M-8: central mapper sanitizes Backend-class payloads.
+                        let message = map_delete_keystore_item_error(&e);
                         results.push(DeleteKeystoreResult { status: DeleteStatus::Error, message });
                     }
                 }
@@ -334,15 +327,16 @@ pub async fn import_remote_keys(
                 )
                 .await
                 {
+                    let message = map_url_validation_error(e);
                     warn!(
                         pubkey = %TruncatedPubkey::new(&key_import.pubkey),
                         status = "error",
-                        error = %e,
+                        error = %message,
                         "Remote key import result"
                     );
                     results.push(ImportRemoteKeyResult {
                         status: ImportRemoteKeyStatus::Error,
-                        message: e,
+                        message,
                     });
                     continue;
                 }
@@ -377,7 +371,7 @@ pub async fn import_remote_keys(
                     Err(e) => {
                         results.push(ImportRemoteKeyResult {
                             status: ImportRemoteKeyStatus::Error,
-                            message: sanitize_item_err(e, "remote key import failed"),
+                            message: map_import_remote_key_item_error(e),
                         });
                     }
                 }
@@ -449,10 +443,8 @@ pub async fn delete_remote_keys(
                         });
                     }
                     Err(e) => {
-                        // M-8: DeleteRemoteKeyError::Other is `#[error("{0}")]`
-                        // — passes through whatever the backend put in the inner
-                        // String (DB sockets, internal service names). Sanitize.
-                        let message = sanitize_item_err(&e, "remote key delete failed");
+                        // M-8: Backend variant is sanitized by the central mapper.
+                        let message = map_delete_remote_key_item_error(&e);
                         results.push(DeleteRemoteKeyResult {
                             status: DeleteRemoteKeyStatus::Error,
                             message,
@@ -637,41 +629,6 @@ pub async fn prepare_exit(
     let signed_exit = exit_manager.sign_voluntary_exit(&pubkey, epoch).await?;
 
     Ok(Json(VoluntaryExitResponse { data: signed_exit }))
-}
-
-/// Escape ASCII control characters in `s` (notably `\n`, `\r`) to their
-/// `\xHH` form so that an attacker cannot smuggle a forged log line through
-/// a user-controllable error string when the tracing-subscriber formatter is
-/// in text mode (CWE-117 / OWASP A09:2021).  Defense-in-depth in addition
-/// to the JSON-mode formatter recommended in the deployment guide.
-fn escape_log_control_chars(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        if ch.is_control() {
-            out.push_str(&format!("\\x{:02x}", ch as u32));
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-/// Logs `err` at `error!` level with a fresh request ID and returns a generic
-/// `ApiError::Internal` whose message is safe to send to API clients.
-fn sanitize_internal<E: std::fmt::Display>(err: E, ctx: &str) -> ApiError {
-    let req_id = Uuid::new_v4();
-    let safe = escape_log_control_chars(&err.to_string());
-    error!(request_id = %req_id, error = %safe, "{ctx}");
-    ApiError::Internal(format!("internal error (request_id={req_id})"))
-}
-
-/// Logs `err` at `error!` level with a fresh request ID and returns a generic
-/// string suitable for the per-item `message` field in bulk-operation responses.
-fn sanitize_item_err<E: std::fmt::Display>(err: E, ctx: &str) -> String {
-    let req_id = Uuid::new_v4();
-    let safe = escape_log_control_chars(&err.to_string());
-    error!(request_id = %req_id, error = %safe, "{ctx}");
-    format!("key error (request_id={req_id})")
 }
 
 fn parse_pubkey(s: &str) -> Result<Pubkey, String> {
@@ -910,12 +867,18 @@ mod tests {
     }
 
     impl SlashingProtection for MockSlashingProtection {
-        fn import_interchange(&self, interchange_json: &str) -> Result<(), String> {
+        fn import_interchange(
+            &self,
+            interchange_json: &str,
+        ) -> Result<(), crate::traits::SlashingProtectionError> {
             self.imported.lock().push(interchange_json.to_string());
             Ok(())
         }
 
-        fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, String> {
+        fn export_interchange(
+            &self,
+            pubkeys: &[Pubkey],
+        ) -> Result<String, crate::traits::SlashingProtectionError> {
             let data: Vec<serde_json::Value> = pubkeys
                 .iter()
                 .map(|pk| {
@@ -1280,12 +1243,18 @@ mod tests {
     struct FailingSlashingProtection;
 
     impl SlashingProtection for FailingSlashingProtection {
-        fn import_interchange(&self, _interchange_json: &str) -> Result<(), String> {
-            Err("slashing DB corrupted".into())
+        fn import_interchange(
+            &self,
+            _interchange_json: &str,
+        ) -> Result<(), crate::traits::SlashingProtectionError> {
+            Err(crate::traits::SlashingProtectionError::Backend("slashing DB corrupted".into()))
         }
 
-        fn export_interchange(&self, _pubkeys: &[Pubkey]) -> Result<String, String> {
-            Err("export failed".into())
+        fn export_interchange(
+            &self,
+            _pubkeys: &[Pubkey],
+        ) -> Result<String, crate::traits::SlashingProtectionError> {
+            Err(crate::traits::SlashingProtectionError::Backend("export failed".into()))
         }
     }
 
@@ -1295,11 +1264,17 @@ mod tests {
     }
 
     impl SlashingProtection for KeyAwareSlashingProtection {
-        fn import_interchange(&self, _interchange_json: &str) -> Result<(), String> {
+        fn import_interchange(
+            &self,
+            _interchange_json: &str,
+        ) -> Result<(), crate::traits::SlashingProtectionError> {
             Ok(())
         }
 
-        fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, String> {
+        fn export_interchange(
+            &self,
+            pubkeys: &[Pubkey],
+        ) -> Result<String, crate::traits::SlashingProtectionError> {
             // Only export data for keys that still exist in the keystore manager
             let existing: Vec<&Pubkey> =
                 pubkeys.iter().filter(|pk| self.keystore_manager.has_key(pk)).collect();

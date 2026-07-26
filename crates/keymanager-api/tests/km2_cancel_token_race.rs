@@ -23,7 +23,7 @@ use rvc_keymanager_api::lifecycle::{DoppelgangerLifecycle, ImportKind};
 use rvc_keymanager_api::traits::{
     DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ImportKeystoreError,
     ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection,
-    ValidatorConfigManager, ValidatorManager,
+    SlashingProtectionError, ValidatorConfigManager, ValidatorManager,
 };
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
@@ -181,10 +181,10 @@ impl KeystoreManager for GatedKeystoreManager {
 
 struct NoopSlashingProtection;
 impl SlashingProtection for NoopSlashingProtection {
-    fn import_interchange(&self, _: &str) -> Result<(), String> {
+    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
-    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, String> {
+    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
         Ok(String::new())
     }
 }

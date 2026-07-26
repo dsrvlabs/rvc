@@ -16,7 +16,7 @@ use keymanager_api::error::ApiError;
 use keymanager_api::traits::{
     DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ImportKeystoreError,
     ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection,
-    ValidatorConfigManager, ValidatorManager, VoluntaryExitManager,
+    SlashingProtectionError, ValidatorConfigManager, ValidatorManager, VoluntaryExitManager,
 };
 use observability::logging::TruncatedPubkey;
 use signer::{SignerService, ValidatorSigner};
@@ -501,13 +501,41 @@ impl SlashingProtectionAdapter {
     }
 }
 
+/// Map a slashing-DB error into a keymanager trait error.
+///
+/// Client-caused interchange/GVR problems become `InvalidInterchange`;
+/// everything else (DB I/O, integrity, permissions with paths) is `Backend`.
+fn map_slashing_db_error(e: slashing::SlashingError) -> SlashingProtectionError {
+    use slashing::SlashingError;
+    match e {
+        SlashingError::InvalidInterchangeFormat(msg) => {
+            SlashingProtectionError::InvalidInterchange(msg)
+        }
+        SlashingError::GenesisValidatorsRootMismatch { expected, actual } => {
+            SlashingProtectionError::InvalidInterchange(format!(
+                "genesis validators root mismatch: expected {expected}, got {actual}"
+            ))
+        }
+        SlashingError::GenesisRootMismatch { expected, got } => {
+            SlashingProtectionError::InvalidInterchange(format!(
+                "genesis root mismatch: expected 0x{}, got 0x{}",
+                hex::encode(expected),
+                hex::encode(got)
+            ))
+        }
+        other => SlashingProtectionError::Backend(other.to_string()),
+    }
+}
+
 impl SlashingProtection for SlashingProtectionAdapter {
-    fn import_interchange(&self, interchange_json: &str) -> Result<(), String> {
-        let interchange: slashing::InterchangeFormat =
-            serde_json::from_str(interchange_json).map_err(|e| format!("invalid JSON: {e}"))?;
+    fn import_interchange(&self, interchange_json: &str) -> Result<(), SlashingProtectionError> {
+        let interchange: slashing::InterchangeFormat = serde_json::from_str(interchange_json)
+            .map_err(|e| {
+                SlashingProtectionError::InvalidInterchange(format!("invalid JSON: {e}"))
+            })?;
         self.slashing_db
             .import(&interchange, &self.genesis_validators_root)
-            .map_err(|e| e.to_string())
+            .map_err(map_slashing_db_error)
     }
 
     /// Export an EIP-3076 interchange blob for the specified public keys.
@@ -528,9 +556,11 @@ impl SlashingProtection for SlashingProtectionAdapter {
     /// slashing rows in the DB receive an explicit empty
     /// `ValidatorRecord { signed_blocks: [], signed_attestations: [] }` so
     /// that a re-importing node sees a clean (rather than absent) record.
-    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, String> {
-        let interchange =
-            self.slashing_db.export(&self.genesis_validators_root).map_err(|e| e.to_string())?;
+    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError> {
+        let interchange = self
+            .slashing_db
+            .export(&self.genesis_validators_root)
+            .map_err(map_slashing_db_error)?;
 
         // Build a canonical hex-string set for fast membership lookup.
         let requested: std::collections::HashSet<String> =
@@ -562,7 +592,8 @@ impl SlashingProtection for SlashingProtectionAdapter {
         let filtered =
             slashing::InterchangeFormat { metadata: interchange.metadata, data: filtered_data };
 
-        serde_json::to_string(&filtered).map_err(|e| format!("serialization failed: {e}"))
+        serde_json::to_string(&filtered)
+            .map_err(|e| SlashingProtectionError::Backend(format!("serialization failed: {e}")))
     }
 }
 
@@ -788,14 +819,14 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
     }
 
     fn import_remote_key(&self, pubkey: Pubkey, url: String) -> Result<(), ImportRemoteKeyError> {
-        let parsed = url::Url::parse(&url)
-            .map_err(|e| ImportRemoteKeyError::Other(format!("invalid remote signer URL: {e}")))?;
+        let parsed =
+            url::Url::parse(&url).map_err(|e| ImportRemoteKeyError::InvalidUrl(e.to_string()))?;
 
         match parsed.scheme() {
             "http" | "https" => {}
             scheme => {
-                return Err(ImportRemoteKeyError::Other(format!(
-                    "invalid URL scheme: must be http:// or https://, got: {scheme}://"
+                return Err(ImportRemoteKeyError::InvalidUrl(format!(
+                    "must be http:// or https://, got: {scheme}://"
                 )));
             }
         }
@@ -803,10 +834,7 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
         if let Some(ref allowed) = self.allowed_hosts {
             let host = parsed.host_str().unwrap_or("");
             if !allowed.iter().any(|h| h == host) {
-                return Err(ImportRemoteKeyError::Other(format!(
-                    "remote signer host '{}' is not in the allowed hosts list",
-                    host
-                )));
+                return Err(ImportRemoteKeyError::HostNotAllowed(host.to_string()));
             }
         } else if !self.warned_no_allowlist.swap(true, Ordering::Relaxed) {
             warn!(
@@ -822,7 +850,7 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
 
         let config = RemoteSignerConfig::new(url.clone());
         let remote_signer = RemoteSigner::new(config, vec![pubkey])
-            .map_err(|e| ImportRemoteKeyError::Other(e.to_string()))?;
+            .map_err(|e| ImportRemoteKeyError::Backend(e.to_string()))?;
 
         self.composite_signer.add_remote_key(pubkey, remote_signer);
         keys.push((pubkey, url));
@@ -1405,15 +1433,15 @@ mod tests {
 
         // file:// scheme — SSRF risk
         let result = adapter.import_remote_key(pk, "file:///etc/passwd".to_string());
-        assert!(matches!(result, Err(ImportRemoteKeyError::Other(_))));
+        assert!(matches!(result, Err(ImportRemoteKeyError::InvalidUrl(_))));
 
         // ftp:// scheme
         let result = adapter.import_remote_key(pk, "ftp://evil.com".to_string());
-        assert!(matches!(result, Err(ImportRemoteKeyError::Other(_))));
+        assert!(matches!(result, Err(ImportRemoteKeyError::InvalidUrl(_))));
 
         // No scheme
         let result = adapter.import_remote_key(pk, "signer.example.com".to_string());
-        assert!(matches!(result, Err(ImportRemoteKeyError::Other(_))));
+        assert!(matches!(result, Err(ImportRemoteKeyError::InvalidUrl(_))));
 
         // Valid schemes should be accepted
         let pk2 = test_pubkey(2);
@@ -1700,9 +1728,7 @@ mod tests {
         );
         let pk = test_pubkey(1);
         let result = adapter.import_remote_key(pk, "https://evil.attacker.com/api".to_string());
-        assert!(
-            matches!(result, Err(ImportRemoteKeyError::Other(ref msg)) if msg.contains("not in the allowed hosts list"))
-        );
+        assert!(matches!(result, Err(ImportRemoteKeyError::HostNotAllowed(_))));
     }
 
     #[test]
@@ -1727,7 +1753,7 @@ mod tests {
 
         let pk3 = test_pubkey(3);
         let result = adapter.import_remote_key(pk3, "https://signer3.example.com".to_string());
-        assert!(matches!(result, Err(ImportRemoteKeyError::Other(_))));
+        assert!(matches!(result, Err(ImportRemoteKeyError::HostNotAllowed(_))));
     }
 
     #[test]
@@ -1735,9 +1761,7 @@ mod tests {
         let (adapter, _, _) = test_remote_adapter(create_empty_composite_signer(), None);
         let pk = test_pubkey(1);
         let result = adapter.import_remote_key(pk, "not a valid url".to_string());
-        assert!(
-            matches!(result, Err(ImportRemoteKeyError::Other(ref msg)) if msg.contains("invalid remote signer URL"))
-        );
+        assert!(matches!(result, Err(ImportRemoteKeyError::InvalidUrl(_))));
     }
 
     #[test]

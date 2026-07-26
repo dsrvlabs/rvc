@@ -247,10 +247,16 @@ mod tests {
 
     struct StubSlashing;
     impl SlashingProtection for StubSlashing {
-        fn import_interchange(&self, _interchange_json: &str) -> Result<(), String> {
+        fn import_interchange(
+            &self,
+            _interchange_json: &str,
+        ) -> Result<(), crate::traits::SlashingProtectionError> {
             Ok(())
         }
-        fn export_interchange(&self, _pubkeys: &[Pubkey]) -> Result<String, String> {
+        fn export_interchange(
+            &self,
+            _pubkeys: &[Pubkey],
+        ) -> Result<String, crate::traits::SlashingProtectionError> {
             Ok(String::new())
         }
     }

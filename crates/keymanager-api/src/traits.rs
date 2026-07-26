@@ -35,10 +35,26 @@ pub trait KeystoreManager: Send + Sync {
     fn delete_keystore(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError>;
 }
 
+/// Errors from [`SlashingProtection`] trait methods.
+///
+/// Client exposure is decided by the central mapper in [`crate::error`]:
+/// * [`Self::NotFound`] / [`Self::InvalidInterchange`] — safe to surface
+/// * [`Self::Backend`] — logged server-side only; clients get a generic message
+#[derive(Debug, Error)]
+pub enum SlashingProtectionError {
+    #[error("not found")]
+    NotFound,
+    #[error("invalid interchange: {0}")]
+    InvalidInterchange(String),
+    /// Internal/backend failure. Detail is never echoed to HTTP clients.
+    #[error("{0}")]
+    Backend(String),
+}
+
 /// Manages EIP-3076 slashing protection interchange data.
 pub trait SlashingProtection: Send + Sync {
-    fn import_interchange(&self, interchange_json: &str) -> Result<(), String>;
-    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, String>;
+    fn import_interchange(&self, interchange_json: &str) -> Result<(), SlashingProtectionError>;
+    fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError>;
 }
 
 /// Manages validator configurations (enable/disable).
@@ -77,18 +93,32 @@ pub trait DoppelgangerMonitor: Send + Sync {
     fn is_doppelganger_safe(&self, pubkey: &Pubkey) -> bool;
 }
 
+/// Errors from remote-key import.
+///
+/// Client exposure is decided by the central mapper in [`crate::error`]:
+/// * [`Self::Duplicate`], [`Self::InvalidUrl`], [`Self::HostNotAllowed`] — safe
+/// * [`Self::Backend`] — logged server-side only
 #[derive(Debug, Error)]
 pub enum ImportRemoteKeyError {
     #[error("duplicate key")]
     Duplicate,
+    #[error("invalid remote signer URL: {0}")]
+    InvalidUrl(String),
+    #[error("remote signer host '{0}' is not in the allowed hosts list")]
+    HostNotAllowed(String),
+    /// Internal/backend failure. Detail is never echoed to HTTP clients.
     #[error("{0}")]
-    Other(String),
+    Backend(String),
 }
 
+/// Errors from remote-key delete.
 #[derive(Debug, Error)]
 pub enum DeleteRemoteKeyError {
+    #[error("not found")]
+    NotFound,
+    /// Internal/backend failure. Detail is never echoed to HTTP clients.
     #[error("{0}")]
-    Other(String),
+    Backend(String),
 }
 
 /// Manages remote signing keys (Web3Signer).

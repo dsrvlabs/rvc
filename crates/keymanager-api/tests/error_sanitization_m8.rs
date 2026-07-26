@@ -19,7 +19,7 @@ use rvc_keymanager_api::handlers::{
 use rvc_keymanager_api::traits::{
     DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ImportKeystoreError,
     ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection,
-    ValidatorConfigManager, ValidatorManager,
+    SlashingProtectionError, ValidatorConfigManager, ValidatorManager,
 };
 
 // ── Verbose error string that must never reach the client ──────────────────
@@ -66,10 +66,10 @@ impl KeystoreManager for VerboseFailingKeystoreManager {
 struct SimpleSlashingProtection;
 
 impl SlashingProtection for SimpleSlashingProtection {
-    fn import_interchange(&self, _: &str) -> Result<(), String> {
+    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
-    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, String> {
+    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
         Ok(r#"{"metadata":{"interchange_format_version":"5","genesis_validators_root":"0x0000000000000000000000000000000000000000000000000000000000000000"},"data":[]}"#.to_string())
     }
 }
@@ -78,11 +78,11 @@ impl SlashingProtection for SimpleSlashingProtection {
 struct VerboseFailingSlashingProtection;
 
 impl SlashingProtection for VerboseFailingSlashingProtection {
-    fn import_interchange(&self, _: &str) -> Result<(), String> {
-        Err(VERBOSE_ERROR.to_string())
+    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
+        Err(SlashingProtectionError::Backend(VERBOSE_ERROR.to_string()))
     }
-    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, String> {
-        Err(VERBOSE_ERROR.to_string())
+    fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
+        Err(SlashingProtectionError::Backend(VERBOSE_ERROR.to_string()))
     }
 }
 
@@ -134,7 +134,7 @@ impl RemoteKeyManager for VerboseFailingRemoteKeyManager {
         false
     }
     fn import_remote_key(&self, _: Pubkey, _: String) -> Result<(), ImportRemoteKeyError> {
-        Err(ImportRemoteKeyError::Other(VERBOSE_ERROR.to_string()))
+        Err(ImportRemoteKeyError::Backend(VERBOSE_ERROR.to_string()))
     }
     fn delete_remote_key(&self, _: &Pubkey) -> Result<bool, DeleteRemoteKeyError> {
         Ok(false)
