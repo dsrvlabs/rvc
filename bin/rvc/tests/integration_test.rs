@@ -434,6 +434,7 @@ fn test_start_help() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Core surface (historical assertions).
     assert!(stdout.contains("--config"));
     assert!(stdout.contains("--beacon-url"));
     assert!(stdout.contains("--keystore-path"));
@@ -444,6 +445,77 @@ fn test_start_help() {
     assert!(stdout.contains("--keymanager-address"));
     assert!(stdout.contains("--keymanager-token-file"));
     assert!(stdout.contains("--remote-signer-url"));
+
+    // RF5-14: complete flag set so a dropped clap flatten field fails loudly.
+    for flag in [
+        "--beacon-nodes",
+        "--beacon-max-body-bytes",
+        "--slashing-db-path",
+        "--init-slashing-db",
+        "--allow-unsupported-fork",
+        "--metrics-address",
+        "--grpc-address",
+        "--genesis-time",
+        "--genesis-validators-root",
+        "--graffiti",
+        "--no-doppelganger-detection",
+        "--log-level",
+        "--log-format",
+        "--enable-log-reload",
+        "--no-keymanager",
+        "--remote-signer-allowed-hosts",
+        "--strict-permissions",
+        "--strict-slashing-semantics",
+        "--block-production-timeout",
+        "--attestation-timeout",
+        "--aggregate-timeout",
+        "--duty-fetch-timeout",
+        "--key-decrypt-threads",
+        "--tracing-endpoint",
+        "--tracing-exporter",
+        "--tracing-sample-rate",
+        "--tracing-max-queue-size",
+        "--tracing-max-export-batch-size",
+        "--secret-provider",
+        "--gcp-project-id",
+        "--gcp-secret-prefix",
+        "--secret-refresh-interval",
+        "--secret-provider-strict",
+        "--allow-insecure-remote-signer",
+        "--keymanager-cors-origins",
+        "--keymanager-body-limit",
+        "--grpc-signer-url",
+        "--grpc-signer-tls-cert",
+        "--grpc-signer-tls-key",
+        "--grpc-signer-tls-ca-cert",
+        "--disable-attesting",
+        "--slashed-validators-action",
+        "--builder-circuit-breaker-consecutive-limit",
+        "--builder-circuit-breaker-epoch-limit",
+        "--disable-keystore-locking",
+        "--proposer-nodes",
+        "--broadcast",
+        "--proposer-config-url",
+        "--proposer-config-file",
+        "--proposer-config-refresh-interval",
+        "--proposer-config-url-token",
+        "--proposer-config-url-insecure",
+        "--monitoring-endpoint",
+        "--monitoring-interval",
+        "--monitoring-endpoint-insecure",
+        "--logfile",
+        "--logfile-max-size",
+        "--logfile-max-number",
+        "--logfile-compress",
+        "--logfile-level",
+        "--block-selection-mode",
+        "--validator-registration-batch-size",
+        "--validator-registration-batch-delay",
+        "--validators-config",
+        "--password-file",
+    ] {
+        assert!(stdout.contains(flag), "start --help missing flag {flag}\n{stdout}");
+    }
 }
 
 #[test]

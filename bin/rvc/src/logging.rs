@@ -570,17 +570,23 @@ mod tests {
         .expect("should parse");
 
         match cli.command {
-            crate::cli::Commands::Start {
-                grpc_signer_url,
-                grpc_signer_tls_cert,
-                grpc_signer_tls_key,
-                grpc_signer_tls_ca_cert,
-                ..
-            } => {
-                assert_eq!(grpc_signer_url.as_deref(), Some("https://signer.example.com:50051"));
-                assert_eq!(grpc_signer_tls_cert, Some(PathBuf::from("/tmp/cert.pem")));
-                assert_eq!(grpc_signer_tls_key, Some(PathBuf::from("/tmp/key.pem")));
-                assert_eq!(grpc_signer_tls_ca_cert, Some(PathBuf::from("/tmp/ca.pem")));
+            crate::cli::Commands::Start(args) => {
+                assert_eq!(
+                    args.grpc_signer.grpc_signer_url.as_deref(),
+                    Some("https://signer.example.com:50051")
+                );
+                assert_eq!(
+                    args.grpc_signer.grpc_signer_tls_cert,
+                    Some(PathBuf::from("/tmp/cert.pem"))
+                );
+                assert_eq!(
+                    args.grpc_signer.grpc_signer_tls_key,
+                    Some(PathBuf::from("/tmp/key.pem"))
+                );
+                assert_eq!(
+                    args.grpc_signer.grpc_signer_tls_ca_cert,
+                    Some(PathBuf::from("/tmp/ca.pem"))
+                );
             }
             _ => panic!("expected Start command"),
         }
@@ -591,17 +597,11 @@ mod tests {
         let cli = Cli::try_parse_from(["rvc", "start"]).expect("should parse without grpc flags");
 
         match cli.command {
-            crate::cli::Commands::Start {
-                grpc_signer_url,
-                grpc_signer_tls_cert,
-                grpc_signer_tls_key,
-                grpc_signer_tls_ca_cert,
-                ..
-            } => {
-                assert!(grpc_signer_url.is_none());
-                assert!(grpc_signer_tls_cert.is_none());
-                assert!(grpc_signer_tls_key.is_none());
-                assert!(grpc_signer_tls_ca_cert.is_none());
+            crate::cli::Commands::Start(args) => {
+                assert!(args.grpc_signer.grpc_signer_url.is_none());
+                assert!(args.grpc_signer.grpc_signer_tls_cert.is_none());
+                assert!(args.grpc_signer.grpc_signer_tls_key.is_none());
+                assert!(args.grpc_signer.grpc_signer_tls_ca_cert.is_none());
             }
             _ => panic!("expected Start command"),
         }
@@ -744,9 +744,9 @@ mod tests {
         let cli = Cli::try_parse_from(["rvc", "start", "--log-format", "json"])
             .expect("--log-format json should parse");
         match cli.command {
-            crate::cli::Commands::Start { log_format, .. } => {
+            crate::cli::Commands::Start(args) => {
                 assert_eq!(
-                    telemetry::LogFormat::resolve(Some(&log_format)),
+                    telemetry::LogFormat::resolve(Some(&args.logging.log_format)),
                     telemetry::LogFormat::Json
                 );
             }
@@ -755,10 +755,13 @@ mod tests {
 
         let cli = Cli::try_parse_from(["rvc", "start"]).expect("default should parse");
         match cli.command {
-            crate::cli::Commands::Start { log_format, .. } => {
-                assert_eq!(log_format, "pretty", "default --log-format must be pretty");
+            crate::cli::Commands::Start(args) => {
                 assert_eq!(
-                    telemetry::LogFormat::resolve(Some(&log_format)),
+                    args.logging.log_format, "pretty",
+                    "default --log-format must be pretty"
+                );
+                assert_eq!(
+                    telemetry::LogFormat::resolve(Some(&args.logging.log_format)),
                     telemetry::LogFormat::Pretty
                 );
             }

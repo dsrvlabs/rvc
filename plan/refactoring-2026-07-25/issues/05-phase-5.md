@@ -934,12 +934,12 @@ and the literal outright, and lets the clap groups mirror RF5-12's config sub-st
    `test_start_help` at `integration_test.rs:96` is the seed — extend it to the complete flag set).
 
 **Acceptance criteria:**
-- [ ] `#[allow(clippy::large_enum_variant)]` is gone.
-- [ ] The destructure block and the `CliOverrides` literal are deleted.
-- [ ] Every flag accepted before is still accepted with the same name, short form, default and help
+- [x] `#[allow(clippy::large_enum_variant)]` is gone.
+- [x] The destructure block and the `CliOverrides` literal are deleted.
+- [x] Every flag accepted before is still accepted with the same name, short form, default and help
       text (snapshot test over `--help`).
-- [ ] Flag precedence over the config file is unchanged for every flag (spot-checked by test).
-- [ ] RF5-01 smoke tests green.
+- [x] Flag precedence over the config file is unchanged for every flag (spot-checked by test).
+- [x] RF5-01 smoke tests green.
 
 **TDD test plan** (RED first):
 - `test_start_help_lists_every_flag` — **RED**: extend the existing help test to a complete snapshot
