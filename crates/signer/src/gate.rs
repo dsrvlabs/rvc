@@ -41,6 +41,11 @@
 //! Because non-slashable signs carry no `!Send` staging guard, they are plain
 //! `async` with a direct `.await` on the signer — no `spawn_blocking` needed.
 //!
+//! **SS-2 / SS-3 (aggregate-and-proof):** `sign_aggregate_and_proof` is
+//! deliberately non-slashable. The inner attestation is slashable and must
+//! already have been committed via `sign_attestation`; re-staging the aggregate
+//! would double-stage and mis-attribute epochs/roots. See the method docs.
+//!
 //! # Gate decision and fail-closed default
 //!
 //! The single `gate_decision` helper centralises the doppelganger check for

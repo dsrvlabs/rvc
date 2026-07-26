@@ -838,10 +838,10 @@ is churn. This issue documents the collision instead.
    `SignerService` / `SigningGate`) and a one-line note on the package-name collision pointing at F2.
 
 **Acceptance criteria:**
-- [ ] Both modules deleted; no import breaks.
-- [ ] No flow documentation is lost (it moves, verified by reviewer diff).
-- [ ] Signer-hierarchy doc exists and names every layer.
-- [ ] Standing invariant green.
+- [x] Both modules deleted; no import breaks.
+- [x] No flow documentation is lost (it moves, verified by reviewer diff).
+- [x] Signer-hierarchy doc exists and names every layer.
+- [x] Standing invariant green.
 
 **TDD test plan:** documentation change — the gate is `cargo doc` building without broken intra-doc
 links plus `cargo test --doc`. **RED first:** add `#![deny(rustdoc::broken_intra_doc_links)]` to the

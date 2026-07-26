@@ -1,4 +1,33 @@
 //! BLS key operations, EIP-2335 keystore decryption, key management, and Ethereum signing utilities.
+//!
+//! # Signer hierarchy
+//!
+//! Signing types stack from raw BLS backends up to the safe-signing gates in the
+//! `rvc-signer` library crate. Read bottom-up:
+//!
+//! | Layer | Type | Crate | Role |
+//! |-------|------|-------|------|
+//! | 1. Raw backend | [`Signer`] | this crate | Sign a 32-byte root with a pubkey. Implemented by [`LocalSigner`], [`RemoteSigner`], and [`CompositeSigner`]. |
+//! | 2. Typed backend | [`TypedSigner`] | this crate | One method per consensus duty; computes the signing root then signs. [`LocalSigner`] implements it; gRPC remotes are typed-only. |
+//! | 3. Key router | [`CompositeSigner`] | this crate | Routes each pubkey to local, HTTP remote, gRPC remote, or dynamic local keys. Implements [`Signer`]. |
+//! | 4a. VC service | `SignerService` | `rvc-signer` (`crates/signer`) | Validator-client path: enablement + slashing stage/commit + metrics around the composite. |
+//! | 4b. Gate | `SigningGate` | `rvc-signer` (`crates/signer`) | Remote-signer / multi-transport path: same defenses via a shared slashable core (`sign_slashable`) plus non-slashable helpers. |
+//!
+//! Related helpers (not layers): `LocalSigner` (in-process keys), `RemoteSigner`
+//! (Web3Signer HTTP), `ValidatorSigner` (async trait over duty-shaped methods on
+//! the VC path). Prefer constructing a [`CompositeSigner`] and wrapping it in
+//! `SignerService` or `SigningGate` rather than calling backends directly from
+//! duty code.
+//!
+//! ## Package-name collision (`rvc-signer`)
+//!
+//! Cargo package **`rvc-signer`** is the library at `crates/signer` (Rust crate
+//! name `rvc_signer`). Package **`rvc-signer-bin`** at `bin/rvc-signer` builds a
+//! **binary** also named `rvc-signer`. Logs and `use rvc_signer::…` refer to the
+//! library; the binary is the server process. The rename/split is deferred to
+//! Phase 5 **F2** (promote the bin lib to `crates/signer-server`).
+
+#![deny(rustdoc::broken_intra_doc_links)]
 
 mod aggregation_signing;
 mod bls;

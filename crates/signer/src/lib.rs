@@ -2,14 +2,18 @@
 //!
 //! This module provides a signing service that ensures all validator
 //! signatures are checked against slashing protection rules before signing.
+//!
+//! See the signer hierarchy doc on the `rvc-crypto` crate root for how
+//! [`crypto::Signer`] / [`crypto::TypedSigner`] / [`crypto::CompositeSigner`]
+//! relate to [`SignerService`] and [`SigningGate`].
+
+#![deny(rustdoc::broken_intra_doc_links)]
 
 mod core;
 mod error;
 mod fail_closed;
 mod gate;
 mod locks;
-pub mod non_slashable;
-pub mod slashable;
 mod traits;
 
 pub use crypto::is_aggregator;
@@ -179,7 +183,7 @@ const DEFAULT_SIGN_TIMEOUT: Duration = Duration::from_secs(4);
 /// preserve `RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS` metric instrumentation
 /// (ISSUE-3.12).
 ///
-/// Non-slashable paths share [`SignerService::sign_nonslashable`]: enablement →
+/// Non-slashable paths share the private `sign_nonslashable` helper: enablement →
 /// `tokio::time::timeout(sign_timeout, backend.sign(...))` with uniform error
 /// mapping. They take no per-validator lock and write no slashing-DB row.
 pub struct SignerService {
@@ -851,7 +855,7 @@ impl SignerService {
     /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
     ///
     /// Non-slashable: the inner attestation must already have been committed by
-    /// [`sign_attestation`]. This method does not touch the slashing DB.
+    /// [`Self::sign_attestation`]. This method does not touch the slashing DB.
     #[tracing::instrument(name = "sign.aggregate_and_proof", skip_all, fields(duty = %Duty::Aggregate.as_str()))]
     pub async fn sign_aggregate_and_proof(
         &self,
@@ -867,7 +871,7 @@ impl SignerService {
 
     /// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
     ///
-    /// Non-slashable: same chain-of-custody rule as [`sign_aggregate_and_proof`].
+    /// Non-slashable: same chain-of-custody rule as [`Self::sign_aggregate_and_proof`].
     #[tracing::instrument(name = "sign.electra_aggregate_and_proof", skip_all, fields(duty = %Duty::Aggregate.as_str()))]
     pub async fn sign_electra_aggregate_and_proof(
         &self,
@@ -888,7 +892,7 @@ impl SignerService {
     ///
     /// Voluntary exits are **not slashable** per the Ethereum consensus spec, so
     /// this function intentionally omits the stage → commit / discard pattern used
-    /// by [`sign_attestation`] and [`sign_block`].  There is no
+    /// by [`Self::sign_attestation`] and [`Self::sign_block`].  There is no
     /// `stage_voluntary_exit` API in the slashing crate.
     ///
     /// The C2 error-handling invariant is still satisfied here: every signer

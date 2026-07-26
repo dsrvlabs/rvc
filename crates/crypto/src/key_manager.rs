@@ -102,7 +102,7 @@ impl KeyManager {
         Self::load_from_directory_with_threads_filtered(path, passwords, num_threads, None)
     }
 
-    /// Like [`load_from_directory_with_threads`], but skips pubkeys present in
+    /// Like [`Self::load_from_directory_with_threads`], but skips pubkeys present in
     /// `denylist` (SEC-1b: Keymanager DELETE persistence across restart).
     ///
     /// Denylisted keystores are not decrypted; they are logged and omitted.
