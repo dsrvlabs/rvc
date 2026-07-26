@@ -1006,10 +1006,10 @@ unvalidated one flows straight into duty processing.
 consumer that did `format!("0x{}", …)` or a hand comparison gets the bytes directly.
 
 **Acceptance criteria.**
-- [ ] `SyncCommitteeDuty.pubkey` is `[u8; 48]`; JSON serialization/deserialization byte-identical.
-- [ ] A malformed pubkey in a BN duties response is now a decode error, not a silently-carried string.
-- [ ] No consumer re-encodes to `String` except at a genuine display/log boundary.
-- [ ] Standing invariant green.
+- [x] `SyncCommitteeDuty.pubkey` is `[u8; 48]`; JSON serialization/deserialization byte-identical.
+- [x] A malformed pubkey in a BN duties response is now a decode error, not a silently-carried string.
+- [x] No consumer re-encodes to `String` except at a genuine display/log boundary.
+- [x] Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_sync_committee_duty_rejects_malformed_pubkey` — deserialize a duties response

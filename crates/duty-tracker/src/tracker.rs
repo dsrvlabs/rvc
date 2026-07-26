@@ -1128,8 +1128,13 @@ mod tests {
 
     // --- Sync committee duty tests ---
 
+    /// Valid 48-byte pubkey hex for BN-shaped mock duties (RF3-16).
+    fn mock_sync_pubkey_hex() -> String {
+        format!("0x{}", "11".repeat(48))
+    }
+
     fn create_mock_sync_committee_response(
-        duties: Vec<(u64, &str, Vec<u64>)>,
+        duties: Vec<(u64, String, Vec<u64>)>,
     ) -> serde_json::Value {
         let data: Vec<serde_json::Value> = duties
             .into_iter()
@@ -1153,8 +1158,11 @@ mod tests {
         let (mock_server, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string()];
 
-        let response =
-            create_mock_sync_committee_response(vec![(1234, "0xpubkey_1234", vec![10, 20])]);
+        let response = create_mock_sync_committee_response(vec![(
+            1234,
+            mock_sync_pubkey_hex(),
+            vec![10, 20],
+        )]);
 
         Mock::given(method("POST"))
             .and(path("/eth/v1/validator/duties/sync/10"))
@@ -1167,6 +1175,7 @@ mod tests {
         let duties = tracker.fetch_sync_committee_duties(10).await.unwrap();
 
         assert_eq!(duties.len(), 1);
+        assert_eq!(duties[0].pubkey, [0x11; 48]);
         assert!(tracker.is_sync_period_cached(10).await);
     }
 
@@ -1175,8 +1184,11 @@ mod tests {
         let (mock_server, beacon) = setup_mock_beacon().await;
         let validator_indices = vec!["1234".to_string()];
 
-        let response =
-            create_mock_sync_committee_response(vec![(1234, "0xpubkey_1234", vec![10, 20])]);
+        let response = create_mock_sync_committee_response(vec![(
+            1234,
+            mock_sync_pubkey_hex(),
+            vec![10, 20],
+        )]);
 
         Mock::given(method("POST"))
             .and(path("/eth/v1/validator/duties/sync/10"))

@@ -10,7 +10,7 @@ use eth_types::{
     is_sync_committee_aggregator, subcommittee_index, ContributionAndProof,
     SignedContributionAndProof, Slot, SyncCommitteeDuty,
 };
-use observability::logging::TruncatedPubkey;
+use observability::logging::{TruncatedPubkey, TruncatedRoot};
 use signer::SignerService;
 use validator_store::ValidatorStore;
 
@@ -302,14 +302,14 @@ impl SyncCommitteeService {
         let mut matching_pubkeys = Vec::new();
 
         for duty in duties {
-            if let Some(pk) = utils::find_pubkey(&self.pubkey_map, &duty.pubkey) {
+            if let Some(pk) = utils::find_pubkey_bytes(&self.pubkey_map, &duty.pubkey) {
                 // D-3: per-validator doppelganger gate (mirrors attestation.rs M-12 check).
                 // `pk` is the already-resolved typed PublicKey — use its infallible
                 // `to_bytes()` instead of re-decoding the hex string (no fail-open).
                 let pk_bytes = pk.to_bytes();
                 if !self.validator_store.is_signing_enabled(&pk_bytes) {
                     warn!(
-                        pubkey = %TruncatedPubkey::new(&duty.pubkey),
+                        pubkey = %TruncatedRoot::new(&duty.pubkey),
                         "Skipping sync committee duty: validator is inside the \
                          post-import doppelganger window (D-3)"
                     );
@@ -400,7 +400,7 @@ mod tests {
         /// Root the BN would return for head queries (different from SlotContext's root).
         r_from_bn_hex: String,
         /// Pubkey for the duty entry returned from post_sync_committee_duties.
-        duty_pubkey: String,
+        duty_pubkey: [u8; 48],
     }
 
     #[async_trait]
@@ -418,7 +418,7 @@ mod tests {
             Ok(ExecutionOptimisticResponse {
                 execution_optimistic: false,
                 data: vec![SyncCommitteeDuty {
-                    pubkey: self.duty_pubkey.clone(),
+                    pubkey: self.duty_pubkey,
                     validator_index: 1,
                     validator_sync_committee_indices: vec![0],
                 }],
@@ -648,7 +648,7 @@ mod tests {
             get_block_root_call_count: get_block_root_call_count.clone(),
             submitted_roots: submitted_roots.clone(),
             r_from_bn_hex,
-            duty_pubkey: pk_hex.clone(),
+            duty_pubkey: pk.to_bytes(),
         });
 
         let service = setup_service(beacon, pk_hex, pk, sk).await;
@@ -701,7 +701,7 @@ mod tests {
             submitted_roots: submitted_roots.clone(),
             r_from_bn_hex: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .to_string(),
-            duty_pubkey: pk_hex.clone(),
+            duty_pubkey: pk.to_bytes(),
         });
 
         let service = setup_service(beacon, pk_hex, pk, sk).await;
@@ -739,7 +739,7 @@ mod tests {
             submitted_roots: submitted_roots.clone(),
             r_from_bn_hex: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .to_string(),
-            duty_pubkey: pk_hex.clone(),
+            duty_pubkey: pk.to_bytes(),
         });
 
         let service = setup_service(beacon, pk_hex, pk, sk).await;
@@ -774,7 +774,7 @@ mod tests {
             submitted_roots: submitted_roots.clone(),
             r_from_bn_hex: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                 .to_string(),
-            duty_pubkey: pk_hex.clone(),
+            duty_pubkey: pk_bytes,
         });
 
         // Set up a store where the validator is disabled (doppelganger window).
@@ -813,7 +813,7 @@ mod tests {
         /// Must be 0 in GREEN (gate fires); > 0 in RED (validator passes filter
         /// AND is selected as aggregator).
         contrib_fetch_calls: Arc<AtomicUsize>,
-        duty_pubkey: String,
+        duty_pubkey: [u8; 48],
     }
 
     #[async_trait]
@@ -830,7 +830,7 @@ mod tests {
             Ok(ExecutionOptimisticResponse {
                 execution_optimistic: false,
                 data: vec![SyncCommitteeDuty {
-                    pubkey: self.duty_pubkey.clone(),
+                    pubkey: self.duty_pubkey,
                     validator_index: 1,
                     validator_sync_committee_indices: vec![0],
                 }],
@@ -1021,7 +1021,7 @@ mod tests {
         let contrib_fetch_calls = Arc::new(AtomicUsize::new(0));
         let beacon = Arc::new(ContribGateBeacon {
             contrib_fetch_calls: contrib_fetch_calls.clone(),
-            duty_pubkey: pk_hex.clone(),
+            duty_pubkey: pk_bytes,
         });
 
         // Validator is disabled (inside post-import doppelganger window).
@@ -1260,17 +1260,17 @@ mod tests {
 
         let duties = vec![
             SyncCommitteeDuty {
-                pubkey: hex_a.clone(),
+                pubkey: pk_a.to_bytes(),
                 validator_index: 10,
                 validator_sync_committee_indices: vec![0],
             },
             SyncCommitteeDuty {
-                pubkey: hex_b.clone(),
+                pubkey: pk_b.to_bytes(),
                 validator_index: 11,
                 validator_sync_committee_indices: vec![1],
             },
             SyncCommitteeDuty {
-                pubkey: hex_c.clone(),
+                pubkey: pk_c.to_bytes(),
                 validator_index: 12,
                 validator_sync_committee_indices: vec![2],
             },
@@ -1351,17 +1351,17 @@ mod tests {
         // selection-proof KeyNotFound is the isolation fault.
         let duties = vec![
             SyncCommitteeDuty {
-                pubkey: hex_a.clone(),
+                pubkey: pk_a.to_bytes(),
                 validator_index: 10,
                 validator_sync_committee_indices: vec![0],
             },
             SyncCommitteeDuty {
-                pubkey: hex_b.clone(),
+                pubkey: pk_b.to_bytes(),
                 validator_index: 11,
                 validator_sync_committee_indices: vec![1],
             },
             SyncCommitteeDuty {
-                pubkey: hex_c.clone(),
+                pubkey: pk_c.to_bytes(),
                 validator_index: 12,
                 validator_sync_committee_indices: vec![2],
             },

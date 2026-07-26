@@ -1015,7 +1015,7 @@ mod tests {
     //
     // Used to test the `sync_enabled` guard without a real beacon node.
     struct SyncGuardBeacon {
-        duty_pubkey: String,
+        duty_pubkey: [u8; 48],
         submitted_roots: Arc<std::sync::Mutex<Vec<Root>>>,
     }
 
@@ -1039,7 +1039,7 @@ mod tests {
             Ok(ExecutionOptimisticResponse {
                 execution_optimistic: false,
                 data: vec![SyncCommitteeDuty {
-                    pubkey: self.duty_pubkey.clone(),
+                    pubkey: self.duty_pubkey,
                     validator_index: 1,
                     validator_sync_committee_indices: vec![0],
                 }],
@@ -5607,7 +5607,7 @@ mod tests {
 
         let beacon = Arc::new(SyncGuardBeacon {
             submitted_roots: submitted_roots.clone(),
-            duty_pubkey: pk_hex.clone(),
+            duty_pubkey: pk.to_bytes(),
         });
 
         // attesting_enabled = false; sync_enabled = true (default)
@@ -5650,7 +5650,7 @@ mod tests {
 
         let beacon = Arc::new(SyncGuardBeacon {
             submitted_roots: submitted_roots.clone(),
-            duty_pubkey: pk_hex.clone(),
+            duty_pubkey: pk.to_bytes(),
         });
 
         // attesting_enabled = true; sync_enabled = false (explicit)
@@ -5806,7 +5806,7 @@ mod tests {
 
         let beacon = Arc::new(SyncGuardBeacon {
             submitted_roots: submitted_roots.clone(),
-            duty_pubkey: pk_hex.clone(),
+            duty_pubkey: pk.to_bytes(),
         });
 
         let attesting_enabled = Arc::new(AtomicBool::new(false));

@@ -107,6 +107,15 @@ pub(crate) fn find_pubkey(pubkey_map: &PubkeyMap, duty_pubkey: &str) -> Option<P
     None
 }
 
+/// Finds a public key by matching validated duty pubkey bytes (RF3-16).
+///
+/// Compares against [`PublicKey::to_bytes`] so callers with `[u8; 48]` do not
+/// re-encode to hex solely for map lookup.
+pub(crate) fn find_pubkey_bytes(pubkey_map: &PubkeyMap, duty_pubkey: &[u8; 48]) -> Option<PublicKey> {
+    let map = pubkey_map.read();
+    map.values().find(|pk| &pk.to_bytes() == duty_pubkey).cloned()
+}
+
 /// Normalizes a pubkey to `0x`-prefixed lowercase hex for consistent comparison.
 ///
 /// Delegates to [`observability::pubkey::CanonicalPubkey`] — the single source of

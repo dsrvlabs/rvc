@@ -89,7 +89,7 @@ fn create_test_config() -> OrchestratorConfig {
 //   - Returns errors for all other endpoints (orchestrator handles gracefully).
 
 struct SyncTestBeacon {
-    duty_pubkey: String,
+    duty_pubkey: [u8; 48],
     submitted_count: Arc<AtomicUsize>,
     /// Notified once when the first sync message batch is submitted.
     submitted_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -97,7 +97,7 @@ struct SyncTestBeacon {
 
 impl SyncTestBeacon {
     fn new(
-        duty_pubkey: String,
+        duty_pubkey: [u8; 48],
         submitted_count: Arc<AtomicUsize>,
         submitted_tx: tokio::sync::oneshot::Sender<()>,
     ) -> Self {
@@ -124,7 +124,7 @@ impl BeaconNodeClient for SyncTestBeacon {
         Ok(ExecutionOptimisticResponse {
             execution_optimistic: false,
             data: vec![SyncCommitteeDuty {
-                pubkey: self.duty_pubkey.clone(),
+                pubkey: self.duty_pubkey,
                 validator_index: 1,
                 validator_sync_committee_indices: vec![0],
             }],
@@ -409,7 +409,7 @@ async fn test_sync_runs_with_attesting_disabled() {
     let (submitted_tx, submitted_rx) = tokio::sync::oneshot::channel::<()>();
 
     let beacon =
-        Arc::new(SyncTestBeacon::new(pk_hex.clone(), submitted_count.clone(), submitted_tx));
+        Arc::new(SyncTestBeacon::new(pk.to_bytes(), submitted_count.clone(), submitted_tx));
 
     // attesting_enabled = false; sync_enabled = true (default)
     let attesting_enabled = Arc::new(AtomicBool::new(false));
@@ -466,7 +466,7 @@ async fn test_sync_disabled_attesting_enabled() {
     let (submitted_tx, _submitted_rx) = tokio::sync::oneshot::channel::<()>();
 
     let beacon =
-        Arc::new(SyncTestBeacon::new(pk_hex.clone(), submitted_count.clone(), submitted_tx));
+        Arc::new(SyncTestBeacon::new(pk.to_bytes(), submitted_count.clone(), submitted_tx));
 
     // attesting_enabled = true; sync_enabled will be set to false below
     let attesting_enabled = Arc::new(AtomicBool::new(true));

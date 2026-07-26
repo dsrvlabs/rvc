@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tree_hash::{Hash256, MerkleHasher, TreeHash, TreeHashType};
 
-use crate::hex_fixed::bytes_32_hex;
+use crate::hex_fixed::{bytes_32_hex, bytes_48_hex};
 use crate::tree_hash_utils::vec_u8_tree_hash_root;
 use crate::{Root, Signature, Slot};
 
@@ -50,7 +50,8 @@ pub struct SyncCommitteeMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncCommitteeDuty {
-    pub pubkey: String,
+    #[serde(with = "bytes_48_hex")]
+    pub pubkey: [u8; 48],
     #[serde(with = "serde_utils::quoted_u64")]
     pub validator_index: u64,
     #[serde(with = "serde_utils::quoted_u64_vec")]
@@ -251,7 +252,7 @@ mod tests {
 
     fn sample_sync_committee_duty() -> SyncCommitteeDuty {
         SyncCommitteeDuty {
-            pubkey: "0xabcd".to_string(),
+            pubkey: [0xab; 48],
             validator_index: 42,
             validator_sync_committee_indices: vec![0, 128, 256],
         }
@@ -322,13 +323,75 @@ mod tests {
     #[test]
     fn test_sync_committee_duty_empty_indices() {
         let duty = SyncCommitteeDuty {
-            pubkey: "0x1234".to_string(),
+            pubkey: [0x12; 48],
             validator_index: 0,
             validator_sync_committee_indices: vec![],
         };
         let json = serde_json::to_string(&duty).unwrap();
         let deserialized: SyncCommitteeDuty = serde_json::from_str(&json).unwrap();
         assert_eq!(duty, deserialized);
+    }
+
+    /// RF3-16: malformed BN pubkey must fail serde, not land as a free-form String.
+    #[test]
+    fn test_sync_committee_duty_rejects_malformed_pubkey() {
+        let invalid_hex = r#"{
+            "pubkey": "0xzz",
+            "validator_index": "42",
+            "validator_sync_committee_indices": ["0"]
+        }"#;
+        assert!(
+            serde_json::from_str::<SyncCommitteeDuty>(invalid_hex).is_err(),
+            "non-hex pubkey must fail deserialize"
+        );
+
+        let wrong_len = format!(
+            r#"{{
+            "pubkey": "0x{}",
+            "validator_index": "42",
+            "validator_sync_committee_indices": ["0"]
+        }}"#,
+            "ab".repeat(32)
+        );
+        assert!(
+            serde_json::from_str::<SyncCommitteeDuty>(&wrong_len).is_err(),
+            "wrong-length pubkey must fail deserialize"
+        );
+
+        let bare = format!(
+            r#"{{
+            "pubkey": "{}",
+            "validator_index": "42",
+            "validator_sync_committee_indices": ["0"]
+        }}"#,
+            "ab".repeat(48)
+        );
+        assert!(
+            serde_json::from_str::<SyncCommitteeDuty>(&bare).is_err(),
+            "bare (no 0x) pubkey must fail deserialize — Beacon API requires 0x"
+        );
+    }
+
+    /// RF3-16: JSON wire form stays `0x` + 96 hex chars (same as ProposerDuty).
+    #[test]
+    fn test_sync_committee_duty_json_wire_form_unchanged() {
+        let duty = sample_sync_committee_duty();
+        let json = serde_json::to_string(&duty).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let expected = format!("0x{}", "ab".repeat(48));
+        assert_eq!(parsed["pubkey"], serde_json::Value::String(expected));
+
+        // Recorded BN-shaped body: re-encode must stay byte-identical on pubkey.
+        let recorded = format!(
+            r#"{{"pubkey":"0x{}","validator_index":"42","validator_sync_committee_indices":["0","128","256"]}}"#,
+            "ab".repeat(48)
+        );
+        let decoded: SyncCommitteeDuty = serde_json::from_str(&recorded).unwrap();
+        assert_eq!(decoded.pubkey, [0xab; 48]);
+        let re_encoded = serde_json::to_string(&decoded).unwrap();
+        let re_parsed: serde_json::Value = serde_json::from_str(&re_encoded).unwrap();
+        let orig: serde_json::Value = serde_json::from_str(&recorded).unwrap();
+        assert_eq!(re_parsed["pubkey"], orig["pubkey"]);
     }
 
     #[test]
