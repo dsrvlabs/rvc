@@ -19,8 +19,7 @@ path = "src/lib.rs"
 
 [features]
 default = []
-# Enables PeerSignerService client stubs (DVT dial-out) via the shared proto crate.
-dvt = ["vsss-rs", "bls12_381_plus", "rand", "signer-proto/client"]
+dvt = ["vsss-rs", "bls12_381_plus", "rand"]
 
 [dependencies]
 async-trait.workspace = true
@@ -33,7 +32,6 @@ prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 signer.workspace = true
-signer-proto = { workspace = true, features = ["server"] }
 slashing.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -120,7 +118,7 @@ tokio = { workspace = true, features = ["test-util"] }
 tracing-test.workspace = true
 grpc-signer.workspace = true
 crypto.workspace = true
-eth-types.workspace = true
+eth-types = { workspace = true, features = ["test-fixtures"] }
 slashing.workspace = true
 # Drives the axum Router in-memory (oneshot) for socket-free http_api tests.
 tower = { workspace = true, features = ["util"] }
@@ -134,3 +132,6 @@ bls12_381_plus.workspace = true
 
 # M4 enumeration gate (SS-1, Issue 2.2) — dev-only; must NOT be a production edge
 signer-registry.workspace = true
+
+[build-dependencies]
+tonic-build.workspace = true

@@ -355,6 +355,9 @@ impl BlockContents {
 ///
 /// Header: slot=3_000_000, proposer=42, parent=`0x11…`, state=`0x22…`;
 /// body = [`crate::block_body::external_vector_electra_body`].
+///
+/// Gated behind `test-fixtures` (or crate-local `cfg(test)`); see RF3-19.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn external_vector_electra_block() -> BeaconBlock {
     BeaconBlock {
         slot: 3_000_000,
@@ -367,6 +370,7 @@ pub fn external_vector_electra_block() -> BeaconBlock {
 
 /// Electra blinded block for the SEC-6d external vector (distinct blinded
 /// graffiti; same header fields as the full Electra block vector).
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn external_vector_electra_blinded_block() -> BlindedBeaconBlock {
     BlindedBeaconBlock {
         slot: 3_000_000,
@@ -378,6 +382,7 @@ pub fn external_vector_electra_blinded_block() -> BlindedBeaconBlock {
 }
 
 /// Deneb `BeaconBlock` for the SEC-6d external block-level vector.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn external_vector_deneb_block() -> BeaconBlock {
     BeaconBlock {
         slot: 3_000_000,
@@ -389,6 +394,7 @@ pub fn external_vector_deneb_block() -> BeaconBlock {
 }
 
 /// Deneb blinded block for the SEC-6d external vector.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn external_vector_deneb_blinded_block() -> BlindedBeaconBlock {
     BlindedBeaconBlock {
         slot: 3_000_000,

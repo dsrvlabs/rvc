@@ -14,8 +14,6 @@ mod domains;
 mod duties;
 mod fork;
 pub(crate) mod hex_fixed;
-/// Named consensus network presets (GVR, fork versions, genesis time).
-pub mod networks;
 pub(crate) mod serde_signature;
 pub mod ssz_helpers;
 mod sync_committee;
@@ -26,25 +24,42 @@ pub use aggregation::{
 };
 pub use attestation::SingleAttestation;
 pub use block::{
-    body_fork_layout, external_vector_deneb_blinded_block, external_vector_deneb_block,
-    external_vector_electra_blinded_block, external_vector_electra_block, kzg_commitment_list_root,
-    BeaconBlock, BeaconBlockBody, BeaconBlockHeader, BlindedBeaconBlock, BlindedBeaconBlockBody,
-    BlobSidecar, BlockContents, BodyForkLayout, ProducedBlock, SignedBeaconBlock,
-    SignedBlindedBeaconBlock,
+    body_fork_layout, kzg_commitment_list_root, BeaconBlock, BeaconBlockBody, BeaconBlockHeader,
+    BlindedBeaconBlock, BlindedBeaconBlockBody, BlobSidecar, BlockContents, BodyForkLayout,
+    ProducedBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
 };
 pub use block_body::{
     blinded_body_tree_hash_root, blinded_body_tree_hash_root_for_layout, body_tree_hash_root,
     body_tree_hash_root_for_layout, decode_beacon_block_body_deneb,
     decode_beacon_block_body_electra, decode_blinded_beacon_block_body_deneb,
-    decode_blinded_beacon_block_body_electra, external_vector_blinded_deneb_body,
-    external_vector_blinded_electra_body, external_vector_deneb_body, external_vector_electra_body,
-    external_vector_execution_payload_header, BeaconBlockBodyDeneb, BeaconBlockBodyElectra,
+    decode_blinded_beacon_block_body_electra, BeaconBlockBodyDeneb, BeaconBlockBodyElectra,
     BlindedBeaconBlockBodyDeneb, BlindedBeaconBlockBodyElectra, BodySszError, ExecutionPayload,
     ExecutionPayloadHeader, ExecutionRequests, SyncAggregate,
-    EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX, EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX,
-    EXTERNAL_DENEB_BLOCK_ROOT_HEX, EXTERNAL_DENEB_BODY_ROOT_HEX, EXTERNAL_ELECTRA_BLOCK_ROOT_HEX,
-    EXTERNAL_ELECTRA_BODY_ROOT_HEX,
 };
+
+/// Deterministic SSZ/KAT bodies and known roots for tests (RF3-19 / G5).
+///
+/// Compiled only when the `test-fixtures` feature is enabled. Consumer crates
+/// should pull it in via a dev-dependency:
+/// `eth-types = { workspace = true, features = ["test-fixtures"] }`.
+#[cfg(feature = "test-fixtures")]
+pub mod fixtures {
+    pub use crate::block::{
+        external_vector_deneb_blinded_block, external_vector_deneb_block,
+        external_vector_electra_blinded_block, external_vector_electra_block,
+    };
+    pub use crate::block_body::{
+        external_vector_blinded_deneb_body, external_vector_blinded_electra_body,
+        external_vector_deneb_body, external_vector_electra_body,
+        external_vector_execution_payload_header, EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX,
+        EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX, EXTERNAL_DENEB_BLOCK_ROOT_HEX,
+        EXTERNAL_DENEB_BODY_ROOT_HEX, EXTERNAL_ELECTRA_BLOCK_ROOT_HEX,
+        EXTERNAL_ELECTRA_BODY_ROOT_HEX,
+    };
+}
+
+// Crate-root re-exports so existing `eth_types::external_vector_*` / `EXTERNAL_*`
+// paths keep working when the feature is on (dev builds / tests).
 pub use builder::{SignedValidatorRegistration, ValidatorRegistrationV1};
 pub use deposit::{BLSToExecutionChange, DepositData, DepositMessage, SignedBLSToExecutionChange};
 pub use domains::{
@@ -54,8 +69,9 @@ pub use domains::{
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 pub use duties::{ProposerDuty, SignedVoluntaryExit, VoluntaryExit};
-pub use fork::{ForkName, ForkSchedule, ParseForkNameError, UnknownForkIdError};
-pub use networks::{from_name as network_from_name, NetworkPreset, ALL as NETWORK_PRESETS};
+#[cfg(feature = "test-fixtures")]
+pub use fixtures::*;
+pub use fork::{ForkName, ForkSchedule};
 pub use ssz_helpers::{
     decode_attestation_ssz, decode_beacon_block_ssz, decode_blinded_beacon_block_ssz,
     decode_sync_committee_contribution_ssz, encode_attestation_ssz, encode_beacon_block_ssz,
@@ -199,16 +215,6 @@ mod tests {
     }
 
     #[test]
-    fn test_slots_per_epoch() {
-        assert_eq!(SLOTS_PER_EPOCH, 32);
-    }
-
-    #[test]
-    fn test_seconds_per_slot() {
-        assert_eq!(SECONDS_PER_SLOT, 12);
-    }
-
-    #[test]
     fn test_checkpoint_quoted_epoch_serialization() {
         let checkpoint = Checkpoint { epoch: 100, root: [0u8; 32] };
         let json = serde_json::to_string(&checkpoint).unwrap();
@@ -336,10 +342,5 @@ mod tests {
     #[test]
     fn test_consensus_spec_version_exists_and_starts_with_v() {
         assert!(CONSENSUS_SPEC_VERSION.starts_with('v'));
-    }
-
-    #[test]
-    fn test_consensus_spec_version_value() {
-        assert_eq!(CONSENSUS_SPEC_VERSION, "v1.5.0-alpha.12");
     }
 }

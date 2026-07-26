@@ -27,6 +27,7 @@ validator-store.workspace = true
 
 [dev-dependencies]
 crypto = { workspace = true, features = ["test-utils"] }
+eth-types = { workspace = true, features = ["test-fixtures"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
 toml.workspace = true
 tracing-test.workspace = true

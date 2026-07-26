@@ -9,6 +9,12 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Deterministic SSZ/KAT bodies + known roots for unit/integration tests only.
+# Production builds leave this off so fixture code is not compiled into the lib.
+default = []
+test-fixtures = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
@@ -23,12 +29,17 @@ ssz_derive.workspace = true
 ssz08.workspace = true
 ssz_types.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
 tree_hash.workspace = true
 tree_hash_derive.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+<<<<<<< ours
 <<<<<<< HEAD
+=======
+tracing-test = { workspace = true, features = ["no-env-filter"] }
+>>>>>>> theirs
 # Independent SSZ-Merkleization oracle for the BeaconBlockHeader KAT (FR-31).
 # Dev-only: not a production out-edge, so the architecture-tests
 # zero-out-edge invariant for rvc-eth-types is unaffected.

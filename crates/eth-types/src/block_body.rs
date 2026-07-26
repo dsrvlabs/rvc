@@ -885,48 +885,59 @@ pub fn blinded_body_tree_hash_root_for_layout(
 
 // ---------------------------------------------------------------------------
 // External-vector fixtures (SEC-6a/b/c/d KATs; also usable as valid bodies)
+// Gated: compiled for crate-local unit tests or the `test-fixtures` feature
+// (RF3-19 / G5). Not part of the default production public API.
 // ---------------------------------------------------------------------------
 
 /// External known-good Electra body root from independent `remerkleable` oracle.
 ///
 /// Matches [`external_vector_electra_body`]'s field construction.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub const EXTERNAL_ELECTRA_BODY_ROOT_HEX: &str =
     "58953d11e9b51a6e95c8c70ca51b7ad6b6e557a91caab298a71688dfab9e4870";
 
 /// External known-good Electra **block** root (`remerkleable` over the full
 /// `BeaconBlock` with slot=3_000_000, proposer=42, parent=`0x11…`, state=`0x22…`,
 /// body=[`external_vector_electra_body`]).
+#[cfg(any(test, feature = "test-fixtures"))]
 pub const EXTERNAL_ELECTRA_BLOCK_ROOT_HEX: &str =
     "b3f19bf190b0ab2466738ba06bbaf6e481041ca66db733c549975b27b53c92b9";
 
 /// Blinded Electra body root with SEC-6d distinct graffiti
 /// (`"rvc-sec6d-blinded-electra!!!!"`). Independent `remerkleable` KAT.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub const EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX: &str =
     "e9e9fd39cc7fc4345e43bf31af21838d9389767cf62c0f8fdaf740b06d26f3e7";
 
 /// Blinded Electra **block** root for [`external_vector_blinded_electra_body`]
 /// (slot=3_000_000, proposer=42, parent=`0x11…`, state=`0x22…`).
+#[cfg(any(test, feature = "test-fixtures"))]
 pub const EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX: &str =
     "6bf364098fe8b865ffecc0b1d88c5b6edada937e5c9c3c69726d1d46cf2e1d24";
 
 /// Deneb full body root (`remerkleable`; graffiti `"rvc-sec6d-deneb-body!!!!!!!!!"`).
+#[cfg(any(test, feature = "test-fixtures"))]
 pub const EXTERNAL_DENEB_BODY_ROOT_HEX: &str =
     "6c74513b682d097373d9f9a962637d753a8f8d6af4efb0283ae5c4941308ec67";
 
 /// Deneb **block** root for [`external_vector_deneb_body`] (same header fields
 /// as the Electra block vector).
+#[cfg(any(test, feature = "test-fixtures"))]
 pub const EXTERNAL_DENEB_BLOCK_ROOT_HEX: &str =
     "86714640e5ee761d6ccc664996816f10ec496324bcac46a999f778abce1f906e";
 
 /// Shared scalar fields for external-vector bodies (eth1 / payload / sync).
+#[cfg(any(test, feature = "test-fixtures"))]
 fn external_vector_eth1_data() -> Eth1Data {
     Eth1Data { deposit_root: [0x22; 32], deposit_count: 7, block_hash: [0x33; 32] }
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
 fn external_vector_sync_aggregate() -> SyncAggregate {
     SyncAggregate { sync_committee_bits: BitVector::new(), sync_committee_signature: [0x44; 96] }
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
 fn external_vector_execution_payload() -> ExecutionPayload {
     ExecutionPayload {
         parent_hash: [0x55; 32],
@@ -949,6 +960,7 @@ fn external_vector_execution_payload() -> ExecutionPayload {
     }
 }
 
+#[cfg(any(test, feature = "test-fixtures"))]
 fn external_vector_empty_execution_requests() -> ExecutionRequests {
     ExecutionRequests {
         deposits: VariableList::from(vec![]),
@@ -959,6 +971,7 @@ fn external_vector_empty_execution_requests() -> ExecutionRequests {
 
 /// Deterministic Electra body matching the external `remerkleable` vector:
 /// fixed non-zero leaves for signatures / eth1 / payload fields; empty op lists.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn external_vector_electra_body() -> BeaconBlockBodyElectra {
     let mut graffiti = [0u8; 32];
     graffiti[..28].copy_from_slice(b"rvc-sec6a-spike-electra!!!!!");
@@ -982,6 +995,7 @@ pub fn external_vector_electra_body() -> BeaconBlockBodyElectra {
 
 /// Execution payload header corresponding to the external-vector payload
 /// (empty txs/withdrawals → their empty-list roots).
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn external_vector_execution_payload_header() -> ExecutionPayloadHeader {
     let p = external_vector_execution_payload();
     ExecutionPayloadHeader {
@@ -1022,6 +1036,7 @@ pub fn external_vector_execution_payload_header() -> ExecutionPayloadHeader {
 ///
 /// Uses header form of the payload and graffiti `rvc-sec6d-blinded-electra!!!!`
 /// so the body root is distinct from the full Electra vector.
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn external_vector_blinded_electra_body() -> BlindedBeaconBlockBodyElectra {
     let mut graffiti = [0u8; 32];
     graffiti[..29].copy_from_slice(b"rvc-sec6d-blinded-electra!!!!");
@@ -1044,6 +1059,7 @@ pub fn external_vector_blinded_electra_body() -> BlindedBeaconBlockBodyElectra {
 }
 
 /// Deneb full body external vector (SEC-6d; no `execution_requests`).
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn external_vector_deneb_body() -> BeaconBlockBodyDeneb {
     let mut graffiti = [0u8; 32];
     graffiti[..29].copy_from_slice(b"rvc-sec6d-deneb-body!!!!!!!!!");
@@ -1067,6 +1083,7 @@ pub fn external_vector_deneb_body() -> BeaconBlockBodyDeneb {
 /// Deneb blinded body external vector (header instead of payload).
 ///
 /// With empty txs/withdrawals the body HTR equals [`EXTERNAL_DENEB_BODY_ROOT_HEX`].
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn external_vector_blinded_deneb_body() -> BlindedBeaconBlockBodyDeneb {
     let full = external_vector_deneb_body();
     BlindedBeaconBlockBodyDeneb {
