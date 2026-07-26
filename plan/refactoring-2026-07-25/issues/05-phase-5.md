@@ -1765,11 +1765,11 @@ time with the comment "Use the same write logic as run()" — proof the logic is
 3. Behavior change on non-unix: refusing to overwrite instead of clobbering — release-note item 2.
 
 **Acceptance criteria:**
-- [ ] One implementation; `rg 'create_new' bin/rvc-keygen/src/` shows it only in `fs_util.rs`.
-- [ ] `create_new` semantics on all platforms; `0o600` on unix.
-- [ ] Existing-file writes fail with a clear, path-bearing error on every platform.
-- [ ] The two test re-duplications are gone; the helper has its own tests.
-- [ ] Release-note item 2 drafted.
+- [x] One implementation; `rg 'create_new' bin/rvc-keygen/src/` shows it only in `fs_util.rs`.
+- [x] `create_new` semantics on all platforms; `0o600` on unix.
+- [x] Existing-file writes fail with a clear, path-bearing error on every platform.
+- [x] The two test re-duplications are gone; the helper has its own tests.
+- [x] Release-note item 2 drafted.
 
 **TDD test plan** (RED first):
 - `test_write_new_0600_refuses_existing_file` — **RED**: the helper does not exist, and the behavior it

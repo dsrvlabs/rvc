@@ -2,6 +2,7 @@ mod bls_to_execution;
 mod deposit;
 mod existing_mnemonic;
 mod exit;
+mod fs_util;
 mod network;
 mod new_mnemonic;
 mod password;

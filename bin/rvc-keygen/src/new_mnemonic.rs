@@ -18,36 +18,10 @@ use crate::verify;
 /// Returns the SHA-256 hex checksum of the mnemonic string.
 pub fn write_mnemonic_backup(path: &Path, mnemonic: &str) -> Result<String> {
     let checksum = mnemonic_checksum(mnemonic);
-
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| {
-                format!("Failed to create mnemonic backup (already exists?): {}", path.display())
-            })?;
-        file.write_all(mnemonic.as_bytes())?;
-        file.write_all(b"\n")?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        let mut file =
-            OpenOptions::new().write(true).create_new(true).open(path).with_context(|| {
-                format!("Failed to create mnemonic backup (already exists?): {}", path.display())
-            })?;
-        file.write_all(mnemonic.as_bytes())?;
-        file.write_all(b"\n")?;
-    }
-
+    let mut data = mnemonic.as_bytes().to_vec();
+    data.push(b'\n');
+    crate::fs_util::write_new_0600(path, &data)
+        .with_context(|| format!("Failed to create mnemonic backup: {}", path.display()))?;
     Ok(checksum)
 }
 
@@ -233,7 +207,7 @@ pub fn generate_from_seed(
         eprintln!("[DRY RUN] Would write deposit data: {}", deposit_path.display());
         println!("{}", deposit_json);
     } else {
-        write_with_permissions(&deposit_path, deposit_json.as_bytes())?;
+        crate::fs_util::write_new_0600(&deposit_path, deposit_json.as_bytes())?;
     }
 
     verify::print_summary(&summaries, net.name, output_dir);
@@ -253,33 +227,6 @@ fn keystore_filename(index: u32, timestamp: u64) -> String {
 
 fn deposit_data_filename(timestamp: u64) -> String {
     format!("deposit_data-{}.json", timestamp)
-}
-
-fn write_with_permissions(path: &Path, data: &[u8]) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file =
-            OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).with_context(
-                || format!("Failed to create file (already exists?): {}", path.display()),
-            )?;
-        file.write_all(data)?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        let mut file =
-            OpenOptions::new().write(true).create_new(true).open(path).with_context(|| {
-                format!("Failed to create file (already exists?): {}", path.display())
-            })?;
-        file.write_all(data)?;
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -814,17 +761,6 @@ mod tests {
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("overflows"));
-    }
-
-    // LOW-24: Atomic file creation rejects existing file
-    #[test]
-    fn test_write_with_permissions_rejects_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("existing.json");
-        std::fs::write(&path, "existing content").unwrap();
-
-        let result = write_with_permissions(&path, b"new content");
-        assert!(result.is_err());
     }
 
     #[test]

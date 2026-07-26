@@ -49,28 +49,8 @@ pub fn run(args: ExitArgs) -> Result<()> {
     let filename = format!("signed_voluntary_exit-{}-{}.json", timestamp, args.validator_index);
     let output_path = args.output_dir.join(filename);
 
-    #[cfg(unix)]
-    {
-        use std::fs::OpenOptions;
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&output_path)
-            .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
-
-        file.write_all(json.as_bytes())
-            .with_context(|| format!("Failed to write output file: {}", output_path.display()))?;
-    }
-
-    #[cfg(not(unix))]
-    {
-        fs::write(&output_path, &json)
-            .with_context(|| format!("Failed to write output file: {}", output_path.display()))?;
-    }
+    crate::fs_util::write_new_0600(&output_path, json.as_bytes())
+        .with_context(|| format!("Failed to create output file: {}", output_path.display()))?;
 
     eprintln!("Signed voluntary exit written to: {}", output_path.display());
 
@@ -251,22 +231,7 @@ mod tests {
         fs::create_dir_all(&output_dir).unwrap();
 
         let output_path = output_dir.join("test_exit.json");
-
-        // Use the same write logic as run()
-        {
-            use std::fs::OpenOptions;
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&output_path)
-                .unwrap();
-
-            file.write_all(json.as_bytes()).unwrap();
-        }
+        crate::fs_util::write_new_0600(&output_path, json.as_bytes()).unwrap();
 
         let metadata = fs::metadata(&output_path).unwrap();
         let mode = metadata.permissions().mode() & 0o777;
@@ -277,6 +242,83 @@ mod tests {
         let parsed: SignedVoluntaryExit = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed.message.epoch, 100);
         assert_eq!(parsed.message.validator_index, 7);
+    }
+
+    /// `run()` must refuse to overwrite an existing output path (create_new via helper).
+    /// Pre-creates the timestamped filename `run` is about to use; retries across second boundaries.
+    #[test]
+    fn test_exit_command_refuses_to_overwrite_existing_output() {
+        use std::io::ErrorKind;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = tempfile::tempdir().unwrap();
+        let secret_key = SecretKey::generate();
+        let password = b"test-password-123";
+        let keystore = Keystore::encrypt(
+            &secret_key,
+            password,
+            "m/12381/3600/0/0/0",
+            EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .unwrap();
+
+        let keystore_path = dir.path().join("keystore.json");
+        keystore.to_file(&keystore_path).unwrap();
+        let password_path = dir.path().join("password.txt");
+        fs::write(&password_path, password).unwrap();
+
+        let output_dir = dir.path().join("exits");
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let validator_index = 7u64;
+        let prior = b"prior signed exit";
+
+        for _ in 0..50 {
+            for entry in fs::read_dir(&output_dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_name().to_string_lossy().starts_with("signed_voluntary_exit-") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+
+            let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+            let output_path =
+                output_dir.join(format!("signed_voluntary_exit-{}-{}.json", ts, validator_index));
+            fs::write(&output_path, prior).unwrap();
+
+            let result = run(ExitArgs {
+                network: "mainnet".into(),
+                output_dir: output_dir.clone(),
+                validator_index,
+                epoch: 100,
+                keystore: keystore_path.clone(),
+                password_file: Some(password_path.clone()),
+            });
+
+            match result {
+                Err(e) => {
+                    let msg = format!("{e:#}");
+                    let name = output_path.file_name().unwrap().to_string_lossy();
+                    assert!(
+                        msg.contains(name.as_ref())
+                            || msg.contains(&output_path.display().to_string()),
+                        "error must include path: {msg}"
+                    );
+                    assert_eq!(fs::read(&output_path).unwrap(), prior);
+                    let io_err = e
+                        .root_cause()
+                        .downcast_ref::<std::io::Error>()
+                        .expect("root cause should be io::Error");
+                    assert_eq!(io_err.kind(), ErrorKind::AlreadyExists);
+                    return;
+                }
+                Ok(()) => {
+                    // Second advanced between pre-create and open; retry.
+                    continue;
+                }
+            }
+        }
+        panic!("failed to force output path collision through exit::run()");
     }
 
     /// RED: Invalid keystore path returns clear error.
