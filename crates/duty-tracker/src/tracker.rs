@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::RwLock;
@@ -135,6 +136,8 @@ pub struct DutyTracker {
     proposer_cache: RwLock<HashMap<u64, ProposerEpochDutyCache>>,
     /// Sync committee duties keyed by sync committee period.
     sync_committee_cache: RwLock<HashMap<u64, SyncPeriodDutyCache>>,
+    /// Count of [`Self::get_duties_for_slot`] calls (complexity tests; RF6-31).
+    slot_duty_lookups: AtomicU64,
 }
 
 impl DutyTracker {
@@ -145,7 +148,13 @@ impl DutyTracker {
             cache: RwLock::new(HashMap::new()),
             proposer_cache: RwLock::new(HashMap::new()),
             sync_committee_cache: RwLock::new(HashMap::new()),
+            slot_duty_lookups: AtomicU64::new(0),
         }
+    }
+
+    /// Number of times [`Self::get_duties_for_slot`] has been called (tests).
+    pub fn slot_duty_lookup_count(&self) -> u64 {
+        self.slot_duty_lookups.load(Ordering::Relaxed)
     }
 
     #[tracing::instrument(name = "duty_tracker.fetch_attester_duties", level = "debug", skip_all, fields(epoch =epoch))]
@@ -285,6 +294,7 @@ impl DutyTracker {
     }
 
     pub async fn get_duties_for_slot(&self, slot: u64) -> Vec<AttesterDuty> {
+        self.slot_duty_lookups.fetch_add(1, Ordering::Relaxed);
         let epoch = slot / SLOTS_PER_EPOCH;
         let cache = self.cache.read().await;
 

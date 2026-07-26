@@ -94,8 +94,7 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
         // advance the generation counter; RF1-07 wires the orchestrator receiver
         // that will clear the duty cache on this notification.
         if let Ok(pk) = PublicKey::from_bytes(&pubkey) {
-            let pubkey_hex = pubkey_hex(pubkey);
-            self.notifier.pubkey_map().write().insert(pubkey_hex, pk);
+            self.notifier.pubkey_map().write().insert(pubkey, pk);
         }
         self.notifier.notify();
 

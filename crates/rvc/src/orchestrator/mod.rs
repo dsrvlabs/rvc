@@ -19,3 +19,8 @@ pub use coordinator::{
     PubkeyMap,
 };
 pub use error::OrchestratorError;
+// Re-export so callers that already depend on `rvc::orchestrator` can reach the
+// shared index registry without a second import path.
+pub use crate::pubkey_index::{
+    parse_pubkey_bytes, pubkey_bytes_to_0x, PubkeyIndexRegistry, SharedPubkeyIndexRegistry,
+};

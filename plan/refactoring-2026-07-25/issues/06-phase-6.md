@@ -1435,13 +1435,13 @@ performance item in the phase, and it scales with validator count.
 5. `get_duties_for_slot` borrows rather than cloning the map.
 
 **Acceptance criteria:**
-- [ ] `PubkeyMap` is keyed by a fixed-size/typed key; no `String` normalization on any per-slot path.
-- [ ] `prepare_proposers` performs O(validators) index lookups (count-based test, not timing).
-- [ ] One pubkey→index registry in the workspace; `IndexToPubkeyHex` and `validator_index_map` are gone
+- [x] `PubkeyMap` is keyed by a fixed-size/typed key; no `String` normalization on any per-slot path.
+- [x] `prepare_proposers` performs O(validators) index lookups (count-based test, not timing).
+- [x] One pubkey→index registry in the workspace; `IndexToPubkeyHex` and `validator_index_map` are gone
       or delegate to it.
-- [ ] `find_pubkey`'s linear fallback deleted; a canonicalization-at-ingestion test exists.
-- [ ] Test count unchanged plus the new perf/canonicalization tests, itemised.
-- [ ] Workspace green.
+- [x] `find_pubkey`'s linear fallback deleted; a canonicalization-at-ingestion test exists.
+- [x] Test count unchanged plus the new perf/canonicalization tests, itemised.
+- [x] Workspace green.
 
 **Test/verification plan:** The perf assertion must be **count-based, never wall-clock** — instrument the
 duty-cache double with an access counter and assert `lookups <= validators + k`, so the test states the

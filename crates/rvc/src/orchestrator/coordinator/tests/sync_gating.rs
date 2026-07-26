@@ -8,7 +8,7 @@ use super::*;
 /// Used to avoid repetition in the H-7 guard tests.
 async fn build_sync_test_orchestrator(
     beacon: Arc<dyn bn_manager::BeaconNodeClient>,
-    pk_hex: String,
+    _pk_hex: String,
     pk: crypto::PublicKey,
     sk: crypto::SecretKey,
     attesting_enabled: Arc<AtomicBool>,
@@ -26,7 +26,7 @@ async fn build_sync_test_orchestrator(
 
     let pk_bytes = pk.to_bytes();
     let mut map = HashMap::new();
-    map.insert(pk_hex, pk);
+    map.insert(pk.to_bytes(), pk);
     let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
 
     let submitter = Arc::new(MockSubmitter::new());

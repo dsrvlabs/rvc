@@ -442,7 +442,7 @@ async fn test_orchestrator_with_validator_keys() {
 
     let secret_key = SecretKey::generate();
     let pubkey = secret_key.public_key();
-    let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+    let _pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
 
     let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
 
@@ -459,7 +459,7 @@ async fn test_orchestrator_with_validator_keys() {
 
     let config = create_test_config();
     let mut pubkey_map_inner = HashMap::new();
-    pubkey_map_inner.insert(pubkey_hex, pubkey);
+    pubkey_map_inner.insert(pubkey.to_bytes(), pubkey);
     let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
     let (_orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
@@ -501,7 +501,7 @@ async fn test_find_pubkey_exact_match() {
 
     let config = create_test_config();
     let mut pubkey_map_inner = HashMap::new();
-    pubkey_map_inner.insert(pubkey_hex.clone(), pubkey.clone());
+    pubkey_map_inner.insert(pubkey.to_bytes(), pubkey.clone());
     let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
     let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
@@ -543,7 +543,7 @@ async fn test_find_pubkey_case_insensitive() {
 
     let config = create_test_config();
     let mut pubkey_map_inner = HashMap::new();
-    pubkey_map_inner.insert(pubkey_hex.to_uppercase(), pubkey.clone());
+    pubkey_map_inner.insert(pubkey.to_bytes(), pubkey.clone());
     let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
     let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(

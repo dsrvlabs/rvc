@@ -53,7 +53,7 @@ async fn test_non_builder_timeout_does_not_trip_breaker() {
 
     let config = create_test_config();
     let mut pubkey_map_inner = HashMap::new();
-    pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
+    pubkey_map_inner.insert(pubkey.to_bytes(), pubkey);
     let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
@@ -137,7 +137,7 @@ async fn test_builder_timeout_trips_breaker() {
 
     let config = create_test_config();
     let mut pubkey_map_inner = HashMap::new();
-    pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
+    pubkey_map_inner.insert(pubkey.to_bytes(), pubkey);
     let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
@@ -223,7 +223,7 @@ async fn test_signer_error_does_not_trip_breaker() {
     let config = create_test_config();
     let mut pubkey_map_inner = HashMap::new();
     // pubkey is in the map so find_pubkey succeeds, but the secret key is absent.
-    pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
+    pubkey_map_inner.insert(pubkey.to_bytes(), pubkey);
     let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));

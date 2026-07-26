@@ -5,7 +5,6 @@
 //! operator opt-out), spawns the per-slot liveness observation loop, and
 //! registers secret-provider refresh with import-strict machine registration.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use bn_manager::BeaconNodeClient;
@@ -21,6 +20,9 @@ use crate::config::{Config, ServiceBuilder};
 use crate::deletion_denylist::DeletionDenylist;
 use crate::liveness_loop::{spawn_liveness_loop, LivenessLoopSpawn};
 use crate::orchestrator::PubkeyMap;
+use crate::pubkey_index::{
+    parse_pubkey_bytes, pubkey_bytes_to_0x, PubkeyIndexRegistry, SharedPubkeyIndexRegistry,
+};
 
 /// Handles produced by [`wire_signing_enablement`].
 ///
@@ -35,15 +37,14 @@ pub struct EnablementHandles {
     pub forward_window_machine: Option<Arc<ForwardWindowMachine>>,
     /// Shared monotonic epoch clock (boot register + keymanager import).
     pub epoch_clock: Arc<MonotonicEpochClock>,
-    /// Hex-keyed pubkey map (same `Arc` as [`LoadedKeys::pubkey_map`]).
+    /// Byte-keyed pubkey map (same `Arc` as [`LoadedKeys::pubkey_map`]).
     pub pubkey_map: PubkeyMap,
     /// Spawned SEC-2c liveness loop; `None` when doppelganger is off or there
     /// are no keys/indices to observe.
     pub liveness_task: Option<LivenessLoopSpawn>,
-    /// Resolved validator indices (`0x`-pubkey → numeric index string) for the
-    /// duty tracker. Empty when unresolved, no keys, or resolution failed with
-    /// doppelganger opted out.
-    pub validator_index_map: HashMap<String, String>,
+    /// Shared pubkey ↔ validator-index registry for duty tracking, proposer
+    /// preparation, and liveness. Empty when unresolved / no keys.
+    pub pubkey_index: SharedPubkeyIndexRegistry,
 }
 
 /// Construct SEC-2b enablement, spawn the SEC-2c liveness loop, and wire
@@ -78,40 +79,34 @@ pub async fn wire_signing_enablement(
     let epoch_clock = Arc::new(MonotonicEpochClock::new(beacon.genesis_time));
     let enablement_epoch = epoch_clock.current_epoch();
 
-    // Resolve validator indices (also used by duty tracker after this phase).
+    // Resolve validator indices into the shared registry (duty tracker + liveness
+    // + prepare_proposers all share this handle).
     let beacon_for_resolve: &dyn BeaconNodeClient = beacon.bn_manager.as_ref();
-    let validator_index_map_result =
-        resolve_validator_indices(beacon_for_resolve, &keys.pubkey_map).await;
+    let pubkey_index = PubkeyIndexRegistry::shared();
+    let resolve_result = resolve_validator_indices(beacon_for_resolve, &keys.pubkey_map).await;
 
-    // Resolve index map for the liveness loop (fail closed if required and missing).
-    let resolved_index_map: HashMap<String, String> =
-        if doppelganger_enabled && !keys.pubkey_map.read().is_empty() {
-            match validator_index_map_result {
-                Ok(ref map) if !map.is_empty() => map.clone(),
-                Ok(_) => {
-                    warn!(
-                        total = keys.pubkey_map.read().len(),
-                        "No validator indices resolved; validators may be pending activation. \
-                         Forward-window liveness loop will not start (gate stays fail-safe closed \
-                         for Pending keys)"
-                    );
-                    HashMap::new()
-                }
-                Err(ref e) => {
-                    error!("Failed to resolve validator indices: {}", e);
-                    return Err(BootstrapError::IndexResolution(e.to_string()));
-                }
+    if doppelganger_enabled && !keys.pubkey_map.read().is_empty() {
+        match &resolve_result {
+            Ok(reg) if !reg.is_empty() => {
+                pubkey_index.write().extend_from(reg);
             }
-        } else {
-            HashMap::new()
-        };
-
-    // Duty-tracker map: keep successful resolution even when doppelganger is off;
-    // empty on error (prior binary ignored Err for duty indices).
-    let validator_index_map: HashMap<String, String> = match &validator_index_map_result {
-        Ok(map) => map.clone(),
-        Err(_) => HashMap::new(),
-    };
+            Ok(_) => {
+                warn!(
+                    total = keys.pubkey_map.read().len(),
+                    "No validator indices resolved; validators may be pending activation. \
+                     Forward-window liveness loop will not start (gate stays fail-safe closed \
+                     for Pending keys)"
+                );
+            }
+            Err(e) => {
+                error!("Failed to resolve validator indices: {}", e);
+                return Err(BootstrapError::IndexResolution(e.to_string()));
+            }
+        }
+    } else if let Ok(reg) = &resolve_result {
+        // Duty-tracker indices: keep successful resolution even when doppelganger is off.
+        pubkey_index.write().extend_from(reg);
+    }
 
     if enablement_epoch == 0 && doppelganger_enabled {
         info!(
@@ -145,7 +140,7 @@ pub async fn wire_signing_enablement(
         spawn_liveness_loop(
             forward_window_machine.clone(),
             Arc::clone(&beacon.bn_manager) as Arc<dyn BeaconNodeClient>,
-            &resolved_index_map,
+            Arc::clone(&pubkey_index),
             Some(Arc::clone(&keys.pubkey_map)),
             Arc::clone(&epoch_clock),
             shutdown.clone(),
@@ -204,7 +199,7 @@ pub async fn wire_signing_enablement(
         epoch_clock,
         pubkey_map: Arc::clone(&keys.pubkey_map),
         liveness_task,
-        validator_index_map,
+        pubkey_index,
     })
 }
 
@@ -212,28 +207,32 @@ pub async fn wire_signing_enablement(
 async fn resolve_validator_indices(
     beacon_client: &dyn BeaconNodeClient,
     pubkey_map: &PubkeyMap,
-) -> Result<HashMap<String, String>, String> {
+) -> Result<PubkeyIndexRegistry, String> {
     let pubkeys: Vec<String> = {
         let map = pubkey_map.read();
         if map.is_empty() {
-            return Ok(HashMap::new());
+            return Ok(PubkeyIndexRegistry::new());
         }
-        map.keys().cloned().collect()
+        map.keys().map(pubkey_bytes_to_0x).collect()
     };
     let response = beacon_client.get_validators(&pubkeys).await.map_err(|e| e.to_string())?;
 
-    let index_map: HashMap<String, String> =
-        response.data.iter().map(|v| (v.validator.pubkey.clone(), v.index.clone())).collect();
+    let mut registry = PubkeyIndexRegistry::new();
+    for v in &response.data {
+        if let Some(bytes) = parse_pubkey_bytes(&v.validator.pubkey) {
+            registry.insert(bytes, v.index.clone());
+        }
+    }
 
-    if index_map.len() < pubkeys.len() {
+    if registry.len() < pubkeys.len() {
         warn!(
-            resolved = index_map.len(),
+            resolved = registry.len(),
             total = pubkeys.len(),
             "Some validator public keys could not be resolved to indices"
         );
     }
-    info!(count = index_map.len(), "Resolved validator indices");
-    Ok(index_map)
+    info!(count = registry.len(), "Resolved validator indices");
+    Ok(registry)
 }
 
 #[cfg(test)]
@@ -247,7 +246,7 @@ mod tests {
     use doppelganger::ForwardWindowStatus;
     use eth_types::{Root, SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
     use slashing::SlashingDbReader;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::time::Duration;
     use tempfile::TempDir;
     use wiremock::matchers::{method, path};
@@ -272,8 +271,7 @@ mod tests {
         let km = KeyManager::new();
         // pubkey_map is authoritative for enablement registration.
         let mut map = HashMap::new();
-        let hex = format!("0x{}", hex::encode(pk.to_bytes()));
-        map.insert(hex, pk.clone());
+        map.insert(pk.to_bytes(), pk.clone());
         let local_signer = LocalSigner::new(km);
         LoadedKeys {
             composite_signer: Arc::new(CompositeSigner::new(local_signer)),
@@ -564,7 +562,7 @@ mod tests {
 
         assert!(handles.forward_window_machine.is_some());
         assert!(handles.liveness_task.is_none(), "no keys → no liveness loop");
-        assert!(handles.validator_index_map.is_empty());
+        assert!(handles.pubkey_index.read().is_empty());
         // Fail-closed for any random key.
         let other = SecretKey::generate().public_key();
         assert!(!handles.signing_enablement.is_signing_enabled(&other));

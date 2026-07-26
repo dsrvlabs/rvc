@@ -516,9 +516,8 @@ mod tests {
     /// Build a `PubkeyMap` containing a single resolvable pubkey under its
     /// canonical `0x`-lowercase key (the form the orchestrator inserts).
     fn pubkey_map_with(pubkey: &PublicKey) -> PubkeyMap {
-        let mut map: HashMap<String, PublicKey> = HashMap::new();
-        let key = format!("0x{}", hex::encode(pubkey.to_bytes()));
-        map.insert(key, pubkey.clone());
+        let mut map: HashMap<[u8; 48], PublicKey> = HashMap::new();
+        map.insert(pubkey.to_bytes(), pubkey.clone());
         Arc::new(RwLock::new(map))
     }
 

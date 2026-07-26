@@ -168,7 +168,7 @@ pub async fn run(
         epoch_clock,
         pubkey_map: _,
         liveness_task: _liveness_loop_handle,
-        validator_index_map: _,
+        pubkey_index,
     } = enablement;
 
     let ServiceHandles {
@@ -234,6 +234,7 @@ pub async fn run(
             validator_store: validator_store.clone(),
             config: orchestrator_config,
             pubkey_map: pubkey_map.clone(),
+            pubkey_index,
             key_gen_rx,
             circuit_breaker,
             attesting_enabled: attesting_enabled.clone(),

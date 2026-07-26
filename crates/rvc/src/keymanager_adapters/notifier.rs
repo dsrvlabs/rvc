@@ -47,15 +47,15 @@ impl KeyChangeNotifier {
         self.key_gen_tx.send_modify(|gen| *gen += 1);
     }
 
-    /// Insert `public_key` under the canonical hex map key and notify.
+    /// Insert `public_key` under the compressed BLS pubkey bytes and notify.
     pub fn insert_and_notify(&self, pubkey: &[u8; 48], public_key: PublicKey) {
-        self.pubkey_map.write().insert(pubkey_hex(pubkey), public_key);
+        self.pubkey_map.write().insert(*pubkey, public_key);
         self.notify();
     }
 
     /// Remove the map entry for `pubkey` and notify.
     pub fn remove_and_notify(&self, pubkey: &[u8; 48]) {
-        self.pubkey_map.write().remove(&pubkey_hex(pubkey));
+        self.pubkey_map.write().remove(pubkey);
         self.notify();
     }
 }

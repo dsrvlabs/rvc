@@ -41,7 +41,7 @@ async fn build_slashing_integration_orchestrator(
     let config = create_test_config();
     let pubkey_bytes = pubkey.to_bytes();
     let mut pubkey_map_inner = HashMap::new();
-    pubkey_map_inner.insert(pubkey_hex.clone(), pubkey);
+    pubkey_map_inner.insert(pubkey.to_bytes(), pubkey);
     let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
     // D-3 fail-closed: register the loaded validator so the per-validator

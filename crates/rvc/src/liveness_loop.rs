@@ -33,17 +33,11 @@ use doppelganger::{
     DEFAULT_MONITORING_EPOCHS,
 };
 use eth_types::{Epoch, SECONDS_PER_SLOT};
-use parking_lot::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 use crate::orchestrator::PubkeyMap;
-
-/// Shared numeric-index → bare-pubkey-hex map (state-map key for the machine).
-///
-/// Beacon nodes return numeric indices; [`ForwardWindowMachine`] keys by
-/// `hex::encode(pubkey.to_bytes())` without a `0x` prefix.
-pub type IndexToPubkeyHex = Arc<RwLock<HashMap<String, String>>>;
+use crate::pubkey_index::{parse_pubkey_bytes, pubkey_bytes_to_0x, SharedPubkeyIndexRegistry};
 
 /// Lookback for completed-epoch liveness queries.
 ///
@@ -52,49 +46,30 @@ pub type IndexToPubkeyHex = Arc<RwLock<HashMap<String, String>>>;
 /// (review Finding 4).
 const LIVENESS_LOOKBACK_EPOCHS: u64 = DEFAULT_MONITORING_EPOCHS + 2;
 
-/// Build the reverse index map used by the liveness loop.
-///
-/// `validator_index_map` maps `0x`-prefixed (or bare) pubkey strings to numeric
-/// index strings. Output maps numeric index → bare lowercase pubkey hex.
-pub fn build_index_to_pubkey_hex(
-    validator_index_map: &HashMap<String, String>,
-) -> HashMap<String, String> {
-    let mut out = HashMap::with_capacity(validator_index_map.len());
-    for (pubkey, index) in validator_index_map {
-        let bare = pubkey.strip_prefix("0x").unwrap_or(pubkey).to_ascii_lowercase();
-        out.insert(index.clone(), bare);
-    }
-    out
-}
-
-/// Merge `pubkey → numeric index` entries into a shared reverse map.
+/// Merge `pubkey-hex → numeric index` entries into the shared registry.
 ///
 /// Safe to call from import/refresh paths so newly registered keys become
 /// observable without waiting for the next BN re-resolve cycle.
 pub fn merge_validator_indices(
-    index_map: &IndexToPubkeyHex,
+    registry: &SharedPubkeyIndexRegistry,
     pubkey_to_index: &HashMap<String, String>,
 ) {
-    let mut w = index_map.write();
-    for (pubkey, index) in pubkey_to_index {
-        let bare = pubkey.strip_prefix("0x").unwrap_or(pubkey).to_ascii_lowercase();
-        w.insert(index.clone(), bare);
-    }
+    registry.write().merge_hex_map(pubkey_to_index);
 }
 
 /// Handle returned by [`spawn_liveness_loop`].
 pub struct LivenessLoopSpawn {
     pub join: tokio::task::JoinHandle<()>,
-    /// Shared reverse index map (import/refresh may call [`merge_validator_indices`]).
-    pub index_map: IndexToPubkeyHex,
+    /// Shared pubkey↔index registry (import/refresh may call [`merge_validator_indices`]).
+    pub pubkey_index: SharedPubkeyIndexRegistry,
 }
 
 /// Background task that ticks the forward-window machine once per slot.
 pub struct LivenessObservationLoop {
     machine: Arc<ForwardWindowMachine>,
     beacon: Arc<dyn BeaconNodeClient>,
-    /// Numeric index → bare pubkey hex (machine key).
-    index_to_pubkey_hex: IndexToPubkeyHex,
+    /// Shared pubkey ↔ index registry (liveness uses the reverse index→bare-hex view).
+    pubkey_index: SharedPubkeyIndexRegistry,
     /// Live keystore/keymanager pubkey set for periodic BN index re-resolve.
     pubkey_map: Option<PubkeyMap>,
     epoch_clock: Arc<MonotonicEpochClock>,
@@ -107,14 +82,14 @@ impl LivenessObservationLoop {
     pub fn new(
         machine: Arc<ForwardWindowMachine>,
         beacon: Arc<dyn BeaconNodeClient>,
-        index_to_pubkey_hex: IndexToPubkeyHex,
+        pubkey_index: SharedPubkeyIndexRegistry,
         epoch_clock: Arc<MonotonicEpochClock>,
         cancel: CancellationToken,
     ) -> Self {
         Self {
             machine,
             beacon,
-            index_to_pubkey_hex,
+            pubkey_index,
             pubkey_map: None,
             epoch_clock,
             slot_duration: Duration::from_secs(SECONDS_PER_SLOT),
@@ -134,9 +109,9 @@ impl LivenessObservationLoop {
         self
     }
 
-    /// Shared reverse index map handle.
-    pub fn index_map(&self) -> IndexToPubkeyHex {
-        Arc::clone(&self.index_to_pubkey_hex)
+    /// Shared registry handle.
+    pub fn pubkey_index(&self) -> SharedPubkeyIndexRegistry {
+        Arc::clone(&self.pubkey_index)
     }
 
     /// Run until cancelled. Spawns no tasks — call from `tokio::spawn`.
@@ -243,21 +218,17 @@ impl LivenessObservationLoop {
             if map.is_empty() {
                 return;
             }
-            map.keys().cloned().collect()
+            map.keys().map(pubkey_bytes_to_0x).collect()
         };
 
         match self.beacon.get_validators(&pubkeys).await {
             Ok(resp) => {
-                let mut w = self.index_to_pubkey_hex.write();
+                let mut w = self.pubkey_index.write();
                 let before = w.len();
                 for v in resp.data {
-                    let bare = v
-                        .validator
-                        .pubkey
-                        .strip_prefix("0x")
-                        .unwrap_or(&v.validator.pubkey)
-                        .to_ascii_lowercase();
-                    w.insert(v.index, bare);
+                    if let Some(bytes) = parse_pubkey_bytes(&v.validator.pubkey) {
+                        w.insert(bytes, v.index);
+                    }
                 }
                 let after = w.len();
                 if after > before {
@@ -284,12 +255,12 @@ impl LivenessObservationLoop {
     /// Returns `Ok(true)` if observation completed (no IncompleteLiveness),
     /// `Ok(false)` if there was nothing to query or the response was incomplete.
     async fn observe_epoch(&self, epoch: Epoch) -> Result<bool, String> {
-        let index_map = self.index_to_pubkey_hex.read().clone();
-        if index_map.is_empty() {
+        let index_to_bare = self.pubkey_index.read().index_to_bare_hex().clone();
+        if index_to_bare.is_empty() {
             return Ok(false);
         }
 
-        let numeric_indices: Vec<String> = index_map.keys().cloned().collect();
+        let numeric_indices: Vec<String> = index_to_bare.keys().cloned().collect();
         let response = self
             .beacon
             .post_validator_liveness(epoch, &numeric_indices)
@@ -302,7 +273,7 @@ impl LivenessObservationLoop {
             .filter_map(|v| {
                 // Translate numeric index → bare pubkey hex. Untranslatable → drop
                 // (fail-closed: observe_liveness treats missing as incomplete).
-                let pubkey_hex = index_map.get(&v.index)?;
+                let pubkey_hex = index_to_bare.get(&v.index)?;
                 Some(ValidatorLivenessData { index: pubkey_hex.clone(), is_live: v.is_live })
             })
             .collect();
@@ -346,46 +317,51 @@ impl LivenessObservationLoop {
 
 /// Spawn the production liveness loop when a machine is present and there are
 /// keys (resolved indices and/or a non-empty pubkey map for later re-resolve).
+///
+/// `pubkey_index` is the workspace-shared registry (same handle used by
+/// `prepare_proposers` / duty tracking). Callers must seed it before spawn or
+/// attach a non-empty `pubkey_map` so re-resolve can fill it later.
 pub fn spawn_liveness_loop(
     machine: Option<Arc<ForwardWindowMachine>>,
     beacon: Arc<dyn BeaconNodeClient>,
-    validator_index_map: &HashMap<String, String>,
+    pubkey_index: SharedPubkeyIndexRegistry,
     pubkey_map: Option<PubkeyMap>,
     epoch_clock: Arc<MonotonicEpochClock>,
     cancel: CancellationToken,
 ) -> Option<LivenessLoopSpawn> {
     let machine = machine?;
     let has_pubkeys = pubkey_map.as_ref().is_some_and(|m| !m.read().is_empty());
-    if validator_index_map.is_empty() && !has_pubkeys {
+    let has_indices = !pubkey_index.read().is_empty();
+    if !has_indices && !has_pubkeys {
         warn!(
             "SEC-2c: no validator indices or pubkeys; liveness loop not started \
              (gate remains fail-safe closed for Pending keys)"
         );
         return None;
     }
-    if validator_index_map.is_empty() {
+    if !has_indices {
         info!(
             "SEC-2c: starting liveness loop with empty indices; will re-resolve from pubkey_map \
              (pending activation / post-import)"
         );
     }
 
-    let index_map = Arc::new(RwLock::new(build_index_to_pubkey_hex(validator_index_map)));
-    let index_map_ret = Arc::clone(&index_map);
+    let pubkey_index_ret = Arc::clone(&pubkey_index);
     let mut loop_task =
-        LivenessObservationLoop::new(machine, beacon, index_map, epoch_clock, cancel);
+        LivenessObservationLoop::new(machine, beacon, pubkey_index, epoch_clock, cancel);
     if let Some(pm) = pubkey_map {
         loop_task = loop_task.with_pubkey_map(pm);
     }
     let join = tokio::spawn(async move {
         loop_task.run().await;
     });
-    Some(LivenessLoopSpawn { join, index_map: index_map_ret })
+    Some(LivenessLoopSpawn { join, pubkey_index: pubkey_index_ret })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pubkey_index::PubkeyIndexRegistry;
     use bn_manager::{BeaconNodeClient, MockBeaconNodeClient};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -557,12 +533,12 @@ mod tests {
         numeric_index: &str,
         pubkey: &crypto::PublicKey,
     ) -> LivenessObservationLoop {
-        let mut map = HashMap::new();
-        map.insert(numeric_index.to_string(), hex::encode(pubkey.to_bytes()));
+        let reg = PubkeyIndexRegistry::shared();
+        reg.write().insert(pubkey.to_bytes(), numeric_index.to_string());
         LivenessObservationLoop::new(
             machine,
             beacon,
-            Arc::new(RwLock::new(map)),
+            reg,
             Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0)),
             CancellationToken::new(),
         )
@@ -656,14 +632,14 @@ mod tests {
         let enablement: Arc<dyn SigningEnablement> = Arc::clone(&m) as _;
         let _signer = SignerService::new(composite, db).with_enablement(enablement);
 
-        let mut index_map = HashMap::new();
-        index_map.insert(format!("0x{}", hex::encode(pk.to_bytes())), "1".to_string());
+        let reg = PubkeyIndexRegistry::shared();
+        reg.write().insert(pk.to_bytes(), "1".to_string());
         let bn: Arc<dyn BeaconNodeClient> = Arc::new(all_not_live(&["1"]).0);
         let cancel = CancellationToken::new();
         let handle = spawn_liveness_loop(
             Some(Arc::clone(&m)),
             bn,
-            &index_map,
+            Arc::clone(&reg),
             None,
             Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 1_000_000)),
             cancel.clone(),
@@ -672,11 +648,11 @@ mod tests {
         cancel.cancel();
         let _ = handle.unwrap().join.await;
 
-        let empty: HashMap<String, String> = HashMap::new();
+        let empty = PubkeyIndexRegistry::shared();
         let no_handle = spawn_liveness_loop(
             Some(machine()),
             Arc::new(all_not_live(&[]).0),
-            &empty,
+            empty,
             None,
             Arc::new(MonotonicEpochClock::new(0)),
             CancellationToken::new(),
@@ -686,7 +662,7 @@ mod tests {
         let no_machine = spawn_liveness_loop(
             None,
             Arc::new(all_not_live(&["1"]).0),
-            &index_map,
+            Arc::clone(&reg),
             None,
             Arc::new(MonotonicEpochClock::new(0)),
             CancellationToken::new(),
@@ -706,8 +682,8 @@ mod tests {
         let pk_hex_0x = format!("0x{}", hex::encode(pk.to_bytes()));
         let bare = hex::encode(pk.to_bytes());
 
-        // Start with EMPTY reverse map — key cannot be observed yet.
-        let index_map: IndexToPubkeyHex = Arc::new(RwLock::new(HashMap::new()));
+        // Start with EMPTY registry — key cannot be observed yet.
+        let pubkey_index = PubkeyIndexRegistry::shared();
         let (bn_mock, bn_state) = all_not_live(&["77"]);
         bn_state.with_validators(&[(&pk_hex_0x, "77")]);
         // Also make liveness report for 77.
@@ -715,13 +691,13 @@ mod tests {
         let bn = Arc::new(bn_mock);
 
         let mut pm_inner = HashMap::new();
-        pm_inner.insert(pk_hex_0x.clone(), pk.clone());
+        pm_inner.insert(pk.to_bytes(), pk.clone());
         let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(pm_inner));
 
         let loop_ = LivenessObservationLoop::new(
             Arc::clone(&m),
             bn as Arc<dyn BeaconNodeClient>,
-            Arc::clone(&index_map),
+            Arc::clone(&pubkey_index),
             Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0)),
             CancellationToken::new(),
         )
@@ -731,11 +707,14 @@ mod tests {
         // Before refresh: empty map → observe is no-op (incomplete path).
         let before = loop_.drive_once_for_test(Some(start), start, 0).await.unwrap();
         assert!(before.iter().all(|s| *s == ForwardWindowStatus::Pending));
-        assert!(index_map.read().is_empty());
+        assert!(pubkey_index.read().is_empty());
 
         // Refresh pulls index 77 from BN for the pubkey_map key.
         loop_.refresh_indices_for_test().await;
-        assert_eq!(index_map.read().get("77").map(String::as_str), Some(bare.as_str()));
+        assert_eq!(
+            pubkey_index.read().bare_hex_of_index("77"),
+            Some(bare.as_str())
+        );
 
         // Now observation succeeds for the imported key.
         let end = start + DEFAULT_MONITORING_EPOCHS;
@@ -779,24 +758,17 @@ mod tests {
         assert!(!m.is_signing_enabled(&pk));
     }
 
-    /// Finding 3 helper: merge_validator_indices updates shared map.
+    /// Finding 3 helper: merge_validator_indices updates shared registry.
     #[test]
     fn test_merge_validator_indices_updates_map() {
-        let map: IndexToPubkeyHex = Arc::new(RwLock::new(HashMap::new()));
+        let reg = PubkeyIndexRegistry::shared();
         let mut pk_to_idx = HashMap::new();
-        pk_to_idx.insert("0xAb".to_string(), "9".to_string());
-        merge_validator_indices(&map, &pk_to_idx);
-        assert_eq!(map.read().get("9").map(String::as_str), Some("ab"));
-    }
-
-    #[test]
-    fn test_build_index_to_pubkey_hex_strips_0x() {
-        let mut m = HashMap::new();
-        m.insert("0xAbCd".to_string(), "12".to_string());
-        m.insert("dead".to_string(), "3".to_string());
-        let rev = build_index_to_pubkey_hex(&m);
-        assert_eq!(rev.get("12").map(String::as_str), Some("abcd"));
-        assert_eq!(rev.get("3").map(String::as_str), Some("dead"));
+        // 48-byte pubkey required for registry insert.
+        let pk = [0xab; 48];
+        pk_to_idx.insert(format!("0x{}", hex::encode(pk)), "9".to_string());
+        merge_validator_indices(&reg, &pk_to_idx);
+        assert_eq!(reg.read().index_of(&pk), Some("9"));
+        assert_eq!(reg.read().bare_hex_of_index("9"), Some(hex::encode(pk).as_str()));
     }
 
     /// Spawn with empty indices but non-empty pubkey_map still starts (activation path).
@@ -804,14 +776,14 @@ mod tests {
     async fn test_spawn_with_empty_indices_but_pubkey_map() {
         let pk = new_pk();
         let mut pm = HashMap::new();
-        pm.insert(format!("0x{}", hex::encode(pk.to_bytes())), pk);
+        pm.insert(pk.to_bytes(), pk);
         let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(pm));
-        let empty = HashMap::new();
+        let empty = PubkeyIndexRegistry::shared();
         let cancel = CancellationToken::new();
         let spawn = spawn_liveness_loop(
             Some(machine()),
             Arc::new(all_not_live(&[]).0),
-            &empty,
+            empty,
             Some(pubkey_map),
             Arc::new(MonotonicEpochClock::new(0)),
             cancel.clone(),

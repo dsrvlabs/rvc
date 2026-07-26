@@ -149,7 +149,7 @@ async fn test_imported_key_clears_duty_cache_without_restart() {
     adapter.import_keystore(&keystore_json, PASSWORD).expect("import keystore");
 
     assert!(
-        fixture.pubkey_map.read().contains_key(&pubkey_hex_0x),
+        fixture.pubkey_map.read().contains_key(&pubkey_bytes),
         "import must update the shared PubkeyMap"
     );
     assert!(

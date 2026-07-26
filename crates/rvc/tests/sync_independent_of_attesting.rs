@@ -174,7 +174,7 @@ impl AttestationSubmitter for NoopSubmitter {
 
 async fn build_integration_orchestrator(
     beacon: Arc<dyn BeaconNodeClient>,
-    pk_hex: String,
+    _pk_hex: String,
     pk: crypto::PublicKey,
     sk: SecretKey,
     attesting_enabled: Arc<AtomicBool>,
@@ -196,7 +196,7 @@ async fn build_integration_orchestrator(
 
     let pk_bytes = pk.to_bytes();
     let mut map = HashMap::new();
-    map.insert(pk_hex, pk);
+    map.insert(pk_bytes, pk);
     let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
 
     let propagator = Arc::new(Propagator::new(Arc::new(NoopSubmitter)));

@@ -430,7 +430,7 @@ fn finish_fixture(
 
     let mut map = HashMap::new();
     if preload {
-        map.insert(pubkey_hex_0x.clone(), pubkey.clone());
+        map.insert(pubkey_bytes, pubkey.clone());
     }
     let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(map));
 

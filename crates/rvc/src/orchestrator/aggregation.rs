@@ -692,7 +692,7 @@ mod tests {
         duty_tracker.fetch_duties_for_epoch(0).await.unwrap();
 
         let mut map = HashMap::new();
-        map.insert(duty_pubkey, pk);
+        map.insert(pk.to_bytes(), pk);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
 
         AggregationService::new(

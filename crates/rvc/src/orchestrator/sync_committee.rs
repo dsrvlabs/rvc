@@ -504,7 +504,7 @@ mod tests {
 
     async fn setup_service_with_store(
         beacon: Arc<dyn BeaconNodeClient>,
-        pk_hex: String,
+        _pk_hex: String,
         pk: crypto::PublicKey,
         sk: SecretKey,
         validator_store: Arc<ValidatorStore>,
@@ -529,7 +529,7 @@ mod tests {
         duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
 
         let mut map = HashMap::new();
-        map.insert(pk_hex, pk);
+        map.insert(pk.to_bytes(), pk);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
 
         SyncCommitteeService::new(
@@ -777,7 +777,7 @@ mod tests {
         // proof is signed, `is_sync_committee_aggregator` returns true, and
         // `get_sync_committee_contribution` is reached — incrementing the counter.
         let (sk, pk) = find_aggregator_sk();
-        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+        let _pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
         let pk_bytes: [u8; 48] = pk.to_bytes();
 
         let contrib_fetch_calls = Arc::new(AtomicUsize::new(0));
@@ -803,7 +803,7 @@ mod tests {
         duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
 
         let mut map = HashMap::new();
-        map.insert(pk_hex, pk);
+        map.insert(pk.to_bytes(), pk);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
 
         let service = SyncCommitteeService::new(
@@ -854,9 +854,9 @@ mod tests {
         let pk_a = sk_a.public_key();
         let pk_b = sk_b.public_key();
         let pk_c = sk_c.public_key();
-        let hex_a = format!("0x{}", hex::encode(pk_a.to_bytes()));
-        let hex_b = format!("0x{}", hex::encode(pk_b.to_bytes()));
-        let hex_c = format!("0x{}", hex::encode(pk_c.to_bytes()));
+        let _hex_a = format!("0x{}", hex::encode(pk_a.to_bytes()));
+        let _hex_b = format!("0x{}", hex::encode(pk_b.to_bytes()));
+        let _hex_c = format!("0x{}", hex::encode(pk_c.to_bytes()));
 
         let duties = vec![
             SyncCommitteeDuty {
@@ -904,9 +904,9 @@ mod tests {
         duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
 
         let mut map = HashMap::new();
-        map.insert(hex_a, pk_a);
-        map.insert(hex_b, pk_b);
-        map.insert(hex_c, pk_c);
+        map.insert(pk_a.to_bytes(), pk_a);
+        map.insert(pk_b.to_bytes(), pk_b);
+        map.insert(pk_c.to_bytes(), pk_c);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
 
         let service = SyncCommitteeService::new(
@@ -940,9 +940,9 @@ mod tests {
         let sk_b = SecretKey::generate();
         let pk_b = sk_b.public_key();
         let (sk_c, pk_c) = find_aggregator_sk();
-        let hex_a = format!("0x{}", hex::encode(pk_a.to_bytes()));
-        let hex_b = format!("0x{}", hex::encode(pk_b.to_bytes()));
-        let hex_c = format!("0x{}", hex::encode(pk_c.to_bytes()));
+        let _hex_a = format!("0x{}", hex::encode(pk_a.to_bytes()));
+        let _hex_b = format!("0x{}", hex::encode(pk_b.to_bytes()));
+        let _hex_c = format!("0x{}", hex::encode(pk_c.to_bytes()));
 
         // Distinct subcommittees (pos 0 / 128 / 256 → subnet 0 / 1 / 2). For A
         // and C we still need aggregator selection on their subcommittee.
@@ -997,9 +997,9 @@ mod tests {
         duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
 
         let mut map = HashMap::new();
-        map.insert(hex_a, pk_a);
-        map.insert(hex_b, pk_b);
-        map.insert(hex_c, pk_c);
+        map.insert(pk_a.to_bytes(), pk_a);
+        map.insert(pk_b.to_bytes(), pk_b);
+        map.insert(pk_c.to_bytes(), pk_c);
         let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
 
         let service = SyncCommitteeService::new(

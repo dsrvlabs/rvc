@@ -24,12 +24,15 @@ use super::duty_management::DutyManagementService;
 use super::error::OrchestratorError;
 use super::slot_context::SlotContext;
 use super::sync_committee::SyncCommitteeService;
+use crate::pubkey_index::SharedPubkeyIndexRegistry;
 
 /// Shared, dynamically-updatable public key map.
 ///
-/// Wrapped in `Arc<RwLock>` so the keymanager API can insert/remove keys at
-/// runtime while the orchestrator reads them each slot.
-pub type PubkeyMap = Arc<parking_lot::RwLock<HashMap<String, PublicKey>>>;
+/// Keyed by compressed BLS pubkey bytes (`[u8; 48]`) so hot-path lookups are
+/// O(1) without hex normalization. Wrapped in `Arc<RwLock>` so the keymanager
+/// API can insert/remove keys at runtime while the orchestrator reads them
+/// each slot.
+pub type PubkeyMap = Arc<parking_lot::RwLock<HashMap<[u8; 48], PublicKey>>>;
 
 /// Configuration for the duty orchestrator.
 #[derive(Clone)]
@@ -131,6 +134,8 @@ where
     pub validator_store: Arc<validator_store::ValidatorStore>,
     pub config: OrchestratorConfig,
     pub pubkey_map: PubkeyMap,
+    /// Shared pubkey → validator-index registry (O(1) prepare_proposers lookups).
+    pub pubkey_index: SharedPubkeyIndexRegistry,
     /// Receiver half of the key-generation watch channel shared with keymanager
     /// adapters. When the generation increments, the duty cache is cleared so
     /// newly imported keys participate in duty matching without a restart.
@@ -184,6 +189,7 @@ where
             validator_store,
             config,
             pubkey_map,
+            pubkey_index: crate::pubkey_index::PubkeyIndexRegistry::shared(),
             key_gen_rx,
             circuit_breaker: Arc::new(CircuitBreakerState::new(0, 0)),
             attesting_enabled: Arc::new(AtomicBool::new(true)),
@@ -209,10 +215,13 @@ where
     pub(crate) circuit_breaker: Arc<CircuitBreakerState>,
     pub(crate) config: OrchestratorConfig,
     pub(crate) pubkey_map: PubkeyMap,
+    /// Shared with duty management / bootstrap (held for future sibling readers).
+    #[allow(dead_code)]
+    pub(crate) pubkey_index: SharedPubkeyIndexRegistry,
     pub(crate) attestation_service: AttestationService<C, S>,
     pub(crate) aggregation_service: AggregationService,
     pub(crate) sync_committee_service: SyncCommitteeService,
-    pub(crate) duty_management: DutyManagementService<C>,
+    pub(crate) duty_management: DutyManagementService,
     pub(crate) key_gen_rx: watch::Receiver<u64>,
     pub(crate) shutdown_rx: watch::Receiver<bool>,
     pub(crate) attesting_enabled: Arc<AtomicBool>,
@@ -248,6 +257,7 @@ where
             validator_store,
             config,
             pubkey_map,
+            pubkey_index,
             key_gen_rx,
             circuit_breaker,
             attesting_enabled,
@@ -294,12 +304,12 @@ where
         );
 
         let duty_management = DutyManagementService::new(
-            clock.clone(),
             signer,
             beacon.clone(),
             duty_tracker.clone(),
             validator_store.clone(),
             pubkey_map.clone(),
+            pubkey_index.clone(),
             config.clone(),
         );
 
@@ -314,6 +324,7 @@ where
             circuit_breaker,
             config,
             pubkey_map,
+            pubkey_index,
             attestation_service,
             aggregation_service,
             sync_committee_service,

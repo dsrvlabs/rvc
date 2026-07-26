@@ -496,8 +496,8 @@ impl ServiceBuilder {
     pub fn build_pubkey_map(&self, key_manager: &KeyManager) -> PubkeyMap {
         let mut map = HashMap::new();
         for pubkey in key_manager.list_public_keys() {
-            let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
-            map.insert(pubkey_hex, pubkey);
+            // Key by compressed BLS bytes — no hex normalization on hot paths.
+            map.insert(pubkey.to_bytes(), pubkey);
         }
         info!(count = map.len(), "Built public key map");
         Arc::new(parking_lot::RwLock::new(map))
@@ -973,6 +973,23 @@ mod tests {
         );
         let root = ServiceBuilder::new(config).parse_genesis_validators_root().unwrap();
         assert_eq!(root, NetworkPreset::MAINNET.genesis_validators_root);
+    }
+
+    /// RF6-31: ingestion keys by compressed BLS bytes (no hex string keys).
+    #[test]
+    fn test_build_pubkey_map_keys_are_compressed_bytes() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let (key_manager, pubkey_map) = loaded_key_manager(&builder, 2);
+        let listed: Vec<_> = key_manager.list_public_keys();
+        let map = pubkey_map.read();
+        assert_eq!(map.len(), listed.len());
+        for pk in &listed {
+            assert!(
+                map.contains_key(&pk.to_bytes()),
+                "build_pubkey_map must key by PublicKey::to_bytes()"
+            );
+        }
     }
 
     #[test]

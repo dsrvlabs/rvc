@@ -11,6 +11,7 @@ pub mod keymanager_adapters;
 pub mod liveness_loop;
 pub mod monitoring;
 pub mod orchestrator;
+pub mod pubkey_index;
 pub mod slashing_monitor;
 pub mod startup;
 

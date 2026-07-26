@@ -68,16 +68,17 @@ async fn test_orchestrator_skips_duty_during_doppelganger_window() {
     let propagator = Arc::new(Propagator::new(submitter.clone()));
     let config = create_test_config();
 
+    // Map key is the duty's compressed bytes (0xdd…); value is a real BLS key.
+    // get_duties_for_slot matches on the key; the gate uses PublicKey::to_bytes().
+    let duty_map_key: [u8; 48] = [0xdd; 48];
     let mut pubkey_map_inner = HashMap::new();
-    pubkey_map_inner.insert(duty_pubkey_hex.to_string(), pubkey.clone());
+    pubkey_map_inner.insert(duty_map_key, pubkey.clone());
     let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
-    // --- Critical: add the DUTY pubkey as DISABLED (inside doppelganger window).
-    // D-3 (FUP-6): the gate now resolves the duty pubkey via `find_pubkey`
-    // and gates on the RESOLVED typed pubkey's infallible `to_bytes()` — it
-    // no longer re-decodes the raw `0xdddd...` duty string.  The store must
-    // therefore track the SAME bytes the `pubkey_map` resolves the duty to
-    // (`pubkey.to_bytes()`), not the literal `0xdddd...` byte pattern.
+    // --- Critical: add the RESOLVED pubkey as DISABLED (inside doppelganger window).
+    // D-3 (FUP-6): the gate resolves the duty pubkey via `find_pubkey` and gates
+    // on the resolved typed pubkey's `to_bytes()` (real BLS bytes), not the
+    // literal `0xdddd...` map key.
     let duty_pk_bytes: [u8; 48] = pubkey.to_bytes();
     let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 30_000_000));
     {

@@ -10,6 +10,7 @@ use tracing::warn;
 
 use super::coordinator::PubkeyMap;
 use super::error::OrchestratorError;
+use crate::pubkey_index::parse_pubkey_bytes;
 
 /// Outcome of running a future under a wall-clock timeout.
 ///
@@ -107,60 +108,22 @@ pub(crate) fn make_aggregation_bits(duty: &AttesterDuty) -> Option<String> {
     Some(format!("0x{}", hex::encode(bits)))
 }
 
-/// Finds a public key by matching against duty pubkey.
+/// Finds a public key by matching against a duty pubkey hex string.
 ///
-/// Pubkeys are matched case-insensitively and with/without "0x" prefix.
+/// Decodes the duty pubkey to compressed bytes (case-insensitive hex, optional
+/// `0x`/`0X` prefix) and does an O(1) map lookup. Invalid hex or wrong length
+/// yields `None` (fail-closed) — there is no linear case-insensitive scan.
 pub(crate) fn find_pubkey(pubkey_map: &PubkeyMap, duty_pubkey: &str) -> Option<PublicKey> {
-    let pubkey_map = pubkey_map.read();
-
-    // Try exact match first
-    if let Some(pk) = pubkey_map.get(duty_pubkey) {
-        return Some(pk.clone());
-    }
-
-    // Try with/without 0x prefix
-    let normalized_pubkey = if duty_pubkey.starts_with("0x") {
-        duty_pubkey.to_string()
-    } else {
-        format!("0x{}", duty_pubkey)
-    };
-
-    if let Some(pk) = pubkey_map.get(&normalized_pubkey) {
-        return Some(pk.clone());
-    }
-
-    // Normalize for case-insensitive matching
-    let duty_normalized = normalize_pubkey(duty_pubkey);
-
-    for (key, pk) in pubkey_map.iter() {
-        if normalize_pubkey(key) == duty_normalized {
-            return Some(pk.clone());
-        }
-    }
-
-    None
+    let bytes = parse_pubkey_bytes(duty_pubkey)?;
+    pubkey_map.read().get(&bytes).cloned()
 }
 
-/// Finds a public key by matching validated duty pubkey bytes (RF3-16).
-///
-/// Compares against [`PublicKey::to_bytes`] so callers with `[u8; 48]` do not
-/// re-encode to hex solely for map lookup.
+/// Finds a public key by compressed duty pubkey bytes (O(1) map lookup).
 pub(crate) fn find_pubkey_bytes(
     pubkey_map: &PubkeyMap,
     duty_pubkey: &[u8; 48],
 ) -> Option<PublicKey> {
-    let map = pubkey_map.read();
-    map.values().find(|pk| &pk.to_bytes() == duty_pubkey).cloned()
-}
-
-/// Normalizes a pubkey to `0x`-prefixed lowercase hex for consistent comparison.
-///
-/// Delegates to [`observability::pubkey::CanonicalPubkey`] — the single source of
-/// truth for pubkey normalisation across all crates (CQ-2.4 / C1).
-/// Output form: `0x`-prefixed lowercase (matches the on-disk slashing-DB key
-/// format, avoiding any schema change).
-pub(crate) fn normalize_pubkey(pubkey: &str) -> String {
-    pubkey.parse::<observability::pubkey::CanonicalPubkey>().expect("infallible").to_string()
+    pubkey_map.read().get(duty_pubkey).cloned()
 }
 
 /// Converts BN-supplied attestation data and normalizes it per-fork.
@@ -246,10 +209,14 @@ pub(crate) async fn get_duties_for_slot(
     duty_tracker: &DutyTracker,
     slot: Slot,
 ) -> Result<Vec<AttesterDuty>, OrchestratorError> {
-    let pubkey_snapshot = pubkey_map.read().clone();
-    if pubkey_snapshot.is_empty() {
-        return Ok(Vec::new());
-    }
+    // Borrow keys only — no full map clone / PublicKey clone on the hot path.
+    let our_keys: std::collections::HashSet<[u8; 48]> = {
+        let map = pubkey_map.read();
+        if map.is_empty() {
+            return Ok(Vec::new());
+        }
+        map.keys().copied().collect()
+    };
 
     let epoch = slot / SLOTS_PER_EPOCH;
 
@@ -257,15 +224,11 @@ pub(crate) async fn get_duties_for_slot(
         duty_tracker.fetch_duties_for_epoch(epoch).await?;
     }
 
-    let normalized_pubkeys: std::collections::HashSet<String> =
-        pubkey_snapshot.keys().map(|k| normalize_pubkey(k)).collect();
-
     let all_duties = duty_tracker.get_duties_for_slot(slot).await;
     let duties: Vec<AttesterDuty> = all_duties
         .into_iter()
         .filter(|duty| {
-            let normalized_duty_pubkey = normalize_pubkey(&duty.pubkey);
-            normalized_pubkeys.contains(&normalized_duty_pubkey)
+            parse_pubkey_bytes(&duty.pubkey).is_some_and(|bytes| our_keys.contains(&bytes))
         })
         .collect();
 
@@ -501,5 +464,53 @@ mod tests {
         let result =
             convert_and_normalize_attestation_data(&beacon_data, ForkName::Electra).unwrap();
         assert_eq!(result.index, 0);
+    }
+
+    // --- RF6-31: find_pubkey O(1) by compressed bytes ---
+
+    #[test]
+    fn test_find_pubkey_accepts_case_and_prefix_variants() {
+        let sk = crypto::SecretKey::generate();
+        let pk = sk.public_key();
+        let bytes = pk.to_bytes();
+        let mut map = std::collections::HashMap::new();
+        map.insert(bytes, pk.clone());
+        let pubkey_map: PubkeyMap = std::sync::Arc::new(parking_lot::RwLock::new(map));
+
+        let lower = format!("0x{}", hex::encode(bytes));
+        let upper = format!("0X{}", hex::encode(bytes).to_uppercase());
+        let bare = hex::encode(bytes).to_uppercase();
+
+        assert_eq!(find_pubkey(&pubkey_map, &lower).unwrap().to_bytes(), bytes);
+        assert_eq!(find_pubkey(&pubkey_map, &upper).unwrap().to_bytes(), bytes);
+        assert_eq!(find_pubkey(&pubkey_map, &bare).unwrap().to_bytes(), bytes);
+    }
+
+    #[test]
+    fn test_find_pubkey_rejects_invalid_hex_without_linear_scan() {
+        let sk = crypto::SecretKey::generate();
+        let pk = sk.public_key();
+        let mut map = std::collections::HashMap::new();
+        map.insert(pk.to_bytes(), pk);
+        let pubkey_map: PubkeyMap = std::sync::Arc::new(parking_lot::RwLock::new(map));
+
+        // Non-hex and wrong length used to be reachable via the O(n) fallback;
+        // with typed keys they miss immediately.
+        assert!(find_pubkey(&pubkey_map, "0xzzzz").is_none());
+        assert!(find_pubkey(&pubkey_map, "0xabcd").is_none());
+        assert!(find_pubkey(&pubkey_map, "not-a-key").is_none());
+    }
+
+    #[test]
+    fn test_find_pubkey_bytes_is_o1_lookup() {
+        let sk = crypto::SecretKey::generate();
+        let pk = sk.public_key();
+        let bytes = pk.to_bytes();
+        let mut map = std::collections::HashMap::new();
+        map.insert(bytes, pk.clone());
+        let pubkey_map: PubkeyMap = std::sync::Arc::new(parking_lot::RwLock::new(map));
+
+        assert_eq!(find_pubkey_bytes(&pubkey_map, &bytes).unwrap().to_bytes(), bytes);
+        assert!(find_pubkey_bytes(&pubkey_map, &[0u8; 48]).is_none());
     }
 }

@@ -20,7 +20,7 @@ fn test_import_updates_shared_pubkey_map_and_notifies() {
     .expect("encrypt");
     let keystore_json = serde_json::to_string(&keystore).unwrap();
     let pk_bytes = sk.public_key().to_bytes();
-    let pubkey_hex = pubkey_hex(pk_bytes);
+    let _pubkey_hex = pubkey_hex(pk_bytes);
 
     // Mark changed so the next has_changed() reflects only this import.
     rx.borrow_and_update();
@@ -29,7 +29,7 @@ fn test_import_updates_shared_pubkey_map_and_notifies() {
     adapter.import_keystore(&keystore_json, "testpass").unwrap();
 
     assert!(
-        pubkey_map.read().contains_key(&pubkey_hex),
+        pubkey_map.read().contains_key(&pk_bytes),
         "import must update the shared PubkeyMap"
     );
     assert!(rx.has_changed().unwrap(), "import must notify via key_gen_tx");
@@ -54,17 +54,17 @@ fn test_delete_removes_from_shared_pubkey_map_and_notifies() {
     .expect("encrypt");
     let keystore_json = serde_json::to_string(&keystore).unwrap();
     let pk_bytes = sk.public_key().to_bytes();
-    let pubkey_hex = pubkey_hex(pk_bytes);
+    let _pubkey_hex = pubkey_hex(pk_bytes);
 
     adapter.import_keystore(&keystore_json, "testpass").unwrap();
-    assert!(pubkey_map.read().contains_key(&pubkey_hex));
+    assert!(pubkey_map.read().contains_key(&pk_bytes));
     rx.borrow_and_update();
     assert!(!rx.has_changed().unwrap());
 
     let deleted = adapter.delete_keystore(&pk_bytes).unwrap();
     assert!(deleted);
     assert!(
-        !pubkey_map.read().contains_key(&pubkey_hex),
+        !pubkey_map.read().contains_key(&pk_bytes),
         "delete must remove the key from the shared PubkeyMap"
     );
     assert!(rx.has_changed().unwrap(), "delete must notify via key_gen_tx");
@@ -79,7 +79,7 @@ fn test_remote_adapter_import_notifies_key_change() {
     // Valid BLS pubkey so map insert and notify are both exercised.
     let sk = SecretKey::generate();
     let pk = sk.public_key().to_bytes();
-    let pubkey_hex = pubkey_hex(pk);
+    let _pubkey_hex = pubkey_hex(pk);
 
     rx.borrow_and_update();
     assert!(!rx.has_changed().unwrap());
@@ -88,7 +88,7 @@ fn test_remote_adapter_import_notifies_key_change() {
     adapter.import_remote_key(pk, "https://signer.example.com".to_string()).unwrap();
 
     assert!(
-        pubkey_map.read().contains_key(&pubkey_hex),
+        pubkey_map.read().contains_key(&pk),
         "remote import of a valid BLS key must update the shared PubkeyMap"
     );
     assert!(rx.has_changed().unwrap(), "remote import must notify via key_gen_tx");
@@ -106,17 +106,17 @@ fn test_keystore_adapter_delete_removes_from_pubkey_map() {
 
     let sk = SecretKey::generate();
     let pk_bytes = sk.public_key().to_bytes();
-    let pubkey_hex = pubkey_hex(pk_bytes);
+    let _pubkey_hex = pubkey_hex(pk_bytes);
     let pk = crypto::PublicKey::from_bytes(&pk_bytes).unwrap();
 
     composite.add_local_key(sk);
     adapter.tracked_keys.lock().push(pk_bytes);
-    pubkey_map.write().insert(pubkey_hex.clone(), pk);
+    pubkey_map.write().insert(pk_bytes, pk);
 
     rx.borrow_and_update();
     let deleted = adapter.delete_keystore(&pk_bytes).unwrap();
     assert!(deleted);
-    assert!(!pubkey_map.read().contains_key(&pubkey_hex));
+    assert!(!pubkey_map.read().contains_key(&pk_bytes));
     assert!(rx.has_changed().unwrap());
 }
 
@@ -128,16 +128,16 @@ fn test_remote_key_adapter_delete_removes_from_pubkey_map() {
     // Use a real BLS pubkey so the map entry is written on import.
     let sk = SecretKey::generate();
     let pk = sk.public_key().to_bytes();
-    let pubkey_hex = pubkey_hex(pk);
+    let _pubkey_hex = pubkey_hex(pk);
 
     adapter.import_remote_key(pk, "https://signer.example.com".to_string()).unwrap();
-    assert!(pubkey_map.read().contains_key(&pubkey_hex));
+    assert!(pubkey_map.read().contains_key(&pk));
     rx.borrow_and_update();
 
     let deleted = adapter.delete_remote_key(&pk).unwrap();
     assert!(deleted);
     assert!(!adapter.has_remote_key(&pk));
-    assert!(!pubkey_map.read().contains_key(&pubkey_hex));
+    assert!(!pubkey_map.read().contains_key(&pk));
     assert!(rx.has_changed().unwrap());
 }
 
@@ -318,7 +318,7 @@ fn test_concurrent_import_delete_same_key() {
 
     let sk = SecretKey::generate();
     let pk_bytes = sk.public_key().to_bytes();
-    let pubkey_hex = pubkey_hex(pk_bytes);
+    let _pubkey_hex = pubkey_hex(pk_bytes);
     let password = b"testpass";
     let keystore = crypto::Keystore::encrypt(
         &sk,
@@ -364,7 +364,7 @@ fn test_concurrent_import_delete_same_key() {
 
     // S1: PubkeyMap must stay in sync with the signing registry after concurrent
     // delete vs re-import (map remove runs under the same lock as registry ops).
-    let in_map = pubkey_map.read().contains_key(&pubkey_hex);
+    let in_map = pubkey_map.read().contains_key(&pk_bytes);
     assert_eq!(
         in_map, has_key,
         "PubkeyMap membership must match CompositeSigner after concurrent delete/import"

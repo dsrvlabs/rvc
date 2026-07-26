@@ -97,7 +97,7 @@ async fn test_maybe_propose_block_bad_proposer_index_drops_duty() {
 
     let config = create_test_config();
     let mut pubkey_map_inner = HashMap::new();
-    pubkey_map_inner.insert(pubkey_hex.clone(), pubkey.clone());
+    pubkey_map_inner.insert(pubkey.to_bytes(), pubkey.clone());
     let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
@@ -210,7 +210,7 @@ async fn test_block_proposal_skipped_when_validator_disabled() {
     }
 
     let mut pubkey_map_inner = HashMap::new();
-    pubkey_map_inner.insert(pubkey_hex, pubkey);
+    pubkey_map_inner.insert(pubkey.to_bytes(), pubkey);
     let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
 
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));

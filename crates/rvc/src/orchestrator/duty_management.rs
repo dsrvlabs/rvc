@@ -10,10 +10,11 @@ use duty_tracker::DutyTracker;
 use eth_types::Slot;
 use metrics::definitions::RVC_DUTY_REORG_DETECTED_TOTAL;
 use signer::{is_aggregator, SignerService, ValidatorSigner};
-use timing::{SlotClock, SLOTS_PER_EPOCH};
+use timing::SLOTS_PER_EPOCH;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
 use super::utils::{self, TimedOutcome};
+use crate::pubkey_index::{parse_pubkey_bytes, SharedPubkeyIndexRegistry};
 
 /// Number of epochs in a single sync committee period.
 const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64 = 256;
@@ -21,35 +22,36 @@ const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64 = 256;
 /// How many epochs before the end of a period to start prefetching next-period duties.
 const PREFETCH_LOOKAHEAD: u64 = 2;
 
-pub(crate) struct DutyManagementService<C: SlotClock + 'static> {
-    clock: Arc<C>,
+pub(crate) struct DutyManagementService {
     signer: Arc<SignerService>,
     beacon: Arc<dyn BeaconNodeClient>,
     duty_tracker: Arc<DutyTracker>,
     validator_store: Arc<validator_store::ValidatorStore>,
     pubkey_map: PubkeyMap,
+    /// Shared pubkey → validator-index registry (O(1) prepare_proposers).
+    pubkey_index: SharedPubkeyIndexRegistry,
     config: OrchestratorConfig,
     /// Tracks which sync committee periods have been prefetched to ensure idempotency.
     prefetched_periods: RwLock<HashSet<u64>>,
 }
 
-impl<C: SlotClock + 'static> DutyManagementService<C> {
+impl DutyManagementService {
     pub(crate) fn new(
-        clock: Arc<C>,
         signer: Arc<SignerService>,
         beacon: Arc<dyn BeaconNodeClient>,
         duty_tracker: Arc<DutyTracker>,
         validator_store: Arc<validator_store::ValidatorStore>,
         pubkey_map: PubkeyMap,
+        pubkey_index: SharedPubkeyIndexRegistry,
         config: OrchestratorConfig,
     ) -> Self {
         Self {
-            clock,
             signer,
             beacon,
             duty_tracker,
             validator_store,
             pubkey_map,
+            pubkey_index,
             config,
             prefetched_periods: RwLock::new(HashSet::new()),
         }
@@ -286,49 +288,34 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
 
     #[tracing::instrument(name = "orchestrator.prepare_proposers", level = "debug", skip_all)]
     pub(crate) async fn prepare_proposers(&self) {
-        let mut preparations = Vec::new();
+        // O(validators): one registry lookup per local key — no duty-cache scan.
+        // Build the preparations list under short sync locks (no await held).
+        let preparations: Vec<ProposerPreparation> = {
+            let pubkey_snapshot = self.pubkey_map.read().clone();
+            let index_registry = self.pubkey_index.read();
+            let mut out = Vec::with_capacity(pubkey_snapshot.len());
+            for (pubkey_bytes, pubkey) in &pubkey_snapshot {
+                let fee_recipient =
+                    self.validator_store.effective_fee_recipient(&pubkey.to_bytes());
+                let fee_recipient_hex = format!("0x{}", hex::encode(fee_recipient));
 
-        let pubkey_snapshot = self.pubkey_map.read().clone();
-        for (pubkey_hex, pubkey) in &pubkey_snapshot {
-            let fee_recipient = self.validator_store.effective_fee_recipient(&pubkey.to_bytes());
-            let fee_recipient_hex = format!("0x{}", hex::encode(fee_recipient));
-
-            // We need the validator_index. Look it up from cached attester duties.
-            // Iterate over current and next epoch slots to find a duty with this pubkey.
-            let normalized = utils::normalize_pubkey(pubkey_hex);
-            let mut found_index = None;
-
-            if let Ok(current_slot) = self.clock.current_slot() {
-                let current_epoch = current_slot / SLOTS_PER_EPOCH;
-                for epoch in [current_epoch, current_epoch + 1] {
-                    for slot_offset in 0..SLOTS_PER_EPOCH {
-                        let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
-                        let duties = self.duty_tracker.get_duties_for_slot(slot).await;
-                        for duty in &duties {
-                            if utils::normalize_pubkey(&duty.pubkey) == normalized {
-                                found_index = Some(duty.validator_index.clone());
-                                break;
-                            }
-                        }
-                        if found_index.is_some() {
-                            break;
-                        }
+                match index_registry.index_of(pubkey_bytes) {
+                    Some(validator_index) => {
+                        out.push(ProposerPreparation {
+                            validator_index: validator_index.to_string(),
+                            fee_recipient: fee_recipient_hex,
+                        });
                     }
-                    if found_index.is_some() {
-                        break;
+                    None => {
+                        debug!(
+                            pubkey = %format!("0x{}", hex::encode(pubkey_bytes)),
+                            "No validator index found for proposer preparation"
+                        );
                     }
                 }
             }
-
-            if let Some(validator_index) = found_index {
-                preparations.push(ProposerPreparation {
-                    validator_index,
-                    fee_recipient: fee_recipient_hex,
-                });
-            } else {
-                debug!(pubkey = %pubkey_hex, "No validator index found for proposer preparation");
-            }
-        }
+            out
+        };
 
         if preparations.is_empty() {
             return;
@@ -363,14 +350,12 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
             let duties = self.duty_tracker.get_duties_for_slot(slot).await;
 
             for duty in &duties {
-                // Only subscribe for our own validators
-                let normalized = utils::normalize_pubkey(&duty.pubkey);
-                let pubkey =
-                    pubkey_snapshot.iter().find(|(k, _)| utils::normalize_pubkey(k) == normalized);
-
-                let pubkey = match pubkey {
-                    Some((_, pk)) => pk.clone(),
-                    None => continue,
+                // Only subscribe for our own validators (O(1) by compressed bytes).
+                let Some(duty_bytes) = parse_pubkey_bytes(&duty.pubkey) else {
+                    continue;
+                };
+                let Some(pubkey) = pubkey_snapshot.get(&duty_bytes).cloned() else {
+                    continue;
                 };
 
                 let committee_length: u64 = match duty.committee_length.parse() {
@@ -511,7 +496,7 @@ mod tests {
     use eth_types::ForkSchedule;
     use signer::{always_enabled, SignerService};
     use slashing::SlashingDb;
-    use timing::MockSlotClock;
+    
     use validator_store::ValidatorStore;
 
     use super::*;
@@ -555,7 +540,7 @@ mod tests {
         })
     }
 
-    async fn build_service_no_validators(beacon_url: &str) -> DutyManagementService<MockSlotClock> {
+    async fn build_service_no_validators(beacon_url: &str) -> DutyManagementService {
         let beacon_config = BeaconClientConfig::new(beacon_url)
             .with_timeout(Duration::from_secs(5))
             .with_max_retries(1);
@@ -566,16 +551,15 @@ mod tests {
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let signer =
             Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
-        let clock = Arc::new(MockSlotClock::new(1606824023, Duration::from_secs(12), 0));
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
         DutyManagementService::new(
-            clock,
             signer,
             beacon,
             duty_tracker,
             validator_store,
             pubkey_map,
+            crate::pubkey_index::PubkeyIndexRegistry::shared(),
             make_config(),
         )
     }
@@ -671,16 +655,15 @@ mod tests {
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let signer =
             Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
-        let clock = Arc::new(MockSlotClock::new(1606824023, Duration::from_secs(12), 0));
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
         let service = DutyManagementService::new(
-            clock,
             signer,
             beacon_client,
             duty_tracker.clone(),
             validator_store,
             pubkey_map,
+            crate::pubkey_index::PubkeyIndexRegistry::shared(),
             make_config(),
         );
 
@@ -921,16 +904,15 @@ mod tests {
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let signer =
             Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
-        let clock = Arc::new(MockSlotClock::new(1606824023, Duration::from_secs(12), 0));
         let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
         let service = DutyManagementService::new(
-            clock,
             signer,
             beacon,
             duty_tracker.clone(),
             validator_store,
             pubkey_map,
+            crate::pubkey_index::PubkeyIndexRegistry::shared(),
             make_config(),
         );
 

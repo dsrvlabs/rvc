@@ -126,7 +126,8 @@ pub async fn build_services(
     // block production.
     let main_beacon: Arc<dyn BeaconNodeClient> =
         Arc::clone(&beacon.bn_manager) as Arc<dyn BeaconNodeClient>;
-    let validator_indices: Vec<String> = enablement.validator_index_map.values().cloned().collect();
+    let validator_indices: Vec<String> =
+        enablement.pubkey_index.read().indices().cloned().collect();
     let duty_tracker = builder.build_duty_tracker(main_beacon.clone(), validator_indices);
 
     let slot_clock = match builder.build_slot_clock() {
@@ -256,8 +257,7 @@ mod tests {
     fn pubkey_map_with(keys: &[PublicKey]) -> PubkeyMap {
         let mut map = HashMap::new();
         for pk in keys {
-            let hex = format!("0x{}", hex::encode(pk.to_bytes()));
-            map.insert(hex, pk.clone());
+            map.insert(pk.to_bytes(), pk.clone());
         }
         Arc::new(parking_lot::RwLock::new(map))
     }
@@ -282,7 +282,7 @@ mod tests {
             epoch_clock: Arc::new(MonotonicEpochClock::new(0)),
             pubkey_map,
             liveness_task: None,
-            validator_index_map: HashMap::new(),
+            pubkey_index: crate::pubkey_index::PubkeyIndexRegistry::shared(),
         }
     }
 
