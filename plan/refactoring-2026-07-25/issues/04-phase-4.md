@@ -394,12 +394,12 @@ and it lands first so the high-risk slashable core (RF4-05/06) is reviewed on it
 3. Reduce each non-slashable method to root derivation (via RF4-02's helper) + one call.
 
 **Acceptance criteria:**
-- [ ] All 8 non-slashable `SignerService` methods are ≤ ~10 lines over the shared helper.
-- [ ] A hung backend causes a non-slashable sign to fail after the configured timeout instead of hanging
+- [x] All 8 non-slashable `SignerService` methods are ≤ ~10 lines over the shared helper.
+- [x] A hung backend causes a non-slashable sign to fail after the configured timeout instead of hanging
       (test with a sleeping mock signer).
-- [ ] The helper takes no per-validator lock and touches no slashing DB (asserted by a test that would
+- [x] The helper takes no per-validator lock and touches no slashing DB (asserted by a test that would
       deadlock or write a row otherwise).
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_nonslashable_sign_times_out_against_hung_backend` — fails today (no timeout on the

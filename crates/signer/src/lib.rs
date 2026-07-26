@@ -22,7 +22,7 @@ pub use locks::ValidatorLockMap;
 pub use traits::ValidatorSigner;
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -142,6 +142,13 @@ impl From<SigningError> for SignerError {
     }
 }
 
+/// Default per-sign timeout: 4 seconds — well under a 12-second Ethereum slot.
+///
+/// Bounds non-slashable BLS sign calls so a wedged remote backend cannot hang
+/// the VC duty loop indefinitely (F37). Matches [`crate::gate`]'s default.
+/// Slashable paths gain the same bound in RF4-05/06.
+const DEFAULT_SIGN_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// Service that combines signing through CompositeSigner with slashing protection.
 ///
 /// Record-then-sign order is mandated by Ethereum consensus spec (phase0/validator.md):
@@ -166,11 +173,25 @@ impl From<SigningError> for SignerError {
 /// Stage → sign → commit/discard still runs here (not via `SigningGate`) to
 /// preserve `RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS` metric instrumentation
 /// (ISSUE-3.12).
+///
+/// Non-slashable paths share [`SignerService::sign_nonslashable`]: enablement →
+/// `tokio::time::timeout(sign_timeout, backend.sign(...))` with uniform error
+/// mapping. They take no per-validator lock and write no slashing-DB row.
 pub struct SignerService {
     signer: Arc<CompositeSigner>,
+    /// BLS backend used by non-slashable paths (and future shared cores).
+    ///
+    /// Defaults to the same [`CompositeSigner`] as [`Self::signer`]. Tests may
+    /// inject a slow/failing backend via [`Self::with_sign_backend`] without
+    /// replacing key-management APIs on the composite.
+    sign_backend: Arc<dyn Signer>,
     slashing_db: Arc<SlashingDb>,
     validator_locks: ValidatorLockMap,
     enablement: Arc<dyn SigningEnablement>,
+    /// Maximum wall-clock duration allowed for a single non-slashable BLS sign.
+    ///
+    /// Expiry returns `Err(SigningFailed("signer timed out"))`. Defaults to 4s.
+    sign_timeout: Duration,
 }
 
 /// Fail-closed enablement used when no `with_enablement` was provided.
@@ -226,12 +247,19 @@ impl SignerService {
     /// The enablement gate defaults to **fail-closed**: every pubkey is refused
     /// until [`with_enablement`](Self::with_enablement) installs a real
     /// [`SigningEnablement`] (e.g. `ForwardWindowMachine` in SEC-2b).
+    ///
+    /// Non-slashable signs use a **4-second** default timeout (matching
+    /// `SigningGate`). Override with [`with_sign_timeout`](Self::with_sign_timeout).
     pub fn new(signer: Arc<CompositeSigner>, slashing_db: Arc<SlashingDb>) -> Self {
+        // Coerce CompositeSigner → dyn Signer for the non-slashable sign path.
+        let sign_backend: Arc<dyn Signer> = signer.clone();
         Self {
             signer,
+            sign_backend,
             slashing_db,
             validator_locks: ValidatorLockMap::new(),
             enablement: Arc::new(FailClosedEnablement),
+            sign_timeout: DEFAULT_SIGN_TIMEOUT,
         }
     }
 
@@ -243,6 +271,27 @@ impl SignerService {
     #[must_use]
     pub fn with_enablement(mut self, enablement: Arc<dyn SigningEnablement>) -> Self {
         self.enablement = enablement;
+        self
+    }
+
+    /// Override the per-sign timeout for non-slashable BLS calls (builder style).
+    ///
+    /// Default is 4 seconds. Slashable-path timeout is introduced in RF4-05/06.
+    #[must_use]
+    pub fn with_sign_timeout(mut self, timeout: Duration) -> Self {
+        self.sign_timeout = timeout;
+        self
+    }
+
+    /// Replace the BLS sign backend used by non-slashable paths (builder style).
+    ///
+    /// Production uses the [`CompositeSigner`] from [`Self::new`]. Available under
+    /// `cfg(test)` / `test-utils` so tests can inject a slow or failing backend
+    /// (timeout / error-mapping coverage) without changing key-management APIs.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn with_sign_backend(mut self, backend: Arc<dyn Signer>) -> Self {
+        self.sign_backend = backend;
         self
     }
 
@@ -659,6 +708,97 @@ impl SignerService {
         Ok(outcome)
     }
 
+    // -------------------------------------------------------------------------
+    // Non-slashable paths — all route through `sign_nonslashable`
+    // -------------------------------------------------------------------------
+    //
+    // Pattern (mirrors SigningGate):
+    //   1. Root derivation in the public wrapper
+    //   2. `sign_nonslashable`: enablement → timeout(sign) → uniform mapping
+    // No per-validator lock, no slashing-DB staging.
+
+    /// Execute the non-slashable signing flow: enablement gate → BLS sign with timeout.
+    ///
+    /// Shared by all non-slashable methods so enablement, timeout, and error
+    /// mapping live in one place.
+    ///
+    /// # No-lock invariant
+    ///
+    /// This helper deliberately does **NOT** acquire the per-pubkey
+    /// `ValidatorLockMap` lock and does **NOT** call any of
+    /// `stage_block`, `stage_attestation`, or `commit`.
+    /// Non-slashable operations have no slashing-DB transaction to serialize,
+    /// so the lock is unnecessary overhead.
+    ///
+    /// **If a future variant of this helper needs to write to the slashing DB,
+    /// it MUST add the per-pubkey lock and the staging/commit/discard pattern
+    /// used by `sign_block` / `sign_attestation`.**
+    ///
+    /// # TOCTOU note
+    ///
+    /// There is a micro-window between `ensure_signing_enabled` returning `Ok`
+    /// and `signer.sign().await` completing during which the doppelganger state
+    /// could theoretically change.  This window is intentionally accepted:
+    /// these operations are **not slashable**, so the worst case is a
+    /// signature produced for a pubkey that was concurrently disabled — a
+    /// tolerable transient condition.  No additional synchronization is needed
+    /// to shrink this window.
+    async fn sign_nonslashable(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+        op_name: &str,
+    ) -> Result<Signature, SignerError> {
+        // Step 1: doppelganger gate (same gate point as slashable early check).
+        self.ensure_signing_enabled(pubkey)?;
+
+        let pubkey_bytes = pubkey.to_bytes();
+        let pubkey_hex = hex::encode(pubkey_bytes);
+        let start = Instant::now();
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            signing_type = op_name,
+            "Signing non-slashable duty"
+        );
+
+        // Step 2: BLS sign with timeout — no slashing DB, no spawn_blocking.
+        let sign_result = tokio::time::timeout(
+            self.sign_timeout,
+            self.sign_backend.sign(&signing_root, &pubkey_bytes),
+        )
+        .await;
+
+        match sign_result {
+            Err(_elapsed) => {
+                error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    op = op_name,
+                    timeout_secs = self.sign_timeout.as_secs_f64(),
+                    "SignerService: non-slashable signer timed out"
+                );
+                Err(SignerError::SigningFailed("signer timed out".to_string()))
+            }
+            Ok(Ok(sig)) => {
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = op_name,
+                    "Signing completed"
+                );
+                Ok(sig)
+            }
+            Ok(Err(e)) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    signing_type = op_name,
+                    "Signing failed"
+                );
+                Err(e.into())
+            }
+        }
+    }
+
     /// Signs a RANDAO reveal for the given epoch.
     #[tracing::instrument(name = "sign.randao", skip_all, fields(duty = %Duty::Block.as_str()))]
     pub async fn sign_randao_reveal(
@@ -668,42 +808,9 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        // Enablement gate before signing (SEC-2a).
-        self.ensure_signing_enabled(pubkey)?;
-
-        let start = Instant::now();
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
-
-        debug!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            epoch = epoch,
-            signing_type = "randao",
-            "Signing RANDAO reveal"
-        );
-
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::Randao(epoch), &ctx);
-
-        match self.signer.sign(&signing_root, &pubkey_bytes).await {
-            Ok(sig) => {
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "randao",
-                    "Signing completed"
-                );
-                Ok(sig)
-            }
-            Err(e) => {
-                warn!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    error = %e,
-                    signing_type = "randao",
-                    "Signing failed"
-                );
-                Err(e.into())
-            }
-        }
+        self.sign_nonslashable(pubkey, signing_root, "randao").await
     }
 
     /// Signs a sync committee message for the given beacon block root and slot.
@@ -716,43 +823,10 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        // Enablement gate before signing (SEC-2a).
-        self.ensure_signing_enabled(pubkey)?;
-
-        let start = Instant::now();
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
-
-        debug!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            slot = slot,
-            signing_type = "sync_committee_message",
-            "Signing sync committee message"
-        );
-
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root =
             signing_root_for(&DutyRef::SyncMessage { beacon_block_root, slot }, &ctx);
-
-        match self.signer.sign(&signing_root, &pubkey_bytes).await {
-            Ok(sig) => {
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "sync_committee_message",
-                    "Signing completed"
-                );
-                Ok(sig)
-            }
-            Err(e) => {
-                warn!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    error = %e,
-                    signing_type = "sync_committee_message",
-                    "Signing failed"
-                );
-                Err(e.into())
-            }
-        }
+        self.sign_nonslashable(pubkey, signing_root, "sync_committee_message").await
     }
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
@@ -764,45 +838,15 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        // Enablement gate before signing (SEC-2a).
-        self.ensure_signing_enabled(pubkey)?;
-
-        let start = Instant::now();
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
-
-        debug!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            slot = slot,
-            signing_type = "selection_proof",
-            "Signing selection proof"
-        );
-
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::SelectionProof(slot), &ctx);
-
-        match self.signer.sign(&signing_root, &pubkey_bytes).await {
-            Ok(sig) => {
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "selection_proof",
-                    "Signing completed"
-                );
-                Ok(sig)
-            }
-            Err(e) => {
-                warn!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    error = %e,
-                    signing_type = "selection_proof",
-                    "Signing failed"
-                );
-                Err(e.into())
-            }
-        }
+        self.sign_nonslashable(pubkey, signing_root, "selection_proof").await
     }
 
     /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
+    ///
+    /// Non-slashable: the inner attestation must already have been committed by
+    /// [`sign_attestation`]. This method does not touch the slashing DB.
     #[tracing::instrument(name = "sign.aggregate_and_proof", skip_all, fields(duty = %Duty::Aggregate.as_str()))]
     pub async fn sign_aggregate_and_proof(
         &self,
@@ -811,46 +855,14 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        // Enablement gate before signing (SEC-2a).
-        self.ensure_signing_enabled(pubkey)?;
-
-        let start = Instant::now();
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
-        let slot = aggregate_and_proof.aggregate.data.slot;
-
-        debug!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            slot = slot,
-            signing_type = "aggregate_and_proof",
-            "Signing aggregate and proof"
-        );
-
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::AggregateAndProof(aggregate_and_proof), &ctx);
-
-        match self.signer.sign(&signing_root, &pubkey_bytes).await {
-            Ok(sig) => {
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "aggregate_and_proof",
-                    "Signing completed"
-                );
-                Ok(sig)
-            }
-            Err(e) => {
-                warn!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    error = %e,
-                    signing_type = "aggregate_and_proof",
-                    "Signing failed"
-                );
-                Err(e.into())
-            }
-        }
+        self.sign_nonslashable(pubkey, signing_root, "aggregate_and_proof").await
     }
 
     /// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
+    ///
+    /// Non-slashable: same chain-of-custody rule as [`sign_aggregate_and_proof`].
     #[tracing::instrument(name = "sign.electra_aggregate_and_proof", skip_all, fields(duty = %Duty::Aggregate.as_str()))]
     pub async fn sign_electra_aggregate_and_proof(
         &self,
@@ -859,44 +871,10 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        // Enablement gate before signing (SEC-2a).
-        self.ensure_signing_enabled(pubkey)?;
-
-        let start = Instant::now();
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
-        let slot = aggregate_and_proof.aggregate.data.slot;
-
-        debug!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            slot = slot,
-            signing_type = "electra_aggregate_and_proof",
-            "Signing Electra aggregate and proof"
-        );
-
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root =
             signing_root_for(&DutyRef::ElectraAggregateAndProof(aggregate_and_proof), &ctx);
-
-        match self.signer.sign(&signing_root, &pubkey_bytes).await {
-            Ok(sig) => {
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "electra_aggregate_and_proof",
-                    "Signing completed"
-                );
-                Ok(sig)
-            }
-            Err(e) => {
-                warn!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    error = %e,
-                    signing_type = "electra_aggregate_and_proof",
-                    "Signing failed"
-                );
-                Err(e.into())
-            }
-        }
+        self.sign_nonslashable(pubkey, signing_root, "electra_aggregate_and_proof").await
     }
 
     /// Signs a voluntary exit with DOMAIN_VOLUNTARY_EXIT.
@@ -909,8 +887,8 @@ impl SignerService {
     /// `stage_voluntary_exit` API in the slashing crate.
     ///
     /// The C2 error-handling invariant is still satisfied here: every signer
-    /// failure is propagated directly to the caller via `Err(e.into())` — no
-    /// error is swallowed or silently converted to `Ok`.
+    /// failure is propagated directly to the caller via `Err` — no error is
+    /// swallowed or silently converted to `Ok`.
     #[tracing::instrument(name = "sign.voluntary_exit", skip_all, fields(duty = %Duty::VoluntaryExit.as_str()))]
     pub async fn sign_voluntary_exit(
         &self,
@@ -919,44 +897,10 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        // Enablement gate before signing (SEC-2a).
-        self.ensure_signing_enabled(pubkey)?;
-
-        let start = Instant::now();
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
-
-        debug!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            epoch = voluntary_exit.epoch,
-            signing_type = "voluntary_exit",
-            "Signing voluntary exit"
-        );
-
         // EIP-7044 Capella cap is applied inside signing_root_for.
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::VoluntaryExit(voluntary_exit), &ctx);
-
-        // C2: signer errors are propagated directly — no stage to discard.
-        match self.signer.sign(&signing_root, &pubkey_bytes).await {
-            Ok(sig) => {
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "voluntary_exit",
-                    "Signing completed"
-                );
-                Ok(sig)
-            }
-            Err(e) => {
-                warn!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    error = %e,
-                    signing_type = "voluntary_exit",
-                    "Signing failed"
-                );
-                Err(e.into())
-            }
-        }
+        self.sign_nonslashable(pubkey, signing_root, "voluntary_exit").await
     }
 
     /// Signs a builder registration with DOMAIN_APPLICATION_BUILDER.
@@ -969,19 +913,6 @@ impl SignerService {
         pubkey: &PublicKey,
         fork_version: [u8; 4],
     ) -> Result<Signature, SignerError> {
-        // Enablement gate before signing (SEC-2a).
-        self.ensure_signing_enabled(pubkey)?;
-
-        let start = Instant::now();
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
-
-        debug!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            signing_type = "builder_registration",
-            "Signing builder registration"
-        );
-
         // Per-transport fork version preserved (RF4-10 unifies deliberately).
         // Builder domain uses zero GVR per MEV-Boost / builder-specs.
         let signing_root = signing_root_with_fork_version(
@@ -990,26 +921,7 @@ impl SignerService {
             fork_version,
             [0u8; 32],
         );
-
-        match self.signer.sign(&signing_root, &pubkey_bytes).await {
-            Ok(sig) => {
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "builder_registration",
-                    "Signing completed"
-                );
-                Ok(sig)
-            }
-            Err(e) => {
-                warn!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    error = %e,
-                    signing_type = "builder_registration",
-                    "Signing failed"
-                );
-                Err(e.into())
-            }
-        }
+        self.sign_nonslashable(pubkey, signing_root, "builder_registration").await
     }
 
     /// Signs a sync committee selection proof for the given slot and subcommittee.
@@ -1022,44 +934,10 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        // Enablement gate before signing (SEC-2a).
-        self.ensure_signing_enabled(pubkey)?;
-
-        let start = Instant::now();
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
-
-        debug!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            slot = slot,
-            subcommittee_index = subcommittee_index,
-            signing_type = "sync_committee_selection_proof",
-            "Signing sync committee selection proof"
-        );
-
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root =
             signing_root_for(&DutyRef::SyncSelection { slot, subcommittee_index }, &ctx);
-
-        match self.signer.sign(&signing_root, &pubkey_bytes).await {
-            Ok(sig) => {
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "sync_committee_selection_proof",
-                    "Signing completed"
-                );
-                Ok(sig)
-            }
-            Err(e) => {
-                warn!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    error = %e,
-                    signing_type = "sync_committee_selection_proof",
-                    "Signing failed"
-                );
-                Err(e.into())
-            }
-        }
+        self.sign_nonslashable(pubkey, signing_root, "sync_committee_selection_proof").await
     }
 
     /// Signs a ContributionAndProof with DOMAIN_CONTRIBUTION_AND_PROOF.
@@ -1071,44 +949,10 @@ impl SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        // Enablement gate before signing (SEC-2a).
-        self.ensure_signing_enabled(pubkey)?;
-
-        let start = Instant::now();
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
-        let slot = contribution_and_proof.contribution.slot;
-
-        debug!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            slot = slot,
-            signing_type = "contribution_and_proof",
-            "Signing contribution and proof"
-        );
-
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root =
             signing_root_for(&DutyRef::ContributionAndProof(contribution_and_proof), &ctx);
-
-        match self.signer.sign(&signing_root, &pubkey_bytes).await {
-            Ok(sig) => {
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "contribution_and_proof",
-                    "Signing completed"
-                );
-                Ok(sig)
-            }
-            Err(e) => {
-                warn!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    error = %e,
-                    signing_type = "contribution_and_proof",
-                    "Signing failed"
-                );
-                Err(e.into())
-            }
-        }
+        self.sign_nonslashable(pubkey, signing_root, "contribution_and_proof").await
     }
 
     /// Returns a reference to the underlying composite signer.
@@ -3342,5 +3186,286 @@ mod tests {
             sig.verify(&pubkey, &root).is_ok(),
             "builder registration must preserve per-transport fork version"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // RF4-04: sign_nonslashable helper (timeout, no-lock, no-row, error parity)
+    // -------------------------------------------------------------------------
+
+    /// Backend that sleeps before signing — used to exercise sign timeout.
+    struct SlowSigner {
+        inner: LocalSigner,
+        sleep: Duration,
+    }
+
+    #[async_trait]
+    impl Signer for SlowSigner {
+        async fn sign(
+            &self,
+            signing_root: &Root,
+            pubkey: &[u8; 48],
+        ) -> Result<Signature, crypto::SigningError> {
+            tokio::time::sleep(self.sleep).await;
+            self.inner.sign(signing_root, pubkey).await
+        }
+
+        fn public_keys(&self) -> Vec<[u8; 48]> {
+            self.inner.public_keys()
+        }
+    }
+
+    /// A hung backend must fail a non-slashable sign after the configured timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_nonslashable_sign_times_out_against_hung_backend() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let mut km = KeyManager::new();
+        km.insert(secret_key);
+        let slow: Arc<dyn Signer> =
+            Arc::new(SlowSigner { inner: LocalSigner::new(km), sleep: Duration::from_millis(400) });
+        // Composite can be empty: non-slashable path uses sign_backend override.
+        let composite = create_empty_composite_signer();
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let service = SignerService::new(composite, slashing_db)
+            .with_enablement(always_enabled())
+            .with_sign_timeout(Duration::from_millis(50))
+            .with_sign_backend(slow);
+
+        let schedule = create_test_fork_schedule();
+        let gvr = [0xaa; 32];
+        let result = service.sign_randao_reveal(5, &pubkey, &schedule, &gvr).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(SignerError::SigningFailed(ref msg)) if msg.contains("timed out")
+            ),
+            "expected SigningFailed containing 'timed out', got: {result:?}"
+        );
+    }
+
+    /// Holding the per-validator lock must not deadlock a non-slashable sign
+    /// (helper must not take the lock).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_nonslashable_helper_takes_no_validator_lock() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_bytes = pubkey.to_bytes();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
+
+        // Hold the per-validator lock. If sign_nonslashable tried to acquire it,
+        // this would deadlock (tokio Mutex is not reentrant on the same task).
+        let lock = service.validator_locks.get(&pubkey_bytes);
+        let _guard = lock.lock().await;
+
+        let schedule = create_test_fork_schedule();
+        let gvr = [0xaa; 32];
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            service.sign_randao_reveal(5, &pubkey, &schedule, &gvr),
+        )
+        .await;
+
+        assert!(result.is_ok(), "non-slashable sign must not block on validator lock");
+        assert!(result.unwrap().is_ok(), "sign must succeed while lock is held by caller");
+    }
+
+    /// Non-slashable helper must not write any slashing-DB row.
+    #[tokio::test]
+    async fn test_nonslashable_helper_writes_no_slashing_row() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let service =
+            SignerService::new(signer, Arc::clone(&slashing_db)).with_enablement(always_enabled());
+
+        let schedule = create_test_fork_schedule();
+        let gvr = [0xaa; 32];
+        let contribution = make_minimal_contribution_and_proof(100);
+
+        service.sign_randao_reveal(5, &pubkey, &schedule, &gvr).await.expect("randao");
+        service
+            .sign_sync_committee_message(&[0x11; 32], 100, &pubkey, &schedule, &gvr)
+            .await
+            .expect("sync message");
+        service.sign_selection_proof(100, &pubkey, &schedule, &gvr).await.expect("selection");
+        let agg = create_test_aggregate_and_proof(100);
+        service.sign_aggregate_and_proof(&agg, &pubkey, &schedule, &gvr).await.expect("aggregate");
+        let electra_agg = create_test_electra_aggregate_and_proof(100);
+        service
+            .sign_electra_aggregate_and_proof(&electra_agg, &pubkey, &schedule, &gvr)
+            .await
+            .expect("electra aggregate");
+        let exit = VoluntaryExit { epoch: 10, validator_index: 1 };
+        service.sign_voluntary_exit(&exit, &pubkey, &schedule, &gvr).await.expect("exit");
+        let reg = create_test_registration();
+        service.sign_builder_registration(&reg, &pubkey, [0; 4]).await.expect("builder");
+        service
+            .sign_sync_committee_selection_proof(100, 0, &pubkey, &schedule, &gvr)
+            .await
+            .expect("sync selection");
+        service
+            .sign_contribution_and_proof(&contribution, &pubkey, &schedule, &gvr)
+            .await
+            .expect("contribution");
+
+        let blocks = slashing_db.get_blocks(&pubkey_hex).expect("get_blocks");
+        let attestations = slashing_db.get_attestations(&pubkey_hex).expect("get_attestations");
+        assert!(blocks.is_empty(), "non-slashable must not write block rows; found: {blocks:?}");
+        assert!(
+            attestations.is_empty(),
+            "non-slashable must not write attestation rows; found: {attestations:?}"
+        );
+    }
+
+    /// All non-slashable methods share the helper's error mapping
+    /// (`BlockedByDoppelganger` and `KeyNotFound` parity tables).
+    #[tokio::test]
+    async fn test_each_nonslashable_method_delegates_to_helper() {
+        let schedule = create_test_fork_schedule();
+        let gvr = [0xaa; 32];
+        // Arbitrary pubkey: enablement / KeyNotFound fire before signature verification.
+        let pubkey = SecretKey::generate().public_key();
+        let exit = VoluntaryExit { epoch: 10, validator_index: 1 };
+        let agg = create_test_aggregate_and_proof(100);
+        let electra_agg = create_test_electra_aggregate_and_proof(100);
+        let reg = create_test_registration();
+        let contribution = make_minimal_contribution_and_proof(100);
+
+        // --- BlockedByDoppelganger: fail-closed default enablement ---
+        {
+            // Key material is irrelevant: the gate refuses before the BLS sign.
+            let signer = create_test_composite_signer_with_key(SecretKey::generate());
+            let db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+            let service = SignerService::new(signer, db); // no with_enablement
+
+            let results = vec![
+                ("randao", service.sign_randao_reveal(5, &pubkey, &schedule, &gvr).await),
+                (
+                    "sync_committee_message",
+                    service
+                        .sign_sync_committee_message(&[0x11; 32], 100, &pubkey, &schedule, &gvr)
+                        .await,
+                ),
+                (
+                    "selection_proof",
+                    service.sign_selection_proof(100, &pubkey, &schedule, &gvr).await,
+                ),
+                (
+                    "aggregate_and_proof",
+                    service.sign_aggregate_and_proof(&agg, &pubkey, &schedule, &gvr).await,
+                ),
+                (
+                    "electra_aggregate_and_proof",
+                    service
+                        .sign_electra_aggregate_and_proof(&electra_agg, &pubkey, &schedule, &gvr)
+                        .await,
+                ),
+                (
+                    "voluntary_exit",
+                    service.sign_voluntary_exit(&exit, &pubkey, &schedule, &gvr).await,
+                ),
+                (
+                    "builder_registration",
+                    service.sign_builder_registration(&reg, &pubkey, [0; 4]).await,
+                ),
+                (
+                    "sync_committee_selection_proof",
+                    service
+                        .sign_sync_committee_selection_proof(100, 0, &pubkey, &schedule, &gvr)
+                        .await,
+                ),
+                (
+                    "contribution_and_proof",
+                    service
+                        .sign_contribution_and_proof(&contribution, &pubkey, &schedule, &gvr)
+                        .await,
+                ),
+            ];
+
+            for (name, result) in results {
+                assert!(
+                    matches!(result, Err(SignerError::BlockedByDoppelganger)),
+                    "{name}: expected BlockedByDoppelganger, got: {result:?}"
+                );
+            }
+        }
+
+        // --- KeyNotFound: always_enabled + empty composite ---
+        {
+            let empty = create_empty_composite_signer();
+            let db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+            let service = SignerService::new(empty, db).with_enablement(always_enabled());
+            let unknown = SecretKey::generate().public_key();
+
+            let results = vec![
+                ("randao", service.sign_randao_reveal(5, &unknown, &schedule, &gvr).await),
+                (
+                    "sync_committee_message",
+                    service
+                        .sign_sync_committee_message(&[0x11; 32], 100, &unknown, &schedule, &gvr)
+                        .await,
+                ),
+                (
+                    "selection_proof",
+                    service.sign_selection_proof(100, &unknown, &schedule, &gvr).await,
+                ),
+                (
+                    "aggregate_and_proof",
+                    service.sign_aggregate_and_proof(&agg, &unknown, &schedule, &gvr).await,
+                ),
+                (
+                    "electra_aggregate_and_proof",
+                    service
+                        .sign_electra_aggregate_and_proof(&electra_agg, &unknown, &schedule, &gvr)
+                        .await,
+                ),
+                (
+                    "voluntary_exit",
+                    service.sign_voluntary_exit(&exit, &unknown, &schedule, &gvr).await,
+                ),
+                (
+                    "builder_registration",
+                    service.sign_builder_registration(&reg, &unknown, [0; 4]).await,
+                ),
+                (
+                    "sync_committee_selection_proof",
+                    service
+                        .sign_sync_committee_selection_proof(100, 0, &unknown, &schedule, &gvr)
+                        .await,
+                ),
+                (
+                    "contribution_and_proof",
+                    service
+                        .sign_contribution_and_proof(&contribution, &unknown, &schedule, &gvr)
+                        .await,
+                ),
+            ];
+
+            for (name, result) in results {
+                assert!(
+                    matches!(result, Err(SignerError::KeyNotFound(_))),
+                    "{name}: expected KeyNotFound, got: {result:?}"
+                );
+            }
+        }
+    }
+
+    fn make_minimal_contribution_and_proof(slot: Slot) -> ContributionAndProof {
+        ContributionAndProof {
+            aggregator_index: 42,
+            contribution: eth_types::SyncCommitteeContribution {
+                slot,
+                beacon_block_root: [0x11; 32],
+                subcommittee_index: 2,
+                aggregation_bits: vec![0xff; 16],
+                signature: vec![0xbb; 96],
+            },
+            selection_proof: vec![0xcc; 96],
+        }
     }
 }
