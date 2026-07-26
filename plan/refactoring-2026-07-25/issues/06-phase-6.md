@@ -524,12 +524,12 @@ items: the 11 `calculate_backoff` tests (`client.rs:1294`, private method) and a
 4. Re-record the test count.
 
 **Acceptance criteria:**
-- [ ] `client.rs` is **< 40% test lines** (target: ~1,300 production + a small unit module).
-- [ ] `crates/beacon/tests/client_http.rs` imports only `beacon::`'s public surface — no `pub` was added
+- [x] `client.rs` is **< 40% test lines** (target: ~1,300 production + a small unit module).
+- [x] `crates/beacon/tests/client_http.rs` imports only `beacon::`'s public surface — no `pub` was added
       to `client.rs` in this PR (`git diff` proof: no line matching `^\+.*\bpub\b` in `src/`).
-- [ ] Test count before == after; any delta itemised.
-- [ ] `git diff -M` renders the move as renames.
-- [ ] Workspace green.
+- [x] Test count before == after; any delta itemised.
+- [x] `git diff -M` renders the move as renames.
+- [x] Workspace green.
 
 **Test/verification plan:** The relocated suite is its own verification — it must pass unmodified. E4
 (Phase 4, beacon retry engine) already used this suite as its oracle, so any behaviour delta here would
