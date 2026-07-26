@@ -10,7 +10,7 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use block_service::{BeaconBlockClient, BlockService};
 use bn_manager::{BeaconNodeClient, OperationTimeouts};
-use builder::{BuilderService, CircuitBreakerState};
+use builder::BuilderService;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkSchedule, Root, Slot};
@@ -19,7 +19,7 @@ use metrics::definitions::{
     RVC_BUILDER_CONSECUTIVE_MISSES, RVC_BUILDER_EPOCH_MISSES,
 };
 use propagator::{AttestationSubmitter, Propagator};
-use signer::SignerService;
+use signer::{CircuitBreakerState, SignerService};
 use timing::{due_ms, SlotClock, AGGREGATE_DUE_BPS, ATTESTATION_DUE_BPS, SLOTS_PER_EPOCH};
 
 use super::aggregation::AggregationService;

@@ -210,7 +210,7 @@ pub async fn run(
     )?;
 
     // Step 8: duty orchestrator.
-    let circuit_breaker = std::sync::Arc::new(builder::CircuitBreakerState::new(
+    let circuit_breaker = std::sync::Arc::new(signer::CircuitBreakerState::new(
         config.builder_limits.circuit_breaker_consecutive_limit,
         config.builder_limits.circuit_breaker_epoch_limit,
     ));

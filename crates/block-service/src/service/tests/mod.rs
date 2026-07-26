@@ -10,9 +10,9 @@ pub(super) use super::{
 pub(super) use crate::traits::{BeaconBlockClient, ProduceBlockResponse};
 pub(super) use crate::types::BlockSelectionMode;
 pub(super) use crate::BlockServiceError;
-pub(super) use builder::CircuitBreakerState;
 pub(super) use crypto::PublicKey;
 pub(super) use eth_types::{ForkSchedule, Root, Slot, SLOTS_PER_EPOCH};
+pub(super) use signer::CircuitBreakerState;
 pub(super) use signer::ValidatorSigner;
 
 mod mocks;

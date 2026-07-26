@@ -1197,12 +1197,12 @@ despite having no deps; or (b) have `block-service` define its own state and `bu
 `FORBIDDEN`, so the edge cannot come back.
 
 **Acceptance criteria:**
-- [ ] `crates/block-service/Cargo.toml` has no `builder` dependency.
-- [ ] The no-domain→domain rule is in `FORBIDDEN` and `cargo test -p architecture-tests` green.
-- [ ] `crates/rvc` and `crates/block-service` import `CircuitBreakerState` from the same new home.
-- [ ] Circuit-breaker behaviour unchanged (existing block-service and coordinator circuit-breaker tests
+- [x] `crates/block-service/Cargo.toml` has no `builder` dependency.
+- [x] The no-domain→domain rule is in `FORBIDDEN` and `cargo test -p architecture-tests` green.
+- [x] `crates/rvc` and `crates/block-service` import `CircuitBreakerState` from the same new home.
+- [x] Circuit-breaker behaviour unchanged (existing block-service and coordinator circuit-breaker tests
       pass unmodified).
-- [ ] Test count unchanged; workspace green.
+- [x] Test count unchanged; workspace green.
 
 **Risks:** Encoding "no domain→domain" as a general rule may trip legitimate existing edges. Enumerate the
 current domain→domain edges from `cargo metadata` **before** writing the rule, and either fix or

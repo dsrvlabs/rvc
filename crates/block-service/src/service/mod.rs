@@ -1,12 +1,11 @@
 use std::sync::Arc;
 
-use builder::CircuitBreakerState;
 use tracing::{debug, error, info, warn, Instrument};
 
 use crypto::PublicKey;
 use eth_types::{ForkSchedule, Root, Slot, SLOTS_PER_EPOCH};
 use observability::logging::{TruncatedPubkey, TruncatedRoot};
-use signer::ValidatorSigner;
+use signer::{CircuitBreakerState, ValidatorSigner};
 use validator_store::ValidatorStore;
 
 use crate::traits::{BeaconBlockClient, ProduceBlockResponse};

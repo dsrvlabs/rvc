@@ -23,7 +23,7 @@ block_selection_mode = "builder-only"
 
 mod composition {
     use bn_manager::{BnManagerConfig, BnRole, HealthTier, TierThresholds};
-    use builder::CircuitBreakerState;
+    use signer::CircuitBreakerState;
     use std::collections::HashSet;
     use validator_store::{BlockSelectionMode, ValidatorConfig, ValidatorStore};
 

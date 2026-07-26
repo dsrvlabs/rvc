@@ -358,6 +358,48 @@ pub fn regenerate_architecture_md() -> Result<bool, String> {
     Ok(true)
 }
 
+/// Production edges that must never appear in the workspace graph.
+///
+/// Kept here (and consumed by `architecture_no_cycles` + the doc policy
+/// cross-check) so the generated ARCHITECTURE.md cannot contradict the DAG gate.
+pub const FORBIDDEN_EDGES: &[(&str, &str)] = &[
+    ("rvc-slashing", "rvc-doppelganger"),
+    ("rvc-signer", "rvc-keymanager-api"),
+    // RF6-25 / F112: block-service must not pull the MEV builder crate for one type.
+    ("rvc-block-service", "rvc-builder"),
+];
+
+/// Domain package names (`Layer::Domain` in [`CLASSIFICATION`]).
+///
+/// Used by the no-domain→domain edge rule. Keep in lock-step with CLASSIFICATION
+/// yellow nodes; the unit test `domain_packages_match_classification` enforces this.
+pub const DOMAIN_PACKAGES: &[&str] = &[
+    "rvc-block-service",
+    "rvc-builder",
+    "rvc-doppelganger",
+    "rvc-duty-tracker",
+    "rvc-propagator",
+    "rvc-signer",
+    "rvc-signer-server",
+    "rvc-sync-service",
+    "rvc-timing",
+];
+
+/// Domain→domain edges that are intentionally allowed (grandfathered).
+///
+/// Enumerated from `cargo metadata` after removing `block-service → builder`
+/// (RF6-25). Do **not** add entries to silence new peer-duty edges — fix the
+/// edge (shared type in a non-domain home) or document a genuine exception.
+pub const DOMAIN_EDGE_ALLOWLIST: &[(&str, &str)] = &[
+    // Duty services take the signing trait from the domain signing crate.
+    ("rvc-block-service", "rvc-signer"),
+    ("rvc-builder", "rvc-signer"),
+    // Remote signing library wraps the in-process signing stack.
+    ("rvc-signer-server", "rvc-signer"),
+    // Issue 1.5: enablement gate lives in doppelganger (REQUIRED_EDGE).
+    ("rvc-signer", "rvc-doppelganger"),
+];
+
 /// Cross-check generated edges against standing policy tables used by
 /// `architecture_no_cycles` (REQUIRED / FORBIDDEN). Shared so the doc cannot
 /// contradict the DAG gate (F109: signer→doppelganger was missing from the doc).
@@ -375,9 +417,7 @@ pub fn assert_generated_agrees_with_policy(graph: &WorkspaceGraph) {
     );
 
     // FORBIDDEN edges must not appear.
-    const FORBIDDEN: &[(&str, &str)] =
-        &[("rvc-slashing", "rvc-doppelganger"), ("rvc-signer", "rvc-keymanager-api")];
-    for (f, t) in FORBIDDEN {
+    for (f, t) in FORBIDDEN_EDGES {
         if let Some(deps) = graph.edges.get(*f) {
             assert!(!deps.contains(*t), "forbidden edge present in cargo metadata: {f} -> {t}");
         }
@@ -394,6 +434,20 @@ mod unit_tests {
         for (name, _, _, _) in CLASSIFICATION {
             assert!(seen.insert(*name), "duplicate CLASSIFICATION entry: {name}");
         }
+    }
+
+    #[test]
+    fn domain_packages_match_classification() {
+        let from_class: BTreeSet<&str> = CLASSIFICATION
+            .iter()
+            .filter(|(_, layer, _, _)| *layer == Layer::Domain)
+            .map(|(name, _, _, _)| *name)
+            .collect();
+        let from_const: BTreeSet<&str> = DOMAIN_PACKAGES.iter().copied().collect();
+        assert_eq!(
+            from_class, from_const,
+            "DOMAIN_PACKAGES must match CLASSIFICATION Layer::Domain entries"
+        );
     }
 
     #[test]

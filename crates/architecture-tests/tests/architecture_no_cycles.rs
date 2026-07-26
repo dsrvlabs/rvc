@@ -8,7 +8,8 @@
 //!
 //! 1. The workspace-internal production dependency graph is acyclic.
 //! 2. Documented forbidden edges are absent (slashing->doppelganger,
-//!    signer->keymanager-api, eth-types->any).
+//!    signer->keymanager-api, block-service->builder, plus the general
+//!    no-domain→domain rule with a grandfather allowlist).
 //! 3. The expected `rvc-signer → rvc-doppelganger` edge (Issue 1.5) is present.
 //! 4. The single new production edge the logging initiative introduces in Phase 2,
 //!    `rvc-signer-bin → rvc-telemetry`, is allowed (never forbidden) and provably acyclic
@@ -43,8 +44,15 @@ use std::process::Command;
 // ---------------------------------------------------------------------------
 
 /// Production edges that must never appear in the workspace graph.
-const FORBIDDEN: &[(&str, &str)] =
-    &[("rvc-slashing", "rvc-doppelganger"), ("rvc-signer", "rvc-keymanager-api")];
+///
+/// Single source of truth: `rvc_architecture_tests::FORBIDDEN_EDGES`.
+const FORBIDDEN: &[(&str, &str)] = rvc_architecture_tests::FORBIDDEN_EDGES;
+
+/// Domain packages for the no-domain→domain rule.
+const DOMAIN_PACKAGES: &[&str] = rvc_architecture_tests::DOMAIN_PACKAGES;
+
+/// Grandfathered domain→domain edges (see `DOMAIN_EDGE_ALLOWLIST` docs).
+const DOMAIN_EDGE_ALLOWLIST: &[(&str, &str)] = rvc_architecture_tests::DOMAIN_EDGE_ALLOWLIST;
 
 /// Crates that must have zero workspace-internal PRODUCTION out-edges (leaf SINKS).
 /// If a name is absent from `cargo metadata` output the check is skipped,
@@ -275,6 +283,36 @@ fn architecture_no_cycles() {
                 edge.1
             );
         }
+    }
+
+    // ------------------------------------------------------------------
+    // 5c. RF6-25: no domain→domain edges except the grandfather allowlist.
+    //     Domain set = Layer::Domain (yellow) packages. Peer duty crates must
+    //     not depend on each other; shared helpers live in non-domain homes
+    //     (e.g. CircuitBreakerState in rvc-signer::service_util).
+    // ------------------------------------------------------------------
+    {
+        let domain: HashSet<&str> = DOMAIN_PACKAGES.iter().copied().collect();
+        let allow: HashSet<(&str, &str)> = DOMAIN_EDGE_ALLOWLIST.iter().copied().collect();
+        let mut violations: Vec<String> = Vec::new();
+        for (from, deps) in &edges {
+            if !domain.contains(from.as_str()) {
+                continue;
+            }
+            for to in deps {
+                if domain.contains(to.as_str()) && !allow.contains(&(from.as_str(), to.as_str())) {
+                    violations.push(format!("{from} -> {to}"));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "forbidden domain→domain edge(s): [{}]. \
+             Domain crates must not depend on peer domain crates. \
+             Fix the edge (shared type in a non-domain / shared home) or add a \
+             deliberate grandfather entry to DOMAIN_EDGE_ALLOWLIST with a comment.",
+            violations.join(", ")
+        );
     }
 
     // ------------------------------------------------------------------

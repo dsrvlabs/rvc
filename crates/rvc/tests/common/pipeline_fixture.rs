@@ -19,7 +19,6 @@ use beacon::{
 };
 use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse as BlockProdResp};
 use bn_manager::{BeaconNodeClient, MockBeaconNodeClient};
-use builder::CircuitBreakerState;
 use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
 use doppelganger::SigningEnablement;
 use duty_tracker::DutyTracker;
@@ -28,6 +27,7 @@ use propagator::{AttestationSubmitter, Propagator};
 use rvc::orchestrator::{
     DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorHandle, PubkeyMap,
 };
+use signer::CircuitBreakerState;
 use signer::{always_enabled, SignerService};
 use slashing::SlashingDb;
 use timing::MockSlotClock;

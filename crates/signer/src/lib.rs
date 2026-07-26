@@ -14,6 +14,7 @@ mod error;
 mod fail_closed;
 mod gate;
 mod locks;
+mod service_util;
 mod traits;
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -31,6 +32,9 @@ pub use error::{classify, GateErrClass, SigningGateError};
 pub use fail_closed::FailClosedDefault;
 pub use gate::{SigningGate, AUDIT_CN_DEFAULT};
 pub use locks::ValidatorLockMap;
+/// Shared duty-crate helpers (circuit breaker, …). Home for types that must not
+/// create peer domain edges (block-service must not depend on builder for this).
+pub use service_util::CircuitBreakerState;
 pub use traits::ValidatorSigner;
 
 /// Test-only stubs (`StubValidatorSigner`, `mock_sig`). Enable via `test-utils`.

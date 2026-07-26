@@ -1,8 +1,8 @@
 //! Safety-feature integration coverage relocated from bin/rvc tier-2 suites.
 //!
 //! Exercises `rvc::slashing_monitor`, `rvc::startup` keystore locking, and
-//! safety-related `rvc::config` fields. Pure `builder::CircuitBreakerState`
-//! unit behaviour lives in `rvc-builder`; AtomicBool-only cases were pruned
+//! safety-related `rvc::config` fields. Pure `signer::CircuitBreakerState`
+//! unit behaviour lives in `rvc-signer`; AtomicBool-only cases were pruned
 //! as tautological (stdlib, not product code).
 
 mod attestation_disable {
@@ -290,8 +290,8 @@ mod config_integration {
 mod composition {
     use beacon::{ValidatorData, ValidatorInfo, ValidatorsResponse};
     use bn_manager::MockBeaconNodeClient;
-    use builder::CircuitBreakerState;
     use rvc::slashing_monitor::{check_slashed_validators, SlashedAction, SlashedOutcome};
+    use signer::CircuitBreakerState;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use validator_store::ValidatorStore;

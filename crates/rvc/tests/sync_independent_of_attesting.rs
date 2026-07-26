@@ -31,12 +31,12 @@ use beacon::{
 };
 use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse as BlockProdResp};
 use bn_manager::{BeaconNodeClient, MockBeaconNodeClient};
-use builder::CircuitBreakerState;
 use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
 use duty_tracker::DutyTracker;
 use eth_types::{ForkSchedule, Slot, SyncCommitteeDuty};
 use propagator::{AttestationSubmitter, Propagator};
 use rvc::orchestrator::{DutyOrchestrator, OrchestratorConfig, OrchestratorDeps};
+use signer::CircuitBreakerState;
 use signer::{always_enabled, SignerService};
 use slashing::SlashingDb;
 use timing::MockSlotClock;
