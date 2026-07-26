@@ -378,13 +378,13 @@ hand-written — pick whichever leaves the leaf list more readable and say which
 non-layout `try_tree_hash_root` delegates to the layout form with the default, exactly as today.
 
 **Acceptance criteria:**
-- [ ] Both types' 5-leaf order (`slot`, `proposer_index`, `parent_root`, `state_root`, `body_root`) is
+- [x] Both types' 5-leaf order (`slot`, `proposer_index`, `parent_root`, `state_root`, `body_root`) is
       stated once each.
-- [ ] `EXTERNAL_ELECTRA_BLOCK_ROOT_HEX`, `EXTERNAL_DENEB_BLOCK_ROOT_HEX`,
+- [x] `EXTERNAL_ELECTRA_BLOCK_ROOT_HEX`, `EXTERNAL_DENEB_BLOCK_ROOT_HEX`,
       `EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX` assertions pass unchanged.
-- [ ] `crates/crypto/src/remote_signer.rs:298,313` (which call `body_tree_hash_root` /
+- [x] `crates/crypto/src/remote_signer.rs:298,313` (which call `body_tree_hash_root` /
       `blinded_body_tree_hash_root` on the signing path) compile and their tests pass.
-- [ ] Test count unchanged; workspace green.
+- [x] Test count unchanged; workspace green.
 
 **Risks:** Low. If the layout variant makes the macro contorted, keeping these two hand-written and
 closing this issue with "evaluated, rejected, here's why" is an acceptable outcome — record it.

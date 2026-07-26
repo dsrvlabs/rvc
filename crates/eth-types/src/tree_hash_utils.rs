@@ -19,6 +19,16 @@ pub enum TreeHashError {
 ///
 /// `$panic_msg` is the `.expect(...)` string on the panicking `tree_hash_root`
 /// wrapper (production paths that can fail should call `try_tree_hash_root`).
+///
+/// # Layout-parameterised body leaf
+///
+/// `BeaconBlock` / `BlindedBeaconBlock` take a fifth leaf that is not a field
+/// root but a typed body HTR over raw SSZ bytes, optionally selected by
+/// [`BodyForkLayout`](crate::BodyForkLayout). Use the
+/// `body_auto` / `body_layout` arm: header leaves are listed explicitly; the
+/// body root is always the final leaf and is supplied by the two body
+/// closures (auto-detect vs explicit layout). That keeps the 5-leaf order
+/// stated once while preserving both root entry points.
 macro_rules! impl_container_tree_hash {
     ($ty:ident, $panic_msg:literal, [ $($leaf:expr),+ $(,)? ]) => {
         impl $ty {
@@ -65,6 +75,128 @@ macro_rules! impl_container_tree_hash {
                 1
             }
 
+            fn tree_hash_root(&self) -> ::tree_hash::Hash256 {
+                self.try_tree_hash_root().expect($panic_msg)
+            }
+        }
+    };
+
+    // Layout-parameterised: header leaves + final body root leaf.
+    //
+    // `$body_auto`:   `|s: &Self| -> Result<Hash256, TreeHashError>` (auto-detect body fork)
+    // `$body_layout`: `|s: &Self, layout: BodyForkLayout| -> Result<Hash256, TreeHashError>`
+    // `$leaf` list:   header field roots only; body is always the last leaf.
+    (
+        $ty:ident,
+        $panic_msg:literal,
+        body_auto = $body_auto:expr,
+        body_layout = $body_layout:expr,
+        [ $($leaf:expr),+ $(,)? ]
+    ) => {
+        impl $ty {
+            /// Spec `hash_tree_root` with typed body leaf (auto-detect Electra/Deneb).
+            ///
+            /// Returns [`TreeHashError::InvalidBody`] when body bytes are not valid
+            /// SSZ for the configured body decoder (does not panic).
+            pub fn try_tree_hash_root(
+                &self,
+            ) -> ::std::result::Result<::tree_hash::Hash256, $crate::TreeHashError> {
+                #[inline(always)]
+                fn call_body<F>(
+                    this: &$ty,
+                    body: F,
+                ) -> ::std::result::Result<::tree_hash::Hash256, $crate::TreeHashError>
+                where
+                    F: ::std::ops::FnOnce(
+                        &$ty,
+                    )
+                        -> ::std::result::Result<::tree_hash::Hash256, $crate::TreeHashError>,
+                {
+                    body(this)
+                }
+
+                let body_root = call_body(self, $body_auto)?;
+                self.hash_with_body_root(body_root)
+            }
+
+            /// Spec block root with an explicit [`BodyForkLayout`](crate::BodyForkLayout)
+            /// (when BN `consensus_version` is known). Prefer this over auto-detect
+            /// for production proposal paths.
+            pub fn try_tree_hash_root_for_layout(
+                &self,
+                layout: $crate::BodyForkLayout,
+            ) -> ::std::result::Result<::tree_hash::Hash256, $crate::TreeHashError> {
+                #[inline(always)]
+                fn call_body_layout<F>(
+                    this: &$ty,
+                    layout: $crate::BodyForkLayout,
+                    body: F,
+                ) -> ::std::result::Result<::tree_hash::Hash256, $crate::TreeHashError>
+                where
+                    F: ::std::ops::FnOnce(
+                        &$ty,
+                        $crate::BodyForkLayout,
+                    )
+                        -> ::std::result::Result<::tree_hash::Hash256, $crate::TreeHashError>,
+                {
+                    body(this, layout)
+                }
+
+                let body_root = call_body_layout(self, layout, $body_layout)?;
+                self.hash_with_body_root(body_root)
+            }
+
+            fn hash_with_body_root(
+                &self,
+                body_root: ::tree_hash::Hash256,
+            ) -> ::std::result::Result<::tree_hash::Hash256, $crate::TreeHashError> {
+                #[inline(always)]
+                fn call_leaf<F>(
+                    this: &$ty,
+                    leaf: F,
+                ) -> ::std::result::Result<::tree_hash::Hash256, $crate::TreeHashError>
+                where
+                    F: ::std::ops::FnOnce(
+                        &$ty,
+                    )
+                        -> ::std::result::Result<::tree_hash::Hash256, $crate::TreeHashError>,
+                {
+                    leaf(this)
+                }
+
+                // N = header leaves + final body_root leaf.
+                let mut hasher = ::tree_hash::MerkleHasher::with_leaves(
+                    1usize $(+ { let _ = ::core::stringify!($leaf); 1usize })+,
+                );
+                $(
+                    hasher
+                        .write(call_leaf(self, $leaf)?.as_slice())
+                        .expect("valid leaf");
+                )+
+                hasher.write(body_root.as_slice()).expect("valid leaf");
+                ::std::result::Result::Ok(hasher.finish().expect("valid root"))
+            }
+        }
+
+        impl ::tree_hash::TreeHash for $ty {
+            fn tree_hash_type() -> ::tree_hash::TreeHashType {
+                ::tree_hash::TreeHashType::Container
+            }
+
+            fn tree_hash_packed_encoding(&self) -> ::tree_hash::PackedEncoding {
+                ::core::unreachable!("containers cannot be packed")
+            }
+
+            fn tree_hash_packing_factor() -> usize {
+                1
+            }
+
+            /// Trait surface for `compute_signing_root` / tests with **valid** body SSZ.
+            ///
+            /// **Production paths must use [`Self::try_tree_hash_root`]** (or the
+            /// layout form), which return `Err` on malformed body bytes. This
+            /// method panics on invalid body SSZ because `TreeHash` cannot
+            /// express `Result`. Prefer failing closed over a zero root.
             fn tree_hash_root(&self) -> ::tree_hash::Hash256 {
                 self.try_tree_hash_root().expect($panic_msg)
             }
