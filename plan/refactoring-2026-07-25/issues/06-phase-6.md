@@ -558,9 +558,9 @@ inline** the 13 tests that reach private items: `primary_endpoint` (`:224`, 2 re
 (`:792`, 11 refs).
 
 **Acceptance criteria:**
-- [ ] `manager.rs` < 40% test lines; relocated file imports only the public surface; no `pub` added.
-- [ ] Test count before == after (baseline recorded with `cargo nextest list -p bn-manager | wc -l`).
-- [ ] `git diff -M` renders as renames. Workspace green.
+- [x] `manager.rs` < 40% test lines; relocated file imports only the public surface; no `pub` added.
+- [x] Test count before == after (baseline recorded with `cargo nextest list -p bn-manager | wc -l`).
+- [x] `git diff -M` renders as renames. Workspace green.
 
 **Risks:** E5 (Phase 4) introduced the shared configurable mock in `bn-manager`'s `test-utils` feature;
 the relocated suite must consume it rather than re-declaring mocks. Confirm at step 1.
