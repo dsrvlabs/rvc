@@ -195,8 +195,7 @@ mod attestation_disable {
 mod slashed_validator_monitor {
     use beacon::{ValidatorData, ValidatorInfo, ValidatorsResponse};
     use bn_manager::MockBeaconNodeClient;
-    use rvc::slashing_monitor::{check_slashed_validators, SlashedAction};
-    use tokio::sync::watch;
+    use rvc::slashing_monitor::{check_slashed_validators, SlashedAction, SlashedOutcome};
     use validator_store::ValidatorStore;
 
     fn mock_with_validators(validators: Vec<ValidatorData>) -> MockBeaconNodeClient {
@@ -233,15 +232,17 @@ mod slashed_validator_monitor {
         let store = ValidatorStore::new([0u8; 20], 100);
         store.add_validator(validator_store::ValidatorConfig::new(pk));
 
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly, &shutdown_tx).await;
+        let outcome = check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly).await;
 
         assert!(
             !store.list_enabled_pubkeys().contains(&pk),
             "slashed validator should be disabled"
         );
-        assert!(!*shutdown_rx.borrow(), "should not trigger shutdown in disable-only mode");
+        assert_eq!(
+            outcome,
+            SlashedOutcome::NoAction,
+            "should not request shutdown in disable-only mode"
+        );
     }
 
     #[tokio::test]
@@ -251,14 +252,13 @@ mod slashed_validator_monitor {
         let store = ValidatorStore::new([0u8; 20], 100);
         store.add_validator(validator_store::ValidatorConfig::new(pk));
 
-        let (shutdown_tx, _rx) = watch::channel(false);
-
-        check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly, &shutdown_tx).await;
+        let outcome = check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly).await;
 
         assert!(
             store.list_enabled_pubkeys().contains(&pk),
             "healthy validator should remain enabled"
         );
+        assert_eq!(outcome, SlashedOutcome::NoAction);
     }
 
     #[tokio::test]
@@ -268,14 +268,13 @@ mod slashed_validator_monitor {
         let store = ValidatorStore::new([0u8; 20], 100);
         store.add_validator(validator_store::ValidatorConfig::new(pk));
 
-        let (shutdown_tx, _rx) = watch::channel(false);
-
-        check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly, &shutdown_tx).await;
+        let outcome = check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly).await;
 
         assert!(
             store.list_enabled_pubkeys().contains(&pk),
             "fail-open: validator should remain enabled on BN error"
         );
+        assert_eq!(outcome, SlashedOutcome::NoAction);
     }
 
     #[tokio::test]
@@ -285,11 +284,13 @@ mod slashed_validator_monitor {
         let store = ValidatorStore::new([0u8; 20], 100);
         store.add_validator(validator_store::ValidatorConfig::new(pk));
 
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let outcome = check_slashed_validators(&beacon, &store, SlashedAction::Shutdown).await;
 
-        check_slashed_validators(&beacon, &store, SlashedAction::Shutdown, &shutdown_tx).await;
-
-        assert!(*shutdown_rx.borrow(), "shutdown signal should be sent");
+        assert_eq!(
+            outcome,
+            SlashedOutcome::ShutdownRequested,
+            "shutdown signal should be requested"
+        );
     }
 
     #[tokio::test]
@@ -299,12 +300,10 @@ mod slashed_validator_monitor {
         let store = ValidatorStore::new([0u8; 20], 100);
         store.add_validator(validator_store::ValidatorConfig::new(pk));
 
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        check_slashed_validators(&beacon, &store, SlashedAction::None, &shutdown_tx).await;
+        let outcome = check_slashed_validators(&beacon, &store, SlashedAction::None).await;
 
         assert!(store.list_enabled_pubkeys().contains(&pk), "none action should not disable");
-        assert!(!*shutdown_rx.borrow(), "none action should not shutdown");
+        assert_eq!(outcome, SlashedOutcome::NoAction, "none action should not shutdown");
     }
 
     #[test]
@@ -330,12 +329,11 @@ mod slashed_validator_monitor {
         store.add_validator(validator_store::ValidatorConfig::new(pk1));
         store.add_validator(validator_store::ValidatorConfig::new(pk2));
 
-        let (shutdown_tx, _rx) = watch::channel(false);
-
-        check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly, &shutdown_tx).await;
+        let outcome = check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly).await;
 
         assert!(!store.list_enabled_pubkeys().contains(&pk1), "slashed pk1 should be disabled");
         assert!(store.list_enabled_pubkeys().contains(&pk2), "healthy pk2 should remain enabled");
+        assert_eq!(outcome, SlashedOutcome::NoAction);
     }
 }
 
@@ -479,10 +477,9 @@ mod composition {
     use beacon::{ValidatorData, ValidatorInfo, ValidatorsResponse};
     use bn_manager::MockBeaconNodeClient;
     use builder::CircuitBreakerState;
-    use rvc::slashing_monitor::{check_slashed_validators, SlashedAction};
+    use rvc::slashing_monitor::{check_slashed_validators, SlashedAction, SlashedOutcome};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use tokio::sync::watch;
     use validator_store::ValidatorStore;
 
     fn test_pubkey() -> [u8; 48] {
@@ -543,16 +540,15 @@ mod composition {
         store.add_validator(validator_store::ValidatorConfig::new(pk));
 
         let attesting_enabled = Arc::new(AtomicBool::new(false));
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         // Even with attestation globally disabled, slashing monitor still operates
-        check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly, &shutdown_tx).await;
+        let outcome = check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly).await;
 
         assert!(
             !store.list_enabled_pubkeys().contains(&pk),
             "slashed validator should be disabled regardless of global attestation flag"
         );
-        assert!(!*shutdown_rx.borrow());
+        assert_eq!(outcome, SlashedOutcome::NoAction);
 
         // Attestation flag is independent
         assert!(!attesting_enabled.load(Ordering::Relaxed));
@@ -588,15 +584,13 @@ mod composition {
         let store = ValidatorStore::new([0u8; 20], 100);
         store.add_validator(validator_store::ValidatorConfig::new(pk));
 
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
         // All features operating together: no slashing, no circuit breaker trip, attestation on
-        check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly, &shutdown_tx).await;
+        let outcome = check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly).await;
 
         assert!(store.list_enabled_pubkeys().contains(&pk));
         assert!(!circuit_breaker.is_tripped());
         assert!(attesting_enabled.load(Ordering::Relaxed));
-        assert!(!*shutdown_rx.borrow());
+        assert_eq!(outcome, SlashedOutcome::NoAction);
 
         // Now disable attestation and trip circuit breaker
         attesting_enabled.store(false, Ordering::Relaxed);
@@ -607,6 +601,6 @@ mod composition {
         assert!(circuit_breaker.is_tripped());
         assert!(!attesting_enabled.load(Ordering::Relaxed));
         assert!(store.list_enabled_pubkeys().contains(&pk)); // healthy validator still enabled
-        assert!(!*shutdown_rx.borrow()); // no shutdown
+        assert_eq!(outcome, SlashedOutcome::NoAction); // no shutdown
     }
 }

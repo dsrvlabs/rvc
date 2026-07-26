@@ -1426,42 +1426,12 @@ async fn run_validator(
             config.slashed_validators_action.parse().map_err(|e: String| anyhow::anyhow!(e))?;
 
         if slashed_action != rvc::slashing_monitor::SlashedAction::None {
-            let monitor_beacon = beacon.clone();
-            let monitor_store = validator_store.clone();
-            let monitor_shutdown = shutdown_token.clone();
-            let monitor_orch_handle_shutdown = {
-                // We need to signal the orchestrator. Create a watch channel for it.
-                let (tx, _rx) = tokio::sync::watch::channel(false);
-                tx
-            };
-            // We'll re-purpose: the slashing monitor just cancels the shutdown_token
-            // and the main select! picks it up.
-            tokio::spawn(async move {
-                let slot_duration = std::time::Duration::from_secs(12);
-                let epoch_duration = slot_duration * 32;
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(epoch_duration) => {}
-                        _ = monitor_shutdown.cancelled() => {
-                            break;
-                        }
-                    }
-
-                    rvc::slashing_monitor::check_slashed_validators(
-                        monitor_beacon.as_ref(),
-                        &monitor_store,
-                        slashed_action,
-                        &monitor_orch_handle_shutdown,
-                    )
-                    .await;
-
-                    // If shutdown action was triggered, cancel everything
-                    if *monitor_orch_handle_shutdown.borrow() {
-                        monitor_shutdown.cancel();
-                        break;
-                    }
-                }
-            });
+            rvc::slashing_monitor::spawn(
+                beacon.clone(),
+                validator_store.clone(),
+                slashed_action,
+                shutdown_token.clone(),
+            );
             info!(
                 action = %config.slashed_validators_action,
                 "Slashing monitor started"

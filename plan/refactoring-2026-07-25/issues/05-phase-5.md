@@ -685,10 +685,10 @@ be the return type. The loop also hardcodes slot/epoch timing that `eth_types::S
 4. Leave `SlashedAction`'s stringly `FromStr` alone here — RF5-11 replaces it.
 
 **Acceptance criteria:**
-- [ ] No `watch::channel` remains in `bin/rvc/src/main.rs` for the slashing monitor.
-- [ ] Epoch tick derives from `eth_types` constants; no `from_secs(12)` literal remains in the loop.
-- [ ] `ShutdownRequested` cancels the `CancellationToken` and the main `select!` still exits cleanly.
-- [ ] The configured `slashed_validators_action` semantics are unchanged for every value.
+- [x] No `watch::channel` remains in `bin/rvc/src/main.rs` for the slashing monitor.
+- [x] Epoch tick derives from `eth_types` constants; no `from_secs(12)` literal remains in the loop.
+- [x] `ShutdownRequested` cancels the `CancellationToken` and the main `select!` still exits cleanly.
+- [x] The configured `slashed_validators_action` semantics are unchanged for every value.
 
 **TDD test plan** (RED first):
 - `test_check_slashed_validators_returns_shutdown_requested_for_configured_action` — **RED**: the
