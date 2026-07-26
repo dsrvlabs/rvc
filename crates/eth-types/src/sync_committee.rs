@@ -1,9 +1,40 @@
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tree_hash::{Hash256, MerkleHasher, TreeHash, TreeHashType};
 
 use crate::hex_fixed::bytes_32_hex;
 use crate::tree_hash_utils::vec_u8_tree_hash_root;
 use crate::{Root, Signature, Slot};
+
+/// Total validators in a sync committee (Altair+).
+pub const SYNC_COMMITTEE_SIZE: u64 = 512;
+
+/// Number of subnets the sync committee is split across.
+pub const SYNC_COMMITTEE_SUBNET_COUNT: u64 = 4;
+
+/// Target number of aggregators per sync subcommittee.
+pub const TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE: u64 = 16;
+
+/// Map a validator's position in the full sync committee to its subcommittee index.
+///
+/// Spec: `subcommittee_index = position // (SYNC_COMMITTEE_SIZE // SYNC_COMMITTEE_SUBNET_COUNT)`.
+#[inline]
+pub fn subcommittee_index(pos: u64) -> u64 {
+    pos / (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT)
+}
+
+/// Returns `true` when `selection_proof` selects the validator as a sync
+/// committee aggregator (`sha256(proof)[0..8] as u64 % modulo == 0`).
+pub fn is_sync_committee_aggregator(selection_proof: &[u8]) -> bool {
+    let modulo = (SYNC_COMMITTEE_SIZE
+        / SYNC_COMMITTEE_SUBNET_COUNT
+        / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE)
+        .max(1);
+
+    let hash = Sha256::digest(selection_proof);
+    let value = u64::from_le_bytes(hash[0..8].try_into().expect("sha256 output is 32 bytes"));
+    value % modulo == 0
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncCommitteeMessage {
@@ -132,6 +163,82 @@ pub struct SignedContributionAndProof {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins `subcommittee_index` to the legacy expression that used to live in
+    /// both `sync-service` and the orchestrator (F99 / RF3-20).
+    #[test]
+    fn test_subcommittee_index_matches_both_legacy_closures() {
+        for pos in 0..SYNC_COMMITTEE_SIZE {
+            let legacy = pos / (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT);
+            assert_eq!(
+                subcommittee_index(pos),
+                legacy,
+                "pos={pos}: helper must match legacy closure"
+            );
+        }
+        // Boundary checks matching the former drift-detection KAT.
+        assert_eq!(subcommittee_index(0), 0);
+        assert_eq!(subcommittee_index(127), 0);
+        assert_eq!(subcommittee_index(128), 1);
+        assert_eq!(subcommittee_index(255), 1);
+        assert_eq!(subcommittee_index(256), 2);
+        assert_eq!(subcommittee_index(383), 2);
+        assert_eq!(subcommittee_index(384), 3);
+        assert_eq!(subcommittee_index(511), 3);
+    }
+
+    fn find_aggregator_proof() -> Vec<u8> {
+        let modulo = (SYNC_COMMITTEE_SIZE
+            / SYNC_COMMITTEE_SUBNET_COUNT
+            / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE)
+            .max(1);
+        for i in 0u64.. {
+            let proof = i.to_le_bytes().to_vec();
+            let hash = Sha256::digest(&proof);
+            let value = u64::from_le_bytes(hash[0..8].try_into().unwrap());
+            if value % modulo == 0 {
+                return proof;
+            }
+        }
+        unreachable!()
+    }
+
+    fn find_non_aggregator_proof() -> Vec<u8> {
+        let modulo = (SYNC_COMMITTEE_SIZE
+            / SYNC_COMMITTEE_SUBNET_COUNT
+            / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE)
+            .max(1);
+        for i in 0u64.. {
+            let proof = i.to_le_bytes().to_vec();
+            let hash = Sha256::digest(&proof);
+            let value = u64::from_le_bytes(hash[0..8].try_into().unwrap());
+            if value % modulo != 0 {
+                return proof;
+            }
+        }
+        unreachable!()
+    }
+
+    #[test]
+    fn test_is_sync_committee_aggregator_kat() {
+        let proof = find_aggregator_proof();
+        assert!(is_sync_committee_aggregator(&proof));
+
+        let non = find_non_aggregator_proof();
+        assert!(!is_sync_committee_aggregator(&non));
+
+        // 512 / 4 / 16 = 8
+        let modulo = SYNC_COMMITTEE_SIZE
+            / SYNC_COMMITTEE_SUBNET_COUNT
+            / TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE;
+        assert_eq!(modulo, 8);
+
+        // Empty proof: SHA256("") first 8 LE bytes % 8
+        let result = is_sync_committee_aggregator(&[]);
+        let hash = Sha256::digest([]);
+        let value = u64::from_le_bytes(hash[0..8].try_into().unwrap());
+        assert_eq!(result, value % 8 == 0);
+    }
 
     fn sample_sync_committee_message() -> SyncCommitteeMessage {
         SyncCommitteeMessage {

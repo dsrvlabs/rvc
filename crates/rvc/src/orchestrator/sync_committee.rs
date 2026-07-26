@@ -7,20 +7,16 @@ use bn_manager::BeaconNodeClient;
 use crypto::logging::TruncatedPubkey;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
-use eth_types::{ContributionAndProof, SignedContributionAndProof, Slot, SyncCommitteeDuty};
+use eth_types::{
+    is_sync_committee_aggregator, subcommittee_index, ContributionAndProof,
+    SignedContributionAndProof, Slot, SyncCommitteeDuty,
+};
 use signer::SignerService;
-use sync_service::is_sync_committee_aggregator;
 use validator_store::ValidatorStore;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
 use super::slot_context::SlotContext;
 use super::utils;
-
-/// Total validators in a sync committee.
-const SYNC_COMMITTEE_SIZE: u64 = 512;
-
-/// Number of subnets the sync committee is split across.
-const SYNC_COMMITTEE_SUBNET_COUNT: u64 = 4;
 
 pub(crate) struct SyncCommitteeService {
     signer: Arc<SignerService>,
@@ -167,7 +163,7 @@ impl SyncCommitteeService {
             let subcommittee_indices: BTreeSet<u64> = duty
                 .validator_sync_committee_indices
                 .iter()
-                .map(|&pos| pos / (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT))
+                .map(|&pos| subcommittee_index(pos))
                 .collect();
 
             for subcommittee_index in &subcommittee_indices {

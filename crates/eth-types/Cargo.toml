@@ -14,6 +14,9 @@ serde.workspace = true
 serde_json.workspace = true
 ethereum_serde_utils.workspace = true
 hex.workspace = true
+# Used by `is_sync_committee_aggregator` (RF3-20 / G7). External only — keeps
+# the zero workspace-internal out-edge pin for rvc-eth-types.
+sha2.workspace = true
 ssz.workspace = true
 ssz_derive.workspace = true
 # Body-container SSZ Encode/Decode only (ssz_types VariableList/Bit* are 0.8 traits).
@@ -25,7 +28,11 @@ tree_hash_derive.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+<<<<<<< HEAD
 # Independent SSZ-Merkleization oracle for the BeaconBlockHeader KAT (FR-31).
 # Dev-only: not a production out-edge, so the architecture-tests
 # zero-out-edge invariant for rvc-eth-types is unaffected.
 sha2.workspace = true
+=======
+tracing-test = { workspace = true, features = ["no-env-filter"] }
+>>>>>>> ccf13a0 (refactor(eth-types): move sync-committee constants and aggregator helpers (RF3-20))

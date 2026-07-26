@@ -62,8 +62,10 @@ pub use ssz_helpers::{
     encode_blinded_beacon_block_ssz, encode_sync_committee_contribution_ssz, SszDecodeError,
 };
 pub use sync_committee::{
-    ContributionAndProof, SignedContributionAndProof, SyncAggregatorSelectionData,
-    SyncCommitteeContribution, SyncCommitteeDuty, SyncCommitteeMessage,
+    is_sync_committee_aggregator, subcommittee_index, ContributionAndProof,
+    SignedContributionAndProof, SyncAggregatorSelectionData, SyncCommitteeContribution,
+    SyncCommitteeDuty, SyncCommitteeMessage, SYNC_COMMITTEE_SIZE, SYNC_COMMITTEE_SUBNET_COUNT,
+    TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE,
 };
 pub use tree_hash_utils::TreeHashError;
 

@@ -35,7 +35,6 @@ serde_json.workspace = true
 secret-provider.workspace = true
 signer.workspace = true
 slashing.workspace = true
-sync-service.workspace = true
 serde.workspace = true
 toml.workspace = true
 thiserror.workspace = true

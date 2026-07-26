@@ -4119,7 +4119,6 @@ dependencies = [
  "rvc-secret-provider",
  "rvc-signer",
  "rvc-slashing",
- "rvc-sync-service",
  "rvc-timing",
  "rvc-validator-store",
  "secrecy",
@@ -4597,7 +4596,6 @@ dependencies = [
 name = "rvc-sync-service"
 version = "0.6.0"
 dependencies = [
- "sha2",
  "thiserror 2.0.18",
 ]
 
