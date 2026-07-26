@@ -9,6 +9,7 @@ use observability::logging::RedactedUrl;
 use eth_types::{ForkSchedule, SignedValidatorRegistration, SignedVoluntaryExit};
 
 use crate::http_caps::{read_body_capped, read_body_capped_lossy, ResponseCaps};
+use crate::retry::RetryPolicy;
 use crate::types::{
     parse_fork_schedule, AttestationDataResponse, AttesterDutiesResponse,
     BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, DataResponse,
@@ -123,18 +124,110 @@ impl BeaconClient {
     /// to avoid exceeding URL length limits.
     const POST_VALIDATORS_THRESHOLD: usize = 50;
 
+    /// Inject W3C trace context headers into an outbound request builder.
+    ///
+    /// Single call site for `telemetry::inject_trace_context` in this crate.
+    fn traced(builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut headers = reqwest::header::HeaderMap::new();
+        telemetry::inject_trace_context(&mut headers);
+        builder.headers(headers)
+    }
+
+    /// Shared retry/backoff policy derived from this client's config.
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy::new(self.config.max_retries, self.config.initial_backoff)
+    }
+
+    /// Join the configured endpoint with a path (and optional query string).
+    ///
+    /// Builds a well-formed absolute URL under the **configured beacon origin**
+    /// only. Matches the historical `format!("{}{}", endpoint, path)` invariant
+    /// that the request host never changes: absolute or scheme-relative path
+    /// inputs that would rewrite scheme/host/port are rejected (`InvalidUrl`)
+    /// rather than followed (SSRF guard against `Url::join` absolute-URL takeover).
+    ///
+    /// Path and query components that contain only unreserved characters remain
+    /// byte-identical to the historical construction for normal `/eth/...` paths.
+    /// Dynamic segments should be percent-encoded via [`Self::build_path`] before
+    /// being passed here.
+    fn resolve_url(&self, path: &str) -> Result<String, BeaconError> {
+        let endpoint = self.config.endpoint.trim_end_matches('/');
+        let origin = url::Url::parse(endpoint).map_err(|e| {
+            BeaconError::InvalidUrl(format!("invalid endpoint '{}': {e}", self.config.endpoint))
+        })?;
+
+        // Scheme-relative references (`//host/...`) rewrite authority under join.
+        // Historical concat could not do that; refuse them explicitly.
+        if path.starts_with("//") {
+            return Err(BeaconError::InvalidUrl(format!(
+                "refusing scheme-relative path that would rewrite origin: {path}"
+            )));
+        }
+
+        // Join against `endpoint/` so a leading-slash path is treated as a path
+        // reference relative to the beacon origin (same host as string concat).
+        let base = format!("{}/", endpoint);
+        let base_url = url::Url::parse(&base).map_err(|e| {
+            BeaconError::InvalidUrl(format!("invalid endpoint '{}': {e}", self.config.endpoint))
+        })?;
+        let rel = path.trim_start_matches('/');
+        let joined = base_url
+            .join(rel)
+            .map_err(|e| BeaconError::InvalidUrl(format!("failed to join path '{path}': {e}")))?;
+
+        // Pin scheme + host + port to the configured endpoint. `Url::join` replaces
+        // the entire base when `rel` is an absolute URL (e.g. path="/http://evil.com/x"
+        // → rel="http://evil.com/x"). That is a cross-origin SSRF regression vs concat.
+        if !Self::same_origin(&origin, &joined) {
+            return Err(BeaconError::InvalidUrl(format!(
+                "resolved URL origin differs from configured beacon endpoint \
+                 (refusing cross-origin request): {path}"
+            )));
+        }
+
+        Ok(joined.to_string())
+    }
+
+    /// True when `candidate` shares scheme, host, and effective port with `origin`.
+    fn same_origin(origin: &url::Url, candidate: &url::Url) -> bool {
+        origin.scheme() == candidate.scheme()
+            && origin.host() == candidate.host()
+            && origin.port_or_known_default() == candidate.port_or_known_default()
+    }
+
+    /// Build a path + query string with percent-encoded segments and query values.
+    ///
+    /// `segments` are joined with `/` (no leading empty segment). Query pairs are
+    /// encoded via `query_pairs_mut` (application/x-www-form-urlencoded).
+    fn build_path(segments: &[&str], query: &[(&str, &str)]) -> String {
+        let mut url = url::Url::parse("http://placeholder.invalid")
+            .expect("static placeholder URL must parse");
+        {
+            let mut segs = url.path_segments_mut().expect("placeholder is a base URL");
+            segs.clear();
+            for seg in segments {
+                segs.push(seg);
+            }
+        }
+        if !query.is_empty() {
+            let mut qp = url.query_pairs_mut();
+            for (k, v) in query {
+                qp.append_pair(k, v);
+            }
+        }
+        let mut out = url.path().to_string();
+        if let Some(q) = url.query() {
+            out.push('?');
+            out.push_str(q);
+        }
+        out
+    }
+
     /// Performs a GET request with retry logic.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, BeaconError> {
-        let url = format!("{}{}", self.config.endpoint, path);
-        let mut trace_headers = reqwest::header::HeaderMap::new();
-        telemetry::inject_trace_context(&mut trace_headers);
-        let hdrs = trace_headers.clone();
+        let url = self.resolve_url(path)?;
         self.execute_with_retry("GET", &url, || async {
-            let mut req = self.client.get(&url);
-            for (name, value) in &hdrs {
-                req = req.header(name.clone(), value.clone());
-            }
-            req.send().await
+            Self::traced(self.client.get(&url)).send().await
         })
         .await
     }
@@ -145,7 +238,7 @@ impl BeaconClient {
         path: &str,
         body: &B,
     ) -> Result<T, BeaconError> {
-        let url = format!("{}{}", self.config.endpoint, path);
+        let url = self.resolve_url(path)?;
         if tracing::enabled!(tracing::Level::TRACE) {
             let body_size = serde_json::to_vec(body).map(|b| b.len()).unwrap_or(0);
             trace!(
@@ -155,15 +248,8 @@ impl BeaconClient {
                 "HTTP request body"
             );
         }
-        let mut trace_headers = reqwest::header::HeaderMap::new();
-        telemetry::inject_trace_context(&mut trace_headers);
-        let hdrs = trace_headers.clone();
         self.execute_with_retry("POST", &url, || async {
-            let mut req = self.client.post(&url).json(body);
-            for (name, value) in &hdrs {
-                req = req.header(name.clone(), value.clone());
-            }
-            req.send().await
+            Self::traced(self.client.post(&url).json(body)).send().await
         })
         .await
     }
@@ -201,9 +287,9 @@ impl BeaconClient {
             let body = serde_json::json!({ "ids": pubkeys });
             self.post(path, &body).instrument(tracing::info_span!("beacon.get_validators")).await
         } else {
-            let ids: String =
-                pubkeys.iter().map(|pk| format!("id={}", pk)).collect::<Vec<_>>().join("&");
-            let path = format!("/eth/v1/beacon/states/head/validators?{}", ids);
+            let pairs: Vec<(&str, &str)> = pubkeys.iter().map(|pk| ("id", pk.as_str())).collect();
+            let path =
+                Self::build_path(&["eth", "v1", "beacon", "states", "head", "validators"], &pairs);
             self.get(&path).instrument(tracing::info_span!("beacon.get_validators")).await
         }
     }
@@ -220,9 +306,11 @@ impl BeaconClient {
         slot: u64,
         committee_index: u64,
     ) -> Result<AttestationDataResponse, BeaconError> {
-        let path = format!(
-            "/eth/v1/validator/attestation_data?slot={}&committee_index={}",
-            slot, committee_index
+        let slot_s = slot.to_string();
+        let ci_s = committee_index.to_string();
+        let path = Self::build_path(
+            &["eth", "v1", "validator", "attestation_data"],
+            &[("slot", &slot_s), ("committee_index", &ci_s)],
         );
         self.get(&path)
             .instrument(tracing::info_span!("beacon.get_attestation_data", slot = slot))
@@ -259,7 +347,7 @@ impl BeaconClient {
     /// Common state_id values: "head", "finalized", "justified", or a specific slot number.
     #[tracing::instrument(name = "beacon.get_fork", skip_all)]
     pub async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError> {
-        let path = format!("/eth/v1/beacon/states/{}/fork", state_id);
+        let path = Self::build_path(&["eth", "v1", "beacon", "states", state_id, "fork"], &[]);
         self.get(&path).await
     }
 
@@ -268,7 +356,7 @@ impl BeaconClient {
     /// Common block_id values: "head", "finalized", "justified", or a slot number.
     #[tracing::instrument(name = "beacon.get_block_root", skip_all)]
     pub async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-        let path = format!("/eth/v1/beacon/blocks/{}/root", block_id);
+        let path = Self::build_path(&["eth", "v1", "beacon", "blocks", block_id, "root"], &[]);
         self.get(&path).await
     }
 
@@ -306,33 +394,30 @@ impl BeaconClient {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, BeaconError> {
-        let mut query = format!("randao_reveal={}", randao_reveal);
+        let slot_s = slot.to_string();
+        let factor_s = builder_boost_factor.map(|f| f.to_string());
+        let mut query: Vec<(&str, &str)> = vec![("randao_reveal", randao_reveal)];
         if let Some(g) = graffiti {
-            let encoded: String = url::form_urlencoded::byte_serialize(g.as_bytes()).collect();
-            query.push_str(&format!("&graffiti={}", encoded));
+            query.push(("graffiti", g));
         }
-        if let Some(factor) = builder_boost_factor {
-            query.push_str(&format!("&builder_boost_factor={}", factor));
+        if let Some(ref f) = factor_s {
+            query.push(("builder_boost_factor", f.as_str()));
         }
-        let url = format!("{}/eth/v3/validator/blocks/{}?{}", self.config.endpoint, slot, query);
-
-        let mut trace_headers = reqwest::header::HeaderMap::new();
-        telemetry::inject_trace_context(&mut trace_headers);
-        let hdrs = trace_headers.clone();
+        let path = Self::build_path(&["eth", "v3", "validator", "blocks", &slot_s], &query);
+        let url = self.resolve_url(&path)?;
 
         let response = self
             .execute_with_retry_raw(
                 "GET",
                 &url,
                 || async {
-                    let mut req = self
-                        .client
-                        .get(&url)
-                        .header(reqwest::header::ACCEPT, Self::SSZ_ACCEPT_HEADER);
-                    for (name, value) in &hdrs {
-                        req = req.header(name.clone(), value.clone());
-                    }
-                    req.send().await
+                    Self::traced(
+                        self.client
+                            .get(&url)
+                            .header(reqwest::header::ACCEPT, Self::SSZ_ACCEPT_HEADER),
+                    )
+                    .send()
+                    .await
                 },
                 Self::take_success_response,
             )
@@ -383,20 +468,18 @@ impl BeaconClient {
                         "SSZ block response processing failed, retrying with JSON"
                     );
                     // Single fallback retry with explicit JSON Accept
-                    let hdrs2 = trace_headers.clone();
                     let fallback_response = self
                         .execute_with_retry_raw(
                             "GET",
                             &url,
                             || async {
-                                let mut req = self
-                                    .client
-                                    .get(&url)
-                                    .header(reqwest::header::ACCEPT, "application/json");
-                                for (name, value) in &hdrs2 {
-                                    req = req.header(name.clone(), value.clone());
-                                }
-                                req.send().await
+                                Self::traced(
+                                    self.client
+                                        .get(&url)
+                                        .header(reqwest::header::ACCEPT, "application/json"),
+                                )
+                                .send()
+                                .await
                             },
                             Self::take_success_response,
                         )
@@ -541,11 +624,7 @@ impl BeaconClient {
     ) -> Result<(), BeaconError> {
         let path =
             if is_blinded { "/eth/v1/beacon/blinded_blocks" } else { "/eth/v2/beacon/blocks" };
-        let url = format!("{}{}", self.config.endpoint, path);
-
-        let mut trace_headers = reqwest::header::HeaderMap::new();
-        telemetry::inject_trace_context(&mut trace_headers);
-        let hdrs = trace_headers.clone();
+        let url = self.resolve_url(path)?;
         let cv = consensus_version.to_string();
         let body = ssz_bytes.to_vec();
 
@@ -553,21 +632,19 @@ impl BeaconClient {
             "POST",
             &url,
             || {
-                let hdrs = hdrs.clone();
                 let cv = cv.clone();
                 let body = body.clone();
                 let url = url.clone();
                 async move {
-                    let mut req = self
-                        .client
-                        .post(&url)
-                        .header("Content-Type", "application/octet-stream")
-                        .header("Eth-Consensus-Version", &cv)
-                        .body(body);
-                    for (name, value) in &hdrs {
-                        req = req.header(name.clone(), value.clone());
-                    }
-                    req.send().await
+                    Self::traced(
+                        self.client
+                            .post(&url)
+                            .header("Content-Type", "application/octet-stream")
+                            .header("Eth-Consensus-Version", &cv)
+                            .body(body),
+                    )
+                    .send()
+                    .await
                 }
             },
             |response| async move {
@@ -611,9 +688,15 @@ impl BeaconClient {
         subcommittee_index: u64,
         beacon_block_root: &str,
     ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-        let path = format!(
-            "/eth/v1/validator/sync_committee_contribution?slot={}&subcommittee_index={}&beacon_block_root={}",
-            slot, subcommittee_index, beacon_block_root
+        let slot_s = slot.to_string();
+        let sub_s = subcommittee_index.to_string();
+        let path = Self::build_path(
+            &["eth", "v1", "validator", "sync_committee_contribution"],
+            &[
+                ("slot", &slot_s),
+                ("subcommittee_index", &sub_s),
+                ("beacon_block_root", beacon_block_root),
+            ],
         );
         self.get(&path).await
     }
@@ -641,13 +724,14 @@ impl BeaconClient {
         attestation_data_root: &str,
         committee_index: Option<u64>,
     ) -> Result<VersionedAggregateAttestation, BeaconError> {
-        let mut path = format!(
-            "/eth/v1/validator/aggregate_attestation?slot={}&attestation_data_root={}",
-            slot, attestation_data_root
-        );
-        if let Some(ci) = committee_index {
-            path.push_str(&format!("&committee_index={}", ci));
+        let slot_s = slot.to_string();
+        let ci_s = committee_index.map(|ci| ci.to_string());
+        let mut query: Vec<(&str, &str)> =
+            vec![("slot", &slot_s), ("attestation_data_root", attestation_data_root)];
+        if let Some(ref ci) = ci_s {
+            query.push(("committee_index", ci.as_str()));
         }
+        let path = Self::build_path(&["eth", "v1", "validator", "aggregate_attestation"], &query);
 
         if committee_index.is_some() {
             let resp: DataResponse<eth_types::ElectraAttestation> = self.get(&path).await?;
@@ -781,7 +865,7 @@ impl BeaconClient {
         &self,
         attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError> {
-        let url = format!("{}/eth/v2/beacon/pool/attestations", self.config.endpoint);
+        let url = self.resolve_url("/eth/v2/beacon/pool/attestations")?;
 
         let span = tracing::info_span!(
             "beacon.submit_attestations",
@@ -789,8 +873,6 @@ impl BeaconClient {
             http.url = %RedactedUrl(&url),
             http.status_code = tracing::field::Empty,
         );
-        let mut trace_headers = reqwest::header::HeaderMap::new();
-        telemetry::inject_trace_context(&mut trace_headers);
 
         let (consensus_version, attestation_count) = match attestations {
             VersionedAttestation::PreElectra(atts) => ("phase0", atts.len()),
@@ -808,31 +890,28 @@ impl BeaconClient {
             "POST",
             &url,
             || {
-                let hdrs = trace_headers.clone();
                 let url = url.clone();
                 async move {
                     match attestations {
                         VersionedAttestation::PreElectra(atts) => {
-                            let mut req = self
-                                .client
-                                .post(&url)
-                                .header("Eth-Consensus-Version", consensus_version)
-                                .json(atts);
-                            for (name, value) in &hdrs {
-                                req = req.header(name.clone(), value.clone());
-                            }
-                            req.send().await
+                            Self::traced(
+                                self.client
+                                    .post(&url)
+                                    .header("Eth-Consensus-Version", consensus_version)
+                                    .json(atts),
+                            )
+                            .send()
+                            .await
                         }
                         VersionedAttestation::Electra(atts) | VersionedAttestation::Fulu(atts) => {
-                            let mut req = self
-                                .client
-                                .post(&url)
-                                .header("Eth-Consensus-Version", consensus_version)
-                                .json(atts);
-                            for (name, value) in &hdrs {
-                                req = req.header(name.clone(), value.clone());
-                            }
-                            req.send().await
+                            Self::traced(
+                                self.client
+                                    .post(&url)
+                                    .header("Eth-Consensus-Version", consensus_version)
+                                    .json(atts),
+                            )
+                            .send()
+                            .await
                         }
                     }
                 }
@@ -931,9 +1010,7 @@ impl BeaconClient {
         body: &B,
         headers: &[(&str, &str)],
     ) -> Result<(), BeaconError> {
-        let url = format!("{}{}", self.config.endpoint, path);
-        let mut trace_headers = reqwest::header::HeaderMap::new();
-        telemetry::inject_trace_context(&mut trace_headers);
+        let url = self.resolve_url(path)?;
 
         // Serialize once so each retry reuses the same body bytes.
         let body_bytes = serde_json::to_vec(body).map_err(|e| {
@@ -946,7 +1023,6 @@ impl BeaconClient {
             "POST",
             &url,
             || {
-                let hdrs = trace_headers.clone();
                 let pairs = header_pairs.clone();
                 let body_bytes = body_bytes.clone();
                 let url = url.clone();
@@ -959,10 +1035,7 @@ impl BeaconClient {
                     for (name, value) in &pairs {
                         request = request.header(name.as_str(), value.as_str());
                     }
-                    for (name, value) in &hdrs {
-                        request = request.header(name.clone(), value.clone());
-                    }
-                    request.send().await
+                    Self::traced(request).send().await
                 }
             },
             |response| async move {
@@ -1004,9 +1077,10 @@ impl BeaconClient {
         let mut last_error = None;
         let endpoint = url.split('?').next().unwrap_or(url);
 
-        for attempt in 0..=self.config.max_retries {
+        let policy = self.retry_policy();
+        for attempt in 0..=policy.max_retries {
             if attempt > 0 {
-                let backoff = self.calculate_backoff(attempt - 1);
+                let backoff = policy.calculate_backoff(attempt - 1);
                 debug!(
                     endpoint = %RedactedUrl(endpoint),
                     attempt = attempt,
@@ -1024,8 +1098,10 @@ impl BeaconClient {
                     span.record("http.status_code", status.as_u16());
 
                     if status.as_u16() == 429 {
-                        let delay =
-                            Self::retry_after_delay(&response, self.calculate_backoff(attempt));
+                        let delay = RetryPolicy::retry_after_delay(
+                            &response,
+                            policy.calculate_backoff(attempt),
+                        );
                         warn!(attempt = attempt, delay_ms = ?delay.as_millis(), "Rate limited (429), backing off");
                         last_error = Some(BeaconError::ApiError {
                             status: 429,
@@ -1088,7 +1164,7 @@ impl BeaconClient {
         span.in_scope(|| {
             error!(
                 endpoint = %RedactedUrl(endpoint),
-                total_attempts = self.config.max_retries + 1,
+                total_attempts = policy.max_retries + 1,
                 last_error = %err,
                 "Request failed after all retries exhausted"
             )
@@ -1112,36 +1188,6 @@ impl BeaconClient {
         } else {
             Err(Self::api_error_from_response(response).await)
         }
-    }
-
-    /// Parses the Retry-After header from a 429 response, capped at 120s.
-    /// Falls back to exponential backoff if the header is missing or unparseable.
-    fn retry_after_delay(response: &reqwest::Response, fallback: Duration) -> Duration {
-        const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
-        response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|secs| Duration::from_secs(secs).min(MAX_RETRY_AFTER))
-            .unwrap_or(fallback)
-    }
-
-    fn calculate_backoff(&self, attempt: u32) -> Duration {
-        // Cap the exponent to prevent overflow. 2^20 is about 1 million,
-        // which when multiplied by a 100ms initial backoff gives ~27 hours max.
-        let capped_attempt = attempt.min(20);
-        let multiplier = 2u32.saturating_pow(capped_attempt);
-        let base = self.config.initial_backoff.saturating_mul(multiplier);
-        // Add +/-25% jitter to avoid thundering herd
-        let base_ms = base.as_millis() as u64;
-        let jitter_range = base_ms / 4; // 25%
-        if jitter_range == 0 {
-            return base;
-        }
-        let jitter = rand::Rng::gen_range(&mut rand::thread_rng(), 0..=jitter_range * 2);
-        let jittered_ms = base_ms.saturating_sub(jitter_range).saturating_add(jitter);
-        Duration::from_millis(jittered_ms)
     }
 }
 
@@ -1236,42 +1282,36 @@ mod tests {
 
     #[test]
     fn test_calculate_backoff() {
-        let config = BeaconClientConfig::new("http://localhost:5052")
-            .with_initial_backoff(Duration::from_millis(100));
-        let client = BeaconClient::new(config).unwrap();
+        let policy = RetryPolicy::new(3, Duration::from_millis(100));
 
         // With +/-25% jitter, check ranges instead of exact values
-        let b0 = client.calculate_backoff(0).as_millis() as u64;
+        let b0 = policy.calculate_backoff(0).as_millis() as u64;
         assert!((75..=125).contains(&b0), "attempt 0: {b0}ms not in [75,125]");
 
-        let b1 = client.calculate_backoff(1).as_millis() as u64;
+        let b1 = policy.calculate_backoff(1).as_millis() as u64;
         assert!((150..=250).contains(&b1), "attempt 1: {b1}ms not in [150,250]");
 
-        let b2 = client.calculate_backoff(2).as_millis() as u64;
+        let b2 = policy.calculate_backoff(2).as_millis() as u64;
         assert!((300..=500).contains(&b2), "attempt 2: {b2}ms not in [300,500]");
 
-        let b3 = client.calculate_backoff(3).as_millis() as u64;
+        let b3 = policy.calculate_backoff(3).as_millis() as u64;
         assert!((600..=1000).contains(&b3), "attempt 3: {b3}ms not in [600,1000]");
     }
 
     #[test]
     fn test_calculate_backoff_high_attempt_values_no_panic() {
-        let config = BeaconClientConfig::new("http://localhost:5052")
-            .with_initial_backoff(Duration::from_millis(100));
-        let client = BeaconClient::new(config).unwrap();
+        let policy = RetryPolicy::new(3, Duration::from_millis(100));
 
         // These should not panic - they would overflow with the naive implementation
-        let _ = client.calculate_backoff(20);
-        let _ = client.calculate_backoff(31);
-        let _ = client.calculate_backoff(32);
-        let _ = client.calculate_backoff(100);
+        let _ = policy.calculate_backoff(20);
+        let _ = policy.calculate_backoff(31);
+        let _ = policy.calculate_backoff(32);
+        let _ = policy.calculate_backoff(100);
     }
 
     #[test]
     fn test_calculate_backoff_capped_at_maximum() {
-        let config = BeaconClientConfig::new("http://localhost:5052")
-            .with_initial_backoff(Duration::from_millis(100));
-        let client = BeaconClient::new(config).unwrap();
+        let policy = RetryPolicy::new(3, Duration::from_millis(100));
 
         // Max base backoff at attempt 20: 100ms * 2^20 = 104,857,600ms (~29 hours)
         let max_base_ms: u64 = 100 * (1 << 20);
@@ -1280,7 +1320,7 @@ mod tests {
 
         // All attempts >= 20 should return backoff within +/-25% of the same max base
         for n in [20u32, 31, 32, 100] {
-            let ms = client.calculate_backoff(n).as_millis() as u64;
+            let ms = policy.calculate_backoff(n).as_millis() as u64;
             assert!(
                 (max_low..=max_high).contains(&ms),
                 "attempt {n}: {ms}ms not in [{max_low},{max_high}]"
@@ -1290,20 +1330,253 @@ mod tests {
 
     #[test]
     fn test_calculate_backoff_within_jitter_range() {
-        let config = BeaconClientConfig::new("http://localhost:5052")
-            .with_initial_backoff(Duration::from_millis(100));
-        let client = BeaconClient::new(config).unwrap();
+        let policy = RetryPolicy::new(3, Duration::from_millis(100));
 
         // Verify each attempt's backoff is within +/-25% of the expected base
         for _ in 0..100 {
-            let b0 = client.calculate_backoff(0).as_millis() as u64;
+            let b0 = policy.calculate_backoff(0).as_millis() as u64;
             assert!((75..=125).contains(&b0), "attempt 0: {b0}ms not in [75,125]");
         }
 
         for _ in 0..100 {
-            let b1 = client.calculate_backoff(1).as_millis() as u64;
+            let b1 = policy.calculate_backoff(1).as_millis() as u64;
             assert!((150..=250).contains(&b1), "attempt 1: {b1}ms not in [150,250]");
         }
+    }
+
+    // --- RF4-22: URL encoding + traced() ---
+
+    #[test]
+    fn test_all_current_urls_unchanged_after_encoding_change() {
+        // KAT: existing safe inputs must produce byte-identical paths to the
+        // historical format!("{}…") construction (no accidental re-encoding).
+        struct Case {
+            segments: &'static [&'static str],
+            query: &'static [(&'static str, &'static str)],
+            expected: &'static str,
+        }
+        let cases = [
+            Case {
+                segments: &["eth", "v1", "config", "spec"],
+                query: &[],
+                expected: "/eth/v1/config/spec",
+            },
+            Case {
+                segments: &["eth", "v1", "beacon", "states", "head", "fork"],
+                query: &[],
+                expected: "/eth/v1/beacon/states/head/fork",
+            },
+            Case {
+                segments: &["eth", "v1", "beacon", "states", "finalized", "fork"],
+                query: &[],
+                expected: "/eth/v1/beacon/states/finalized/fork",
+            },
+            Case {
+                segments: &["eth", "v1", "beacon", "blocks", "head", "root"],
+                query: &[],
+                expected: "/eth/v1/beacon/blocks/head/root",
+            },
+            Case {
+                segments: &["eth", "v1", "validator", "duties", "proposer", "123"],
+                query: &[],
+                expected: "/eth/v1/validator/duties/proposer/123",
+            },
+            Case {
+                segments: &["eth", "v1", "validator", "attestation_data"],
+                query: &[("slot", "1000"), ("committee_index", "1")],
+                expected: "/eth/v1/validator/attestation_data?slot=1000&committee_index=1",
+            },
+            Case {
+                segments: &["eth", "v3", "validator", "blocks", "42"],
+                query: &[("randao_reveal", "0xabc"), ("builder_boost_factor", "50")],
+                expected: "/eth/v3/validator/blocks/42?randao_reveal=0xabc&builder_boost_factor=50",
+            },
+            Case {
+                segments: &["eth", "v1", "validator", "aggregate_attestation"],
+                query: &[("slot", "100"), ("attestation_data_root", "0xdeadbeef")],
+                expected:
+                    "/eth/v1/validator/aggregate_attestation?slot=100&attestation_data_root=0xdeadbeef",
+            },
+        ];
+
+        for case in &cases {
+            let got = BeaconClient::build_path(case.segments, case.query);
+            assert_eq!(&got, case.expected, "segments={:?} query={:?}", case.segments, case.query);
+        }
+
+        let config = BeaconClientConfig::new("http://localhost:5052");
+        let client = BeaconClient::new(config).unwrap();
+        let abs = client.resolve_url("/eth/v1/config/spec").unwrap();
+        assert_eq!(abs, "http://localhost:5052/eth/v1/config/spec");
+    }
+
+    #[test]
+    fn test_state_id_with_reserved_characters_is_percent_encoded() {
+        // Path segment with `/` and space must be percent-encoded (not split into
+        // extra path segments).
+        let path = BeaconClient::build_path(
+            &["eth", "v1", "beacon", "states", "foo/bar baz", "fork"],
+            &[],
+        );
+        assert_eq!(path, "/eth/v1/beacon/states/foo%2Fbar%20baz/fork");
+
+        // Query values with reserved characters are form-urlencoded.
+        let path = BeaconClient::build_path(
+            &["eth", "v1", "validator", "sync_committee_contribution"],
+            &[("slot", "1"), ("subcommittee_index", "2"), ("beacon_block_root", "0xab&cd=ef")],
+        );
+        assert!(
+            path.contains("beacon_block_root=0xab%26cd%3Def")
+                || path.contains("beacon_block_root=0xab%26cd%3def"),
+            "reserved query chars must be encoded: {path}"
+        );
+    }
+
+    /// SSRF regression: absolute / scheme-relative path inputs must not rewrite
+    /// the configured beacon origin (`Url::join` absolute-URL takeover).
+    #[test]
+    fn test_resolve_url_rejects_absolute_url_host_takeover() {
+        let client = BeaconClient::new(BeaconClientConfig::new("http://localhost:5052")).unwrap();
+
+        let evil_paths = [
+            "http://evil.com/x",
+            "/http://evil.com/x",
+            "https://evil.com/a?b=1",
+            "/https://evil.com/a?b=1",
+            "HTTP://evil.com/",
+            "//evil.com/steal",
+            "/http://127.0.0.1:9/admin",
+        ];
+        for evil in evil_paths {
+            let err = client.resolve_url(evil).expect_err(&format!(
+                "expected rejection for absolute/scheme-relative path: {evil}"
+            ));
+            match err {
+                BeaconError::InvalidUrl(msg) => {
+                    assert!(
+                        msg.contains("origin")
+                            || msg.contains("scheme-relative")
+                            || msg.contains("refusing")
+                            || msg.contains("cross-origin"),
+                        "unexpected InvalidUrl message for {evil}: {msg}"
+                    );
+                    // Must not leak a joined evil absolute URL as a successful request target.
+                    assert!(
+                        !msg.contains("http://evil.com/x")
+                            || msg.contains("refusing")
+                            || msg.contains("origin")
+                            || msg.contains("cross-origin"),
+                        "error should refuse takeover for {evil}: {msg}"
+                    );
+                }
+                other => panic!("expected InvalidUrl for {evil}, got {other:?}"),
+            }
+        }
+
+        // Legitimate relative paths still resolve on the configured origin.
+        assert_eq!(
+            client.resolve_url("/eth/v1/config/spec").unwrap(),
+            "http://localhost:5052/eth/v1/config/spec"
+        );
+        assert_eq!(
+            client.resolve_url("/eth/v1/beacon/states/head/fork").unwrap(),
+            "http://localhost:5052/eth/v1/beacon/states/head/fork"
+        );
+
+        // Percent-encoded scheme-like *segment* (via build_path) stays on-host.
+        let encoded = BeaconClient::build_path(
+            &["eth", "v1", "beacon", "states", "http://evil.com", "fork"],
+            &[],
+        );
+        let abs = client.resolve_url(&encoded).unwrap();
+        assert!(
+            abs.starts_with("http://localhost:5052/"),
+            "encoded segment must stay on configured origin: {abs}"
+        );
+        assert!(!abs.starts_with("http://evil.com"), "must not takeover origin: {abs}");
+    }
+
+    #[tokio::test]
+    async fn test_get_fork_encodes_reserved_state_id_on_wire() {
+        let mock_server = MockServer::start().await;
+
+        // wiremock path matcher sees the decoded path segment form; match the
+        // encoded request URL path that leaves the client.
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/states/foo%2Fbar/fork"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "previous_version": "0x00000000",
+                    "current_version": "0x00000001",
+                    "epoch": "0"
+                },
+                "execution_optimistic": false,
+                "finalized": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(config).unwrap();
+        let result = client.get_fork("foo/bar").await;
+        assert!(result.is_ok(), "get_fork failed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_every_request_carries_trace_headers() {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::Registry;
+        use wiremock::matchers::header_exists;
+
+        let config = telemetry::TelemetryConfig::default();
+        let (layer, guard) = telemetry::init_tracing(&config).expect("init_tracing");
+        let subscriber = Registry::default().with(layer);
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let mock_server = MockServer::start().await;
+
+        // GET path
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .and(header_exists("traceparent"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": {
+                    "is_syncing": false,
+                    "is_optimistic": false,
+                    "el_offline": false,
+                    "head_slot": "1",
+                    "sync_distance": "0"
+                }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // POST empty path
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+            .and(header_exists("traceparent"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client_config = BeaconClientConfig::new(mock_server.uri());
+        let client = BeaconClient::new(client_config).unwrap();
+
+        let span = tracing::info_span!("rf4_22_trace_test");
+        let _enter = span.enter();
+
+        client.get_node_syncing().await.expect("GET should succeed with traceparent");
+        client
+            .prepare_beacon_proposer(&[])
+            .await
+            .expect("POST empty should succeed with traceparent");
+
+        drop(_enter);
+        drop(_default);
+        telemetry::shutdown_tracing(guard).await;
     }
 
     #[tokio::test]

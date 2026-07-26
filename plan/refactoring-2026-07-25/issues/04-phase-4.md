@@ -1281,13 +1281,13 @@ independent retry loop that does not share the beacon policy (F108).
    architecture-tests edge rules first).
 
 **Acceptance criteria:**
-- [ ] `rg 'inject_trace_context' crates/beacon/src` == 1 (inside `traced`).
-- [ ] Query values are percent-encoded; a test with a reserved character in a state id produces a
+- [x] `rg 'inject_trace_context' crates/beacon/src` == 1 (inside `traced`).
+- [x] Query values are percent-encoded; a test with a reserved character in a state id produces a
       correctly-escaped URL.
-- [ ] Current URLs are byte-identical for all existing inputs (table-driven regression).
-- [ ] `monitoring.rs` uses the shared policy; its 4xx-no-retry behavior is preserved.
-- [ ] architecture-tests green (no new forbidden edge).
-- [ ] Standing invariant green.
+- [x] Current URLs are byte-identical for all existing inputs (table-driven regression).
+- [x] `monitoring.rs` uses the shared policy; its 4xx-no-retry behavior is preserved.
+- [x] architecture-tests green (no new forbidden edge).
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_state_id_with_reserved_characters_is_percent_encoded` — fails today.

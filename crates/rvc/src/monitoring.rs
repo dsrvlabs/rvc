@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use beacon::RetryPolicy;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -169,10 +170,15 @@ pub async fn start_monitoring_push(
     }
 }
 
-const MAX_RETRIES: u32 = 3;
+/// Total push attempts (first try + retries). Preserves the historical 3-attempt budget.
+const MAX_ATTEMPTS: u32 = 3;
 
 async fn push_with_retry(client: &reqwest::Client, endpoint: &str, payload: &MonitoringPayload) {
-    for attempt in 0..MAX_RETRIES {
+    // Share beacon's backoff / Retry-After policy (F108). Attempt budget stays at
+    // MAX_ATTEMPTS total (not `0..=max_retries`) so existing 4xx/5xx expectations hold.
+    let policy = RetryPolicy::default();
+
+    for attempt in 0..MAX_ATTEMPTS {
         match client.post(endpoint).json(payload).send().await {
             Ok(response) => {
                 if response.status().is_success() {
@@ -182,14 +188,32 @@ async fn push_with_retry(client: &reqwest::Client, endpoint: &str, payload: &Mon
                 }
 
                 let status = response.status();
+
+                // 429: honour Retry-After via the shared policy, then retry.
+                if status.as_u16() == 429 {
+                    warn!(
+                        status = %status,
+                        attempt = attempt + 1,
+                        "Monitoring push rate-limited (429), retrying"
+                    );
+                    if attempt < MAX_ATTEMPTS - 1 {
+                        let delay = RetryPolicy::retry_after_delay(
+                            &response,
+                            policy.calculate_backoff(attempt),
+                        );
+                        tokio::time::sleep(delay).await;
+                    }
+                    continue;
+                }
+
                 if status.is_client_error() {
-                    // 4xx — not transient, don't retry
+                    // Other 4xx — not transient, don't retry
                     warn!(status = %status, "Monitoring push rejected (client error), not retrying");
                     metrics::definitions::RVC_MONITORING_PUSH_FAILURES_TOTAL.inc();
                     return;
                 }
 
-                // 5xx — transient, retry
+                // 5xx — transient, retry with shared exponential backoff
                 warn!(
                     status = %status,
                     attempt = attempt + 1,
@@ -205,13 +229,12 @@ async fn push_with_retry(client: &reqwest::Client, endpoint: &str, payload: &Mon
             }
         }
 
-        if attempt < MAX_RETRIES - 1 {
-            let backoff = Duration::from_secs(1 << attempt);
-            tokio::time::sleep(backoff).await;
+        if attempt < MAX_ATTEMPTS - 1 {
+            tokio::time::sleep(policy.calculate_backoff(attempt)).await;
         }
     }
 
-    warn!("Monitoring push failed after {MAX_RETRIES} attempts");
+    warn!("Monitoring push failed after {MAX_ATTEMPTS} attempts");
     metrics::definitions::RVC_MONITORING_PUSH_FAILURES_TOTAL.inc();
 }
 
@@ -345,6 +368,53 @@ mod tests {
         let client = reqwest::Client::new();
         let payload = collect_metrics(1, 1);
 
+        push_with_retry(&client, &mock_server.uri(), &payload).await;
+    }
+
+    #[test]
+    fn test_monitoring_push_uses_shared_backoff_policy() {
+        // Monitoring shares beacon::RetryPolicy for delay calculation (F108).
+        let policy = RetryPolicy::default();
+        assert_eq!(policy.max_retries, 3);
+        assert_eq!(policy.initial_backoff, Duration::from_millis(100));
+
+        let b0 = policy.calculate_backoff(0).as_millis() as u64;
+        assert!((75..=125).contains(&b0), "shared policy attempt-0 backoff {b0}ms not in [75,125]");
+        let b1 = policy.calculate_backoff(1).as_millis() as u64;
+        assert!(
+            (150..=250).contains(&b1),
+            "shared policy attempt-1 backoff {b1}ms not in [150,250]"
+        );
+
+        // 4xx (other than 429) remains non-retryable via is_retryable_status.
+        assert!(!RetryPolicy::is_retryable_status(reqwest::StatusCode::BAD_REQUEST));
+        assert!(RetryPolicy::is_retryable_status(reqwest::StatusCode::TOO_MANY_REQUESTS));
+        assert!(RetryPolicy::is_retryable_status(reqwest::StatusCode::INTERNAL_SERVER_ERROR));
+    }
+
+    #[tokio::test]
+    async fn test_push_with_retry_429_uses_shared_retry_after() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // First call 429 with Retry-After: 0 (no real wait), then success.
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "0"))
+            .up_to_n_times(1)
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::new();
+        let payload = collect_metrics(1, 1);
         push_with_retry(&client, &mock_server.uri(), &payload).await;
     }
 
