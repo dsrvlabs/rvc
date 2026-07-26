@@ -1131,11 +1131,11 @@ why. This must land before the F2 extraction chain so each step is guarded.
    `tests/server_startup.rs`.
 
 **Acceptance criteria:**
-- [ ] `rg 'cargo build' bin/rvc-signer/` returns nothing under `src/` or `tests/`.
-- [ ] Tests pass with `--offline` and `--locked`.
-- [ ] The suite runs under both `--features dvt` and default features.
-- [ ] A clean start + SIGTERM + exit-code-0 test exists and is not `#[ignore]`d.
-- [ ] Workspace green.
+- [x] `rg 'cargo build' bin/rvc-signer/` returns nothing under `src/` or `tests/`.
+- [x] Tests pass with `--offline` and `--locked`.
+- [x] The suite runs under both `--features dvt` and default features.
+- [x] A clean start + SIGTERM + exit-code-0 test exists and is not `#[ignore]`d.
+- [x] Workspace green.
 
 **TDD test plan** (RED first):
 - `test_server_starts_and_shuts_down_cleanly` — **RED**: written against the new `tests/` harness before

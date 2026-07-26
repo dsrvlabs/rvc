@@ -16,8 +16,6 @@ pub mod dvt;
 pub(crate) mod grpc_common;
 pub mod http_api;
 pub mod insecure_startup;
-#[cfg(test)]
-mod integration_polish;
 pub mod metrics;
 pub mod reload;
 pub mod service;

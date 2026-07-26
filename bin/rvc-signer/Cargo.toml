@@ -123,11 +123,16 @@ proptest.workspace = true
 rand.workspace = true
 tokio-stream.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tokio-util.workspace = true
+tonic = { workspace = true, features = ["tls"] }
 tracing-test.workspace = true
 grpc-signer.workspace = true
 crypto.workspace = true
 eth-types = { workspace = true, features = ["test-fixtures"] }
 slashing.workspace = true
+zeroize.workspace = true
+# SIGTERM in binary-level startup tests (server_startup / common harness).
+libc = "0.2"
 # Drives the axum Router in-memory (oneshot) for socket-free http_api tests.
 tower = { workspace = true, features = ["util"] }
 # The `client` hyper feature drives the real-TLS-client integration tests for
