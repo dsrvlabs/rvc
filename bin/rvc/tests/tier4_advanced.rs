@@ -287,27 +287,15 @@ mod registration_batching {
 
     use async_trait::async_trait;
     use bn_manager::{
-        AttestationApi, AttestationDataResponse, AttesterDutiesResponse,
-        BeaconCommitteeSubscription, BeaconError, BeaconNodeClient, BlockProducer,
-        BlockRootResponse, ConfigSpecResponse, DutiesProvider, GenesisResponse, LivenessApi,
-        NodeStatusApi, ProduceBlockResponse, ProposerDutiesResponse, SignedBeaconBlock,
-        SignedBlindedBeaconBlock, SignedContributionAndProof, SignedValidatorRegistration,
-        StateForkResponse, SubmitAttestationResult, SyncCommitteeApi,
-        SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-        SyncingResponse, ValidatorLivenessResponse, ValidatorRegistrationV1, ValidatorsResponse,
-        VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+        BeaconError, ProposerPreparation, SignedValidatorRegistration, ValidatorRegistrationV1,
     };
-    use builder::BuilderService;
+    use builder::{BuilderBeaconClient, BuilderService, RegistrationSigner};
     use crypto::PublicKey;
-    use eth_types::{
-        AggregateAndProof, AttestationData, ElectraAggregateAndProof, Epoch, ForkSchedule, Root,
-        Slot, VoluntaryExit,
-    };
     use parking_lot::Mutex;
-    use signer::{SignerError, ValidatorSigner};
+    use signer::SignerError;
     use validator_store::{ValidatorConfig, ValidatorStore};
 
-    // --- Mock BN ---
+    // --- Narrow mock BN (BuilderBeaconClient only) ---
 
     struct MockBn {
         register_calls: Mutex<Vec<Vec<SignedValidatorRegistration>>>,
@@ -331,81 +319,14 @@ mod registration_batching {
     }
 
     #[async_trait]
-    impl NodeStatusApi for MockBn {
-        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_fork(&self, _: &str) -> Result<StateForkResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_validators(&self, _: &[String]) -> Result<ValidatorsResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_block_root(&self, _: &str) -> Result<BlockRootResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-    }
-
-    #[async_trait]
-    impl DutiesProvider for MockBn {
-        async fn get_attester_duties(
-            &self,
-            _: u64,
-            _: &[String],
-        ) -> Result<AttesterDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_proposer_duties(&self, _: u64) -> Result<ProposerDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn post_sync_committee_duties(
-            &self,
-            _: u64,
-            _: &[String],
-        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-    }
-
-    #[async_trait]
-    impl BlockProducer for MockBn {
-        async fn produce_block_v3(
-            &self,
-            _: u64,
-            _: &str,
-            _: Option<&str>,
-            _: Option<u64>,
-        ) -> Result<ProduceBlockResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn publish_block(&self, _: &SignedBeaconBlock, _: &str) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn publish_blinded_block(
-            &self,
-            _: &SignedBlindedBeaconBlock,
-            _: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
+    impl BuilderBeaconClient for MockBn {
         async fn prepare_beacon_proposer(
             &self,
-            _: &[bn_manager::ProposerPreparation],
+            _: &[ProposerPreparation],
         ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
+            Ok(())
         }
+
         async fn register_validators(
             &self,
             registrations: &[SignedValidatorRegistration],
@@ -420,160 +341,12 @@ mod registration_batching {
         }
     }
 
-    #[async_trait]
-    impl AttestationApi for MockBn {
-        async fn get_attestation_data(
-            &self,
-            _: u64,
-            _: u64,
-        ) -> Result<AttestationDataResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_attestation(
-            &self,
-            _: &VersionedAttestation,
-        ) -> Result<SubmitAttestationResult, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_aggregate_attestation(
-            &self,
-            _: u64,
-            _: &str,
-            _: Option<u64>,
-        ) -> Result<VersionedAggregateAttestation, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_aggregate_and_proofs(
-            &self,
-            _: &VersionedSignedAggregateAndProof,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-    }
-
-    #[async_trait]
-    impl SyncCommitteeApi for MockBn {
-        async fn submit_sync_committee_messages(
-            &self,
-            _: &[SyncCommitteeMessage],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_sync_committee_contribution(
-            &self,
-            _: u64,
-            _: u64,
-            _: &str,
-        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_contribution_and_proofs(
-            &self,
-            _: &[SignedContributionAndProof],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-    }
-
-    #[async_trait]
-    impl LivenessApi for MockBn {
-        async fn post_validator_liveness(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<ValidatorLivenessResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-    }
-
-    impl BeaconNodeClient for MockBn {}
-
-    // --- Mock Signer ---
+    // --- Narrow mock signer (RegistrationSigner only) ---
 
     struct MockSigner;
 
     #[async_trait(?Send)]
-    impl ValidatorSigner for MockSigner {
-        async fn sign_attestation(
-            &self,
-            _: &AttestationData,
-            _: &PublicKey,
-            _: &ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_block(
-            &self,
-            _: &Root,
-            _: Slot,
-            _: &PublicKey,
-            _: &ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_randao_reveal(
-            &self,
-            _: Epoch,
-            _: &PublicKey,
-            _: &ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_sync_committee_message(
-            &self,
-            _: &Root,
-            _: Slot,
-            _: &PublicKey,
-            _: &ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_selection_proof(
-            &self,
-            _: Slot,
-            _: &PublicKey,
-            _: &ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_aggregate_and_proof(
-            &self,
-            _: &AggregateAndProof,
-            _: &PublicKey,
-            _: &ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_electra_aggregate_and_proof(
-            &self,
-            _: &ElectraAggregateAndProof,
-            _: &PublicKey,
-            _: &ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_voluntary_exit(
-            &self,
-            _: &VoluntaryExit,
-            _: &PublicKey,
-            _: &ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
+    impl RegistrationSigner for MockSigner {
         async fn sign_builder_registration(
             &self,
             _: &ValidatorRegistrationV1,
@@ -581,25 +354,6 @@ mod registration_batching {
             _: [u8; 4],
         ) -> Result<Vec<u8>, SignerError> {
             Ok(vec![0xaa; 96])
-        }
-        async fn sign_sync_committee_selection_proof(
-            &self,
-            _: Slot,
-            _: u64,
-            _: &PublicKey,
-            _: &ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
-        }
-        async fn sign_contribution_and_proof(
-            &self,
-            _: &eth_types::ContributionAndProof,
-            _: &PublicKey,
-            _: &ForkSchedule,
-            _: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Err(SignerError::KeyNotFound("mock".into()))
         }
     }
 

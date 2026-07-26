@@ -103,7 +103,12 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         self.propose_block_impl(slot, pubkey, mode, Some(&validator)).await
     }
 
-    pub async fn propose_block_with_mode(
+    /// Mode-override entry point for tests. Not part of the public API —
+    /// callers must use [`Self::propose_block`], which applies response
+    /// validation. Visibility is `pub(crate)` so external crates cannot
+    /// bypass validation (F101).
+    #[allow(dead_code)] // exercised only from `#[cfg(test)]` modules in this crate
+    pub(crate) async fn propose_block_with_mode(
         &self,
         slot: Slot,
         pubkey: &PublicKey,

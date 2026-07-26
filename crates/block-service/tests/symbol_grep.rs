@@ -15,3 +15,21 @@ fn test_no_propose_block_unvalidated_symbol_in_service_rs() {
          the unvalidated propose_block entry-point must not be reintroduced (CQ-3.2 / C3)"
     );
 }
+
+/// F101: `propose_block_with_mode` must not be crate-public — it skips the
+/// response validation that `propose_block` performs.
+#[test]
+fn test_propose_block_with_mode_not_publicly_reachable() {
+    let service_src =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/service.rs"))
+            .expect("could not read crates/block-service/src/service.rs");
+
+    assert!(
+        !service_src.contains("pub async fn propose_block_with_mode"),
+        "propose_block_with_mode must not be `pub` (external crates would bypass validation)"
+    );
+    assert!(
+        service_src.contains("pub(crate) async fn propose_block_with_mode"),
+        "propose_block_with_mode must remain `pub(crate)` for in-crate tests"
+    );
+}

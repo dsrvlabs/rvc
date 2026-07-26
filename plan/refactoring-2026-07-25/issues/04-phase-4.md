@@ -1565,12 +1565,12 @@ symbol-grep guard test to cover it. (Note: the plan files this under E8a, but th
 4. Demote `propose_block_with_mode`; extend the guard test.
 
 **Acceptance criteria:**
-- [ ] `crates/builder` no longer references `BeaconNodeClient` in its tests; the ~250 mock lines are gone.
-- [ ] All existing builder tests pass unchanged, including the batching and error-on-call-index cases
+- [x] `crates/builder` no longer references `BeaconNodeClient` in its tests; the ~250 mock lines are gone.
+- [x] All existing builder tests pass unchanged, including the batching and error-on-call-index cases
       (`service.rs:322-338`).
-- [ ] `propose_block_with_mode` is `pub(crate)`; the symbol-grep guard covers it; the four existing
+- [x] `propose_block_with_mode` is `pub(crate)`; the symbol-grep guard covers it; the four existing
       call sites (`block-service/src/service.rs:2161`, `:2180`, `:2200`, `:2221` — all tests) still compile.
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_builder_service_compiles_against_two_method_stub` — a test implementing only the

@@ -1606,12 +1606,16 @@ async fn run_validator(
     };
 
     #[allow(clippy::arc_with_non_send_sync)]
-    let builder_service = Some(std::sync::Arc::new(builder::BuilderService::new(
-        signer.clone(),
-        beacon.clone(),
-        validator_store.clone(),
-        orchestrator_config.fork_schedule.genesis_fork_version,
-    )));
+    let builder_service = {
+        // Bridge full trait objects onto the narrow builder seams.
+        let signer_dyn: std::sync::Arc<dyn signer::ValidatorSigner> = signer.clone();
+        Some(std::sync::Arc::new(builder::BuilderService::new(
+            std::sync::Arc::new(signer_dyn),
+            std::sync::Arc::new(beacon.clone()),
+            validator_store.clone(),
+            orchestrator_config.fork_schedule.genesis_fork_version,
+        )))
+    };
 
     // Step 7b: Configure remote signer if URL provided
     if let Some(ref url) = config.remote_signer_url {

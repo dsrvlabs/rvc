@@ -23,7 +23,7 @@ use doppelganger::{
 use duty_tracker::DutyTracker;
 use eth_types::{Epoch, ForkSchedule, Root};
 use propagator::{AttestationSubmitter, Propagator};
-use signer::SignerService;
+use signer::{SignerService, ValidatorSigner};
 use slashing::SlashingDb;
 use timing::SystemSlotClock;
 use validator_store::ValidatorStore;
@@ -572,7 +572,15 @@ impl ServiceBuilder {
         validator_store: Arc<ValidatorStore>,
         genesis_fork_version: [u8; 4],
     ) -> Arc<BuilderService> {
-        let service = BuilderService::new(signer, beacon, validator_store, genesis_fork_version);
+        // Bridge full trait objects onto the narrow builder seams
+        // (`RegistrationSigner` / `BuilderBeaconClient`).
+        let signer: Arc<dyn ValidatorSigner> = signer;
+        let service = BuilderService::new(
+            Arc::new(signer),
+            Arc::new(beacon),
+            validator_store,
+            genesis_fork_version,
+        );
         info!("Created builder service");
         Arc::new(service)
     }
