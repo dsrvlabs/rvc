@@ -1812,12 +1812,12 @@ subcommands — two conventions for one problem.
    Args-struct conversion is in scope.
 
 **Acceptance criteria:**
-- [ ] No `#[allow(clippy::too_many_arguments)]` remains in `new_mnemonic.rs` or `existing_mnemonic.rs`.
-- [ ] `pbkdf2: bool` is replaced by `EncryptionKdf`; the produced keystore KDF is unchanged for both
+- [x] No `#[allow(clippy::too_many_arguments)]` remains in `new_mnemonic.rs` or `existing_mnemonic.rs`.
+- [x] `pbkdf2: bool` is replaced by `EncryptionKdf`; the produced keystore KDF is unchanged for both
       values (test).
-- [ ] Both subcommands share `GenerateArgs`.
-- [ ] Generated output is byte-identical for the same inputs (fixture comparison with a fixed seed).
-- [ ] No CLI-visible change.
+- [x] Both subcommands share `GenerateArgs`.
+- [x] Generated output is byte-identical for the same inputs (fixture comparison with a fixed seed).
+- [x] No CLI-visible change.
 
 **TDD test plan** (RED first):
 - `test_generate_args_kdf_enum_selects_same_kdf_as_bool` — **RED**: `GenerateArgs` does not exist; this
