@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/rvc", "bin/rvc-keygen", "bin/rvc-signer", "crates/architecture-tests", "crates/beacon", "crates/block-service", "crates/bn-manager", "crates/builder", "crates/crypto", "crates/doppelganger", "crates/duty-tracker", "crates/eth-types", "crates/grpc-signer", "crates/keymanager-api", "crates/metrics", "crates/observability", "crates/propagator", "crates/rvc", "crates/secret-provider", "crates/signer", "crates/signer-proto", "crates/signer-registry", "crates/slashing", "crates/sync-service", "crates/telemetry", "crates/timing", "crates/validator-store", "crates/web3signer-wire"]
+members = ["bin/rvc", "bin/rvc-keygen", "bin/rvc-signer", "crates/architecture-tests", "crates/beacon", "crates/block-service", "crates/bn-manager", "crates/builder", "crates/crypto", "crates/doppelganger", "crates/duty-tracker", "crates/eth-types", "crates/grpc-signer", "crates/keymanager-api", "crates/metrics", "crates/observability", "crates/propagator", "crates/rvc", "crates/secret-provider", "crates/signer", "crates/signer-proto", "crates/signer-registry", "crates/signer-server", "crates/slashing", "crates/sync-service", "crates/telemetry", "crates/timing", "crates/validator-store", "crates/web3signer-wire"]
 default-members = ["bin/rvc", "crates/architecture-tests"]
 resolver = "2"
 
@@ -42,6 +42,7 @@ grpc-signer = { path = "crates/grpc-signer", package = "rvc-grpc-signer" }
 signer-registry = { path = "crates/signer-registry", package = "rvc-signer-registry" }
 web3signer-wire = { path = "crates/web3signer-wire", package = "rvc-web3signer-wire" }
 signer-proto = { path = "crates/signer-proto", package = "rvc-signer-proto" }
+signer-server = { path = "crates/signer-server", package = "rvc-signer-server" }
 
 # External
 async-trait = "0.1"

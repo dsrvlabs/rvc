@@ -1465,12 +1465,12 @@ awkwardness noted in D7.
    duplicated PKI fixtures in grpc-signer if the server helpers now cover them.
 
 **Acceptance criteria:**
-- [ ] `bin/rvc-signer/src/` contains `main.rs` (and nothing that is a library).
-- [ ] `crates/signer-server` is covered by `crates/architecture-tests`; the allowed-edge table names it
+- [x] `bin/rvc-signer/src/` contains `main.rs` (and nothing that is a library).
+- [x] `crates/signer-server` is covered by `crates/architecture-tests`; the allowed-edge table names it
       explicitly.
-- [ ] Any layering violation surfaced is fixed in-issue or filed with the specific edge named in the PR.
-- [ ] `crates/grpc-signer` integration tests use the library server (or a follow-up is filed).
-- [ ] Diff is dominated by moves; `cargo build --release` still produces the same binary name.
+- [x] Any layering violation surfaced is fixed in-issue or filed with the specific edge named in the PR.
+- [x] `crates/grpc-signer` integration tests use the library server (or a follow-up is filed).
+- [x] Diff is dominated by moves; `cargo build --release` still produces the same binary name.
 
 **TDD test plan** (RED first):
 - `test_signer_server_crate_edges_conform_to_layer_policy` — **RED**: the crate is unknown to

@@ -22,10 +22,10 @@
 //! ## Package-name collision (`rvc-signer`)
 //!
 //! Cargo package **`rvc-signer`** is the library at `crates/signer` (Rust crate
-//! name `rvc_signer`). Package **`rvc-signer-bin`** at `bin/rvc-signer` builds a
-//! **binary** also named `rvc-signer`. Logs and `use rvc_signer::…` refer to the
-//! library; the binary is the server process. The rename/split is deferred to
-//! Phase 5 **F2** (promote the bin lib to `crates/signer-server`).
+//! name `signer` via the workspace dep key). Package **`rvc-signer-server`** at
+//! `crates/signer-server` (Rust crate `signer_server`) owns server assembly.
+//! Package **`rvc-signer-bin`** at `bin/rvc-signer` is a thin CLI that builds the
+//! **binary** also named `rvc-signer`.
 
 #![deny(rustdoc::broken_intra_doc_links)]
 

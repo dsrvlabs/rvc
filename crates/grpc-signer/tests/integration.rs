@@ -76,7 +76,7 @@ impl SignerServiceV2 for TestSignerServiceV2 {
     // ── Signing RPCs — Unimplemented in the test mock ────────────────────────
     // The integration tests only exercise the connect path (list_public_keys)
     // and the client-side key-not-found guard (no RPC sent).  Full signing
-    // round-trips are covered by the rvc-signer-bin integration tests.
+    // round-trips are covered by the rvc-signer-server integration tests.
 
     async fn sign_beacon_block(
         &self,

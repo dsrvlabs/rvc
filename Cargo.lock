@@ -4521,6 +4521,39 @@ dependencies = [
 name = "rvc-signer-bin"
 version = "0.6.0"
 dependencies = [
+ "clap",
+ "hex",
+ "libc",
+ "rcgen",
+ "rvc-crypto",
+ "rvc-signer-server",
+ "rvc-telemetry",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "rvc-signer-proto"
+version = "0.6.0"
+dependencies = [
+ "prost 0.13.5",
+ "tonic 0.12.3",
+ "tonic-build",
+]
+
+[[package]]
+name = "rvc-signer-registry"
+version = "0.6.0"
+
+[[package]]
+name = "rvc-signer-server"
+version = "0.6.0"
+dependencies = [
  "async-trait",
  "axum 0.7.9",
  "bls12_381_plus",
@@ -4559,7 +4592,6 @@ dependencies = [
  "tokio-util",
  "toml",
  "tonic 0.12.3",
- "tonic-build",
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
@@ -4569,19 +4601,6 @@ dependencies = [
  "x509-parser",
  "zeroize",
 ]
-
-[[package]]
-name = "rvc-signer-proto"
-version = "0.6.0"
-dependencies = [
- "prost 0.13.5",
- "tonic 0.12.3",
- "tonic-build",
-]
-
-[[package]]
-name = "rvc-signer-registry"
-version = "0.6.0"
 
 [[package]]
 name = "rvc-slashing"

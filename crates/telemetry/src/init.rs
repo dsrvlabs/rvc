@@ -344,12 +344,12 @@ mod tests {
 
     #[test]
     fn env_filter_or_preserves_per_module_directive() {
-        let rendered = with_rust_log(Some("warn,rvc_signer_bin::http_api=trace"), || {
+        let rendered = with_rust_log(Some("warn,signer_server::http_api=trace"), || {
             format!("{}", env_filter_or("info"))
         });
         assert!(rendered.contains("warn"), "global directive missing: {rendered}");
         assert!(
-            rendered.contains("rvc_signer_bin::http_api"),
+            rendered.contains("signer_server::http_api"),
             "per-module target missing: {rendered}"
         );
         assert!(rendered.contains("trace"), "per-module level missing: {rendered}");

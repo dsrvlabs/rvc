@@ -54,8 +54,9 @@ const FORBIDDEN: &[(&str, &str)] =
 ///   import by adding a `uuid`/`rvc-telemetry` (or any workspace) edge to it.
 /// - `rvc-signer-registry`: dev-only const table, no runtime out-edges.
 /// - `rvc-telemetry`: a zero-internal-dependency leaf sink. Pinning it here locks the
-///   acyclicity of the Phase-2 `rvc-signer-bin -> rvc-telemetry` edge (`EXPECTED_EDGE`):
-///   attaching an edge *to* a zero-out-edge node can never create a cycle.
+///   acyclicity of the logging edges into telemetry (`EXPECTED_EDGE` and the
+///   `rvc-signer-server` production edge): attaching an edge *to* a zero-out-edge
+///   node can never create a cycle.
 /// - `rvc-observability`: logging/hex/pubkey leaf sink (RF3-01); zero workspace out-edges so
 ///   dependents can take the light path without pulling BLS/KDF/HTTP via crypto.
 const ZERO_OUT_EDGE_IF_PRESENT: &[&str] = &[
@@ -68,16 +69,26 @@ const ZERO_OUT_EDGE_IF_PRESENT: &[&str] = &[
 /// Edge that MUST be present (Issue 1.5 regression guard).
 const REQUIRED_EDGE: (&str, &str) = ("rvc-signer", "rvc-doppelganger");
 
-/// Edge the structured-logging initiative introduces in Phase 2 (Issue 2.3):
-/// `rvc-signer-bin -> rvc-telemetry` (to call `set_parent_from_headers` + the init helper).
-/// The *edge* (not the `rvc-telemetry` crate, which exists and is leaf-checked today) does NOT
-/// exist on `develop` during Phase 1; this gate stays green before AND after Phase 2 adds it.
-/// It is provably acyclic because `rvc-telemetry` is a zero-internal-out-edge leaf sink
-/// (pinned in `ZERO_OUT_EDGE_IF_PRESENT`), so attaching an edge *to* it can never create a
-/// cycle. Documented + locked here per the architecture's Gate-6 recommendation: this is the
-/// single new production edge the whole logging initiative introduces; it must stay allowed
-/// (never forbidden) while remaining acyclic.
+/// Logging → telemetry leaf attachments (must stay allowed, never forbidden).
+/// The bin keeps the init/reload edge; the server library carries HTTP parent
+/// extraction (`set_parent_from_headers`). Both targets are the zero-out-edge
+/// leaf `rvc-telemetry`, so the attachments are provably acyclic.
 const EXPECTED_EDGE: (&str, &str) = ("rvc-signer-bin", "rvc-telemetry");
+const EXPECTED_EDGE_SERVER: (&str, &str) = ("rvc-signer-server", "rvc-telemetry");
+
+/// Workspace production deps that `rvc-signer-server` is allowed to take.
+/// Any new production edge must be reviewed and added here deliberately —
+/// do not widen this table to silence a real layering violation.
+const SIGNER_SERVER_ALLOWED_EDGES: &[&str] = &[
+    "rvc-crypto",
+    "rvc-eth-types",
+    "rvc-observability",
+    "rvc-signer",
+    "rvc-signer-proto",
+    "rvc-slashing",
+    "rvc-telemetry",
+    "rvc-web3signer-wire",
+];
 
 // ---------------------------------------------------------------------------
 // Helper: build the workspace-internal production edge map
@@ -242,29 +253,25 @@ fn architecture_no_cycles() {
     }
 
     // ------------------------------------------------------------------
-    // 5b. Expected/allowed leaf-attachment edge (Phase 2, Issue 2.3):
-    //     rvc-signer-bin -> rvc-telemetry. It may be ABSENT (Phase 1) or PRESENT
-    //     (Phase 2); either way it must never be a forbidden edge, and its target
-    //     must stay a zero-out-edge leaf sink (asserted in step 6) so the
-    //     attachment is provably acyclic. The whole-graph cycle check (step 4)
-    //     additionally guarantees no cycle regardless of presence. Steps 4 (cycle
-    //     check) + 6 (leaf-sink pin) are the REAL enforcers; the not-forbidden
-    //     assert below is a consistency tripwire — do not drop the rvc-telemetry pin.
+    // 5b. Expected/allowed leaf-attachment edges into rvc-telemetry
+    //     (bin init/reload + signer-server HTTP parent extraction).
+    //     Must never be forbidden; target must stay a zero-out-edge leaf sink.
     // ------------------------------------------------------------------
-    assert!(
-        !FORBIDDEN.contains(&EXPECTED_EDGE),
-        "expected leaf-attachment edge {} -> {} must remain allowed, not forbidden",
-        EXPECTED_EDGE.0,
-        EXPECTED_EDGE.1
-    );
-    if edges.get(EXPECTED_EDGE.0).is_some_and(|d| d.contains(&EXPECTED_EDGE.1.to_string())) {
-        // Edge present (post Phase 2): its target must be a pinned leaf sink.
+    for edge in [EXPECTED_EDGE, EXPECTED_EDGE_SERVER] {
         assert!(
-            ZERO_OUT_EDGE_IF_PRESENT.contains(&EXPECTED_EDGE.1),
-            "edge {} -> {} is present but its target is not pinned as a zero-out-edge leaf sink",
-            EXPECTED_EDGE.0,
-            EXPECTED_EDGE.1
+            !FORBIDDEN.contains(&edge),
+            "expected leaf-attachment edge {} -> {} must remain allowed, not forbidden",
+            edge.0,
+            edge.1
         );
+        if edges.get(edge.0).is_some_and(|d| d.contains(&edge.1.to_string())) {
+            assert!(
+                ZERO_OUT_EDGE_IF_PRESENT.contains(&edge.1),
+                "edge {} -> {} is present but its target is not pinned as a zero-out-edge leaf sink",
+                edge.0,
+                edge.1
+            );
+        }
     }
 
     // ------------------------------------------------------------------
@@ -348,5 +355,78 @@ fn beacon_has_no_crypto_production_edge() {
     assert!(
         beacon_deps.iter().any(|d| d == "rvc-observability"),
         "beacon should depend on rvc-observability; deps={beacon_deps:?}"
+    );
+}
+
+/// RF5-25: `rvc-signer-server` is a first-class workspace package whose
+/// production edges are named in `SIGNER_SERVER_ALLOWED_EDGES`.
+#[test]
+fn test_signer_server_crate_edges_conform_to_layer_policy() {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap())
+        .output()
+        .expect("failed to run cargo metadata");
+    assert!(
+        output.status.success(),
+        "cargo metadata exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cargo metadata output must be valid JSON");
+    let packages =
+        metadata["packages"].as_array().expect("metadata 'packages' field must be an array");
+    let edges = build_edge_map(packages);
+
+    let server_deps = edges.get("rvc-signer-server").unwrap_or_else(|| {
+        panic!(
+            "package 'rvc-signer-server' not found in workspace metadata — \
+             crates/signer-server must be a workspace member"
+        );
+    });
+
+    let allowed: HashSet<&str> = SIGNER_SERVER_ALLOWED_EDGES.iter().copied().collect();
+    let unexpected: Vec<&str> =
+        server_deps.iter().map(String::as_str).filter(|d| !allowed.contains(d)).collect();
+    assert!(
+        unexpected.is_empty(),
+        "rvc-signer-server has production edges not in SIGNER_SERVER_ALLOWED_EDGES: {unexpected:?}; \
+         deps={server_deps:?}. Fix the edge or add it deliberately to the allow table."
+    );
+
+    // Shim edge: the bin depends on the library (and keeps telemetry for init).
+    let bin_deps = edges.get("rvc-signer-bin").expect("rvc-signer-bin must exist");
+    assert!(
+        bin_deps.iter().any(|d| d == "rvc-signer-server"),
+        "rvc-signer-bin must depend on rvc-signer-server; deps={bin_deps:?}"
+    );
+}
+
+/// RF5-25: `bin/rvc-signer/src` is a CLI-only shim — no library modules.
+#[test]
+fn test_bin_rvc_signer_contains_only_cli() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+    let src = root.join("bin/rvc-signer/src");
+    assert!(src.is_dir(), "bin/rvc-signer/src missing at {}", src.display());
+
+    let mut entries: Vec<String> = std::fs::read_dir(&src)
+        .expect("read bin/rvc-signer/src")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+
+    assert_eq!(
+        entries,
+        vec!["main.rs".to_string()],
+        "bin/rvc-signer/src must contain only main.rs after the signer-server promotion; found {entries:?}"
+    );
+
+    // Cargo.toml must not declare a [lib] target.
+    let cargo_toml = std::fs::read_to_string(root.join("bin/rvc-signer/Cargo.toml"))
+        .expect("read bin/rvc-signer/Cargo.toml");
+    assert!(
+        !cargo_toml.contains("[lib]"),
+        "bin/rvc-signer/Cargo.toml must not declare [lib]; library lives in crates/signer-server"
     );
 }

@@ -1,10 +1,10 @@
 //! rvc-signer binary entry point.
 //!
-//! All implementation lives in `lib.rs` (crate root for the library target).
-//! This file only handles CLI parsing and wires up the library.
+//! Thin CLI shim: parse args, init logging, call [`signer_server::server::run`].
+//! Server assembly lives in the `signer_server` crate.
 
-use rvc_signer_bin::config::ServeArgs;
-use rvc_signer_bin::{config, server, ServerError};
+use signer_server::config::ServeArgs;
+use signer_server::{config, server, ServerError};
 
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
@@ -281,7 +281,7 @@ async fn shutdown_signal() {
 /// Run the split-key subcommand.
 #[cfg(feature = "dvt")]
 fn run_split_key(args: SplitKeyCliArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use rvc_signer_bin::commands::split_key::{execute, SplitKeyArgs};
+    use signer_server::commands::split_key::{execute, SplitKeyArgs};
     use zeroize::Zeroizing;
 
     let password = if let Some(ref pw) = args.password {
@@ -436,16 +436,21 @@ mod tests {
     fn test_init_logging_json_arm_emits_parseable_json() {
         use tracing_subscriber::prelude::*;
 
-        let buf = SharedBuf::default();
-        let (filter, _handle) = telemetry::reloadable_env_filter("info");
-        let console_layer = telemetry::console_fmt_layer(telemetry::LogFormat::Json, buf.clone());
-        let subscriber = tracing_subscriber::registry().with(console_layer).with(filter);
+        // Hold ENV_LOCK + clear RUST_LOG so a parallel filter test cannot drop info.
+        let out = with_rust_log(None, || {
+            let buf = SharedBuf::default();
+            let (filter, _handle) = telemetry::reloadable_env_filter("info");
+            let console_layer =
+                telemetry::console_fmt_layer(telemetry::LogFormat::Json, buf.clone());
+            let subscriber = tracing_subscriber::registry().with(console_layer).with(filter);
 
-        tracing::subscriber::with_default(subscriber, || {
-            tracing::info!(request_id = "abc-123", "rvc-signer json arm marker");
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(request_id = "abc-123", "rvc-signer json arm marker");
+            });
+
+            let captured = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            captured
         });
-
-        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         let line = out.lines().find(|l| l.contains("rvc-signer json arm marker")).expect("present");
         let v: serde_json::Value =
             serde_json::from_str(line).expect("JSON arm must emit parseable JSON");
@@ -487,7 +492,7 @@ mod tests {
 
     #[test]
     fn test_rvc_signer_per_module_directive_preserved() {
-        let rendered = with_rust_log(Some("warn,rvc_signer_bin::http_api=trace"), || {
+        let rendered = with_rust_log(Some("warn,signer_server::http_api=trace"), || {
             format!("{}", telemetry::env_filter_or("info"))
         });
         assert!(rendered.contains("warn"), "global directive missing: {rendered}");
@@ -495,7 +500,7 @@ mod tests {
         // the latter green-lights a filter where the target binds to a *different*
         // level (e.g. http_api=info,foo=trace).
         assert!(
-            rendered.contains("rvc_signer_bin::http_api=trace"),
+            rendered.contains("signer_server::http_api=trace"),
             "per-module directive not preserved verbatim (target must bind to trace): {rendered}"
         );
     }
@@ -513,12 +518,12 @@ mod tests {
 
     #[test]
     fn test_rvc_signer_whitespace_padded_rust_log_honored() {
-        let rendered = with_rust_log(Some("warn, rvc_signer_bin::http_api=trace"), || {
+        let rendered = with_rust_log(Some("warn, signer_server::http_api=trace"), || {
             format!("{}", telemetry::env_filter_or("info"))
         });
         assert!(rendered.contains("warn"), "global directive missing: {rendered}");
         assert!(
-            rendered.contains("rvc_signer_bin::http_api=trace"),
+            rendered.contains("signer_server::http_api=trace"),
             "padded per-module directive not preserved verbatim (target must bind to trace): {rendered}"
         );
     }
