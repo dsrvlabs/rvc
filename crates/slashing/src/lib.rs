@@ -8,6 +8,7 @@ mod db;
 mod error;
 mod migration;
 mod reader;
+mod rules;
 mod scoped;
 mod stage;
 mod types;

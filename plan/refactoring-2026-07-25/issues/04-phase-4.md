@@ -990,13 +990,13 @@ is simply "two impls of one trait, same verdict".
    operator runbooks depend on those exact reason strings.
 
 **Acceptance criteria:**
-- [ ] `rules.rs` functions are pure over the traits — no `rusqlite` import in `rules.rs` (`rg` proof).
-- [ ] The seam is the query-trait shape above (not `Vec<Row>`), so RF4-18 can swap implementations without
+- [x] `rules.rs` functions are pure over the traits — no `rusqlite` import in `rules.rs` (`rg` proof).
+- [x] The seam is the query-trait shape above (not `Vec<Row>`), so RF4-18 can swap implementations without
       touching `rules.rs`.
-- [ ] **A2's conformance suite (all 76 cases) and the proptests are green on the stage path, unmodified.**
-- [ ] `rejection_reason` values and the strict-semantics behavior are byte-identical to today.
-- [ ] Watermark equality (A1's `<=`) is preserved in the extracted rules.
-- [ ] Standing invariant green.
+- [x] **A2's conformance suite (all 76 cases) and the proptests are green on the stage path, unmodified.**
+- [x] `rejection_reason` values and the strict-semantics behavior are byte-identical to today.
+- [x] Watermark equality (A1's `<=`) is preserved in the extracted rules.
+- [x] Standing invariant green.
 
 **TDD test plan** (`crates/slashing/src/rules.rs` `#[cfg(test)]` + existing conformance as oracle):
 - **RED first:** `test_check_attestation_is_pure_over_history_trait` — construct an in-memory fake
