@@ -324,11 +324,11 @@ Doing this **first** in Stream B means Stream A's RF5-08 moves already-clean cod
    untouched.
 
 **Acceptance criteria:**
-- [ ] `#[allow(clippy::too_many_arguments)]` is gone from `server.rs`.
-- [ ] `KeymanagerServer::new` takes exactly two arguments; all fields are named at every call site.
-- [ ] `KeymanagerSettings::default()` supplies addr and body limit from the existing constants.
-- [ ] No behavioral change: existing keymanager tests pass untouched except for construction syntax.
-- [ ] Workspace green.
+- [x] `#[allow(clippy::too_many_arguments)]` is gone from `server.rs`.
+- [x] `KeymanagerServer::new` takes exactly two arguments; all fields are named at every call site.
+- [x] `KeymanagerSettings::default()` supplies addr and body limit from the existing constants.
+- [x] No behavioral change: existing keymanager tests pass untouched except for construction syntax.
+- [x] Workspace green.
 
 **TDD test plan** (RED first):
 - `test_keymanager_settings_default_uses_declared_constants` — **RED**: `KeymanagerSettings` does not

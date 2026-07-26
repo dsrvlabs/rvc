@@ -1465,20 +1465,24 @@ mod tests {
         let addr = "127.0.0.1:0".parse().unwrap();
 
         keymanager_api::KeymanagerServer::new(
-            keystore_mgr,
-            slashing_prot,
-            validator_mgr,
-            doppelganger_mon,
-            remote_key_mgr,
-            config_mgr,
-            None,
-            token,
-            addr,
-            vec![],
-            keymanager_api::DEFAULT_BODY_LIMIT,
-            true,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            std::time::Duration::ZERO,
+            keymanager_api::KeymanagerDeps {
+                keystore_manager: keystore_mgr,
+                slashing_protection: slashing_prot,
+                validator_manager: validator_mgr,
+                doppelganger_monitor: doppelganger_mon,
+                remote_key_manager: remote_key_mgr,
+                config_manager: config_mgr,
+                exit_manager: None,
+            },
+            keymanager_api::KeymanagerSettings {
+                token,
+                addr,
+                cors_origins: vec![],
+                body_limit: keymanager_api::DEFAULT_BODY_LIMIT,
+                allow_insecure_remote_signer: true,
+                attesting_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                doppelganger_window: std::time::Duration::ZERO,
+            },
         )
     }
 
@@ -1577,20 +1581,24 @@ mod tests {
         let addr = "127.0.0.1:0".parse().unwrap();
 
         let server = keymanager_api::KeymanagerServer::new(
-            keystore_mgr,
-            slashing_prot,
-            validator_mgr,
-            doppelganger_mon,
-            remote_key_mgr,
-            config_mgr,
-            None,
-            token.clone(),
-            addr,
-            vec![],
-            keymanager_api::DEFAULT_BODY_LIMIT,
-            true,
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            std::time::Duration::ZERO,
+            keymanager_api::KeymanagerDeps {
+                keystore_manager: keystore_mgr,
+                slashing_protection: slashing_prot,
+                validator_manager: validator_mgr,
+                doppelganger_monitor: doppelganger_mon,
+                remote_key_manager: remote_key_mgr,
+                config_manager: config_mgr,
+                exit_manager: None,
+            },
+            keymanager_api::KeymanagerSettings {
+                token: token.clone(),
+                addr,
+                cors_origins: vec![],
+                body_limit: keymanager_api::DEFAULT_BODY_LIMIT,
+                allow_insecure_remote_signer: true,
+                attesting_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                doppelganger_window: std::time::Duration::ZERO,
+            },
         );
 
         // 1. Import a remote key

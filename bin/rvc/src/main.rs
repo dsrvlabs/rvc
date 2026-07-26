@@ -1750,20 +1750,24 @@ async fn run_validator(
             )));
 
         let km_server = keymanager_api::KeymanagerServer::new(
-            keystore_mgr,
-            slashing_prot,
-            validator_mgr,
-            doppelganger_mon,
-            remote_key_mgr,
-            config_mgr,
-            exit_mgr,
-            token.to_string(),
-            km_addr,
-            config.keymanager_cors_origins.clone(),
-            config.keymanager_body_limit,
-            config.allow_insecure_remote_signer,
-            attesting_enabled.clone(),
-            doppelganger_window,
+            keymanager_api::KeymanagerDeps {
+                keystore_manager: keystore_mgr,
+                slashing_protection: slashing_prot,
+                validator_manager: validator_mgr,
+                doppelganger_monitor: doppelganger_mon,
+                remote_key_manager: remote_key_mgr,
+                config_manager: config_mgr,
+                exit_manager: exit_mgr,
+            },
+            keymanager_api::KeymanagerSettings {
+                token: token.to_string(),
+                addr: km_addr,
+                cors_origins: config.keymanager_cors_origins.clone(),
+                body_limit: config.keymanager_body_limit,
+                allow_insecure_remote_signer: config.allow_insecure_remote_signer,
+                attesting_enabled: attesting_enabled.clone(),
+                doppelganger_window,
+            },
         );
 
         info!(addr = %km_addr, token_path = %token_path.display(), "Keymanager API enabled");

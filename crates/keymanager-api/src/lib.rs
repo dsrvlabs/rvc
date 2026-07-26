@@ -7,4 +7,6 @@ pub mod traits;
 pub mod types;
 pub mod url_validator;
 
-pub use server::{KeymanagerServer, DEFAULT_ADDR, DEFAULT_BODY_LIMIT};
+pub use server::{
+    KeymanagerDeps, KeymanagerServer, KeymanagerSettings, DEFAULT_ADDR, DEFAULT_BODY_LIMIT,
+};

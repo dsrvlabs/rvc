@@ -2628,20 +2628,24 @@ mod tests {
 
         let app = TestApp::new();
         let server = KeymanagerServer::new(
-            app.keystore_manager.clone(),
-            app.slashing_protection.clone(),
-            app.validator_manager.clone(),
-            app.doppelganger_monitor.clone(),
-            app.remote_key_manager.clone(),
-            app.config_manager.clone(),
-            None,
-            "test_token".to_string(),
-            "127.0.0.1:0".parse().unwrap(),
-            vec![],
-            1024, // 1 KB limit
-            true,
-            Arc::new(AtomicBool::new(true)),
-            std::time::Duration::ZERO,
+            crate::KeymanagerDeps {
+                keystore_manager: app.keystore_manager.clone(),
+                slashing_protection: app.slashing_protection.clone(),
+                validator_manager: app.validator_manager.clone(),
+                doppelganger_monitor: app.doppelganger_monitor.clone(),
+                remote_key_manager: app.remote_key_manager.clone(),
+                config_manager: app.config_manager.clone(),
+                exit_manager: None,
+            },
+            crate::KeymanagerSettings {
+                token: "test_token".to_string(),
+                addr: "127.0.0.1:0".parse().unwrap(),
+                cors_origins: vec![],
+                body_limit: 1024, // 1 KB limit
+                allow_insecure_remote_signer: true,
+                attesting_enabled: Arc::new(AtomicBool::new(true)),
+                doppelganger_window: std::time::Duration::ZERO,
+            },
         );
 
         let big_body = "x".repeat(2048); // 2 KB > 1 KB limit
@@ -2668,20 +2672,24 @@ mod tests {
 
         let app = TestApp::new();
         let server = KeymanagerServer::new(
-            app.keystore_manager.clone(),
-            app.slashing_protection.clone(),
-            app.validator_manager.clone(),
-            app.doppelganger_monitor.clone(),
-            app.remote_key_manager.clone(),
-            app.config_manager.clone(),
-            None,
-            "test_token".to_string(),
-            "127.0.0.1:0".parse().unwrap(),
-            vec![],
-            10 * 1024 * 1024, // 10 MB
-            true,
-            Arc::new(AtomicBool::new(true)),
-            std::time::Duration::ZERO,
+            crate::KeymanagerDeps {
+                keystore_manager: app.keystore_manager.clone(),
+                slashing_protection: app.slashing_protection.clone(),
+                validator_manager: app.validator_manager.clone(),
+                doppelganger_monitor: app.doppelganger_monitor.clone(),
+                remote_key_manager: app.remote_key_manager.clone(),
+                config_manager: app.config_manager.clone(),
+                exit_manager: None,
+            },
+            crate::KeymanagerSettings {
+                token: "test_token".to_string(),
+                addr: "127.0.0.1:0".parse().unwrap(),
+                cors_origins: vec![],
+                body_limit: 10 * 1024 * 1024, // 10 MB
+                allow_insecure_remote_signer: true,
+                attesting_enabled: Arc::new(AtomicBool::new(true)),
+                doppelganger_window: std::time::Duration::ZERO,
+            },
         );
 
         let body = serde_json::json!({
@@ -2715,20 +2723,24 @@ mod tests {
 
         let app = TestApp::new();
         let server = KeymanagerServer::new(
-            app.keystore_manager.clone(),
-            app.slashing_protection.clone(),
-            app.validator_manager.clone(),
-            app.doppelganger_monitor.clone(),
-            app.remote_key_manager.clone(),
-            app.config_manager.clone(),
-            None,
-            "test_token".to_string(),
-            "127.0.0.1:0".parse().unwrap(),
-            vec![],
-            10 * 1024 * 1024,
-            true,
-            Arc::new(AtomicBool::new(true)),
-            std::time::Duration::ZERO,
+            crate::KeymanagerDeps {
+                keystore_manager: app.keystore_manager.clone(),
+                slashing_protection: app.slashing_protection.clone(),
+                validator_manager: app.validator_manager.clone(),
+                doppelganger_monitor: app.doppelganger_monitor.clone(),
+                remote_key_manager: app.remote_key_manager.clone(),
+                config_manager: app.config_manager.clone(),
+                exit_manager: None,
+            },
+            crate::KeymanagerSettings {
+                token: "test_token".to_string(),
+                addr: "127.0.0.1:0".parse().unwrap(),
+                cors_origins: vec![],
+                body_limit: 10 * 1024 * 1024,
+                allow_insecure_remote_signer: true,
+                attesting_enabled: Arc::new(AtomicBool::new(true)),
+                doppelganger_window: std::time::Duration::ZERO,
+            },
         );
 
         let response = server
@@ -2756,20 +2768,24 @@ mod tests {
 
         let app = TestApp::new();
         let server = KeymanagerServer::new(
-            app.keystore_manager.clone(),
-            app.slashing_protection.clone(),
-            app.validator_manager.clone(),
-            app.doppelganger_monitor.clone(),
-            app.remote_key_manager.clone(),
-            app.config_manager.clone(),
-            None,
-            "test_token".to_string(),
-            "127.0.0.1:0".parse().unwrap(),
-            vec!["http://localhost:3000".to_string()],
-            10 * 1024 * 1024,
-            true,
-            Arc::new(AtomicBool::new(true)),
-            std::time::Duration::ZERO,
+            crate::KeymanagerDeps {
+                keystore_manager: app.keystore_manager.clone(),
+                slashing_protection: app.slashing_protection.clone(),
+                validator_manager: app.validator_manager.clone(),
+                doppelganger_monitor: app.doppelganger_monitor.clone(),
+                remote_key_manager: app.remote_key_manager.clone(),
+                config_manager: app.config_manager.clone(),
+                exit_manager: None,
+            },
+            crate::KeymanagerSettings {
+                token: "test_token".to_string(),
+                addr: "127.0.0.1:0".parse().unwrap(),
+                cors_origins: vec!["http://localhost:3000".to_string()],
+                body_limit: 10 * 1024 * 1024,
+                allow_insecure_remote_signer: true,
+                attesting_enabled: Arc::new(AtomicBool::new(true)),
+                doppelganger_window: std::time::Duration::ZERO,
+            },
         );
 
         let response = server
@@ -2797,20 +2813,24 @@ mod tests {
 
         let app = TestApp::new();
         let server = KeymanagerServer::new(
-            app.keystore_manager.clone(),
-            app.slashing_protection.clone(),
-            app.validator_manager.clone(),
-            app.doppelganger_monitor.clone(),
-            app.remote_key_manager.clone(),
-            app.config_manager.clone(),
-            None,
-            "test_token".to_string(),
-            "127.0.0.1:0".parse().unwrap(),
-            vec!["http://localhost:3000".to_string()],
-            10 * 1024 * 1024,
-            true,
-            Arc::new(AtomicBool::new(true)),
-            std::time::Duration::ZERO,
+            crate::KeymanagerDeps {
+                keystore_manager: app.keystore_manager.clone(),
+                slashing_protection: app.slashing_protection.clone(),
+                validator_manager: app.validator_manager.clone(),
+                doppelganger_monitor: app.doppelganger_monitor.clone(),
+                remote_key_manager: app.remote_key_manager.clone(),
+                config_manager: app.config_manager.clone(),
+                exit_manager: None,
+            },
+            crate::KeymanagerSettings {
+                token: "test_token".to_string(),
+                addr: "127.0.0.1:0".parse().unwrap(),
+                cors_origins: vec!["http://localhost:3000".to_string()],
+                body_limit: 10 * 1024 * 1024,
+                allow_insecure_remote_signer: true,
+                attesting_enabled: Arc::new(AtomicBool::new(true)),
+                doppelganger_window: std::time::Duration::ZERO,
+            },
         );
 
         let response = server
