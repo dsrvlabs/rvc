@@ -7,11 +7,11 @@ use tracing::{debug, info, warn};
 use async_trait::async_trait;
 
 use super::bls::{SecretKey, Signature, PUBLIC_KEY_BYTES_LEN};
-use observability::logging::TruncatedPubkey;
 use super::remote_signer::RemoteSigner;
 use super::signer_trait::{LocalSigner, Signer, SigningError};
 use super::typed_signer::TypedSigner;
 use eth_types::Root;
+use observability::logging::TruncatedPubkey;
 
 pub struct CompositeSigner {
     local: LocalSigner,

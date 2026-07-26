@@ -760,11 +760,11 @@ the HTTP client, `Signer` + `TypedSigner` impls, and ~800 lines of tests.
 - `crates/crypto/Cargo.toml` — add `web3signer-wire`.
 
 **Acceptance criteria.**
-- [ ] `remote_signer.rs` no longer defines any wire type; all come from `web3signer-wire`.
-- [ ] The file is split into `wire.rs` and `client.rs`, each under ~800 lines including tests.
-- [ ] The public API path used by `crates/signer` and `crates/rvc` is unchanged (no consumer edits).
-- [ ] Serialized request bodies byte-identical to pre-split (test below).
-- [ ] Standing invariant green.
+- [x] `remote_signer.rs` no longer defines any wire type; all come from `web3signer-wire`.
+- [x] The file is split into `wire.rs` and `client.rs`, each under ~800 lines including tests.
+- [x] The public API path used by `crates/signer` and `crates/rvc` is unchanged (no consumer edits).
+- [x] Serialized request bodies byte-identical to pre-split (test below).
+- [x] Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_request_bodies_byte_identical_after_wire_extraction` — snapshot the serialized

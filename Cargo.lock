@@ -4278,6 +4278,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rvc-eth-types",
  "rvc-observability",
+ "rvc-web3signer-wire",
  "scrypt",
  "secrecy",
  "serde",

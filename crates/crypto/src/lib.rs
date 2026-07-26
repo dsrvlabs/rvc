@@ -31,10 +31,10 @@ pub use remote_signer::{
     build_blinded_block_v2_request, build_block_v2_request, build_contribution_and_proof_request,
     build_randao_reveal_request, build_sync_committee_message_request,
     build_sync_selection_proof_request, build_validator_registration_request,
-    build_voluntary_exit_request, check_remote_signer_url, AggregationSlotPayload,
-    BeaconBlockEnvelope, RandaoRevealPayload, RemoteSigner, RemoteSignerConfig,
-    SyncSelectionPayload, Web3SignerPayload, Web3SignerSignRequest, WireForkInfo,
-    REMOTE_SIGNER_INSECURE_ENV_VAR,
+    build_voluntary_exit_request, check_remote_signer_url, sign_request_to_json,
+    AggregationSlotPayload, BeaconBlockEnvelope, RandaoRevealPayload, RemoteSigner,
+    RemoteSignerConfig, SignRequestJson, SyncSelectionPayload, Web3SignerPayload,
+    Web3SignerSignRequest, WireForkInfo, WireForkInfoExt, REMOTE_SIGNER_INSECURE_ENV_VAR,
 };
 pub use signer_trait::{LocalSigner, Signer, SigningError};
 pub use signing::{compute_domain, compute_fork_data_root, compute_signing_root};
