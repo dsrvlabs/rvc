@@ -976,12 +976,8 @@ mod tests {
     /// the audit extractor and no chain validation happens at the audit layer, so
     /// a self-signed cert suffices to drive the cert-bearing CN path.
     fn peer_cert_with_cn(cn: &str) -> PeerCert {
-        let mut params = rcgen::CertificateParams::new(vec![cn.to_string()]).unwrap();
-        params.distinguished_name = rcgen::DistinguishedName::new();
-        params.distinguished_name.push(rcgen::DnType::CommonName, cn);
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = params.self_signed(&key).unwrap();
-        PeerCert(Some(cert.der().clone()))
+        let der = rvc_test_support::self_signed_leaf_der(cn);
+        PeerCert(Some(rustls::pki_types::CertificateDer::from(der)))
     }
 
     /// `post_sign` with a Phase-3 `PeerCert` request extension injected, so the

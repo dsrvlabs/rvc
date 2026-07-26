@@ -234,13 +234,13 @@ mod tests {
 
     // ── build_server_config / client_verifier (Issue 3.1) ────────────────────
 
-    use rcgen::{CertificateParams, KeyPair};
     use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
     use rustls::ClientConfig;
+    use rvc_test_support::{TestPki, TestPkiParams};
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-    /// rcgen-minted PKI: a trusted CA, a `localhost` server cert + key, a
+    /// Shared-harness PKI: a trusted CA, a `localhost` server cert + key, a
     /// CA-signed client cert + key, and a ROGUE client signed by a different CA.
     struct Pki {
         ca: CertificateDer<'static>,
@@ -252,42 +252,27 @@ mod tests {
         rogue_key: Vec<u8>,
     }
 
-    fn leaf(
-        name: &str,
-        ca: &rcgen::Certificate,
-        ca_key: &KeyPair,
-    ) -> (Vec<CertificateDer<'static>>, Vec<u8>) {
-        let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
-        // Set an explicit CommonName (= `name`) so the leaf carries a CN the audit
-        // extractor (Issue 3.4) can read — CN lives in the DN, not the SAN.
-        params.distinguished_name = rcgen::DistinguishedName::new();
-        params.distinguished_name.push(rcgen::DnType::CommonName, name);
-        let key = KeyPair::generate().unwrap();
-        let cert = params.signed_by(&key, ca, ca_key).unwrap();
-        (vec![cert.der().clone()], key.serialize_der())
-    }
-
     fn test_pki() -> Pki {
-        let ca_params = CertificateParams::new(vec!["test-ca".to_string()]).unwrap();
-        let ca_key = KeyPair::generate().unwrap();
-        let ca = ca_params.self_signed(&ca_key).unwrap();
-        let (server_chain, server_key) = leaf("localhost", &ca, &ca_key);
-        let (client_chain, client_key) = leaf("client", &ca, &ca_key);
-
+        let good = TestPki::generate(TestPkiParams {
+            ca_name: "test-ca".to_string(),
+            server_sans: vec!["localhost".to_string()],
+            client_name: "client".to_string(),
+        });
         // A rogue CA + client the server's CA does NOT trust.
-        let rogue_ca_params = CertificateParams::new(vec!["rogue-ca".to_string()]).unwrap();
-        let rogue_ca_key = KeyPair::generate().unwrap();
-        let rogue_ca = rogue_ca_params.self_signed(&rogue_ca_key).unwrap();
-        let (rogue_chain, rogue_key) = leaf("rogue", &rogue_ca, &rogue_ca_key);
+        let rogue = TestPki::generate(TestPkiParams {
+            ca_name: "rogue-ca".to_string(),
+            server_sans: vec!["localhost".to_string()],
+            client_name: "rogue".to_string(),
+        });
 
         Pki {
-            ca: ca.der().clone(),
-            server_chain,
-            server_key,
-            client_chain,
-            client_key,
-            rogue_chain,
-            rogue_key,
+            ca: CertificateDer::from(good.ca_cert_der),
+            server_chain: vec![CertificateDer::from(good.server_cert_der)],
+            server_key: good.server_key_der,
+            client_chain: vec![CertificateDer::from(good.client_cert_der)],
+            client_key: good.client_key_der,
+            rogue_chain: vec![CertificateDer::from(rogue.client_cert_der)],
+            rogue_key: rogue.client_key_der,
         }
     }
 
@@ -446,15 +431,14 @@ mod tests {
         path
     }
 
-    /// rcgen CA + `localhost` server cert/key as PEM bytes (PKCS#8 key).
+    /// CA + `localhost` server cert/key as PEM bytes (PKCS#8 key).
     fn server_pems() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let ca_params = CertificateParams::new(vec!["test-ca".to_string()]).unwrap();
-        let ca_key = KeyPair::generate().unwrap();
-        let ca = ca_params.self_signed(&ca_key).unwrap();
-        let sp = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let sk = KeyPair::generate().unwrap();
-        let server = sp.signed_by(&sk, &ca, &ca_key).unwrap();
-        (server.pem().into_bytes(), sk.serialize_pem().into_bytes(), ca.pem().into_bytes())
+        let pki = TestPki::generate(TestPkiParams {
+            ca_name: "test-ca".to_string(),
+            server_sans: vec!["localhost".to_string()],
+            client_name: "client".to_string(),
+        });
+        (pki.server_cert_pem, pki.server_key_pem, pki.ca_cert_pem)
     }
 
     #[test]
@@ -517,8 +501,9 @@ mod tests {
         install_crypto_provider();
         let dir = TempDir::new().unwrap();
         let (cert, _key, ca) = server_pems();
-        // A DIFFERENT key that does not match the server cert.
-        let wrong_key = KeyPair::generate().unwrap().serialize_pem().into_bytes();
+        // A DIFFERENT key that does not match the server cert (client key from a
+        // freshly minted PKI — same algorithm, unrelated keypair).
+        let wrong_key = TestPki::new().client_key_pem;
         let cert_p = write_pem(&dir, "server.pem", &cert);
         let key_p = write_pem(&dir, "wrong.key", &wrong_key);
         let ca_p = write_pem(&dir, "ca.pem", &ca);

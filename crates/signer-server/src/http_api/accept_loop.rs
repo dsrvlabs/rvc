@@ -237,10 +237,10 @@ mod tests {
     use axum::Extension;
     use axum::Router;
     use hyper_util::rt::TokioIo;
-    use rcgen::{CertificateParams, KeyPair};
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use rustls::ClientConfig;
     use rustls::RootCertStore;
+    use rvc_test_support::{TestPki, TestPkiParams};
     use tempfile::TempDir;
     use tokio::net::{TcpListener, TcpStream};
     use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -256,26 +256,19 @@ mod tests {
         client_key: Vec<u8>,
     }
 
-    fn leaf(
-        name: &str,
-        ca: &rcgen::Certificate,
-        ca_key: &KeyPair,
-    ) -> (Vec<CertificateDer<'static>>, Vec<u8>) {
-        let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
-        params.distinguished_name = rcgen::DistinguishedName::new();
-        params.distinguished_name.push(rcgen::DnType::CommonName, name);
-        let key = KeyPair::generate().unwrap();
-        let cert = params.signed_by(&key, ca, ca_key).unwrap();
-        (vec![cert.der().clone()], key.serialize_der())
-    }
-
     fn test_pki() -> Pki {
-        let ca_params = CertificateParams::new(vec!["test-ca".to_string()]).unwrap();
-        let ca_key = KeyPair::generate().unwrap();
-        let ca = ca_params.self_signed(&ca_key).unwrap();
-        let (server_chain, server_key) = leaf("localhost", &ca, &ca_key);
-        let (client_chain, client_key) = leaf("client", &ca, &ca_key);
-        Pki { ca: ca.der().clone(), server_chain, server_key, client_chain, client_key }
+        let pki = TestPki::generate(TestPkiParams {
+            ca_name: "test-ca".to_string(),
+            server_sans: vec!["localhost".to_string()],
+            client_name: "client".to_string(),
+        });
+        Pki {
+            ca: CertificateDer::from(pki.ca_cert_der),
+            server_chain: vec![CertificateDer::from(pki.server_cert_der)],
+            server_key: pki.server_key_der,
+            client_chain: vec![CertificateDer::from(pki.client_cert_der)],
+            client_key: pki.client_key_der,
+        }
     }
 
     fn key_of(der: &[u8]) -> PrivateKeyDer<'static> {
@@ -316,13 +309,12 @@ mod tests {
     }
 
     fn server_pems() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let ca_params = CertificateParams::new(vec!["test-ca".to_string()]).unwrap();
-        let ca_key = KeyPair::generate().unwrap();
-        let ca = ca_params.self_signed(&ca_key).unwrap();
-        let sp = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let sk = KeyPair::generate().unwrap();
-        let server = sp.signed_by(&sk, &ca, &ca_key).unwrap();
-        (server.pem().into_bytes(), sk.serialize_pem().into_bytes(), ca.pem().into_bytes())
+        let pki = TestPki::generate(TestPkiParams {
+            ca_name: "test-ca".to_string(),
+            server_sans: vec!["localhost".to_string()],
+            client_name: "client".to_string(),
+        });
+        (pki.server_cert_pem, pki.server_key_pem, pki.ca_cert_pem)
     }
 
     async fn peer_handler(Extension(PeerCert(leaf)): Extension<PeerCert>) -> &'static str {

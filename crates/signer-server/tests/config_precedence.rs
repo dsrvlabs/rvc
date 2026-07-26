@@ -365,14 +365,8 @@ fn test_audit_extract_cn_without_tls_returns_unknown() {
 
 #[test]
 fn test_audit_extract_cn_from_der_known_cert() {
-    use rcgen::DnType;
-
-    let mut params = rcgen::CertificateParams::new(vec!["test.example.com".to_string()]).unwrap();
-    params.distinguished_name.push(DnType::CommonName, "integration-test-client");
-    let key = rcgen::KeyPair::generate().unwrap();
-    let cert = params.self_signed(&key).unwrap();
-
-    let cn = signer_server::audit::cn::extract_cn_from_der(cert.der().as_ref());
+    let der = rvc_test_support::self_signed_der_with_cn("integration-test-client");
+    let cn = signer_server::audit::cn::extract_cn_from_der(&der);
     assert_eq!(cn, Some("integration-test-client".to_string()));
 }
 

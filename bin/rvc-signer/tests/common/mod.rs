@@ -241,7 +241,7 @@ impl SpawnedServe {
     }
 }
 
-/// rcgen mTLS fixture: CA + server cert/key written under `dir`.
+/// mTLS fixture: CA + server cert/key written under `dir`.
 pub struct PkiFixture {
     pub ca_cert: PathBuf,
     pub server_cert: PathBuf,
@@ -250,27 +250,16 @@ pub struct PkiFixture {
 
 impl PkiFixture {
     pub fn generate(dir: &Path) -> Self {
-        use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+        use rvc_test_support::{TestPki, TestPkiParams};
 
-        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca_params.distinguished_name.push(DnType::CommonName, "test-ca");
-        let ca_key = KeyPair::generate().unwrap();
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-        let mut server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        server_params.distinguished_name.push(DnType::CommonName, "rvc-signer.test");
-        let server_key = KeyPair::generate().unwrap();
-        let server_cert =
-            server_params.signed_by(&server_key, &ca_cert, &ca_key).expect("sign server cert");
-
-        let ca_path = dir.join("ca.pem");
-        let cert_path = dir.join("server.pem");
-        let key_path = dir.join("server.key");
-        std::fs::write(&ca_path, ca_cert.pem()).unwrap();
-        std::fs::write(&cert_path, server_cert.pem()).unwrap();
-        std::fs::write(&key_path, server_key.serialize_pem()).unwrap();
-
-        Self { ca_cert: ca_path, server_cert: cert_path, server_key: key_path }
+        let pki = TestPki::generate(TestPkiParams {
+            ca_name: "test-ca".to_string(),
+            server_sans: vec!["localhost".to_string()],
+            client_name: "rvc-signer.test".to_string(),
+        });
+        // Server CN is the first SAN (`localhost`); rewrite PEMs with the
+        // shared helper's layout (ca.pem / server.pem / server.key).
+        let paths = pki.write_server_pem(dir);
+        Self { ca_cert: paths.ca_cert, server_cert: paths.cert, server_key: paths.key }
     }
 }

@@ -1,0 +1,20 @@
+[package]
+name = "rvc-test-support"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Dev-only shared PKI + mTLS test harness (rcgen)"
+
+[lints]
+workspace = true
+
+# Zero workspace-internal dependencies by design (pinned in ZERO_OUT_EDGE_IF_PRESENT).
+# External-only: rcgen for cert minting, tonic/tokio for the mTLS server helper.
+[dependencies]
+rcgen.workspace = true
+tokio = { workspace = true, features = ["net", "rt", "macros", "time"] }
+tokio-stream.workspace = true
+tonic = { workspace = true, features = ["transport", "tls"] }

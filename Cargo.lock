@@ -4361,12 +4361,12 @@ dependencies = [
  "async-trait",
  "hex",
  "prost 0.13.5",
- "rcgen",
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-observability",
  "rvc-signer-proto",
  "rvc-slashing",
+ "rvc-test-support",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -4525,10 +4525,10 @@ dependencies = [
  "clap",
  "hex",
  "libc",
- "rcgen",
  "rvc-crypto",
  "rvc-signer-server",
  "rvc-telemetry",
+ "rvc-test-support",
  "serde_json",
  "tempfile",
  "tokio",
@@ -4569,7 +4569,6 @@ dependencies = [
  "proptest",
  "prost 0.13.5",
  "rand 0.8.5",
- "rcgen",
  "reqwest 0.12.28",
  "rustls",
  "rustls-pemfile",
@@ -4582,6 +4581,7 @@ dependencies = [
  "rvc-signer-registry",
  "rvc-slashing",
  "rvc-telemetry",
+ "rvc-test-support",
  "rvc-web3signer-wire",
  "serde",
  "serde_json",
@@ -4649,6 +4649,16 @@ dependencies = [
  "tracing-appender",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "rvc-test-support"
+version = "0.6.0"
+dependencies = [
+ "rcgen",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.12.3",
 ]
 
 [[package]]

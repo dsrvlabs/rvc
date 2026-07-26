@@ -87,9 +87,7 @@ impl TlsConfig {
 mod tests {
     use super::*;
 
-    use std::io::Write;
-
-    use rcgen::{CertificateParams, KeyPair};
+    use rvc_test_support::{TestPki, TestPkiParams};
     use tempfile::TempDir;
 
     struct TestCerts {
@@ -101,31 +99,18 @@ mod tests {
 
     fn generate_test_certs() -> TestCerts {
         let dir = TempDir::new().unwrap();
-
-        // Generate CA
-        let ca_params = CertificateParams::new(vec!["rvc-signer-ca".to_string()]).unwrap();
-        let ca_key = KeyPair::generate().unwrap();
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-        // Generate server cert signed by CA
-        let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
-        let server_key = KeyPair::generate().unwrap();
-        let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
-
-        let cert_path = dir.path().join("server.pem");
-        let key_path = dir.path().join("server.key");
-        let ca_cert_path = dir.path().join("ca.pem");
-
-        let mut f = std::fs::File::create(&cert_path).unwrap();
-        f.write_all(server_cert.pem().as_bytes()).unwrap();
-
-        let mut f = std::fs::File::create(&key_path).unwrap();
-        f.write_all(server_key.serialize_pem().as_bytes()).unwrap();
-
-        let mut f = std::fs::File::create(&ca_cert_path).unwrap();
-        f.write_all(ca_cert.pem().as_bytes()).unwrap();
-
-        TestCerts { _dir: dir, cert_path, key_path, ca_cert_path }
+        let pki = TestPki::generate(TestPkiParams {
+            ca_name: "rvc-signer-ca".to_string(),
+            server_sans: vec!["localhost".to_string()],
+            client_name: "rvc-client".to_string(),
+        });
+        let paths = pki.write_server_pem(dir.path());
+        TestCerts {
+            _dir: dir,
+            cert_path: paths.cert,
+            key_path: paths.key,
+            ca_cert_path: paths.ca_cert,
+        }
     }
 
     #[test]

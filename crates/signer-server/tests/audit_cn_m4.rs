@@ -9,49 +9,30 @@
 //! The new `x509-parser`-based implementation returns the **first** CN match
 //! per RDN rules, which is the standard-compliant behaviour.
 
-use rcgen::{CertificateParams, DnType, KeyPair};
+use rvc_test_support::{
+    self_signed_der_with_cn, self_signed_der_with_two_cns, self_signed_der_without_cn,
+};
 use signer_server::audit::cn::extract_cn_from_der;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /// Build a self-signed certificate whose Subject contains exactly one CN entry.
 fn cert_with_single_cn(cn: &str) -> Vec<u8> {
-    let mut params = CertificateParams::new(vec![]).unwrap();
-    params.distinguished_name = rcgen::DistinguishedName::new();
-    params.distinguished_name.push(DnType::CommonName, cn);
-    let key = KeyPair::generate().unwrap();
-    params.self_signed(&key).unwrap().der().to_vec()
+    self_signed_der_with_cn(cn)
 }
 
 /// Build a self-signed certificate whose Subject contains **two** CN entries:
 /// the first is `first_cn` and the second is `second_cn`.
 ///
-/// rcgen's `DistinguishedName` is backed by an `IndexMap<DnType, DnValue>`,
-/// so a second `push(DnType::CommonName, …)` would overwrite the first.
-/// We work around this by storing the second entry under a `CustomDnType`
-/// whose OID arcs are identical to CN (`2.5.4.3`).  Both entries encode to
-/// the same OID in the generated DER, but occupy separate IndexMap slots,
-/// so both survive serialisation.
+/// See `rvc_test_support::self_signed_der_with_two_cns` for the CustomDnType
+/// workaround (rcgen IndexMap would otherwise collapse two CommonName pushes).
 fn cert_with_two_cns(first_cn: &str, second_cn: &str) -> Vec<u8> {
-    let mut params = CertificateParams::new(vec![]).unwrap();
-    params.distinguished_name = rcgen::DistinguishedName::new();
-    // First CN — stored under the canonical DnType::CommonName key.
-    params.distinguished_name.push(DnType::CommonName, first_cn);
-    // Second CN — stored under CustomDnType([2,5,4,3]) which encodes to the
-    // same OID 2.5.4.3 but is a distinct IndexMap key.
-    params.distinguished_name.push(DnType::CustomDnType(vec![2, 5, 4, 3]), second_cn);
-    let key = KeyPair::generate().unwrap();
-    params.self_signed(&key).unwrap().der().to_vec()
+    self_signed_der_with_two_cns(first_cn, second_cn)
 }
 
 /// Build a self-signed certificate with no CN in the Subject.
 fn cert_with_no_cn() -> Vec<u8> {
-    let mut params = CertificateParams::new(vec![]).unwrap();
-    params.distinguished_name = rcgen::DistinguishedName::new();
-    // Add a non-CN attribute so the Subject isn't completely empty.
-    params.distinguished_name.push(DnType::OrganizationName, "TestOrg");
-    let key = KeyPair::generate().unwrap();
-    params.self_signed(&key).unwrap().der().to_vec()
+    self_signed_der_without_cn()
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────

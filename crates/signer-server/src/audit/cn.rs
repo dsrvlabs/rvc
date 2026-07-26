@@ -276,30 +276,14 @@ mod tests {
 
     #[test]
     fn test_extract_cn_from_der_with_known_cert() {
-        use rcgen::DnType;
-
-        let mut params =
-            rcgen::CertificateParams::new(vec!["test-client.example.com".to_string()]).unwrap();
-        params.distinguished_name.push(DnType::CommonName, "my-validator-client");
-        let key = rcgen::KeyPair::generate().unwrap();
-        let cert = params.self_signed(&key).unwrap();
-        let der = cert.der().as_ref();
-
-        let cn = extract_cn_from_der(der);
+        let der = rvc_test_support::self_signed_der_with_cn("my-validator-client");
+        let cn = extract_cn_from_der(&der);
         assert_eq!(cn, Some("my-validator-client".to_string()));
     }
 
     /// A self-signed leaf carrying CN = `cn` (or no CN when `None`), as DER.
     fn self_signed_with_cn(cn: Option<&str>) -> Vec<u8> {
-        use rcgen::DnType;
-
-        let mut params = rcgen::CertificateParams::new(vec!["host.example".to_string()]).unwrap();
-        params.distinguished_name = rcgen::DistinguishedName::new();
-        if let Some(cn) = cn {
-            params.distinguished_name.push(DnType::CommonName, cn);
-        }
-        let key = rcgen::KeyPair::generate().unwrap();
-        params.self_signed(&key).unwrap().der().as_ref().to_vec()
+        rvc_test_support::self_signed_der_optional_cn(cn)
     }
 
     #[test]

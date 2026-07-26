@@ -59,12 +59,15 @@ const FORBIDDEN: &[(&str, &str)] =
 ///   node can never create a cycle.
 /// - `rvc-observability`: logging/hex/pubkey leaf sink (RF3-01); zero workspace out-edges so
 ///   dependents can take the light path without pulling BLS/KDF/HTTP via crypto.
+/// - `rvc-test-support`: dev-only rcgen PKI + mTLS harness (RF6-14); external deps only
+///   (rcgen/tonic/tokio), never a production edge into the workspace graph.
 const ZERO_OUT_EDGE_IF_PRESENT: &[&str] = &[
     "rvc-eth-types",
     "rvc-signer-registry",
     "rvc-telemetry",
     "rvc-observability",
     "rvc-signer-proto",
+    "rvc-test-support",
 ];
 /// Edge that MUST be present (Issue 1.5 regression guard).
 const REQUIRED_EDGE: (&str, &str) = ("rvc-signer", "rvc-doppelganger");

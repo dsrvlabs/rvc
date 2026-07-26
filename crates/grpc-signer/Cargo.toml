@@ -24,7 +24,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 eth-types = { workspace = true, features = ["test-fixtures"] }
-rcgen.workspace = true
+rvc-test-support.workspace = true
 slashing.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

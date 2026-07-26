@@ -34,9 +34,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rcgen::{CertificateParams, KeyPair};
+use rvc_test_support::{TestPki, TestPkiParams};
 use tempfile::TempDir;
-use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 use signer_server::dvt::allow_list::{AllowedPeer, AllowedPeers};
 use signer_server::dvt::peer_client::{
@@ -53,12 +52,8 @@ use signer_server::PeerSignerServiceServerV2;
 
 /// All cert artifacts for one test run.
 struct TestCerts {
-    /// PEM of the shared CA.
-    ca_pem: Vec<u8>,
-    /// PEM of the server cert (SANs: DNS:`sni_name`).
-    server_cert_pem: Vec<u8>,
-    /// PEM of the server private key.
-    server_key_pem: Vec<u8>,
+    /// Shared PKI (CA + server + client).
+    pki: TestPki,
     /// `TlsConfig` that the client passes to `GrpcPeerRequester::connect`.
     /// Points to temp files on disk (kept alive by `_dir`).
     client_tls_config: TlsConfig,
@@ -70,15 +65,9 @@ struct TestCerts {
 ///
 /// The server cert has DNS SAN = `sni_name` and IP SAN = `127.0.0.1`.
 /// The IP SAN is required to make `test_wrong_peer_cert_refused` a genuine
-/// RED→GREEN regression test (see the inline comment in the function body
-/// for the full reasoning).
+/// RED→GREEN regression test (see the inline comment below for the full
+/// reasoning).
 fn generate_test_certs(sni_name: &str) -> TestCerts {
-    // CA
-    let ca_params = CertificateParams::new(vec!["test-ca.internal".to_string()]).unwrap();
-    let ca_key = KeyPair::generate().unwrap();
-    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-    let ca_pem = ca_cert.pem().into_bytes();
-
     // Server cert: DNS SAN = sni_name + IP SAN = 127.0.0.1.
     //
     // The IP SAN is critical for making the test a genuine RED→GREEN.  Without
@@ -91,53 +80,23 @@ fn generate_test_certs(sni_name: &str) -> TestCerts {
     //     connection SUCCEEDS → `test_wrong_peer_cert_refused` FAILS (RED).
     //   - New code (domain_name("peer-b.local")): cert has `peer-a.local` SAN,
     //     NOT `peer-b.local` → rustls rejects → FAILS → assertion passes (GREEN).
-    let server_params =
-        CertificateParams::new(vec![sni_name.to_string(), "127.0.0.1".to_string()]).unwrap();
-    let server_key = KeyPair::generate().unwrap();
-    let server_cert = server_params.signed_by(&server_key, &ca_cert, &ca_key).unwrap();
-    let server_cert_pem = server_cert.pem().into_bytes();
-    let server_key_pem = server_key.serialize_pem().into_bytes();
+    let pki = TestPki::generate(TestPkiParams {
+        ca_name: "test-ca.internal".to_string(),
+        server_sans: vec![sni_name.to_string(), "127.0.0.1".to_string()],
+        client_name: "test-client.internal".to_string(),
+    });
 
-    // Client cert (signed by the same CA; used for mTLS)
-    let client_params = CertificateParams::new(vec!["test-client.internal".to_string()]).unwrap();
-    let client_key = KeyPair::generate().unwrap();
-    let client_cert = client_params.signed_by(&client_key, &ca_cert, &ca_key).unwrap();
-    let client_cert_pem = client_cert.pem().into_bytes();
-    let client_key_pem = client_key.serialize_pem().into_bytes();
-
-    // Write client-side files to a temp dir
     let dir = TempDir::new().unwrap();
-    let ca_path = dir.path().join("ca.pem");
-    let cert_path = dir.path().join("client.pem");
-    let key_path = dir.path().join("client.key");
+    let paths = pki.write_client_pem(dir.path());
+    let client_tls_config = TlsConfig::new(paths.cert, paths.key, paths.ca_cert);
 
-    std::fs::write(&ca_path, &ca_pem).unwrap();
-    std::fs::write(&cert_path, &client_cert_pem).unwrap();
-    std::fs::write(&key_path, &client_key_pem).unwrap();
-
-    let client_tls_config = TlsConfig::new(cert_path, key_path, ca_path);
-
-    TestCerts { ca_pem, server_cert_pem, server_key_pem, client_tls_config, _dir: dir }
+    TestCerts { pki, client_tls_config, _dir: dir }
 }
 
 /// Spin up a tonic gRPC server with mTLS on `127.0.0.1:0`.
 ///
-/// The server presents `server_cert_pem` / `server_key_pem` and requires
-/// clients to authenticate with a cert signed by `ca_pem`.
-///
 /// Returns the bound port.  The server task runs until dropped.
-async fn start_mtls_server(
-    server_cert_pem: Vec<u8>,
-    server_key_pem: Vec<u8>,
-    ca_pem: Vec<u8>,
-) -> u16 {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    let tls = ServerTlsConfig::new()
-        .identity(Identity::from_pem(&server_cert_pem, &server_key_pem))
-        .client_ca_root(Certificate::from_pem(&ca_pem));
-
+async fn start_mtls_server(pki: &TestPki) -> u16 {
     // Minimal DVT peer service — no real shares, but the TLS handshake and
     // HTTP/2 settings exchange happen before any RPC is dispatched.
     let share_map: Arc<HashMap<[u8; 48], ShareInfo>> = Arc::new(HashMap::new());
@@ -146,23 +105,12 @@ async fn start_mtls_server(
     });
     let peer_svc = PeerSignerServiceImpl::new(share_map, allow_list, None);
 
-    tokio::spawn(async move {
-        use tokio_stream::wrappers::TcpListenerStream;
+    let (addr, _handle) = rvc_test_support::start_mtls_server(pki, move |mut server| {
+        server.add_service(PeerSignerServiceServerV2::new(peer_svc))
+    })
+    .await;
 
-        let incoming = TcpListenerStream::new(listener);
-        Server::builder()
-            .tls_config(tls)
-            .unwrap()
-            .add_service(PeerSignerServiceServerV2::new(peer_svc))
-            .serve_with_incoming(incoming)
-            .await
-            .ok();
-    });
-
-    // Yield so the spawned task has a chance to bind before we return.
-    tokio::task::yield_now().await;
-
-    port
+    addr.port()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -182,12 +130,7 @@ async fn start_mtls_server(
 #[tokio::test]
 async fn test_wrong_peer_cert_refused() {
     let certs = generate_test_certs("peer-a.local");
-    let port = start_mtls_server(
-        certs.server_cert_pem.clone(),
-        certs.server_key_pem.clone(),
-        certs.ca_pem.clone(),
-    )
-    .await;
+    let port = start_mtls_server(&certs.pki).await;
 
     // Client expects peer-b.local, but server holds a cert for peer-a.local.
     let peer =
@@ -211,12 +154,7 @@ async fn test_wrong_peer_cert_refused() {
 #[tokio::test]
 async fn test_correct_peer_cert_accepted() {
     let certs = generate_test_certs("peer-a.local");
-    let port = start_mtls_server(
-        certs.server_cert_pem.clone(),
-        certs.server_key_pem.clone(),
-        certs.ca_pem.clone(),
-    )
-    .await;
+    let port = start_mtls_server(&certs.pki).await;
 
     let peer =
         PeerConnectInfo { addr: format!("127.0.0.1:{}", port), sni_cn: "peer-a.local".to_string() };

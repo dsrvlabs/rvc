@@ -774,11 +774,11 @@ has the precedent for a dev-only pinned crate: `rvc-signer-registry` is pinned i
 `rustls`, `tokio`). Repoint both consumers via `[dev-dependencies]`; delete the copies.
 
 **Acceptance criteria:**
-- [ ] `crates/rvc-test-support` exists with `publish = false` and zero workspace-internal dependencies.
-- [ ] It appears in `ZERO_OUT_EDGE_IF_PRESENT`; `cargo test -p architecture-tests` green.
-- [ ] `rg "rcgen::" --type rust` outside the new crate returns 0 hits.
-- [ ] It appears **only** in `[dev-dependencies]` — never a runtime dep of a binary (grep proof).
-- [ ] Test count unchanged; the two relocated suites pass unmodified.
+- [x] `crates/rvc-test-support` exists with `publish = false` and zero workspace-internal dependencies.
+- [x] It appears in `ZERO_OUT_EDGE_IF_PRESENT`; `cargo test -p architecture-tests` green.
+- [x] `rg "rcgen::" --type rust` outside the new crate returns 0 hits.
+- [x] It appears **only** in `[dev-dependencies]` — never a runtime dep of a binary (grep proof).
+- [x] Test count unchanged; the two relocated suites pass unmodified.
 
 **Risks:** RF6-23's generated ARCHITECTURE.md must account for the new crate. Sequence the two so the
 generator runs after this lands, or accept one regeneration.
