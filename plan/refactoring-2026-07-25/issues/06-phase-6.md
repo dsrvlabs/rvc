@@ -709,10 +709,10 @@ would require promoting `test_support` to `pub` — which the H1 rule forbids. R
 and take the crate-level route instead.
 
 **Acceptance criteria:**
-- [ ] `routes.rs` and `tls.rs` each < 40% test lines.
-- [ ] No `pub(crate)` → `pub` promotion in this PR.
-- [ ] Test count before == after (`cargo nextest list -p rvc-signer-bin | wc -l`).
-- [ ] `git diff -M` renders as renames. Workspace green.
+- [x] `routes.rs` and `tls.rs` each < 40% test lines.
+- [x] No `pub(crate)` → `pub` promotion in this PR.
+- [x] Test count before == after (`cargo nextest list -p rvc-signer-bin | wc -l`).
+- [x] `git diff -M` renders as renames. Workspace green.
 
 **Risks:** Phase 5's F2 moved this composition root into the lib and split `tls/` into
 `tls_config.rs` + `accept_loop.rs`. Re-derive the file layout from HEAD-of-Phase-5 before starting; the
