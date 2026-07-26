@@ -1713,13 +1713,13 @@ config.
    readers; confirm no accessor now holds the write lock longer than before.
 
 **Acceptance criteria:**
-- [ ] Exactly one `RwLock` over the store state; opposite-order acquisition is impossible by
+- [x] Exactly one `RwLock` over the store state; opposite-order acquisition is impossible by
       construction.
-- [ ] `reload_config` is atomic: a concurrent reader observes either the old or the new config, never a
+- [x] `reload_config` is atomic: a concurrent reader observes either the old or the new config, never a
       mix (stress test).
-- [ ] A parse failure during reload leaves the previous state fully intact.
-- [ ] No accessor regresses from a read guard to a write guard.
-- [ ] Existing validator-store and orchestrator tests green.
+- [x] A parse failure during reload leaves the previous state fully intact.
+- [x] No accessor regresses from a read guard to a write guard.
+- [x] Existing validator-store and orchestrator tests green.
 
 **TDD test plan** (RED first):
 - `test_reader_never_observes_half_applied_reload` — **RED**: a stress test spawning readers against a

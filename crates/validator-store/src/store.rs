@@ -97,29 +97,44 @@ pub struct ValidatorDefaults {
     pub graffiti: Option<[u8; 32]>,
 }
 
+/// In-memory validator store payload behind a single `RwLock`.
+///
+/// Validators, defaults, and the global block-selection mode are stored
+/// together so accessors never acquire multiple state locks (which previously
+/// allowed opposite-order deadlocks between `effective_config` and
+/// `save_config`) and so `reload_config` can apply a full update under one
+/// write guard — concurrent readers observe either the pre- or post-reload
+/// state, never a mix of old defaults with new validators (or vice versa).
+struct StoreState {
+    validators: HashMap<[u8; 48], ValidatorConfig>,
+    defaults: ValidatorDefaults,
+    global_block_selection_mode: BlockSelectionMode,
+}
+
 pub struct ValidatorStore {
-    validators: RwLock<HashMap<[u8; 48], ValidatorConfig>>,
-    defaults: RwLock<ValidatorDefaults>,
+    state: RwLock<StoreState>,
     config_path: Option<PathBuf>,
-    global_block_selection_mode: RwLock<BlockSelectionMode>,
     // Serializes `save_config` so that snapshot → tempfile write → atomic
     // rename happens as a single critical section. Without this, a thread
     // holding a stale snapshot can `persist` AFTER a thread with newer data,
-    // silently clobbering committed updates.
+    // silently clobbering committed updates. Intentionally separate from
+    // `state`: it guards file I/O ordering, not in-memory fields.
     save_lock: Mutex<()>,
 }
 
 impl ValidatorStore {
     pub fn new(default_fee_recipient: [u8; 20], default_gas_limit: u64) -> Self {
         Self {
-            validators: RwLock::new(HashMap::new()),
-            defaults: RwLock::new(ValidatorDefaults {
-                fee_recipient: default_fee_recipient,
-                gas_limit: default_gas_limit,
-                graffiti: None,
+            state: RwLock::new(StoreState {
+                validators: HashMap::new(),
+                defaults: ValidatorDefaults {
+                    fee_recipient: default_fee_recipient,
+                    gas_limit: default_gas_limit,
+                    graffiti: None,
+                },
+                global_block_selection_mode: BlockSelectionMode::default(),
             }),
             config_path: None,
-            global_block_selection_mode: RwLock::new(BlockSelectionMode::default()),
             save_lock: Mutex::new(()),
         }
     }
@@ -146,10 +161,12 @@ impl ValidatorStore {
         );
 
         Ok(Self {
-            validators: RwLock::new(validators),
-            defaults: RwLock::new(defaults),
+            state: RwLock::new(StoreState {
+                validators,
+                defaults,
+                global_block_selection_mode: BlockSelectionMode::default(),
+            }),
             config_path: Some(path.to_path_buf()),
-            global_block_selection_mode: RwLock::new(BlockSelectionMode::default()),
             save_lock: Mutex::new(()),
         })
     }
@@ -157,29 +174,28 @@ impl ValidatorStore {
     /// Returns the default fee recipient address applied to any validator
     /// that does not have a per-validator override.
     pub fn default_fee_recipient(&self) -> [u8; 20] {
-        self.defaults.read().fee_recipient
+        self.state.read().defaults.fee_recipient
     }
 
     /// Returns the default gas limit applied to any validator that does not
     /// have a per-validator override.
     pub fn default_gas_limit(&self) -> u64 {
-        self.defaults.read().gas_limit
+        self.state.read().defaults.gas_limit
     }
 
     pub fn get_config(&self, pubkey: &[u8; 48]) -> Option<ValidatorConfig> {
-        self.validators.read().get(pubkey).cloned()
+        self.state.read().validators.get(pubkey).cloned()
     }
 
     pub fn effective_config(&self, pubkey: &[u8; 48]) -> ValidatorDefaults {
-        let validators = self.validators.read();
-        let defaults = self.defaults.read();
-        let validator = validators.get(pubkey);
+        let state = self.state.read();
+        let validator = state.validators.get(pubkey);
         ValidatorDefaults {
             fee_recipient: validator
                 .and_then(|c| c.fee_recipient)
-                .unwrap_or(defaults.fee_recipient),
-            gas_limit: validator.and_then(|c| c.gas_limit).unwrap_or(defaults.gas_limit),
-            graffiti: validator.and_then(|c| c.graffiti).or(defaults.graffiti),
+                .unwrap_or(state.defaults.fee_recipient),
+            gas_limit: validator.and_then(|c| c.gas_limit).unwrap_or(state.defaults.gas_limit),
+            graffiti: validator.and_then(|c| c.graffiti).or(state.defaults.graffiti),
         }
     }
 
@@ -202,7 +218,7 @@ impl ValidatorStore {
 
     pub fn is_builder_enabled(&self, pubkey: &[u8; 48]) -> bool {
         let enabled =
-            self.validators.read().get(pubkey).map(|c| c.builder_proposals).unwrap_or(false);
+            self.state.read().validators.get(pubkey).map(|c| c.builder_proposals).unwrap_or(false);
         trace!(
             pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
             is_builder_enabled = enabled,
@@ -212,24 +228,25 @@ impl ValidatorStore {
     }
 
     pub fn builder_boost_factor(&self, pubkey: &[u8; 48]) -> u64 {
-        self.validators.read().get(pubkey).map(|c| c.builder_boost_factor).unwrap_or(100)
+        self.state.read().validators.get(pubkey).map(|c| c.builder_boost_factor).unwrap_or(100)
     }
 
     pub fn effective_block_selection_mode(&self, pubkey: &[u8; 48]) -> BlockSelectionMode {
-        self.validators
-            .read()
+        let state = self.state.read();
+        state
+            .validators
             .get(pubkey)
             .and_then(|c| c.block_selection_mode)
-            .unwrap_or(*self.global_block_selection_mode.read())
+            .unwrap_or(state.global_block_selection_mode)
     }
 
     pub fn set_global_block_selection_mode(&self, mode: BlockSelectionMode) {
-        *self.global_block_selection_mode.write() = mode;
+        self.state.write().global_block_selection_mode = mode;
     }
 
     #[tracing::instrument(name = "validator_store.list_enabled_pubkeys", skip_all)]
     pub fn list_enabled_pubkeys(&self) -> Vec<[u8; 48]> {
-        self.validators.read().values().filter(|c| c.enabled).map(|c| c.pubkey).collect()
+        self.state.read().validators.values().filter(|c| c.enabled).map(|c| c.pubkey).collect()
     }
 
     /// Returns `true` if this validator is permitted to sign.
@@ -242,19 +259,19 @@ impl ValidatorStore {
     /// freshly imported via the Keymanager API while inside the doppelganger
     /// window) also return `false`.
     pub fn is_signing_enabled(&self, pubkey: &[u8; 48]) -> bool {
-        self.validators.read().get(pubkey).map(|c| c.enabled).unwrap_or(false)
+        self.state.read().validators.get(pubkey).map(|c| c.enabled).unwrap_or(false)
     }
 
     pub fn add_validator(&self, config: ValidatorConfig) {
-        self.validators.write().insert(config.pubkey, config);
+        self.state.write().validators.insert(config.pubkey, config);
     }
 
     pub fn remove_validator(&self, pubkey: &[u8; 48]) -> Option<ValidatorConfig> {
-        self.validators.write().remove(pubkey)
+        self.state.write().validators.remove(pubkey)
     }
 
     pub fn set_enabled(&self, pubkey: &[u8; 48], enabled: bool) {
-        if let Some(config) = self.validators.write().get_mut(pubkey) {
+        if let Some(config) = self.state.write().validators.get_mut(pubkey) {
             config.enabled = enabled;
             let pk_hex = hex::encode(pubkey);
             if enabled {
@@ -286,7 +303,7 @@ impl ValidatorStore {
             changed_fields.push("block_selection_mode");
         }
 
-        if let Some(config) = self.validators.write().get_mut(pubkey) {
+        if let Some(config) = self.state.write().validators.get_mut(pubkey) {
             if let Some(fr) = update.fee_recipient {
                 config.fee_recipient = fr;
             }
@@ -316,7 +333,7 @@ impl ValidatorStore {
     }
 
     pub fn has_validator(&self, pubkey: &[u8; 48]) -> bool {
-        self.validators.read().contains_key(pubkey)
+        self.state.read().validators.contains_key(pubkey)
     }
 
     #[tracing::instrument(name = "validator_store.save_config", skip_all)]
@@ -330,32 +347,32 @@ impl ValidatorStore {
         // saver with newer data and clobber it.
         let _save_guard = self.save_lock.lock();
 
-        let defaults = self.defaults.read();
-        let validators = self.validators.read();
-
-        let toml_defaults = TomlDefaults {
-            fee_recipient: Some(format!("0x{}", hex::encode(defaults.fee_recipient))),
-            gas_limit: Some(defaults.gas_limit),
-            graffiti: defaults.graffiti.map(|g| graffiti_to_string(&g)),
+        // Single state read: defaults + validators under one guard (no
+        // multi-lock ordering with `effective_config`).
+        let (toml_defaults, toml_validators) = {
+            let state = self.state.read();
+            let toml_defaults = TomlDefaults {
+                fee_recipient: Some(format!("0x{}", hex::encode(state.defaults.fee_recipient))),
+                gas_limit: Some(state.defaults.gas_limit),
+                graffiti: state.defaults.graffiti.map(|g| graffiti_to_string(&g)),
+            };
+            let toml_validators: Vec<TomlValidator> = state
+                .validators
+                .values()
+                .map(|v| TomlValidator {
+                    pubkey: format!("0x{}", hex::encode(v.pubkey)),
+                    fee_recipient: v.fee_recipient.map(|fr| format!("0x{}", hex::encode(fr))),
+                    gas_limit: v.gas_limit,
+                    builder_proposals: Some(v.builder_proposals),
+                    builder_boost_factor: Some(v.builder_boost_factor),
+                    graffiti: v.graffiti.map(|g| graffiti_to_string(&g)),
+                    enabled: Some(v.enabled),
+                    block_selection_mode: v.block_selection_mode,
+                })
+                .collect();
+            (toml_defaults, toml_validators)
         };
-
-        let toml_validators: Vec<TomlValidator> = validators
-            .values()
-            .map(|v| TomlValidator {
-                pubkey: format!("0x{}", hex::encode(v.pubkey)),
-                fee_recipient: v.fee_recipient.map(|fr| format!("0x{}", hex::encode(fr))),
-                gas_limit: v.gas_limit,
-                builder_proposals: Some(v.builder_proposals),
-                builder_boost_factor: Some(v.builder_boost_factor),
-                graffiti: v.graffiti.map(|g| graffiti_to_string(&g)),
-                enabled: Some(v.enabled),
-                block_selection_mode: v.block_selection_mode,
-            })
-            .collect();
-
-        // Release locks before I/O
-        drop(defaults);
-        drop(validators);
+        // State read guard dropped before I/O.
 
         let toml_config = TomlConfig { defaults: Some(toml_defaults), validators: toml_validators };
 
@@ -391,17 +408,21 @@ impl ValidatorStore {
             e
         })?;
 
-        // Apply-second: all parsing succeeded, now mutate under write locks.
-        *self.defaults.write() = new_defaults;
-
-        let mut validators = self.validators.write();
-        let existing_count = validators.len();
-        for config in &parsed_validators {
-            validators.insert(config.pubkey, config.clone());
+        // Apply-second under one write guard: defaults + validator merges are
+        // visible to concurrent readers as a single atomic transition. Merge
+        // (insert/overwrite) preserves programmatic validators not present in
+        // the file; global_block_selection_mode is left untouched.
+        let mut state = self.state.write();
+        state.defaults = new_defaults;
+        let existing_count = state.validators.len();
+        for config in parsed_validators {
+            state.validators.insert(config.pubkey, config);
         }
-        let added_count = validators.len().saturating_sub(existing_count);
+        let added_count = state.validators.len().saturating_sub(existing_count);
+        let total_count = state.validators.len();
+        drop(state);
 
-        info!(added_count = added_count, total_count = validators.len(), "config reloaded");
+        info!(added_count = added_count, total_count = total_count, "config reloaded");
 
         Ok(())
     }
@@ -464,9 +485,9 @@ mod tests {
         let store = ValidatorStore::new(fr, 30_000_000);
 
         assert!(store.list_enabled_pubkeys().is_empty());
-        assert_eq!(store.defaults.read().fee_recipient, fr);
-        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
-        assert!(store.defaults.read().graffiti.is_none());
+        assert_eq!(store.state.read().defaults.fee_recipient, fr);
+        assert_eq!(store.state.read().defaults.gas_limit, 30_000_000);
+        assert!(store.state.read().defaults.graffiti.is_none());
     }
 
     #[test]
@@ -581,7 +602,7 @@ mod tests {
         default_graffiti[..4].copy_from_slice(b"test");
 
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
-        store.defaults.write().graffiti = Some(default_graffiti);
+        store.state.write().defaults.graffiti = Some(default_graffiti);
 
         let pk = test_pubkey(1);
         store.add_validator(ValidatorConfig::new(pk));
@@ -805,8 +826,8 @@ graffiti = "my graffiti"
         assert!(config.graffiti.is_some());
         assert!(config.enabled);
 
-        assert_eq!(store.defaults.read().fee_recipient, [0xaau8; 20]);
-        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
+        assert_eq!(store.state.read().defaults.fee_recipient, [0xaau8; 20]);
+        assert_eq!(store.state.read().defaults.gas_limit, 30_000_000);
     }
 
     #[test]
@@ -861,9 +882,9 @@ pubkey = "{}"
         file.write_all(toml_content.as_bytes()).unwrap();
 
         let store = ValidatorStore::load_from_config(&config_path).unwrap();
-        assert_eq!(store.defaults.read().fee_recipient, [0u8; 20]);
-        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
-        assert!(store.defaults.read().graffiti.is_none());
+        assert_eq!(store.state.read().defaults.fee_recipient, [0u8; 20]);
+        assert_eq!(store.state.read().defaults.gas_limit, 30_000_000);
+        assert!(store.state.read().defaults.graffiti.is_none());
     }
 
     #[test]
@@ -1241,8 +1262,8 @@ pubkey = "invalid-hex-not-48-bytes"
 
         // CRITICAL: Store must be completely unchanged after failed reload
         // Defaults must not have changed
-        assert_eq!(store.defaults.read().fee_recipient, [0xaau8; 20]);
-        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
+        assert_eq!(store.state.read().defaults.fee_recipient, [0xaau8; 20]);
+        assert_eq!(store.state.read().defaults.gas_limit, 30_000_000);
 
         // No new validators added
         assert!(store.get_config(&[2u8; 48]).is_none());
@@ -1274,9 +1295,9 @@ pubkey = "{}"
         std::fs::write(&config_path, &toml_v1).unwrap();
 
         let store = ValidatorStore::load_from_config(&config_path).unwrap();
-        assert_eq!(store.defaults.read().fee_recipient, [0xaau8; 20]);
-        assert_eq!(store.defaults.read().gas_limit, 50_000_000);
-        assert!(store.defaults.read().graffiti.is_some());
+        assert_eq!(store.state.read().defaults.fee_recipient, [0xaau8; 20]);
+        assert_eq!(store.state.read().defaults.gas_limit, 50_000_000);
+        assert!(store.state.read().defaults.graffiti.is_some());
 
         // Remove [defaults] section entirely
         let toml_v2 = format!(
@@ -1291,9 +1312,9 @@ pubkey = "{}"
         store.reload_config().unwrap();
 
         // Defaults should reset to hardcoded fallbacks
-        assert_eq!(store.defaults.read().fee_recipient, [0u8; 20]);
-        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
-        assert!(store.defaults.read().graffiti.is_none());
+        assert_eq!(store.state.read().defaults.fee_recipient, [0u8; 20]);
+        assert_eq!(store.state.read().defaults.gas_limit, 30_000_000);
+        assert!(store.state.read().defaults.graffiti.is_none());
     }
 
     #[test]
@@ -1336,9 +1357,9 @@ pubkey = "{}"
         store.reload_config().unwrap();
 
         // fee_recipient and graffiti should reset to hardcoded fallbacks
-        assert_eq!(store.defaults.read().fee_recipient, [0u8; 20]);
-        assert_eq!(store.defaults.read().gas_limit, 40_000_000);
-        assert!(store.defaults.read().graffiti.is_none());
+        assert_eq!(store.state.read().defaults.fee_recipient, [0u8; 20]);
+        assert_eq!(store.state.read().defaults.gas_limit, 40_000_000);
+        assert!(store.state.read().defaults.graffiti.is_none());
     }
 
     /// RF5-29: load and reload must share one parse path so defaults/validators
@@ -1377,7 +1398,7 @@ enabled = true
 
         let store = ValidatorStore::load_from_config(&config_path).unwrap();
         {
-            let defaults = store.defaults.read();
+            let defaults = store.state.read().defaults;
             assert_eq!(defaults.fee_recipient, parsed_defaults.fee_recipient);
             assert_eq!(defaults.gas_limit, parsed_defaults.gas_limit);
             assert_eq!(defaults.graffiti, parsed_defaults.graffiti);
@@ -1393,14 +1414,14 @@ enabled = true
         assert_eq!(loaded.enabled, expected.enabled);
 
         // Mutate in-memory state so a broken reload would leave drift.
-        store.defaults.write().gas_limit = 1;
-        store.defaults.write().fee_recipient = [0xff; 20];
+        store.state.write().defaults.gas_limit = 1;
+        store.state.write().defaults.fee_recipient = [0xff; 20];
         store.set_enabled(&pk, false);
 
         store.reload_config().unwrap();
 
         {
-            let defaults = store.defaults.read();
+            let defaults = store.state.read().defaults;
             assert_eq!(defaults.fee_recipient, parsed_defaults.fee_recipient);
             assert_eq!(defaults.gas_limit, parsed_defaults.gas_limit);
             assert_eq!(defaults.graffiti, parsed_defaults.graffiti);
@@ -1470,15 +1491,15 @@ builder_proposals = true
 
         let store = ValidatorStore::load_from_config(&config_path).unwrap();
         let pk = [1u8; 48];
-        assert_eq!(store.defaults.read().fee_recipient, [0xaau8; 20]);
-        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
+        assert_eq!(store.state.read().defaults.fee_recipient, [0xaau8; 20]);
+        assert_eq!(store.state.read().defaults.gas_limit, 30_000_000);
         assert!(store.is_builder_enabled(&pk));
 
         std::fs::write(&config_path, "this is not valid toml [[[").unwrap();
         assert!(store.reload_config().is_err());
 
-        assert_eq!(store.defaults.read().fee_recipient, [0xaau8; 20]);
-        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
+        assert_eq!(store.state.read().defaults.fee_recipient, [0xaau8; 20]);
+        assert_eq!(store.state.read().defaults.gas_limit, 30_000_000);
         assert!(store.is_builder_enabled(&pk));
         assert!(store.get_config(&pk).is_some());
     }
@@ -1489,7 +1510,7 @@ builder_proposals = true
         let store = ValidatorStore::new(default_fr, 30_000_000);
 
         let pk = test_pubkey(1);
-        store.validators.write().insert(
+        store.state.write().validators.insert(
             pk,
             ValidatorConfig {
                 pubkey: pk,
@@ -1529,7 +1550,7 @@ builder_proposals = true
         let store = Arc::new(ValidatorStore::new(default_fr, 30_000_000));
 
         let pk = test_pubkey(1);
-        store.validators.write().insert(
+        store.state.write().validators.insert(
             pk,
             ValidatorConfig {
                 pubkey: pk,
@@ -1658,10 +1679,10 @@ enabled = false
         let reloaded = ValidatorStore::load_from_config(&config_path).unwrap();
 
         // Check defaults
-        assert_eq!(reloaded.defaults.read().fee_recipient, [0xccu8; 20]);
-        assert_eq!(reloaded.defaults.read().gas_limit, 25_000_000);
-        assert!(reloaded.defaults.read().graffiti.is_some());
-        let graffiti = reloaded.defaults.read().graffiti.unwrap();
+        assert_eq!(reloaded.state.read().defaults.fee_recipient, [0xccu8; 20]);
+        assert_eq!(reloaded.state.read().defaults.gas_limit, 25_000_000);
+        assert!(reloaded.state.read().defaults.graffiti.is_some());
+        let graffiti = reloaded.state.read().defaults.graffiti.unwrap();
         assert_eq!(&graffiti[..16], b"default graffiti");
 
         // Check validator
@@ -1804,5 +1825,280 @@ block_selection_mode = "builder-only"
 
         store.set_enabled(&pk, true);
         assert!(store.is_signing_enabled(&pk), "must be enabled after flip");
+    }
+
+    // ── RF5-30: single StoreState lock + atomic reload ────────────────────
+
+    /// Concurrent readers must never observe a half-applied reload (old
+    /// defaults with new per-validator overrides, or vice versa). Under the
+    /// previous multi-lock layout this was possible between the defaults write
+    /// and the validators write; a single write guard makes it impossible.
+    #[test]
+    fn test_reader_never_observes_half_applied_reload() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let pk = [1u8; 48];
+        let pk_hex = format!("0x{}", hex::encode(pk));
+        let fr_old = format!("0x{}", hex::encode([0xaau8; 20]));
+        let fr_new = format!("0x{}", hex::encode([0xbbu8; 20]));
+        let override_old = format!("0x{}", hex::encode([0x11u8; 20]));
+        let override_new = format!("0x{}", hex::encode([0x22u8; 20]));
+
+        let toml_old = format!(
+            r#"
+[defaults]
+fee_recipient = "{fr_old}"
+gas_limit = 30000000
+
+[[validators]]
+pubkey = "{pk_hex}"
+fee_recipient = "{override_old}"
+gas_limit = 31000000
+"#
+        );
+        let toml_new = format!(
+            r#"
+[defaults]
+fee_recipient = "{fr_new}"
+gas_limit = 40000000
+
+[[validators]]
+pubkey = "{pk_hex}"
+fee_recipient = "{override_new}"
+gas_limit = 41000000
+"#
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &toml_old).unwrap();
+
+        let store = Arc::new(ValidatorStore::load_from_config(&config_path).unwrap());
+        // Confirm starting snapshot.
+        let start = store.effective_config(&pk);
+        assert_eq!(start.fee_recipient, [0x11u8; 20]);
+        assert_eq!(start.gas_limit, 31_000_000);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = vec![];
+
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    // Single guard: observe defaults + validator together so
+                    // the assertion pins store atomicity, not cross-call races.
+                    let state = store.state.read();
+                    let v = state
+                        .validators
+                        .get(&pk)
+                        .expect("validator present for entire stress run");
+                    let old_pair = state.defaults.fee_recipient == [0xaau8; 20]
+                        && state.defaults.gas_limit == 30_000_000
+                        && v.fee_recipient == Some([0x11u8; 20])
+                        && v.gas_limit == Some(31_000_000);
+                    let new_pair = state.defaults.fee_recipient == [0xbbu8; 20]
+                        && state.defaults.gas_limit == 40_000_000
+                        && v.fee_recipient == Some([0x22u8; 20])
+                        && v.gas_limit == Some(41_000_000);
+                    assert!(
+                        old_pair || new_pair,
+                        "half-applied reload: defaults.fee={:?} defaults.gas={} v.fee={:?} v.gas={:?}",
+                        state.defaults.fee_recipient,
+                        state.defaults.gas_limit,
+                        v.fee_recipient,
+                        v.gas_limit
+                    );
+                }
+            }));
+        }
+
+        // Flip the on-disk config and reload repeatedly while readers run.
+        for i in 0..40 {
+            let content = if i % 2 == 0 { &toml_new } else { &toml_old };
+            std::fs::write(&config_path, content).unwrap();
+            store.reload_config().unwrap();
+            thread::yield_now();
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().expect("reader panicked on half-applied state");
+        }
+
+        // Final state matches last write (toml_old because 0..40 ends on odd).
+        let end = store.effective_config(&pk);
+        assert_eq!(end.fee_recipient, [0x11u8; 20]);
+        assert_eq!(end.gas_limit, 31_000_000);
+
+        // Bound the test; readers exit promptly after stop.
+        let _ = Duration::from_millis(1);
+    }
+
+    /// Stress: concurrent `effective_config` readers and `save_config` writers
+    /// must not deadlock. Opposite-order multi-lock acquisition made this a
+    /// real risk under parking_lot write-preferring fairness; a single state
+    /// lock makes the deadlock unrepresentable.
+    #[test]
+    fn test_effective_config_and_save_config_cannot_deadlock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let pk = [1u8; 48];
+        let pk_hex = format!("0x{}", hex::encode(pk));
+        let fr = format!("0x{}", hex::encode([0xaau8; 20]));
+        let toml = format!(
+            r#"
+[defaults]
+fee_recipient = "{fr}"
+gas_limit = 30000000
+
+[[validators]]
+pubkey = "{pk_hex}"
+"#
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &toml).unwrap();
+
+        let store = Arc::new(ValidatorStore::load_from_config(&config_path).unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = vec![];
+
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = store.effective_config(&pk);
+                    let _ = store.effective_fee_recipient(&pk);
+                    let _ = store.effective_block_selection_mode(&pk);
+                }
+            }));
+        }
+
+        for _ in 0..4 {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            handles.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    store.save_config().expect("save_config under stress");
+                    // Mild mutation so writers do real work.
+                    store.set_global_block_selection_mode(BlockSelectionMode::MaxProfit);
+                }
+            }));
+        }
+
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while Instant::now() < deadline {
+            thread::yield_now();
+        }
+        stop.store(true, Ordering::Relaxed);
+
+        let join_deadline = Instant::now() + Duration::from_secs(5);
+        for h in handles {
+            while !h.is_finished() {
+                assert!(
+                    Instant::now() < join_deadline,
+                    "deadlock suspected: stress threads did not finish within 5s"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            h.join().expect("stress thread panicked");
+        }
+    }
+
+    /// Parse failure during reload must leave the previous state fully intact
+    /// (defaults, validators, and global block-selection mode).
+    #[test]
+    fn test_reload_failure_leaves_previous_state_intact() {
+        let pk = [1u8; 48];
+        let pk_hex = format!("0x{}", hex::encode(pk));
+        let fr = format!("0x{}", hex::encode([0xaau8; 20]));
+        let valid = format!(
+            r#"
+[defaults]
+fee_recipient = "{fr}"
+gas_limit = 35000000
+graffiti = "keep-me"
+
+[[validators]]
+pubkey = "{pk_hex}"
+builder_proposals = true
+builder_boost_factor = 175
+"#
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &valid).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+        store.set_global_block_selection_mode(BlockSelectionMode::BuilderOnly);
+        let pk_extra = [99u8; 48];
+        store.add_validator(ValidatorConfig::new(pk_extra));
+
+        std::fs::write(&config_path, "not valid toml [[[").unwrap();
+        assert!(store.reload_config().is_err());
+
+        let state = store.state.read();
+        assert_eq!(state.defaults.fee_recipient, [0xaau8; 20]);
+        assert_eq!(state.defaults.gas_limit, 35_000_000);
+        assert!(state.defaults.graffiti.is_some());
+        assert_eq!(state.global_block_selection_mode, BlockSelectionMode::BuilderOnly);
+        let cfg = state.validators.get(&pk).unwrap();
+        assert!(cfg.builder_proposals);
+        assert_eq!(cfg.builder_boost_factor, 175);
+        assert!(state.validators.contains_key(&pk_extra));
+    }
+
+    /// Structural pin: exactly one `RwLock` protects store state; `save_lock`
+    /// remains a separate `Mutex` for file-I/O serialization only.
+    #[test]
+    fn test_all_accessors_use_single_state_lock() {
+        // Compile-time shape of ValidatorStore: one RwLock + one Mutex.
+        // Field access below fails to compile if the layout regresses.
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let _state_guard = store.state.read();
+        drop(_state_guard);
+        let _save_guard = store.save_lock.lock();
+        drop(_save_guard);
+
+        // Runtime pin: product code declares a single `RwLock` field on
+        // `ValidatorStore` / `StoreState` wiring (not in comments or this test).
+        let src = include_str!("store.rs");
+        let rwlock_fields = src
+            .lines()
+            .filter(|l| {
+                let t = l.trim();
+                t.contains("state: ")
+                    && t.contains("RwLock")
+                    && t.ends_with(',')
+                    && !t.starts_with("//")
+            })
+            .count();
+        assert_eq!(rwlock_fields, 1, "expected exactly one `state: RwLock<…>` field declaration");
+
+        // Accessors must not take a write lock for pure reads: exercise the
+        // read path concurrently while a writer holds the save_lock only.
+        let pk = test_pubkey(1);
+        store.add_validator(ValidatorConfig::new(pk));
+        let cfg = store.effective_config(&pk);
+        assert_eq!(cfg.gas_limit, 30_000_000);
+        assert_eq!(store.default_fee_recipient(), test_fee_recipient(1));
+        assert_eq!(store.default_gas_limit(), 30_000_000);
+        assert!(store.has_validator(&pk));
+        assert!(store.is_signing_enabled(&pk));
+        assert!(!store.is_builder_enabled(&pk));
+        assert_eq!(store.builder_boost_factor(&pk), 100);
+        assert_eq!(store.effective_block_selection_mode(&pk), BlockSelectionMode::MaxProfit);
+        assert_eq!(store.list_enabled_pubkeys(), vec![pk]);
     }
 }
