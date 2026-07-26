@@ -881,14 +881,14 @@ Verified: `rg 'RVC_SECRET_PROVIDER' crates/secret-provider/src/refresh.rs` retur
    post-fetch check — a fail-closed improvement worth its own test).
 
 **Acceptance criteria:**
-- [ ] Boot fetch has a per-key timeout: a hung mock provider fails that key and startup continues
+- [x] Boot fetch has a per-key timeout: a hung mock provider fails that key and startup continues
       (test asserts bounded wall-clock).
-- [ ] Refresh emits `RVC_SECRET_PROVIDER_KEYS_LOADED`, `RVC_SECRET_PROVIDER_ERRORS_TOTAL` and
+- [x] Refresh emits `RVC_SECRET_PROVIDER_KEYS_LOADED`, `RVC_SECRET_PROVIDER_ERRORS_TOTAL` and
       `RVC_SECRET_PROVIDER_LOAD_DURATION_SECONDS` (test asserts counters move).
-- [ ] Refresh performs the post-fetch denylist check (a key whose listed `pubkey_hex` is absent but whose
+- [x] Refresh performs the post-fetch denylist check (a key whose listed `pubkey_hex` is absent but whose
       fetched material is denylisted is not returned).
-- [ ] Existing boot metrics tests (`key_source_manager.rs:835-913`) pass unchanged.
-- [ ] Standing invariant green.
+- [x] Existing boot metrics tests (`key_source_manager.rs:835-913`) pass unchanged.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_boot_fetch_times_out_on_hung_provider` — fails today (no boot timeout).

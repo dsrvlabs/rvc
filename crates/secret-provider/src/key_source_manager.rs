@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crypto::{KeyManager, Keystore, SecretKey};
 use observability::logging::TruncatedPubkey;
@@ -9,27 +10,278 @@ use crate::metrics::{
     classify_error, RVC_SECRET_PROVIDER_ERRORS_TOTAL, RVC_SECRET_PROVIDER_KEYS_LOADED,
     RVC_SECRET_PROVIDER_LOAD_DURATION_SECONDS,
 };
-use crate::{KeyMaterial, LoadSummary, ProviderSummary, SecretProvider, SecretProviderError};
+use crate::{
+    KeyMaterial, LoadSummary, ProviderSummary, SecretKeyEntry, SecretProvider, SecretProviderError,
+};
+
+/// Default per-key fetch timeout shared by boot and refresh (historical refresh value).
+pub const DEFAULT_KEY_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Default max concurrent `fetch_key` calls per provider (JoinSet window).
+///
+/// Bounds provider thundering-herd risk on boot and especially on the lifetime
+/// refresh loop (RF4-14 Finding 2 / F72 concurrency axis).
+pub const DEFAULT_FETCH_CONCURRENCY: usize = 8;
+
+/// How [`fetch_provider_keys`] updates `RVC_SECRET_PROVIDER_KEYS_LOADED`.
+///
+/// Boot sets an absolute per-source total. Refresh must **not** overwrite that
+/// gauge with a per-cycle delta (often 0 when all keys are already known), or
+/// dashboards flip to zero on every idle refresh.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeysLoadedUpdate {
+    /// Set the gauge to this call's successfully loaded count (boot full load).
+    SetAbsolute,
+    /// Leave the gauge untouched in the pipeline. Callers that admit new keys
+    /// (refresh) should [`prometheus::Gauge::add`] only the newly admitted count.
+    LeaveUnchanged,
+}
+
+/// Instrumented result of fetching keys from a single provider's listed entries.
+///
+/// Callers own post-processing: boot inserts into [`KeyManager`]; refresh returns new keys.
+pub struct ProviderFetchResult {
+    pub name: String,
+    pub loaded: usize,
+    pub skipped: usize,
+    pub errors: Vec<String>,
+    /// Successfully converted keys that passed the post-fetch denylist check.
+    pub keys: Vec<SecretKey>,
+}
+
+enum FetchOutcome {
+    Material(KeyMaterial),
+    Error(SecretProviderError),
+    Timeout,
+}
+
+/// Denylist / skip predicate for the shared fetch pipeline (`Send + Sync` so the
+/// future remains spawnable across boot and the refresh loop).
+pub type SkipPubkey = Arc<dyn Fn(&[u8; 48]) -> bool + Send + Sync>;
+
+/// Record a `list_keys` failure on the shared metric families (boot + refresh).
+pub fn record_list_keys_failure(provider_name: &str, err: &SecretProviderError, started: Instant) {
+    RVC_SECRET_PROVIDER_ERRORS_TOTAL.with_label_values(&[provider_name, classify_error(err)]).inc();
+    RVC_SECRET_PROVIDER_LOAD_DURATION_SECONDS
+        .with_label_values(&[provider_name])
+        .observe(started.elapsed().as_secs_f64());
+}
+
+/// Shared instrumented fetch pipeline for boot and refresh (RF4-14 / E9).
+///
+/// Owns: hex denylist precheck, bounded concurrent `JoinSet` fan-out, per-fetch
+/// `tokio::time::timeout`, `secret_provider.fetch_key` spans, error + duration
+/// metrics, and optional absolute `KEYS_LOADED` gauge update.
+///
+/// `is_denied` is consulted both before fetch (when `pubkey_hex` is present) and
+/// after conversion (fail-closed when list metadata omits the pubkey).
+/// `load_started` is used for the duration histogram (callers may start it before
+/// `list_keys` so list latency is included).
+/// `concurrency` caps in-flight `fetch_key` tasks (minimum 1).
+pub async fn fetch_provider_keys(
+    provider: Arc<dyn SecretProvider>,
+    entries: &[SecretKeyEntry],
+    is_denied: Option<SkipPubkey>,
+    timeout: Duration,
+    concurrency: usize,
+    load_started: Instant,
+    keys_loaded_update: KeysLoadedUpdate,
+) -> ProviderFetchResult {
+    let provider_name = provider.name().to_string();
+    let mut loaded = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = Vec::new();
+    let mut keys = Vec::new();
+
+    let concurrency = concurrency.max(1);
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(concurrency));
+    let mut join_set = tokio::task::JoinSet::new();
+    for entry in entries {
+        // Early skip when list_keys already provides the pubkey.
+        if let (Some(ref deny), Some(ref hex_str)) = (&is_denied, &entry.pubkey_hex) {
+            if let Ok(pk) = eth_types::canonical::pubkey_hex::parse_pubkey_hex(hex_str) {
+                let arr = *pk.as_bytes();
+                if deny(&arr) {
+                    let pubkey_hex = format!("0x{}", hex::encode(arr));
+                    info!(
+                        pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                        source = %provider_name,
+                        "Skipping denylisted secret-provider key"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            }
+        }
+
+        let id = entry.id.clone();
+        let prov = Arc::clone(&provider);
+        let prov_name = provider_name.clone();
+        let permit = Arc::clone(&semaphore);
+        let fetch_span = info_span!(
+            "secret_provider.fetch_key",
+            key.id = %id,
+            provider.name = %prov_name,
+        );
+        join_set.spawn(
+            async move {
+                // Bound in-flight fetches; acquire before the timed fetch so the
+                // timeout does not count queue wait against the provider SLA.
+                let _permit = permit
+                    .acquire_owned()
+                    .await
+                    .expect("fetch concurrency semaphore is never closed");
+                let outcome = match tokio::time::timeout(timeout, prov.fetch_key(&id)).await {
+                    Ok(Ok(material)) => FetchOutcome::Material(material),
+                    Ok(Err(e)) => FetchOutcome::Error(e),
+                    Err(_elapsed) => FetchOutcome::Timeout,
+                };
+                (id, outcome)
+            }
+            .instrument(fetch_span),
+        );
+    }
+
+    while let Some(join_result) = join_set.join_next().await {
+        let (entry_id, outcome) = match join_result {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!(
+                    provider = %provider_name,
+                    error = %e,
+                    "JoinSet task panicked, skipping"
+                );
+                RVC_SECRET_PROVIDER_ERRORS_TOTAL
+                    .with_label_values(&[provider_name.as_str(), "task_panic"])
+                    .inc();
+                skipped += 1;
+                errors.push(format!("task panic: {}", e));
+                continue;
+            }
+        };
+
+        match outcome {
+            FetchOutcome::Material(material) => match convert_key_material(&entry_id, material) {
+                Ok(secret_key) => {
+                    let pubkey_bytes = secret_key.public_key().to_bytes();
+                    if is_denied.as_ref().is_some_and(|deny| deny(&pubkey_bytes)) {
+                        let pubkey_hex = format!("0x{}", hex::encode(pubkey_bytes));
+                        info!(
+                            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                            source = %provider_name,
+                            "Skipping denylisted secret-provider key"
+                        );
+                        skipped += 1;
+                        continue;
+                    }
+                    loaded += 1;
+                    keys.push(secret_key);
+                }
+                Err(e) => {
+                    warn!(
+                        key_id = %entry_id,
+                        source = %provider_name,
+                        error = %e,
+                        "Key fetch failure"
+                    );
+                    RVC_SECRET_PROVIDER_ERRORS_TOTAL
+                        .with_label_values(&[provider_name.as_str(), classify_error(&e)])
+                        .inc();
+                    skipped += 1;
+                    errors.push(format!("{}: {}", entry_id, e));
+                }
+            },
+            FetchOutcome::Error(e) => {
+                tracing::Span::current().in_scope(|| {
+                    tracing::error!(
+                        provider = %provider_name,
+                        key_id = %entry_id,
+                        error = %e,
+                        "Failed to fetch key"
+                    );
+                });
+                RVC_SECRET_PROVIDER_ERRORS_TOTAL
+                    .with_label_values(&[provider_name.as_str(), classify_error(&e)])
+                    .inc();
+                skipped += 1;
+                errors.push(format!("{}: {}", entry_id, e));
+            }
+            FetchOutcome::Timeout => {
+                warn!(
+                    provider = %provider_name,
+                    key_id = %entry_id,
+                    timeout_secs = timeout.as_secs(),
+                    "Timed out fetching key from secret provider"
+                );
+                RVC_SECRET_PROVIDER_ERRORS_TOTAL
+                    .with_label_values(&[provider_name.as_str(), "timeout"])
+                    .inc();
+                skipped += 1;
+                errors.push(format!("{}: fetch timed out after {}s", entry_id, timeout.as_secs()));
+            }
+        }
+    }
+
+    match keys_loaded_update {
+        KeysLoadedUpdate::SetAbsolute => {
+            RVC_SECRET_PROVIDER_KEYS_LOADED
+                .with_label_values(&[provider_name.as_str()])
+                .set(loaded as f64);
+        }
+        KeysLoadedUpdate::LeaveUnchanged => {}
+    }
+    RVC_SECRET_PROVIDER_LOAD_DURATION_SECONDS
+        .with_label_values(&[provider_name.as_str()])
+        .observe(load_started.elapsed().as_secs_f64());
+
+    ProviderFetchResult { name: provider_name, loaded, skipped, errors, keys }
+}
 
 pub struct KeySourceManager {
     providers: Vec<Arc<dyn SecretProvider>>,
     /// When true, any provider `list_keys` failure aborts the load (SEC-9 / M-9).
     /// Default is resilient: log and continue so healthy providers still load.
     strict: bool,
+    /// Per-key fetch timeout (default [`DEFAULT_KEY_FETCH_TIMEOUT`]).
+    fetch_timeout: Duration,
+    /// Max concurrent `fetch_key` tasks per provider (default [`DEFAULT_FETCH_CONCURRENCY`]).
+    fetch_concurrency: usize,
 }
 
 impl KeySourceManager {
     pub fn new(providers: Vec<Box<dyn SecretProvider>>) -> Self {
-        Self { providers: providers.into_iter().map(Arc::from).collect(), strict: false }
+        Self {
+            providers: providers.into_iter().map(Arc::from).collect(),
+            strict: false,
+            fetch_timeout: DEFAULT_KEY_FETCH_TIMEOUT,
+            fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+        }
     }
 
     pub fn from_arc(providers: Vec<Arc<dyn SecretProvider>>) -> Self {
-        Self { providers, strict: false }
+        Self {
+            providers,
+            strict: false,
+            fetch_timeout: DEFAULT_KEY_FETCH_TIMEOUT,
+            fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+        }
     }
 
     /// Fail-fast when any provider's `list_keys` fails (SEC-9 / M-9 strict mode).
     pub fn with_strict(mut self, strict: bool) -> Self {
         self.strict = strict;
+        self
+    }
+
+    /// Override the per-key fetch timeout (shared pipeline default is 30s).
+    pub fn with_fetch_timeout(mut self, timeout: Duration) -> Self {
+        self.fetch_timeout = timeout;
+        self
+    }
+
+    /// Override max concurrent `fetch_key` calls per provider.
+    pub fn with_fetch_concurrency(mut self, concurrency: usize) -> Self {
+        self.fetch_concurrency = concurrency.max(1);
         self
     }
 
@@ -65,9 +317,15 @@ impl KeySourceManager {
         let mut list_successes = 0usize;
         let mut last_list_error: Option<SecretProviderError> = None;
 
+        // Build SkipPubkey once for all providers (avoid cloning HashSet per provider).
+        let is_denied: Option<SkipPubkey> = denylist.map(|set| {
+            let set = Arc::new(set.clone());
+            Arc::new(move |pk: &[u8; 48]| set.contains(pk)) as SkipPubkey
+        });
+
         for provider in &self.providers {
             let provider_name = provider.name().to_string();
-            let timer = std::time::Instant::now();
+            let timer = Instant::now();
 
             let list_span = info_span!(
                 "secret_provider.list_keys",
@@ -80,13 +338,7 @@ impl KeySourceManager {
                     entries
                 }
                 Err(err) => {
-                    let elapsed = timer.elapsed().as_secs_f64();
-                    RVC_SECRET_PROVIDER_ERRORS_TOTAL
-                        .with_label_values(&[provider_name.as_str(), classify_error(&err)])
-                        .inc();
-                    RVC_SECRET_PROVIDER_LOAD_DURATION_SECONDS
-                        .with_label_values(&[provider_name.as_str()])
-                        .observe(elapsed);
+                    record_list_keys_failure(&provider_name, &err, timer);
                     if self.strict {
                         return Err(err);
                     }
@@ -107,130 +359,33 @@ impl KeySourceManager {
             };
             list_span.record("keys.count", entries.len());
 
-            let mut provider_summary = ProviderSummary {
-                name: provider_name.clone(),
-                loaded: 0,
-                skipped: 0,
-                errors: Vec::new(),
-            };
+            let fetch = fetch_provider_keys(
+                Arc::clone(provider),
+                &entries,
+                is_denied.clone(),
+                self.fetch_timeout,
+                self.fetch_concurrency,
+                timer,
+                KeysLoadedUpdate::SetAbsolute,
+            )
+            .await;
 
-            let mut join_set = tokio::task::JoinSet::new();
-            for entry in &entries {
-                // Early skip when list_keys already provides the pubkey.
-                if let (Some(deny), Some(ref hex_str)) = (denylist, &entry.pubkey_hex) {
-                    if let Ok(pk) = eth_types::canonical::pubkey_hex::parse_pubkey_hex(hex_str) {
-                        let arr = *pk.as_bytes();
-                        if deny.contains(&arr) {
-                            let pubkey_hex = format!("0x{}", hex::encode(arr));
-                            info!(
-                                pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                                source = %provider_name,
-                                "Skipping denylisted secret-provider key"
-                            );
-                            provider_summary.skipped += 1;
-                            continue;
-                        }
-                    }
-                }
-
-                let id = entry.id.clone();
-                let prov = Arc::clone(provider);
-                let prov_name = provider_name.clone();
-                let fetch_span = info_span!(
-                    "secret_provider.fetch_key",
-                    key.id = %id,
-                    provider.name = %prov_name,
+            for secret_key in fetch.keys {
+                let pubkey_hex = format!("0x{}", hex::encode(secret_key.public_key().to_bytes()));
+                info!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    source = %provider_name,
+                    "New key discovered"
                 );
-                join_set.spawn(
-                    async move {
-                        let result = prov.fetch_key(&id).await;
-                        (id, result)
-                    }
-                    .instrument(fetch_span),
-                );
+                key_manager.insert(secret_key);
             }
 
-            while let Some(join_result) = join_set.join_next().await {
-                let (entry_id, result) = match join_result {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        warn!(
-                            provider = %provider_name,
-                            error = %e,
-                            "JoinSet task panicked, skipping"
-                        );
-                        RVC_SECRET_PROVIDER_ERRORS_TOTAL
-                            .with_label_values(&[provider_name.as_str(), "task_panic"])
-                            .inc();
-                        provider_summary.skipped += 1;
-                        provider_summary.errors.push(format!("task panic: {}", e));
-                        continue;
-                    }
-                };
-
-                match result {
-                    Ok(material) => match convert_key_material(&entry_id, material) {
-                        Ok(secret_key) => {
-                            let pubkey_bytes = secret_key.public_key().to_bytes();
-                            if denylist.is_some_and(|d| d.contains(&pubkey_bytes)) {
-                                let pubkey_hex = format!("0x{}", hex::encode(pubkey_bytes));
-                                info!(
-                                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                                    source = %provider_name,
-                                    "Skipping denylisted secret-provider key"
-                                );
-                                provider_summary.skipped += 1;
-                                continue;
-                            }
-                            let pubkey_hex = format!("0x{}", hex::encode(pubkey_bytes));
-                            info!(
-                                pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                                source = %provider_name,
-                                "New key discovered"
-                            );
-                            key_manager.insert(secret_key);
-                            provider_summary.loaded += 1;
-                        }
-                        Err(e) => {
-                            warn!(
-                                key_id = %entry_id,
-                                source = %provider_name,
-                                error = %e,
-                                "Key fetch failure"
-                            );
-                            RVC_SECRET_PROVIDER_ERRORS_TOTAL
-                                .with_label_values(&[provider_name.as_str(), classify_error(&e)])
-                                .inc();
-                            provider_summary.skipped += 1;
-                            provider_summary.errors.push(format!("{}: {}", entry_id, e));
-                        }
-                    },
-                    Err(e) => {
-                        tracing::Span::current().in_scope(|| {
-                            tracing::error!(
-                                provider = %provider_name,
-                                key_id = %entry_id,
-                                error = %e,
-                                "Failed to fetch key"
-                            );
-                        });
-                        RVC_SECRET_PROVIDER_ERRORS_TOTAL
-                            .with_label_values(&[provider_name.as_str(), classify_error(&e)])
-                            .inc();
-                        provider_summary.skipped += 1;
-                        provider_summary.errors.push(format!("{}: {}", entry_id, e));
-                    }
-                }
-            }
-
-            RVC_SECRET_PROVIDER_KEYS_LOADED
-                .with_label_values(&[&provider_name])
-                .set(provider_summary.loaded as f64);
-            RVC_SECRET_PROVIDER_LOAD_DURATION_SECONDS
-                .with_label_values(&[&provider_name])
-                .observe(timer.elapsed().as_secs_f64());
-
-            summary.per_provider.push(provider_summary);
+            summary.per_provider.push(ProviderSummary {
+                name: fetch.name,
+                loaded: fetch.loaded,
+                skipped: fetch.skipped,
+                errors: fetch.errors,
+            });
         }
 
         // All configured providers failed list_keys — still fatal (SEC-9 / M-9).
@@ -344,6 +499,8 @@ pub mod mock {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
+    use std::time::{Duration, Instant};
+
     use parking_lot::Mutex;
 
     use crypto::SecretKey;
@@ -1055,5 +1212,237 @@ mod tests {
         assert_eq!(summary.per_provider[0].loaded, 1);
         assert_eq!(summary.per_provider[0].skipped, 0);
         assert!(km.contains(&pk));
+    }
+
+    // ── RF4-14: shared fetch_provider_keys pipeline ───────────────────────
+
+    /// Hung mock: `fetch_key` never completes until the per-key timeout fires.
+    struct HungSecretProvider {
+        name: String,
+        entry_ids: Vec<String>,
+        fetch_calls: Arc<Mutex<u32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SecretProvider for HungSecretProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn list_keys(&self) -> Result<Vec<SecretKeyEntry>, SecretProviderError> {
+            Ok(self
+                .entry_ids
+                .iter()
+                .map(|id| SecretKeyEntry { id: id.clone(), pubkey_hex: None })
+                .collect())
+        }
+
+        async fn fetch_key(&self, _id: &str) -> Result<KeyMaterial, SecretProviderError> {
+            *self.fetch_calls.lock() += 1;
+            // Sleep longer than any test timeout; with tokio::time::pause the
+            // timeout future advances without waiting wall-clock.
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Err(SecretProviderError::Provider("unreachable".into()))
+        }
+    }
+
+    /// Counts `fetch_key` invocations; material is always a valid raw key.
+    struct CountingSecretProvider {
+        name: String,
+        keys: Vec<(SecretKeyEntry, SecretKey)>,
+        fetch_calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SecretProvider for CountingSecretProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn list_keys(&self) -> Result<Vec<SecretKeyEntry>, SecretProviderError> {
+            Ok(self
+                .keys
+                .iter()
+                .map(|(e, _)| SecretKeyEntry { id: e.id.clone(), pubkey_hex: e.pubkey_hex.clone() })
+                .collect())
+        }
+
+        async fn fetch_key(&self, id: &str) -> Result<KeyMaterial, SecretProviderError> {
+            self.fetch_calls.lock().push(id.to_string());
+            for (entry, sk) in &self.keys {
+                if entry.id == id {
+                    let bytes: [u8; 32] = sk.to_bytes();
+                    return Ok(KeyMaterial::RawKey(Zeroizing::new(bytes)));
+                }
+            }
+            Err(SecretProviderError::NotFound(format!("key {id} not found")))
+        }
+    }
+
+    /// RED first (RF4-14): boot must bound hung providers with a per-key timeout.
+    #[tokio::test]
+    async fn test_boot_fetch_times_out_on_hung_provider() {
+        tokio::time::pause();
+
+        let fetch_calls = Arc::new(Mutex::new(0u32));
+        let hung = HungSecretProvider {
+            name: "hung-boot".to_string(),
+            entry_ids: vec!["slow-key".to_string()],
+            fetch_calls: fetch_calls.clone(),
+        };
+        // A healthy key must still load when the hung key times out.
+        let sk_ok = SecretKey::generate();
+        let healthy = MockSecretProvider {
+            name: "healthy-boot".to_string(),
+            keys: vec![make_raw_key_entry("ok-key", &sk_ok)],
+            list_error: None,
+        };
+
+        let ksm = KeySourceManager::new(vec![Box::new(hung), Box::new(healthy)])
+            .with_fetch_timeout(Duration::from_secs(5));
+        let mut km = KeyManager::new();
+
+        let wall = Instant::now();
+        let summary = ksm.load_all(&mut km).await.expect("boot continues after hung key timeout");
+        let wall_elapsed = wall.elapsed();
+
+        assert!(
+            wall_elapsed < Duration::from_secs(2),
+            "boot wall-clock must stay bounded under time pause, got {wall_elapsed:?}"
+        );
+        assert_eq!(*fetch_calls.lock(), 1, "hung provider must still be contacted");
+        assert_eq!(km.len(), 1, "healthy key must load");
+        assert!(km.contains(&sk_ok.public_key().to_bytes()));
+
+        let hung_summary =
+            summary.per_provider.iter().find(|p| p.name == "hung-boot").expect("hung summary");
+        assert_eq!(hung_summary.loaded, 0);
+        assert_eq!(hung_summary.skipped, 1);
+        assert!(
+            hung_summary.errors.iter().any(|e| e.contains("timed out")),
+            "timeout must be recorded as an error: {:?}",
+            hung_summary.errors
+        );
+
+        let errors = crate::metrics::RVC_SECRET_PROVIDER_ERRORS_TOTAL
+            .with_label_values(&["hung-boot", "timeout"])
+            .get();
+        assert!(errors >= 1, "timeout must increment RVC_SECRET_PROVIDER_ERRORS_TOTAL");
+    }
+
+    /// Denylisted pubkey_hex must skip before any `fetch_key` is issued.
+    #[tokio::test]
+    async fn test_denylisted_key_skipped_before_fetch_issued() {
+        let sk_denied = SecretKey::generate();
+        let sk_ok = SecretKey::generate();
+        let pk_denied = sk_denied.public_key().to_bytes();
+        let pubkey_hex = format!("0x{}", hex::encode(pk_denied));
+
+        let sk_ok_pk = sk_ok.public_key().to_bytes();
+        let fetch_calls = Arc::new(Mutex::new(Vec::new()));
+        let provider = CountingSecretProvider {
+            name: "count-deny".to_string(),
+            keys: vec![
+                (
+                    SecretKeyEntry { id: "denied-key".to_string(), pubkey_hex: Some(pubkey_hex) },
+                    sk_denied,
+                ),
+                (SecretKeyEntry { id: "ok-key".to_string(), pubkey_hex: None }, sk_ok),
+            ],
+            fetch_calls: fetch_calls.clone(),
+        };
+
+        let mut denylist = HashSet::new();
+        denylist.insert(pk_denied);
+
+        let ksm = KeySourceManager::from_arc(vec![Arc::new(provider)]);
+        let mut km = KeyManager::new();
+        let summary = ksm.load_all_except(&mut km, Some(&denylist)).await.unwrap();
+
+        let calls = fetch_calls.lock().clone();
+        assert!(
+            !calls.iter().any(|id| id == "denied-key"),
+            "denylisted key must not be fetched, calls={calls:?}"
+        );
+        assert!(calls.iter().any(|id| id == "ok-key"), "non-denied key must be fetched");
+        assert_eq!(summary.per_provider[0].skipped, 1);
+        assert_eq!(summary.per_provider[0].loaded, 1);
+        assert!(km.contains(&sk_ok_pk));
+        assert!(!km.contains(&pk_denied));
+    }
+
+    fn shared_pipeline_fixture(
+        sk1: &SecretKey,
+        sk2: &SecretKey,
+    ) -> Vec<(SecretKeyEntry, Result<KeyMaterial, SecretProviderError>)> {
+        let pk_denied = sk2.public_key().to_bytes();
+        let bytes1: [u8; 32] = sk1.to_bytes();
+        let bytes2: [u8; 32] = sk2.to_bytes();
+        let hex = format!("0x{}", hex::encode(pk_denied));
+        vec![
+            (
+                SecretKeyEntry { id: "k1".to_string(), pubkey_hex: None },
+                Ok(KeyMaterial::RawKey(Zeroizing::new(bytes1))),
+            ),
+            (
+                SecretKeyEntry { id: "k2".to_string(), pubkey_hex: Some(hex) },
+                Ok(KeyMaterial::RawKey(Zeroizing::new(bytes2))),
+            ),
+            (
+                SecretKeyEntry { id: "k3".to_string(), pubkey_hex: None },
+                Err(SecretProviderError::Provider("boom".into())),
+            ),
+        ]
+    }
+
+    /// Boot and refresh share one pipeline: identical fixture → identical fetch summary.
+    #[tokio::test]
+    async fn test_boot_and_refresh_share_one_fetch_pipeline() {
+        let sk1 = SecretKey::generate();
+        let sk2 = SecretKey::generate();
+        let pk_denied = sk2.public_key().to_bytes();
+
+        let boot_provider = MockSecretProvider {
+            name: "shared-pipe".to_string(),
+            keys: shared_pipeline_fixture(&sk1, &sk2),
+            list_error: None,
+        };
+        let refresh_provider = MockSecretProvider {
+            name: "shared-pipe".to_string(),
+            keys: shared_pipeline_fixture(&sk1, &sk2),
+            list_error: None,
+        };
+
+        let mut denylist = HashSet::new();
+        denylist.insert(pk_denied);
+
+        let ksm = KeySourceManager::new(vec![Box::new(boot_provider)]);
+        let mut km = KeyManager::new();
+        let boot_summary = ksm.load_all_except(&mut km, Some(&denylist)).await.unwrap();
+        let boot = &boot_summary.per_provider[0];
+
+        let deny: crate::refresh::DenylistCheck = Arc::new(move |pk: &[u8; 48]| *pk == pk_denied);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut refresh = crate::RefreshService::with_denylist(
+            vec![Arc::new(refresh_provider)],
+            HashSet::new(),
+            Some(deny),
+            Duration::from_secs(60),
+            cancel,
+        );
+        let refresh_keys = refresh.refresh().await;
+
+        // Same loaded/skipped semantics: 1 loaded (sk1), 1 early-deny skip (sk2), 1 error skip.
+        assert_eq!(boot.loaded, 1);
+        assert_eq!(boot.skipped, 2);
+        assert_eq!(boot.errors.len(), 1);
+        assert_eq!(
+            refresh_keys.len(),
+            boot.loaded,
+            "refresh must surface the same non-denied successes as boot"
+        );
+        assert_eq!(refresh_keys[0].public_key().to_bytes(), sk1.public_key().to_bytes());
+        assert_eq!(km.len(), 1);
+        assert!(km.contains(&sk1.public_key().to_bytes()));
     }
 }
