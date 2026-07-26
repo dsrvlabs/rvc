@@ -829,14 +829,9 @@ fn sanitize_item_err<E: std::fmt::Display>(err: E, ctx: &str) -> String {
 }
 
 fn parse_pubkey(s: &str) -> Result<Pubkey, String> {
-    let hex_str = s.strip_prefix("0x").unwrap_or(s);
-    let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {e}"))?;
-    if bytes.len() != 48 {
-        return Err(format!("invalid pubkey length: expected 48 bytes, got {}", bytes.len()));
-    }
-    let mut pubkey = [0u8; 48];
-    pubkey.copy_from_slice(&bytes);
-    Ok(pubkey)
+    eth_types::canonical::pubkey_hex::parse_pubkey_hex(s)
+        .map(|pk| *pk.as_bytes())
+        .map_err(|e| e.to_string())
 }
 
 fn empty_interchange() -> String {
@@ -4177,5 +4172,35 @@ mod tests {
             hex::decode(sig.strip_prefix("0x").unwrap()).is_ok(),
             "signature must be valid hex"
         );
+    }
+
+    /// RF3-15: keymanager now accepts uppercase `0X` via canonical parse.
+    #[test]
+    fn test_keymanager_accepts_uppercase_0x_pubkey() {
+        let bare = "ab".repeat(48);
+        let pk = parse_pubkey(&format!("0X{bare}")).expect("0X-prefixed pubkey must parse");
+        assert_eq!(pk, [0xabu8; 48]);
+    }
+
+    /// RF3-15: shared case table — bare / 0x / 0X / mixed hex accepted; doubles,
+    /// wrong length, and non-hex rejected.
+    #[test]
+    fn test_parse_pubkey_shared_case_table() {
+        let bare = "cd".repeat(48);
+        let expected = [0xcdu8; 48];
+        for s in [
+            bare.clone(),
+            format!("0x{bare}"),
+            format!("0X{bare}"),
+            format!("0x{}", bare.to_uppercase()),
+            format!("0X{}", bare.to_uppercase()),
+        ] {
+            assert_eq!(parse_pubkey(&s).unwrap(), expected, "input={s}");
+        }
+        assert!(parse_pubkey(&format!("0x0x{bare}")).is_err());
+        assert!(parse_pubkey(&format!("0x0X{bare}")).is_err());
+        assert!(parse_pubkey(&format!("0X0x{bare}")).is_err());
+        assert!(parse_pubkey(&format!("0x{}", "ab".repeat(47))).is_err());
+        assert!(parse_pubkey(&format!("0x{}", "zz".repeat(48))).is_err());
     }
 }

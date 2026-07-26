@@ -416,7 +416,11 @@ impl ValidatorStore {
 }
 
 fn parse_validator(v: &TomlValidator) -> Result<ValidatorConfig, ValidatorStoreError> {
-    let pubkey: [u8; 48] = parse_hex_bytes(&v.pubkey)?;
+    // 48-byte BLS pubkeys go through the shared canonical engine (RF3-15).
+    // Fee-recipient remains on the local generic (20-byte) path.
+    let pubkey: [u8; 48] = eth_types::canonical::pubkey_hex::parse_pubkey_hex(&v.pubkey)
+        .map(|pk| *pk.as_bytes())
+        .map_err(|e| ValidatorStoreError::Config(e.to_string()))?;
     let fee_recipient = v.fee_recipient.as_ref().map(|s| parse_hex_bytes(s)).transpose()?;
     let graffiti = v.graffiti.as_ref().map(|s| parse_graffiti(s));
 
@@ -955,6 +959,34 @@ pubkey = "not-valid-hex"
     fn test_parse_hex_bytes_wrong_length() {
         let result = parse_hex_bytes::<4>("aabb");
         assert!(result.is_err());
+    }
+
+    /// RF3-15: the 20-byte fee-recipient path stays on the local generic parser.
+    #[test]
+    fn test_validator_store_20_byte_path_unaffected() {
+        let addr: [u8; 20] = parse_hex_bytes(&format!("0x{}", "ab".repeat(20))).unwrap();
+        assert_eq!(addr, [0xabu8; 20]);
+        let bare: [u8; 20] = parse_hex_bytes(&"cd".repeat(20)).unwrap();
+        assert_eq!(bare, [0xcdu8; 20]);
+        // Still only strips lowercase `0x` (local path, not canonical).
+        assert!(parse_hex_bytes::<20>(&format!("0X{}", "ab".repeat(20))).is_err());
+    }
+
+    /// RF3-15: validator pubkey parsing accepts uppercase `0X` via canonical.
+    #[test]
+    fn test_parse_validator_accepts_uppercase_0x_pubkey() {
+        let v = TomlValidator {
+            pubkey: format!("0X{}", "ab".repeat(48)),
+            fee_recipient: None,
+            gas_limit: None,
+            builder_proposals: None,
+            builder_boost_factor: None,
+            graffiti: None,
+            enabled: None,
+            block_selection_mode: None,
+        };
+        let cfg = parse_validator(&v).expect("0X-prefixed pubkey must parse");
+        assert_eq!(cfg.pubkey, [0xabu8; 48]);
     }
 
     #[test]

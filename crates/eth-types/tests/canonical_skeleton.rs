@@ -39,7 +39,7 @@ fn test_pubkey_hex_rejects_double_prefix() {
     assert!(matches!(err, ParseError::DoublePrefix));
 }
 
-// Item 1: "0x0X…" (mixed-case second prefix) must also be DoublePrefix.
+// "0x0X…" (mixed-case second prefix) must also be DoublePrefix.
 #[test]
 fn test_pubkey_hex_rejects_double_prefix_mixed_second_0x_upper() {
     let hex_str = format!("0x0X{}", "ab".repeat(48));
@@ -47,22 +47,20 @@ fn test_pubkey_hex_rejects_double_prefix_mixed_second_0x_upper() {
     assert!(matches!(err, ParseError::DoublePrefix));
 }
 
-// Item 1 (policy pin): outer "0X" is not a recognised prefix → InvalidHex.
-// "0X0x…" does not get the double-prefix guard; the outer strip_prefix call
-// leaves the string unchanged, and "0X0x…" fails hex decode.
+// RF3-13: outer "0X" is a recognised prefix; "0X0x…" is DoublePrefix.
 #[test]
-fn test_pubkey_hex_outer_upper_x_prefix_is_invalid_hex() {
+fn test_pubkey_hex_outer_upper_x_double_prefix_rejected() {
     let hex_str = format!("0X0x{}", "ab".repeat(48));
     let err = parse_pubkey_hex(&hex_str).unwrap_err();
-    assert!(matches!(err, ParseError::InvalidHex(_)));
+    assert!(matches!(err, ParseError::DoublePrefix));
 }
 
-// Item 1 (policy pin): "0X0X…" → InvalidHex for the same reason.
+// RF3-13: "0X0X…" → DoublePrefix.
 #[test]
-fn test_pubkey_hex_both_upper_x_prefixes_is_invalid_hex() {
+fn test_pubkey_hex_both_upper_x_prefixes_rejected() {
     let hex_str = format!("0X0X{}", "ab".repeat(48));
     let err = parse_pubkey_hex(&hex_str).unwrap_err();
-    assert!(matches!(err, ParseError::InvalidHex(_)));
+    assert!(matches!(err, ParseError::DoublePrefix));
 }
 
 // Item 2: true bare unprefixed odd-length hex → InvalidHex.
@@ -110,11 +108,33 @@ fn test_pubkey_hex_rejects_lone_0x() {
     assert!(matches!(err, ParseError::InvalidLength { got: 0, .. }));
 }
 
-// Item 4: uppercase-X single prefix "0X…" → InvalidHex (policy: only lowercase 0x stripped).
+// RF3-13: uppercase-X single prefix "0X…" is accepted (widened strip_prefix).
 #[test]
-fn test_pubkey_hex_uppercase_x_single_prefix_is_invalid_hex() {
+fn test_canonical_accepts_uppercase_0x_prefix() {
     let hex_str = format!("0X{}", "ab".repeat(48));
-    let err = parse_pubkey_hex(&hex_str).unwrap_err();
+    let pk = parse_pubkey_hex(&hex_str).expect("0X-prefixed pubkey must parse");
+    assert_eq!(pk.as_bytes(), &[0xabu8; 48]);
+}
+
+// RF3-13: all doubled-prefix case combinations rejected.
+#[test]
+fn test_double_prefix_still_rejected_both_cases() {
+    for prefix in ["0x0x", "0x0X", "0X0x", "0X0X"] {
+        let hex_str = format!("{prefix}{}", "ab".repeat(48));
+        let err = parse_pubkey_hex(&hex_str).unwrap_err();
+        assert!(
+            matches!(err, ParseError::DoublePrefix),
+            "expected DoublePrefix for {prefix}…, got {err:?}"
+        );
+    }
+}
+
+// RF3-13: error messages never echo the raw offending character.
+#[test]
+fn test_error_messages_contain_no_raw_input_characters() {
+    let err = parse_pubkey_hex(&format!("0x{}", "zz".repeat(48))).unwrap_err();
+    let msg = err.to_string();
+    assert!(!msg.contains('z'), "error must not echo raw non-hex char: {msg}");
     assert!(matches!(err, ParseError::InvalidHex(_)));
 }
 
@@ -155,7 +175,7 @@ fn test_gvr_hex_rejects_double_prefix() {
     assert!(matches!(err, ParseError::DoublePrefix));
 }
 
-// Item 1: "0x0X…" must also be DoublePrefix.
+// "0x0X…" must also be DoublePrefix.
 #[test]
 fn test_gvr_hex_rejects_double_prefix_mixed_second_0x_upper() {
     let hex_str = format!("0x0X{}", "cd".repeat(32));
@@ -163,20 +183,20 @@ fn test_gvr_hex_rejects_double_prefix_mixed_second_0x_upper() {
     assert!(matches!(err, ParseError::DoublePrefix));
 }
 
-// Item 1 (policy pin): outer "0X" not a recognised prefix → InvalidHex.
+// RF3-13: outer "0X" is recognised; "0X0x…" is DoublePrefix.
 #[test]
-fn test_gvr_hex_outer_upper_x_prefix_is_invalid_hex() {
+fn test_gvr_hex_outer_upper_x_double_prefix_rejected() {
     let hex_str = format!("0X0x{}", "cd".repeat(32));
     let err = parse_gvr_hex(&hex_str).unwrap_err();
-    assert!(matches!(err, ParseError::InvalidHex(_)));
+    assert!(matches!(err, ParseError::DoublePrefix));
 }
 
-// Item 1 (policy pin): "0X0X…" → InvalidHex.
+// RF3-13: "0X0X…" → DoublePrefix.
 #[test]
-fn test_gvr_hex_both_upper_x_prefixes_is_invalid_hex() {
+fn test_gvr_hex_both_upper_x_prefixes_rejected() {
     let hex_str = format!("0X0X{}", "cd".repeat(32));
     let err = parse_gvr_hex(&hex_str).unwrap_err();
-    assert!(matches!(err, ParseError::InvalidHex(_)));
+    assert!(matches!(err, ParseError::DoublePrefix));
 }
 
 // Item 2 (fixed comment): prefixed odd-length hex → InvalidHex.
@@ -222,12 +242,12 @@ fn test_gvr_hex_rejects_lone_0x() {
     assert!(matches!(err, ParseError::InvalidLength { got: 0, .. }));
 }
 
-// Item 4: uppercase-X single prefix "0X…" → InvalidHex.
+// RF3-13: uppercase-X single prefix "0X…" is accepted.
 #[test]
-fn test_gvr_hex_uppercase_x_single_prefix_is_invalid_hex() {
+fn test_gvr_hex_accepts_uppercase_0x_prefix() {
     let hex_str = format!("0X{}", "cd".repeat(32));
-    let err = parse_gvr_hex(&hex_str).unwrap_err();
-    assert!(matches!(err, ParseError::InvalidHex(_)));
+    let root = parse_gvr_hex(&hex_str).expect("0X-prefixed GVR must parse");
+    assert_eq!(root, [0xcdu8; 32]);
 }
 
 #[test]
@@ -331,7 +351,7 @@ fn test_signing_root_hex_rejects_double_prefix() {
     assert!(matches!(err, ParseError::DoublePrefix));
 }
 
-// Item 1: "0x0X…" must also be DoublePrefix.
+// "0x0X…" must also be DoublePrefix.
 #[test]
 fn test_signing_root_hex_rejects_double_prefix_mixed_second_0x_upper() {
     let hex_str = format!("0x0X{}", "de".repeat(32));
@@ -339,20 +359,20 @@ fn test_signing_root_hex_rejects_double_prefix_mixed_second_0x_upper() {
     assert!(matches!(err, ParseError::DoublePrefix));
 }
 
-// Item 1 (policy pin): outer "0X" not a recognised prefix → InvalidHex.
+// RF3-13: outer "0X" is recognised; "0X0x…" is DoublePrefix.
 #[test]
-fn test_signing_root_hex_outer_upper_x_prefix_is_invalid_hex() {
+fn test_signing_root_hex_outer_upper_x_double_prefix_rejected() {
     let hex_str = format!("0X0x{}", "de".repeat(32));
     let err = parse_signing_root_hex(&hex_str).unwrap_err();
-    assert!(matches!(err, ParseError::InvalidHex(_)));
+    assert!(matches!(err, ParseError::DoublePrefix));
 }
 
-// Item 1 (policy pin): "0X0X…" → InvalidHex.
+// RF3-13: "0X0X…" → DoublePrefix.
 #[test]
-fn test_signing_root_hex_both_upper_x_prefixes_is_invalid_hex() {
+fn test_signing_root_hex_both_upper_x_prefixes_rejected() {
     let hex_str = format!("0X0X{}", "de".repeat(32));
     let err = parse_signing_root_hex(&hex_str).unwrap_err();
-    assert!(matches!(err, ParseError::InvalidHex(_)));
+    assert!(matches!(err, ParseError::DoublePrefix));
 }
 
 // Item 2 (fixed comment): prefixed odd-length hex → InvalidHex.
@@ -398,12 +418,12 @@ fn test_signing_root_hex_rejects_lone_0x() {
     assert!(matches!(err, ParseError::InvalidLength { got: 0, .. }));
 }
 
-// Item 4: uppercase-X single prefix "0X…" → InvalidHex.
+// RF3-13: uppercase-X single prefix "0X…" is accepted.
 #[test]
-fn test_signing_root_hex_uppercase_x_single_prefix_is_invalid_hex() {
+fn test_signing_root_hex_accepts_uppercase_0x_prefix() {
     let hex_str = format!("0X{}", "de".repeat(32));
-    let err = parse_signing_root_hex(&hex_str).unwrap_err();
-    assert!(matches!(err, ParseError::InvalidHex(_)));
+    let sr = parse_signing_root_hex(&hex_str).expect("0X-prefixed signing root must parse");
+    assert_eq!(sr.as_bytes(), &[0xdeu8; 32]);
 }
 
 #[test]

@@ -24,14 +24,14 @@ impl SigningRootHex {
 
 /// Parse a signing root from a hex string.
 ///
-/// Accepts a bare 64-character hex string or a `0x`-prefixed one.
-/// Rejects double `0x0x` prefix, odd-length hex, non-hex characters,
-/// and any decoded byte length other than 32.
+/// Accepts a bare 64-character hex string or a single `0x`/`0X`-prefixed one.
+/// Rejects a doubled prefix, odd-length hex, non-hex characters, and any
+/// decoded byte length other than 32.
 ///
 /// # Errors
-/// Returns [`ParseError::DoublePrefix`] for a `0x0x…` input, [`ParseError::InvalidHex`]
-/// for non-hex or odd-length input, and [`ParseError::InvalidLength`] when the
-/// decoded byte count is not 32.
+/// Returns [`ParseError::DoublePrefix`] for a doubled `0x`/`0X` prefix,
+/// [`ParseError::InvalidHex`] for non-hex or odd-length input, and
+/// [`ParseError::InvalidLength`] when the decoded byte count is not 32.
 ///
 /// # Examples
 /// ```

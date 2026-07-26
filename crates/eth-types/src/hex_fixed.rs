@@ -1,5 +1,27 @@
+//! Fixed-length hex serde helpers for Beacon API wire types.
+//!
+//! # Prefix policy (deliberate per-seam strictness)
+//!
+//! Unlike [`crate::canonical`]'s typed constructors (which accept bare hex
+//! and an optional single `0x`/`0X` prefix), this module **requires** a
+//! leading `0x` or `0X` prefix. Bare hex is rejected. That matches the Beacon
+//! API contract for hex-encoded roots, pubkeys, and similar fields — it is
+//! intentional, not a second decode engine.
+//!
+//! All prefix-strip and hex-decode work is delegated to
+//! [`crate::canonical::pubkey_hex`]; this module only enforces the
+//! "prefix required" gate and the fixed length.
+
 use serde::de::Error;
 use serde::{Deserialize, Deserializer, Serializer};
+
+use crate::canonical::pubkey_hex::{decode_hex, strip_prefix};
+use crate::canonical::ParseError;
+
+/// Map a canonical [`ParseError`] into a serde custom error.
+fn map_parse_err<E: Error>(err: ParseError) -> E {
+    E::custom(err.to_string())
+}
 
 macro_rules! bytes_hex_mod {
     ($mod_name:ident, $len:expr) => {
@@ -23,9 +45,12 @@ macro_rules! bytes_hex_mod {
                 D: Deserializer<'de>,
             {
                 let s = String::deserialize(deserializer)?;
-                let s =
-                    s.strip_prefix("0x").ok_or_else(|| D::Error::custom("missing 0x prefix"))?;
-                let decoded = hex::decode(s).map_err(D::Error::custom)?;
+                // Beacon API: require a 0x/0X prefix (bare hex rejected).
+                if !s.starts_with("0x") && !s.starts_with("0X") {
+                    return Err(D::Error::custom("missing 0x prefix"));
+                }
+                let hex = strip_prefix(&s).map_err(map_parse_err)?;
+                let decoded = decode_hex(hex).map_err(map_parse_err)?;
                 if decoded.len() != BYTES_LEN {
                     return Err(D::Error::custom(format!(
                         "expected {} bytes, got {}",
@@ -81,10 +106,40 @@ mod tests {
     }
 
     #[test]
+    fn test_hex_fixed_still_requires_0x_prefix() {
+        let hex = "ab".repeat(32);
+        let json = format!(r#"{{"val":"{}"}}"#, hex);
+        let err = serde_json::from_str::<Wrapper32>(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("missing 0x prefix"),
+            "bare hex must stay rejected: {err}"
+        );
+    }
+
+    #[test]
     fn test_bytes_32_hex_deserialize_requires_0x_prefix() {
         let hex = "ab".repeat(32);
         let json = format!(r#"{{"val":"{}"}}"#, hex);
         assert!(serde_json::from_str::<Wrapper32>(&json).is_err());
+    }
+
+    #[test]
+    fn test_bytes_32_hex_accepts_uppercase_0x_prefix() {
+        let hex = format!("0X{}", "ab".repeat(32));
+        let json = format!(r#"{{"val":"{}"}}"#, hex);
+        let decoded: Wrapper32 = serde_json::from_str(&json).expect("0X prefix accepted");
+        assert_eq!(decoded.val, [0xab; 32]);
+    }
+
+    #[test]
+    fn test_bytes_32_hex_rejects_double_prefix() {
+        let hex = format!("0x0x{}", "ab".repeat(32));
+        let json = format!(r#"{{"val":"{}"}}"#, hex);
+        let err = serde_json::from_str::<Wrapper32>(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("double 0x prefix"),
+            "double prefix must be rejected via canonical: {err}"
+        );
     }
 
     #[test]

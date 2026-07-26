@@ -118,21 +118,17 @@ impl KeySourceManager {
             for entry in &entries {
                 // Early skip when list_keys already provides the pubkey.
                 if let (Some(deny), Some(ref hex_str)) = (denylist, &entry.pubkey_hex) {
-                    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-                    if let Ok(bytes) = hex::decode(hex_str) {
-                        if bytes.len() == 48 {
-                            let mut arr = [0u8; 48];
-                            arr.copy_from_slice(&bytes);
-                            if deny.contains(&arr) {
-                                let pubkey_hex = format!("0x{}", hex::encode(arr));
-                                info!(
-                                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                                    source = %provider_name,
-                                    "Skipping denylisted secret-provider key"
-                                );
-                                provider_summary.skipped += 1;
-                                continue;
-                            }
+                    if let Ok(pk) = eth_types::canonical::pubkey_hex::parse_pubkey_hex(hex_str) {
+                        let arr = *pk.as_bytes();
+                        if deny.contains(&arr) {
+                            let pubkey_hex = format!("0x{}", hex::encode(arr));
+                            info!(
+                                pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                                source = %provider_name,
+                                "Skipping denylisted secret-provider key"
+                            );
+                            provider_summary.skipped += 1;
+                            continue;
                         }
                     }
                 }

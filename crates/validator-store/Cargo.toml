@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 crypto.workspace = true
+eth-types.workspace = true
 hex.workspace = true
 parking_lot.workspace = true
 serde.workspace = true

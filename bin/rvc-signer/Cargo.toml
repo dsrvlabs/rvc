@@ -19,7 +19,8 @@ path = "src/lib.rs"
 
 [features]
 default = []
-dvt = ["vsss-rs", "bls12_381_plus", "rand"]
+# Enables PeerSignerService client stubs (DVT dial-out) via the shared proto crate.
+dvt = ["vsss-rs", "bls12_381_plus", "rand", "signer-proto/client"]
 
 [dependencies]
 async-trait.workspace = true
@@ -35,6 +36,7 @@ signer.workspace = true
 # RF3-14 incomplete on develop: lib.rs re-exports signer_proto without a dep.
 # Required for rvc-signer-bin to compile; features match the former local build.rs.
 signer-proto = { workspace = true, features = ["server", "client"] }
+signer-proto = { workspace = true, features = ["server"] }
 slashing.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

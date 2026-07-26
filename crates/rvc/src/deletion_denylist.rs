@@ -161,14 +161,7 @@ fn parse_pubkey_line(line: &str) -> Option<[u8; 48]> {
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
     }
-    let hex_str = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-    let bytes = hex::decode(hex_str).ok()?;
-    if bytes.len() != 48 {
-        return None;
-    }
-    let mut arr = [0u8; 48];
-    arr.copy_from_slice(&bytes);
-    Some(arr)
+    eth_types::canonical::pubkey_hex::parse_pubkey_hex(trimmed).map(|pk| *pk.as_bytes()).ok()
 }
 
 fn load_keys_from_file(path: &Path) -> Result<HashSet<[u8; 48]>, DeletionDenylistError> {
@@ -455,5 +448,23 @@ mod tests {
         assert!(!good_tmp.exists());
         assert!(denylist.contains(&b));
         assert!(!denylist.contains(&a));
+    }
+
+    /// RF3-15: blank lines and `#` comments stay skips; `0X` is accepted.
+    #[test]
+    fn test_denylist_line_parse_unchanged_for_comments_and_blanks() {
+        assert!(parse_pubkey_line("").is_none());
+        assert!(parse_pubkey_line("   ").is_none());
+        assert!(parse_pubkey_line("# comment").is_none());
+        assert!(parse_pubkey_line("  # indented comment").is_none());
+
+        let bare = "ab".repeat(48);
+        let expected = [0xabu8; 48];
+        assert_eq!(parse_pubkey_line(&bare), Some(expected));
+        assert_eq!(parse_pubkey_line(&format!("0x{bare}")), Some(expected));
+        assert_eq!(parse_pubkey_line(&format!("0X{bare}")), Some(expected));
+        assert_eq!(parse_pubkey_line(&format!("  0x{bare}  ")), Some(expected));
+        assert!(parse_pubkey_line(&format!("0x0x{bare}")).is_none());
+        assert!(parse_pubkey_line("not-hex").is_none());
     }
 }

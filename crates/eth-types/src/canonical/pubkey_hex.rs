@@ -22,12 +22,12 @@ impl PubkeyHex {
 
 /// Parse a BLS public key from a hex string.
 ///
-/// Accepts a bare 96-character hex string or a `0x`-prefixed one.
-/// Rejects a double `0x0x` / `0x0X` prefix, odd-length hex, non-hex
-/// characters, and any decoded byte length other than 48.
+/// Accepts a bare 96-character hex string or a single `0x`/`0X`-prefixed one.
+/// Rejects a doubled prefix (`0x0x` / `0x0X` / `0X0x` / `0X0X`), odd-length
+/// hex, non-hex characters, and any decoded byte length other than 48.
 ///
 /// # Errors
-/// Returns [`ParseError::DoublePrefix`] for a `0x0x…` / `0x0X…` input,
+/// Returns [`ParseError::DoublePrefix`] for a doubled `0x`/`0X` prefix,
 /// [`ParseError::InvalidHex`] for non-hex or odd-length input, and
 /// [`ParseError::InvalidLength`] when the decoded byte count is not 48.
 ///
@@ -36,6 +36,8 @@ impl PubkeyHex {
 /// use rvc_eth_types::canonical::pubkey_hex::parse_pubkey_hex;
 /// let pk = parse_pubkey_hex(&format!("0x{}", "ab".repeat(48))).unwrap();
 /// assert_eq!(pk.as_bytes(), &[0xabu8; 48]);
+/// let pk_upper = parse_pubkey_hex(&format!("0X{}", "ab".repeat(48))).unwrap();
+/// assert_eq!(pk_upper.as_bytes(), &[0xabu8; 48]);
 /// ```
 pub fn parse_pubkey_hex(s: &str) -> Result<PubkeyHex, ParseError> {
     let hex = strip_prefix(s)?;
@@ -48,14 +50,14 @@ pub fn parse_pubkey_hex(s: &str) -> Result<PubkeyHex, ParseError> {
     Ok(PubkeyHex(arr))
 }
 
-/// Strip a single optional lowercase `0x` prefix, rejecting a double `0x0x`
-/// or `0x0X` prefix as [`ParseError::DoublePrefix`].
+/// Strip a single optional `0x` or `0X` prefix, rejecting a doubled prefix
+/// (`0x0x` / `0x0X` / `0X0x` / `0X0X`) as [`ParseError::DoublePrefix`].
 ///
-/// Only a lowercase `0x` outer prefix is recognised. An uppercase `0X` outer
-/// prefix is NOT stripped — it will surface as [`ParseError::InvalidHex`] when
-/// the caller passes the original string to `decode_hex`.
-pub(super) fn strip_prefix(s: &str) -> Result<&str, ParseError> {
-    if let Some(rest) = s.strip_prefix("0x") {
+/// This is the single prefix-strip engine for `eth-types`. Policy matches
+/// `crypto::hex::strip_prefix_strict`: at most one leading `0x`/`0X`, mixed
+/// case accepted, doubled prefixes rejected.
+pub(crate) fn strip_prefix(s: &str) -> Result<&str, ParseError> {
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         if rest.starts_with("0x") || rest.starts_with("0X") {
             return Err(ParseError::DoublePrefix);
         }
@@ -70,7 +72,9 @@ pub(super) fn strip_prefix(s: &str) -> Result<&str, ParseError> {
 /// Maps each `hex::FromHexError` variant to a message that omits the raw
 /// offending character, preventing latent secret-byte leakage into logs if
 /// a secret value were ever misrouted through these parsers.
-pub(super) fn decode_hex(hex: &str) -> Result<Vec<u8>, ParseError> {
+///
+/// This is the single hex-decode engine for `eth-types`.
+pub(crate) fn decode_hex(hex: &str) -> Result<Vec<u8>, ParseError> {
     hex::decode(hex).map_err(|e| {
         let msg = match e {
             hex::FromHexError::OddLength => "odd number of hex digits".to_owned(),
@@ -98,13 +102,28 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_prefix_double_0x0x_rejected() {
+    fn test_strip_prefix_single_uppercase() {
+        assert_eq!(strip_prefix("0Xabcd").unwrap(), "abcd");
+    }
+
+    #[test]
+    fn test_strip_prefix_double_lower_lower_rejected() {
         assert!(matches!(strip_prefix("0x0xabcd"), Err(ParseError::DoublePrefix)));
     }
 
     #[test]
-    fn test_strip_prefix_double_0x0x_upper_rejected() {
+    fn test_strip_prefix_double_lower_upper_rejected() {
         assert!(matches!(strip_prefix("0x0Xabcd"), Err(ParseError::DoublePrefix)));
+    }
+
+    #[test]
+    fn test_strip_prefix_double_upper_lower_rejected() {
+        assert!(matches!(strip_prefix("0X0xabcd"), Err(ParseError::DoublePrefix)));
+    }
+
+    #[test]
+    fn test_strip_prefix_double_upper_upper_rejected() {
+        assert!(matches!(strip_prefix("0X0Xabcd"), Err(ParseError::DoublePrefix)));
     }
 
     #[test]

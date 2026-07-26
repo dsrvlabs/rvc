@@ -76,14 +76,10 @@ impl RefreshService {
                 // Skip entries whose pubkey_hex is already known or denylisted
                 // (avoids unnecessary fetch / resurrection after DELETE).
                 if let Some(ref hex_str) = entry.pubkey_hex {
-                    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
-                    if let Ok(bytes) = hex::decode(hex_str) {
-                        if bytes.len() == 48 {
-                            let mut arr = [0u8; 48];
-                            arr.copy_from_slice(&bytes);
-                            if self.known_pubkeys.contains(&arr) || self.denied(&arr) {
-                                continue;
-                            }
+                    if let Ok(pk) = eth_types::canonical::pubkey_hex::parse_pubkey_hex(hex_str) {
+                        let arr = *pk.as_bytes();
+                        if self.known_pubkeys.contains(&arr) || self.denied(&arr) {
+                            continue;
                         }
                     }
                 }
@@ -253,6 +249,36 @@ mod tests {
 
         let new_keys = service.refresh().await;
         assert_eq!(new_keys.len(), 0);
+    }
+
+    /// RF3-15: early-skip path accepts uppercase `0X` pubkey_hex via canonical.
+    #[tokio::test]
+    async fn test_refresh_skips_known_key_with_uppercase_0x_pubkey_hex() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        let bytes: [u8; 32] = sk.to_bytes();
+        let pubkey_hex = format!("0X{}", hex::encode(pk).to_uppercase());
+        let provider = MockSecretProvider {
+            name: "test-provider".to_string(),
+            keys: vec![(
+                SecretKeyEntry { id: "key-1".to_string(), pubkey_hex: Some(pubkey_hex) },
+                Ok(KeyMaterial::RawKey(Zeroizing::new(bytes))),
+            )],
+            list_error: None,
+        };
+
+        let mut known = HashSet::new();
+        known.insert(pk);
+
+        let cancel = CancellationToken::new();
+        let mut service =
+            RefreshService::new(vec![Arc::new(provider)], known, Duration::from_secs(60), cancel);
+
+        let new_keys = service.refresh().await;
+        assert!(
+            new_keys.is_empty(),
+            "0X-prefixed known pubkey_hex must early-skip without re-fetch"
+        );
     }
 
     #[tokio::test]

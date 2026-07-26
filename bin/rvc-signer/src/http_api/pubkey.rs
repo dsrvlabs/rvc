@@ -41,21 +41,11 @@ pub fn resolve_identifier(
     crypto::PublicKey::from_bytes(&bytes).map_err(|_| PubkeyError::Malformed)
 }
 
-/// Parse a `{identifier}` into 48 raw bytes: strip an optional `0x`/`0X`,
-/// require exactly 96 hex chars, decode (case-insensitive). Returns `None` on
-/// any malformation.
+/// Parse a `{identifier}` into 48 raw bytes via the shared canonical engine
+/// (`0x`/`0X`/bare, mixed-case hex, 48-byte length). Returns `None` on any
+/// malformation. FR-18 case-insensitivity is preserved by `parse_pubkey_hex`.
 fn parse_pubkey_bytes(identifier: &str) -> Option<[u8; 48]> {
-    let stripped = identifier
-        .strip_prefix("0x")
-        .or_else(|| identifier.strip_prefix("0X"))
-        .unwrap_or(identifier);
-    if stripped.len() != 96 {
-        return None;
-    }
-    let mut out = [0u8; 48];
-    // `hex::decode_to_slice` accepts mixed-case hex (FR-18 case-insensitivity).
-    hex::decode_to_slice(stripped, &mut out).ok()?;
-    Some(out)
+    eth_types::canonical::pubkey_hex::parse_pubkey_hex(identifier).map(|pk| *pk.as_bytes()).ok()
 }
 
 #[cfg(test)]
@@ -145,5 +135,20 @@ mod tests {
             resolve_identifier("not-hex", backend.as_ref()).unwrap_err(),
             PubkeyError::Malformed
         );
+    }
+
+    /// RF3-15: double-prefix still malformed after routing through canonical.
+    #[test]
+    fn double_prefix_is_malformed() {
+        let backend = backend_with(vec![]);
+        let hex = "ab".repeat(48);
+        for prefix in ["0x0x", "0x0X", "0X0x", "0X0X"] {
+            let id = format!("{prefix}{hex}");
+            assert_eq!(
+                resolve_identifier(&id, backend.as_ref()).unwrap_err(),
+                PubkeyError::Malformed,
+                "double prefix {prefix} must stay malformed"
+            );
+        }
     }
 }
