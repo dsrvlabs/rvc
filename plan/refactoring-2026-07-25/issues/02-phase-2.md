@@ -32,16 +32,16 @@
     `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run --workspace`,
     `crates/architecture-tests`.
 - **Exit criteria (phase gate):**
-  - [ ] Workspace green on the standing invariant; `cargo build --release` succeeds and the
+  - [x] Workspace green on the standing invariant; `cargo build --release` succeeds and the
         dependency graph is reviewed (`cargo tree` diff: grpc-signer loses the v1 proto module,
         crypto loses `decryption_tracker`).
-  - [ ] Slashing conformance + proptest suites green **on the stage path** (unchanged from the
+  - [x] Slashing conformance + proptest suites green **on the stage path** (unchanged from the
         Phase 1 gate — these suites are the oracle for every slashing deletion here).
-  - [ ] Every deletion PR carries an `rg` zero-caller proof in its description and an explained
+  - [x] Every deletion PR carries an `rg` zero-caller proof in its description and an explained
         test-count delta (ported vs deleted-with-the-dead-code).
-  - [ ] `ARCHITECTURE.md` no longer advertises `SyncService`, `DecryptionAttemptTracker` as a live
+  - [x] `ARCHITECTURE.md` no longer advertises `SyncService`, `DecryptionAttemptTracker` as a live
         loader feature, and records the B5 wire-not-delete decision.
-  - [ ] `rg "proto::signer::signer_service_server"` returns zero hits workspace-wide (verified: the
+  - [x] `rg "proto::signer::signer_service_server"` returns zero hits workspace-wide (verified: the
         v1 trait is imported unaliased at `bin/rvc-signer/src/service.rs:58` and implemented at
         `:460`, while the v2 impl at `:485` uses the `SignerServiceV2` alias from `:65` — so the v1
         surface is greppable without false positives); neither `build.rs` compiles
