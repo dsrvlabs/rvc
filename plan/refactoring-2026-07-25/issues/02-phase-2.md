@@ -750,18 +750,21 @@ real consumers.
 6. **GREEN:** RF2-07's KAT file is untouched and still green — that is the proof no coverage was lost.
 
 **Acceptance criteria:**
-- [ ] `rg "^pub fn sign_" crates/crypto/src` returns exactly one hit: `sign_voluntary_exit`.
-- [ ] `rg "RawSigner"` returns zero hits workspace-wide.
-- [ ] Exactly one `DOMAIN_BEACON_ATTESTER` definition exists workspace-wide, in `eth_types`.
-- [ ] `is_aggregator`, `compute_domain`, `compute_signing_root`, `sign_voluntary_exit`,
+- [x] `rg "^pub fn sign_" crates/crypto/src` returns exactly one hit: `sign_voluntary_exit`.
+- [x] `rg "RawSigner"` returns zero hits workspace-wide.
+- [x] Exactly one `DOMAIN_BEACON_ATTESTER` definition exists workspace-wide, in `eth_types`
+      (`crypto` re-exports it from `eth_types` for call-site compatibility).
+- [x] `is_aggregator`, `compute_domain`, `compute_signing_root`, `sign_voluntary_exit`,
       `capella_capped_fork_version` all still exported; `bin/rvc-keygen` builds unchanged.
-- [ ] `no_direct_composite_signer_outside_signer.rs` is green with its symbol list intact and its
+- [x] `no_direct_composite_signer_outside_signer.rs` is green with its symbol list intact and its
       doc comment updated to describe the tripwire role.
-- [ ] **Test-count delta stated and justified:** expected ≈ −60 to −90, every one of them appearing
-      in RF2-07's classification table as either *ported* (already re-added in RF2-07, so the net
-      across the two PRs is ≈ 0) or *dropped-as-self-consistency*. No test disappears without a row
-      in that table.
-- [ ] Standing invariant green.
+- [x] **Test-count delta stated and justified:** ≈ **−58** crypto unit tests
+      (*dropped-as-self-consistency* / *deleted-with-the-dead-code*; domain/root KATs already
+      re-homed by RF2-07 into `signing_root_kat.rs` 31 tests). Breakdown: signing free-fn −8,
+      block_signing −18, builder_signing −7, sync_signing −14, aggregation free-fn −10,
+      RawSigner blanket −1. `is_aggregator` suite retained. No RF2-07 exceptions.
+- [x] Standing invariant green (fmt; clippy `-D warnings` on `rvc-crypto`; crypto lib +
+      `signing_root_kat` + architecture guard + `rvc-keygen` tests).
 
 **Risks:**
 - Any exception RF2-07 handed over (a KAT that could not be reproduced through `LocalSigner`) keeps

@@ -2,7 +2,7 @@
 //!
 //! [`TypedSigner`] exposes one method per Ethereum consensus duty type.
 //! [`LocalSigner`] implements it by computing the signing root and delegating
-//! to [`RawSigner::sign`].
+//! to [`Signer::sign`].
 
 use async_trait::async_trait;
 
@@ -14,28 +14,10 @@ use eth_types::{
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 
-use crate::bls::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
+use crate::bls::{PublicKey, Signature};
 use crate::signer_trait::{LocalSigner, Signer, SigningError};
 use crate::signing::{compute_domain, compute_signing_root};
 use eth_types::{ForkName, ForkSchedule, SyncAggregatorSelectionData};
-
-// ============================================================
-// RawSigner
-// ============================================================
-
-/// Low-level signing trait: signs a 32-byte root with a known keypair.
-///
-/// [`LocalSigner`] implements this. Web3Signer HTTP (`RemoteSigner`) and
-/// `GrpcRemoteSigner` do **not** — both require typed payloads (SEC-8 /
-/// C-2/C-3) and only implement [`TypedSigner`].
-#[async_trait]
-pub trait RawSigner: Send + Sync {
-    async fn sign(
-        &self,
-        root: &[u8; 32],
-        pubkey: &[u8; PUBLIC_KEY_BYTES_LEN],
-    ) -> Result<Signature, SigningError>;
-}
 
 // ============================================================
 // SignContext
@@ -146,21 +128,6 @@ pub trait TypedSigner: Send + Sync {
         exit: &VoluntaryExit,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError>;
-}
-
-// ============================================================
-// RawSigner blanket impl for LocalSigner (bridges old + new)
-// ============================================================
-
-#[async_trait]
-impl RawSigner for LocalSigner {
-    async fn sign(
-        &self,
-        root: &[u8; 32],
-        pubkey: &[u8; PUBLIC_KEY_BYTES_LEN],
-    ) -> Result<Signature, SigningError> {
-        Signer::sign(self, root, pubkey).await
-    }
 }
 
 // ============================================================
@@ -355,20 +322,6 @@ mod tests {
 
     fn test_ctx(sk: &SecretKey) -> SignContext {
         SignContext { pubkey: sk.public_key(), fork_info: test_fork_info() }
-    }
-
-    // ---- RawSigner blanket ----
-
-    #[tokio::test]
-    async fn test_raw_signer_bridges_to_signer_trait() {
-        let sk = SecretKey::generate();
-        let pk_bytes = sk.public_key().to_bytes();
-        let root = [0x11u8; 32];
-        let signer = make_local_signer(sk);
-
-        let sig_raw = RawSigner::sign(&signer, &root, &pk_bytes).await.unwrap();
-        let sig_trait = Signer::sign(&signer, &root, &pk_bytes).await.unwrap();
-        assert_eq!(sig_raw.to_bytes(), sig_trait.to_bytes());
     }
 
     // ---- TypedSigner::sign_block ----
