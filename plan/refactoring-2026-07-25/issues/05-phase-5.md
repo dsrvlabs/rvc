@@ -1328,13 +1328,13 @@ in a security-critical mTLS path.
    split anyway).
 
 **Acceptance criteria:**
-- [ ] No two modules named `tls`; the gRPC one is `grpc_tls`.
-- [ ] `to_client_tls_config`'s doc comment describes the client config (and a doc test or review note
+- [x] No two modules named `tls`; the gRPC one is `grpc_tls`.
+- [x] `to_client_tls_config`'s doc comment describes the client config (and a doc test or review note
       confirms mTLS client behavior).
-- [ ] Accept-loop hardening (semaphore limit, drain, handshake timeout) is behaviorally unchanged —
+- [x] Accept-loop hardening (semaphore limit, drain, handshake timeout) is behaviorally unchanged —
       assert the configured values.
-- [ ] File-read errors carry the path through one shared representation.
-- [ ] All ~660 lines of existing TLS tests still run (test-count diff explained).
+- [x] File-read errors carry the path through one shared representation.
+- [x] All ~660 lines of existing TLS tests still run (test-count diff explained).
 
 **TDD test plan** (RED first):
 - `test_accept_loop_rejects_beyond_semaphore_limit` — **RED** if not already covered; write it against

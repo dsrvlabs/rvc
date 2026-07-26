@@ -45,8 +45,8 @@ pub async fn run(
     // explicit default so the Phase-3 `ServerConfig::builder()` path stays
     // deterministic and never hits rustls's automatic resolution, which panics
     // if the feature graph ever compiles in more than one provider. Not
-    // load-bearing in today's ring-only build; see http_api::tls for details.
-    http_api::tls::install_crypto_provider();
+    // load-bearing in today's ring-only build; see http_api::tls_config for details.
+    http_api::tls_config::install_crypto_provider();
 
     info!(
         listen_address = %resolved.listen_address,
@@ -63,7 +63,7 @@ pub async fn run(
         resolved.tls_ca_cert.as_ref(),
     ) {
         (Some(cert), Some(key), Some(ca)) => {
-            Some(crate::tls::TlsConfig::new(cert.clone(), key.clone(), ca.clone()))
+            Some(crate::grpc_tls::TlsConfig::new(cert.clone(), key.clone(), ca.clone()))
         }
         _ => None,
     };

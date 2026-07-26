@@ -7,12 +7,12 @@ use tracing::{debug, warn};
 
 use crate::backend::dvt::{PartialSignDuty, PeerRequestError, PeerRequester};
 use crate::dvt::allow_list::AllowedPeers;
+use crate::grpc_tls::TlsConfig;
 use crate::proto::signer_v2::peer_signer_service_client::PeerSignerServiceClient;
 use crate::proto::signer_v2::{
     PartialSignAttestationDataRequest, PartialSignBeaconBlockRequest, PartialSignResponse,
     PartialSignSyncCommitteeRequest,
 };
-use crate::tls::TlsConfig;
 
 #[derive(Error, Debug)]
 pub enum PeerClientError {

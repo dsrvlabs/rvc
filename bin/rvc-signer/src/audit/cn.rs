@@ -198,6 +198,25 @@ pub fn extract_client_cn<T>(request: &tonic::Request<T>) -> String {
     })
 }
 
+/// Derive the audit CN for a request from an optional leaf client-certificate
+/// DER (Issue 3.4, FR-33 CN portion, R9).
+///
+/// Reuses [`extract_cn_from_der`] (first-CN-wins — identical CN semantics to the
+/// gRPC path) and degrades to `default` (`signer::AUDIT_CN_DEFAULT`) when there
+/// is no client cert (Prysm / server-TLS-only) or the leaf carries no parseable
+/// CN.
+///
+/// When no primary client-CN allow-list is configured, the CN remains audit-only
+/// (a missing CN still signs). When `--allowed-client-cns` is set (SEC-4), the
+/// sign handler authorizes this CN against the shared list before any signing
+/// work — including the default fallback CN.
+///
+/// Moved here from the former `http_api::tls` grab-bag (RF5-22) so CN extraction
+/// lives next to the rest of the audit CN helpers.
+pub fn audit_cn(leaf_der: Option<&[u8]>, default: &str) -> String {
+    leaf_der.and_then(extract_cn_from_der).unwrap_or_else(|| default.to_string())
+}
+
 /// Extract the CN from a DER-encoded X.509 certificate using `x509-parser`.
 ///
 /// Iterates the Subject's RDN sequence in order and returns the string value
@@ -268,6 +287,36 @@ mod tests {
 
         let cn = extract_cn_from_der(der);
         assert_eq!(cn, Some("my-validator-client".to_string()));
+    }
+
+    /// A self-signed leaf carrying CN = `cn` (or no CN when `None`), as DER.
+    fn self_signed_with_cn(cn: Option<&str>) -> Vec<u8> {
+        use rcgen::DnType;
+
+        let mut params = rcgen::CertificateParams::new(vec!["host.example".to_string()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        if let Some(cn) = cn {
+            params.distinguished_name.push(DnType::CommonName, cn);
+        }
+        let key = rcgen::KeyPair::generate().unwrap();
+        params.self_signed(&key).unwrap().der().as_ref().to_vec()
+    }
+
+    #[test]
+    fn audit_cn_reads_the_leaf_common_name() {
+        let der = self_signed_with_cn(Some("lighthouse-vc-1"));
+        assert_eq!(audit_cn(Some(&der), "signing-gate"), "lighthouse-vc-1");
+    }
+
+    #[test]
+    fn audit_cn_none_falls_back_to_default() {
+        assert_eq!(audit_cn(None, "signing-gate"), "signing-gate");
+    }
+
+    #[test]
+    fn audit_cn_cert_without_cn_falls_back_to_default() {
+        let der = self_signed_with_cn(None);
+        assert_eq!(audit_cn(Some(&der), "signing-gate"), "signing-gate");
     }
 
     // ── SEC-4: ClientCnAllowList ──────────────────────────────────────────────

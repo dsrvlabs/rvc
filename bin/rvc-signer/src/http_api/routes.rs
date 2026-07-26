@@ -10,13 +10,14 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 
+use super::accept_loop::PeerCert;
 use super::dispatch::plan_sign;
 use super::pubkey::{resolve_identifier, PubkeyError};
 use super::request::{SignPayload, SignRequest};
 use super::response::{sign_response, HttpSignError};
-use super::tls::{audit_cn, PeerCert};
 use super::Web3SignerState;
 use crate::audit;
+use crate::audit::cn::audit_cn;
 use crate::metrics::grpc_sign_type;
 use crate::sign_plan::{dispatch_sign, DispatchError, RequestCtx};
 
@@ -134,7 +135,7 @@ async fn sign_traced(
     // SEC-4: when `client_cn_allow_list` is configured, the CN *is* an
     // authorization gate (same list as gRPC). When unset, missing/default CN
     // still signs (backward compatible).
-    let cn = audit_cn(peer.as_ref().map(|Extension(p)| p), &state.audit.default_cn);
+    let cn = audit_cn(peer.as_ref().and_then(|Extension(p)| p.leaf_der()), &state.audit.default_cn);
 
     // Audit posture (Issue 4.4): emit exactly one structured entry per request —
     // success at `info`, every rejection at `warn` — carrying only metadata
@@ -355,11 +356,11 @@ mod tests {
     use axum::response::Response;
     use tower::ServiceExt; // oneshot
 
+    use crate::http_api::accept_loop::PeerCert;
     use crate::http_api::router;
     use crate::http_api::test_support::{
         test_keypair, test_state, MockBackend, RealSigningBackend,
     };
-    use crate::http_api::tls::PeerCert;
 
     use crypto::{compute_domain, compute_signing_root};
     // Import BeaconBlockHeader EXPLICITLY from eth_types: an unrelated all-String

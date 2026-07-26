@@ -15,6 +15,7 @@ mod cross_transport;
 pub mod dvt;
 pub mod error;
 pub(crate) mod grpc_common;
+pub mod grpc_tls;
 pub mod http_api;
 pub mod insecure_startup;
 pub mod metrics;
@@ -24,7 +25,8 @@ pub mod service;
 /// Transport-neutral SignPlan engine (RF4-09 / D4).
 pub(crate) mod sign_plan;
 pub mod slashing;
-pub mod tls;
+/// Shared TLS PEM file I/O with path-preserving errors (used by gRPC and HTTP).
+pub(crate) mod tls_io;
 
 pub use error::ServerError;
 

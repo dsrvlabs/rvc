@@ -15,13 +15,13 @@ use crate::metrics::SignerMetrics;
 use crate::service::SignerServiceImpl;
 #[cfg(feature = "dvt")]
 use crate::{dvt, PeerSignerServiceServerV2};
-use crate::{insecure_startup, tls, SignerServiceServerV2};
+use crate::{grpc_tls, insecure_startup, SignerServiceServerV2};
 
 /// Per-service max decoding message size (M-10). Signing a BeaconBlock is well
 /// under 1 MiB after SSZ encoding; 1 MiB is a comfortable upper bound.
 pub(crate) const MAX_DECODE_BYTES: usize = 1 << 20; // 1 MiB
 
-/// Tower concurrency limit applied by [`tls::server_builder::hardened_server_builder`].
+/// Tower concurrency limit applied by [`grpc_tls::server_builder::hardened_server_builder`].
 /// Kept here so unit tests can assert the composition root still pins this value.
 pub(crate) const CONCURRENCY_LIMIT_PER_CONNECTION: usize = 32;
 
@@ -38,7 +38,7 @@ pub(crate) const REQUEST_TIMEOUT_SECS: u64 = 10;
 /// receives the same `Arc` through [`super::http::spawn_http_api`].
 pub(crate) struct GrpcRouterDeps<'a> {
     pub resolved: &'a ResolvedConfig,
-    pub tls_config: Option<&'a crate::tls::TlsConfig>,
+    pub tls_config: Option<&'a crate::grpc_tls::TlsConfig>,
     pub signing_backend: Arc<dyn crate::backend::SigningBackend>,
     pub shared_gate: Option<Arc<signer::SigningGate>>,
     pub client_cn_allow_list: Option<Arc<crate::audit::ClientCnAllowList>>,
@@ -129,15 +129,15 @@ pub(crate) fn build_grpc_router(deps: GrpcRouterDeps<'_>) -> Result<BuiltGrpcRou
     // Per-service max_decoding_message_size(1 MiB) is set on each ServiceServer
     // below (Tonic exposes it only at the service level, not the builder level).
     //
-    // The constants above must stay in lockstep with `tls::server_builder`.
+    // The constants above must stay in lockstep with `grpc_tls::server_builder`.
     debug_assert_eq!(
         CONCURRENCY_LIMIT_PER_CONNECTION, 32,
-        "keep in sync with tls::server_builder::hardened_server_builder"
+        "keep in sync with grpc_tls::server_builder::hardened_server_builder"
     );
     debug_assert_eq!(MAX_CONCURRENT_STREAMS, 64);
     debug_assert_eq!(REQUEST_TIMEOUT_SECS, 10);
 
-    let mut builder = tls::server_builder::hardened_server_builder();
+    let mut builder = grpc_tls::server_builder::hardened_server_builder();
 
     if let Some(tls_cfg) = deps.tls_config {
         let server_tls =

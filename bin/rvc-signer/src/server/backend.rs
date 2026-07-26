@@ -76,7 +76,7 @@ pub(crate) async fn build_backend(
     resolved: &ResolvedConfig,
     metrics: &SignerMetrics,
     password: &Zeroizing<String>,
-    tls_config: Option<&crate::tls::TlsConfig>,
+    tls_config: Option<&crate::grpc_tls::TlsConfig>,
 ) -> Result<BuiltBackend, ServerError> {
     // The allow-list is loaded ONCE here (DVT arm only) and shared between the
     // client-side SNI derivation (build_dvt_backend) and the server-side
@@ -151,7 +151,7 @@ pub(crate) async fn build_backend(
 pub(crate) async fn build_dvt_backend(
     resolved: &ResolvedConfig,
     password: &Zeroizing<String>,
-    tls_config: Option<&crate::tls::TlsConfig>,
+    tls_config: Option<&crate::grpc_tls::TlsConfig>,
     dvt_metrics: Arc<crate::metrics::DvtMetrics>,
     allow_list: Option<Arc<crate::dvt::allow_list::AllowedPeers>>,
 ) -> Result<(Arc<dyn crate::backend::SigningBackend>, ShareMap), ServerError> {

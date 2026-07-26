@@ -44,7 +44,7 @@ use rvc_signer_bin::dvt::peer_client::{
 };
 use rvc_signer_bin::dvt::peer_service::PeerSignerServiceImpl;
 use rvc_signer_bin::dvt::types::ShareInfo;
-use rvc_signer_bin::tls::TlsConfig;
+use rvc_signer_bin::grpc_tls::TlsConfig;
 use rvc_signer_bin::PeerSignerServiceServerV2;
 
 // ─────────────────────────────────────────────────────────────────────────────

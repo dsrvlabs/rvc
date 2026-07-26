@@ -1,4 +1,9 @@
-//! rustls crypto-provider install for the HTTP signing transport.
+//! HTTP TLS configuration: crypto-provider install, PEM→DER loading, and rustls `ServerConfig` build.
+//!
+//! Split from the former grab-bag `http_api::tls` (RF5-22 / F34). Accept-loop
+//! concerns live in [`super::accept_loop`]; audit CN derivation lives in
+//! [`crate::audit::cn::audit_cn`]. Shared path-preserving file I/O is
+//! [`crate::tls_io`].
 //!
 //! rustls 0.23 resolves a process-global default
 //! [`CryptoProvider`](rustls::crypto::CryptoProvider) when
@@ -50,69 +55,16 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
-use axum::Router;
-use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::Request;
-use hyper_util::rt::{TokioIo, TokioTimer};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
 use tokio_rustls::rustls::{
     self,
     pki_types::{CertificateDer, PrivateKeyDer},
     server::{VerifierBuilderError, WebPkiClientVerifier},
     RootCertStore, ServerConfig,
 };
-use tokio_rustls::TlsAcceptor;
-use tokio_util::sync::CancellationToken;
-use tower::ServiceExt;
 
 use crate::config::HttpTlsMode;
-
-/// The leaf client certificate from the TLS handshake, injected as a request
-/// extension so the audit layer (Issue 3.4) can derive the client CN. `None` on
-/// a server-TLS-only / no-cert connection (→ `AUDIT_CN_DEFAULT`).
-#[derive(Clone, Debug)]
-pub struct PeerCert(pub Option<CertificateDer<'static>>);
-
-/// Derive the audit CN for a request from its [`PeerCert`] (Issue 3.4, FR-33 CN
-/// portion, R9).
-///
-/// Reuses `audit::cn::extract_cn_from_der` verbatim (first-CN-wins — identical
-/// CN semantics to the gRPC path) and degrades to `default`
-/// (`signer::AUDIT_CN_DEFAULT`) when there is no client cert (Prysm /
-/// server-TLS-only) or the leaf carries no parseable CN.
-///
-/// When no primary client-CN allow-list is configured, the CN remains
-/// audit-only (a missing CN still signs). When `--allowed-client-cns` is set
-/// (SEC-4), the sign handler authorizes this CN against the shared list before
-/// any signing work — including the default fallback CN.
-pub(crate) fn audit_cn(peer: Option<&PeerCert>, default: &str) -> String {
-    peer.and_then(|p| p.0.as_ref())
-        .and_then(|der| crate::audit::cn::extract_cn_from_der(der.as_ref()))
-        .unwrap_or_else(|| default.to_string())
-}
-
-/// Per-connection handshake timeout: a stalled client cannot hold a task open.
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Slow-header (slowloris) bound on each accepted connection (SEC-2.11-01, the
-/// Phase-2 request-hardening carry-forward).
-const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
-/// Max concurrently-served connections. Bounds per-connection-task fan-out so a
-/// connection flood cannot exhaust memory/fds (3.3 review). Sensible default;
-/// promoting it to a `[signer.http]` knob is a follow-up.
-const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
-/// Backoff after an `accept()` error. EMFILE/ENFILE (fd exhaustion) leaves the
-/// listener readable, so a bare `continue` busy-spins at 100% CPU; this yields
-/// the task and bounds the spin (3.3 review).
-const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
-/// Upper bound on draining in-flight connections at shutdown, so SIGTERM cannot
-/// hang on an idle keep-alive client.
-const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::tls_io::{read_tls_file, TlsFileError};
 
 /// Errors building the HTTP listener's rustls `ServerConfig` (Issue 3.1).
 ///
@@ -135,9 +87,10 @@ pub enum HttpTlsError {
     /// The server cert chain / private key was rejected (e.g. cert/key mismatch).
     #[error("invalid server certificate or key: {0}")]
     ServerCert(rustls::Error),
-    /// A cert/key/CA file could not be read (missing, unreadable). Names the path.
-    #[error("cannot read TLS file {0}: {1}")]
-    Read(PathBuf, std::io::Error),
+    /// A cert/key/CA file could not be read (missing, unreadable). Names the path
+    /// via the shared [`TlsFileError`] representation.
+    #[error(transparent)]
+    Read(#[from] TlsFileError),
     /// A PEM file failed to decode. Names the path.
     #[error("malformed PEM in {0}: {1}")]
     Pem(PathBuf, std::io::Error),
@@ -233,7 +186,7 @@ pub fn load_server_config(
 
 /// Read all PEM certificates from `path` (a server chain or a CA bundle).
 fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, HttpTlsError> {
-    let pem = std::fs::read(path).map_err(|e| HttpTlsError::Read(path.to_path_buf(), e))?;
+    let pem = read_tls_file(path)?;
     let certs = rustls_pemfile::certs(&mut pem.as_slice())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| HttpTlsError::Pem(path.to_path_buf(), e))?;
@@ -247,169 +200,10 @@ fn read_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, HttpTlsError>
 /// and SEC1 (EC) encodings (rustls-pemfile dispatches by tag). An encrypted key
 /// carries an unsupported tag and yields [`HttpTlsError::NoPrivateKey`].
 fn read_key(path: &Path) -> Result<PrivateKeyDer<'static>, HttpTlsError> {
-    let pem = std::fs::read(path).map_err(|e| HttpTlsError::Read(path.to_path_buf(), e))?;
+    let pem = read_tls_file(path)?;
     rustls_pemfile::private_key(&mut pem.as_slice())
         .map_err(|e| HttpTlsError::Pem(path.to_path_buf(), e))?
         .ok_or_else(|| HttpTlsError::NoPrivateKey(path.to_path_buf()))
-}
-
-/// Serve the Web3Signer HTTP API over TLS on `listener` (ADR-005, R7).
-///
-/// Per accepted connection: complete the rustls handshake (bounded by
-/// [`HANDSHAKE_TIMEOUT`]), extract the leaf client cert into a [`PeerCert`]
-/// request extension, and serve the **opaque** `router` over HTTP/1.1 via hyper
-/// `serve_connection` (no upgrades — research R6). Each connection runs in its
-/// own task, so one bad client (handshake failure or a panicking handler) never
-/// wedges the accept loop or the process. A `header_read_timeout` bounds
-/// slow-header (slowloris) connections.
-///
-/// Hardening (3.3 review):
-/// - a [`Semaphore`] caps concurrency at [`MAX_CONCURRENT_CONNECTIONS`] —
-///   acquired before each accept, so a flood applies backpressure rather than
-///   spawning unbounded tasks;
-/// - an `accept()` error backs off [`ACCEPT_ERROR_BACKOFF`] so EMFILE/ENFILE
-///   cannot busy-spin the loop;
-/// - on `shutdown`, the loop stops accepting and drains in-flight connections
-///   (bounded by [`DRAIN_TIMEOUT`]) so an in-progress `/sign` completes.
-///
-/// `router` is taken as an opaque [`axum::Router`]; this module stays ignorant
-/// of `/sign` and the gate (extraction-readiness). Unlike `serve_metrics` (which
-/// handles connections serially, inline), this fans connections out across tasks.
-pub async fn serve_https(
-    listener: TcpListener,
-    tls: Arc<ServerConfig>,
-    router: Router,
-    shutdown: CancellationToken,
-) {
-    serve_https_inner(listener, tls, router, shutdown, MAX_CONCURRENT_CONNECTIONS, DRAIN_TIMEOUT)
-        .await
-}
-
-/// [`serve_https`] with the connection cap and drain timeout injected, so tests
-/// can saturate the cap and assert prompt shutdown.
-async fn serve_https_inner(
-    listener: TcpListener,
-    tls: Arc<ServerConfig>,
-    router: Router,
-    shutdown: CancellationToken,
-    max_connections: usize,
-    drain_timeout: Duration,
-) {
-    let acceptor = TlsAcceptor::from(tls);
-    let limit = Arc::new(Semaphore::new(max_connections));
-    let mut conns: JoinSet<()> = JoinSet::new();
-
-    loop {
-        // Backpressure: do not accept a new connection until a serving slot is
-        // free. The acquire is RACED against `shutdown` — when the cap is
-        // saturated the loop must still observe cancellation promptly rather than
-        // park on the permit until an in-flight connection frees one (3.5 review).
-        // `acquire_owned`'s future is cancel-safe (dropping it just deregisters
-        // the waiter), so losing the race leaks no permit.
-        let permit = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => break,
-            permit = Arc::clone(&limit).acquire_owned() => match permit {
-                Ok(permit) => permit,
-                Err(_) => break,
-            },
-        };
-
-        let (tcp, _peer) = tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => break,
-            res = listener.accept() => match res {
-                Ok(conn) => conn,
-                Err(e) => {
-                    tracing::warn!(error = %e, "HTTP listener: accept failed");
-                    drop(permit);
-                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
-                    continue;
-                }
-            },
-        };
-
-        let acceptor = acceptor.clone();
-        let router = router.clone();
-        conns.spawn(async move {
-            serve_one(acceptor, tcp, router).await;
-            drop(permit); // release the serving slot when the connection ends
-        });
-
-        // Reap finished connection tasks so the JoinSet does not grow unbounded.
-        while conns.try_join_next().is_some() {}
-    }
-
-    // Graceful shutdown: stop accepting (listener dropped) and drain in-flight
-    // connections, bounded so an idle keep-alive client cannot hang exit.
-    drop(listener);
-    let _ =
-        tokio::time::timeout(drain_timeout, async { while conns.join_next().await.is_some() {} })
-            .await;
-}
-
-/// Build the HTTP listener's TLS config + router from already-loaded paths and
-/// the shared application state, bind `listen_address`, and spawn
-/// [`serve_https`] (Issue 3.5). Returns the bound address + the listener task.
-///
-/// `run_serve` calls this when `[signer.http].enabled`; the `state` carries the
-/// SAME `Arc<SigningGate>` injected into the gRPC service (FR-26).
-#[allow(clippy::too_many_arguments)]
-pub async fn spawn_https_listener(
-    listen_address: &str,
-    tls_cert: &Path,
-    tls_key: &Path,
-    tls_ca_cert: &Path,
-    tls_mode: HttpTlsMode,
-    state: super::Web3SignerState,
-    shutdown: CancellationToken,
-) -> Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>), Box<dyn std::error::Error>> {
-    let tls = load_server_config(tls_cert, tls_key, tls_ca_cert, tls_mode)?;
-    let router = super::router(state);
-    let listener = TcpListener::bind(listen_address).await?;
-    let addr = listener.local_addr()?;
-    let handle = tokio::spawn(serve_https(listener, tls, router, shutdown));
-    Ok((addr, handle))
-}
-
-/// Handshake one connection, inject [`PeerCert`], and serve `router` over it.
-async fn serve_one(acceptor: TlsAcceptor, tcp: TcpStream, router: Router) {
-    let tls_stream = match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            // Handshake failure (e.g. an mTLS client with no/invalid cert) drops
-            // this connection only; the accept loop keeps serving others.
-            tracing::debug!(error = %e, "TLS handshake failed");
-            return;
-        }
-        Err(_) => {
-            tracing::debug!("TLS handshake timed out");
-            return;
-        }
-    };
-
-    // Leaf client cert (owned so it outlives the borrow); `None` in
-    // server-TLS-only / no-cert connections.
-    let leaf = tls_stream
-        .get_ref()
-        .1
-        .peer_certificates()
-        .and_then(|chain| chain.first())
-        .map(|cert| cert.clone().into_owned());
-    let peer = PeerCert(leaf);
-
-    // Inject the per-connection PeerCert into every request, then serve the
-    // opaque Router (tower) via hyper. `oneshot` drives poll_ready + call.
-    let service = service_fn(move |mut req: Request<Incoming>| {
-        req.extensions_mut().insert(peer.clone());
-        router.clone().oneshot(req)
-    });
-
-    let mut builder = http1::Builder::new();
-    builder.timer(TokioTimer::new()).header_read_timeout(HEADER_READ_TIMEOUT);
-    if let Err(e) = builder.serve_connection(TokioIo::new(tls_stream), service).await {
-        tracing::debug!(error = %e, "HTTP connection closed with error");
-    }
 }
 
 /// Install the `ring` rustls provider as the process-global default.
@@ -732,291 +526,6 @@ mod tests {
         assert!(
             matches!(err, HttpTlsError::ServerCert(_)),
             "cert/key mismatch must be rejected at build time, got {err:?}"
-        );
-    }
-
-    // ── serve_https accept loop (Issue 3.3) ──────────────────────────────────
-
-    use axum::routing::get;
-    use axum::Extension;
-
-    async fn peer_handler(Extension(PeerCert(leaf)): Extension<PeerCert>) -> &'static str {
-        if leaf.is_some() {
-            "some"
-        } else {
-            "none"
-        }
-    }
-
-    async fn panic_handler() -> &'static str {
-        panic!("intentional handler panic")
-    }
-
-    /// Reflects the audit CN derived from the connection's `PeerCert` (Issue 3.4).
-    async fn cn_handler(Extension(peer): Extension<PeerCert>) -> String {
-        audit_cn(Some(&peer), signer::AUDIT_CN_DEFAULT)
-    }
-
-    /// An OPAQUE test router (no gate/state) with a route that reflects the
-    /// injected `PeerCert`, the derived audit CN, a panicking route, and a
-    /// liveness route.
-    fn serve_test_router() -> Router {
-        Router::new()
-            .route("/peer", get(peer_handler))
-            .route("/cn", get(cn_handler))
-            .route("/ok", get(|| async { "ok" }))
-            .route("/panic", get(panic_handler))
-    }
-
-    /// Spawn `serve_https` on an ephemeral loopback port; return its address.
-    async fn start_server(mode: HttpTlsMode, pki: &Pki) -> std::net::SocketAddr {
-        install_crypto_provider();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve_https(
-            listener,
-            server_cfg(pki, mode),
-            serve_test_router(),
-            CancellationToken::new(),
-        ));
-        addr
-    }
-
-    /// One real HTTPS GET over a fresh TLS connection (raw hyper client), using
-    /// `client` (with or without a client identity). `Err` if the TLS handshake
-    /// or the request fails.
-    async fn https_get(
-        addr: std::net::SocketAddr,
-        client: Arc<ClientConfig>,
-        path: &str,
-    ) -> Result<(axum::http::StatusCode, String), String> {
-        let tcp = TcpStream::connect(addr).await.map_err(|e| e.to_string())?;
-        let connector = TlsConnector::from(client);
-        let name = ServerName::try_from("localhost").unwrap();
-        let tls = connector.connect(name, tcp).await.map_err(|e| e.to_string())?;
-
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
-            .await
-            .map_err(|e| e.to_string())?;
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-
-        let req = Request::builder()
-            .uri(path)
-            .header("host", "localhost")
-            .body(axum::body::Body::empty())
-            .unwrap();
-        let resp = sender.send_request(req).await.map_err(|e| e.to_string())?;
-        let status = resp.status();
-        let bytes = axum::body::to_bytes(axum::body::Body::new(resp.into_body()), usize::MAX)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok((status, String::from_utf8(bytes.to_vec()).unwrap()))
-    }
-
-    #[tokio::test]
-    async fn mtls_client_cert_is_injected_as_peer_cert_some() {
-        let pki = test_pki();
-        let addr = start_server(HttpTlsMode::Mtls, &pki).await;
-        let client = client_cfg(&pki, Some((&pki.client_chain, &pki.client_key)));
-        let (status, body) = https_get(addr, client, "/peer").await.expect("mTLS request succeeds");
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert_eq!(body, "some", "the leaf client cert must reach the handler as PeerCert(Some)");
-    }
-
-    #[tokio::test]
-    async fn server_tls_only_no_cert_is_peer_cert_none() {
-        let pki = test_pki();
-        let addr = start_server(HttpTlsMode::ServerTlsOnly, &pki).await;
-        let client = client_cfg(&pki, None);
-        let (status, body) = https_get(addr, client, "/peer").await.expect("no-cert request ok");
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert_eq!(body, "none", "a no-cert connection must yield PeerCert(None)");
-    }
-
-    #[tokio::test]
-    async fn handshake_failure_does_not_wedge_the_loop() {
-        let pki = test_pki();
-        let addr = start_server(HttpTlsMode::Mtls, &pki).await;
-        // A no-cert client against mTLS fails the handshake — its connection dies.
-        let bad = https_get(addr, client_cfg(&pki, None), "/ok").await;
-        assert!(bad.is_err(), "no-cert client must be rejected at handshake");
-        // The loop must still serve a subsequent good client.
-        let good = client_cfg(&pki, Some((&pki.client_chain, &pki.client_key)));
-        let (status, body) = https_get(addr, good, "/ok").await.expect("loop still serves");
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert_eq!(body, "ok");
-    }
-
-    #[tokio::test]
-    async fn handler_panic_does_not_take_down_the_listener() {
-        let pki = test_pki();
-        let addr = start_server(HttpTlsMode::ServerTlsOnly, &pki).await;
-        // Trigger a handler panic on one connection (the request errors as the
-        // connection task aborts) — the spawned-task panic is isolated by tokio.
-        let _ = https_get(addr, client_cfg(&pki, None), "/panic").await;
-        // A new connection must still be served.
-        let (status, body) =
-            https_get(addr, client_cfg(&pki, None), "/ok").await.expect("listener survived");
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert_eq!(body, "ok");
-    }
-
-    // ── audit CN derivation (Issue 3.4) ──────────────────────────────────────
-
-    /// A self-signed leaf carrying CN = `cn` (or no CN when `None`), as DER.
-    fn self_signed_with_cn(cn: Option<&str>) -> CertificateDer<'static> {
-        let mut params = CertificateParams::new(vec!["host.example".to_string()]).unwrap();
-        params.distinguished_name = rcgen::DistinguishedName::new();
-        if let Some(cn) = cn {
-            params.distinguished_name.push(rcgen::DnType::CommonName, cn);
-        }
-        let key = KeyPair::generate().unwrap();
-        params.self_signed(&key).unwrap().der().clone()
-    }
-
-    #[test]
-    fn audit_cn_reads_the_leaf_common_name() {
-        let peer = PeerCert(Some(self_signed_with_cn(Some("lighthouse-vc-1"))));
-        assert_eq!(audit_cn(Some(&peer), "signing-gate"), "lighthouse-vc-1");
-    }
-
-    #[test]
-    fn audit_cn_none_falls_back_to_default() {
-        assert_eq!(audit_cn(Some(&PeerCert(None)), "signing-gate"), "signing-gate");
-        assert_eq!(audit_cn(None, "signing-gate"), "signing-gate");
-    }
-
-    #[test]
-    fn audit_cn_cert_without_cn_falls_back_to_default() {
-        let peer = PeerCert(Some(self_signed_with_cn(None)));
-        assert_eq!(audit_cn(Some(&peer), "signing-gate"), "signing-gate");
-    }
-
-    #[tokio::test]
-    async fn server_tls_only_cert_bearing_client_yields_its_real_cn() {
-        // AC: a client that DOES present a cert on a server-TLS-only listener
-        // still has its CN extracted (allow_unauthenticated relaxes "required",
-        // not the cert's CA-validation or its CN).
-        let pki = test_pki();
-        let addr = start_server(HttpTlsMode::ServerTlsOnly, &pki).await;
-        let client = client_cfg(&pki, Some((&pki.client_chain, &pki.client_key)));
-        let (status, body) = https_get(addr, client, "/cn").await.expect("request ok");
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert_eq!(body, "client", "the leaf CN must reach the audit layer");
-    }
-
-    #[tokio::test]
-    async fn server_tls_only_no_cert_yields_default_cn() {
-        let pki = test_pki();
-        let addr = start_server(HttpTlsMode::ServerTlsOnly, &pki).await;
-        let (status, body) =
-            https_get(addr, client_cfg(&pki, None), "/cn").await.expect("no-cert request ok");
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert_eq!(body, signer::AUDIT_CN_DEFAULT, "no client cert → default audit CN");
-    }
-
-    // ── run_serve wiring: spawn_https_listener + graceful shutdown (Issue 3.5) ─
-
-    /// A client config trusting `ca_pem` (to validate the server cert), no client cert.
-    fn client_trusting(ca_pem: &[u8]) -> Arc<ClientConfig> {
-        let ca = rustls_pemfile::certs(&mut &ca_pem[..]).next().unwrap().unwrap();
-        let mut roots = RootCertStore::empty();
-        roots.add(ca).unwrap();
-        Arc::new(ClientConfig::builder().with_root_certificates(roots).with_no_client_auth())
-    }
-
-    #[tokio::test]
-    async fn spawn_https_listener_serves_upcheck_over_tls() {
-        install_crypto_provider();
-        let dir = TempDir::new().unwrap();
-        let (cert, key, ca) = server_pems();
-        let cert_p = write_pem(&dir, "c.pem", &cert);
-        let key_p = write_pem(&dir, "k.pem", &key);
-        let ca_p = write_pem(&dir, "ca.pem", &ca);
-
-        // The state carries a real shared SigningGate — the exact wiring
-        // `run_serve` performs (the gate is cloned from the gRPC service's gate).
-        let state = crate::http_api::test_support::test_state(Arc::new(
-            crate::http_api::test_support::MockBackend::empty(),
-        ));
-        let (addr, _handle) = spawn_https_listener(
-            "127.0.0.1:0",
-            &cert_p,
-            &key_p,
-            &ca_p,
-            HttpTlsMode::ServerTlsOnly,
-            state,
-            CancellationToken::new(),
-        )
-        .await
-        .expect("HTTP listener spawns");
-
-        let (status, body) =
-            https_get(addr, client_trusting(&ca), "/upcheck").await.expect("upcheck over TLS");
-        assert_eq!(status, axum::http::StatusCode::OK);
-        assert_eq!(body, "OK", "the full 3.1–3.4 path serves /upcheck over TLS");
-    }
-
-    #[tokio::test]
-    async fn serve_https_exits_promptly_on_shutdown() {
-        install_crypto_provider();
-        let pki = test_pki();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let token = CancellationToken::new();
-        let handle = tokio::spawn(serve_https(
-            listener,
-            server_cfg(&pki, HttpTlsMode::ServerTlsOnly),
-            serve_test_router(),
-            token.clone(),
-        ));
-        token.cancel();
-        // The loop must break on cancellation and the drain must complete.
-        let exited = tokio::time::timeout(Duration::from_secs(5), handle).await;
-        assert!(exited.is_ok(), "serve_https must exit promptly after cancellation");
-    }
-
-    /// The carry-forward #3 proof (3.5 review): shutdown must be prompt even when
-    /// the connection cap is SATURATED. Pre-fix, the loop parked on the permit
-    /// acquire (outside the select) and ignored cancellation until an in-flight
-    /// connection freed a permit (~HEADER_READ_TIMEOUT). This holds the only
-    /// permit and asserts exit well under that stall.
-    #[tokio::test]
-    async fn shutdown_is_prompt_even_when_connection_cap_is_saturated() {
-        install_crypto_provider();
-        let pki = test_pki();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let token = CancellationToken::new();
-        // cap = 1 so a single held connection saturates the loop's permit;
-        // a short drain timeout keeps the test fast.
-        let handle = tokio::spawn(serve_https_inner(
-            listener,
-            server_cfg(&pki, HttpTlsMode::ServerTlsOnly),
-            serve_test_router(),
-            token.clone(),
-            1,
-            Duration::from_millis(200),
-        ));
-
-        // Finish the TLS handshake but send NO request: this connection's
-        // serve_one task holds the only permit (parked in header-read), so the
-        // accept loop is parked acquiring the next permit.
-        let tcp = TcpStream::connect(addr).await.unwrap();
-        let connector = TlsConnector::from(client_cfg(&pki, None));
-        let _held =
-            connector.connect(ServerName::try_from("localhost").unwrap(), tcp).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        token.cancel();
-        // With the acquire raced against shutdown the loop breaks promptly and
-        // the bounded drain finishes — far under HEADER_READ_TIMEOUT (30s), the
-        // pre-fix stall point.
-        let exited = tokio::time::timeout(Duration::from_secs(2), handle).await;
-        assert!(
-            exited.is_ok(),
-            "shutdown must be prompt even when the connection cap is saturated"
         );
     }
 

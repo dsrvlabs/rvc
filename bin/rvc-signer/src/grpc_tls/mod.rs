@@ -1,9 +1,11 @@
 pub mod server_builder;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use tonic::transport::server::ServerTlsConfig;
 use tonic::transport::{Certificate, ClientTlsConfig, Identity};
+
+use crate::tls_io::read_tls_file;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
@@ -32,21 +34,31 @@ impl TlsConfig {
         Self { cert_path, key_path, ca_cert_path }
     }
 
-    /// Build a tonic `ServerTlsConfig` with mTLS enabled.
+    /// Build a tonic [`ClientTlsConfig`] for mTLS peer connections.
     ///
-    /// Client certificates are required (not optional). Connections
-    /// without a valid client certificate signed by the CA are rejected.
-    /// Build a tonic `ClientTlsConfig` for mTLS peer connections.
+    /// The client presents this node's cert/key as its identity and verifies
+    /// the peer's certificate against the shared CA (server-cert validation is
+    /// required — there is no insecure-skip-verify path).
     ///
-    /// Uses the same cert/key/CA as the server: the client presents its
-    /// identity and verifies the peer's certificate against the shared CA.
+    /// ```rust,no_run
+    /// # use std::path::PathBuf;
+    /// # use rvc_signer_bin::grpc_tls::TlsConfig;
+    /// let tls = TlsConfig::new(
+    ///     PathBuf::from("client.pem"),
+    ///     PathBuf::from("client.key"),
+    ///     PathBuf::from("ca.pem"),
+    /// );
+    /// let client_cfg = tls.to_client_tls_config().expect("readable PEM paths");
+    /// // client_cfg is applied to tonic Channel endpoints for peer dials.
+    /// let _ = client_cfg;
+    /// ```
     pub fn to_client_tls_config(&self) -> Result<ClientTlsConfig, TlsError> {
-        let cert = read_file(&self.cert_path)
-            .map_err(|source| TlsError::ReadCert { path: self.cert_path.clone(), source })?;
-        let key = read_file(&self.key_path)
-            .map_err(|source| TlsError::ReadKey { path: self.key_path.clone(), source })?;
-        let ca_cert = read_file(&self.ca_cert_path)
-            .map_err(|source| TlsError::ReadCaCert { path: self.ca_cert_path.clone(), source })?;
+        let cert = read_tls_file(&self.cert_path)
+            .map_err(|e| TlsError::ReadCert { path: e.path, source: e.source })?;
+        let key = read_tls_file(&self.key_path)
+            .map_err(|e| TlsError::ReadKey { path: e.path, source: e.source })?;
+        let ca_cert = read_tls_file(&self.ca_cert_path)
+            .map_err(|e| TlsError::ReadCaCert { path: e.path, source: e.source })?;
 
         Ok(ClientTlsConfig::new()
             .identity(Identity::from_pem(&cert, &key))
@@ -58,21 +70,17 @@ impl TlsConfig {
     /// Client certificates are required (not optional). Connections
     /// without a valid client certificate signed by the CA are rejected.
     pub fn to_server_tls_config(&self) -> Result<ServerTlsConfig, TlsError> {
-        let cert = read_file(&self.cert_path)
-            .map_err(|source| TlsError::ReadCert { path: self.cert_path.clone(), source })?;
-        let key = read_file(&self.key_path)
-            .map_err(|source| TlsError::ReadKey { path: self.key_path.clone(), source })?;
-        let ca_cert = read_file(&self.ca_cert_path)
-            .map_err(|source| TlsError::ReadCaCert { path: self.ca_cert_path.clone(), source })?;
+        let cert = read_tls_file(&self.cert_path)
+            .map_err(|e| TlsError::ReadCert { path: e.path, source: e.source })?;
+        let key = read_tls_file(&self.key_path)
+            .map_err(|e| TlsError::ReadKey { path: e.path, source: e.source })?;
+        let ca_cert = read_tls_file(&self.ca_cert_path)
+            .map_err(|e| TlsError::ReadCaCert { path: e.path, source: e.source })?;
 
         Ok(ServerTlsConfig::new()
             .identity(Identity::from_pem(&cert, &key))
             .client_ca_root(Certificate::from_pem(&ca_cert)))
     }
-}
-
-fn read_file(path: &Path) -> Result<Vec<u8>, std::io::Error> {
-    std::fs::read(path)
 }
 
 #[cfg(test)]
@@ -194,5 +202,33 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("/tmp/cert.pem"));
         assert!(msg.contains("file not found"));
+    }
+
+    /// Pins client mTLS behavior: the client config requires a CA so the peer's
+    /// server certificate is validated (the former copy-pasted server doc comment
+    /// mis-described this builder).
+    #[test]
+    fn test_client_tls_config_requires_server_cert_validation() {
+        let certs = generate_test_certs();
+        let tls = TlsConfig::new(certs.cert_path, certs.key_path, certs.ca_cert_path);
+        assert!(
+            tls.to_client_tls_config().is_ok(),
+            "client config must build with cert/key/CA (CA enables server-cert validation)"
+        );
+
+        let certs = generate_test_certs();
+        let tls =
+            TlsConfig::new(certs.cert_path, certs.key_path, PathBuf::from("/nonexistent/ca.pem"));
+        let err = tls.to_client_tls_config().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("CA certificate"), "error: {msg}");
+        assert!(msg.contains("/nonexistent/ca.pem"), "error: {msg}");
+    }
+
+    #[test]
+    fn test_to_client_tls_config_success() {
+        let certs = generate_test_certs();
+        let tls = TlsConfig::new(certs.cert_path, certs.key_path, certs.ca_cert_path);
+        assert!(tls.to_client_tls_config().is_ok());
     }
 }

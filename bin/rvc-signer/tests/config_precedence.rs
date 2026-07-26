@@ -325,7 +325,7 @@ keystore_dir = "{}"
 fn test_dry_run_invalid_tls_cert_detected() {
     let dir = TempDir::new().unwrap();
 
-    let tls = rvc_signer_bin::tls::TlsConfig::new(
+    let tls = rvc_signer_bin::grpc_tls::TlsConfig::new(
         dir.path().join("nonexistent.pem"),
         dir.path().join("nonexistent.key"),
         dir.path().join("nonexistent-ca.pem"),

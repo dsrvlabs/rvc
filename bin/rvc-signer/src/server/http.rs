@@ -90,7 +90,7 @@ pub(crate) async fn spawn_http_api(
         ServerError::config("[signer.http] enabled but http.tls_ca_cert is not set")
     })?;
 
-    let (bound, handle) = http_api::tls::spawn_https_listener(
+    let (bound, handle) = http_api::accept_loop::spawn_https_listener(
         &deps.resolved.http_listen_address,
         cert,
         key,

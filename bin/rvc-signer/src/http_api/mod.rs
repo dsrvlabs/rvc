@@ -27,7 +27,8 @@ const MAX_BODY_BYTES: usize = 1 << 20;
 
 use crate::backend::SigningBackend;
 
-pub mod tls;
+pub mod accept_loop;
+pub mod tls_config;
 
 mod dispatch;
 mod pubkey;

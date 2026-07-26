@@ -17,7 +17,7 @@ pub mod cn;
 pub mod log;
 
 pub use cn::{
-    authorize_client_cn, extract_client_cn, log_missing_client_cn_allow_list_warning,
+    audit_cn, authorize_client_cn, extract_client_cn, log_missing_client_cn_allow_list_warning,
     ClientAllowListError, ClientCnAllowList,
 };
 pub use log::{log_audit, AuditEntry};

@@ -32,7 +32,7 @@ use grpc_signer::proto::signer_v2::{
 };
 use grpc_signer::{SignerServiceClientV2, SignerServiceServerV2, SignerServiceV2};
 
-use rvc_signer_bin::tls::server_builder::hardened_server_builder;
+use rvc_signer_bin::grpc_tls::server_builder::hardened_server_builder;
 
 // ── TestService ────────────────────────────────────────────────────────────────
 

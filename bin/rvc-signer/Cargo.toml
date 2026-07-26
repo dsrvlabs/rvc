@@ -58,9 +58,9 @@ web3signer-wire.workspace = true
 # implementing: it broke rvc-grpc-signer integration + rvc-signer-bin dvt tests
 # on a --workspace run). We instead match the workspace's existing backend
 # (`ring`, pulled by rcgen/quinn/reqwest) and install the ring provider as the
-# startup default (see `http_api::tls`). This keeps the shared rustls feature set
+# startup default (see `http_api::tls_config`). This keeps the shared rustls feature set
 # identical to `develop` — zero graph perturbation, zero net-new crates (R1/R4).
-# NOTE: deviates from ADR-006's named `aws_lc_rs` provider; see http_api/tls.rs.
+# NOTE: deviates from ADR-006's named `aws_lc_rs` provider; see http_api/tls_config.rs.
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "logging",
