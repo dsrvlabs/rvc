@@ -271,13 +271,13 @@ every later extraction reviewable.
    place with an explicit diff.
 
 **Acceptance criteria:**
-- [ ] No `#[ignore]` remains on the three startup tests; they pass in a normal `cargo nextest run`
+- [x] No `#[ignore]` remains on the three startup tests; they pass in a normal `cargo nextest run`
       with no network access.
-- [ ] Clean start and clean SIGTERM shutdown (exit code 0) asserted, with a bounded timeout.
-- [ ] Startup log markers asserted **in order** from a single named constant.
-- [ ] A genesis-root mismatch exits non-zero (fail-closed pin).
-- [ ] Tests are hermetic and parallel-safe (no fixed global ports, no shared temp paths).
-- [ ] Workspace green on the standing invariant.
+- [x] Clean start and clean SIGTERM shutdown (exit code 0) asserted, with a bounded timeout.
+- [x] Startup log markers asserted **in order** from a single named constant.
+- [x] A genesis-root mismatch exits non-zero (fail-closed pin).
+- [x] Tests are hermetic and parallel-safe (no fixed global ports, no shared temp paths).
+- [x] Workspace green on the standing invariant.
 
 **TDD test plan** (RED first):
 - `test_startup_reaches_ready_against_mock_bn` — **RED**: fails today because the ignored test cannot
