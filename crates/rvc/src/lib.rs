@@ -1,6 +1,7 @@
 //! rvc - Rust Validator Client
 
 pub mod beacon_adapter;
+pub mod bootstrap;
 pub mod config;
 pub mod config_url;
 pub mod deletion_denylist;

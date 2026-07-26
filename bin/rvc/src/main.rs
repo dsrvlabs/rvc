@@ -1145,66 +1145,30 @@ async fn run_validator(
 
     let builder = ServiceBuilder::new(config.clone());
 
-    // Step 1: Open slashing DB
-    let slashing_db = match builder.build_slashing_db() {
-        Ok(db) => {
+    // Steps 1–2d: open slashing DB, integrity, permissions, keystore lock, denylist.
+    // Health updates stay in the binary (see `rvc::bootstrap` health-status policy).
+    let slashing_handles = match rvc::bootstrap::open_slashing_db(
+        &config,
+        strict_permissions,
+        strict_slashing_semantics,
+    ) {
+        Ok(handles) => {
             update_health_slashing_db(&health_status, true).await;
-            db
+            handles
+        }
+        Err(e) if e.is_keystore_locked() => {
+            std::process::exit(e.exit_code());
         }
         Err(e) => {
-            error!("Failed to open slashing database: {}", e);
-            update_health_error(&health_status, format!("Slashing DB error: {}", e)).await;
+            if matches!(e, rvc::bootstrap::BootstrapError::Config(_)) {
+                update_health_error(&health_status, format!("Slashing DB error: {}", e)).await;
+            }
             return Err(e.into());
         }
     };
-
-    // Step 2: Run integrity check
-    if let Err(e) = startup::check_integrity(&slashing_db) {
-        error!("Slashing DB integrity check failed: {}", e);
-        return Err(e.into());
-    }
-
-    // Step 2a: Configure strict slashing semantics
-    if strict_slashing_semantics {
-        slashing_db.set_strict_semantics(true);
-        info!("Strict slashing semantics enabled: null-root re-signs will be rejected");
-    }
-
-    // Step 2b: Check slashing DB file permissions
-    if strict_permissions {
-        if let Err(e) = slashing_db.check_file_permissions_strict() {
-            error!("Strict permissions check failed: {}", e);
-            return Err(e.into());
-        }
-    } else {
-        slashing_db.check_file_permissions();
-    }
-
-    // Step 2c: Acquire keystore lock
-    let _keystore_lock_guard = if config.disable_keystore_locking {
-        warn!("Keystore locking disabled -- ensure no duplicate instances");
-        None
-    } else {
-        match startup::acquire_keystore_lock(&config.keystore_path) {
-            Ok(guard) => Some(guard),
-            Err(e) => {
-                error!("Failed to acquire keystore lock: {}", e);
-                std::process::exit(startup::EXIT_KEYSTORE_LOCKED);
-            }
-        }
-    };
-
-    // Step 2d (SEC-1b): Load deletion denylist so keystore-dir / secret-provider
-    // loaders skip keys deleted via the Keymanager API on a prior boot.
-    // Path: <keystore_path>/.rvc.deleted_keys (shares the durable data volume).
-    let deletion_denylist =
-        match rvc::deletion_denylist::DeletionDenylist::load(&config.keystore_path) {
-            Ok(d) => std::sync::Arc::new(d),
-            Err(e) => {
-                error!("Failed to load deletion denylist: {}", e);
-                return Err(e.into());
-            }
-        };
+    let slashing_db = slashing_handles.db;
+    let _keystore_lock_guard = slashing_handles.keystore_lock;
+    let deletion_denylist = slashing_handles.denylist;
     let denylist_snapshot = deletion_denylist.snapshot();
 
     // Step 3: Create beacon client and BnManager

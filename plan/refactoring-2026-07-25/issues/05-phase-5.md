@@ -378,12 +378,12 @@ the keystore lock guard and the denylist — no dependency on the beacon node or
    `allow_fresh_db`, integrity failure, permission strictness, lock contention.
 
 **Acceptance criteria:**
-- [ ] `bootstrap::open_slashing_db` exists in `crates/rvc` and is unit-tested without spawning a binary.
-- [ ] `main.rs:1102-1163` is replaced by one call; log lines and their order are byte-identical.
-- [ ] `BootstrapCtx` is documented with the "populated once, never reassigned" invariant; it has no
+- [x] `bootstrap::open_slashing_db` exists in `crates/rvc` and is unit-tested without spawning a binary.
+- [x] `main.rs:1102-1163` is replaced by one call; log lines and their order are byte-identical.
+- [x] `BootstrapCtx` is documented with the "populated once, never reassigned" invariant; it has no
       `Option<T>` field used as a phase-ordering flag.
-- [ ] RF5-01's smoke tests pass unchanged (including the startup-marker order).
-- [ ] Workspace green.
+- [x] RF5-01's smoke tests pass unchanged (including the startup-marker order).
+- [x] Workspace green.
 
 **TDD test plan** (RED first):
 - `test_open_slashing_db_refuses_missing_path_without_allow_fresh_db` — **RED**: the function does not
