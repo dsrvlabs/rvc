@@ -1355,11 +1355,11 @@ again.
    are the oracle.
 
 **Acceptance criteria:**
-- [ ] `maybe_produce_aggregations` under ~120 lines; no mirrored fork branch remains.
-- [ ] One `timed(...)` combinator, used at all 13 sites (`rg -c` proof for both files).
-- [ ] `RVC_AGGREGATIONS_TOTAL` label values and log messages byte-identical (grep-diff in the PR).
-- [ ] Test count unchanged; the aggregator-determinism tests (test-audit issue 3.10) pass.
-- [ ] Workspace green.
+- [x] `maybe_produce_aggregations` under ~120 lines; no mirrored fork branch remains.
+- [x] One `timed(...)` combinator, used at all 13 sites (`rg -c` proof for both files).
+- [x] `RVC_AGGREGATIONS_TOTAL` label values and log messages byte-identical (grep-diff in the PR).
+- [x] Test count unchanged; the aggregator-determinism tests (test-audit issue 3.10) pass.
+- [x] Workspace green.
 
 **Risks:** Generic-over-proof-type may fight the two `VersionedSignedAggregateAndProof` variants. If the
 generic gets contorted, keep two small explicit functions and still extract `timed()` + `submit_versioned`

@@ -1,3 +1,6 @@
+use std::future::Future;
+use std::time::Duration;
+
 use beacon::AttesterDuty;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
@@ -7,6 +10,37 @@ use tracing::warn;
 
 use super::coordinator::PubkeyMap;
 use super::error::OrchestratorError;
+
+/// Outcome of running a future under a wall-clock timeout.
+///
+/// Flattens nested `Result<Result<T, E>, Elapsed>` so call sites match once
+/// without repeating the `tokio::time::timeout` idiom. Callers own log
+/// messages and metrics so labels stay byte-identical to the pre-refactor path.
+#[derive(Debug)]
+pub(crate) enum TimedOutcome<T, E> {
+    Ok(T),
+    Err(E),
+    Timeout,
+}
+
+/// Run `fut` under `timeout`, returning a flat [`TimedOutcome`].
+///
+/// `op_name` documents the timed operation (for call-site clarity / grepping);
+/// logging and metric increments remain at the caller so messages are unchanged.
+pub(crate) async fn timed<T, E, F>(
+    _op_name: &'static str,
+    timeout: Duration,
+    fut: F,
+) -> TimedOutcome<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(v)) => TimedOutcome::Ok(v),
+        Ok(Err(e)) => TimedOutcome::Err(e),
+        Err(_) => TimedOutcome::Timeout,
+    }
+}
 
 /// Constructs a hex-encoded SSZ bitlist where only the validator's position
 /// in the committee is set (pre-Electra aggregation_bits format).

@@ -13,7 +13,7 @@ use signer::{is_aggregator, SignerService, ValidatorSigner};
 use timing::{SlotClock, SLOTS_PER_EPOCH};
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
-use super::utils;
+use super::utils::{self, TimedOutcome};
 
 /// Number of epochs in a single sync committee period.
 const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64 = 256;
@@ -63,15 +63,16 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         // Attester duties
         if !self.duty_tracker.is_epoch_cached(epoch).await {
             debug!(epoch, "Fetching attester duties for epoch");
-            match tokio::time::timeout(
+            match utils::timed(
+                "attester_duty_fetch",
                 self.config.timeouts.duty_fetch,
                 self.duty_tracker.fetch_duties_for_epoch(epoch),
             )
             .await
             {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch attester duties"),
-                Err(_) => warn!(
+                TimedOutcome::Ok(_) => {}
+                TimedOutcome::Err(e) => warn!(epoch, error = %e, "Failed to fetch attester duties"),
+                TimedOutcome::Timeout => warn!(
                     epoch,
                     "Attester duty fetch timed out after {}s",
                     self.config.timeouts.duty_fetch.as_secs()
@@ -82,15 +83,16 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         // Proposer duties
         if !self.duty_tracker.is_proposer_epoch_cached(epoch).await {
             debug!(epoch, "Fetching proposer duties for epoch");
-            match tokio::time::timeout(
+            match utils::timed(
+                "proposer_duty_fetch",
                 self.config.timeouts.duty_fetch,
                 self.duty_tracker.fetch_proposer_duties(epoch),
             )
             .await
             {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch proposer duties"),
-                Err(_) => warn!(
+                TimedOutcome::Ok(_) => {}
+                TimedOutcome::Err(e) => warn!(epoch, error = %e, "Failed to fetch proposer duties"),
+                TimedOutcome::Timeout => warn!(
                     epoch,
                     "Proposer duty fetch timed out after {}s",
                     self.config.timeouts.duty_fetch.as_secs()
@@ -101,15 +103,18 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         // Sync committee duties (at period boundaries)
         if !self.duty_tracker.is_sync_period_cached(epoch).await {
             debug!(epoch, "Fetching sync committee duties");
-            match tokio::time::timeout(
+            match utils::timed(
+                "sync_duty_fetch",
                 self.config.timeouts.duty_fetch,
                 self.duty_tracker.fetch_sync_committee_duties(epoch),
             )
             .await
             {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => warn!(epoch, error = %e, "Failed to fetch sync committee duties"),
-                Err(_) => warn!(
+                TimedOutcome::Ok(_) => {}
+                TimedOutcome::Err(e) => {
+                    warn!(epoch, error = %e, "Failed to fetch sync committee duties")
+                }
+                TimedOutcome::Timeout => warn!(
                     epoch,
                     "Sync committee duty fetch timed out after {}s",
                     self.config.timeouts.duty_fetch.as_secs()
@@ -167,13 +172,14 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
             next_period, next_period_first_epoch, "Prefetching next-period sync committee duties"
         );
 
-        match tokio::time::timeout(
+        match utils::timed(
+            "sync_duty_prefetch",
             self.config.timeouts.duty_fetch,
             self.duty_tracker.fetch_sync_committee_duties(next_period_first_epoch),
         )
         .await
         {
-            Ok(Ok(_)) => {
+            TimedOutcome::Ok(_) => {
                 info!(
                     next_period,
                     next_period_first_epoch, "Prefetched sync committee duties for next period"
@@ -182,7 +188,7 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
                 // in the lookahead window skips the BN round-trip.
                 self.prefetched_periods.write().await.insert(next_period);
             }
-            Ok(Err(e)) => {
+            TimedOutcome::Err(e) => {
                 warn!(
                     next_period,
                     next_period_first_epoch,
@@ -190,7 +196,7 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
                     "Failed to prefetch sync committee duties for next period"
                 );
             }
-            Err(_) => {
+            TimedOutcome::Timeout => {
                 warn!(
                     next_period,
                     next_period_first_epoch,
@@ -206,13 +212,14 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         for epoch in [current_epoch, current_epoch + 1] {
             let attester_cached = self.duty_tracker.is_epoch_cached(epoch).await;
             let old_attester_root = self.duty_tracker.get_cached_dependent_root(epoch).await;
-            match tokio::time::timeout(
+            match utils::timed(
+                "attester_reorg_check",
                 self.config.timeouts.duty_fetch,
                 self.duty_tracker.check_and_refetch_if_root_changed(epoch),
             )
             .await
             {
-                Ok(Ok(true)) if attester_cached => {
+                TimedOutcome::Ok(true) if attester_cached => {
                     let new_root = self.duty_tracker.get_cached_dependent_root(epoch).await;
                     warn!(
                         epoch,
@@ -222,14 +229,14 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
                     );
                     RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["attester"]).inc();
                 }
-                Ok(Ok(true)) => {
+                TimedOutcome::Ok(true) => {
                     debug!(epoch, "Attester duties fetched (was uncached)");
                 }
-                Ok(Ok(false)) => {}
-                Ok(Err(e)) => {
+                TimedOutcome::Ok(false) => {}
+                TimedOutcome::Err(e) => {
                     warn!(epoch, error = %e, "Failed to check attester dependent root");
                 }
-                Err(_) => {
+                TimedOutcome::Timeout => {
                     warn!(
                         epoch,
                         "Attester reorg check timed out after {}s",
@@ -241,13 +248,14 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
             let proposer_cached = self.duty_tracker.is_proposer_epoch_cached(epoch).await;
             let old_proposer_root =
                 self.duty_tracker.get_cached_proposer_dependent_root(epoch).await;
-            match tokio::time::timeout(
+            match utils::timed(
+                "proposer_reorg_check",
                 self.config.timeouts.duty_fetch,
                 self.duty_tracker.check_and_refetch_proposer_if_root_changed(epoch),
             )
             .await
             {
-                Ok(Ok(true)) if proposer_cached => {
+                TimedOutcome::Ok(true) if proposer_cached => {
                     let new_root =
                         self.duty_tracker.get_cached_proposer_dependent_root(epoch).await;
                     warn!(
@@ -258,14 +266,14 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
                     );
                     RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["proposer"]).inc();
                 }
-                Ok(Ok(true)) => {
+                TimedOutcome::Ok(true) => {
                     debug!(epoch, "Proposer duties fetched (was uncached)");
                 }
-                Ok(Ok(false)) => {}
-                Ok(Err(e)) => {
+                TimedOutcome::Ok(false) => {}
+                TimedOutcome::Err(e) => {
                     warn!(epoch, error = %e, "Failed to check proposer dependent root");
                 }
-                Err(_) => {
+                TimedOutcome::Timeout => {
                     warn!(
                         epoch,
                         "Proposer reorg check timed out after {}s",
@@ -327,15 +335,16 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         }
 
         let count = preparations.len();
-        match tokio::time::timeout(
+        match utils::timed(
+            "proposer_preparation",
             self.config.timeouts.preparation,
             self.beacon.prepare_beacon_proposer(&preparations),
         )
         .await
         {
-            Ok(Ok(_)) => info!(count, "Sent proposer preparations"),
-            Ok(Err(e)) => warn!(error = %e, "Failed to send proposer preparations"),
-            Err(_) => {
+            TimedOutcome::Ok(_) => info!(count, "Sent proposer preparations"),
+            TimedOutcome::Err(e) => warn!(error = %e, "Failed to send proposer preparations"),
+            TimedOutcome::Timeout => {
                 warn!(
                     "Proposer preparation timed out after {}s",
                     self.config.timeouts.preparation.as_secs()
@@ -416,15 +425,18 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
         }
 
         let count = subscriptions.len();
-        match tokio::time::timeout(
+        match utils::timed(
+            "committee_subscription",
             self.config.timeouts.preparation,
             self.beacon.submit_beacon_committee_subscriptions(&subscriptions),
         )
         .await
         {
-            Ok(Ok(_)) => info!(count, epoch, "Sent committee subscriptions"),
-            Ok(Err(e)) => warn!(epoch, error = %e, "Failed to send committee subscriptions"),
-            Err(_) => warn!(
+            TimedOutcome::Ok(_) => info!(count, epoch, "Sent committee subscriptions"),
+            TimedOutcome::Err(e) => {
+                warn!(epoch, error = %e, "Failed to send committee subscriptions")
+            }
+            TimedOutcome::Timeout => warn!(
                 epoch,
                 "Committee subscription timed out after {}s",
                 self.config.timeouts.preparation.as_secs()

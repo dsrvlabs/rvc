@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
-use tracing::{debug, info, info_span, warn, Instrument};
+use tracing::{debug, info, info_span, warn, Instrument, Span};
 
-use beacon::{VersionedAggregateAttestation, VersionedSignedAggregateAndProof};
+use beacon::{AttesterDuty, VersionedAggregateAttestation, VersionedSignedAggregateAndProof};
 use bn_manager::BeaconNodeClient;
+use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{
     AggregateAndProof, ElectraAggregateAndProof, ForkName, SignedAggregateAndProof,
@@ -16,7 +17,7 @@ use tree_hash::TreeHash;
 use validator_store::ValidatorStore;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
-use super::utils;
+use super::utils::{self, TimedOutcome};
 
 pub(crate) struct AggregationService {
     signer: Arc<SignerService>,
@@ -28,6 +29,29 @@ pub(crate) struct AggregationService {
     /// present in attestation.rs so that aggregation and selection proofs
     /// are also suppressed during the post-import doppelganger window.
     validator_store: Arc<ValidatorStore>,
+}
+
+/// Signed aggregate produced for one aggregator duty (fork-discriminated).
+enum ProducedAggregate {
+    PreElectra(SignedAggregateAndProof),
+    Electra(SignedElectraAggregateAndProof),
+}
+
+/// Selects the pre-refactor log message set for aggregate submission.
+enum AggregateSubmitLabel {
+    PreElectra,
+    Electra,
+}
+
+/// Result of attempting aggregation for a single attester duty.
+///
+/// `None` means the duty was skipped before selection (parse / disabled / not
+/// selected). `Some` means the validator was selected as aggregator; `proof`
+/// is `None` when a later step failed after selection (source_validators still
+/// records the validator_index — matches pre-refactor behaviour).
+struct AggregateDutyOutcome {
+    validator_index: String,
+    proof: Option<ProducedAggregate>,
 }
 
 impl AggregationService {
@@ -78,382 +102,452 @@ impl AggregationService {
                 aggregation.fork = fork_label,
             );
 
-            let committee_length: u64 = match duty.committee_length.parse() {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let pubkey = match utils::find_pubkey(&self.pubkey_map, &duty.pubkey) {
-                Some(pk) => pk,
-                None => continue,
-            };
-
-            // D-3: per-validator doppelganger gate (mirrors attestation.rs M-12 check).
-            // `pubkey` is the already-resolved typed PublicKey — use its infallible
-            // `to_bytes()` instead of re-decoding the hex string (no fail-open).
-            {
-                let pk_bytes = pubkey.to_bytes();
-                if !self.validator_store.is_signing_enabled(&pk_bytes) {
-                    warn!(
-                        pubkey = %TruncatedPubkey::new(&duty.pubkey),
-                        slot,
-                        "Skipping aggregation duty: validator is inside the \
-                         post-import doppelganger window (D-3)"
-                    );
-                    continue;
-                }
-            }
-
-            let selection_proof = match self
-                .signer
-                .sign_selection_proof(
-                    slot,
-                    &pubkey,
-                    &self.config.fork_schedule,
-                    &self.config.genesis_validators_root,
-                )
-                .instrument(agg_span.clone())
-                .await
-            {
-                Ok(sig) => sig,
-                Err(e) => {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        error = %e,
-                        "Failed to sign selection proof for aggregation"
-                    );
-                    continue;
-                }
-            };
-
-            if !is_aggregator(committee_length, &selection_proof.to_bytes()) {
-                debug!(
-                    slot,
-                    validator_index = %duty.validator_index,
-                    "Not selected as attestation aggregator"
-                );
+            let Some(outcome) = self.produce_one_aggregate(duty, slot, fork_name, agg_span).await
+            else {
                 continue;
-            }
-
-            info!(
-                slot,
-                validator_index = %duty.validator_index,
-                "Selected as attestation aggregator"
-            );
-            source_validators.push(duty.validator_index.clone());
-
-            // Compute attestation data root for fetching the aggregate
-            let committee_index: u64 = match duty.committee_index.parse() {
-                Ok(c) => c,
-                Err(_) => continue,
             };
 
-            let attestation_data_response = match tokio::time::timeout(
-                self.config.timeouts.aggregate_fetch,
-                self.beacon.get_attestation_data(slot, committee_index),
-            )
-            .instrument(agg_span.clone())
-            .await
-            {
-                Ok(Ok(resp)) => resp,
-                Ok(Err(e)) => {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        error = %e,
-                        "Failed to get attestation data for aggregation"
-                    );
-                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-                    continue;
-                }
-                Err(_) => {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        "Attestation data fetch timed out for aggregation"
-                    );
-                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-                    continue;
-                }
-            };
-
-            // EIP-7549: For Electra+, `AttestationData.index` must be zeroed
-            // before computing the tree-hash root used in the aggregate query.
-            // The BN returns the real committee index in its response; we must
-            // normalize it away here. Pre-Electra forks keep the index intact.
-            let crypto_attestation_data = match utils::convert_and_normalize_attestation_data(
-                &attestation_data_response.data,
-                fork_name,
-            ) {
-                Ok(data) => data,
-                Err(e) => {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        error = %e,
-                        "Failed to convert attestation data for aggregation"
-                    );
-                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-                    continue;
-                }
-            };
-
-            let att_data_root = crypto_attestation_data.tree_hash_root();
-            let att_data_root_hex = format!("0x{}", hex::encode(att_data_root.0));
-
-            // Fetch the aggregate attestation
-            // Electra: pass committee_index for per-committee aggregation
-            let electra_committee_index = if is_electra { Some(committee_index) } else { None };
-            let aggregate = match tokio::time::timeout(
-                self.config.timeouts.aggregate_fetch,
-                self.beacon.get_aggregate_attestation(
-                    slot,
-                    &att_data_root_hex,
-                    electra_committee_index,
-                ),
-            )
-            .instrument(agg_span.clone())
-            .await
-            {
-                Ok(Ok(resp)) => resp,
-                Ok(Err(e)) => {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        error = %e,
-                        "Failed to get aggregate attestation"
-                    );
-                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-                    continue;
-                }
-                Err(_) => {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        "Aggregate attestation fetch timed out"
-                    );
-                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-                    continue;
-                }
-            };
-
-            let aggregator_index: u64 = match duty.validator_index.parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-
-            if is_electra {
-                let electra_agg = match aggregate {
-                    VersionedAggregateAttestation::Electra(a)
-                    | VersionedAggregateAttestation::Fulu(a) => a,
-                    _ => {
-                        warn!(
-                            slot,
-                            validator_index = %duty.validator_index,
-                            "Expected Electra aggregate but got pre-Electra"
-                        );
-                        RVC_AGGREGATIONS_TOTAL
-                            .with_label_values(&[attestation_status::FAILED])
-                            .inc();
-                        continue;
-                    }
-                };
-                let aggregate_and_proof = ElectraAggregateAndProof {
-                    aggregator_index,
-                    aggregate: electra_agg,
-                    selection_proof: selection_proof.to_bytes().to_vec(),
-                };
-                if let Err(e) = aggregate_and_proof.try_tree_hash_root() {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        error = %e,
-                        "Skipping aggregate with invalid aggregation bits"
-                    );
-                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-                    continue;
-                }
-                let signature = match self
-                    .signer
-                    .sign_electra_aggregate_and_proof(
-                        &aggregate_and_proof,
-                        &pubkey,
-                        &self.config.fork_schedule,
-                        &self.config.genesis_validators_root,
-                    )
-                    .instrument(agg_span.clone())
-                    .await
-                {
-                    Ok(sig) => sig,
-                    Err(e) => {
-                        warn!(
-                            slot,
-                            validator_index = %duty.validator_index,
-                            error = %e,
-                            "Failed to sign Electra aggregate and proof"
-                        );
-                        RVC_AGGREGATIONS_TOTAL
-                            .with_label_values(&[attestation_status::FAILED])
-                            .inc();
-                        continue;
-                    }
-                };
-                electra_aggregates.push(SignedElectraAggregateAndProof {
-                    message: aggregate_and_proof,
-                    signature: signature.to_bytes().to_vec(),
-                });
-            } else {
-                let pre_electra_agg = match aggregate {
-                    VersionedAggregateAttestation::PreElectra(a) => a,
-                    _ => {
-                        warn!(
-                            slot,
-                            validator_index = %duty.validator_index,
-                            "Expected pre-Electra aggregate but got Electra"
-                        );
-                        RVC_AGGREGATIONS_TOTAL
-                            .with_label_values(&[attestation_status::FAILED])
-                            .inc();
-                        continue;
-                    }
-                };
-                let aggregate_and_proof = AggregateAndProof {
-                    aggregator_index,
-                    aggregate: pre_electra_agg,
-                    selection_proof: selection_proof.to_bytes().to_vec(),
-                };
-                if let Err(e) = aggregate_and_proof.try_tree_hash_root() {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        error = %e,
-                        "Skipping aggregate with invalid aggregation bits"
-                    );
-                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-                    continue;
-                }
-                let signature = match self
-                    .signer
-                    .sign_aggregate_and_proof(
-                        &aggregate_and_proof,
-                        &pubkey,
-                        &self.config.fork_schedule,
-                        &self.config.genesis_validators_root,
-                    )
-                    .instrument(agg_span.clone())
-                    .await
-                {
-                    Ok(sig) => sig,
-                    Err(e) => {
-                        warn!(
-                            slot,
-                            validator_index = %duty.validator_index,
-                            error = %e,
-                            "Failed to sign aggregate and proof"
-                        );
-                        RVC_AGGREGATIONS_TOTAL
-                            .with_label_values(&[attestation_status::FAILED])
-                            .inc();
-                        continue;
-                    }
-                };
-                pre_electra_aggregates.push(SignedAggregateAndProof {
-                    message: aggregate_and_proof,
-                    signature: signature.to_bytes().to_vec(),
-                });
+            source_validators.push(outcome.validator_index);
+            match outcome.proof {
+                Some(ProducedAggregate::PreElectra(p)) => pre_electra_aggregates.push(p),
+                Some(ProducedAggregate::Electra(p)) => electra_aggregates.push(p),
+                None => {}
             }
         }
 
         if !pre_electra_aggregates.is_empty() {
-            let count = pre_electra_aggregates.len();
-            let source_validators_str = source_validators.join(",");
-
-            let submit_span = info_span!(
-                "aggregation.submit",
-                slot = slot,
-                aggregation.count = count,
-                aggregation.source_validators = %source_validators_str,
-            );
-
             let versioned = VersionedSignedAggregateAndProof::PreElectra(pre_electra_aggregates);
-            match tokio::time::timeout(
-                self.config.timeouts.aggregate_submit,
-                self.beacon.submit_aggregate_and_proofs(&versioned),
+            self.submit_versioned(
+                slot,
+                versioned,
+                &source_validators,
+                AggregateSubmitLabel::PreElectra,
             )
-            .instrument(submit_span)
-            .await
-            {
-                Ok(Ok(_)) => {
-                    info!(slot, count, "Submitted aggregate and proofs");
-                    RVC_AGGREGATIONS_TOTAL
-                        .with_label_values(&[attestation_status::SUCCESS])
-                        .inc_by(count as u64);
-                }
-                Ok(Err(e)) => {
-                    warn!(slot, error = %e, "Failed to submit aggregate and proofs");
-                    RVC_AGGREGATIONS_TOTAL
-                        .with_label_values(&[attestation_status::FAILED])
-                        .inc_by(count as u64);
-                }
-                Err(_) => {
-                    warn!(
-                        slot,
-                        "Aggregate and proofs submit timed out after {}s",
-                        self.config.timeouts.aggregate_submit.as_secs()
-                    );
-                    RVC_AGGREGATIONS_TOTAL
-                        .with_label_values(&[attestation_status::FAILED])
-                        .inc_by(count as u64);
-                }
-            }
+            .await;
         }
 
         if !electra_aggregates.is_empty() {
-            let count = electra_aggregates.len();
-            let source_validators_str = source_validators.join(",");
-
-            let submit_span = info_span!(
-                "aggregation.submit",
-                slot = slot,
-                aggregation.count = count,
-                aggregation.source_validators = %source_validators_str,
-            );
-
             let versioned = if fork_name >= ForkName::Fulu {
                 VersionedSignedAggregateAndProof::Fulu(electra_aggregates)
             } else {
                 VersionedSignedAggregateAndProof::Electra(electra_aggregates)
             };
-            match tokio::time::timeout(
-                self.config.timeouts.aggregate_submit,
-                self.beacon.submit_aggregate_and_proofs(&versioned),
+            self.submit_versioned(
+                slot,
+                versioned,
+                &source_validators,
+                AggregateSubmitLabel::Electra,
             )
-            .instrument(submit_span)
+            .await;
+        }
+    }
+
+    /// Select-as-aggregator path for a single duty: selection proof through
+    /// signed aggregate-and-proof. Returns `None` when the duty is skipped
+    /// before selection; `Some` once selected (proof may still be `None`).
+    async fn produce_one_aggregate(
+        &self,
+        duty: &AttesterDuty,
+        slot: Slot,
+        fork_name: ForkName,
+        agg_span: Span,
+    ) -> Option<AggregateDutyOutcome> {
+        let committee_length: u64 = duty.committee_length.parse().ok()?;
+
+        let pubkey = utils::find_pubkey(&self.pubkey_map, &duty.pubkey)?;
+
+        // D-3: per-validator doppelganger gate (mirrors attestation.rs M-12 check).
+        // `pubkey` is the already-resolved typed PublicKey — use its infallible
+        // `to_bytes()` instead of re-decoding the hex string (no fail-open).
+        {
+            let pk_bytes = pubkey.to_bytes();
+            if !self.validator_store.is_signing_enabled(&pk_bytes) {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&duty.pubkey),
+                    slot,
+                    "Skipping aggregation duty: validator is inside the \
+                     post-import doppelganger window (D-3)"
+                );
+                return None;
+            }
+        }
+
+        let selection_proof = match self
+            .signer
+            .sign_selection_proof(
+                slot,
+                &pubkey,
+                &self.config.fork_schedule,
+                &self.config.genesis_validators_root,
+            )
+            .instrument(agg_span.clone())
             .await
-            {
-                Ok(Ok(_)) => {
-                    info!(slot, count, "Submitted Electra aggregate and proofs");
-                    RVC_AGGREGATIONS_TOTAL
-                        .with_label_values(&[attestation_status::SUCCESS])
-                        .inc_by(count as u64);
-                }
-                Ok(Err(e)) => {
-                    warn!(slot, error = %e, "Failed to submit Electra aggregate and proofs");
-                    RVC_AGGREGATIONS_TOTAL
-                        .with_label_values(&[attestation_status::FAILED])
-                        .inc_by(count as u64);
-                }
-                Err(_) => {
+        {
+            Ok(sig) => sig,
+            Err(e) => {
+                warn!(
+                    slot,
+                    validator_index = %duty.validator_index,
+                    error = %e,
+                    "Failed to sign selection proof for aggregation"
+                );
+                return None;
+            }
+        };
+
+        if !is_aggregator(committee_length, &selection_proof.to_bytes()) {
+            debug!(
+                slot,
+                validator_index = %duty.validator_index,
+                "Not selected as attestation aggregator"
+            );
+            return None;
+        }
+
+        info!(
+            slot,
+            validator_index = %duty.validator_index,
+            "Selected as attestation aggregator"
+        );
+
+        let validator_index = duty.validator_index.clone();
+        let proof = self
+            .fetch_sign_aggregate(
+                duty,
+                slot,
+                fork_name,
+                &pubkey,
+                selection_proof.to_bytes().to_vec(),
+                agg_span,
+            )
+            .await;
+
+        Some(AggregateDutyOutcome { validator_index, proof })
+    }
+
+    /// Fetch attestation data + aggregate, then sign_and_wrap for the fork.
+    async fn fetch_sign_aggregate(
+        &self,
+        duty: &AttesterDuty,
+        slot: Slot,
+        fork_name: ForkName,
+        pubkey: &PublicKey,
+        selection_proof: Vec<u8>,
+        agg_span: Span,
+    ) -> Option<ProducedAggregate> {
+        let is_electra = fork_name >= ForkName::Electra;
+        let committee_index: u64 = duty.committee_index.parse().ok()?;
+
+        let attestation_data_response = match utils::timed(
+            "aggregate_attestation_data",
+            self.config.timeouts.aggregate_fetch,
+            self.beacon.get_attestation_data(slot, committee_index),
+        )
+        .instrument(agg_span.clone())
+        .await
+        {
+            TimedOutcome::Ok(resp) => resp,
+            TimedOutcome::Err(e) => {
+                warn!(
+                    slot,
+                    validator_index = %duty.validator_index,
+                    error = %e,
+                    "Failed to get attestation data for aggregation"
+                );
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                return None;
+            }
+            TimedOutcome::Timeout => {
+                warn!(
+                    slot,
+                    validator_index = %duty.validator_index,
+                    "Attestation data fetch timed out for aggregation"
+                );
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                return None;
+            }
+        };
+
+        // EIP-7549: For Electra+, `AttestationData.index` must be zeroed
+        // before computing the tree-hash root used in the aggregate query.
+        // The BN returns the real committee index in its response; we must
+        // normalize it away here. Pre-Electra forks keep the index intact.
+        let crypto_attestation_data = match utils::convert_and_normalize_attestation_data(
+            &attestation_data_response.data,
+            fork_name,
+        ) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!(
+                    slot,
+                    validator_index = %duty.validator_index,
+                    error = %e,
+                    "Failed to convert attestation data for aggregation"
+                );
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                return None;
+            }
+        };
+
+        let att_data_root = crypto_attestation_data.tree_hash_root();
+        let att_data_root_hex = format!("0x{}", hex::encode(att_data_root.0));
+
+        // Fetch the aggregate attestation
+        // Electra: pass committee_index for per-committee aggregation
+        let electra_committee_index = if is_electra { Some(committee_index) } else { None };
+        let aggregate = match utils::timed(
+            "aggregate_attestation_fetch",
+            self.config.timeouts.aggregate_fetch,
+            self.beacon.get_aggregate_attestation(
+                slot,
+                &att_data_root_hex,
+                electra_committee_index,
+            ),
+        )
+        .instrument(agg_span.clone())
+        .await
+        {
+            TimedOutcome::Ok(resp) => resp,
+            TimedOutcome::Err(e) => {
+                warn!(
+                    slot,
+                    validator_index = %duty.validator_index,
+                    error = %e,
+                    "Failed to get aggregate attestation"
+                );
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                return None;
+            }
+            TimedOutcome::Timeout => {
+                warn!(
+                    slot,
+                    validator_index = %duty.validator_index,
+                    "Aggregate attestation fetch timed out"
+                );
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                return None;
+            }
+        };
+
+        let aggregator_index: u64 = duty.validator_index.parse().ok()?;
+
+        if is_electra {
+            let electra_agg = match aggregate {
+                VersionedAggregateAttestation::Electra(a)
+                | VersionedAggregateAttestation::Fulu(a) => a,
+                _ => {
                     warn!(
                         slot,
-                        "Electra aggregate and proofs submit timed out after {}s",
-                        self.config.timeouts.aggregate_submit.as_secs()
+                        validator_index = %duty.validator_index,
+                        "Expected Electra aggregate but got pre-Electra"
                     );
-                    RVC_AGGREGATIONS_TOTAL
-                        .with_label_values(&[attestation_status::FAILED])
-                        .inc_by(count as u64);
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    return None;
                 }
+            };
+            let message = ElectraAggregateAndProof {
+                aggregator_index,
+                aggregate: electra_agg,
+                selection_proof,
+            };
+            let signed = self
+                .sign_and_wrap_electra(slot, &duty.validator_index, pubkey, message, agg_span)
+                .await?;
+            Some(ProducedAggregate::Electra(signed))
+        } else {
+            let pre_electra_agg = match aggregate {
+                VersionedAggregateAttestation::PreElectra(a) => a,
+                _ => {
+                    warn!(
+                        slot,
+                        validator_index = %duty.validator_index,
+                        "Expected pre-Electra aggregate but got Electra"
+                    );
+                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    return None;
+                }
+            };
+            let message =
+                AggregateAndProof { aggregator_index, aggregate: pre_electra_agg, selection_proof };
+            let signed = self
+                .sign_and_wrap_pre_electra(slot, &duty.validator_index, pubkey, message, agg_span)
+                .await?;
+            Some(ProducedAggregate::PreElectra(signed))
+        }
+    }
+
+    /// Tree-hash guard + sign + wrap for pre-Electra aggregate-and-proof.
+    ///
+    /// Explicit (non-generic) twin of [`Self::sign_and_wrap_electra`]: the two
+    /// signer methods and log strings differ; a generic over proof type would
+    /// contort more than it saves.
+    async fn sign_and_wrap_pre_electra(
+        &self,
+        slot: Slot,
+        validator_index: &str,
+        pubkey: &PublicKey,
+        message: AggregateAndProof,
+        agg_span: Span,
+    ) -> Option<SignedAggregateAndProof> {
+        if let Err(e) = message.try_tree_hash_root() {
+            warn!(
+                slot,
+                validator_index = %validator_index,
+                error = %e,
+                "Skipping aggregate with invalid aggregation bits"
+            );
+            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+            return None;
+        }
+        let signature = match self
+            .signer
+            .sign_aggregate_and_proof(
+                &message,
+                pubkey,
+                &self.config.fork_schedule,
+                &self.config.genesis_validators_root,
+            )
+            .instrument(agg_span)
+            .await
+        {
+            Ok(sig) => sig,
+            Err(e) => {
+                warn!(
+                    slot,
+                    validator_index = %validator_index,
+                    error = %e,
+                    "Failed to sign aggregate and proof"
+                );
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                return None;
+            }
+        };
+        Some(SignedAggregateAndProof { message, signature: signature.to_bytes().to_vec() })
+    }
+
+    /// Tree-hash guard + sign + wrap for Electra/Fulu aggregate-and-proof.
+    async fn sign_and_wrap_electra(
+        &self,
+        slot: Slot,
+        validator_index: &str,
+        pubkey: &PublicKey,
+        message: ElectraAggregateAndProof,
+        agg_span: Span,
+    ) -> Option<SignedElectraAggregateAndProof> {
+        if let Err(e) = message.try_tree_hash_root() {
+            warn!(
+                slot,
+                validator_index = %validator_index,
+                error = %e,
+                "Skipping aggregate with invalid aggregation bits"
+            );
+            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+            return None;
+        }
+        let signature = match self
+            .signer
+            .sign_electra_aggregate_and_proof(
+                &message,
+                pubkey,
+                &self.config.fork_schedule,
+                &self.config.genesis_validators_root,
+            )
+            .instrument(agg_span)
+            .await
+        {
+            Ok(sig) => sig,
+            Err(e) => {
+                warn!(
+                    slot,
+                    validator_index = %validator_index,
+                    error = %e,
+                    "Failed to sign Electra aggregate and proof"
+                );
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                return None;
+            }
+        };
+        Some(SignedElectraAggregateAndProof { message, signature: signature.to_bytes().to_vec() })
+    }
+
+    /// Submit a versioned batch of signed aggregates; shared by pre-Electra and
+    /// Electra/Fulu. Log messages stay as static literals (byte-identical to
+    /// the pre-refactor paths) via [`AggregateSubmitLabel`].
+    async fn submit_versioned(
+        &self,
+        slot: Slot,
+        versioned: VersionedSignedAggregateAndProof,
+        source_validators: &[String],
+        label: AggregateSubmitLabel,
+    ) {
+        let count = match &versioned {
+            VersionedSignedAggregateAndProof::PreElectra(v) => v.len(),
+            VersionedSignedAggregateAndProof::Electra(v)
+            | VersionedSignedAggregateAndProof::Fulu(v) => v.len(),
+        };
+        let source_validators_str = source_validators.join(",");
+
+        let submit_span = info_span!(
+            "aggregation.submit",
+            slot = slot,
+            aggregation.count = count,
+            aggregation.source_validators = %source_validators_str,
+        );
+
+        match utils::timed(
+            "aggregate_submit",
+            self.config.timeouts.aggregate_submit,
+            self.beacon.submit_aggregate_and_proofs(&versioned),
+        )
+        .instrument(submit_span)
+        .await
+        {
+            TimedOutcome::Ok(()) => {
+                match label {
+                    AggregateSubmitLabel::PreElectra => {
+                        info!(slot, count, "Submitted aggregate and proofs");
+                    }
+                    AggregateSubmitLabel::Electra => {
+                        info!(slot, count, "Submitted Electra aggregate and proofs");
+                    }
+                }
+                RVC_AGGREGATIONS_TOTAL
+                    .with_label_values(&[attestation_status::SUCCESS])
+                    .inc_by(count as u64);
+            }
+            TimedOutcome::Err(e) => {
+                match label {
+                    AggregateSubmitLabel::PreElectra => {
+                        warn!(slot, error = %e, "Failed to submit aggregate and proofs");
+                    }
+                    AggregateSubmitLabel::Electra => {
+                        warn!(slot, error = %e, "Failed to submit Electra aggregate and proofs");
+                    }
+                }
+                RVC_AGGREGATIONS_TOTAL
+                    .with_label_values(&[attestation_status::FAILED])
+                    .inc_by(count as u64);
+            }
+            TimedOutcome::Timeout => {
+                match label {
+                    AggregateSubmitLabel::PreElectra => {
+                        warn!(
+                            slot,
+                            "Aggregate and proofs submit timed out after {}s",
+                            self.config.timeouts.aggregate_submit.as_secs()
+                        );
+                    }
+                    AggregateSubmitLabel::Electra => {
+                        warn!(
+                            slot,
+                            "Electra aggregate and proofs submit timed out after {}s",
+                            self.config.timeouts.aggregate_submit.as_secs()
+                        );
+                    }
+                }
+                RVC_AGGREGATIONS_TOTAL
+                    .with_label_values(&[attestation_status::FAILED])
+                    .inc_by(count as u64);
             }
         }
     }
