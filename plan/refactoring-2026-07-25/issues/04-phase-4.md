@@ -926,10 +926,10 @@ outside the shared function.
 3. Delete the per-impl duplicates.
 
 **Acceptance criteria:**
-- [ ] Only the primitive accessors are required trait methods.
-- [ ] Both impls lose their duplicated math; existing timing tests pass unchanged.
-- [ ] A single test exercised against **both** impls proves identical derived results for the same inputs.
-- [ ] Standing invariant green.
+- [x] Only the primitive accessors are required trait methods.
+- [x] Both impls lose their duplicated math; existing timing tests pass unchanged.
+- [x] A single test exercised against **both** impls proves identical derived results for the same inputs.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_system_and_mock_clocks_agree_on_all_derived_methods` — a table-driven test run
