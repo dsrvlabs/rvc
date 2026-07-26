@@ -659,13 +659,13 @@ request-construction plus one dispatch call, and makes the policy single-sourced
    helper moves, it is not reimplemented per transport.
 
 **Acceptance criteria:**
-- [ ] Each v2 handler is request-construction + one dispatcher call (target ≤ ~15 lines).
-- [ ] gRPC, HTTP and DVT all route through one `plan_sign`; `rg` shows no second domain/root policy in
+- [x] Each v2 handler is request-construction + one dispatcher call (target ≤ ~15 lines).
+- [x] gRPC, HTTP and DVT all route through one `plan_sign`; `rg` shows no second domain/root policy in
       `bin/rvc-signer`.
-- [ ] **A7's metric-scrape test is green unmodified** — `sign_total`, `sign_duration_seconds` and
+- [x] **A7's metric-scrape test is green unmodified** — `sign_total`, `sign_duration_seconds` and
       `sign_errors_total` are non-zero after a sign on *each* transport, with identical label sets.
-- [ ] Existing v2 handler tests (`service.rs:1296-1628`) pass unchanged.
-- [ ] Standing invariant green.
+- [x] Existing v2 handler tests (`service.rs:1296-1628`) pass unchanged.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_grpc_handler_records_sign_metrics_via_shared_helper` — asserts the dispatcher (not

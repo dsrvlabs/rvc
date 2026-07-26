@@ -43,16 +43,13 @@ use crate::proto::signer_v2::{
     PartialSignSyncCommitteeRequest,
 };
 
-use crypto::{
-    compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
-};
-use eth_types::DOMAIN_SYNC_COMMITTEE;
 use slashing::SlashingDb;
 
 use crate::grpc_common::{
     decode_attestation_data, decode_beacon_block, decode_fork_info, validate_pubkey,
     validate_root32,
 };
+use crate::sign_plan::{plan_sign, PlanInput};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PeerSignerServiceImpl (v2)
@@ -204,19 +201,20 @@ impl PeerSignerService for PeerSignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
 
-        // 3. Decode block and compute signing root.
+        // 3. Decode block and compute signing root via shared plan engine.
         let block = decode_beacon_block(&r.block_ssz, r.fork_id)?;
         let slot = block.slot;
         Span::current().record("slot", slot);
 
-        let domain = compute_domain(DOMAIN_BEACON_PROPOSER, current_version, gvr);
         // SEC-6c: typed body leaf — malformed Electra body SSZ must error, not panic.
         let object_root = block.try_tree_hash_root().map_err(|e| {
             Status::invalid_argument(format!("invalid block body for tree_hash_root: {e}"))
         })?;
-        let signing_root = compute_signing_root(&object_root.0, domain);
+        let plan =
+            plan_sign(&PlanInput::Block { object_root: object_root.0, slot, fork_version, gvr });
+        let signing_root = plan.signing_root;
         let signing_root_hex = Some(root_hex(&signing_root));
 
         // 4. Get share — clone to own, then explicitly drop the Arc<HashMap> so the
@@ -301,15 +299,15 @@ impl PeerSignerService for PeerSignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
 
-        // 3. Decode AttestationData from proto fields.
+        // 3. Decode AttestationData from proto fields; plan via shared engine.
         let (att_data, source_epoch, target_epoch) = decode_attestation_data(r.data)?;
         Span::current().record("source_epoch", source_epoch);
         Span::current().record("target_epoch", target_epoch);
 
-        let domain = compute_domain(DOMAIN_BEACON_ATTESTER, current_version, gvr);
-        let signing_root = compute_signing_root(&att_data, domain);
+        let plan = plan_sign(&PlanInput::Attestation { data: att_data, fork_version, gvr });
+        let signing_root = plan.signing_root;
         let signing_root_hex = Some(root_hex(&signing_root));
 
         // 4. Get share — clone to own, explicitly drop Arc<HashMap>.
@@ -394,17 +392,16 @@ impl PeerSignerService for PeerSignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
 
         let slot = r.slot;
         let beacon_block_root = validate_root32(&r.beacon_block_root, "beacon_block_root")?;
         Span::current().record("slot", slot);
 
-        // 3. Compute signing root for sync committee message.
-        //    Domain = DOMAIN_SYNC_COMMITTEE.
-        //    The message is the beacon_block_root itself (hash_tree_root of a root is itself).
-        let domain = compute_domain(DOMAIN_SYNC_COMMITTEE, current_version, gvr);
-        let signing_root = compute_signing_root(&beacon_block_root, domain);
+        // 3. Signing root via shared plan engine (DOMAIN_SYNC_COMMITTEE).
+        let plan =
+            plan_sign(&PlanInput::SyncCommitteeMessage { beacon_block_root, fork_version, gvr });
+        let signing_root = plan.signing_root;
 
         // 4. Get share — clone to own, explicitly drop Arc<HashMap>.
         let share =

@@ -21,6 +21,8 @@ mod integration_polish;
 pub mod metrics;
 pub mod reload;
 pub mod service;
+/// Transport-neutral SignPlan engine (RF4-09 / D4).
+pub(crate) mod sign_plan;
 pub mod slashing;
 pub mod tls;
 

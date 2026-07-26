@@ -22,6 +22,9 @@ pub mod grpc_sign_type {
     pub const CONTRIBUTION_AND_PROOF: &str = "contribution_and_proof";
     pub const BUILDER_REGISTRATION: &str = "builder_registration";
     pub const VOLUNTARY_EXIT: &str = "voluntary_exit";
+    /// Web3Signer `AGGREGATION_SLOT` (HTTP-only; domain 0x05 selection proof).
+    /// Not a v2 gRPC RPC, but shares the A7 `sign_*` series when HTTP dispatches.
+    pub const AGGREGATION_SLOT: &str = "aggregation_slot";
 
     /// All ten v2 RPC type labels — used by the table-driven recording test.
     pub const ALL: &[&str] = &[

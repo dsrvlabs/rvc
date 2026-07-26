@@ -10,13 +10,15 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 
-use super::dispatch::{plan_sign, Slashing};
+use super::dispatch::plan_sign;
 use super::pubkey::{resolve_identifier, PubkeyError};
 use super::request::{SignPayload, SignRequest};
 use super::response::{sign_response, HttpSignError};
 use super::tls::{audit_cn, PeerCert};
 use super::Web3SignerState;
 use crate::audit;
+use crate::metrics::grpc_sign_type;
+use crate::sign_plan::{dispatch_sign, DispatchError, RequestCtx};
 
 use tracing::Instrument;
 
@@ -274,59 +276,72 @@ async fn sign_inner(
     }
 
     // 3. Compute the signing root + slashing inputs; enforce the signingRoot /
-    //    fork_info policy (the dispatcher owns the domain).
+    //    fork_info policy (the shared SignPlan engine owns the domain).
     let plan = plan_sign(&req)?;
-    let root = plan.signing_root;
 
-    // 4. Route to the matching gate method. `cn` is the TLS peer-cert audit CN
-    //    derived by the caller (Phase 3), or the audit default.
-    let sig = match plan.slashing {
-        Slashing::Block { slot, gvr } => state.gate.sign_block(&pubkey, slot, root, gvr, cn).await,
-        Slashing::Attestation { source_epoch, target_epoch, gvr } => {
-            state.gate.sign_attestation(&pubkey, source_epoch, target_epoch, root, gvr, cn).await
-        }
-        Slashing::NonSlashable => match &req.payload {
-            SignPayload::RandaoReveal { .. } => state.gate.sign_randao_reveal(&pubkey, root).await,
-            SignPayload::AggregationSlot { .. } => {
-                state.gate.sign_selection_proof(&pubkey, root).await
-            }
-            SignPayload::AggregateAndProof { .. } => {
-                state.gate.sign_aggregate_and_proof(&pubkey, root).await
-            }
-            SignPayload::SyncCommitteeMessage { .. } => {
-                state.gate.sign_sync_committee_message(&pubkey, root).await
-            }
-            SignPayload::SyncCommitteeContributionAndProof { .. } => {
-                state.gate.sign_contribution_and_proof(&pubkey, root).await
-            }
-            // Same gate method as AGGREGATION_SLOT; the dispatcher already applied
-            // the DISTINCT 0x08 domain, so the gate just signs the root.
-            SignPayload::SyncCommitteeSelectionProof { .. } => {
-                state.gate.sign_selection_proof(&pubkey, root).await
-            }
-            SignPayload::ValidatorRegistration { .. } => {
-                state.gate.sign_builder_registration(&pubkey, root).await
-            }
-            SignPayload::VoluntaryExit { .. } => {
-                state.gate.sign_voluntary_exit(&pubkey, root).await
-            }
-            // Electra: SAME gate method as the base AGGREGATE_AND_PROOF; the
-            // dispatcher already applied the (identical) domain over the Electra
-            // SSZ root, so the gate just signs the pre-computed root.
-            SignPayload::AggregateAndProofV2 { .. } => {
-                state.gate.sign_aggregate_and_proof(&pubkey, root).await
-            }
-            // BLOCK_V2 / ATTESTATION are slashable and never yield NonSlashable;
-            // a no-`_` match keeps a future payload variant a compile error.
-            SignPayload::BlockV2 { .. } | SignPayload::Attestation { .. } => {
-                return Err(HttpSignError::BadRequest("internal dispatch mismatch".to_string()))
-            }
-        },
-    }
-    .map_err(HttpSignError::Gate)?;
+    // 4. Shared dispatcher (same A7 metrics path as gRPC). Gate method selection
+    //    is carried on `plan.non_slashable_op` — no second payload→gate match here.
+    let pubkey_bytes = pubkey.to_bytes();
+    let ctx = RequestCtx {
+        client_cn: cn.to_string(),
+        pubkey,
+        pubkey_bytes,
+        rpc_type: http_a7_sign_type(&req.payload),
+    };
+    let sig = dispatch_sign(
+        Some(state.gate.as_ref()),
+        state.backend.as_ref(),
+        Some(state.metrics.as_ref()),
+        &state.audit.backend_name,
+        &ctx,
+        &plan,
+    )
+    .await
+    .map_err(dispatch_err_to_http)?;
 
     // 5. Shape the success body per Accept (FR-17).
     Ok(sign_response(accept, &sig))
+}
+
+/// Map Web3Signer payload types onto the bounded A7 `sign_*` type labels so HTTP
+/// and gRPC populate the same series with the same vocabulary.
+fn http_a7_sign_type(payload: &SignPayload) -> &'static str {
+    match payload {
+        SignPayload::BlockV2 { .. } => grpc_sign_type::BEACON_BLOCK,
+        SignPayload::Attestation { .. } => grpc_sign_type::ATTESTATION_DATA,
+        SignPayload::RandaoReveal { .. } => grpc_sign_type::RANDAO_REVEAL,
+        SignPayload::AggregationSlot { .. } => grpc_sign_type::AGGREGATION_SLOT,
+        SignPayload::AggregateAndProof { .. } | SignPayload::AggregateAndProofV2 { .. } => {
+            grpc_sign_type::AGGREGATE_AND_PROOF
+        }
+        SignPayload::SyncCommitteeMessage { .. } => grpc_sign_type::SYNC_COMMITTEE_MESSAGE,
+        SignPayload::SyncCommitteeContributionAndProof { .. } => {
+            grpc_sign_type::CONTRIBUTION_AND_PROOF
+        }
+        SignPayload::SyncCommitteeSelectionProof { .. } => {
+            grpc_sign_type::SYNC_AGGREGATOR_SELECTION_DATA
+        }
+        SignPayload::ValidatorRegistration { .. } => grpc_sign_type::BUILDER_REGISTRATION,
+        SignPayload::VoluntaryExit { .. } => grpc_sign_type::VOLUNTARY_EXIT,
+    }
+}
+
+fn dispatch_err_to_http(e: DispatchError) -> HttpSignError {
+    match e {
+        DispatchError::Gate(ge) => HttpSignError::Gate(ge),
+        DispatchError::Backend(be) => {
+            // HTTP always has a gate in production; backend-only path is the
+            // insecure no-DB case. Surface as a gate-shaped internal error.
+            tracing::error!(error = %be, "HTTP dispatch backend error");
+            HttpSignError::Gate(signer::SigningGateError::SigningFailed(be.to_string()))
+        }
+        DispatchError::GateRequired => {
+            HttpSignError::BadRequest("slashing protection is not configured".to_string())
+        }
+        DispatchError::PlanMismatch => {
+            HttpSignError::BadRequest("internal dispatch mismatch".to_string())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1271,9 +1286,9 @@ mod tests {
         );
     }
 
-    /// AC: a single `:9101` scrape spans BOTH transports — after exercising a
-    /// gRPC-style series and an HTTP sign on the shared registry, the encoded
-    /// output carries both the gRPC `rvc_signer_sign_total` and the HTTP
+    /// AC: a single `:9101` scrape spans BOTH transports — after a real HTTP
+    /// sign (via shared `dispatch_sign`), the encoded output carries both the
+    /// A7 `rvc_signer_sign_total` series (type×outcome) and the HTTP-only
     /// `rvc_signer_http_sign_total` series.
     #[tokio::test]
     async fn single_scrape_spans_grpc_and_http_series() {
@@ -1282,16 +1297,32 @@ mod tests {
         let metrics = Arc::clone(&state.metrics);
         let id = format!("0x{}", hex::encode(pk_bytes));
 
-        // gRPC-style increment on the shared registry (RF1-09 arity: backend,type,result)...
-        metrics.sign_total.with_label_values(&["basic", "beacon_block", "success"]).inc();
-        // ...and a real HTTP sign on the same registry.
+        // Real HTTP sign — shared dispatcher also records A7 sign_* labels.
         let resp = post_sign(state, &id, None, attestation_body(None)).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
+        assert_eq!(
+            metrics.sign_total.with_label_values(&["basic", "attestation_data", "success"]).get(),
+            1,
+            "HTTP path must record A7 sign_total via dispatch_sign"
+        );
+        assert_eq!(
+            metrics
+                .sign_duration_seconds
+                .with_label_values(&["basic", "attestation_data"])
+                .get_sample_count(),
+            1
+        );
+        assert_eq!(
+            metrics.http_sign_total.with_label_values(&["ATTESTATION", "success"]).get(),
+            1,
+            "Issue 4.5 HTTP-only series still recorded"
+        );
+
         let scrape = String::from_utf8(metrics.encode().unwrap()).unwrap();
-        assert!(scrape.contains("rvc_signer_sign_total"), "gRPC series present");
+        assert!(scrape.contains("rvc_signer_sign_total"), "A7 series present");
         assert!(scrape.contains("rvc_signer_http_sign_total"), "HTTP series present");
-        assert!(scrape.contains("beacon_block"), "gRPC type label present after arity change");
+        assert!(scrape.contains("attestation_data"), "A7 type label from HTTP dispatch");
     }
 
     // ── Issue 5.1: VOLUNTARY_EXIT (P2, non-slashable, FR-13) ──────────────────

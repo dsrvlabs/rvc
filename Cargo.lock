@@ -4562,6 +4562,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tracing-test",
+ "tree_hash",
  "vsss-rs",
  "x509-parser",
  "zeroize",

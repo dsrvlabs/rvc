@@ -45,10 +45,9 @@ fn make_allow_list(entries: Vec<(&str, u64)>) -> Arc<AllowedPeers> {
 }
 
 fn make_db() -> Arc<slashing::SlashingDb> {
-    let f = tempfile::NamedTempFile::new().unwrap();
-    let path = f.path().to_path_buf();
-    std::mem::forget(f);
-    Arc::new(slashing::SlashingDb::open(&path).expect("open test DB"))
+    // In-memory DB — empty NamedTempFile paths fail `open` with CorruptOrEmpty
+    // after the slashing open/migrations split (same pattern as peer_service unit tests).
+    Arc::new(slashing::SlashingDb::open_in_memory().expect("open in-memory test DB"))
 }
 
 fn make_service(

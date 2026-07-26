@@ -40,10 +40,11 @@
 //! per the Ethereum consensus spec.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tonic::{Request, Response, Status};
 use tracing::Span;
+use tree_hash::TreeHash;
 
 use crate::audit;
 use crate::backend::signer_adapter::SigningBackendAsSigner;
@@ -53,8 +54,10 @@ use crate::grpc_common::{
     decode_fork_info, decode_sync_committee_contribution, validate_pubkey, validate_root32,
     validate_selection_proof,
 };
-use crate::metrics::{
-    classify_error, classify_gate_error, grpc_sign_type, record_sign, SignerMetrics,
+use crate::metrics::{grpc_sign_type, SignerMetrics};
+use crate::sign_plan::{
+    dispatch_non_slashable, dispatch_slashable, plan_builder_registration, plan_sign,
+    plan_voluntary_exit, DispatchError, NonSlashableOp, PlanInput, RequestCtx,
 };
 
 // V2 imports
@@ -69,15 +72,10 @@ use crate::proto::signer_v2::{
     SignSyncCommitteeMessageRequest, SignVoluntaryExitRequest,
 };
 
-use crypto::{
-    compute_domain, compute_signing_root, PublicKey, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO,
-};
+use crypto::PublicKey;
 use eth_types::{
     AggregateAndProof, ContributionAndProof, SyncAggregatorSelectionData, ValidatorRegistrationV1,
-    VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
-    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
-    DOMAIN_VOLUNTARY_EXIT,
+    VoluntaryExit,
 };
 use signer::{SigningGate, SigningGateError, ValidatorLockMap};
 use slashing::SlashingDb; // kept for new_v2 constructor parameter type
@@ -303,51 +301,22 @@ fn backend_err_to_status(e: SigningBackendError) -> Status {
     }
 }
 
-/// Record metrics for a gate sign result, then map the error to `Status`.
+/// Map a SignPlan dispatcher error to gRPC `Status`.
 ///
-/// Errors are classified via [`classify_gate_error`] into a bounded
-/// `error_type` set (aligned with HTTP audit labels) before
-/// [`record_sign`] — no Display-string projection, no collapse to
-/// `internal` for slashing/doppelganger.
+/// Metrics are already recorded inside the dispatcher (A7 absorption).
 #[allow(clippy::result_large_err)]
-fn finish_gate_sign(
-    metrics: Option<&SignerMetrics>,
-    backend_name: &str,
-    rpc_type: &'static str,
-    started: Instant,
-    result: Result<Vec<u8>, SigningGateError>,
-) -> Result<Vec<u8>, Status> {
-    match result {
-        Ok(sig) => {
-            record_sign(metrics, backend_name, rpc_type, started, Ok(()));
-            Ok(sig)
-        }
-        Err(e) => {
-            record_sign(metrics, backend_name, rpc_type, started, Err(classify_gate_error(&e)));
-            Err(gate_err_to_status(e))
-        }
-    }
-}
-
-/// Record metrics for a raw backend sign result, then map the error to `Status`.
-///
-/// Errors are classified via [`classify_error`] before [`record_sign`].
-#[allow(clippy::result_large_err)]
-fn finish_backend_sign(
-    metrics: Option<&SignerMetrics>,
-    backend_name: &str,
-    rpc_type: &'static str,
-    started: Instant,
-    result: Result<[u8; 96], SigningBackendError>,
-) -> Result<Vec<u8>, Status> {
-    match result {
-        Ok(sig) => {
-            record_sign(metrics, backend_name, rpc_type, started, Ok(()));
-            Ok(sig.to_vec())
-        }
-        Err(e) => {
-            record_sign(metrics, backend_name, rpc_type, started, Err(classify_error(&e)));
-            Err(backend_err_to_status(e))
+fn dispatch_err_to_status(e: DispatchError) -> Status {
+    match e {
+        DispatchError::Gate(ge) => gate_err_to_status(ge),
+        DispatchError::Backend(be) => backend_err_to_status(be),
+        DispatchError::GateRequired => Status::internal(
+            "slashing protection database is not configured; \
+             restart with a valid --data-dir or --disable-slashing-protection + \
+             RVC_ALLOW_INSECURE=true",
+        ),
+        DispatchError::PlanMismatch => {
+            tracing::error!("sign_plan dispatcher: plan class / entry-point mismatch");
+            Status::internal("internal dispatch mismatch")
         }
     }
 }
@@ -425,29 +394,33 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
-
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
         let block = decode_beacon_block(&r.block_ssz, r.fork_id)?;
         let slot = block.slot;
         Span::current().record("slot", slot);
 
-        let domain = compute_domain(DOMAIN_BEACON_PROPOSER, current_version, gvr);
         // SEC-6c: typed body leaf — malformed Electra body SSZ must error, not panic.
         let object_root = block.try_tree_hash_root().map_err(|e| {
             Status::invalid_argument(format!("invalid block body for tree_hash_root: {e}"))
         })?;
-        let signing_root = compute_signing_root(&object_root.0, domain);
+        let plan =
+            plan_sign(&PlanInput::Block { object_root: object_root.0, slot, fork_version, gvr });
 
-        let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-        let gate = self.require_gate()?;
-        let started = Instant::now();
-        let sig = finish_gate_sign(
+        let ctx = RequestCtx {
+            client_cn: client_cn.clone(),
+            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_bytes,
+            rpc_type: grpc_sign_type::BEACON_BLOCK,
+        };
+        let sig = dispatch_slashable(
+            self.require_gate()?,
             self.metrics.as_deref(),
             &self.backend_name,
-            grpc_sign_type::BEACON_BLOCK,
-            started,
-            gate.sign_block(&pubkey, slot, signing_root, gvr, &client_cn).await,
-        )?;
+            &ctx,
+            &plan,
+        )
+        .await
+        .map_err(dispatch_err_to_status)?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -478,29 +451,32 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
-
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
         let block = decode_blinded_beacon_block(&r.block_ssz, r.fork_id)?;
         let slot = block.slot;
         Span::current().record("slot", slot);
 
-        let domain = compute_domain(DOMAIN_BEACON_PROPOSER, current_version, gvr);
-        // SEC-6c: typed body leaf — malformed Electra body SSZ must error, not panic.
         let object_root = block.try_tree_hash_root().map_err(|e| {
             Status::invalid_argument(format!("invalid blinded block body for tree_hash_root: {e}"))
         })?;
-        let signing_root = compute_signing_root(&object_root.0, domain);
+        let plan =
+            plan_sign(&PlanInput::Block { object_root: object_root.0, slot, fork_version, gvr });
 
-        let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-        let gate = self.require_gate()?;
-        let started = Instant::now();
-        let sig = finish_gate_sign(
+        let ctx = RequestCtx {
+            client_cn: client_cn.clone(),
+            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_bytes,
+            rpc_type: grpc_sign_type::BLINDED_BEACON_BLOCK,
+        };
+        let sig = dispatch_slashable(
+            self.require_gate()?,
             self.metrics.as_deref(),
             &self.backend_name,
-            grpc_sign_type::BLINDED_BEACON_BLOCK,
-            started,
-            gate.sign_block(&pubkey, slot, signing_root, gvr, &client_cn).await,
-        )?;
+            &ctx,
+            &plan,
+        )
+        .await
+        .map_err(dispatch_err_to_status)?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -526,34 +502,28 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
-
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
         let epoch = r.epoch;
         Span::current().record("epoch", epoch);
 
-        // Per FR-P0-3: RANDAO is not slashable.
-        let domain = compute_domain(DOMAIN_RANDAO, current_version, gvr);
-        let signing_root = compute_signing_root(&epoch, domain);
-
-        let started = Instant::now();
-        let sig = if let Some(gate) = &self.gate {
-            let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-            finish_gate_sign(
-                self.metrics.as_deref(),
-                &self.backend_name,
-                grpc_sign_type::RANDAO_REVEAL,
-                started,
-                gate.sign_randao_reveal(&pubkey, signing_root).await,
-            )?
-        } else {
-            finish_backend_sign(
-                self.metrics.as_deref(),
-                &self.backend_name,
-                grpc_sign_type::RANDAO_REVEAL,
-                started,
-                self.backend.sign(&signing_root, &pubkey_bytes).await,
-            )?
+        let plan = plan_sign(&PlanInput::Randao { epoch, fork_version, gvr });
+        let ctx = RequestCtx {
+            client_cn,
+            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_bytes,
+            rpc_type: grpc_sign_type::RANDAO_REVEAL,
         };
+        let sig = dispatch_non_slashable(
+            self.gate.as_deref(),
+            self.backend.as_ref(),
+            self.metrics.as_deref(),
+            &self.backend_name,
+            &ctx,
+            &plan,
+            NonSlashableOp::RandaoReveal,
+        )
+        .await
+        .map_err(dispatch_err_to_status)?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -583,36 +553,28 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
-
-        // Decode AttestationData from proto message fields.
-        // Per ISSUE-1.6b spec: the proto carries AttestationData as explicit fields.
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
         // EIP-7549 index-zeroing is the client's responsibility (H-2 / Phase 2).
         let (att_data, source_epoch, target_epoch) = decode_attestation_data(r.data)?;
         Span::current().record("source_epoch", source_epoch);
         Span::current().record("target_epoch", target_epoch);
 
-        let domain = compute_domain(DOMAIN_BEACON_ATTESTER, current_version, gvr);
-        let signing_root = compute_signing_root(&att_data, domain);
-
-        let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-        let gate = self.require_gate()?;
-        let started = Instant::now();
-        let sig = finish_gate_sign(
+        let plan = plan_sign(&PlanInput::Attestation { data: att_data, fork_version, gvr });
+        let ctx = RequestCtx {
+            client_cn: client_cn.clone(),
+            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_bytes,
+            rpc_type: grpc_sign_type::ATTESTATION_DATA,
+        };
+        let sig = dispatch_slashable(
+            self.require_gate()?,
             self.metrics.as_deref(),
             &self.backend_name,
-            grpc_sign_type::ATTESTATION_DATA,
-            started,
-            gate.sign_attestation(
-                &pubkey,
-                source_epoch,
-                target_epoch,
-                signing_root,
-                gvr,
-                &client_cn,
-            )
-            .await,
-        )?;
+            &ctx,
+            &plan,
+        )
+        .await
+        .map_err(dispatch_err_to_status)?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -626,11 +588,7 @@ impl SignerServiceV2 for SignerServiceImpl {
 
     // ── SignAggregateAndProof ─────────────────────────────────────────────────
     //
-    // SS-2/SS-3 FIX (Issue 2.10a): the previous handler erroneously called
-    // `stage_attestation` for the aggregate path.  Routing through
-    // `gate.sign_aggregate_and_proof` removes that staging because aggregate
-    // signing is NOT slashable by the Ethereum consensus spec.  The inner
-    // attestation's slashing watermark was already committed by `sign_attestation`.
+    // SS-2/SS-3: non-slashable. Aggregate staging is intentionally NOT performed.
 
     #[allow(clippy::result_large_err)]
     #[tracing::instrument(
@@ -650,11 +608,8 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
-
-        // Decode the inner Attestation from aggregate_ssz.
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
         let attestation = decode_attestation(&r.aggregate_ssz, r.fork_id)?;
-
         let source_epoch = attestation.data.source.epoch;
         let target_epoch = attestation.data.target.epoch;
         Span::current().record("source_epoch", source_epoch);
@@ -666,32 +621,33 @@ impl SignerServiceV2 for SignerServiceImpl {
             aggregate: attestation,
             selection_proof,
         };
+        // Fallible HTR — match HTTP: oversize aggregation_bits → 400, never panic.
+        let object_root = agg_and_proof
+            .try_tree_hash_root()
+            .map_err(|_| Status::invalid_argument("invalid aggregate_and_proof"))?;
+        let plan = plan_sign(&PlanInput::AggregateAndProof {
+            object_root: object_root.0,
+            fork_version,
+            gvr,
+        });
 
-        let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, current_version, gvr);
-        let signing_root = compute_signing_root(&agg_and_proof, domain);
-
-        // SS-2/SS-3: route through gate.sign_aggregate_and_proof which is non-slashable.
-        // No attestation staging occurs here.  Also works without a slashing DB
-        // (--disable-slashing-protection) since aggregates are non-slashable.
-        let started = Instant::now();
-        let sig = if let Some(gate) = &self.gate {
-            let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-            finish_gate_sign(
-                self.metrics.as_deref(),
-                &self.backend_name,
-                grpc_sign_type::AGGREGATE_AND_PROOF,
-                started,
-                gate.sign_aggregate_and_proof(&pubkey, signing_root).await,
-            )?
-        } else {
-            finish_backend_sign(
-                self.metrics.as_deref(),
-                &self.backend_name,
-                grpc_sign_type::AGGREGATE_AND_PROOF,
-                started,
-                self.backend.sign(&signing_root, &pubkey_bytes).await,
-            )?
+        let ctx = RequestCtx {
+            client_cn: client_cn.clone(),
+            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_bytes,
+            rpc_type: grpc_sign_type::AGGREGATE_AND_PROOF,
         };
+        let sig = dispatch_non_slashable(
+            self.gate.as_deref(),
+            self.backend.as_ref(),
+            self.metrics.as_deref(),
+            &self.backend_name,
+            &ctx,
+            &plan,
+            NonSlashableOp::AggregateAndProof,
+        )
+        .await
+        .map_err(dispatch_err_to_status)?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -725,37 +681,30 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
-
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
         let slot = r.slot;
         Span::current().record("slot", slot);
-
         let beacon_block_root = validate_root32(&r.beacon_block_root, "beacon_block_root")?;
 
-        // Sync committee messages sign over beacon_block_root directly.
-        // Domain: DOMAIN_SYNC_COMMITTEE (0x07000000).
-        let domain = compute_domain(DOMAIN_SYNC_COMMITTEE, current_version, gvr);
-        let signing_root = compute_signing_root(&beacon_block_root, domain);
-
-        let started = Instant::now();
-        let sig = if let Some(gate) = &self.gate {
-            let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-            finish_gate_sign(
-                self.metrics.as_deref(),
-                &self.backend_name,
-                grpc_sign_type::SYNC_COMMITTEE_MESSAGE,
-                started,
-                gate.sign_sync_committee_message(&pubkey, signing_root).await,
-            )?
-        } else {
-            finish_backend_sign(
-                self.metrics.as_deref(),
-                &self.backend_name,
-                grpc_sign_type::SYNC_COMMITTEE_MESSAGE,
-                started,
-                self.backend.sign(&signing_root, &pubkey_bytes).await,
-            )?
+        let plan =
+            plan_sign(&PlanInput::SyncCommitteeMessage { beacon_block_root, fork_version, gvr });
+        let ctx = RequestCtx {
+            client_cn: client_cn.clone(),
+            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_bytes,
+            rpc_type: grpc_sign_type::SYNC_COMMITTEE_MESSAGE,
         };
+        let sig = dispatch_non_slashable(
+            self.gate.as_deref(),
+            self.backend.as_ref(),
+            self.metrics.as_deref(),
+            &self.backend_name,
+            &ctx,
+            &plan,
+            NonSlashableOp::SyncCommitteeMessage,
+        )
+        .await
+        .map_err(dispatch_err_to_status)?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -788,37 +737,32 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
-
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
         let slot = r.slot;
         Span::current().record("slot", slot);
 
-        // Domain: DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF (0x08000000).
-        // Message: SyncAggregatorSelectionData { slot, subcommittee_index }.
-        let domain = compute_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, current_version, gvr);
-        let selection_data =
-            SyncAggregatorSelectionData { slot, subcommittee_index: r.subcommittee_index };
-        let signing_root = compute_signing_root(&selection_data, domain);
-
-        let started = Instant::now();
-        let sig = if let Some(gate) = &self.gate {
-            let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-            finish_gate_sign(
-                self.metrics.as_deref(),
-                &self.backend_name,
-                grpc_sign_type::SYNC_AGGREGATOR_SELECTION_DATA,
-                started,
-                gate.sign_selection_proof(&pubkey, signing_root).await,
-            )?
-        } else {
-            finish_backend_sign(
-                self.metrics.as_deref(),
-                &self.backend_name,
-                grpc_sign_type::SYNC_AGGREGATOR_SELECTION_DATA,
-                started,
-                self.backend.sign(&signing_root, &pubkey_bytes).await,
-            )?
+        let plan = plan_sign(&PlanInput::SyncCommitteeSelection {
+            data: SyncAggregatorSelectionData { slot, subcommittee_index: r.subcommittee_index },
+            fork_version,
+            gvr,
+        });
+        let ctx = RequestCtx {
+            client_cn: client_cn.clone(),
+            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_bytes,
+            rpc_type: grpc_sign_type::SYNC_AGGREGATOR_SELECTION_DATA,
         };
+        let sig = dispatch_non_slashable(
+            self.gate.as_deref(),
+            self.backend.as_ref(),
+            self.metrics.as_deref(),
+            &self.backend_name,
+            &ctx,
+            &plan,
+            NonSlashableOp::SelectionProof,
+        )
+        .await
+        .map_err(dispatch_err_to_status)?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -856,45 +800,37 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
-
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
         let contribution = decode_sync_committee_contribution(&r.contribution_ssz, r.fork_id)?;
-
         let slot = contribution.slot;
         Span::current().record("slot", slot);
 
-        // The server does NOT verify the selection_proof BLS signature — it is
-        // the client's responsibility — but its length is enforced (96 bytes).
         let selection_proof = validate_selection_proof(&r.selection_proof)?;
         let cap = ContributionAndProof {
             aggregator_index: r.aggregator_index,
             contribution,
             selection_proof,
         };
+        let object_root = cap.tree_hash_root().0;
+        let plan = plan_sign(&PlanInput::ContributionAndProof { object_root, fork_version, gvr });
 
-        // Domain: DOMAIN_CONTRIBUTION_AND_PROOF (0x09000000).
-        let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, current_version, gvr);
-        let signing_root = compute_signing_root(&cap, domain);
-
-        let started = Instant::now();
-        let sig = if let Some(gate) = &self.gate {
-            let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-            finish_gate_sign(
-                self.metrics.as_deref(),
-                &self.backend_name,
-                grpc_sign_type::CONTRIBUTION_AND_PROOF,
-                started,
-                gate.sign_contribution_and_proof(&pubkey, signing_root).await,
-            )?
-        } else {
-            finish_backend_sign(
-                self.metrics.as_deref(),
-                &self.backend_name,
-                grpc_sign_type::CONTRIBUTION_AND_PROOF,
-                started,
-                self.backend.sign(&signing_root, &pubkey_bytes).await,
-            )?
+        let ctx = RequestCtx {
+            client_cn: client_cn.clone(),
+            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_bytes,
+            rpc_type: grpc_sign_type::CONTRIBUTION_AND_PROOF,
         };
+        let sig = dispatch_non_slashable(
+            self.gate.as_deref(),
+            self.backend.as_ref(),
+            self.metrics.as_deref(),
+            &self.backend_name,
+            &ctx,
+            &plan,
+            NonSlashableOp::ContributionAndProof,
+        )
+        .await
+        .map_err(dispatch_err_to_status)?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -908,12 +844,8 @@ impl SignerServiceV2 for SignerServiceImpl {
 
     // ── SignBuilderRegistration ────────────────────────────────────────────────
     //
-    // domain = DOMAIN_APPLICATION_BUILDER + GENESIS_FORK_VERSION + ZERO_HASH
-    // GENESIS_FORK_VERSION is the per-network config value carried on the request
-    // (mainnet 0x00000000, Holesky 0x01017000, …; empty ⇒ mainnet). The genesis
-    // validators root is a zero hash, NOT sourced from ForkInfo.
-    //
-    // Not slashable — no stage/commit calls.
+    // domain = DOMAIN_APPLICATION_BUILDER + GENESIS_FORK_VERSION + ZERO_HASH.
+    // Empty genesis_fork_version ⇒ mainnet. Not slashable.
     #[tracing::instrument(name = "signer.v2.sign_builder_registration", skip_all, fields(pubkey))]
     async fn sign_builder_registration(
         &self,
@@ -941,8 +873,6 @@ impl SignerServiceV2 for SignerServiceImpl {
             pubkey: pubkey_bytes,
         };
 
-        // Per-network GENESIS_FORK_VERSION from the request; empty ⇒ mainnet
-        // 0x00000000 (back-compat). ZERO_HASH=[0u8;32] for the genesis gvr.
         let genesis_fork_version: [u8; 4] = if r.genesis_fork_version.is_empty() {
             [0u8; 4]
         } else {
@@ -953,29 +883,25 @@ impl SignerServiceV2 for SignerServiceImpl {
                 ))
             })?
         };
-        let zero_hash = [0u8; 32];
-        let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_hash);
-        let signing_root = compute_signing_root(&registration, domain);
+        let plan = plan_builder_registration(&registration, genesis_fork_version);
 
-        let started = Instant::now();
-        let sig = if let Some(gate) = &self.gate {
-            let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-            finish_gate_sign(
-                self.metrics.as_deref(),
-                &self.backend_name,
-                grpc_sign_type::BUILDER_REGISTRATION,
-                started,
-                gate.sign_builder_registration(&pubkey, signing_root).await,
-            )?
-        } else {
-            finish_backend_sign(
-                self.metrics.as_deref(),
-                &self.backend_name,
-                grpc_sign_type::BUILDER_REGISTRATION,
-                started,
-                self.backend.sign(&signing_root, &pubkey_bytes).await,
-            )?
+        let ctx = RequestCtx {
+            client_cn,
+            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_bytes,
+            rpc_type: grpc_sign_type::BUILDER_REGISTRATION,
         };
+        let sig = dispatch_non_slashable(
+            self.gate.as_deref(),
+            self.backend.as_ref(),
+            self.metrics.as_deref(),
+            &self.backend_name,
+            &ctx,
+            &plan,
+            NonSlashableOp::BuilderRegistration,
+        )
+        .await
+        .map_err(dispatch_err_to_status)?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -986,12 +912,7 @@ impl SignerServiceV2 for SignerServiceImpl {
 
     // ── SignVoluntaryExit ──────────────────────────────────────────────────────
     //
-    // Domain: DOMAIN_VOLUNTARY_EXIT + fork_info.current_version + gvr.
-    //
-    // EIP-7044 caller responsibility: the caller MUST pass a `current_version`
-    // that is already Capella-capped for any post-Capella exit.
-    //
-    // Not slashable — no stage/commit calls.
+    // EIP-7044: caller supplies Capella-capped current_version. Not slashable.
     #[tracing::instrument(
         name = "signer.v2.sign_voluntary_exit",
         skip_all,
@@ -1009,38 +930,32 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
-
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
         let epoch = r.epoch;
         let validator_index = r.validator_index;
         Span::current().record("epoch", epoch);
         Span::current().record("validator_index", validator_index);
 
         let exit = VoluntaryExit { epoch, validator_index };
+        let plan = plan_voluntary_exit(&exit, fork_version, gvr);
 
-        // Domain: DOMAIN_VOLUNTARY_EXIT + current_version (caller-capped per EIP-7044).
-        let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, current_version, gvr);
-        let signing_root = compute_signing_root(&exit, domain);
-
-        let started = Instant::now();
-        let sig = if let Some(gate) = &self.gate {
-            let pubkey = pubkey_from_bytes(&pubkey_bytes)?;
-            finish_gate_sign(
-                self.metrics.as_deref(),
-                &self.backend_name,
-                grpc_sign_type::VOLUNTARY_EXIT,
-                started,
-                gate.sign_voluntary_exit(&pubkey, signing_root).await,
-            )?
-        } else {
-            finish_backend_sign(
-                self.metrics.as_deref(),
-                &self.backend_name,
-                grpc_sign_type::VOLUNTARY_EXIT,
-                started,
-                self.backend.sign(&signing_root, &pubkey_bytes).await,
-            )?
+        let ctx = RequestCtx {
+            client_cn,
+            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_bytes,
+            rpc_type: grpc_sign_type::VOLUNTARY_EXIT,
         };
+        let sig = dispatch_non_slashable(
+            self.gate.as_deref(),
+            self.backend.as_ref(),
+            self.metrics.as_deref(),
+            &self.backend_name,
+            &ctx,
+            &plan,
+            NonSlashableOp::VoluntaryExit,
+        )
+        .await
+        .map_err(dispatch_err_to_status)?;
 
         tracing::info!(
             pubkey = %pubkey_hex_str,
@@ -1633,6 +1548,9 @@ mod tests {
     #[test]
     fn test_sign_recording_helper_no_ops_without_metrics() {
         // Free-standing helper is safe with None (also covered in metrics unit tests).
+        // A7 absorption: the dispatcher calls this helper; handlers do not.
+        use crate::metrics::record_sign;
+        use std::time::Instant;
         record_sign(None, "basic", grpc_sign_type::BEACON_BLOCK, Instant::now(), Ok(()));
         record_sign(
             None,
@@ -1640,6 +1558,42 @@ mod tests {
             grpc_sign_type::BEACON_BLOCK,
             Instant::now(),
             Err("key_not_found"),
+        );
+    }
+
+    /// A7 scrape gate: after a real gRPC sign via the dispatcher, the scrape
+    /// text still contains the RF1-09 series (helper absorbed, not deleted).
+    #[tokio::test]
+    async fn test_a7_scrape_test_still_green() {
+        let pubkey = test_pubkey_bytes();
+        let (svc, metrics) = make_service_v2_with_metrics(MockBackend::with_test_key());
+        let req = Request::new(SignBeaconBlockRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            block_ssz: sample_block_ssz(42),
+            fork_id: 4,
+        });
+        svc.sign_beacon_block(req).await.unwrap();
+        let scrape = String::from_utf8(metrics.encode().unwrap()).unwrap();
+        assert!(scrape.contains("rvc_signer_sign_total"), "scrape: {scrape}");
+        assert!(scrape.contains("rvc_signer_sign_duration_seconds"), "scrape: {scrape}");
+        // sign_errors_total is always registered even when zero.
+        assert!(scrape.contains("rvc_signer_sign_errors_total") || scrape.contains("sign_total"));
+        assert!(scrape.contains("beacon_block"), "scrape: {scrape}");
+        assert!(scrape.contains("success"), "scrape: {scrape}");
+        assert_eq!(
+            metrics
+                .sign_total
+                .with_label_values(&["basic", grpc_sign_type::BEACON_BLOCK, "success"])
+                .get(),
+            1
+        );
+        assert_eq!(
+            metrics
+                .sign_duration_seconds
+                .with_label_values(&["basic", grpc_sign_type::BEACON_BLOCK])
+                .get_sample_count(),
+            1
         );
     }
 
