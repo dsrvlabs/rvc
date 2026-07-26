@@ -26,13 +26,11 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 ssz.workspace = true
-ssz_derive.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
 tree_hash.workspace = true
-tree_hash_derive.workspace = true
 uuid.workspace = true
 zeroize.workspace = true
 hkdf.workspace = true
@@ -40,9 +38,6 @@ num-bigint.workspace = true
 parking_lot.workspace = true
 bip39.workspace = true
 rayon.workspace = true
-
-[features]
-test-utils = []
 
 [dev-dependencies]
 eth-types = { workspace = true, features = ["test-fixtures"] }

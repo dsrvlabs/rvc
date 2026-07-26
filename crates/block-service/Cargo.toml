@@ -27,7 +27,7 @@ serde_json.workspace = true
 validator-store.workspace = true
 
 [dev-dependencies]
-crypto = { workspace = true, features = ["test-utils"] }
+crypto.workspace = true
 eth-types = { workspace = true, features = ["test-fixtures"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
 toml.workspace = true

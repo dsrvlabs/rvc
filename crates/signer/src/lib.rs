@@ -142,16 +142,16 @@ impl SigningEnablement for FailClosedEnablement {
 
 /// Enablement that permits every pubkey.
 ///
-/// **Test / test-helpers only.** Gated by `cfg(any(test, feature = "test-helpers"))`
+/// **Test / test-utils only.** Gated by `cfg(any(test, feature = "test-utils"))`
 /// so production dependency lines cannot import it without an explicit feature.
 /// Do **not** wire this into production `build_signer` / `main.rs`. SEC-2b
 /// operator opt-out must use a distinctly named type (e.g.
 /// `DoppelgangerDisabledByOperator`), not this helper.
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub struct AlwaysEnabled;
 
-#[cfg(any(test, feature = "test-helpers"))]
+#[cfg(any(test, feature = "test-utils"))]
 impl SigningEnablement for AlwaysEnabled {
     fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
         true
@@ -160,8 +160,8 @@ impl SigningEnablement for AlwaysEnabled {
 
 /// Convenience constructor for [`AlwaysEnabled`].
 ///
-/// Available only under `cfg(test)` or the `test-helpers` feature.
-#[cfg(any(test, feature = "test-helpers"))]
+/// Available only under `cfg(test)` or the `test-utils` feature.
+#[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 #[must_use]
 pub fn always_enabled() -> Arc<dyn SigningEnablement> {
@@ -193,7 +193,7 @@ impl SignerService {
     /// Replace the signing enablement gate (builder style).
     ///
     /// Production paths wire `ForwardWindowMachine` (SEC-2b).  Tests that need
-    /// unrestricted signing use `always_enabled()` (requires `test-helpers`
+    /// unrestricted signing use `always_enabled()` (requires `test-utils`
     /// feature or `cfg(test)`).
     #[must_use]
     pub fn with_enablement(mut self, enablement: Arc<dyn SigningEnablement>) -> Self {

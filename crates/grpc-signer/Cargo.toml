@@ -17,7 +17,6 @@ eth-types.workspace = true
 hex.workspace = true
 prost.workspace = true
 signer-proto = { workspace = true, features = ["server", "client"] }
-thiserror.workspace = true
 tonic = { workspace = true, features = ["transport", "tls"] }
 tracing.workspace = true
 url.workspace = true
@@ -25,7 +24,7 @@ zeroize.workspace = true
 
 [dev-dependencies]
 eth-types = { workspace = true, features = ["test-fixtures"] }
-rcgen = "0.13"
+rcgen.workspace = true
 slashing.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

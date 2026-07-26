@@ -63,6 +63,10 @@ tonic = "0.12"
 prost = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 reqwest-eventsource = "0.6"
+futures = "0.3"
+hyper = "1"
+http-body-util = "0.1"
+rcgen = "0.13"
 
 # OpenTelemetry
 opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }

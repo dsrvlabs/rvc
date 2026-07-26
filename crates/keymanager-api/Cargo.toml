@@ -34,8 +34,8 @@ zeroize.workspace = true
 [dev-dependencies]
 axum = { workspace = true, features = ["macros"] }
 parking_lot.workspace = true
-http-body-util = "0.1"
-hyper = "1"
+http-body-util.workspace = true
+hyper.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time", "test-util"] }
 tower = { workspace = true, features = ["util"] }

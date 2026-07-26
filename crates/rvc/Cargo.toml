@@ -55,14 +55,14 @@ tonic-build.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
-crypto = { workspace = true, features = ["test-utils"] }
-http-body-util = "0.1"
+crypto.workspace = true
+http-body-util.workspace = true
 # Used by pipeline_slashing.rs to poison a file-backed SlashingDb (DROP TABLE)
 # for the RF1-02 fail-closed DB-error integration test.
 rusqlite = { workspace = true, features = ["bundled"] }
 serde_json.workspace = true
-# test-helpers: AlwaysEnabled for orchestrator unit/integration tests (SEC-2a).
-signer = { workspace = true, features = ["test-helpers"] }
+# test-utils: AlwaysEnabled for orchestrator unit/integration tests (SEC-2a).
+signer = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tower = { workspace = true, features = ["util"] }
 tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }

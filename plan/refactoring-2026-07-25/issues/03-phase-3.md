@@ -482,16 +482,16 @@ HEAD: `crypto`'s `ssz_derive` and `tree_hash_derive` (0 source references each),
   (`Cargo.toml:50-58`).
 
 **Acceptance criteria.**
-- [ ] The four unused dependencies are gone; `cargo machete` (or `cargo udeps --workspace`) reports
+- [x] The four unused dependencies are gone; `cargo machete` (or `cargo udeps --workspace`) reports
       clean for `crypto`, `metrics`, `grpc-signer`, `bn-manager`.
-- [ ] `crypto`'s `test-utils = []` and its three downstream feature requests are deleted (per
+- [x] `crypto`'s `test-utils = []` and its three downstream feature requests are deleted (per
       assumption A5 — H2 reintroduces a real one in Phase 6 if needed).
-- [ ] `signer`'s feature is named `test-utils`; no `test-helpers` string remains in any Cargo.toml
+- [x] `signer`'s feature is named `test-utils`; no `test-helpers` string remains in any Cargo.toml
       or `cfg` attribute.
-- [ ] `futures`, `rcgen`, `hyper`, `http-body-util` are declared in `[workspace.dependencies]` and
+- [x] `futures`, `rcgen`, `hyper`, `http-body-util` are declared in `[workspace.dependencies]` and
       consumed via `.workspace = true`; `bin/rvc-signer`'s prod (`server,http1`) vs dev (`client`)
       `hyper` feature split is preserved.
-- [ ] `Cargo.lock` shows no new or changed resolved versions.
+- [x] `Cargo.lock` shows no new or changed resolved versions.
 
 **TDD test plan.**
 - **RED first:** `cargo machete` (or `cargo udeps`) run recorded in the PR showing the four findings
