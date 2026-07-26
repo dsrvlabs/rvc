@@ -1137,14 +1137,14 @@ self-contained clusters out: connection opening (`open` `:100`, `open_with_creat
 4. Delete `migration.rs`.
 
 **Acceptance criteria:**
-- [ ] Git move detection (`git diff -M`) shows the change as renames/moves; **no behavioral edit** other
+- [x] Git move detection (`git diff -M`) shows the change as renames/moves; **no behavioral edit** other
       than the `read_schema_version` deduplication, which is called out explicitly in the PR.
-- [ ] `crates/slashing`'s public API is byte-identical (`cargo public-api` diff or an explicit
+- [x] `crates/slashing`'s public API is byte-identical (`cargo public-api` diff or an explicit
       re-export audit).
-- [ ] Test count is unchanged (CI test-count diff attached, per plan §6.7).
-- [ ] One `read_schema_version` remains (`rg` proof).
-- [ ] A2 conformance suite green.
-- [ ] Standing invariant green.
+- [x] Test count is unchanged (CI test-count diff attached, per plan §6.7).
+- [x] One `read_schema_version` remains (`rg` proof).
+- [x] A2 conformance suite green.
+- [x] Standing invariant green.
 
 **TDD test plan:** code motion — the existing suite is the oracle. **RED first:** before moving anything,
 add `test_schema_version_readers_agree` asserting `db.rs`'s and `migration.rs`'s readers return the same
