@@ -69,20 +69,21 @@ pub enum SigningGateError {
     ///
     /// | Cause | Typical row fate |
     /// |---|---|
-    /// | Backend error path (today) | Discarded (ROLLBACK) |
+    /// | Unambiguous no-signature (`KeyNotFound`, `LocalRejected`, `UnsupportedSigningType`) | Discarded (ROLLBACK) |
     /// | Sign **timeout** + [`crate::TimeoutPolicy::DiscardStagedRow`] | Discarded |
     /// | Sign **timeout** + [`crate::TimeoutPolicy::RetainStagedRow`] | **Committed** (fail-closed history; slot/epoch consumed) |
+    /// | Ambiguous backend error + [`crate::TimeoutPolicy::DiscardStagedRow`] | Discarded |
+    /// | Ambiguous backend error + [`crate::TimeoutPolicy::RetainStagedRow`] | **Committed** (remote may have signed) |
     /// | Panic of the blocking task after stage | Unspecified — treat history as possibly written |
     ///
     /// Callers **must not** treat `SigningFailed` as “slot free / different-root
-    /// retry safe.” After a retain-on-timeout path, a conflicting different-root
-    /// retry is blocked by stage (EIP-3076); only same-root re-sign may apply.
+    /// retry safe.” After a retain path, a conflicting different-root retry is
+    /// blocked by stage (EIP-3076); only same-root re-sign may apply.
     /// [`SigningGateError::permits_retry_with_root`] does **not** special-case
     /// this variant (it only authorizes `CommitFailed` same-root retry).
     ///
-    /// See [`crate::TimeoutPolicy`]: policy currently applies to the **timeout**
-    /// arm only; non-timeout `SigningError` arms still discard today (RF4-06 must
-    /// decide retain for ambiguous remote errors).
+    /// See [`crate::TimeoutPolicy`]: policy applies to timeout **and** ambiguous
+    /// non-timeout signer errors (not `KeyNotFound`).
     #[error("signing backend failed: {0}")]
     SigningFailed(String),
 

@@ -11,6 +11,15 @@ pub enum SigningError {
     #[error("key not found: {0}")]
     KeyNotFound(String),
 
+    /// Local precondition failed with **no remote I/O** and no signature produced.
+    ///
+    /// Examples: raw-root `Signer::sign` called for a gRPC-only key (TypedSigner
+    /// required). Safe to discard a staged slashing row — the remote was never
+    /// contacted. Distinct from [`Self::RemoteSignerError`], which may follow
+    /// a possible remote sign.
+    #[error("signing rejected locally (no remote contact): {0}")]
+    LocalRejected(String),
+
     #[error("remote signer error: {0}")]
     RemoteSignerError(String),
 
@@ -21,6 +30,17 @@ pub enum SigningError {
     /// (SEC-8). Never falls back to a bare `{signing_root}` body.
     #[error("unsupported remote signing type: {0}")]
     UnsupportedSigningType(String),
+}
+
+impl SigningError {
+    /// True when no remote signature can have been produced (safe to discard staged rows).
+    #[must_use]
+    pub fn is_unambiguous_no_signature(&self) -> bool {
+        matches!(
+            self,
+            Self::KeyNotFound(_) | Self::LocalRejected(_) | Self::UnsupportedSigningType(_)
+        )
+    }
 }
 
 #[async_trait]

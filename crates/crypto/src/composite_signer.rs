@@ -73,6 +73,11 @@ impl CompositeSigner {
         self.grpc_remote.read().contains_key(pubkey)
     }
 
+    /// Returns true if an HTTP (Web3Signer) remote is registered for the pubkey.
+    pub fn has_remote_key(&self, pubkey: &[u8; PUBLIC_KEY_BYTES_LEN]) -> bool {
+        self.remote.read().contains_key(pubkey)
+    }
+
     pub fn add_remote_key(&self, pubkey: [u8; PUBLIC_KEY_BYTES_LEN], signer: RemoteSigner) {
         let pubkey_hex = hex::encode(pubkey);
         info!(pubkey = %TruncatedPubkey::new(&pubkey_hex), "Added remote signer key");
@@ -155,7 +160,8 @@ impl Signer for CompositeSigner {
                     pubkey = %TruncatedPubkey::new(&pk_hex),
                     "raw-root Signer::sign called for a gRPC remote key — use TypedSigner instead"
                 );
-                return Err(SigningError::RemoteSignerError(
+                // LocalRejected: never contacted the remote — staged-row discard is safe.
+                return Err(SigningError::LocalRejected(
                     "raw-root signing is not supported for gRPC remote signers; \
                      use TypedSigner::sign_block / sign_attestation / etc."
                         .to_string(),
@@ -626,11 +632,12 @@ mod tests {
         let result = composite.sign(&signing_root, &pk_bytes).await;
         assert!(result.is_err(), "raw-root sign on gRPC remote key must fail");
         let err = result.unwrap_err();
+        assert!(err.is_unambiguous_no_signature(), "gRPC raw-root reject must be discard-safe");
         match err {
-            SigningError::RemoteSignerError(msg) => {
+            SigningError::LocalRejected(msg) => {
                 assert!(msg.contains("TypedSigner"), "error message should mention TypedSigner");
             }
-            other => panic!("expected RemoteSignerError, got: {other:?}"),
+            other => panic!("expected LocalRejected, got: {other:?}"),
         }
     }
 

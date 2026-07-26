@@ -514,17 +514,17 @@ via RF4-03's `CommitFailed`.
 4. The service also gains `PubkeyScopedDb` auditing, which the gate already had.
 
 **Acceptance criteria:**
-- [ ] **Late-completion test (phase-gate criterion):** with a remote-backed pubkey and a mock signer that
+- [x] **Late-completion test (phase-gate criterion):** with a remote-backed pubkey and a mock signer that
       completes *after* the timeout expires, the first sign returns a timeout error, and a **subsequent
       conflicting sign for the same slot / target epoch is blocked**. This test must be named in the PR
       and must fail if `DiscardStagedRow` is ever used for a remote pubkey.
-- [ ] A same-root retry after a timeout is permitted; a different-root retry after a timeout is blocked.
-- [ ] An in-process pubkey still discards on timeout (no phantom row) — gate parity preserved.
-- [ ] `BackendKind::Unknown` resolves to `RetainStagedRow` (fail-closed), asserted by test.
-- [ ] Every metric the service recorded before is still recorded, with identical label values
+- [x] A same-root retry after a timeout is permitted; a different-root retry after a timeout is blocked.
+- [x] An in-process pubkey still discards on timeout (no phantom row) — gate parity preserved.
+- [x] `BackendKind::Unknown` resolves to `RetainStagedRow` (fail-closed), asserted by test.
+- [x] Every metric the service recorded before is still recorded, with identical label values
       (before/after scrape comparison in the PR).
-- [ ] **A3's pipeline slashing tests are green**, unmodified.
-- [ ] Standing invariant green.
+- [x] **A3's pipeline slashing tests are green**, unmodified.
+- [x] Standing invariant green.
 
 **TDD test plan** (`crates/signer/src/lib.rs` `#[cfg(test)]`):
 - **RED first:** `test_remote_backend_timeout_then_late_completion_blocks_conflicting_sign` — the

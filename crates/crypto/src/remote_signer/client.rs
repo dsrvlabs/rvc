@@ -85,10 +85,11 @@ impl RemoteSigner {
 
     /// Creates a `RemoteSigner` without running the insecure-URL gate check.
     ///
-    /// **For unit tests only.**  Production callers must use [`Self::new`],
-    /// which enforces the `InsecureMode::Refuse` gate (ISSUE-3.13 / NFR-10).
-    #[cfg(test)]
-    pub(crate) fn new_unchecked(
+    /// **For tests / fixtures only** (e.g. registering a remote pubkey for
+    /// policy resolution without dialing Web3Signer). Production callers must
+    /// use [`Self::new`], which enforces the `InsecureMode::Refuse` gate
+    /// (ISSUE-3.13 / NFR-10).
+    pub fn new_for_tests(
         config: RemoteSignerConfig,
         pubkeys: Vec<[u8; PUBLIC_KEY_BYTES_LEN]>,
     ) -> Self {
@@ -96,6 +97,15 @@ impl RemoteSigner {
         let client =
             Client::builder().timeout(config.timeout).build().expect("test http client build");
         Self { client, url, pubkeys }
+    }
+
+    /// Alias kept for in-crate tests that predate [`Self::new_for_tests`].
+    #[cfg(test)]
+    pub(crate) fn new_unchecked(
+        config: RemoteSignerConfig,
+        pubkeys: Vec<[u8; PUBLIC_KEY_BYTES_LEN]>,
+    ) -> Self {
+        Self::new_for_tests(config, pubkeys)
     }
 
     /// POST a fully-typed Web3Signer body and re-verify the returned signature

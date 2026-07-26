@@ -18,18 +18,20 @@
 //!   `SigningFailed("signer timed out")` — history is **retained**, not discarded
 //!   (see [`SigningGateError::SigningFailed`] docs).
 //!
-//! ## Scope of `TimeoutPolicy` (RF4-05 vs RF4-06)
+//! ## Scope of `TimeoutPolicy`
 //!
-//! **Today the policy is consulted only on the client-side timeout arm**
-//! (`tokio::time::timeout` elapsed). Non-timeout `SigningError` outcomes
-//! (`KeyNotFound`, `RemoteSignerError`, transport/HTTP failures, etc.) **always
-//! discard** the staged row, regardless of policy.
+//! [`TimeoutPolicy`] is consulted on:
 //!
-//! That is correct for proven local backends (gate production path). It is **not**
-//! sufficient for remote backends: a post-sign connection reset or 5xx can be as
-//! ambiguous as a timeout. **RF4-06 must choose retain/fail-closed for ambiguous
-//! remote errors**, not only for timeout — do not assume timeout is the sole
-//! late-completion window.
+//! 1. **Client-side timeout** (`tokio::time::timeout` elapsed).
+//! 2. **Ambiguous non-timeout signer errors** (e.g. `RemoteSignerError`,
+//!    transport/HTTP failures, invalid remote signature) — outcomes where the
+//!    remote **may** already have signed. Under
+//!    [`TimeoutPolicy::RetainStagedRow`] the staged row is **committed**
+//!    (fail-closed). Under [`TimeoutPolicy::DiscardStagedRow`] it is rolled back.
+//!
+//! Unambiguous **no-signature** outcomes always discard regardless of policy:
+//! `KeyNotFound`, `LocalRejected` (e.g. gRPC raw-root without remote I/O), and
+//! `UnsupportedSigningType`.
 //!
 //! # `!Send` staging guards
 //!
@@ -64,19 +66,22 @@ use crate::locks::ValidatorLockMap;
 /// explicitly so a new remote-backend path cannot accidentally inherit
 /// discard-on-timeout (a double-sign hazard).
 ///
-/// # Timeout-only (RF4-05)
+/// # When this policy is applied
 ///
-/// This enum is applied **only** when `tokio::time::timeout` elapses. Other
-/// `SigningError` arms currently **always discard** the staged row. RF4-06 must
-/// extend fail-closed retain to ambiguous remote non-timeout failures (transport
-/// errors after a possible remote sign), not only timeouts.
+/// - **Timeout** (`tokio::time::timeout` elapses).
+/// - **Ambiguous non-timeout signer errors** (`RemoteSignerError`,
+///   `InvalidRemoteSignature`, …) — remote may already have signed. Under
+///   [`TimeoutPolicy::RetainStagedRow`] these **commit** the staged row.
+///
+/// Unambiguous no-signature errors always discard (`KeyNotFound`,
+/// `LocalRejected`, `UnsupportedSigningType`).
 ///
 /// # Error surface on retain
 ///
-/// After a successful retain-commit on timeout the core still returns
-/// [`SigningGateError::SigningFailed`] (`"signer timed out"`). That does **not**
-/// mean the row was discarded — see that variant’s docs. Callers must not treat
-/// timeout as “slot free.”
+/// After a successful retain-commit the core still returns
+/// [`SigningGateError::SigningFailed`] (e.g. `"signer timed out"`). That does
+/// **not** mean the row was discarded — see that variant’s docs. Callers must
+/// not treat timeout / remote error as “slot free.”
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeoutPolicy {
     /// In-process backend: dropping the timed-out future is treated as “no
@@ -89,6 +94,31 @@ pub enum TimeoutPolicy {
     /// impossible; the caller receives `SigningFailed("signer timed out")` with
     /// **history retained** (not discarded).
     RetainStagedRow,
+}
+
+/// How [`sign_slashable`] obtains [`TimeoutPolicy`].
+///
+/// Prefer [`TimeoutPolicySource::ResolveUnderLock`] on paths whose registry can
+/// change concurrently (VC `SignerService` + keymanager remote import) so
+/// policy is not snapshotted as InProcess while the live route becomes remote.
+pub enum TimeoutPolicySource {
+    /// Fixed policy chosen at the call site (gate / pure in-process backends).
+    Fixed(TimeoutPolicy),
+    /// Evaluated **under** the per-validator lock immediately before stage, and
+    /// re-checked immediately before BLS sign (fail-closed: Retain wins).
+    ResolveUnderLock(Arc<dyn Fn() -> TimeoutPolicy + Send + Sync>),
+}
+
+impl TimeoutPolicySource {
+    /// Fail-closed merge: if either side is Retain, use Retain.
+    fn fail_closed_max(a: TimeoutPolicy, b: TimeoutPolicy) -> TimeoutPolicy {
+        match (a, b) {
+            (TimeoutPolicy::RetainStagedRow, _) | (_, TimeoutPolicy::RetainStagedRow) => {
+                TimeoutPolicy::RetainStagedRow
+            }
+            _ => TimeoutPolicy::DiscardStagedRow,
+        }
+    }
 }
 
 // ── Staged row trait ──────────────────────────────────────────────────────────
@@ -213,7 +243,11 @@ pub struct SlashableSignSession {
     pubkey_hex: String,
     signing_root: Root,
     sign_timeout: Duration,
+    /// Mutable so a fail-closed recheck immediately before sign can upgrade
+    /// Discard → Retain (SEC-1 concurrent remote import).
     policy: TimeoutPolicy,
+    /// When present, re-evaluated immediately before BLS sign; Retain wins.
+    policy_recheck: Option<Arc<dyn Fn() -> TimeoutPolicy + Send + Sync>>,
     hooks: Arc<dyn SignHooks>,
     op_name: &'static str,
 }
@@ -223,7 +257,7 @@ impl SlashableSignSession {
     ///
     /// `stage` is invoked on this blocking thread and must return a staged guard
     /// that lives only for the duration of this call (the `!Send` constraint).
-    pub fn stage_then_sign<S, F>(self, stage: F) -> Result<Vec<u8>, SigningGateError>
+    pub fn stage_then_sign<S, F>(mut self, stage: F) -> Result<Vec<u8>, SigningGateError>
     where
         S: StagedRow,
         F: FnOnce() -> Result<S, SlashingError>,
@@ -240,6 +274,12 @@ impl SlashableSignSession {
                 return Err(SigningGateError::SlashingBlocked(e));
             }
         };
+
+        // SEC-1: re-resolve policy immediately before contacting the backend so a
+        // concurrent remote import after lock acquisition still fail-closes.
+        if let Some(ref recheck) = self.policy_recheck {
+            self.policy = TimeoutPolicySource::fail_closed_max(self.policy, recheck());
+        }
 
         let sign_result = self.handle.block_on(tokio::time::timeout(
             self.sign_timeout,
@@ -272,33 +312,34 @@ impl SlashableSignSession {
                 }
             },
 
-            // Key not found — always discard today (local-safe: no signature).
-            // TimeoutPolicy is not consulted here (timeout-only in RF4-05).
-            Ok(Err(SigningError::KeyNotFound(_))) => {
+            // Unambiguous no-signature outcomes — always discard (local-safe).
+            Ok(Err(e)) if e.is_unambiguous_no_signature() => {
                 staged.discard_row();
                 self.hooks.on_tx_hold_ms(tx_hold_ms);
-                warn!(
-                    pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
-                    op = self.op_name,
-                    "sign_slashable: key not found; staged row discarded"
-                );
-                Err(SigningGateError::KeyNotFound)
+                match e {
+                    SigningError::KeyNotFound(_) => {
+                        warn!(
+                            pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                            op = self.op_name,
+                            "sign_slashable: key not found; staged row discarded"
+                        );
+                        Err(SigningGateError::KeyNotFound)
+                    }
+                    other => {
+                        warn!(
+                            pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                            op = self.op_name,
+                            error = %other,
+                            "sign_slashable: local/no-remote-contact error; staged row discarded"
+                        );
+                        Err(SigningGateError::SigningFailed(other.to_string()))
+                    }
+                }
             }
 
-            // Other signer errors — always discard today, regardless of policy.
-            // RF4-06: ambiguous remote outcomes (transport/HTTP after a possible
-            // remote sign) must not blindly discard when policy is Retain.
-            Ok(Err(e)) => {
-                staged.discard_row();
-                self.hooks.on_tx_hold_ms(tx_hold_ms);
-                error!(
-                    pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
-                    op = self.op_name,
-                    error = %e,
-                    "sign_slashable: signer error; staged row discarded"
-                );
-                Err(SigningGateError::SigningFailed(e.to_string()))
-            }
+            // Ambiguous signer errors — policy decides discard vs retain.
+            // Remote may already have signed (transport/HTTP after possible sign).
+            Ok(Err(e)) => self.finish_ambiguous_error(staged, tx_hold_ms, e),
         }
     }
 
@@ -323,30 +364,89 @@ impl SlashableSignSession {
                 // Fail-closed for remote backends: keep history so a conflicting
                 // retry cannot pass stage. Same-root re-sign remains an EIP-3076 path.
                 // Error is still SigningFailed — docs on that variant note retained history.
-                if let Err(e) = staged.commit_row() {
-                    error!(
-                        pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
-                        op = self.op_name,
-                        error = %e,
-                        "sign_slashable: retain-on-timeout commit failed"
-                    );
-                    self.hooks.on_tx_hold_ms(tx_hold_ms);
-                    return Err(SigningGateError::CommitFailed {
-                        signing_root: self.signing_root,
-                        source: e,
-                    });
-                }
+                self.retain_staged_row(
+                    staged,
+                    tx_hold_ms,
+                    "signer timed out",
+                    "sign_slashable: signer timed out; staged row retained (committed)",
+                    true,
+                )
+            }
+        }
+    }
+
+    /// Ambiguous non-timeout signer failure: discard or retain per policy.
+    fn finish_ambiguous_error<S: StagedRow>(
+        self,
+        staged: S,
+        tx_hold_ms: f64,
+        err: SigningError,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        match self.policy {
+            TimeoutPolicy::DiscardStagedRow => {
+                staged.discard_row();
                 self.hooks.on_tx_hold_ms(tx_hold_ms);
                 error!(
                     pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
                     op = self.op_name,
-                    timeout_secs = self.sign_timeout.as_secs_f64(),
-                    "sign_slashable: signer timed out; staged row retained (committed)"
+                    error = %err,
+                    "sign_slashable: signer error; staged row discarded"
                 );
-                // History committed — not discarded. See SigningFailed rustdoc (S1).
-                Err(SigningGateError::SigningFailed("signer timed out".to_string()))
+                Err(SigningGateError::SigningFailed(err.to_string()))
+            }
+            TimeoutPolicy::RetainStagedRow => {
+                // Fail-closed: remote may already have signed. Do not claim "discarded".
+                let msg = err.to_string();
+                self.retain_staged_row(
+                    staged,
+                    tx_hold_ms,
+                    &msg,
+                    "sign_slashable: signer error; staged row retained (committed)",
+                    false,
+                )
             }
         }
+    }
+
+    /// Commit staged row then return `SigningFailed` (history retained, not discarded).
+    fn retain_staged_row<S: StagedRow>(
+        self,
+        staged: S,
+        tx_hold_ms: f64,
+        failed_msg: &str,
+        retain_log: &str,
+        is_timeout: bool,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        if let Err(e) = staged.commit_row() {
+            error!(
+                pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                op = self.op_name,
+                error = %e,
+                "sign_slashable: retain commit failed"
+            );
+            self.hooks.on_tx_hold_ms(tx_hold_ms);
+            return Err(SigningGateError::CommitFailed {
+                signing_root: self.signing_root,
+                source: e,
+            });
+        }
+        self.hooks.on_tx_hold_ms(tx_hold_ms);
+        if is_timeout {
+            error!(
+                pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                op = self.op_name,
+                timeout_secs = self.sign_timeout.as_secs_f64(),
+                "{retain_log}"
+            );
+        } else {
+            error!(
+                pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                op = self.op_name,
+                "{retain_log}"
+            );
+        }
+        // History committed — not discarded. See SigningFailed rustdoc (S1).
+        Err(SigningGateError::SigningFailed(failed_msg.to_string()))
     }
 }
 
@@ -354,8 +454,8 @@ impl SlashableSignSession {
 
 /// Inputs for [`sign_slashable`] (bundled to keep the call surface explicit).
 ///
-/// [`TimeoutPolicy`] is required with **no default** — every call site must
-/// choose discard vs retain deliberately.
+/// Policy is required with **no default** — every call site must choose
+/// [`TimeoutPolicySource`] deliberately (fixed or resolve-under-lock).
 pub struct SignSlashableRequest<'a> {
     pub locks: &'a ValidatorLockMap,
     pub pubkey: &'a PublicKey,
@@ -363,8 +463,8 @@ pub struct SignSlashableRequest<'a> {
     pub signer: Arc<dyn Signer>,
     pub signing_root: Root,
     pub sign_timeout: Duration,
-    /// Explicit timeout policy — no `Default` (see [`TimeoutPolicy`]).
-    pub policy: TimeoutPolicy,
+    /// Explicit policy source — no `Default` (see [`TimeoutPolicy`] / [`TimeoutPolicySource`]).
+    pub policy: TimeoutPolicySource,
     pub hooks: Arc<dyn SignHooks>,
     pub op_name: &'static str,
 }
@@ -373,11 +473,11 @@ pub struct SignSlashableRequest<'a> {
 ///
 /// 1. Acquire the per-validator async lock.
 /// 2. Re-check `enablement` **under the lock** (closes Safe→Detected TOCTOU).
-/// 3. `spawn_blocking`: caller `body` stages, then
+/// 3. Resolve [`TimeoutPolicy`] under the lock (and re-check before sign when
+///    using [`TimeoutPolicySource::ResolveUnderLock`] — SEC-1).
+/// 4. `spawn_blocking`: caller `body` stages, then
 ///    [`SlashableSignSession::stage_then_sign`] signs with timeout and
-///    commit/discards per `req.policy`.
-///
-/// `req.policy` has **no default** — it must be set explicitly at every site.
+///    commit/discards per policy.
 ///
 /// # Errors
 ///
@@ -414,7 +514,16 @@ where
         return Err(SigningGateError::BlockedByDoppelganger);
     }
 
-    // Step 3: stage → sign → commit/discard inside spawn_blocking.
+    // Step 3: resolve policy under the lock (SEC-1). Keep Arc recheck for pre-sign.
+    let (policy, policy_recheck) = match req.policy {
+        TimeoutPolicySource::Fixed(p) => (p, None),
+        TimeoutPolicySource::ResolveUnderLock(f) => {
+            let policy = f();
+            (policy, Some(f))
+        }
+    };
+
+    // Step 4: stage → sign → commit/discard inside spawn_blocking.
     let handle = tokio::runtime::Handle::current();
     let hooks_for_success = Arc::clone(&req.hooks);
     let session = SlashableSignSession {
@@ -424,7 +533,8 @@ where
         pubkey_hex: pubkey_hex.clone(),
         signing_root: req.signing_root,
         sign_timeout: req.sign_timeout,
-        policy: req.policy,
+        policy,
+        policy_recheck,
         hooks: req.hooks,
         op_name,
     };
@@ -562,7 +672,7 @@ mod tests {
                 signer,
                 signing_root,
                 sign_timeout: TEST_TIMEOUT,
-                policy: TimeoutPolicy::RetainStagedRow,
+                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::RetainStagedRow),
                 hooks,
                 op_name: "test_retain",
             },
@@ -588,6 +698,134 @@ mod tests {
         assert_eq!(blocks[0].slot, 7);
     }
 
+    /// Backend that fails with a remote transport error (S2 ambiguous failure).
+    struct RemoteFailSigner;
+    #[async_trait]
+    impl Signer for RemoteFailSigner {
+        async fn sign(
+            &self,
+            _signing_root: &Root,
+            _pubkey: &[u8; 48],
+        ) -> Result<Signature, SigningError> {
+            Err(SigningError::RemoteSignerError("http 502 after possible sign".into()))
+        }
+        fn public_keys(&self) -> Vec<[u8; 48]> {
+            vec![]
+        }
+    }
+
+    /// LocalRejected always discards even under Retain (MAJOR-2 / no remote I/O).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_core_local_rejected_always_discards_under_retain() {
+        let sk = SecretKey::generate();
+        let pubkey = sk.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let locks = ValidatorLockMap::new();
+        let hooks = Arc::new(NoopSignHooks);
+        let signing_root: Root = [0x55; 32];
+
+        struct LocalReject;
+        #[async_trait]
+        impl Signer for LocalReject {
+            async fn sign(
+                &self,
+                _signing_root: &Root,
+                _pubkey: &[u8; 48],
+            ) -> Result<Signature, SigningError> {
+                Err(SigningError::LocalRejected("gRPC raw-root".into()))
+            }
+            fn public_keys(&self) -> Vec<[u8; 48]> {
+                vec![]
+            }
+        }
+        let signer: Arc<dyn Signer> = Arc::new(LocalReject);
+
+        let db_c = Arc::clone(&db);
+        let pk_hex = pubkey_hex.clone();
+        let result = sign_slashable(
+            SignSlashableRequest {
+                locks: &locks,
+                pubkey: &pubkey,
+                enablement: &AlwaysAllowed,
+                signer,
+                signing_root,
+                sign_timeout: Duration::from_secs(4),
+                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::RetainStagedRow),
+                hooks,
+                op_name: "test_local_rejected",
+            },
+            move |session| {
+                let scoped = PubkeyScopedDb::new(db_c, "test".into(), GVR);
+                session.stage_then_sign(|| {
+                    scoped.stage_block(&pk_hex, 15, Some(hex::encode(signing_root)))
+                })
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SigningGateError::SigningFailed(_))),
+            "expected SigningFailed, got {result:?}"
+        );
+        let blocks = db.get_blocks(&pubkey_hex).expect("get_blocks");
+        assert!(blocks.is_empty(), "LocalRejected must discard under Retain; found {blocks:?}");
+    }
+
+    /// Retain policy must commit on ambiguous non-timeout remote errors (S2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_core_retain_policy_keeps_staged_row_on_remote_error() {
+        let sk = SecretKey::generate();
+        let pubkey = sk.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+        let locks = ValidatorLockMap::new();
+        let hooks = Arc::new(NoopSignHooks);
+        let signing_root: Root = [0x44; 32];
+        let signer: Arc<dyn Signer> = Arc::new(RemoteFailSigner);
+
+        let db_c = Arc::clone(&db);
+        let pk_hex = pubkey_hex.clone();
+        let result = sign_slashable(
+            SignSlashableRequest {
+                locks: &locks,
+                pubkey: &pubkey,
+                enablement: &AlwaysAllowed,
+                signer,
+                signing_root,
+                sign_timeout: Duration::from_secs(4),
+                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::RetainStagedRow),
+                hooks,
+                op_name: "test_retain_remote_err",
+            },
+            move |session| {
+                let scoped = PubkeyScopedDb::new(db_c, "test".into(), GVR);
+                session.stage_then_sign(|| {
+                    scoped.stage_block(&pk_hex, 13, Some(hex::encode(signing_root)))
+                })
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(SigningGateError::SigningFailed(_))),
+            "expected SigningFailed, got {result:?}"
+        );
+        // Error text must not claim the row was discarded (S1 residual).
+        if let Err(SigningGateError::SigningFailed(ref m)) = result {
+            assert!(
+                !m.to_lowercase().contains("discard"),
+                "retain path must not surface 'discarded' in error: {m}"
+            );
+        }
+        let blocks = db.get_blocks(&pubkey_hex).expect("get_blocks");
+        assert_eq!(
+            blocks.len(),
+            1,
+            "RetainStagedRow must commit on ambiguous remote error; found {blocks:?}"
+        );
+    }
+
     /// Discard policy rolls back the staged row on timeout (gate parity).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_core_discard_policy_rolls_back_staged_row_on_timeout() {
@@ -609,7 +847,7 @@ mod tests {
                 signer,
                 signing_root,
                 sign_timeout: TEST_TIMEOUT,
-                policy: TimeoutPolicy::DiscardStagedRow,
+                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
                 hooks,
                 op_name: "test_discard",
             },
@@ -655,7 +893,7 @@ mod tests {
                 signer,
                 signing_root,
                 sign_timeout: Duration::from_secs(4),
-                policy: TimeoutPolicy::DiscardStagedRow,
+                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
                 hooks: hooks_c,
                 op_name: "test_hooks",
             },
@@ -702,7 +940,7 @@ mod tests {
                     signer,
                     signing_root: [0x44; 32],
                     sign_timeout: Duration::from_secs(4),
-                    policy: TimeoutPolicy::DiscardStagedRow,
+                    policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
                     hooks: Arc::new(NoopSignHooks),
                     op_name: "test_recheck",
                 },

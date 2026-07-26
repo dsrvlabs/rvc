@@ -92,7 +92,10 @@ use observability::logging::TruncatedPubkey;
 use slashing::{PubkeyScopedDb, SlashingDb};
 use tracing::{error, warn};
 
-use crate::core::{sign_slashable, SignSlashableRequest, StandardSlashableHooks, TimeoutPolicy};
+use crate::core::{
+    sign_slashable, SignSlashableRequest, StandardSlashableHooks, TimeoutPolicy,
+    TimeoutPolicySource,
+};
 use crate::error::SigningGateError;
 use crate::fail_closed::FailClosedDefault;
 use crate::locks::ValidatorLockMap;
@@ -268,7 +271,7 @@ impl SigningGate {
                 signer: Arc::clone(&self.signer),
                 signing_root,
                 sign_timeout: self.sign_timeout,
-                policy: TimeoutPolicy::DiscardStagedRow,
+                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
                 hooks: Arc::new(StandardSlashableHooks::block()),
                 op_name: "sign_block",
             },
@@ -316,8 +319,9 @@ impl SigningGate {
     /// [`sign_slashable`] with [`TimeoutPolicy::DiscardStagedRow`].
     /// On stage error → `SlashingBlocked` (epoch consumed).
     /// On commit error → `CommitFailed` (nothing written; same-root retry safe).
-    /// On timeout with Discard → `discard()` (no phantom row); other sign errors
-    /// also discard today (see [`crate::TimeoutPolicy`] scope notes).
+    /// On timeout or ambiguous sign errors with Discard → `discard()` (no phantom
+    /// row). Discard applies to the full [`crate::TimeoutPolicy`] scope on the
+    /// gate path (in-process backends).
     pub async fn sign_attestation(
         &self,
         pubkey: &PublicKey,
@@ -353,7 +357,7 @@ impl SigningGate {
                 signer: Arc::clone(&self.signer),
                 signing_root,
                 sign_timeout: self.sign_timeout,
-                policy: TimeoutPolicy::DiscardStagedRow,
+                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
                 hooks: Arc::new(StandardSlashableHooks::attestation()),
                 op_name: "sign_attestation",
             },
