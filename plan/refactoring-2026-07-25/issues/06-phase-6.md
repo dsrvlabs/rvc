@@ -1026,11 +1026,11 @@ it: issues **2.1/2.2** (block-service capture structs + assertions, 5 pts) and *
    assertions are on content, not call counts.
 
 **Acceptance criteria:**
-- [ ] A written reconciliation in the PR: 2.1/2.2 status, 2.3/2.4 marked superseded-by-B1 (or done).
-- [ ] `rg "assert_eq!\(.*\.len\(\), [0-9]" crates/block-service` reviewed — every count-only assertion is
+- [x] A written reconciliation in the PR: 2.1/2.2 status, 2.3/2.4 marked superseded-by-B1 (or done).
+- [x] `rg "assert_eq!\(.*\.len\(\), [0-9]" crates/block-service` reviewed — every count-only assertion is
       either justified or upgraded to a content assertion.
-- [ ] No mock in `block-service` discards an argument it previously captured.
-- [ ] Workspace green.
+- [x] No mock in `block-service` discards an argument it previously captured.
+- [x] Workspace green.
 
 **Risks (flag at programme level, not in this issue):** if test-audit 2.3/2.4 are scheduled *after*
 Phase 2, 5 points are spent on code B1 deletes. Sequence 2.3/2.4 before Phase 2 or drop them.
