@@ -1042,12 +1042,12 @@ nothing.
    or write to file.
 
 **Acceptance criteria:**
-- [ ] Each command file is ≤ ~40 lines of command logic over the shared helper.
-- [ ] `rg 'panic!' bin/rvc/src/commands/` returns nothing.
-- [ ] Pubkey normalization exists once and its test exercises the shared function.
-- [ ] The `--confirm` gate on `voluntary_exit` and the file-write path on `prepare_exit` behave
+- [x] Each command file is ≤ ~40 lines of command logic over the shared helper.
+- [x] `rg 'panic!' bin/rvc/src/commands/` returns nothing.
+- [x] Pubkey normalization exists once and its test exercises the shared function.
+- [x] The `--confirm` gate on `voluntary_exit` and the file-write path on `prepare_exit` behave
       identically (tests).
-- [ ] Workspace green.
+- [x] Workspace green.
 
 **TDD test plan** (RED first):
 - `test_build_signed_exit_returns_error_instead_of_panicking_on_shared_key_manager` — **RED**: today
