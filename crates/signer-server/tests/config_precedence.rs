@@ -14,9 +14,7 @@ use signer_server::config::{self, Backend, ServeArgs};
 use signer_server::metrics::SignerMetrics;
 use signer_server::reload::KeystoreReloader;
 
-mod common;
-
-use common::create_test_keystore;
+use crypto::test_utils::create_test_keystore;
 
 fn write_toml(dir: &Path, content: &str) -> std::path::PathBuf {
     let path = dir.join("config.toml");
@@ -147,7 +145,7 @@ async fn test_hot_reload_new_key_available() {
         Arc::clone(&signer),
     );
 
-    let pubkey = create_test_keystore(dir.path(), &password);
+    let pubkey = create_test_keystore(dir.path(), &password, None).pubkey();
 
     let cancel = tokio_util::sync::CancellationToken::new();
     let cancel_clone = cancel.clone();
@@ -201,9 +199,9 @@ async fn test_hot_reload_multiple_keys_added_incrementally() {
         reloader.run(cancel_clone).await;
     });
 
-    let pk1 = create_test_keystore(dir.path(), &password);
+    let pk1 = create_test_keystore(dir.path(), &password, None).pubkey();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while signer.public_keys().len() < 1 {
+    while signer.public_keys().is_empty() {
         if tokio::time::Instant::now() >= deadline {
             panic!("first key not reloaded");
         }
@@ -211,7 +209,7 @@ async fn test_hot_reload_multiple_keys_added_incrementally() {
     }
     assert_eq!(signer.public_keys().len(), 1);
 
-    let pk2 = create_test_keystore(dir.path(), &password);
+    let pk2 = create_test_keystore(dir.path(), &password, None).pubkey();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     while signer.public_keys().len() < 2 {
         if tokio::time::Instant::now() >= deadline {

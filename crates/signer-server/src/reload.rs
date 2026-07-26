@@ -237,7 +237,7 @@ fn check_keystore_dir_perms(dir: &std::path::Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::backend::SigningBackend;
-    use crypto::{EncryptionKdf, Keystore, SecretKey};
+    use crypto::test_utils::create_test_keystore;
     use std::fs;
     use tempfile::TempDir;
 
@@ -252,21 +252,6 @@ mod tests {
     }
     #[cfg(not(unix))]
     fn make_strict(_dir: &std::path::Path) {}
-
-    fn create_test_keystore(dir: &std::path::Path, password: &str) -> ([u8; 48], SecretKey) {
-        let sk = SecretKey::generate();
-        let pubkey = sk.public_key().to_bytes();
-        let ks = Keystore::encrypt(
-            &sk,
-            password.as_bytes(),
-            "",
-            EncryptionKdf::scrypt_cheap_for_tests(),
-        )
-        .expect("encrypt");
-        let filename = format!("{}.json", hex::encode(pubkey));
-        fs::write(dir.join(&filename), ks.to_json().unwrap()).unwrap();
-        (pubkey, sk)
-    }
 
     #[tokio::test]
     async fn test_reloader_detects_new_keystore() {
@@ -289,7 +274,7 @@ mod tests {
         assert!(signer.public_keys().is_empty());
 
         // Add a keystore file
-        let (pubkey, _sk) = create_test_keystore(dir.path(), &password);
+        let pubkey = create_test_keystore(dir.path(), &password, None).pubkey();
 
         // Trigger scan
         reloader.scan_and_reload().await;
@@ -307,7 +292,7 @@ mod tests {
         let password = Zeroizing::new("test-password".to_string());
 
         // Start with one key
-        let (pubkey, _sk) = create_test_keystore(dir.path(), &password);
+        let pubkey = create_test_keystore(dir.path(), &password, None).pubkey();
         let signer = BasicSigner::load(dir.path(), &password).unwrap();
         assert_eq!(signer.public_keys().len(), 1);
 
@@ -336,7 +321,7 @@ mod tests {
         make_strict(dir.path());
         let password = Zeroizing::new("test-password".to_string());
 
-        let (pubkey, _sk) = create_test_keystore(dir.path(), &password);
+        let pubkey = create_test_keystore(dir.path(), &password, None).pubkey();
         let signer = BasicSigner::load(dir.path(), &password).unwrap();
         let signer = Arc::new(signer);
 
@@ -402,9 +387,9 @@ mod tests {
         );
 
         // Add 3 keystores
-        let (pk1, _) = create_test_keystore(dir.path(), &password);
-        let (pk2, _) = create_test_keystore(dir.path(), &password);
-        let (pk3, _) = create_test_keystore(dir.path(), &password);
+        let pk1 = create_test_keystore(dir.path(), &password, None).pubkey();
+        let pk2 = create_test_keystore(dir.path(), &password, None).pubkey();
+        let pk3 = create_test_keystore(dir.path(), &password, None).pubkey();
 
         reloader.scan_and_reload().await;
         assert_eq!(signer.public_keys().len(), 3);
@@ -426,7 +411,7 @@ mod tests {
         make_strict(dir.path());
         let password = Zeroizing::new("test-password".to_string());
 
-        let (pubkey, _sk) = create_test_keystore(dir.path(), &password);
+        let pubkey = create_test_keystore(dir.path(), &password, None).pubkey();
         let signer = BasicSigner::load(dir.path(), &password).unwrap();
         let signer = Arc::new(signer);
 

@@ -165,19 +165,9 @@ fn validate_args(args: &SplitKeyArgs) -> Result<(), SplitKeyError> {
 mod tests {
     #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip raw key bytes for assertions; not a logging surface
     use super::*;
-    use crypto::SecretKey;
+    use crypto::test_utils::create_test_keystore;
     use tempfile::TempDir;
     use vsss_rs::ReadableShareSet;
-
-    fn create_test_keystore(dir: &std::path::Path, password: &str) -> (PathBuf, SecretKey) {
-        let sk = SecretKey::generate();
-        let keystore =
-            crypto::Keystore::encrypt(&sk, password.as_bytes(), "", crypto::EncryptionKdf::Pbkdf2)
-                .unwrap();
-        let path = dir.join("source-keystore.json");
-        fs::write(&path, keystore.to_json().unwrap()).unwrap();
-        (path, sk)
-    }
 
     #[test]
     fn test_validate_threshold_zero() {
@@ -238,7 +228,9 @@ mod tests {
     fn test_split_key_2_of_3() {
         let tmp = TempDir::new().unwrap();
         let password = "test-password";
-        let (keystore_path, original_sk) = create_test_keystore(tmp.path(), password);
+        let fixture = create_test_keystore(tmp.path(), password, None);
+        let keystore_path = fixture.path.clone();
+        let original_sk = fixture.secret_key;
 
         let output_dir = tmp.path().join("shares");
         let args = SplitKeyArgs {
@@ -282,7 +274,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let password = "test-password";
         let share_password = "share-pw";
-        let (keystore_path, original_sk) = create_test_keystore(tmp.path(), password);
+        let fixture = create_test_keystore(tmp.path(), password, None);
+        let keystore_path = fixture.path.clone();
+        let original_sk = fixture.secret_key;
 
         let output_dir = tmp.path().join("shares");
         let args = SplitKeyArgs {
@@ -345,7 +339,7 @@ mod tests {
     #[test]
     fn test_split_key_wrong_password() {
         let tmp = TempDir::new().unwrap();
-        let (keystore_path, _) = create_test_keystore(tmp.path(), "correct-pw");
+        let keystore_path = create_test_keystore(tmp.path(), "correct-pw", None).path;
 
         let args = SplitKeyArgs {
             keystore: keystore_path,
@@ -364,7 +358,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let password = "pw";
         let share_password = "share-pw";
-        let (keystore_path, original_sk) = create_test_keystore(tmp.path(), password);
+        let fixture = create_test_keystore(tmp.path(), password, None);
+        let keystore_path = fixture.path.clone();
+        let original_sk = fixture.secret_key;
 
         let output_dir = tmp.path().join("shares");
         execute(SplitKeyArgs {

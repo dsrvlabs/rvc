@@ -806,9 +806,9 @@ signatures (add optional parameters rather than four variants). Add
 the copies. If RF6-13 renamed `integration_polish.rs`, coordinate ordering.
 
 **Acceptance criteria:**
-- [ ] One `create_test_keystore` in the workspace (`rg "fn create_test_keystore" -c` = 1).
-- [ ] `crypto`'s `test-utils` feature is non-empty and enabled only in `[dev-dependencies]`.
-- [ ] Test count unchanged; workspace green with and without the feature
+- [x] One `create_test_keystore` in the workspace (`rg "fn create_test_keystore" -c` = 1).
+- [x] `crypto`'s `test-utils` feature is non-empty and enabled only in `[dev-dependencies]`.
+- [x] Test count unchanged; workspace green with and without the feature
       (`cargo check -p rvc-crypto` and `cargo check -p rvc-crypto --features test-utils`).
 
 **Risks:** Low.

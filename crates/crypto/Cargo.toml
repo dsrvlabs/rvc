@@ -9,6 +9,12 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Exposes `test_utils` (create_test_keystore fixtures). Enable only from
+# consumers' [dev-dependencies] — never on production dependency lines.
+test-utils = []
+
 [dependencies]
 observability = { workspace = true }
 aes.workspace = true

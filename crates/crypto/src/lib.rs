@@ -42,6 +42,8 @@ mod remote_signer;
 mod signer_trait;
 mod signing;
 mod signing_root;
+#[cfg(feature = "test-utils")]
+pub mod test_utils;
 pub mod typed_signer;
 mod voluntary_exit_signing;
 

@@ -171,34 +171,16 @@ pub fn load_keystore_from_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crypto::{EncryptionKdf, Keystore as CryptoKeystore, Signature};
+    use crypto::test_utils::create_test_keystore;
+    use crypto::Signature;
     use std::fs;
     use tempfile::TempDir;
-
-    fn create_test_keystore(dir: &Path, password: &str) -> [u8; 48] {
-        let sk = SecretKey::generate();
-        let pubkey = sk.public_key().to_bytes();
-
-        let keystore = CryptoKeystore::encrypt(
-            &sk,
-            password.as_bytes(),
-            "",
-            EncryptionKdf::scrypt_cheap_for_tests(),
-        )
-        .expect("encryption should succeed");
-
-        let json = keystore.to_json().expect("serialize");
-        let filename = format!("{}.json", hex::encode(pubkey));
-        fs::write(dir.join(&filename), json).expect("write keystore");
-
-        pubkey
-    }
 
     #[tokio::test]
     async fn test_sign_verify_roundtrip() {
         let dir = TempDir::new().unwrap();
         let password = Zeroizing::new("test-password".to_string());
-        let pubkey = create_test_keystore(dir.path(), &password);
+        let pubkey = create_test_keystore(dir.path(), &password, None).pubkey();
 
         let signer = BasicSigner::load(dir.path(), &password).unwrap();
 
@@ -214,7 +196,7 @@ mod tests {
     async fn test_unknown_key_returns_error() {
         let dir = TempDir::new().unwrap();
         let password = Zeroizing::new("test-password".to_string());
-        let _pubkey = create_test_keystore(dir.path(), &password);
+        let _pubkey = create_test_keystore(dir.path(), &password, None).pubkey();
 
         let signer = BasicSigner::load(dir.path(), &password).unwrap();
 
@@ -240,8 +222,8 @@ mod tests {
     async fn test_public_keys_returns_loaded_keys() {
         let dir = TempDir::new().unwrap();
         let password = Zeroizing::new("test-password".to_string());
-        let pk1 = create_test_keystore(dir.path(), &password);
-        let pk2 = create_test_keystore(dir.path(), &password);
+        let pk1 = create_test_keystore(dir.path(), &password, None).pubkey();
+        let pk2 = create_test_keystore(dir.path(), &password, None).pubkey();
 
         let signer = BasicSigner::load(dir.path(), &password).unwrap();
 
@@ -291,7 +273,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let correct_password = Zeroizing::new("correct".to_string());
         let wrong_password = Zeroizing::new("wrong".to_string());
-        create_test_keystore(dir.path(), &correct_password);
+        let _ = create_test_keystore(dir.path(), &correct_password, None);
 
         let result = BasicSigner::load(dir.path(), &wrong_password);
         assert!(result.is_err());
@@ -305,7 +287,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let password = Zeroizing::new("test-password".to_string());
-        let pubkey = create_test_keystore(dir.path(), &password);
+        let pubkey = create_test_keystore(dir.path(), &password, None).pubkey();
         let filename = format!("{}.json", hex::encode(pubkey));
         let keystore_path = dir.path().join(&filename);
 
@@ -324,7 +306,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let password = Zeroizing::new("test-password".to_string());
-        let pubkey = create_test_keystore(dir.path(), &password);
+        let pubkey = create_test_keystore(dir.path(), &password, None).pubkey();
         let filename = format!("{}.json", hex::encode(pubkey));
         let keystore_path = dir.path().join(&filename);
 
@@ -346,7 +328,7 @@ mod tests {
     async fn test_concurrent_signing_same_key() {
         let dir = TempDir::new().unwrap();
         let password = Zeroizing::new("test-password".to_string());
-        let pubkey = create_test_keystore(dir.path(), &password);
+        let pubkey = create_test_keystore(dir.path(), &password, None).pubkey();
 
         let signer = std::sync::Arc::new(BasicSigner::load(dir.path(), &password).unwrap());
 
@@ -397,7 +379,7 @@ mod tests {
     async fn test_remove_key_makes_key_unavailable() {
         let dir = TempDir::new().unwrap();
         let password = Zeroizing::new("test-password".to_string());
-        let pubkey = create_test_keystore(dir.path(), &password);
+        let pubkey = create_test_keystore(dir.path(), &password, None).pubkey();
 
         let signer = BasicSigner::load(dir.path(), &password).unwrap();
         assert_eq!(signer.public_keys().len(), 1);
@@ -426,7 +408,7 @@ mod tests {
     async fn test_load_keystore_from_file() {
         let dir = TempDir::new().unwrap();
         let password = Zeroizing::new("test-password".to_string());
-        let expected_pubkey = create_test_keystore(dir.path(), &password);
+        let expected_pubkey = create_test_keystore(dir.path(), &password, None).pubkey();
 
         let filename = format!("{}.json", hex::encode(expected_pubkey));
         let path = dir.path().join(&filename);
@@ -441,7 +423,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let password = Zeroizing::new("correct".to_string());
         let wrong = Zeroizing::new("wrong".to_string());
-        let pubkey = create_test_keystore(dir.path(), &password);
+        let pubkey = create_test_keystore(dir.path(), &password, None).pubkey();
 
         let filename = format!("{}.json", hex::encode(pubkey));
         let path = dir.path().join(&filename);

@@ -43,19 +43,6 @@ pub fn wait_for_port(host: &str, port: u16, timeout: Duration) -> bool {
     false
 }
 
-/// Create a cheap test keystore under `dir` and return its public key bytes.
-pub fn create_test_keystore(dir: &Path, password: &str) -> [u8; 48] {
-    use crypto::{EncryptionKdf, Keystore, SecretKey};
-    let sk = SecretKey::generate();
-    let pubkey = sk.public_key().to_bytes();
-    let ks =
-        Keystore::encrypt(&sk, password.as_bytes(), "", EncryptionKdf::scrypt_cheap_for_tests())
-            .expect("encrypt");
-    let filename = format!("{}.json", hex::encode(pubkey));
-    std::fs::write(dir.join(&filename), ks.to_json().unwrap()).unwrap();
-    pubkey
-}
-
 /// Minimal on-disk fixture for binary serve/dry-run tests.
 pub struct ServeFixture {
     pub dir: TempDir,
@@ -82,7 +69,7 @@ impl ServeFixture {
     }
 
     pub fn with_keystore(self) -> Self {
-        create_test_keystore(&self.keystore_dir, &self.password);
+        let _ = crypto::test_utils::create_test_keystore(&self.keystore_dir, &self.password, None);
         self
     }
 
