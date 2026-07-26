@@ -10,7 +10,7 @@ use eth_types::{
     is_sync_committee_aggregator, subcommittee_index, ContributionAndProof,
     SignedContributionAndProof, Slot, SyncCommitteeDuty,
 };
-use observability::logging::{TruncatedPubkey, TruncatedRoot};
+use observability::logging::TruncatedRoot;
 use signer::SignerService;
 use validator_store::ValidatorStore;
 
