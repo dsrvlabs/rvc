@@ -253,14 +253,14 @@ divergence unrepresentable by having one macro emit both the struct and the `Enc
 3. Leave `Uint256` (`:178`, a newtype with hand-written impls) alone — it is not a container.
 
 **Acceptance criteria:**
-- [ ] `ssz_container!` defines struct + `Encode` + `Decode` from one field list; the 24 targets use it.
-- [ ] No field name or type appears twice for any converted container (`rg` proof in the PR).
-- [ ] Every `EXTERNAL_*_ROOT_HEX` assertion in `block_body.rs`'s test module passes **unchanged** — the
+- [x] `ssz_container!` defines struct + `Encode` + `Decode` from one field list; the 24 targets use it.
+- [x] No field name or type appears twice for any converted container (`rg` proof in the PR).
+- [x] Every `EXTERNAL_*_ROOT_HEX` assertion in `block_body.rs`'s test module passes **unchanged** — the
       hex constants are not edited in this PR (grep-diff proof: `git diff` touches no `EXTERNAL_` line).
-- [ ] Round-trip tests (`test_*_ssz_round_trip`) and sub-container root tests
+- [x] Round-trip tests (`test_*_ssz_round_trip`) and sub-container root tests
       (`test_subcontainer_roots_match_external_vector_components`, `block_body.rs:1160`) green.
-- [ ] `cargo nextest list -p rvc-eth-types | wc -l` unchanged.
-- [ ] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
+- [x] `cargo nextest list -p rvc-eth-types | wc -l` unchanged.
+- [x] `cargo fmt`/`clippy -D warnings`/`cargo nextest run --workspace` green.
 
 **Test/verification plan:** No new tests — the existing external-vector KATs are the oracle, and their
 value is that they were computed by a reference client. Add one *negative* compile-fail check only if

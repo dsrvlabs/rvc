@@ -101,10 +101,40 @@ impl From<DecodeError> for BodySszError {
 // SSZ container Encode/Decode helper (ethereum_ssz 0.8 trait surface)
 // ---------------------------------------------------------------------------
 
+/// Define an SSZ container struct and its `ssz08::{Encode, Decode}` impls from
+/// a single field list (merkleization- and serialization-sensitive order).
+///
+/// Prefer this over a free-standing struct + [`impl_ssz_container!`] so the
+/// field list cannot drift between the type definition and the encoder.
+macro_rules! ssz_container {
+    (
+        $(#[$meta:meta])*
+        pub struct $ty:ident {
+            $(
+                $(#[$field_meta:meta])*
+                pub $field:ident : $ftype:ty
+            ),* $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        pub struct $ty {
+            $(
+                $(#[$field_meta])*
+                pub $field: $ftype,
+            )*
+        }
+
+        impl_ssz_container!($ty { $($field: $ftype),* });
+    };
+}
+
 /// Generate `ssz08::{Encode, Decode}` for a named SSZ container in field order.
 ///
 /// Field order is merkleization- and serialization-sensitive — keep in sync
 /// with the struct definition and the consensus-specs container.
+///
+/// Prefer [`ssz_container!`] when defining the struct; this remains for types
+/// that still declare the field list separately.
 macro_rules! impl_ssz_container {
     ($ty:ident { $($field:ident : $ftype:ty),* $(,)? }) => {
         impl Encode for $ty {
@@ -247,204 +277,168 @@ pub type KzgCommitment = [u8; 48];
 // Shared sub-containers
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct Eth1Data {
-    pub deposit_root: [u8; 32],
-    pub deposit_count: u64,
-    pub block_hash: [u8; 32],
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct Eth1Data {
+        pub deposit_root: [u8; 32],
+        pub deposit_count: u64,
+        pub block_hash: [u8; 32],
+    }
 }
-impl_ssz_container!(Eth1Data { deposit_root: [u8; 32], deposit_count: u64, block_hash: [u8; 32] });
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct Checkpoint {
-    pub epoch: u64,
-    pub root: [u8; 32],
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct Checkpoint {
+        pub epoch: u64,
+        pub root: [u8; 32],
+    }
 }
-impl_ssz_container!(Checkpoint { epoch: u64, root: [u8; 32] });
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct AttestationData {
-    pub slot: u64,
-    pub index: u64,
-    pub beacon_block_root: [u8; 32],
-    pub source: Checkpoint,
-    pub target: Checkpoint,
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct AttestationData {
+        pub slot: u64,
+        pub index: u64,
+        pub beacon_block_root: [u8; 32],
+        pub source: Checkpoint,
+        pub target: Checkpoint,
+    }
 }
-impl_ssz_container!(AttestationData {
-    slot: u64,
-    index: u64,
-    beacon_block_root: [u8; 32],
-    source: Checkpoint,
-    target: Checkpoint,
-});
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct BeaconBlockHeader {
-    pub slot: u64,
-    pub proposer_index: u64,
-    pub parent_root: [u8; 32],
-    pub state_root: [u8; 32],
-    pub body_root: [u8; 32],
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct BeaconBlockHeader {
+        pub slot: u64,
+        pub proposer_index: u64,
+        pub parent_root: [u8; 32],
+        pub state_root: [u8; 32],
+        pub body_root: [u8; 32],
+    }
 }
-impl_ssz_container!(BeaconBlockHeader {
-    slot: u64,
-    proposer_index: u64,
-    parent_root: [u8; 32],
-    state_root: [u8; 32],
-    body_root: [u8; 32],
-});
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct SignedBeaconBlockHeader {
-    pub message: BeaconBlockHeader,
-    pub signature: [u8; 96],
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct SignedBeaconBlockHeader {
+        pub message: BeaconBlockHeader,
+        pub signature: [u8; 96],
+    }
 }
-impl_ssz_container!(SignedBeaconBlockHeader { message: BeaconBlockHeader, signature: [u8; 96] });
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct ProposerSlashing {
-    pub signed_header_1: SignedBeaconBlockHeader,
-    pub signed_header_2: SignedBeaconBlockHeader,
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct ProposerSlashing {
+        pub signed_header_1: SignedBeaconBlockHeader,
+        pub signed_header_2: SignedBeaconBlockHeader,
+    }
 }
-impl_ssz_container!(ProposerSlashing {
-    signed_header_1: SignedBeaconBlockHeader,
-    signed_header_2: SignedBeaconBlockHeader,
-});
 
-/// Pre-Electra (phase0–Deneb) `IndexedAttestation`.
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct IndexedAttestation {
-    pub attesting_indices: VariableList<u64, MaxValidatorsPerCommittee>,
-    pub data: AttestationData,
-    pub signature: [u8; 96],
+ssz_container! {
+    /// Pre-Electra (phase0–Deneb) `IndexedAttestation`.
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct IndexedAttestation {
+        pub attesting_indices: VariableList<u64, MaxValidatorsPerCommittee>,
+        pub data: AttestationData,
+        pub signature: [u8; 96],
+    }
 }
-impl_ssz_container!(IndexedAttestation {
-    attesting_indices: VariableList<u64, MaxValidatorsPerCommittee>,
-    data: AttestationData,
-    signature: [u8; 96],
-});
 
-/// Pre-Electra (phase0–Deneb) `AttesterSlashing`.
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct AttesterSlashing {
-    pub attestation_1: IndexedAttestation,
-    pub attestation_2: IndexedAttestation,
+ssz_container! {
+    /// Pre-Electra (phase0–Deneb) `AttesterSlashing`.
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct AttesterSlashing {
+        pub attestation_1: IndexedAttestation,
+        pub attestation_2: IndexedAttestation,
+    }
 }
-impl_ssz_container!(AttesterSlashing {
-    attestation_1: IndexedAttestation,
-    attestation_2: IndexedAttestation,
-});
 
-/// Pre-Electra (phase0–Deneb) `Attestation` (no `committee_bits`).
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct Attestation {
-    pub aggregation_bits: BitList<MaxValidatorsPerCommittee>,
-    pub data: AttestationData,
-    pub signature: [u8; 96],
+ssz_container! {
+    /// Pre-Electra (phase0–Deneb) `Attestation` (no `committee_bits`).
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct Attestation {
+        pub aggregation_bits: BitList<MaxValidatorsPerCommittee>,
+        pub data: AttestationData,
+        pub signature: [u8; 96],
+    }
 }
-impl_ssz_container!(Attestation {
-    aggregation_bits: BitList<MaxValidatorsPerCommittee>,
-    data: AttestationData,
-    signature: [u8; 96],
-});
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct IndexedAttestationElectra {
-    pub attesting_indices: VariableList<u64, MaxValidatorsPerSlot>,
-    pub data: AttestationData,
-    pub signature: [u8; 96],
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct IndexedAttestationElectra {
+        pub attesting_indices: VariableList<u64, MaxValidatorsPerSlot>,
+        pub data: AttestationData,
+        pub signature: [u8; 96],
+    }
 }
-impl_ssz_container!(IndexedAttestationElectra {
-    attesting_indices: VariableList<u64, MaxValidatorsPerSlot>,
-    data: AttestationData,
-    signature: [u8; 96],
-});
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct AttesterSlashingElectra {
-    pub attestation_1: IndexedAttestationElectra,
-    pub attestation_2: IndexedAttestationElectra,
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct AttesterSlashingElectra {
+        pub attestation_1: IndexedAttestationElectra,
+        pub attestation_2: IndexedAttestationElectra,
+    }
 }
-impl_ssz_container!(AttesterSlashingElectra {
-    attestation_1: IndexedAttestationElectra,
-    attestation_2: IndexedAttestationElectra,
-});
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct AttestationElectra {
-    pub aggregation_bits: BitList<MaxValidatorsPerSlot>,
-    pub data: AttestationData,
-    pub signature: [u8; 96],
-    pub committee_bits: BitVector<MaxCommitteesPerSlot>,
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct AttestationElectra {
+        pub aggregation_bits: BitList<MaxValidatorsPerSlot>,
+        pub data: AttestationData,
+        pub signature: [u8; 96],
+        pub committee_bits: BitVector<MaxCommitteesPerSlot>,
+    }
 }
-impl_ssz_container!(AttestationElectra {
-    aggregation_bits: BitList<MaxValidatorsPerSlot>,
-    data: AttestationData,
-    signature: [u8; 96],
-    committee_bits: BitVector<MaxCommitteesPerSlot>,
-});
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct DepositData {
-    pub pubkey: [u8; 48],
-    pub withdrawal_credentials: [u8; 32],
-    pub amount: u64,
-    pub signature: [u8; 96],
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct DepositData {
+        pub pubkey: [u8; 48],
+        pub withdrawal_credentials: [u8; 32],
+        pub amount: u64,
+        pub signature: [u8; 96],
+    }
 }
-impl_ssz_container!(DepositData {
-    pubkey: [u8; 48],
-    withdrawal_credentials: [u8; 32],
-    amount: u64,
-    signature: [u8; 96],
-});
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct Deposit {
-    pub proof: FixedVector<[u8; 32], DepositProofLength>,
-    pub data: DepositData,
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct Deposit {
+        pub proof: FixedVector<[u8; 32], DepositProofLength>,
+        pub data: DepositData,
+    }
 }
-impl_ssz_container!(Deposit {
-    proof: FixedVector<[u8; 32], DepositProofLength>,
-    data: DepositData,
-});
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct VoluntaryExit {
-    pub epoch: u64,
-    pub validator_index: u64,
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct VoluntaryExit {
+        pub epoch: u64,
+        pub validator_index: u64,
+    }
 }
-impl_ssz_container!(VoluntaryExit { epoch: u64, validator_index: u64 });
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct SignedVoluntaryExit {
-    pub message: VoluntaryExit,
-    pub signature: [u8; 96],
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct SignedVoluntaryExit {
+        pub message: VoluntaryExit,
+        pub signature: [u8; 96],
+    }
 }
-impl_ssz_container!(SignedVoluntaryExit { message: VoluntaryExit, signature: [u8; 96] });
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct SyncAggregate {
-    pub sync_committee_bits: BitVector<SyncCommitteeSize>,
-    pub sync_committee_signature: [u8; 96],
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct SyncAggregate {
+        pub sync_committee_bits: BitVector<SyncCommitteeSize>,
+        pub sync_committee_signature: [u8; 96],
+    }
 }
-impl_ssz_container!(SyncAggregate {
-    sync_committee_bits: BitVector<SyncCommitteeSize>,
-    sync_committee_signature: [u8; 96],
-});
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct Withdrawal {
-    pub index: u64,
-    pub validator_index: u64,
-    pub address: [u8; 20],
-    pub amount: u64,
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct Withdrawal {
+        pub index: u64,
+        pub validator_index: u64,
+        pub address: [u8; 20],
+        pub amount: u64,
+    }
 }
-impl_ssz_container!(Withdrawal {
-    index: u64,
-    validator_index: u64,
-    address: [u8; 20],
-    amount: u64,
-});
 
 /// Deneb+ full `ExecutionPayload` (Electra unchanged).
 #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
@@ -528,79 +522,60 @@ impl_ssz_container!(ExecutionPayloadHeader {
     excess_blob_gas: u64,
 });
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct BlsToExecutionChange {
-    pub validator_index: u64,
-    pub from_bls_pubkey: [u8; 48],
-    pub to_execution_address: [u8; 20],
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct BlsToExecutionChange {
+        pub validator_index: u64,
+        pub from_bls_pubkey: [u8; 48],
+        pub to_execution_address: [u8; 20],
+    }
 }
-impl_ssz_container!(BlsToExecutionChange {
-    validator_index: u64,
-    from_bls_pubkey: [u8; 48],
-    to_execution_address: [u8; 20],
-});
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct SignedBlsToExecutionChange {
-    pub message: BlsToExecutionChange,
-    pub signature: [u8; 96],
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct SignedBlsToExecutionChange {
+        pub message: BlsToExecutionChange,
+        pub signature: [u8; 96],
+    }
 }
-impl_ssz_container!(SignedBlsToExecutionChange {
-    message: BlsToExecutionChange,
-    signature: [u8; 96],
-});
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct DepositRequest {
-    pub pubkey: [u8; 48],
-    pub withdrawal_credentials: [u8; 32],
-    pub amount: u64,
-    pub signature: [u8; 96],
-    pub index: u64,
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct DepositRequest {
+        pub pubkey: [u8; 48],
+        pub withdrawal_credentials: [u8; 32],
+        pub amount: u64,
+        pub signature: [u8; 96],
+        pub index: u64,
+    }
 }
-impl_ssz_container!(DepositRequest {
-    pubkey: [u8; 48],
-    withdrawal_credentials: [u8; 32],
-    amount: u64,
-    signature: [u8; 96],
-    index: u64,
-});
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct WithdrawalRequest {
-    pub source_address: [u8; 20],
-    pub validator_pubkey: [u8; 48],
-    pub amount: u64,
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct WithdrawalRequest {
+        pub source_address: [u8; 20],
+        pub validator_pubkey: [u8; 48],
+        pub amount: u64,
+    }
 }
-impl_ssz_container!(WithdrawalRequest {
-    source_address: [u8; 20],
-    validator_pubkey: [u8; 48],
-    amount: u64,
-});
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct ConsolidationRequest {
-    pub source_address: [u8; 20],
-    pub source_pubkey: [u8; 48],
-    pub target_pubkey: [u8; 48],
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct ConsolidationRequest {
+        pub source_address: [u8; 20],
+        pub source_pubkey: [u8; 48],
+        pub target_pubkey: [u8; 48],
+    }
 }
-impl_ssz_container!(ConsolidationRequest {
-    source_address: [u8; 20],
-    source_pubkey: [u8; 48],
-    target_pubkey: [u8; 48],
-});
 
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct ExecutionRequests {
-    pub deposits: VariableList<DepositRequest, MaxDepositRequestsPerPayload>,
-    pub withdrawals: VariableList<WithdrawalRequest, MaxWithdrawalRequestsPerPayload>,
-    pub consolidations: VariableList<ConsolidationRequest, MaxConsolidationRequestsPerPayload>,
+ssz_container! {
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct ExecutionRequests {
+        pub deposits: VariableList<DepositRequest, MaxDepositRequestsPerPayload>,
+        pub withdrawals: VariableList<WithdrawalRequest, MaxWithdrawalRequestsPerPayload>,
+        pub consolidations: VariableList<ConsolidationRequest, MaxConsolidationRequestsPerPayload>,
+    }
 }
-impl_ssz_container!(ExecutionRequests {
-    deposits: VariableList<DepositRequest, MaxDepositRequestsPerPayload>,
-    withdrawals: VariableList<WithdrawalRequest, MaxWithdrawalRequestsPerPayload>,
-    consolidations: VariableList<ConsolidationRequest, MaxConsolidationRequestsPerPayload>,
-});
 
 // ---------------------------------------------------------------------------
 // Electra body variants
