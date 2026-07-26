@@ -294,16 +294,16 @@ field lists can be diffed against each other (Electra vs Deneb differ only by `e
 blinded differs only by `execution_payload` → `execution_payload_header`).
 
 **Acceptance criteria:**
-- [ ] All six use `ssz_container!`; `impl_ssz_container!` and its doc-comment warning are **deleted**
+- [x] All six use `ssz_container!`; `impl_ssz_container!` and its doc-comment warning are **deleted**
       from the file (this is the last consumer).
-- [ ] `EXTERNAL_ELECTRA_BODY_ROOT_HEX`, `EXTERNAL_DENEB_BODY_ROOT_HEX`,
+- [x] `EXTERNAL_ELECTRA_BODY_ROOT_HEX`, `EXTERNAL_DENEB_BODY_ROOT_HEX`,
       `EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX` and the four `EXTERNAL_*_BLOCK_ROOT_HEX` constants are
       untouched and their assertions pass (`test_beacon_block_body_electra_htr_matches_external_vector`
       `:1099`, `test_deneb_body_htr_matches_external_vector` `:1215`,
       `test_blinded_deneb_body_htr_matches_external_vector` `:1227`, and siblings).
-- [ ] `crates/crypto/tests/typed_signer_local_golden.rs` (golden signing roots over
+- [x] `crates/crypto/tests/typed_signer_local_golden.rs` (golden signing roots over
       `external_vector_electra_body()`) green — this is the cross-crate proof that block roots did not move.
-- [ ] Test count unchanged; workspace green.
+- [x] Test count unchanged; workspace green.
 
 **Risks:** The blinded/full pairs are easy to transpose during a copy-heavy edit. Mitigation: the
 `test_full_and_blinded_bodies_have_distinct_roots`-style assertions (`:1240-1243`) already fail loudly on

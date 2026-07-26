@@ -104,8 +104,9 @@ impl From<DecodeError> for BodySszError {
 /// Define an SSZ container struct and its `ssz08::{Encode, Decode}` impls from
 /// a single field list (merkleization- and serialization-sensitive order).
 ///
-/// Prefer this over a free-standing struct + [`impl_ssz_container!`] so the
-/// field list cannot drift between the type definition and the encoder.
+/// Field order is merkleization- and serialization-sensitive — keep in sync
+/// with the consensus-specs container. One list feeds both the type definition
+/// and the encoder so they cannot drift.
 macro_rules! ssz_container {
     (
         $(#[$meta:meta])*
@@ -124,19 +125,6 @@ macro_rules! ssz_container {
             )*
         }
 
-        impl_ssz_container!($ty { $($field: $ftype),* });
-    };
-}
-
-/// Generate `ssz08::{Encode, Decode}` for a named SSZ container in field order.
-///
-/// Field order is merkleization- and serialization-sensitive — keep in sync
-/// with the struct definition and the consensus-specs container.
-///
-/// Prefer [`ssz_container!`] when defining the struct; this remains for types
-/// that still declare the field list separately.
-macro_rules! impl_ssz_container {
-    ($ty:ident { $($field:ident : $ftype:ty),* $(,)? }) => {
         impl Encode for $ty {
             fn is_ssz_fixed_len() -> bool {
                 $( <$ftype as Encode>::is_ssz_fixed_len() && )* true
@@ -440,87 +428,53 @@ ssz_container! {
     }
 }
 
-/// Deneb+ full `ExecutionPayload` (Electra unchanged).
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct ExecutionPayload {
-    pub parent_hash: [u8; 32],
-    pub fee_recipient: [u8; 20],
-    pub state_root: [u8; 32],
-    pub receipts_root: [u8; 32],
-    pub logs_bloom: FixedVector<u8, BytesPerLogsBloom>,
-    pub prev_randao: [u8; 32],
-    pub block_number: u64,
-    pub gas_limit: u64,
-    pub gas_used: u64,
-    pub timestamp: u64,
-    pub extra_data: VariableList<u8, MaxExtraDataBytes>,
-    pub base_fee_per_gas: Uint256,
-    pub block_hash: [u8; 32],
-    pub transactions: VariableList<Transaction, MaxTransactionsPerPayload>,
-    pub withdrawals: VariableList<Withdrawal, MaxWithdrawalsPerPayload>,
-    pub blob_gas_used: u64,
-    pub excess_blob_gas: u64,
+ssz_container! {
+    /// Deneb+ full `ExecutionPayload` (Electra unchanged).
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct ExecutionPayload {
+        pub parent_hash: [u8; 32],
+        pub fee_recipient: [u8; 20],
+        pub state_root: [u8; 32],
+        pub receipts_root: [u8; 32],
+        pub logs_bloom: FixedVector<u8, BytesPerLogsBloom>,
+        pub prev_randao: [u8; 32],
+        pub block_number: u64,
+        pub gas_limit: u64,
+        pub gas_used: u64,
+        pub timestamp: u64,
+        pub extra_data: VariableList<u8, MaxExtraDataBytes>,
+        pub base_fee_per_gas: Uint256,
+        pub block_hash: [u8; 32],
+        pub transactions: VariableList<Transaction, MaxTransactionsPerPayload>,
+        pub withdrawals: VariableList<Withdrawal, MaxWithdrawalsPerPayload>,
+        pub blob_gas_used: u64,
+        pub excess_blob_gas: u64,
+    }
 }
-impl_ssz_container!(ExecutionPayload {
-    parent_hash: [u8; 32],
-    fee_recipient: [u8; 20],
-    state_root: [u8; 32],
-    receipts_root: [u8; 32],
-    logs_bloom: FixedVector<u8, BytesPerLogsBloom>,
-    prev_randao: [u8; 32],
-    block_number: u64,
-    gas_limit: u64,
-    gas_used: u64,
-    timestamp: u64,
-    extra_data: VariableList<u8, MaxExtraDataBytes>,
-    base_fee_per_gas: Uint256,
-    block_hash: [u8; 32],
-    transactions: VariableList<Transaction, MaxTransactionsPerPayload>,
-    withdrawals: VariableList<Withdrawal, MaxWithdrawalsPerPayload>,
-    blob_gas_used: u64,
-    excess_blob_gas: u64,
-});
 
-/// Blinded header form of the execution payload (body field for MEV path).
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct ExecutionPayloadHeader {
-    pub parent_hash: [u8; 32],
-    pub fee_recipient: [u8; 20],
-    pub state_root: [u8; 32],
-    pub receipts_root: [u8; 32],
-    pub logs_bloom: FixedVector<u8, BytesPerLogsBloom>,
-    pub prev_randao: [u8; 32],
-    pub block_number: u64,
-    pub gas_limit: u64,
-    pub gas_used: u64,
-    pub timestamp: u64,
-    pub extra_data: VariableList<u8, MaxExtraDataBytes>,
-    pub base_fee_per_gas: Uint256,
-    pub block_hash: [u8; 32],
-    pub transactions_root: [u8; 32],
-    pub withdrawals_root: [u8; 32],
-    pub blob_gas_used: u64,
-    pub excess_blob_gas: u64,
+ssz_container! {
+    /// Blinded header form of the execution payload (body field for MEV path).
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct ExecutionPayloadHeader {
+        pub parent_hash: [u8; 32],
+        pub fee_recipient: [u8; 20],
+        pub state_root: [u8; 32],
+        pub receipts_root: [u8; 32],
+        pub logs_bloom: FixedVector<u8, BytesPerLogsBloom>,
+        pub prev_randao: [u8; 32],
+        pub block_number: u64,
+        pub gas_limit: u64,
+        pub gas_used: u64,
+        pub timestamp: u64,
+        pub extra_data: VariableList<u8, MaxExtraDataBytes>,
+        pub base_fee_per_gas: Uint256,
+        pub block_hash: [u8; 32],
+        pub transactions_root: [u8; 32],
+        pub withdrawals_root: [u8; 32],
+        pub blob_gas_used: u64,
+        pub excess_blob_gas: u64,
+    }
 }
-impl_ssz_container!(ExecutionPayloadHeader {
-    parent_hash: [u8; 32],
-    fee_recipient: [u8; 20],
-    state_root: [u8; 32],
-    receipts_root: [u8; 32],
-    logs_bloom: FixedVector<u8, BytesPerLogsBloom>,
-    prev_randao: [u8; 32],
-    block_number: u64,
-    gas_limit: u64,
-    gas_used: u64,
-    timestamp: u64,
-    extra_data: VariableList<u8, MaxExtraDataBytes>,
-    base_fee_per_gas: Uint256,
-    block_hash: [u8; 32],
-    transactions_root: [u8; 32],
-    withdrawals_root: [u8; 32],
-    blob_gas_used: u64,
-    excess_blob_gas: u64,
-});
 
 ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
@@ -581,41 +535,27 @@ ssz_container! {
 // Electra body variants
 // ---------------------------------------------------------------------------
 
-/// Electra `BeaconBlockBody` (13 fields; Fulu shares this layout).
-///
-/// Spec order is merkleization-sensitive — do not reorder.
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct BeaconBlockBodyElectra {
-    pub randao_reveal: [u8; 96],
-    pub eth1_data: Eth1Data,
-    pub graffiti: [u8; 32],
-    pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
-    pub attester_slashings: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra>,
-    pub attestations: VariableList<AttestationElectra, MaxAttestationsElectra>,
-    pub deposits: VariableList<Deposit, MaxDeposits>,
-    pub voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
-    pub sync_aggregate: SyncAggregate,
-    pub execution_payload: ExecutionPayload,
-    pub bls_to_execution_changes:
-        VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
-    pub blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
-    pub execution_requests: ExecutionRequests,
+ssz_container! {
+    /// Electra `BeaconBlockBody` (13 fields; Fulu shares this layout).
+    ///
+    /// Spec order is merkleization-sensitive — do not reorder.
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct BeaconBlockBodyElectra {
+        pub randao_reveal: [u8; 96],
+        pub eth1_data: Eth1Data,
+        pub graffiti: [u8; 32],
+        pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
+        pub attester_slashings: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra>,
+        pub attestations: VariableList<AttestationElectra, MaxAttestationsElectra>,
+        pub deposits: VariableList<Deposit, MaxDeposits>,
+        pub voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
+        pub sync_aggregate: SyncAggregate,
+        pub execution_payload: ExecutionPayload,
+        pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
+        pub blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
+        pub execution_requests: ExecutionRequests,
+    }
 }
-impl_ssz_container!(BeaconBlockBodyElectra {
-    randao_reveal: [u8; 96],
-    eth1_data: Eth1Data,
-    graffiti: [u8; 32],
-    proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
-    attester_slashings: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra>,
-    attestations: VariableList<AttestationElectra, MaxAttestationsElectra>,
-    deposits: VariableList<Deposit, MaxDeposits>,
-    voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
-    sync_aggregate: SyncAggregate,
-    execution_payload: ExecutionPayload,
-    bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
-    blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
-    execution_requests: ExecutionRequests,
-});
 
 impl BeaconBlockBodyElectra {
     /// Decode SSZ bytes into a typed Electra `BeaconBlockBody`.
@@ -629,39 +569,25 @@ impl BeaconBlockBodyElectra {
     }
 }
 
-/// Electra blinded body: `execution_payload` → `ExecutionPayloadHeader`.
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct BlindedBeaconBlockBodyElectra {
-    pub randao_reveal: [u8; 96],
-    pub eth1_data: Eth1Data,
-    pub graffiti: [u8; 32],
-    pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
-    pub attester_slashings: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra>,
-    pub attestations: VariableList<AttestationElectra, MaxAttestationsElectra>,
-    pub deposits: VariableList<Deposit, MaxDeposits>,
-    pub voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
-    pub sync_aggregate: SyncAggregate,
-    pub execution_payload_header: ExecutionPayloadHeader,
-    pub bls_to_execution_changes:
-        VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
-    pub blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
-    pub execution_requests: ExecutionRequests,
+ssz_container! {
+    /// Electra blinded body: `execution_payload` → `ExecutionPayloadHeader`.
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct BlindedBeaconBlockBodyElectra {
+        pub randao_reveal: [u8; 96],
+        pub eth1_data: Eth1Data,
+        pub graffiti: [u8; 32],
+        pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
+        pub attester_slashings: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra>,
+        pub attestations: VariableList<AttestationElectra, MaxAttestationsElectra>,
+        pub deposits: VariableList<Deposit, MaxDeposits>,
+        pub voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
+        pub sync_aggregate: SyncAggregate,
+        pub execution_payload_header: ExecutionPayloadHeader,
+        pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
+        pub blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
+        pub execution_requests: ExecutionRequests,
+    }
 }
-impl_ssz_container!(BlindedBeaconBlockBodyElectra {
-    randao_reveal: [u8; 96],
-    eth1_data: Eth1Data,
-    graffiti: [u8; 32],
-    proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
-    attester_slashings: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra>,
-    attestations: VariableList<AttestationElectra, MaxAttestationsElectra>,
-    deposits: VariableList<Deposit, MaxDeposits>,
-    voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
-    sync_aggregate: SyncAggregate,
-    execution_payload_header: ExecutionPayloadHeader,
-    bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
-    blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
-    execution_requests: ExecutionRequests,
-});
 
 impl BlindedBeaconBlockBodyElectra {
     /// Decode SSZ bytes into a typed Electra blinded `BeaconBlockBody`.
@@ -679,41 +605,28 @@ impl BlindedBeaconBlockBodyElectra {
 // Deneb body variants (SEC-6d)
 // ---------------------------------------------------------------------------
 
-/// Deneb `BeaconBlockBody` (12 fields; no `execution_requests`).
-///
-/// Attester/attestation list limits and element types are pre-Electra
-/// (`MAX_ATTESTER_SLASHINGS=2`, `MAX_ATTESTATIONS=128`, no `committee_bits`).
-/// Spec order is merkleization-sensitive — do not reorder.
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct BeaconBlockBodyDeneb {
-    pub randao_reveal: [u8; 96],
-    pub eth1_data: Eth1Data,
-    pub graffiti: [u8; 32],
-    pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
-    pub attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
-    pub attestations: VariableList<Attestation, MaxAttestations>,
-    pub deposits: VariableList<Deposit, MaxDeposits>,
-    pub voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
-    pub sync_aggregate: SyncAggregate,
-    pub execution_payload: ExecutionPayload,
-    pub bls_to_execution_changes:
-        VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
-    pub blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
+ssz_container! {
+    /// Deneb `BeaconBlockBody` (12 fields; no `execution_requests`).
+    ///
+    /// Attester/attestation list limits and element types are pre-Electra
+    /// (`MAX_ATTESTER_SLASHINGS=2`, `MAX_ATTESTATIONS=128`, no `committee_bits`).
+    /// Spec order is merkleization-sensitive — do not reorder.
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct BeaconBlockBodyDeneb {
+        pub randao_reveal: [u8; 96],
+        pub eth1_data: Eth1Data,
+        pub graffiti: [u8; 32],
+        pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
+        pub attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
+        pub attestations: VariableList<Attestation, MaxAttestations>,
+        pub deposits: VariableList<Deposit, MaxDeposits>,
+        pub voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
+        pub sync_aggregate: SyncAggregate,
+        pub execution_payload: ExecutionPayload,
+        pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
+        pub blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
+    }
 }
-impl_ssz_container!(BeaconBlockBodyDeneb {
-    randao_reveal: [u8; 96],
-    eth1_data: Eth1Data,
-    graffiti: [u8; 32],
-    proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
-    attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
-    attestations: VariableList<Attestation, MaxAttestations>,
-    deposits: VariableList<Deposit, MaxDeposits>,
-    voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
-    sync_aggregate: SyncAggregate,
-    execution_payload: ExecutionPayload,
-    bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
-    blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
-});
 
 impl BeaconBlockBodyDeneb {
     /// Decode SSZ bytes into a typed Deneb `BeaconBlockBody`.
@@ -727,38 +640,25 @@ impl BeaconBlockBodyDeneb {
     }
 }
 
-/// Deneb blinded body: `execution_payload` → `ExecutionPayloadHeader`, no
-/// `execution_requests`.
-#[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-pub struct BlindedBeaconBlockBodyDeneb {
-    pub randao_reveal: [u8; 96],
-    pub eth1_data: Eth1Data,
-    pub graffiti: [u8; 32],
-    pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
-    pub attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
-    pub attestations: VariableList<Attestation, MaxAttestations>,
-    pub deposits: VariableList<Deposit, MaxDeposits>,
-    pub voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
-    pub sync_aggregate: SyncAggregate,
-    pub execution_payload_header: ExecutionPayloadHeader,
-    pub bls_to_execution_changes:
-        VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
-    pub blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
+ssz_container! {
+    /// Deneb blinded body: `execution_payload` → `ExecutionPayloadHeader`, no
+    /// `execution_requests`.
+    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    pub struct BlindedBeaconBlockBodyDeneb {
+        pub randao_reveal: [u8; 96],
+        pub eth1_data: Eth1Data,
+        pub graffiti: [u8; 32],
+        pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
+        pub attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
+        pub attestations: VariableList<Attestation, MaxAttestations>,
+        pub deposits: VariableList<Deposit, MaxDeposits>,
+        pub voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
+        pub sync_aggregate: SyncAggregate,
+        pub execution_payload_header: ExecutionPayloadHeader,
+        pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
+        pub blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
+    }
 }
-impl_ssz_container!(BlindedBeaconBlockBodyDeneb {
-    randao_reveal: [u8; 96],
-    eth1_data: Eth1Data,
-    graffiti: [u8; 32],
-    proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
-    attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
-    attestations: VariableList<Attestation, MaxAttestations>,
-    deposits: VariableList<Deposit, MaxDeposits>,
-    voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
-    sync_aggregate: SyncAggregate,
-    execution_payload_header: ExecutionPayloadHeader,
-    bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
-    blob_kzg_commitments: VariableList<KzgCommitment, MaxBlobCommitmentsPerBlock>,
-});
 
 impl BlindedBeaconBlockBodyDeneb {
     /// Decode SSZ bytes into a typed Deneb blinded body.
