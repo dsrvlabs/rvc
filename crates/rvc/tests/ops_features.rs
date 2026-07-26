@@ -254,7 +254,7 @@ mod broadcast_topics {
 }
 
 mod monitoring {
-    use rvc::monitoring::{collect_metrics, MonitoringConfig};
+    use rvc::background_tasks::monitoring::{collect_metrics, MonitoringConfig};
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
@@ -307,7 +307,12 @@ mod monitoring {
         let shutdown_clone = shutdown.clone();
 
         let handle = tokio::spawn(async move {
-            rvc::monitoring::start_monitoring_push(config, shutdown_clone, || (3, 2)).await;
+            rvc::background_tasks::monitoring::start_monitoring_push(
+                config,
+                shutdown_clone,
+                || (3, 2),
+            )
+            .await;
         });
 
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -339,7 +344,12 @@ mod monitoring {
         let shutdown_clone = shutdown.clone();
 
         let handle = tokio::spawn(async move {
-            rvc::monitoring::start_monitoring_push(config, shutdown_clone, || (1, 1)).await;
+            rvc::background_tasks::monitoring::start_monitoring_push(
+                config,
+                shutdown_clone,
+                || (1, 1),
+            )
+            .await;
         });
 
         // Give it time for one push cycle with retries
@@ -372,7 +382,12 @@ mod monitoring {
         let shutdown_clone = shutdown.clone();
 
         let handle = tokio::spawn(async move {
-            rvc::monitoring::start_monitoring_push(config, shutdown_clone, || (1, 1)).await;
+            rvc::background_tasks::monitoring::start_monitoring_push(
+                config,
+                shutdown_clone,
+                || (1, 1),
+            )
+            .await;
         });
 
         // Let it run for one tick cycle
@@ -395,7 +410,7 @@ mod monitoring {
         shutdown.cancel();
 
         // Should return immediately because HTTP is rejected without insecure
-        rvc::monitoring::start_monitoring_push(config, shutdown, || (0, 0)).await;
+        rvc::background_tasks::monitoring::start_monitoring_push(config, shutdown, || (0, 0)).await;
     }
 
     #[tokio::test]
@@ -419,7 +434,12 @@ mod monitoring {
         let shutdown_clone = shutdown.clone();
 
         let handle = tokio::spawn(async move {
-            rvc::monitoring::start_monitoring_push(config, shutdown_clone, || (0, 0)).await;
+            rvc::background_tasks::monitoring::start_monitoring_push(
+                config,
+                shutdown_clone,
+                || (0, 0),
+            )
+            .await;
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -512,7 +532,7 @@ mod logfile_config {
 }
 
 mod config_url {
-    use rvc::config_url::{
+    use rvc::background_tasks::config_url::{
         fetch_proposer_config, ProposerConfigUrlSettings, ValidatorConfigUpdate,
     };
     use std::time::Duration;
@@ -595,7 +615,7 @@ mod config_url {
         let shutdown_clone = shutdown.clone();
 
         let handle = tokio::spawn(async move {
-            rvc::config_url::start_proposer_config_refresh(
+            rvc::background_tasks::config_url::start_proposer_config_refresh(
                 settings,
                 shutdown_clone,
                 move |updates, _default| {
@@ -673,8 +693,12 @@ mod config_url {
         let shutdown_clone = shutdown.clone();
 
         let handle = tokio::spawn(async move {
-            rvc::config_url::start_proposer_config_refresh(settings, shutdown_clone, |_, _| {})
-                .await;
+            rvc::background_tasks::config_url::start_proposer_config_refresh(
+                settings,
+                shutdown_clone,
+                |_, _| {},
+            )
+            .await;
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -714,8 +738,8 @@ mod config_url {
 
 mod composition {
     use bn_manager::{BnManager, BnManagerConfig};
+    use rvc::background_tasks::monitoring::MonitoringConfig;
     use rvc::config::{BroadcastTopic, Config};
-    use rvc::monitoring::MonitoringConfig;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
 
@@ -764,12 +788,16 @@ mod composition {
 
         let shutdown_mon = shutdown.clone();
         let mon_handle = tokio::spawn(async move {
-            rvc::monitoring::start_monitoring_push(monitoring_config, shutdown_mon, || (1, 1))
-                .await;
+            rvc::background_tasks::monitoring::start_monitoring_push(
+                monitoring_config,
+                shutdown_mon,
+                || (1, 1),
+            )
+            .await;
         });
 
         // Start config refresh (will also fail to connect, which is fine)
-        let config_settings = rvc::config_url::ProposerConfigUrlSettings {
+        let config_settings = rvc::background_tasks::config_url::ProposerConfigUrlSettings {
             url: "http://localhost:1/nonexistent".to_string(),
             refresh_interval: Duration::from_millis(50),
             token: None,
@@ -778,7 +806,7 @@ mod composition {
 
         let shutdown_cfg = shutdown.clone();
         let cfg_handle = tokio::spawn(async move {
-            rvc::config_url::start_proposer_config_refresh(
+            rvc::background_tasks::config_url::start_proposer_config_refresh(
                 config_settings,
                 shutdown_cfg,
                 move |_, _| {

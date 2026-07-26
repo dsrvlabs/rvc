@@ -18,7 +18,7 @@ use super::{
     BeaconHandles, BootstrapError, EnablementHandles, LoadedKeys, ServiceHandles,
 };
 use crate::config::{redact_url, Config};
-use crate::duty_tracker::DutyTrackerService;
+use crate::grpc_health::DutyTrackerService;
 use crate::keymanager_adapters::{spawn_keymanager_api, KeymanagerApiDeps};
 use crate::startup;
 use crate::DutyTrackerServer;

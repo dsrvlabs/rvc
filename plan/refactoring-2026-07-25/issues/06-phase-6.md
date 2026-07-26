@@ -1480,10 +1480,10 @@ rename that one, it must match the wire package). Group `monitoring.rs` and `con
 `background_tasks/`.
 
 **Acceptance criteria:**
-- [ ] `rvc::duty_tracker` no longer exists; `rvc::grpc_health` does; `proto::duty_tracker` unchanged
+- [x] `rvc::duty_tracker` no longer exists; `rvc::grpc_health` does; `proto::duty_tracker` unchanged
       (wire package name preserved).
-- [ ] `monitoring` and `config_url` live under `background_tasks/`; consumers updated.
-- [ ] Pure rename (`git diff -M`); test count unchanged; workspace green.
+- [x] `monitoring` and `config_url` live under `background_tasks/`; consumers updated.
+- [x] Pure rename (`git diff -M`); test count unchanged; workspace green.
 
 **Risks:** The public re-export `DutyTrackerServer` is part of the crate's API — keep the re-export path
 stable even though the module moved.

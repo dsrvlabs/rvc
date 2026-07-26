@@ -89,7 +89,7 @@ pub fn spawn_background_tasks(
 
     // Spawn monitoring push task if endpoint is configured (T3.6)
     if let Some(ref monitoring_endpoint) = config.monitoring.endpoint {
-        let monitoring_config = crate::monitoring::MonitoringConfig {
+        let monitoring_config = crate::background_tasks::monitoring::MonitoringConfig {
             endpoint: monitoring_endpoint.clone(),
             interval: Duration::from_secs(config.monitoring.interval),
             insecure: config.monitoring.endpoint_insecure,
@@ -100,7 +100,7 @@ pub fn spawn_background_tasks(
             interval_secs = config.monitoring.interval,
             "Starting monitoring push task"
         );
-        tokio::spawn(crate::monitoring::start_monitoring_push(
+        tokio::spawn(crate::background_tasks::monitoring::start_monitoring_push(
             monitoring_config,
             monitoring_shutdown,
             move || (validator_count as u32, validator_count as u32),
@@ -109,7 +109,7 @@ pub fn spawn_background_tasks(
 
     // Spawn proposer config URL refresh task if configured (T3.12)
     if let Some(ref proposer_config_url) = config.proposer_config.url {
-        let settings = crate::config_url::ProposerConfigUrlSettings {
+        let settings = crate::background_tasks::config_url::ProposerConfigUrlSettings {
             url: proposer_config_url.clone(),
             refresh_interval: Duration::from_secs(config.proposer_config.refresh_interval),
             token: config.proposer_config.url_token.clone(),
@@ -121,7 +121,7 @@ pub fn spawn_background_tasks(
             refresh_interval_secs = config.proposer_config.refresh_interval,
             "Starting proposer config URL refresh task"
         );
-        tokio::spawn(crate::config_url::start_proposer_config_refresh(
+        tokio::spawn(crate::background_tasks::config_url::start_proposer_config_refresh(
             settings,
             config_refresh_shutdown,
             move |updates, _default| {
