@@ -600,6 +600,10 @@ mod tests {
         assert_eq!(normalize_hex("abcdef").unwrap(), "abcdef");
     }
 
+    // RF3-04: mainnet GVR hex literals below are test-side KAT anchors — an
+    // independent check that NetworkPreset delegation did not change the value.
+    // Production source of truth is eth_types::NetworkPreset::MAINNET.
+
     #[tokio::test]
     async fn test_validate_genesis_root_matching() {
         let root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";

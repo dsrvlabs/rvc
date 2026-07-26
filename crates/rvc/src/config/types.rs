@@ -434,7 +434,6 @@ impl Config {
 
         self.network
             .genesis_validators_root()
-            .map(|s| s.to_string())
             .ok_or_else(|| ConfigError::MissingField("genesis_validators_root".to_string()))
     }
 
@@ -1144,7 +1143,7 @@ allow_fresh_db = true
             ..Default::default()
         };
         let root = config.effective_genesis_validators_root().unwrap();
-        assert!(root.starts_with("0x"));
+        assert_eq!(root, eth_types::NetworkPreset::MAINNET.genesis_validators_root_hex());
     }
 
     #[test]

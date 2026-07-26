@@ -650,6 +650,7 @@ impl ServiceBuilder {
 mod tests {
     use super::*;
     use crypto::{LocalSigner, Signer as _};
+    use eth_types::NetworkPreset;
     use tempfile::TempDir;
     use timing::SlotClock;
 
@@ -889,9 +890,7 @@ mod tests {
     #[test]
     fn test_parse_genesis_validators_root() {
         let config = Config {
-            genesis_validators_root: Some(
-                "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95".to_string(),
-            ),
+            genesis_validators_root: Some(NetworkPreset::MAINNET.genesis_validators_root_hex()),
             ..create_minimal_config()
         };
 
@@ -900,7 +899,7 @@ mod tests {
 
         assert!(result.is_ok());
         let root = result.unwrap();
-        assert_eq!(root[0], 0x4b);
+        assert_eq!(root, NetworkPreset::MAINNET.genesis_validators_root);
     }
 
     #[test]
@@ -910,6 +909,19 @@ mod tests {
         let result = builder.parse_genesis_validators_root();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_builder_default_gvr_is_mainnet_preset() {
+        // Default config uses Network::Mainnet; GVR must match the shared preset.
+        let config = create_minimal_config();
+        assert_eq!(config.network, crate::config::Network::Mainnet);
+        assert_eq!(
+            config.effective_genesis_validators_root().unwrap(),
+            NetworkPreset::MAINNET.genesis_validators_root_hex()
+        );
+        let root = ServiceBuilder::new(config).parse_genesis_validators_root().unwrap();
+        assert_eq!(root, NetworkPreset::MAINNET.genesis_validators_root);
     }
 
     #[test]
