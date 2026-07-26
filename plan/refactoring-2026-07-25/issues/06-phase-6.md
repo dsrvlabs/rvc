@@ -1235,12 +1235,12 @@ both key adapters (this is the type A4's required-parameter change was reaching 
 the crate had 58 such occurrences at survey time; fix the ones in this file and count what remains.
 
 **Acceptance criteria:**
-- [ ] No file in `keymanager_adapters/` exceeds ~600 lines; each adapter's tests sit beside it.
-- [ ] One `KeyChangeNotifier`; neither key adapter defines its own `notify_key_change`.
-- [ ] Zero `format!("0x{}", hex::encode(` in `keymanager_adapters/` (`rg -c` = 0); the remaining
+- [x] No file in `keymanager_adapters/` exceeds ~600 lines; each adapter's tests sit beside it.
+- [x] One `KeyChangeNotifier`; neither key adapter defines its own `notify_key_change`.
+- [x] Zero `format!("0x{}", hex::encode(` in `keymanager_adapters/` (`rg -c` = 0); the remaining
       workspace count is stated in the PR.
-- [ ] Move commits are pure moves; the notifier extraction is its own commit.
-- [ ] Test count unchanged; workspace green.
+- [x] Move commits are pure moves; the notifier extraction is its own commit.
+- [x] Test count unchanged; workspace green.
 
 **Risks:** SEC-1/SEC-1b and Phase-5 F5 both rewrote this file. Re-derive boundaries from HEAD-of-Phase-5.
 

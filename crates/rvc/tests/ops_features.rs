@@ -121,9 +121,9 @@ mod proposer_nodes {
         .expect("read crates/rvc/src/bootstrap/services.rs");
         let km_src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/keymanager_adapters.rs"
+            "/src/keymanager_adapters/spawn.rs"
         ))
-        .expect("read crates/rvc/src/keymanager_adapters.rs");
+        .expect("read crates/rvc/src/keymanager_adapters/spawn.rs");
 
         // Single build_beacon call site for the runtime VC path (connect_beacon).
         let build_beacon_count = beacon_src.matches("build_beacon()").count();
