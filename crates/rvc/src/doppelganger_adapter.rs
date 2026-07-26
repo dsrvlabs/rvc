@@ -121,7 +121,7 @@ mod tests {
     fn test_slashing_db_reader_adapter_with_attestation() {
         let db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let gvr = [0u8; 32];
-        db.record_attestation("0xabc", 5, 10, None, &gvr).unwrap();
+        db.seed_attestation("0xabc", 5, 10, None, &gvr).unwrap();
         let adapter = SlashingDbReaderAdapter::new(db);
         let result = adapter.last_signed_attestation_epoch("0xabc").unwrap();
         assert_eq!(result, Some(10));
@@ -131,9 +131,9 @@ mod tests {
     fn test_slashing_db_reader_adapter_returns_max_epoch() {
         let db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let gvr = [0u8; 32];
-        db.record_attestation("0xabc", 1, 5, None, &gvr).unwrap();
-        db.record_attestation("0xabc", 5, 10, None, &gvr).unwrap();
-        db.record_attestation("0xabc", 10, 15, None, &gvr).unwrap();
+        db.seed_attestation("0xabc", 1, 5, None, &gvr).unwrap();
+        db.seed_attestation("0xabc", 5, 10, None, &gvr).unwrap();
+        db.seed_attestation("0xabc", 10, 15, None, &gvr).unwrap();
         let adapter = SlashingDbReaderAdapter::new(db);
         let result = adapter.last_signed_attestation_epoch("0xabc").unwrap();
         assert_eq!(result, Some(15));

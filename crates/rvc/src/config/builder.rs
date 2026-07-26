@@ -845,7 +845,7 @@ mod tests {
         {
             let db = SlashingDb::open(&db_path).unwrap();
             let gvr = [0u8; 32];
-            db.record_attestation("0xabcd", 1, 2, Some("0xdead".to_string()), &gvr).unwrap();
+            db.seed_attestation("0xabcd", 1, 2, Some("0xdead".to_string()), &gvr).unwrap();
         }
         let size_before = std::fs::metadata(&db_path).unwrap().len();
         assert!(size_before > 0);

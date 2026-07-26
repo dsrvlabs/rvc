@@ -519,7 +519,7 @@ impl SlashingProtection for SlashingProtectionAdapter {
     /// interchange is emitted.  The underlying `SlashingDb::export` holds a
     /// single `Mutex<Connection>` lock for the entire read — `read_all_pubkeys`,
     /// `read_attestations`, and `read_blocks` all execute under that one held
-    /// guard — so no concurrent `record_attestation`/`record_block` write can
+    /// guard — so no concurrent `seed_attestation`/`seed_block` write can
     /// interleave and produce a stale snapshot.
     ///
     /// # Completeness (KM-1(a))
@@ -2766,8 +2766,8 @@ mod tests {
         let gvr_root = [0u8; 32];
         let db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let pk_hex = format!("0x{}", hex::encode(pk));
-        db.record_attestation(&pk_hex, 10, 11, None, &gvr_root).expect("seed history");
-        db.record_block(&pk_hex, 42, None, &gvr_root).expect("seed block history");
+        db.seed_attestation(&pk_hex, 10, 11, None, &gvr_root).expect("seed history");
+        db.seed_block(&pk_hex, 42, None, &gvr_root).expect("seed block history");
 
         let slashing = SlashingProtectionAdapter::new(db, gvr_hex.to_string());
 

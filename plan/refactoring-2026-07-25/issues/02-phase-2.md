@@ -962,19 +962,19 @@ later, C7 adds it using its own name.
 4. **GREEN:** unchanged behaviour; `cargo doc` no longer advertises the helpers on the public page.
 
 **Acceptance criteria:**
-- [ ] `rg "\brecord_attestation\b|\brecord_block\b"` returns zero hits workspace-wide (comments
+- [x] `rg "\brecord_attestation\b|\brecord_block\b"` returns zero hits workspace-wide (comments
       included).
-- [ ] `seed_attestation` / `seed_block` carry `#[doc(hidden)]` and a doc comment stating they bypass
+- [x] `seed_attestation` / `seed_block` carry `#[doc(hidden)]` and a doc comment stating they bypass
       EIP-3076 checks and are for test fixtures only.
-- [ ] A named test pins the no-check contract.
-- [ ] The **documented** `SlashingDb` surface for writing history is `stage_* → commit` and
+- [x] A named test pins the no-check contract.
+- [x] The **documented** `SlashingDb` surface for writing history is `stage_* → commit` and
       `check_and_record_*`. `seed_attestation`/`seed_block` remain `pub` (callers in `crates/rvc` and
       `crates/signer` tests need them) but are `#[doc(hidden)]` with the stated bypass contract, so
       they do not appear in `cargo doc` — they are the only other row-writing entry points and are
       test-fixture-only by contract.
-- [ ] **Test-count delta stated and justified:** expected ≈ 0 (renames only) plus +1 *newly added*
+- [x] **Test-count delta stated and justified:** expected ≈ 0 (renames only) plus +1 *newly added*
       contract test.
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **Risks:**
 - Low. The main hazard is a missed call site in a `#[cfg(test)]` block that only compiles under a
