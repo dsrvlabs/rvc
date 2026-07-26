@@ -18,6 +18,29 @@
 //! - [`BeaconBlockBodyElectra`] / [`BlindedBeaconBlockBodyElectra`] — 13 fields
 //! - [`BeaconBlockBodyDeneb`] / [`BlindedBeaconBlockBodyDeneb`] — 12 fields
 //!   (no `execution_requests`; pre-Electra attestation limits/types)
+//!
+//! # Dual-SSZ wire twins
+//!
+//! Crate-root types use workspace `ssz` 0.9 (`ssz_derive`); body containers need
+//! `ssz_types` 0.10, which implements `Encode`/`Decode` only against
+//! `ethereum_ssz` 0.8. Eight body-path sub-containers therefore exist as
+//! encode/decode-facing `Wire*` twins of the crate-root forms. Prefer the
+//! crate-root type at the API boundary; use `Wire*` only inside typed body SSZ.
+//!
+//! | Wire twin (`block_body`) | Crate-root counterpart | Why both exist |
+//! | --- | --- | --- |
+//! | [`WireCheckpoint`] | [`crate::Checkpoint`] | ssz 0.9 vs ethereum_ssz 0.8 + ssz_types |
+//! | [`WireAttestationData`] | [`crate::AttestationData`] | same |
+//! | [`WireBeaconBlockHeader`] | [`crate::BeaconBlockHeader`] | same |
+//! | [`WireAttestation`] | [`crate::Attestation`] | same |
+//! | [`WireAttestationElectra`] | [`crate::ElectraAttestation`] | same (Electra attestation) |
+//! | [`WireDepositData`] | [`crate::DepositData`] | same |
+//! | [`WireVoluntaryExit`] | [`crate::VoluntaryExit`] | same |
+//! | [`WireSignedVoluntaryExit`] | [`crate::SignedVoluntaryExit`] | same |
+//!
+//! **Deletion trigger:** remove the `Wire*` twins when `ssz_types` compiles
+//! against `ethereum_ssz` 0.9 (or workspace `ssz` aligns with the stack
+//! `ssz_types` implements); see plan §5 / F80 full unification (deferred).
 
 use ssz08::{Decode, DecodeError, Encode, SszDecoderBuilder, SszEncoder, BYTES_PER_LENGTH_OFFSET};
 use ssz_types::{
@@ -276,7 +299,7 @@ ssz_container! {
 
 ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct Checkpoint {
+    pub struct WireCheckpoint {
         pub epoch: u64,
         pub root: [u8; 32],
     }
@@ -284,18 +307,18 @@ ssz_container! {
 
 ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct AttestationData {
+    pub struct WireAttestationData {
         pub slot: u64,
         pub index: u64,
         pub beacon_block_root: [u8; 32],
-        pub source: Checkpoint,
-        pub target: Checkpoint,
+        pub source: WireCheckpoint,
+        pub target: WireCheckpoint,
     }
 }
 
 ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct BeaconBlockHeader {
+    pub struct WireBeaconBlockHeader {
         pub slot: u64,
         pub proposer_index: u64,
         pub parent_root: [u8; 32],
@@ -307,7 +330,7 @@ ssz_container! {
 ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct SignedBeaconBlockHeader {
-        pub message: BeaconBlockHeader,
+        pub message: WireBeaconBlockHeader,
         pub signature: [u8; 96],
     }
 }
@@ -325,7 +348,7 @@ ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct IndexedAttestation {
         pub attesting_indices: VariableList<u64, MaxValidatorsPerCommittee>,
-        pub data: AttestationData,
+        pub data: WireAttestationData,
         pub signature: [u8; 96],
     }
 }
@@ -340,11 +363,11 @@ ssz_container! {
 }
 
 ssz_container! {
-    /// Pre-Electra (phase0–Deneb) `Attestation` (no `committee_bits`).
+    /// Pre-Electra (phase0–Deneb) SSZ `Attestation` (no `committee_bits`).
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct Attestation {
+    pub struct WireAttestation {
         pub aggregation_bits: BitList<MaxValidatorsPerCommittee>,
-        pub data: AttestationData,
+        pub data: WireAttestationData,
         pub signature: [u8; 96],
     }
 }
@@ -353,7 +376,7 @@ ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct IndexedAttestationElectra {
         pub attesting_indices: VariableList<u64, MaxValidatorsPerSlot>,
-        pub data: AttestationData,
+        pub data: WireAttestationData,
         pub signature: [u8; 96],
     }
 }
@@ -368,9 +391,9 @@ ssz_container! {
 
 ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct AttestationElectra {
+    pub struct WireAttestationElectra {
         pub aggregation_bits: BitList<MaxValidatorsPerSlot>,
-        pub data: AttestationData,
+        pub data: WireAttestationData,
         pub signature: [u8; 96],
         pub committee_bits: BitVector<MaxCommitteesPerSlot>,
     }
@@ -378,7 +401,7 @@ ssz_container! {
 
 ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct DepositData {
+    pub struct WireDepositData {
         pub pubkey: [u8; 48],
         pub withdrawal_credentials: [u8; 32],
         pub amount: u64,
@@ -390,13 +413,13 @@ ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct Deposit {
         pub proof: FixedVector<[u8; 32], DepositProofLength>,
-        pub data: DepositData,
+        pub data: WireDepositData,
     }
 }
 
 ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct VoluntaryExit {
+    pub struct WireVoluntaryExit {
         pub epoch: u64,
         pub validator_index: u64,
     }
@@ -404,8 +427,8 @@ ssz_container! {
 
 ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct SignedVoluntaryExit {
-        pub message: VoluntaryExit,
+    pub struct WireSignedVoluntaryExit {
+        pub message: WireVoluntaryExit,
         pub signature: [u8; 96],
     }
 }
@@ -546,9 +569,9 @@ ssz_container! {
         pub graffiti: [u8; 32],
         pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
         pub attester_slashings: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra>,
-        pub attestations: VariableList<AttestationElectra, MaxAttestationsElectra>,
+        pub attestations: VariableList<WireAttestationElectra, MaxAttestationsElectra>,
         pub deposits: VariableList<Deposit, MaxDeposits>,
-        pub voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
+        pub voluntary_exits: VariableList<WireSignedVoluntaryExit, MaxVoluntaryExits>,
         pub sync_aggregate: SyncAggregate,
         pub execution_payload: ExecutionPayload,
         pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
@@ -578,9 +601,9 @@ ssz_container! {
         pub graffiti: [u8; 32],
         pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
         pub attester_slashings: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra>,
-        pub attestations: VariableList<AttestationElectra, MaxAttestationsElectra>,
+        pub attestations: VariableList<WireAttestationElectra, MaxAttestationsElectra>,
         pub deposits: VariableList<Deposit, MaxDeposits>,
-        pub voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
+        pub voluntary_exits: VariableList<WireSignedVoluntaryExit, MaxVoluntaryExits>,
         pub sync_aggregate: SyncAggregate,
         pub execution_payload_header: ExecutionPayloadHeader,
         pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
@@ -618,9 +641,9 @@ ssz_container! {
         pub graffiti: [u8; 32],
         pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
         pub attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
-        pub attestations: VariableList<Attestation, MaxAttestations>,
+        pub attestations: VariableList<WireAttestation, MaxAttestations>,
         pub deposits: VariableList<Deposit, MaxDeposits>,
-        pub voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
+        pub voluntary_exits: VariableList<WireSignedVoluntaryExit, MaxVoluntaryExits>,
         pub sync_aggregate: SyncAggregate,
         pub execution_payload: ExecutionPayload,
         pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
@@ -650,9 +673,9 @@ ssz_container! {
         pub graffiti: [u8; 32],
         pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
         pub attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
-        pub attestations: VariableList<Attestation, MaxAttestations>,
+        pub attestations: VariableList<WireAttestation, MaxAttestations>,
         pub deposits: VariableList<Deposit, MaxDeposits>,
-        pub voluntary_exits: VariableList<SignedVoluntaryExit, MaxVoluntaryExits>,
+        pub voluntary_exits: VariableList<WireSignedVoluntaryExit, MaxVoluntaryExits>,
         pub sync_aggregate: SyncAggregate,
         pub execution_payload_header: ExecutionPayloadHeader,
         pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
@@ -1037,7 +1060,7 @@ mod tests {
             hex32("f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b"),
         );
         assert_eq!(
-            VariableList::<AttestationElectra, MaxAttestationsElectra>::from(vec![])
+            VariableList::<WireAttestationElectra, MaxAttestationsElectra>::from(vec![])
                 .tree_hash_root(),
             hex32("e8e527e84f666163a90ef900e013f56b0a4d020148b2224057b719f351b003a6"),
         );
@@ -1150,10 +1173,10 @@ mod tests {
         );
         // Type identity: Deneb attester/attestation lists use pre-Electra containers.
         let _: VariableList<AttesterSlashing, MaxAttesterSlashings> = full_d.attester_slashings;
-        let _: VariableList<Attestation, MaxAttestations> = full_d.attestations;
+        let _: VariableList<WireAttestation, MaxAttestations> = full_d.attestations;
         let _: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra> =
             full_e.attester_slashings;
-        let _: VariableList<AttestationElectra, MaxAttestationsElectra> = full_e.attestations;
+        let _: VariableList<WireAttestationElectra, MaxAttestationsElectra> = full_e.attestations;
     }
 
     #[test]
@@ -1202,7 +1225,7 @@ mod tests {
             hex32("7a0501f5957bdf9cb3a8ff4966f02265f968658b7a9c62642cba1165e86642f5"),
         );
         assert_eq!(
-            VariableList::<Attestation, MaxAttestations>::from(vec![]).tree_hash_root(),
+            VariableList::<WireAttestation, MaxAttestations>::from(vec![]).tree_hash_root(),
             hex32("96559674a79656e540871e1f39c9b91e152aa8cddb71493e754827c4cc809d57"),
         );
     }
@@ -1231,7 +1254,7 @@ mod tests {
         // Non-empty lists exercise VariableList of composites + FixedVector proof.
         let mut body = external_vector_electra_body();
 
-        let header = BeaconBlockHeader {
+        let header = WireBeaconBlockHeader {
             slot: 1,
             proposer_index: 2,
             parent_root: [0xab; 32],
@@ -1242,7 +1265,7 @@ mod tests {
         let slashing = ProposerSlashing {
             signed_header_1: signed.clone(),
             signed_header_2: SignedBeaconBlockHeader {
-                message: BeaconBlockHeader {
+                message: WireBeaconBlockHeader {
                     slot: 1,
                     proposer_index: 2,
                     parent_root: [0xab; 32],
@@ -1257,7 +1280,7 @@ mod tests {
         let proof_leaves: Vec<[u8; 32]> = (0..33).map(|i| [i as u8; 32]).collect();
         let deposit = Deposit {
             proof: FixedVector::from(proof_leaves),
-            data: DepositData {
+            data: WireDepositData {
                 pubkey: [0xde; 48],
                 withdrawal_credentials: [0xad; 32],
                 amount: 32_000_000_000,

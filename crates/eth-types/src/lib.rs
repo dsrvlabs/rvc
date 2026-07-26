@@ -6,6 +6,9 @@ mod aggregation;
 mod attestation;
 mod block;
 /// Typed BeaconBlockBody containers + SSZ decode (SEC-6b; foundation for SEC-6c wire).
+///
+/// Body-path sub-containers that collide with crate-root names are `Wire*` twins
+/// (ssz 0.9 vs ethereum_ssz 0.8); see the twin table in `block_body` module docs.
 pub mod block_body;
 mod builder;
 pub mod canonical;

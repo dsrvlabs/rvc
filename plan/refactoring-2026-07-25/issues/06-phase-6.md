@@ -423,12 +423,12 @@ and `lib.rs`'s re-export list does not include the eight twins. So the rename is
 3. Add a one-line pointer from `lib.rs`'s module docs.
 
 **Acceptance criteria:**
-- [ ] No type name is defined twice in the `rvc_eth_types` public namespace
+- [x] No type name is defined twice in the `rvc_eth_types` public namespace
       (`cargo doc` search, or an `rg` over `pub struct` names, attached to the PR).
-- [ ] The twin table names all eight pairs and states the deletion trigger.
-- [ ] No downstream crate changed (`git diff --stat` touches only `crates/eth-types/`) — if it does, A3
+- [x] The twin table names all eight pairs and states the deletion trigger.
+- [x] No downstream crate changed (`git diff --stat` touches only `crates/eth-types/`) — if it does, A3
       was wrong and the issue is re-scoped to 3 points.
-- [ ] Workspace green.
+- [x] Workspace green.
 
 **Risks:** None material. Naming bikeshed is the main cost — `Wire*` is chosen because these are the
 encode/decode-facing forms; state it once in the twin table and move on.
