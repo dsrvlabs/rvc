@@ -6,37 +6,39 @@
 #![allow(clippy::arc_with_non_send_sync)]
 #![allow(unused_imports)] // re-exports for topic submodules
 
-// Re-exports for topic submodules (`use super::*`).
+// Re-exports for topic submodules (`use super::*`) and sibling modules
+// (e.g. `block_proposal::tests`) that share this harness.
 // External crates use `::crate_name` so submodule names cannot shadow them.
-pub(super) use super::*;
-pub(super) use ::async_trait::async_trait;
-pub(super) use ::beacon::{AttesterDuty, BeaconClient, BeaconClientConfig, VersionedAttestation};
-pub(super) use ::block_service::BeaconBlockClient;
-pub(super) use ::block_service::ProduceBlockResponse;
-pub(super) use ::bn_manager::{
+pub(crate) use super::*;
+pub(crate) use crate::orchestrator::utils;
+pub(crate) use ::async_trait::async_trait;
+pub(crate) use ::beacon::{AttesterDuty, BeaconClient, BeaconClientConfig, VersionedAttestation};
+pub(crate) use ::block_service::BeaconBlockClient;
+pub(crate) use ::block_service::ProduceBlockResponse;
+pub(crate) use ::bn_manager::{
     AttestationSubmitter, BeaconNodeClient, OperationTimeouts, Propagator,
 };
-pub(super) use ::builder::BuilderService;
-pub(super) use ::crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
-pub(super) use ::duty_tracker::DutyTracker;
-pub(super) use ::eth_types::{ForkName, ForkSchedule, Root, Slot};
-pub(super) use ::signer::{always_enabled, CircuitBreakerState, SignerService, ValidatorSigner};
-pub(super) use ::slashing::SlashingDb;
-pub(super) use ::timing::MockSlotClock;
-pub(super) use ::tree_hash::TreeHash;
-pub(super) use ::validator_store::ValidatorStore;
-pub(super) use std::collections::HashMap;
-pub(super) use std::future::Future;
-pub(super) use std::pin::Pin;
-pub(super) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-pub(super) use std::sync::Arc;
-pub(super) use std::time::Duration;
+pub(crate) use ::builder::BuilderService;
+pub(crate) use ::crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
+pub(crate) use ::duty_tracker::DutyTracker;
+pub(crate) use ::eth_types::{ForkName, ForkSchedule, Root, Slot};
+pub(crate) use ::signer::{always_enabled, CircuitBreakerState, SignerService, ValidatorSigner};
+pub(crate) use ::slashing::SlashingDb;
+pub(crate) use ::timing::MockSlotClock;
+pub(crate) use ::tree_hash::TreeHash;
+pub(crate) use ::validator_store::ValidatorStore;
+pub(crate) use std::collections::HashMap;
+pub(crate) use std::future::Future;
+pub(crate) use std::pin::Pin;
+pub(crate) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+pub(crate) use std::sync::Arc;
+pub(crate) use std::time::Duration;
 
 // ── Shared helpers / mocks ─────────────────────────────────────────────
 
-pub(super) const TEST_GENESIS_TIME: u64 = 1606824023;
+pub(crate) const TEST_GENESIS_TIME: u64 = 1606824023;
 
-pub(super) fn fast_timeouts() -> OperationTimeouts {
+pub(crate) fn fast_timeouts() -> OperationTimeouts {
     OperationTimeouts {
         duty_fetch: Duration::from_millis(200),
         block_production: Duration::from_millis(200),
@@ -51,7 +53,7 @@ pub(super) fn fast_timeouts() -> OperationTimeouts {
     }
 }
 
-pub(super) fn create_test_fork_schedule() -> Arc<ForkSchedule> {
+pub(crate) fn create_test_fork_schedule() -> Arc<ForkSchedule> {
     Arc::new(ForkSchedule {
         genesis_fork_version: [0, 0, 0, 1],
         altair_fork_epoch: 10,
@@ -69,17 +71,17 @@ pub(super) fn create_test_fork_schedule() -> Arc<ForkSchedule> {
     })
 }
 
-pub(super) fn create_test_config() -> OrchestratorConfig {
+pub(crate) fn create_test_config() -> OrchestratorConfig {
     OrchestratorConfig::new([0xaa; 32], create_test_fork_schedule())
 }
 
-pub(super) struct MockSubmitter {
-    call_count: AtomicUsize,
+pub(crate) struct MockSubmitter {
+    pub(crate) call_count: AtomicUsize,
     should_succeed: std::sync::atomic::AtomicBool,
 }
 
 impl MockSubmitter {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             call_count: AtomicUsize::new(0),
             should_succeed: std::sync::atomic::AtomicBool::new(true),
@@ -120,7 +122,7 @@ impl AttestationSubmitter for MockSubmitter {
     }
 }
 
-pub(super) struct MockBlockBeacon;
+pub(crate) struct MockBlockBeacon;
 
 #[async_trait(?Send)]
 impl BeaconBlockClient for MockBlockBeacon {
@@ -160,19 +162,19 @@ impl BeaconBlockClient for MockBlockBeacon {
     }
 }
 
-pub(super) fn create_mock_block_beacon() -> Arc<MockBlockBeacon> {
+pub(crate) fn create_mock_block_beacon() -> Arc<MockBlockBeacon> {
     Arc::new(MockBlockBeacon)
 }
 
 /// Block beacon that returns a block with a configurable `proposer_index`
 /// and tracks whether `publish_block` / `publish_blinded_block` /
-/// `publish_block_ssz` is called.  Used by the H-4 coordinator integration
+/// `publish_block_ssz` is called.  Used by the H-4 block-proposal integration
 /// test to verify that a wrong `proposer_index` causes the duty to be
 /// dropped before any publish attempt.
-pub(super) struct BadProposerBlockBeacon {
-    slot: Slot,
-    bad_proposer_index: u64,
-    publish_called: Arc<AtomicBool>,
+pub(crate) struct BadProposerBlockBeacon {
+    pub(crate) slot: Slot,
+    pub(crate) bad_proposer_index: u64,
+    pub(crate) publish_called: Arc<AtomicBool>,
 }
 
 #[async_trait(?Send)]
@@ -229,7 +231,7 @@ impl BeaconBlockClient for BadProposerBlockBeacon {
     }
 }
 
-pub(super) fn create_mock_validator_store() -> Arc<ValidatorStore> {
+pub(crate) fn create_mock_validator_store() -> Arc<ValidatorStore> {
     Arc::new(ValidatorStore::new([0u8; 20], 100))
 }
 

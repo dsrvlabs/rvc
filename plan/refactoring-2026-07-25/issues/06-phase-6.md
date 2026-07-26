@@ -1315,11 +1315,11 @@ field plumbing, no constructor change). Move the corresponding tests from
 extraction would need (which fields it would take, which seam it would inject).
 
 **Acceptance criteria:**
-- [ ] `coordinator/mod.rs` contains the slot loop and phase dispatch only; proposal methods live in
+- [x] `coordinator/mod.rs` contains the slot loop and phase dispatch only; proposal methods live in
       `block_proposal.rs`.
-- [ ] `git diff -M` renders as a move; no signature, field, or constructor changed.
-- [ ] The module doc records the go/no-go note for a future `BlockProposalService`.
-- [ ] Test count unchanged; workspace green.
+- [x] `git diff -M` renders as a move; no signature, field, or constructor changed.
+- [x] The module doc records the go/no-go note for a future `BlockProposalService`.
+- [x] Test count unchanged; workspace green.
 
 **Risks:** If the proposal methods turn out to be entangled with the slot loop's state such that a second
 `impl` block does not compile cleanly, stop and convert this issue into the 1-point decision issue it
