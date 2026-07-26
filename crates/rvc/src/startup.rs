@@ -5,7 +5,9 @@
 //! 2. Run integrity check
 //! 3. Validate genesis root against beacon node
 //! 4. Check beacon node reachability
-//! 5. Run doppelganger detection (if enabled)
+//! 5. Doppelganger / forward-window enablement is wired in `bin/rvc` via
+//!    [`ForwardWindowMachine`](doppelganger::ForwardWindowMachine) + the
+//!    SEC-2c liveness loop (not the legacy one-shot service).
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;
@@ -21,7 +23,8 @@ use crate::config::ConfigError;
 /// Distinct exit codes for startup failures.
 pub const EXIT_INTEGRITY_CHECK_FAILED: i32 = 10;
 pub const EXIT_GENESIS_ROOT_MISMATCH: i32 = 11;
-pub const EXIT_DOPPELGANGER_DETECTED: i32 = 12;
+// EXIT 12 reserved historically for one-shot doppelganger detection (retired with
+// run_doppelganger_detection; production uses ForwardWindowMachine + Detected gate).
 pub const EXIT_UNSUPPORTED_FORK_VERSION: i32 = 13;
 pub const EXIT_KEYSTORE_LOCKED: i32 = 14;
 
@@ -34,9 +37,6 @@ pub enum StartupError {
     #[error("genesis validators root mismatch: local={local}, beacon={beacon}")]
     GenesisRootMismatch { local: String, beacon: String },
 
-    #[error("doppelganger detected for validators: {0:?}")]
-    DoppelgangerDetected(Vec<String>),
-
     #[error("unsupported consensus fork version {version}; upgrade rvc")]
     UnsupportedForkVersion { version: String },
 
@@ -48,9 +48,6 @@ pub enum StartupError {
 
     #[error("beacon error: {0}")]
     Beacon(#[from] beacon::BeaconError),
-
-    #[error("doppelganger error: {0}")]
-    Doppelganger(#[from] doppelganger::DoppelgangerError),
 
     #[error("keystore locked: {0}")]
     KeystoreLocked(String),
@@ -67,7 +64,6 @@ impl StartupError {
         match self {
             Self::IntegrityCheckFailed(_) => EXIT_INTEGRITY_CHECK_FAILED,
             Self::GenesisRootMismatch { .. } => EXIT_GENESIS_ROOT_MISMATCH,
-            Self::DoppelgangerDetected(_) => EXIT_DOPPELGANGER_DETECTED,
             Self::UnsupportedForkVersion { .. } => EXIT_UNSUPPORTED_FORK_VERSION,
             Self::KeystoreLocked(_) => EXIT_KEYSTORE_LOCKED,
             _ => 1,
@@ -135,83 +131,6 @@ pub async fn check_beacon_reachability(beacon: &dyn BeaconNodeClient) {
             warn!(error = %e, "Beacon node may not be synced or reachable");
         }
     }
-}
-
-/// Run doppelganger detection for the given validators.
-pub async fn run_doppelganger_detection(
-    doppelganger: &doppelganger::DoppelgangerService,
-    pubkeys: &[String],
-    validator_indices: &std::collections::HashMap<String, String>,
-    current_epoch: u64,
-) -> Result<Vec<String>, StartupError> {
-    // S-3 (Issue 2.8): at epoch 0 (genesis / pre-genesis) no slots have occurred,
-    // so liveness-based detection is not meaningful and a pre-genesis beacon node
-    // may return Err from check_liveness, which would abort startup.  Return all
-    // validators as safe immediately, without issuing any beacon query.
-    //
-    // TODO(Issue 2.10): defend against clock-skew making current_epoch==0 mid-chain
-    // (cross-check wall clock vs genesis_time before bypassing).
-    if current_epoch == 0 {
-        info!(
-            count = pubkeys.len(),
-            "Doppelganger detection: pre-genesis (epoch 0) bypass — all validators marked Safe \
-             without a monitoring window (no beacon liveness query issued)"
-        );
-        return Ok(pubkeys.to_vec());
-    }
-
-    info!(validator_count = pubkeys.len(), "Starting doppelganger detection");
-
-    let check_results = doppelganger.check_validators(pubkeys, current_epoch)?;
-
-    let mut needs_monitoring: Vec<String> = Vec::new();
-    let mut safe: Vec<String> = Vec::new();
-
-    for (pubkey, status) in &check_results {
-        match status {
-            doppelganger::DoppelgangerStatus::Safe => {
-                safe.push(pubkey.clone());
-            }
-            doppelganger::DoppelgangerStatus::DetectionInProgress => {
-                needs_monitoring.push(pubkey.clone());
-            }
-            doppelganger::DoppelgangerStatus::DoppelgangerDetected => {
-                return Err(StartupError::DoppelgangerDetected(vec![pubkey.clone()]));
-            }
-        }
-    }
-
-    if safe.len() == pubkeys.len() {
-        info!(count = safe.len(), "All validators safe (restart-aware skip)");
-        return Ok(safe);
-    }
-
-    info!(
-        needs_monitoring = needs_monitoring.len(),
-        already_safe = safe.len(),
-        "Running doppelganger monitoring"
-    );
-
-    let result =
-        doppelganger.run_monitoring(&needs_monitoring, validator_indices, current_epoch).await?;
-
-    if !result.detected.is_empty() {
-        error!(
-            detected = ?result.detected,
-            "Doppelganger detected! Shutting down to prevent slashing"
-        );
-        return Err(StartupError::DoppelgangerDetected(result.detected));
-    }
-
-    let mut all_safe = safe;
-    all_safe.extend(result.safe_validators);
-
-    info!(
-        count = all_safe.len(),
-        "Doppelganger detection complete, all monitored validators are safe"
-    );
-
-    Ok(all_safe)
 }
 
 /// Log that the orchestrator has been started with validator and beacon node counts.
@@ -563,12 +482,6 @@ mod tests {
     }
 
     #[test]
-    fn test_exit_code_doppelganger() {
-        let err = StartupError::DoppelgangerDetected(vec!["0xpk1".to_string()]);
-        assert_eq!(err.exit_code(), EXIT_DOPPELGANGER_DETECTED);
-    }
-
-    #[test]
     fn test_exit_code_generic() {
         let err = StartupError::SlashingDb(slashing::SlashingError::IntegrityCheckFailed(
             "test".to_string(),
@@ -703,12 +616,6 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("0xabc"));
         assert!(msg.contains("0xdef"));
-    }
-
-    #[test]
-    fn test_startup_error_display_doppelganger() {
-        let err = StartupError::DoppelgangerDetected(vec!["0xpk1".to_string()]);
-        assert!(err.to_string().contains("doppelganger detected"));
     }
 
     #[test]
@@ -897,85 +804,5 @@ mod tests {
             "error variant must be InvalidHexInput"
         );
         assert!(logs_contain("double 0x prefix"), "expected warn log about double prefix");
-    }
-
-    // -- S-3 (Issue 2.8): epoch-0 bypass in run_doppelganger_detection --
-
-    /// A `LivenessChecker` that panics if `check_liveness` is ever called.
-    ///
-    /// Used to prove that `run_doppelganger_detection` at epoch 0 returns
-    /// immediately without issuing any beacon node liveness query.
-    struct PanicsOnCheckLiveness;
-
-    #[async_trait]
-    impl doppelganger::LivenessChecker for PanicsOnCheckLiveness {
-        async fn check_liveness(
-            &self,
-            _epoch: u64,
-            _validator_indices: &[String],
-        ) -> Result<Vec<doppelganger::ValidatorLivenessData>, doppelganger::DoppelgangerError>
-        {
-            panic!("check_liveness must NOT be called at epoch 0 (pre-genesis bypass)");
-        }
-    }
-
-    struct EmptySlashingDb;
-
-    impl doppelganger::LegacySlashingHistoryReader for EmptySlashingDb {
-        fn last_signed_attestation_epoch(
-            &self,
-            _pubkey: &str,
-        ) -> Result<Option<u64>, doppelganger::DoppelgangerError> {
-            Ok(None)
-        }
-    }
-
-    fn doppelganger_service_with_panicking_liveness() -> doppelganger::DoppelgangerService {
-        use std::sync::Arc;
-        let liveness: Arc<dyn doppelganger::LivenessChecker> = Arc::new(PanicsOnCheckLiveness);
-        let slashing: Arc<dyn doppelganger::LegacySlashingHistoryReader> =
-            Arc::new(EmptySlashingDb);
-        // genesis_time = 0 → current_epoch() would compute a very large number
-        // from SystemTime::now(), but we pass current_epoch explicitly so it
-        // does not matter for this test.
-        doppelganger::DoppelgangerService::new(liveness, slashing, 0)
-    }
-
-    /// S-3 (Issue 2.8): `run_doppelganger_detection` at epoch 0 must return all
-    /// pubkeys as Safe immediately without issuing any beacon liveness query.
-    ///
-    /// The `PanicsOnCheckLiveness` mock proves the BN is never contacted:
-    /// if the implementation falls through to `run_monitoring`, the panic fires.
-    #[tokio::test]
-    async fn test_run_doppelganger_detection_epoch_0_bypasses_bn_query() {
-        let service = doppelganger_service_with_panicking_liveness();
-        let pubkeys = vec!["0xpubkey_a".to_string(), "0xpubkey_b".to_string()];
-        let validator_indices = std::collections::HashMap::new();
-
-        let result = run_doppelganger_detection(&service, &pubkeys, &validator_indices, 0).await;
-
-        assert!(result.is_ok(), "epoch-0 bypass must return Ok, got: {:?}", result.unwrap_err());
-        let safe = result.unwrap();
-        assert_eq!(safe, pubkeys, "epoch-0 bypass must return all pubkeys as Safe");
-        // If PanicsOnCheckLiveness::check_liveness had been called, the test
-        // would have panicked before reaching this assertion.
-    }
-
-    /// S-3: epoch > 0 still invokes the normal detection path (regression guard).
-    ///
-    /// At epoch 1, `check_validators` is called and returns `DetectionInProgress`
-    /// (no slashing DB entry), which causes `run_monitoring` to be invoked — and
-    /// `PanicsOnCheckLiveness::check_liveness` fires.  This confirms the bypass
-    /// is epoch-0-ONLY and that the normal path is not silently short-circuited.
-    #[tokio::test]
-    #[should_panic(expected = "check_liveness must NOT be called at epoch 0")]
-    async fn test_run_doppelganger_detection_epoch_1_calls_bn() {
-        let service = doppelganger_service_with_panicking_liveness();
-        let pubkeys = vec!["0xpubkey_a".to_string()];
-        let mut validator_indices = std::collections::HashMap::new();
-        validator_indices.insert("0xpubkey_a".to_string(), "1".to_string());
-
-        // At epoch 1 the service calls run_monitoring → check_liveness → panic.
-        let _ = run_doppelganger_detection(&service, &pubkeys, &validator_indices, 1).await;
     }
 }

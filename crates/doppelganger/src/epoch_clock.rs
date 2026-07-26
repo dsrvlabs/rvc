@@ -44,7 +44,11 @@ impl MonotonicEpochClock {
         Self { genesis_time, start_instant: Instant::now(), start_unix_time }
     }
 
-    /// Test/helper constructor with explicit anchors (mirrors `DoppelgangerService::with_start_time`).
+    /// Test/helper constructor with explicit anchors.
+    ///
+    /// Production paths use [`Self::new`]; tests and
+    /// [`crate::DoppelgangerService::with_start_time`] use this to drive
+    /// deterministic epoch values.
     pub fn with_start_time(
         genesis_time: u64,
         start_instant: Instant,

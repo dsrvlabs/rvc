@@ -23,7 +23,9 @@
 
 use std::sync::Arc;
 
-use rvc_doppelganger::{ForwardWindowMachine, SigningEnablement, ValidatorLivenessData};
+use rvc_doppelganger::{
+    ForwardWindowMachine, ForwardWindowStatus, SigningEnablement, ValidatorLivenessData,
+};
 
 use crypto::SecretKey;
 use eth_types::{Epoch, Root, SLOTS_PER_EPOCH};
@@ -403,6 +405,89 @@ fn test_restart_safe_skip_blocked_at_low_epoch() {
     assert!(
         !machine.is_signing_enabled(&pubkey),
         "current_epoch <= monitoring_epochs must block safe-skip (pre-genesis guard)"
+    );
+}
+
+/// Future last_signed target (interchange plant / clock lag) must NOT Safe-skip.
+#[test]
+fn test_restart_safe_skip_rejects_future_last_signed() {
+    let monitoring_epochs: u64 = 2;
+    let current_epoch: Epoch = 100;
+    let future_target: Epoch = 200;
+
+    let machine = machine_with_prior(monitoring_epochs, future_target);
+    let pubkey = new_pubkey();
+    machine.register(&pubkey, current_epoch);
+
+    assert!(
+        !machine.is_signing_enabled(&pubkey),
+        "future last_signed ({future_target} > {current_epoch}) must force Pending, not Safe-skip"
+    );
+    assert_eq!(
+        machine.status(&pubkey),
+        ForwardWindowStatus::Pending,
+        "future last_signed must enter the monitoring window"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle: imported / restarted keys stay gated until the window clears
+// ---------------------------------------------------------------------------
+
+/// Keymanager import path: always Pending; signing stays disabled until the
+/// full monitoring window is observed and the satisfaction boundary is hit.
+#[test]
+fn test_imported_key_does_not_attest_until_window_clears() {
+    let monitoring_epochs: u64 = 2;
+    let start_epoch: Epoch = 10;
+    let end_epoch = start_epoch + monitoring_epochs;
+
+    let machine = machine_no_prior(monitoring_epochs);
+    let pubkey = new_pubkey();
+    machine.register_for_import(&pubkey, start_epoch);
+
+    assert!(
+        !machine.is_signing_enabled(&pubkey),
+        "imported key must not sign until the forward window clears"
+    );
+
+    // Mid-window: still Pending even with complete observations so far.
+    observe_complete_window(&machine, &pubkey, start_epoch, start_epoch);
+    machine.tick(start_epoch, SLOTS_PER_EPOCH - 1);
+    assert!(!machine.is_signing_enabled(&pubkey), "imported key still Pending mid-window");
+
+    // Complete remaining epochs and tick the satisfaction boundary.
+    observe_complete_window(&machine, &pubkey, start_epoch + 1, end_epoch);
+    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    assert!(
+        machine.is_signing_enabled(&pubkey),
+        "imported key may sign only after the window fully clears"
+    );
+}
+
+/// Boot restart without recent local history: register enters Pending; signing
+/// stays disabled until observe + tick clear the window (enablement gate).
+#[test]
+fn test_restarted_key_does_not_attest_until_window_clears() {
+    let monitoring_epochs: u64 = 2;
+    let start_epoch: Epoch = 10;
+    let end_epoch = start_epoch + monitoring_epochs;
+
+    // No prior attestation → restart path still requires full monitoring.
+    let machine = machine_no_prior(monitoring_epochs);
+    let pubkey = new_pubkey();
+    machine.register(&pubkey, start_epoch);
+
+    assert!(
+        !machine.is_signing_enabled(&pubkey),
+        "restarted key without recent history must not sign until the window clears"
+    );
+
+    observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
+    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    assert!(
+        machine.is_signing_enabled(&pubkey),
+        "restarted key may sign only after the window fully clears"
     );
 }
 
