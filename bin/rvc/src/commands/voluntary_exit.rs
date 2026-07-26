@@ -6,7 +6,7 @@ use tracing::info;
 
 use eth_types::{SignedVoluntaryExit, VoluntaryExit, SLOTS_PER_EPOCH};
 use rvc::config::{Config, ServiceBuilder};
-use signer::SignerService;
+use signer::{SignerService, ValidatorSigner};
 
 pub struct VoluntaryExitArgs {
     pub pubkey: String,

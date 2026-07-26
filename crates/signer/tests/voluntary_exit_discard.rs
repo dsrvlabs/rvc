@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey};
 use eth_types::{ForkSchedule, Root, VoluntaryExit};
-use rvc_signer::{SignerError, SignerService};
+use rvc_signer::{SignerError, SignerService, ValidatorSigner};
 use slashing::SlashingDb;
 
 use rvc_signer::SigningEnablement;

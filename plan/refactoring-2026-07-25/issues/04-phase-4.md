@@ -793,10 +793,10 @@ wire boundary.
    RF4-06's core owns `spawn_blocking`, drop it; if it still is, document why in one place.
 
 **Acceptance criteria:**
-- [ ] `crates/signer/src/lib.rs:1138-1337` is gone; no delegation impl remains.
-- [ ] `.to_bytes()` appears only at wire boundaries (enumerated in PR).
-- [ ] The `?Send` decision is made and documented either way.
-- [ ] Standing invariant green.
+- [x] `crates/signer/src/lib.rs:1138-1337` is gone; no delegation impl remains.
+- [x] `.to_bytes()` appears only at wire boundaries (enumerated in PR).
+- [x] The `?Send` decision is made and documented either way.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_validator_signer_trait_returns_typed_signature` — a compile-level test

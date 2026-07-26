@@ -19,7 +19,7 @@ use keymanager_api::traits::{
     ValidatorConfigManager, ValidatorManager, VoluntaryExitManager,
 };
 use observability::logging::TruncatedPubkey;
-use signer::SignerService;
+use signer::{SignerService, ValidatorSigner};
 use slashing::SlashingDb;
 use tokio::sync::watch;
 use tracing::{error, info, warn};

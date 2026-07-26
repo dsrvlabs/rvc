@@ -343,7 +343,8 @@ impl SignerService {
     /// Production paths use [`Self::timeout_policy_source`] (resolve under lock).
     /// This helper is retained for tests that assert the kind→policy mapping.
     #[cfg(any(test, feature = "test-utils"))]
-    fn timeout_policy_for(&self, pubkey: &PublicKey) -> TimeoutPolicy {
+    #[doc(hidden)]
+    pub fn timeout_policy_for(&self, pubkey: &PublicKey) -> TimeoutPolicy {
         Self::timeout_policy_for_kind(self.backend_kind(pubkey))
     }
 
@@ -409,236 +410,6 @@ impl SignerService {
         Signature::from_bytes(&bytes).map_err(|e| {
             SignerError::SigningFailed(format!("invalid signature bytes from sign core: {e}"))
         })
-    }
-
-    /// Signs an attestation after checking slashing protection.
-    ///
-    /// Delegates to [`sign_slashable`] with per-pubkey [`TimeoutPolicy`]:
-    /// in-process local keys discard on timeout; remote/unknown retain
-    /// (fail-closed). Metrics via [`StandardSlashableHooks::attestation`].
-    #[tracing::instrument(name = "sign.attestation", skip_all, fields(slot = attestation_data.slot, duty = %Duty::Attestation.as_str(), slashing_result = tracing::field::Empty))]
-    pub async fn sign_attestation(
-        &self,
-        attestation_data: &AttestationData,
-        pubkey: &PublicKey,
-        fork_schedule: &ForkSchedule,
-        genesis_validators_root: &Root,
-    ) -> Result<Signature, SignerError> {
-        // Cheap outer enablement check (core re-checks under the lock).
-        self.ensure_signing_enabled(pubkey)?;
-
-        let start = Instant::now();
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
-
-        debug!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            slot = attestation_data.slot,
-            source_epoch = attestation_data.source.epoch,
-            target_epoch = attestation_data.target.epoch,
-            signing_type = "attestation",
-            "Signing attestation"
-        );
-
-        let source_epoch = attestation_data.source.epoch;
-        let target_epoch = attestation_data.target.epoch;
-
-        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
-        let signing_root = signing_root_for(&DutyRef::Attestation(attestation_data), &ctx);
-
-        debug!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            signing_root = %TruncatedRoot::new(&signing_root),
-            genesis_validators_root = %TruncatedRoot::new(genesis_validators_root),
-            slot = attestation_data.slot,
-            index = attestation_data.index,
-            source_epoch = attestation_data.source.epoch,
-            target_epoch = attestation_data.target.epoch,
-            "Computed attestation signing root"
-        );
-
-        // Emit `slashing.check` on the async task so subscribers can observe it
-        // before the core moves stage work onto a blocking thread.
-        let _slashing_span = tracing::info_span!("slashing.check").entered();
-        drop(_slashing_span);
-
-        let db = Arc::clone(&self.slashing_db);
-        let gvr = *genesis_validators_root;
-        let pubkey_hex_clone = pubkey_hex.clone();
-        let slot_for_log = attestation_data.slot;
-        // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
-        let policy = self.timeout_policy_source(pubkey);
-        let span = tracing::Span::current();
-
-        let result = sign_slashable(
-            SignSlashableRequest {
-                locks: &self.validator_locks,
-                pubkey,
-                enablement: self.enablement.as_ref(),
-                signer: Arc::clone(&self.sign_backend),
-                signing_root,
-                sign_timeout: self.sign_timeout,
-                policy,
-                hooks: Arc::new(StandardSlashableHooks::attestation()),
-                op_name: "sign_attestation",
-            },
-            move |session| {
-                let _e = span.enter();
-                // Sampled 1-in-N stage trace (issue 5.3); zero-cost when TRACE off.
-                if tracing::enabled!(tracing::Level::TRACE)
-                    && observability::logging::should_log_sampled(
-                        &ATTESTATION_STAGE_TRACE_CTR,
-                        ATTESTATION_STAGE_TRACE_SAMPLE_N,
-                    )
-                {
-                    tracing::trace!(
-                        "staging attestation slashing-protection record on blocking thread (sampled 1-in-{ATTESTATION_STAGE_TRACE_SAMPLE_N})"
-                    );
-                }
-                let scoped = PubkeyScopedDb::new(db, AUDIT_CN_VC.to_string(), gvr);
-                session.stage_then_sign(|| {
-                    scoped
-                        .stage_attestation(
-                            &pubkey_hex_clone,
-                            source_epoch,
-                            target_epoch,
-                            Some(hex::encode(signing_root)),
-                        )
-                        .map_err(|e| {
-                            error!(
-                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                                slot = slot_for_log,
-                                source_epoch = source_epoch,
-                                target_epoch = target_epoch,
-                                rejection_reason = %e,
-                                "Slashing protection rejected attestation"
-                            );
-                            e
-                        })
-                })
-            },
-        )
-        .await;
-
-        match result {
-            Ok(bytes) => {
-                observability::logging::record_display(
-                    &tracing::Span::current(),
-                    "slashing_result",
-                    "safe",
-                );
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "attestation",
-                    "Signing completed"
-                );
-                Self::signature_from_bytes(bytes)
-            }
-            Err(e) => {
-                if matches!(e, SigningGateError::SlashingBlocked(_)) {
-                    observability::logging::record_display(
-                        &tracing::Span::current(),
-                        "slashing_result",
-                        "blocked",
-                    );
-                }
-                Err(Self::map_gate_error(e, &pubkey_hex))
-            }
-        }
-    }
-
-    /// Signs a block after checking slashing protection.
-    ///
-    /// Same shared-core path as [`Self::sign_attestation`] with
-    /// [`StandardSlashableHooks::block`] and per-pubkey [`TimeoutPolicy`].
-    #[tracing::instrument(name = "sign.block", skip_all, fields(slot = slot, duty = %Duty::Block.as_str(), slashing_result = tracing::field::Empty))]
-    pub async fn sign_block(
-        &self,
-        block_root: &Root,
-        slot: Slot,
-        pubkey: &PublicKey,
-        fork_schedule: &ForkSchedule,
-        genesis_validators_root: &Root,
-    ) -> Result<Signature, SignerError> {
-        self.ensure_signing_enabled(pubkey)?;
-
-        let start = Instant::now();
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
-
-        debug!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            slot = slot,
-            signing_type = "block",
-            "Signing block"
-        );
-
-        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
-        let signing_root = signing_root_for(&DutyRef::BlockRoot { root: block_root, slot }, &ctx);
-
-        let db = Arc::clone(&self.slashing_db);
-        let gvr = *genesis_validators_root;
-        let pubkey_hex_clone = pubkey_hex.clone();
-        // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
-        let policy = self.timeout_policy_source(pubkey);
-        let span = tracing::Span::current();
-
-        let result = sign_slashable(
-            SignSlashableRequest {
-                locks: &self.validator_locks,
-                pubkey,
-                enablement: self.enablement.as_ref(),
-                signer: Arc::clone(&self.sign_backend),
-                signing_root,
-                sign_timeout: self.sign_timeout,
-                policy,
-                hooks: Arc::new(StandardSlashableHooks::block()),
-                op_name: "sign_block",
-            },
-            move |session| {
-                let _e = span.enter();
-                tracing::trace!("staging block slashing-protection record on blocking thread");
-                let scoped = PubkeyScopedDb::new(db, AUDIT_CN_VC.to_string(), gvr);
-                session.stage_then_sign(|| {
-                    scoped
-                        .stage_block(&pubkey_hex_clone, slot, Some(hex::encode(signing_root)))
-                        .map_err(|e| {
-                            error!(
-                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                                slot = slot,
-                                rejection_reason = %e,
-                                "Slashing protection rejected block proposal"
-                            );
-                            e
-                        })
-                })
-            },
-        )
-        .await;
-
-        match result {
-            Ok(bytes) => {
-                observability::logging::record_display(
-                    &tracing::Span::current(),
-                    "slashing_result",
-                    "safe",
-                );
-                debug!(
-                    duration_ms = start.elapsed().as_millis() as u64,
-                    signing_type = "block",
-                    "Signing completed"
-                );
-                Self::signature_from_bytes(bytes)
-            }
-            Err(e) => {
-                if matches!(e, SigningGateError::SlashingBlocked(_)) {
-                    observability::logging::record_display(
-                        &tracing::Span::current(),
-                        "slashing_result",
-                        "blocked",
-                    );
-                }
-                Err(Self::map_gate_error(e, &pubkey_hex))
-            }
-        }
     }
 
     // -------------------------------------------------------------------------
@@ -732,9 +503,258 @@ impl SignerService {
         }
     }
 
+    /// Returns a reference to the underlying composite signer.
+    pub fn signer(&self) -> &CompositeSigner {
+        &self.signer
+    }
+
+    /// Returns a reference to the underlying slashing database.
+    pub fn slashing_db(&self) -> &SlashingDb {
+        &self.slashing_db
+    }
+}
+
+// Single surface: sign methods live only on [`ValidatorSigner`] (RF4-12 / F44).
+// No parallel inherent methods and no pure-forward delegation. Callers of a
+// concrete [`SignerService`] need `ValidatorSigner` in scope (crate re-exports it).
+// Wire conversion via [`Signature::to_bytes`] remains at beacon/gRPC/HTTP boundaries.
+//
+// `Send` futures — see docs on [`ValidatorSigner`].
+#[async_trait]
+impl ValidatorSigner for SignerService {
+    /// Signs an attestation after checking slashing protection.
+    ///
+    /// Delegates to [`sign_slashable`] with per-pubkey [`TimeoutPolicy`]:
+    /// in-process local keys discard on timeout; remote/unknown retain
+    /// (fail-closed). Metrics via [`StandardSlashableHooks::attestation`].
+    #[tracing::instrument(name = "sign.attestation", skip_all, fields(slot = data.slot, duty = %Duty::Attestation.as_str(), slashing_result = tracing::field::Empty))]
+    async fn sign_attestation(
+        &self,
+        data: &AttestationData,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        // Cheap outer enablement check (core re-checks under the lock).
+        self.ensure_signing_enabled(pubkey)?;
+
+        let start = Instant::now();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = data.slot,
+            source_epoch = data.source.epoch,
+            target_epoch = data.target.epoch,
+            signing_type = "attestation",
+            "Signing attestation"
+        );
+
+        let source_epoch = data.source.epoch;
+        let target_epoch = data.target.epoch;
+
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(&DutyRef::Attestation(data), &ctx);
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            signing_root = %TruncatedRoot::new(&signing_root),
+            genesis_validators_root = %TruncatedRoot::new(genesis_validators_root),
+            slot = data.slot,
+            index = data.index,
+            source_epoch = data.source.epoch,
+            target_epoch = data.target.epoch,
+            "Computed attestation signing root"
+        );
+
+        // Emit `slashing.check` on the async task so subscribers can observe it
+        // before the core moves stage work onto a blocking thread.
+        let _slashing_span = tracing::info_span!("slashing.check").entered();
+        drop(_slashing_span);
+
+        let db = Arc::clone(&self.slashing_db);
+        let gvr = *genesis_validators_root;
+        let pubkey_hex_clone = pubkey_hex.clone();
+        let slot_for_log = data.slot;
+        // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
+        let policy = self.timeout_policy_source(pubkey);
+        let span = tracing::Span::current();
+
+        let result = sign_slashable(
+            SignSlashableRequest {
+                locks: &self.validator_locks,
+                pubkey,
+                enablement: self.enablement.as_ref(),
+                signer: Arc::clone(&self.sign_backend),
+                signing_root,
+                sign_timeout: self.sign_timeout,
+                policy,
+                hooks: Arc::new(StandardSlashableHooks::attestation()),
+                op_name: "sign_attestation",
+            },
+            move |session| {
+                let _e = span.enter();
+                // Sampled 1-in-N stage trace (issue 5.3); zero-cost when TRACE off.
+                if tracing::enabled!(tracing::Level::TRACE)
+                    && observability::logging::should_log_sampled(
+                        &ATTESTATION_STAGE_TRACE_CTR,
+                        ATTESTATION_STAGE_TRACE_SAMPLE_N,
+                    )
+                {
+                    tracing::trace!(
+                        "staging attestation slashing-protection record on blocking thread (sampled 1-in-{ATTESTATION_STAGE_TRACE_SAMPLE_N})"
+                    );
+                }
+                let scoped = PubkeyScopedDb::new(db, AUDIT_CN_VC.to_string(), gvr);
+                session.stage_then_sign(|| {
+                    scoped
+                        .stage_attestation(
+                            &pubkey_hex_clone,
+                            source_epoch,
+                            target_epoch,
+                            Some(hex::encode(signing_root)),
+                        )
+                        .map_err(|e| {
+                            error!(
+                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                                slot = slot_for_log,
+                                source_epoch = source_epoch,
+                                target_epoch = target_epoch,
+                                rejection_reason = %e,
+                                "Slashing protection rejected attestation"
+                            );
+                            e
+                        })
+                })
+            },
+        )
+        .await;
+
+        match result {
+            Ok(bytes) => {
+                observability::logging::record_display(
+                    &tracing::Span::current(),
+                    "slashing_result",
+                    "safe",
+                );
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "attestation",
+                    "Signing completed"
+                );
+                Self::signature_from_bytes(bytes)
+            }
+            Err(e) => {
+                if matches!(e, SigningGateError::SlashingBlocked(_)) {
+                    observability::logging::record_display(
+                        &tracing::Span::current(),
+                        "slashing_result",
+                        "blocked",
+                    );
+                }
+                Err(Self::map_gate_error(e, &pubkey_hex))
+            }
+        }
+    }
+
+    /// Signs a block after checking slashing protection.
+    ///
+    /// Same shared-core path as [`Self::sign_attestation`] with
+    /// [`StandardSlashableHooks::block`] and per-pubkey [`TimeoutPolicy`].
+    #[tracing::instrument(name = "sign.block", skip_all, fields(slot = slot, duty = %Duty::Block.as_str(), slashing_result = tracing::field::Empty))]
+    async fn sign_block(
+        &self,
+        block_root: &Root,
+        slot: Slot,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        self.ensure_signing_enabled(pubkey)?;
+
+        let start = Instant::now();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "block",
+            "Signing block"
+        );
+
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(&DutyRef::BlockRoot { root: block_root, slot }, &ctx);
+
+        let db = Arc::clone(&self.slashing_db);
+        let gvr = *genesis_validators_root;
+        let pubkey_hex_clone = pubkey_hex.clone();
+        // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
+        let policy = self.timeout_policy_source(pubkey);
+        let span = tracing::Span::current();
+
+        let result = sign_slashable(
+            SignSlashableRequest {
+                locks: &self.validator_locks,
+                pubkey,
+                enablement: self.enablement.as_ref(),
+                signer: Arc::clone(&self.sign_backend),
+                signing_root,
+                sign_timeout: self.sign_timeout,
+                policy,
+                hooks: Arc::new(StandardSlashableHooks::block()),
+                op_name: "sign_block",
+            },
+            move |session| {
+                let _e = span.enter();
+                tracing::trace!("staging block slashing-protection record on blocking thread");
+                let scoped = PubkeyScopedDb::new(db, AUDIT_CN_VC.to_string(), gvr);
+                session.stage_then_sign(|| {
+                    scoped
+                        .stage_block(&pubkey_hex_clone, slot, Some(hex::encode(signing_root)))
+                        .map_err(|e| {
+                            error!(
+                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
+                                slot = slot,
+                                rejection_reason = %e,
+                                "Slashing protection rejected block proposal"
+                            );
+                            e
+                        })
+                })
+            },
+        )
+        .await;
+
+        match result {
+            Ok(bytes) => {
+                observability::logging::record_display(
+                    &tracing::Span::current(),
+                    "slashing_result",
+                    "safe",
+                );
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "block",
+                    "Signing completed"
+                );
+                Self::signature_from_bytes(bytes)
+            }
+            Err(e) => {
+                if matches!(e, SigningGateError::SlashingBlocked(_)) {
+                    observability::logging::record_display(
+                        &tracing::Span::current(),
+                        "slashing_result",
+                        "blocked",
+                    );
+                }
+                Err(Self::map_gate_error(e, &pubkey_hex))
+            }
+        }
+    }
+
     /// Signs a RANDAO reveal for the given epoch.
     #[tracing::instrument(name = "sign.randao", skip_all, fields(duty = %Duty::Block.as_str()))]
-    pub async fn sign_randao_reveal(
+    async fn sign_randao_reveal(
         &self,
         epoch: Epoch,
         pubkey: &PublicKey,
@@ -748,7 +768,7 @@ impl SignerService {
 
     /// Signs a sync committee message for the given beacon block root and slot.
     #[tracing::instrument(name = "sign.sync_committee_message", skip_all, fields(duty = %Duty::SyncCommittee.as_str()))]
-    pub async fn sign_sync_committee_message(
+    async fn sign_sync_committee_message(
         &self,
         beacon_block_root: &Root,
         slot: Slot,
@@ -764,7 +784,7 @@ impl SignerService {
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
     #[tracing::instrument(name = "sign.selection_proof", skip_all, fields(duty = %Duty::Aggregate.as_str()))]
-    pub async fn sign_selection_proof(
+    async fn sign_selection_proof(
         &self,
         slot: Slot,
         pubkey: &PublicKey,
@@ -781,7 +801,7 @@ impl SignerService {
     /// Non-slashable: the inner attestation must already have been committed by
     /// [`Self::sign_attestation`]. This method does not touch the slashing DB.
     #[tracing::instrument(name = "sign.aggregate_and_proof", skip_all, fields(duty = %Duty::Aggregate.as_str()))]
-    pub async fn sign_aggregate_and_proof(
+    async fn sign_aggregate_and_proof(
         &self,
         aggregate_and_proof: &AggregateAndProof,
         pubkey: &PublicKey,
@@ -797,7 +817,7 @@ impl SignerService {
     ///
     /// Non-slashable: same chain-of-custody rule as [`Self::sign_aggregate_and_proof`].
     #[tracing::instrument(name = "sign.electra_aggregate_and_proof", skip_all, fields(duty = %Duty::Aggregate.as_str()))]
-    pub async fn sign_electra_aggregate_and_proof(
+    async fn sign_electra_aggregate_and_proof(
         &self,
         aggregate_and_proof: &ElectraAggregateAndProof,
         pubkey: &PublicKey,
@@ -823,7 +843,7 @@ impl SignerService {
     /// failure is propagated directly to the caller via `Err` — no error is
     /// swallowed or silently converted to `Ok`.
     #[tracing::instrument(name = "sign.voluntary_exit", skip_all, fields(duty = %Duty::VoluntaryExit.as_str()))]
-    pub async fn sign_voluntary_exit(
+    async fn sign_voluntary_exit(
         &self,
         voluntary_exit: &VoluntaryExit,
         pubkey: &PublicKey,
@@ -840,7 +860,7 @@ impl SignerService {
     ///
     /// No slashing check is needed — builder registrations are not slashable.
     #[tracing::instrument(name = "sign.builder_registration", skip_all, fields(duty = %Duty::ValidatorRegistration.as_str()))]
-    pub async fn sign_builder_registration(
+    async fn sign_builder_registration(
         &self,
         registration: &ValidatorRegistrationV1,
         pubkey: &PublicKey,
@@ -859,7 +879,7 @@ impl SignerService {
 
     /// Signs a sync committee selection proof for the given slot and subcommittee.
     #[tracing::instrument(name = "sign.sync_committee_selection_proof", skip_all, fields(duty = %Duty::SyncContribution.as_str()))]
-    pub async fn sign_sync_committee_selection_proof(
+    async fn sign_sync_committee_selection_proof(
         &self,
         slot: Slot,
         subcommittee_index: u64,
@@ -875,7 +895,7 @@ impl SignerService {
 
     /// Signs a ContributionAndProof with DOMAIN_CONTRIBUTION_AND_PROOF.
     #[tracing::instrument(name = "sign.contribution_and_proof", skip_all, fields(duty = %Duty::SyncContribution.as_str()))]
-    pub async fn sign_contribution_and_proof(
+    async fn sign_contribution_and_proof(
         &self,
         contribution_and_proof: &ContributionAndProof,
         pubkey: &PublicKey,
@@ -886,217 +906,6 @@ impl SignerService {
         let signing_root =
             signing_root_for(&DutyRef::ContributionAndProof(contribution_and_proof), &ctx);
         self.sign_nonslashable(pubkey, signing_root, "contribution_and_proof").await
-    }
-
-    /// Returns a reference to the underlying composite signer.
-    pub fn signer(&self) -> &CompositeSigner {
-        &self.signer
-    }
-
-    /// Returns a reference to the underlying slashing database.
-    pub fn slashing_db(&self) -> &SlashingDb {
-        &self.slashing_db
-    }
-}
-
-#[async_trait(?Send)]
-impl ValidatorSigner for SignerService {
-    async fn sign_attestation(
-        &self,
-        data: &AttestationData,
-        pubkey: &PublicKey,
-        fork_schedule: &ForkSchedule,
-        genesis_validators_root: &Root,
-    ) -> Result<Vec<u8>, SignerError> {
-        let signature = SignerService::sign_attestation(
-            self,
-            data,
-            pubkey,
-            fork_schedule,
-            genesis_validators_root,
-        )
-        .await?;
-        Ok(signature.to_bytes().to_vec())
-    }
-
-    async fn sign_block(
-        &self,
-        block_root: &Root,
-        slot: Slot,
-        pubkey: &PublicKey,
-        fork_schedule: &ForkSchedule,
-        genesis_validators_root: &Root,
-    ) -> Result<Vec<u8>, SignerError> {
-        let signature = SignerService::sign_block(
-            self,
-            block_root,
-            slot,
-            pubkey,
-            fork_schedule,
-            genesis_validators_root,
-        )
-        .await?;
-        Ok(signature.to_bytes().to_vec())
-    }
-
-    async fn sign_randao_reveal(
-        &self,
-        epoch: Epoch,
-        pubkey: &PublicKey,
-        fork_schedule: &ForkSchedule,
-        genesis_validators_root: &Root,
-    ) -> Result<Vec<u8>, SignerError> {
-        let signature = SignerService::sign_randao_reveal(
-            self,
-            epoch,
-            pubkey,
-            fork_schedule,
-            genesis_validators_root,
-        )
-        .await?;
-        Ok(signature.to_bytes().to_vec())
-    }
-
-    async fn sign_sync_committee_message(
-        &self,
-        beacon_block_root: &Root,
-        slot: Slot,
-        pubkey: &PublicKey,
-        fork_schedule: &ForkSchedule,
-        genesis_validators_root: &Root,
-    ) -> Result<Vec<u8>, SignerError> {
-        let signature = SignerService::sign_sync_committee_message(
-            self,
-            beacon_block_root,
-            slot,
-            pubkey,
-            fork_schedule,
-            genesis_validators_root,
-        )
-        .await?;
-        Ok(signature.to_bytes().to_vec())
-    }
-
-    async fn sign_selection_proof(
-        &self,
-        slot: Slot,
-        pubkey: &PublicKey,
-        fork_schedule: &ForkSchedule,
-        genesis_validators_root: &Root,
-    ) -> Result<Vec<u8>, SignerError> {
-        let signature = SignerService::sign_selection_proof(
-            self,
-            slot,
-            pubkey,
-            fork_schedule,
-            genesis_validators_root,
-        )
-        .await?;
-        Ok(signature.to_bytes().to_vec())
-    }
-
-    async fn sign_aggregate_and_proof(
-        &self,
-        aggregate_and_proof: &AggregateAndProof,
-        pubkey: &PublicKey,
-        fork_schedule: &ForkSchedule,
-        genesis_validators_root: &Root,
-    ) -> Result<Vec<u8>, SignerError> {
-        let signature = SignerService::sign_aggregate_and_proof(
-            self,
-            aggregate_and_proof,
-            pubkey,
-            fork_schedule,
-            genesis_validators_root,
-        )
-        .await?;
-        Ok(signature.to_bytes().to_vec())
-    }
-
-    async fn sign_electra_aggregate_and_proof(
-        &self,
-        aggregate_and_proof: &ElectraAggregateAndProof,
-        pubkey: &PublicKey,
-        fork_schedule: &ForkSchedule,
-        genesis_validators_root: &Root,
-    ) -> Result<Vec<u8>, SignerError> {
-        let signature = SignerService::sign_electra_aggregate_and_proof(
-            self,
-            aggregate_and_proof,
-            pubkey,
-            fork_schedule,
-            genesis_validators_root,
-        )
-        .await?;
-        Ok(signature.to_bytes().to_vec())
-    }
-
-    async fn sign_voluntary_exit(
-        &self,
-        voluntary_exit: &VoluntaryExit,
-        pubkey: &PublicKey,
-        fork_schedule: &ForkSchedule,
-        genesis_validators_root: &Root,
-    ) -> Result<Vec<u8>, SignerError> {
-        let signature = SignerService::sign_voluntary_exit(
-            self,
-            voluntary_exit,
-            pubkey,
-            fork_schedule,
-            genesis_validators_root,
-        )
-        .await?;
-        Ok(signature.to_bytes().to_vec())
-    }
-
-    async fn sign_builder_registration(
-        &self,
-        registration: &ValidatorRegistrationV1,
-        pubkey: &PublicKey,
-        fork_version: [u8; 4],
-    ) -> Result<Vec<u8>, SignerError> {
-        let signature =
-            SignerService::sign_builder_registration(self, registration, pubkey, fork_version)
-                .await?;
-        Ok(signature.to_bytes().to_vec())
-    }
-
-    async fn sign_sync_committee_selection_proof(
-        &self,
-        slot: Slot,
-        subcommittee_index: u64,
-        pubkey: &PublicKey,
-        fork_schedule: &ForkSchedule,
-        genesis_validators_root: &Root,
-    ) -> Result<Vec<u8>, SignerError> {
-        let signature = SignerService::sign_sync_committee_selection_proof(
-            self,
-            slot,
-            subcommittee_index,
-            pubkey,
-            fork_schedule,
-            genesis_validators_root,
-        )
-        .await?;
-        Ok(signature.to_bytes().to_vec())
-    }
-
-    async fn sign_contribution_and_proof(
-        &self,
-        contribution_and_proof: &ContributionAndProof,
-        pubkey: &PublicKey,
-        fork_schedule: &ForkSchedule,
-        genesis_validators_root: &Root,
-    ) -> Result<Vec<u8>, SignerError> {
-        let signature = SignerService::sign_contribution_and_proof(
-            self,
-            contribution_and_proof,
-            pubkey,
-            fork_schedule,
-            genesis_validators_root,
-        )
-        .await?;
-        Ok(signature.to_bytes().to_vec())
     }
 }
 
@@ -2212,8 +2021,8 @@ mod tests {
             trait_signer.sign_block(&block_root, 5, &pubkey, &schedule, &genesis_root).await;
         assert!(result.is_ok());
 
-        let sig_bytes = result.unwrap();
-        assert_eq!(sig_bytes.len(), 96);
+        let sig = result.unwrap();
+        assert_eq!(sig.to_bytes().len(), 96);
 
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let blocks = slashing_db.get_blocks(&pubkey_hex).expect("failed to get");
@@ -2240,8 +2049,69 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let sig_bytes = result.unwrap();
-        assert_eq!(sig_bytes.len(), 96);
+        let sig = result.unwrap();
+        assert_eq!(sig.to_bytes().len(), 96);
+    }
+
+    /// Compile-level + runtime check that `ValidatorSigner` returns `crypto::Signature`.
+    #[tokio::test]
+    async fn test_validator_signer_trait_returns_typed_signature() {
+        fn _assert_returns_signature<T: ValidatorSigner>(_: &T) {}
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
+        _assert_returns_signature(&service);
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let trait_signer: &dyn ValidatorSigner = &service;
+        let sig: Signature = trait_signer
+            .sign_block(&[0x11; 32], 5, &pubkey, &schedule, &genesis_root)
+            .await
+            .expect("sign_block via trait");
+        // Typed binding proves the trait surface is `Signature`, not `Vec<u8>`.
+        let _: [u8; 96] = sig.to_bytes();
+    }
+
+    /// Concrete `SignerService` and `&dyn ValidatorSigner` share one method
+    /// surface (single-surface RF4-12) — same-root re-sign yields identical bytes.
+    ///
+    /// BLS signing with a fixed key and root is deterministic; the second call
+    /// is allowed by EIP-3076 same-root retry and must match the first.
+    #[tokio::test]
+    async fn test_trait_and_inherent_methods_are_the_same_function() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let block_root = [0x22; 32];
+        let slot = 7u64;
+
+        // Concrete type (trait method in scope via `use super::*`).
+        let via_concrete = service
+            .sign_block(&block_root, slot, &pubkey, &schedule, &genesis_root)
+            .await
+            .expect("concrete");
+
+        // Same service via trait object — no second API surface.
+        let trait_signer: &dyn ValidatorSigner = &service;
+        let via_trait = trait_signer
+            .sign_block(&block_root, slot, &pubkey, &schedule, &genesis_root)
+            .await
+            .expect("trait object");
+
+        assert_eq!(
+            via_concrete.to_bytes(),
+            via_trait.to_bytes(),
+            "concrete and dyn trait object must return identical signature bytes"
+        );
     }
 
     // --- Aggregation signing tests ---

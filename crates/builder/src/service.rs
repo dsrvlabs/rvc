@@ -130,8 +130,11 @@ impl BuilderService {
                 .await
             {
                 Ok(signature) => {
-                    registrations
-                        .push(SignedValidatorRegistration { message: registration, signature });
+                    // Wire boundary: eth_types::Signature is Vec<u8> for JSON serde.
+                    registrations.push(SignedValidatorRegistration {
+                        message: registration,
+                        signature: signature.to_bytes().to_vec(),
+                    });
                 }
                 Err(e) => {
                     error!(
@@ -357,32 +360,42 @@ mod tests {
     struct MockSigner {
         fail_sign: bool,
         sign_calls: Mutex<Vec<[u8; 48]>>,
+        /// Fixed valid BLS signature for wire-boundary assertions.
+        sig: crypto::Signature,
     }
 
     impl MockSigner {
         fn new() -> Self {
-            Self { fail_sign: false, sign_calls: Mutex::new(Vec::new()) }
+            Self {
+                fail_sign: false,
+                sign_calls: Mutex::new(Vec::new()),
+                sig: crypto::SecretKey::generate().sign(b"mock-builder-reg"),
+            }
         }
 
         fn with_sign_error(mut self) -> Self {
             self.fail_sign = true;
             self
         }
+
+        fn signature_bytes(&self) -> Vec<u8> {
+            self.sig.to_bytes().to_vec()
+        }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl RegistrationSigner for MockSigner {
         async fn sign_builder_registration(
             &self,
             _registration: &ValidatorRegistrationV1,
             pubkey: &PublicKey,
             _fork_version: [u8; 4],
-        ) -> Result<Vec<u8>, SignerError> {
+        ) -> Result<crypto::Signature, SignerError> {
             if self.fail_sign {
                 return Err(SignerError::KeyNotFound("mock sign failure".into()));
             }
             self.sign_calls.lock().push(pubkey.to_bytes());
-            Ok(vec![0xaa; 96])
+            Ok(self.sig.clone())
         }
     }
 
@@ -517,7 +530,7 @@ mod tests {
         assert_eq!(calls[0][0].message.pubkey, pk1);
         assert_eq!(calls[0][0].message.fee_recipient, fr);
         assert_eq!(calls[0][0].message.gas_limit, 35_000_000);
-        assert_eq!(calls[0][0].signature, vec![0xaa; 96]);
+        assert_eq!(calls[0][0].signature, signer.signature_bytes());
 
         let sign_calls = signer.sign_calls.lock();
         assert_eq!(sign_calls.len(), 1);

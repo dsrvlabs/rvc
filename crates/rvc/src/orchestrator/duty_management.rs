@@ -8,7 +8,7 @@ use beacon::{BeaconCommitteeSubscription, ProposerPreparation};
 use bn_manager::BeaconNodeClient;
 use duty_tracker::DutyTracker;
 use metrics::definitions::RVC_DUTY_REORG_DETECTED_TOTAL;
-use signer::{is_aggregator, SignerService};
+use signer::{is_aggregator, SignerService, ValidatorSigner};
 use timing::{SlotClock, SLOTS_PER_EPOCH};
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};

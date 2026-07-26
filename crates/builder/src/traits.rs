@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bn_manager::{BeaconError, BeaconNodeClient, ProposerPreparation, SignedValidatorRegistration};
-use crypto::PublicKey;
+use crypto::{PublicKey, Signature};
 use eth_types::ValidatorRegistrationV1;
 use signer::{SignerError, ValidatorSigner};
 
@@ -46,25 +46,31 @@ impl BuilderBeaconClient for Arc<dyn BeaconNodeClient> {
 }
 
 /// Signer methods used by [`crate::BuilderService`] for builder registrations.
-#[async_trait(?Send)]
-pub trait RegistrationSigner {
+///
+/// Returns [`crypto::Signature`]; convert with [`Signature::to_bytes`] at the
+/// eth_types / beacon wire boundary only (RF4-12).
+///
+/// `Send + Sync` so `Arc<dyn RegistrationSigner>` / production bridges work
+/// with Send futures (matches [`ValidatorSigner`]).
+#[async_trait]
+pub trait RegistrationSigner: Send + Sync {
     async fn sign_builder_registration(
         &self,
         registration: &ValidatorRegistrationV1,
         pubkey: &PublicKey,
         fork_version: [u8; 4],
-    ) -> Result<Vec<u8>, SignerError>;
+    ) -> Result<Signature, SignerError>;
 }
 
 /// Production bridge: full signer trait object satisfies the registration surface.
-#[async_trait(?Send)]
+#[async_trait]
 impl RegistrationSigner for Arc<dyn ValidatorSigner> {
     async fn sign_builder_registration(
         &self,
         registration: &ValidatorRegistrationV1,
         pubkey: &PublicKey,
         fork_version: [u8; 4],
-    ) -> Result<Vec<u8>, SignerError> {
+    ) -> Result<Signature, SignerError> {
         (**self).sign_builder_registration(registration, pubkey, fork_version).await
     }
 }

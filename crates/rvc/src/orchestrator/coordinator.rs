@@ -782,7 +782,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use beacon::{AttesterDuty, BeaconClient, BeaconClientConfig, VersionedAttestation};
-    use signer::always_enabled;
+    use signer::{always_enabled, ValidatorSigner};
     // block_service::ProduceBlockResponse is used in MockBlockBeacon / BadProposerBlockBeacon
     use block_service::ProduceBlockResponse;
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
@@ -4900,7 +4900,7 @@ mod tests {
         let error_msg =
             results_2[0].error.as_deref().expect("rejected attestation must have error");
         assert!(
-            error_msg.contains("slashing protection blocked"),
+            error_msg.contains("slashing protection") || error_msg.contains("SlashingBlocked"),
             "Error must indicate slashing protection blocked signing, got: {error_msg}"
         );
 

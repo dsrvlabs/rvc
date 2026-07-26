@@ -12,7 +12,7 @@ use metrics::definitions::{
 };
 use observability::logging::TruncatedPubkey;
 use propagator::{AttestationSubmitter, Propagator};
-use signer::SignerService;
+use signer::{SignerService, ValidatorSigner};
 use timing::{SlotClock, SLOTS_PER_EPOCH};
 use validator_store::ValidatorStore;
 

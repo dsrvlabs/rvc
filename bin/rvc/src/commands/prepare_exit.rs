@@ -7,7 +7,7 @@ use tracing::info;
 use eth_types::{SignedVoluntaryExit, VoluntaryExit, SLOTS_PER_EPOCH};
 use rvc::config::{Config, ServiceBuilder};
 use rvc::prepare_exit::write_exit_to_file;
-use signer::SignerService;
+use signer::{SignerService, ValidatorSigner};
 
 pub struct PrepareExitArgs {
     pub pubkey: String,

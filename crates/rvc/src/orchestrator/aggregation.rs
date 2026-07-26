@@ -11,7 +11,7 @@ use eth_types::{
 };
 use metrics::definitions::{attestation_status, RVC_AGGREGATIONS_TOTAL};
 use observability::logging::TruncatedPubkey;
-use signer::{is_aggregator, SignerService};
+use signer::{is_aggregator, SignerService, ValidatorSigner};
 use tree_hash::TreeHash;
 use validator_store::ValidatorStore;
 

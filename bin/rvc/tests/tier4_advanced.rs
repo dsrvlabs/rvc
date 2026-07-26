@@ -345,15 +345,15 @@ mod registration_batching {
 
     struct MockSigner;
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl RegistrationSigner for MockSigner {
         async fn sign_builder_registration(
             &self,
             _: &ValidatorRegistrationV1,
             _: &PublicKey,
             _: [u8; 4],
-        ) -> Result<Vec<u8>, SignerError> {
-            Ok(vec![0xaa; 96])
+        ) -> Result<crypto::Signature, SignerError> {
+            Ok(crypto::SecretKey::generate().sign(b"mock-builder-reg"))
         }
     }
 

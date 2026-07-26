@@ -133,7 +133,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
 
         // 1. Sign RANDAO reveal
         let randao_start = std::time::Instant::now();
-        let randao_bytes = self
+        let randao_sig = self
             .signer
             .sign_randao_reveal(epoch, pubkey, &self.fork_schedule, &self.genesis_validators_root)
             .instrument(tracing::info_span!("sign.randao"))
@@ -148,7 +148,8 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             duration_ms = randao_start.elapsed().as_millis() as u64,
             "RANDAO reveal signed"
         );
-        let randao_hex = format!("0x{}", hex::encode(&randao_bytes));
+        // Wire boundary: beacon produce_block_v3 takes hex-encoded RANDAO.
+        let randao_hex = format!("0x{}", hex::encode(randao_sig.to_bytes()));
 
         // 2. Get validator preferences, applying block selection mode
         let pubkey_bytes = pubkey.to_bytes();
@@ -378,7 +379,8 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let message_offset: u32 = 100; // 4 (offset) + 96 (signature)
         let mut signed_ssz = Vec::with_capacity(100 + block_ssz.len());
         signed_ssz.extend_from_slice(&message_offset.to_le_bytes());
-        signed_ssz.extend_from_slice(&sig);
+        // Wire boundary: SSZ SignedBeaconBlock encodes raw 96-byte BLS signature.
+        signed_ssz.extend_from_slice(&sig.to_bytes());
         signed_ssz.extend_from_slice(block_ssz);
 
         self.beacon
@@ -466,7 +468,9 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             "Block signing duration"
         );
 
-        let signed = eth_types::SignedBeaconBlock { message: block, signature: sig };
+        // Wire boundary: eth_types::Signature is Vec<u8> for JSON/SSZ serde.
+        let signed =
+            eth_types::SignedBeaconBlock { message: block, signature: sig.to_bytes().to_vec() };
         self.beacon
             .publish_block(&signed, &response.consensus_version)
             .instrument(tracing::info_span!("beacon.publish_block"))
@@ -517,7 +521,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             "Block signing duration"
         );
 
-        let signed = eth_types::SignedBlindedBeaconBlock { message: block, signature: sig };
+        // Wire boundary: eth_types::Signature is Vec<u8> for JSON/SSZ serde.
+        let signed = eth_types::SignedBlindedBeaconBlock {
+            message: block,
+            signature: sig.to_bytes().to_vec(),
+        };
         self.beacon
             .publish_blinded_block(&signed, &response.consensus_version)
             .instrument(tracing::info_span!("beacon.publish_block"))
@@ -647,7 +655,32 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    /// Valid-curve mock BLS signature (bytes not stable across calls).
+    ///
+    /// Uses a fresh key each call — fine when tests only need a non-empty
+    /// valid `Signature`. Prefer [`mock_block_sig`] / [`mock_randao_sig`] when
+    /// assertions compare signature bytes across a test.
+    fn mock_sig(tag: &[u8]) -> crypto::Signature {
+        crypto::SecretKey::generate().sign(tag)
+    }
+
+    /// Fixed signatures so SSZ assertions can compare bytes across a test.
+    fn mock_block_sig() -> crypto::Signature {
+        // Use a real key once; bytes are whatever blst produces (not 0xbb fill).
+        thread_local! {
+            static SIG: crypto::Signature = crypto::SecretKey::generate().sign(b"mock-block");
+        }
+        SIG.with(|s| s.clone())
+    }
+
+    fn mock_randao_sig() -> crypto::Signature {
+        thread_local! {
+            static SIG: crypto::Signature = crypto::SecretKey::generate().sign(b"mock-randao");
+        }
+        SIG.with(|s| s.clone())
+    }
+
+    #[async_trait]
     impl ValidatorSigner for MockSigner {
         async fn sign_attestation(
             &self,
@@ -655,8 +688,8 @@ mod tests {
             _pubkey: &PublicKey,
             _fork_schedule: &ForkSchedule,
             _genesis_validators_root: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Ok(vec![])
+        ) -> Result<crypto::Signature, SignerError> {
+            Ok(mock_sig(b"attestation"))
         }
 
         async fn sign_block(
@@ -666,7 +699,7 @@ mod tests {
             pubkey: &PublicKey,
             fork_schedule: &ForkSchedule,
             genesis_validators_root: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
+        ) -> Result<crypto::Signature, SignerError> {
             self.block_calls.lock().unwrap().push(CapturedSignBlockCall {
                 block_root: *block_root,
                 slot,
@@ -677,7 +710,7 @@ mod tests {
             if self.fail_block {
                 Err(SignerError::KeyNotFound("test".to_string()))
             } else {
-                Ok(vec![0xbb; 96])
+                Ok(mock_block_sig())
             }
         }
 
@@ -687,12 +720,12 @@ mod tests {
             _pubkey: &PublicKey,
             _fork_schedule: &ForkSchedule,
             _genesis_validators_root: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
+        ) -> Result<crypto::Signature, SignerError> {
             self.randao_calls.lock().unwrap().push(epoch);
             if self.fail_randao {
                 Err(SignerError::KeyNotFound("test".to_string()))
             } else {
-                Ok(vec![0xaa; 96])
+                Ok(mock_randao_sig())
             }
         }
 
@@ -703,8 +736,8 @@ mod tests {
             _pubkey: &PublicKey,
             _fork_schedule: &ForkSchedule,
             _genesis_validators_root: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Ok(vec![])
+        ) -> Result<crypto::Signature, SignerError> {
+            Ok(mock_sig(b"sync-msg"))
         }
 
         async fn sign_selection_proof(
@@ -713,8 +746,8 @@ mod tests {
             _pubkey: &PublicKey,
             _fork_schedule: &ForkSchedule,
             _genesis_validators_root: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Ok(vec![0xcc; 96])
+        ) -> Result<crypto::Signature, SignerError> {
+            Ok(mock_sig(b"selection"))
         }
 
         async fn sign_aggregate_and_proof(
@@ -723,8 +756,8 @@ mod tests {
             _pubkey: &PublicKey,
             _fork_schedule: &ForkSchedule,
             _genesis_validators_root: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Ok(vec![0xdd; 96])
+        ) -> Result<crypto::Signature, SignerError> {
+            Ok(mock_sig(b"aggregate"))
         }
 
         async fn sign_electra_aggregate_and_proof(
@@ -733,8 +766,8 @@ mod tests {
             _pubkey: &PublicKey,
             _fork_schedule: &ForkSchedule,
             _genesis_validators_root: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Ok(vec![0xdd; 96])
+        ) -> Result<crypto::Signature, SignerError> {
+            Ok(mock_sig(b"electra-aggregate"))
         }
 
         async fn sign_voluntary_exit(
@@ -743,8 +776,8 @@ mod tests {
             _pubkey: &PublicKey,
             _fork_schedule: &ForkSchedule,
             _genesis_validators_root: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Ok(vec![0xee; 96])
+        ) -> Result<crypto::Signature, SignerError> {
+            Ok(mock_sig(b"voluntary-exit"))
         }
 
         async fn sign_builder_registration(
@@ -752,8 +785,8 @@ mod tests {
             _registration: &eth_types::ValidatorRegistrationV1,
             _pubkey: &PublicKey,
             _fork_version: [u8; 4],
-        ) -> Result<Vec<u8>, SignerError> {
-            Ok(vec![0xff; 96])
+        ) -> Result<crypto::Signature, SignerError> {
+            Ok(mock_sig(b"builder-reg"))
         }
 
         async fn sign_sync_committee_selection_proof(
@@ -763,8 +796,8 @@ mod tests {
             _pubkey: &PublicKey,
             _fork_schedule: &ForkSchedule,
             _genesis_validators_root: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Ok(vec![0xaa; 96])
+        ) -> Result<crypto::Signature, SignerError> {
+            Ok(mock_sig(b"sync-selection"))
         }
 
         async fn sign_contribution_and_proof(
@@ -773,8 +806,8 @@ mod tests {
             _pubkey: &PublicKey,
             _fork_schedule: &ForkSchedule,
             _genesis_validators_root: &Root,
-        ) -> Result<Vec<u8>, SignerError> {
-            Ok(vec![0xbb; 96])
+        ) -> Result<crypto::Signature, SignerError> {
+            Ok(mock_sig(b"contribution"))
         }
     }
 
@@ -2015,10 +2048,14 @@ mod tests {
         let message_offset = u32::from_le_bytes(published[0..4].try_into().unwrap());
         assert_eq!(message_offset, 100);
 
-        // Bytes 4..100: 96-byte signature (MockSigner returns 0xbb * 96)
+        // Bytes 4..100: 96-byte signature (typed crypto::Signature at wire boundary)
         let sig = &published[4..100];
         assert_eq!(sig.len(), 96);
-        assert!(sig.iter().all(|&b| b == 0xbb), "signature should be mock 0xbb bytes");
+        assert_eq!(
+            sig,
+            mock_block_sig().to_bytes(),
+            "SSZ payload must carry mock block signature bytes"
+        );
 
         // Bytes 100..: BeaconBlock SSZ data
         assert!(
@@ -2084,9 +2121,9 @@ mod tests {
         let message_offset = u32::from_le_bytes(published[0..4].try_into().unwrap());
         assert_eq!(message_offset, 100);
 
-        // Signature present
+        // Signature present (typed crypto::Signature → raw bytes at SSZ boundary)
         let sig = &published[4..100];
-        assert!(sig.iter().all(|&b| b == 0xbb));
+        assert_eq!(sig, mock_block_sig().to_bytes());
 
         // Blinded flag should be true
         assert!(ssz_calls[0].2);
@@ -2357,7 +2394,7 @@ mod tests {
         beacon_arc.assert_last_published_block(slot, 42);
         let calls = beacon_arc.publish_full_calls.lock().unwrap();
         assert_eq!(calls[0].consensus_version, "deneb");
-        assert_eq!(calls[0].signature_bytes, vec![0xbb; 96]);
+        assert_eq!(calls[0].signature_bytes, mock_block_sig().to_bytes().to_vec());
     }
 
     #[tokio::test]
@@ -2383,7 +2420,7 @@ mod tests {
         beacon_arc.assert_last_published_blinded_block(slot, 42);
         let calls = beacon_arc.publish_blinded_full_calls.lock().unwrap();
         assert_eq!(calls[0].consensus_version, "deneb");
-        assert_eq!(calls[0].signature_bytes, vec![0xbb; 96]);
+        assert_eq!(calls[0].signature_bytes, mock_block_sig().to_bytes().to_vec());
     }
 
     #[tokio::test]
@@ -2557,10 +2594,10 @@ mod tests {
         let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok());
 
-        // Verify signature is non-empty (MockSigner returns 0xbb * 96)
+        // Verify signature is the mock block signature at the wire boundary
         let calls = beacon_arc.publish_full_calls.lock().unwrap();
         assert!(!calls[0].signature_bytes.is_empty(), "signature must be non-empty");
-        assert_eq!(calls[0].signature_bytes, vec![0xbb; 96]);
+        assert_eq!(calls[0].signature_bytes, mock_block_sig().to_bytes().to_vec());
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey};
 use eth_types::{AttestationData, Checkpoint, ForkSchedule, Root};
 use metrics::definitions::{tx_hold_kind, RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS};
-use rvc_signer::SignerService;
+use rvc_signer::{SignerService, ValidatorSigner};
 use slashing::SlashingDb;
 
 use rvc_signer::SigningEnablement;

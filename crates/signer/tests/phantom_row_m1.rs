@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey};
 use eth_types::{AttestationData, Checkpoint, ForkSchedule, Root};
-use rvc_signer::SignerService;
+use rvc_signer::{SignerService, ValidatorSigner};
 use slashing::SlashingDb;
 
 use rvc_signer::SigningEnablement;

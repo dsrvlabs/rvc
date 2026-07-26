@@ -11,7 +11,7 @@ use eth_types::{
     SignedContributionAndProof, Slot, SyncCommitteeDuty,
 };
 use observability::logging::TruncatedRoot;
-use signer::SignerService;
+use signer::{SignerService, ValidatorSigner};
 use validator_store::ValidatorStore;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
