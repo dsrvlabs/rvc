@@ -61,18 +61,14 @@ pub trait BlockProducer: Send + Sync {
 
     /// Publish a block as raw SSZ bytes (`Content-Type: application/octet-stream`).
     ///
-    /// Default returns an error so role-narrow test stubs need not implement SSZ
-    /// publish. Production `BnManager` / `BeaconClient` override with real
-    /// failover-aware (or direct) implementations.
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure (same policy as [`LivenessApi::post_validator_liveness`]).
     async fn publish_block_ssz(
         &self,
         ssz_bytes: &[u8],
         consensus_version: &str,
         is_blinded: bool,
-    ) -> Result<(), BeaconError> {
-        let _ = (ssz_bytes, consensus_version, is_blinded);
-        Err(BeaconError::HttpError("publish_block_ssz not implemented".to_string()))
-    }
+    ) -> Result<(), BeaconError>;
 
     async fn prepare_beacon_proposer(
         &self,

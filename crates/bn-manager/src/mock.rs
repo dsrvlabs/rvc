@@ -81,6 +81,7 @@ pub struct MockBeaconNodeClient {
     produce_block_v3: MethodHook<(u64, String, Option<String>, Option<u64>), ProduceBlockResponse>,
     publish_block: MethodHook<(SignedBeaconBlock, String), ()>,
     publish_blinded_block: MethodHook<(SignedBlindedBeaconBlock, String), ()>,
+    publish_block_ssz: MethodHook<(Vec<u8>, String, bool), ()>,
     prepare_beacon_proposer: MethodHook<Vec<ProposerPreparation>, ()>,
     register_validators: MethodHook<Vec<SignedValidatorRegistration>, ()>,
     // AttestationApi
@@ -236,6 +237,15 @@ impl MockBeaconNodeClient {
         f: impl Fn(SignedBlindedBeaconBlock, String) -> Result<(), BeaconError> + Send + Sync + 'static,
     ) -> Self {
         self.publish_blinded_block.set_handler(Arc::new(move |(block, version)| f(block, version)));
+        self
+    }
+
+    pub fn with_publish_block_ssz(
+        self,
+        f: impl Fn(Vec<u8>, String, bool) -> Result<(), BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.publish_block_ssz
+            .set_handler(Arc::new(move |(bytes, version, blinded)| f(bytes, version, blinded)));
         self
     }
 
@@ -491,6 +501,18 @@ impl BlockProducer for MockBeaconNodeClient {
         self.publish_blinded_block.invoke(
             "publish_blinded_block",
             (signed_blinded_block.clone(), consensus_version.to_string()),
+        )
+    }
+
+    async fn publish_block_ssz(
+        &self,
+        ssz_bytes: &[u8],
+        consensus_version: &str,
+        is_blinded: bool,
+    ) -> Result<(), BeaconError> {
+        self.publish_block_ssz.invoke(
+            "publish_block_ssz",
+            (ssz_bytes.to_vec(), consensus_version.to_string(), is_blinded),
         )
     }
 

@@ -1426,13 +1426,13 @@ endpoint touches the trait and the macro list, not 165 hand-written lines.
    keeping the generated signatures identical.
 
 **Acceptance criteria:**
-- [ ] **`rg "impl BeaconNodeClient for" | wc -l` == 3** — BnManager, BeaconClient, shared mock
+- [x] **`rg "impl BeaconNodeClient for" | wc -l` == 3** — BnManager, BeaconClient, shared mock
       (phase-gate criterion; the empty supertrait impls from RF4-23 are counted and named in the PR so the
       number is unambiguous).
-- [ ] The passthrough is macro-generated; adding a trait method fails to compile until the macro list is
+- [x] The passthrough is macro-generated; adding a trait method fails to compile until the macro list is
       updated (demonstrated in the PR).
-- [ ] All `bin/rvc` tier tests pass unchanged.
-- [ ] Standing invariant green.
+- [x] All `bin/rvc` tier tests pass unchanged.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_beacon_client_passthrough_covers_every_trait_method` — a test that fails if any

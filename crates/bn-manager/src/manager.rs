@@ -1295,193 +1295,157 @@ impl LivenessApi for BnManager {
 
 impl BeaconNodeClient for BnManager {}
 
-/// Implements `BeaconNodeClient` for `BeaconClient` directly, useful for tests
-/// and cases where single-BN behavior without `BnManager` wrapping is desired.
-#[async_trait]
-impl NodeStatusApi for BeaconClient {
-    async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-        self.get_genesis().await
-    }
+/// Forward every role-trait method on `BeaconClient` to the inherent method of
+/// the same name. Adding a role-trait endpoint requires adding it to this
+/// list (compile error until then) — no 165-line hand-written passthrough.
+///
+/// `BEACON_CLIENT_PASSTHROUGH_METHODS` is emitted for the coverage test.
+macro_rules! impl_beacon_client_passthrough {
+    (
+        $(
+            $trait_name:ident {
+                $(
+                    async fn $method:ident(
+                        &self $(, $arg:ident : $arg_ty:ty)* $(,)?
+                    ) -> $ret:ty ;
+                )*
+            }
+        )*
+    ) => {
+        $(
+            #[async_trait]
+            impl $trait_name for BeaconClient {
+                $(
+                    async fn $method(
+                        &self $(, $arg: $arg_ty)*
+                    ) -> $ret {
+                        BeaconClient::$method(self $(, $arg)*).await
+                    }
+                )*
+            }
+        )*
 
-    async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-        self.get_config_spec().await
-    }
-
-    async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-        self.get_fork_schedule().await
-    }
-
-    async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError> {
-        self.get_fork(state_id).await
-    }
-
-    async fn get_validators(&self, pubkeys: &[String]) -> Result<ValidatorsResponse, BeaconError> {
-        self.get_validators(pubkeys).await
-    }
-
-    async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-        self.get_block_root(block_id).await
-    }
-
-    async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-        self.get_node_syncing().await
-    }
-
-    async fn get_node_version(&self) -> Result<String, BeaconError> {
-        self.get_node_version().await
-    }
+        /// Method names covered by the `BeaconClient` passthrough macro.
+        #[cfg(test)]
+        pub(crate) const BEACON_CLIENT_PASSTHROUGH_METHODS: &[&str] = &[
+            $($(stringify!($method),)*)*
+        ];
+    };
 }
 
-#[async_trait]
-impl DutiesProvider for BeaconClient {
-    async fn get_attester_duties(
-        &self,
-        epoch: u64,
-        validator_indices: &[String],
-    ) -> Result<AttesterDutiesResponse, BeaconError> {
-        self.get_attester_duties(epoch, validator_indices).await
+impl_beacon_client_passthrough! {
+    NodeStatusApi {
+        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError>;
+        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError>;
+        async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError>;
+        async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError>;
+        async fn get_validators(
+            &self,
+            pubkeys: &[String],
+        ) -> Result<ValidatorsResponse, BeaconError>;
+        async fn get_block_root(
+            &self,
+            block_id: &str,
+        ) -> Result<BlockRootResponse, BeaconError>;
+        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError>;
+        async fn get_node_version(&self) -> Result<String, BeaconError>;
     }
-
-    async fn get_proposer_duties(&self, epoch: u64) -> Result<ProposerDutiesResponse, BeaconError> {
-        self.get_proposer_duties(epoch).await
+    DutiesProvider {
+        async fn get_attester_duties(
+            &self,
+            epoch: u64,
+            validator_indices: &[String],
+        ) -> Result<AttesterDutiesResponse, BeaconError>;
+        async fn get_proposer_duties(
+            &self,
+            epoch: u64,
+        ) -> Result<ProposerDutiesResponse, BeaconError>;
+        async fn post_sync_committee_duties(
+            &self,
+            epoch: u64,
+            validator_indices: &[String],
+        ) -> Result<SyncCommitteeDutiesResponse, BeaconError>;
     }
-
-    async fn post_sync_committee_duties(
-        &self,
-        epoch: u64,
-        validator_indices: &[String],
-    ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-        self.post_sync_committee_duties(epoch, validator_indices).await
+    BlockProducer {
+        async fn produce_block_v3(
+            &self,
+            slot: u64,
+            randao_reveal: &str,
+            graffiti: Option<&str>,
+            builder_boost_factor: Option<u64>,
+        ) -> Result<ProduceBlockResponse, BeaconError>;
+        async fn publish_block(
+            &self,
+            signed_block: &SignedBeaconBlock,
+            consensus_version: &str,
+        ) -> Result<(), BeaconError>;
+        async fn publish_blinded_block(
+            &self,
+            signed_blinded_block: &SignedBlindedBeaconBlock,
+            consensus_version: &str,
+        ) -> Result<(), BeaconError>;
+        async fn publish_block_ssz(
+            &self,
+            ssz_bytes: &[u8],
+            consensus_version: &str,
+            is_blinded: bool,
+        ) -> Result<(), BeaconError>;
+        async fn prepare_beacon_proposer(
+            &self,
+            preparations: &[ProposerPreparation],
+        ) -> Result<(), BeaconError>;
+        async fn register_validators(
+            &self,
+            registrations: &[SignedValidatorRegistration],
+        ) -> Result<(), BeaconError>;
     }
-}
-
-#[async_trait]
-impl BlockProducer for BeaconClient {
-    async fn produce_block_v3(
-        &self,
-        slot: u64,
-        randao_reveal: &str,
-        graffiti: Option<&str>,
-        builder_boost_factor: Option<u64>,
-    ) -> Result<ProduceBlockResponse, BeaconError> {
-        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    AttestationApi {
+        async fn get_attestation_data(
+            &self,
+            slot: u64,
+            committee_index: u64,
+        ) -> Result<AttestationDataResponse, BeaconError>;
+        async fn submit_attestation(
+            &self,
+            attestations: &VersionedAttestation,
+        ) -> Result<SubmitAttestationResult, BeaconError>;
+        async fn get_aggregate_attestation(
+            &self,
+            slot: u64,
+            attestation_data_root: &str,
+            committee_index: Option<u64>,
+        ) -> Result<VersionedAggregateAttestation, BeaconError>;
+        async fn submit_aggregate_and_proofs(
+            &self,
+            proofs: &VersionedSignedAggregateAndProof,
+        ) -> Result<(), BeaconError>;
+        async fn submit_beacon_committee_subscriptions(
+            &self,
+            subscriptions: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError>;
     }
-
-    async fn publish_block(
-        &self,
-        signed_block: &SignedBeaconBlock,
-        consensus_version: &str,
-    ) -> Result<(), BeaconError> {
-        BeaconClient::publish_block(self, signed_block, consensus_version).await
+    SyncCommitteeApi {
+        async fn submit_sync_committee_messages(
+            &self,
+            messages: &[SyncCommitteeMessage],
+        ) -> Result<(), BeaconError>;
+        async fn get_sync_committee_contribution(
+            &self,
+            slot: u64,
+            subcommittee_index: u64,
+            beacon_block_root: &str,
+        ) -> Result<SyncCommitteeContributionResponse, BeaconError>;
+        async fn submit_contribution_and_proofs(
+            &self,
+            proofs: &[SignedContributionAndProof],
+        ) -> Result<(), BeaconError>;
     }
-
-    async fn publish_blinded_block(
-        &self,
-        signed_blinded_block: &SignedBlindedBeaconBlock,
-        consensus_version: &str,
-    ) -> Result<(), BeaconError> {
-        BeaconClient::publish_blinded_block(self, signed_blinded_block, consensus_version).await
-    }
-
-    async fn publish_block_ssz(
-        &self,
-        ssz_bytes: &[u8],
-        consensus_version: &str,
-        is_blinded: bool,
-    ) -> Result<(), BeaconError> {
-        BeaconClient::publish_block_ssz(self, ssz_bytes, consensus_version, is_blinded).await
-    }
-
-    async fn prepare_beacon_proposer(
-        &self,
-        preparations: &[ProposerPreparation],
-    ) -> Result<(), BeaconError> {
-        self.prepare_beacon_proposer(preparations).await
-    }
-
-    async fn register_validators(
-        &self,
-        registrations: &[SignedValidatorRegistration],
-    ) -> Result<(), BeaconError> {
-        self.register_validators(registrations).await
-    }
-}
-
-#[async_trait]
-impl AttestationApi for BeaconClient {
-    async fn get_attestation_data(
-        &self,
-        slot: u64,
-        committee_index: u64,
-    ) -> Result<AttestationDataResponse, BeaconError> {
-        self.get_attestation_data(slot, committee_index).await
-    }
-
-    async fn submit_attestation(
-        &self,
-        attestations: &VersionedAttestation,
-    ) -> Result<SubmitAttestationResult, BeaconError> {
-        self.submit_attestation(attestations).await
-    }
-
-    async fn get_aggregate_attestation(
-        &self,
-        slot: u64,
-        attestation_data_root: &str,
-        committee_index: Option<u64>,
-    ) -> Result<VersionedAggregateAttestation, BeaconError> {
-        self.get_aggregate_attestation(slot, attestation_data_root, committee_index).await
-    }
-
-    async fn submit_aggregate_and_proofs(
-        &self,
-        proofs: &VersionedSignedAggregateAndProof,
-    ) -> Result<(), BeaconError> {
-        self.submit_aggregate_and_proofs(proofs).await
-    }
-
-    async fn submit_beacon_committee_subscriptions(
-        &self,
-        subscriptions: &[BeaconCommitteeSubscription],
-    ) -> Result<(), BeaconError> {
-        self.submit_beacon_committee_subscriptions(subscriptions).await
-    }
-}
-
-#[async_trait]
-impl SyncCommitteeApi for BeaconClient {
-    async fn submit_sync_committee_messages(
-        &self,
-        messages: &[SyncCommitteeMessage],
-    ) -> Result<(), BeaconError> {
-        self.submit_sync_committee_messages(messages).await
-    }
-
-    async fn get_sync_committee_contribution(
-        &self,
-        slot: u64,
-        subcommittee_index: u64,
-        beacon_block_root: &str,
-    ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-        self.get_sync_committee_contribution(slot, subcommittee_index, beacon_block_root).await
-    }
-
-    async fn submit_contribution_and_proofs(
-        &self,
-        proofs: &[SignedContributionAndProof],
-    ) -> Result<(), BeaconError> {
-        self.submit_contribution_and_proofs(proofs).await
-    }
-}
-
-#[async_trait]
-impl LivenessApi for BeaconClient {
-    async fn post_validator_liveness(
-        &self,
-        epoch: u64,
-        validator_indices: &[String],
-    ) -> Result<ValidatorLivenessResponse, BeaconError> {
-        BeaconClient::post_validator_liveness(self, epoch, validator_indices).await
+    LivenessApi {
+        async fn post_validator_liveness(
+            &self,
+            epoch: u64,
+            validator_indices: &[String],
+        ) -> Result<ValidatorLivenessResponse, BeaconError>;
     }
 }
 
@@ -1499,6 +1463,48 @@ mod tests {
     use crate::sync_status::{BnSyncDetail, BnSyncStatus};
 
     use super::*;
+
+    /// Guard: the passthrough macro list must name every role-trait method.
+    /// Primary enforcement is compile-time (missing method → trait not satisfied).
+    /// This test documents the expected surface and catches accidental list drift.
+    #[test]
+    fn test_beacon_client_passthrough_covers_every_trait_method() {
+        // Type-level: BeaconClient implements the full supertrait surface.
+        fn _assert_full_client<T: BeaconNodeClient>() {}
+        _assert_full_client::<BeaconClient>();
+
+        // 26 methods across the six role traits (see impl_beacon_client_passthrough!).
+        assert_eq!(
+            BEACON_CLIENT_PASSTHROUGH_METHODS.len(),
+            26,
+            "update impl_beacon_client_passthrough! when adding a role-trait method"
+        );
+
+        let mut sorted: Vec<&str> = BEACON_CLIENT_PASSTHROUGH_METHODS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            BEACON_CLIENT_PASSTHROUGH_METHODS.len(),
+            "passthrough method list must not contain duplicates: {sorted:?}"
+        );
+
+        // Spot-check that each role trait is represented.
+        for required in [
+            "get_genesis",
+            "get_attester_duties",
+            "produce_block_v3",
+            "publish_block_ssz",
+            "submit_attestation",
+            "submit_sync_committee_messages",
+            "post_validator_liveness",
+        ] {
+            assert!(
+                BEACON_CLIENT_PASSTHROUGH_METHODS.contains(&required),
+                "passthrough list missing {required}"
+            );
+        }
+    }
 
     /// Gate 3 (high-risk redaction): the `bn.attempt` span's `bn_url` field MUST redact
     /// URL credentials. Capturing the span's creation attributes, a credentialed endpoint
