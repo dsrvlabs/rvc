@@ -30,7 +30,7 @@
 
 use serde::Deserialize;
 
-use rvc_slashing::{InterchangeFormat, SlashingDb, SlashingError};
+use rvc_slashing::{InterchangeFormat, SlashingDb};
 
 mod common;
 use common::{stage_and_commit_attestation, stage_and_commit_block};

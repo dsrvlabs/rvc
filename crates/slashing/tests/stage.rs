@@ -524,6 +524,33 @@ fn test_stage_attestation_at_source_watermark_succeeds() {
     assert_eq!(atts[0].target_epoch, 201);
 }
 
+/// RF2-09: source strictly below the source watermark is rejected even when target
+/// is above the target watermark. (Check-only: stage fails before a guard is handed out.)
+#[test]
+fn test_stage_attestation_below_source_watermark_is_rejected() {
+    let db = SlashingDb::open_in_memory().expect("open");
+    db.set_attestation_watermark(PUBKEY, 20, 20).expect("set watermark");
+
+    // source=1 < source watermark=20; target=31 > target watermark=20.
+    let err = db
+        .stage_attestation(PUBKEY, 1, 31, Some("0xsrc_below".into()), GVR)
+        .expect_err("source strictly below att-source watermark must be rejected");
+
+    match err {
+        // Check-only path: stage returns the watermark error; no commit needed.
+        SlashingError::BelowAttestationSourceWatermark { source_epoch, watermark_source } => {
+            assert_eq!(source_epoch, 1);
+            assert_eq!(watermark_source, 20);
+        }
+        other => panic!("expected BelowAttestationSourceWatermark, got: {other:?}"),
+    }
+
+    // At source watermark with target above is fine (mirrors the deleted unit test).
+    db.stage_attestation(PUBKEY, 20, 31, Some("0xsrc_at_ok".into()), GVR)
+        .expect("source at watermark with target above must succeed")
+        .discard();
+}
+
 /// RF1-01: a watermark rejection must leave no committed row.
 #[test]
 fn test_stage_below_watermark_commits_no_row() {

@@ -295,11 +295,11 @@ flowchart TD
     A[Slot start, validator is proposer] --> B[Sign RANDAO reveal<br/>DOMAIN_RANDAO]
     B --> C[produce_block_v3<br/>graffiti, builder_boost_factor]
     C --> D{Blinded?}
-    D -->|Yes| E[SlashingDb<br/>is_safe_to_propose]
+    D -->|Yes| E[SlashingDb<br/>stage_block]
     D -->|No| E
     E -->|Slashable| X1[REJECT: DoubleProposal]
     E -->|Safe| F[Sign block<br/>DOMAIN_BEACON_PROPOSER]
-    F --> G[Record block in SlashingDb]
+    F --> G[commit staged block in SlashingDb]
     G --> H{Blinded?}
     H -->|Yes| I[publish_blinded_block<br/>broadcast to all BNs]
     H -->|No| J[publish_block<br/>broadcast to all BNs]

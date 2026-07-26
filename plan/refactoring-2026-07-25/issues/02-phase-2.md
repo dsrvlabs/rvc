@@ -812,18 +812,18 @@ otherwise have to reconcile in Phase 4.
 4. **GREEN:** conformance + proptests + `tests/stage.rs` green.
 
 **Acceptance criteria:**
-- [ ] `rg "is_safe_to_sign|is_safe_to_propose"` returns zero hits workspace-wide.
-- [ ] Every deleted test case is either named against a covering conformance case or has a ported
+- [x] `rg "is_safe_to_sign|is_safe_to_propose"` returns zero hits workspace-wide.
+- [x] Every deleted test case is either named against a covering conformance case or has a ported
       equivalent in `crates/slashing/tests/stage.rs` — one table row each.
-- [ ] The EIP-3076 conformance suite and `proptest_slashing.rs` are green on the stage path and
+- [x] The EIP-3076 conformance suite and `proptest_slashing.rs` are green on the stage path and
       **unmodified by this PR** (if they needed changing, generation 1 was load-bearing and this
       issue must stop).
-- [ ] Two rule implementations remain (`stage_*` and `check_and_record_*`), down from three; RF2-10
+- [x] Two rule implementations remain (`stage_*` and `check_and_record_*`), down from three; RF2-10
       removes the second.
-- [ ] **Test-count delta stated and justified:** expected ≈ −25 to −36 *deleted-because-covered*,
+- [x] **Test-count delta stated and justified:** expected ≈ −25 to −36 *deleted-because-covered*,
       plus *ported* additions in `tests/stage.rs`. Net delta near zero is the healthy outcome; a
       large negative delta with few ports means the classification was too generous.
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **Risks:**
 - If A2 has not actually retargeted the conformance suite (e.g. it landed partially), this issue
