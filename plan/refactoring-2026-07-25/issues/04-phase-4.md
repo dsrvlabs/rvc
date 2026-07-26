@@ -1232,14 +1232,14 @@ once.
    parsed and reported per-index, not retried.
 
 **Acceptance criteria:**
-- [ ] One retry loop remains (`rg 'for attempt in'` in `client.rs` == 1).
-- [ ] **The wiremock suite is green unmodified**, specifically the 400-partial-failure tests, the
+- [x] One retry loop remains (`rg 'for attempt in'` in `client.rs` == 1).
+- [x] **The wiremock suite is green unmodified**, specifically the 400-partial-failure tests, the
       client-error-no-retry test (`:1516`), the server-error-retry test (`:1541`), the
       retry-success-after-failures test (`:1567`) and the timeout-retry test (`:1617`).
-- [ ] Retry counts and backoff timings are unchanged (asserted by request-count assertions in the
+- [x] Retry counts and backoff timings are unchanged (asserted by request-count assertions in the
       wiremock tests).
-- [ ] Body-size limiting (`max_body_bytes`) applies uniformly on every path.
-- [ ] Standing invariant green.
+- [x] Body-size limiting (`max_body_bytes`) applies uniformly on every path.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_all_request_paths_share_one_retry_loop` — a behavioral test asserting the same
