@@ -1,13 +1,9 @@
 //! gRPC signer service implementation.
 //!
-//! # V1 service (`SignerService` from `signer.proto`)
-//! The v1 raw-root `sign(signing_root, pubkey)` RPC is **deprecated** and kept
-//! alive until ISSUE-1.8 deletes the v1 client path.  Do not add new features
-//! to the v1 handler.
-//!
 //! # V2 service (`SignerService` from `signer.v2.proto`)
 //! All 10 typed RPCs are implemented (ISSUE-1.6a–d) and route through
-//! `SigningGate` (Issue 2.10a — D-3).
+//! `SigningGate` (Issue 2.10a — D-3).  The legacy v1 raw-root proto surface
+//! was retired in RF2-17; only `signer.v2` is compiled and registered.
 //!
 //! # Gate routing (D-3 wiring, Issue 2.10a)
 //!
@@ -54,13 +50,6 @@ use crate::backend::signer_adapter::SigningBackendAsSigner;
 use crate::backend::{SigningBackend, SigningBackendError};
 use crate::metrics::{
     classify_error, classify_gate_error, grpc_sign_type, record_sign, SignerMetrics,
-};
-
-// V1 imports (deprecated — kept until ISSUE-1.8)
-use crate::proto::signer::signer_service_server::SignerService;
-use crate::proto::signer::{
-    GetStatusRequest, GetStatusResponse, ListPublicKeysRequest, ListPublicKeysResponse,
-    SignRequest, SignResponse,
 };
 
 // V2 imports
@@ -145,9 +134,11 @@ pub struct SignerServiceImpl {
 }
 
 impl SignerServiceImpl {
-    /// Create a v1-only service (no slashing DB, no gate).
+    /// Create a service with no slashing DB / gate (insecure / tests only).
     ///
-    /// **Deprecated**: new callers should use `new_v2`.
+    /// Production with a DB should use `new_v2` or `new_v2_with_gate`.
+    /// Without a gate, slashable RPCs fail closed; non-slashable RPCs fall
+    /// through to the backend (BUG-001).
     pub fn new(backend: Arc<dyn SigningBackend>, backend_name: String) -> Self {
         Self { backend, backend_name, metrics: None, gate: None, client_cn_allow_list: None }
     }
@@ -487,41 +478,10 @@ fn pubkey_from_bytes(bytes: &[u8; 48]) -> Result<PublicKey, Status> {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// V1 SignerService impl — SS-1 FIX (Issue 2.2)
-// ─────────────────────────────────────────────────────────────────────────────
-// The v1 raw-root `sign(signing_root, pubkey)` path has been removed from the
-// live listener (see `main.rs`).  Per ADR-010, the trait impl is kept compiled
-// so the proto types remain usable for a future separately-bound, off-by-default
-// insecure listener that would require `crypto::InsecureGate` (Allow/opt-in)
-// (NOT implemented here).  All methods return `Unimplemented` so any accidental
-// call produces a clear diagnostic rather than silent misbehavior.
-//
-// SS-1: v1 raw-root sign bypass — removed in Issue 2.2.
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[tonic::async_trait]
-impl SignerService for SignerServiceImpl {
-    async fn sign(&self, _request: Request<SignRequest>) -> Result<Response<SignResponse>, Status> {
-        Err(Status::unimplemented("v1 raw-root signing has been removed; use the v2 typed RPCs."))
-    }
-
-    async fn list_public_keys(
-        &self,
-        _request: Request<ListPublicKeysRequest>,
-    ) -> Result<Response<ListPublicKeysResponse>, Status> {
-        Err(Status::unimplemented("v1 list_public_keys has been removed; use the v2 typed RPCs."))
-    }
-
-    async fn get_status(
-        &self,
-        _request: Request<GetStatusRequest>,
-    ) -> Result<Response<GetStatusResponse>, Status> {
-        Err(Status::unimplemented("v1 get_status has been removed; use the v2 typed RPCs."))
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
 // V2 SignerService impl — all handlers route through SigningGate (D-3, Issue 2.10a)
+// RF2-17: v1 SignerService trait impl and proto compilation are gone.
+// ADR-010's hypothetical off-by-default insecure listener was never built; if
+// needed later it can be rebuilt on the v2 surface.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tonic::async_trait]
@@ -1390,53 +1350,11 @@ mod tests {
         }
     }
 
-    // --- V1 tests — updated for SS-1 fix (Issue 2.2) ---
-    // All v1 methods return Unimplemented immediately; they never reach the gate.
-    // These tests use arbitrary byte arrays as "pubkeys" — v1 returns before any
-    // BLS validation so any 48-byte value is fine.
-
-    #[tokio::test]
-    async fn test_sign_returns_unimplemented() {
-        // V1 sign method returns Unimplemented before any pubkey validation.
-        let pubkey_bytes = test_pubkey_bytes();
-        let svc = make_service(MockBackend::with_test_key());
-
-        let req = Request::new(SignRequest {
-            signing_root: vec![0u8; 32],
-            pubkey: pubkey_bytes.to_vec(),
-        });
-        let err = svc.sign(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-    }
-
-    #[tokio::test]
-    async fn test_sign_unknown_key_returns_unimplemented() {
-        let svc = make_service(MockBackend::with_test_key());
-        // V1 sign returns Unimplemented even for unknown keys.
-        let req = Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: vec![2u8; 48] });
-        let err = svc.sign(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-    }
-
-    #[tokio::test]
-    async fn test_sign_invalid_signing_root_returns_unimplemented() {
-        let svc = make_service(MockBackend::empty());
-        let req = Request::new(SignRequest { signing_root: vec![0u8; 16], pubkey: vec![1u8; 48] });
-        let err = svc.sign(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-    }
-
-    #[tokio::test]
-    async fn test_sign_invalid_pubkey_returns_unimplemented() {
-        let svc = make_service(MockBackend::empty());
-        let req = Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: vec![1u8; 32] });
-        let err = svc.sign(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-    }
-
     // --- V2 tests ---
     // These tests use `test_pubkey_bytes()` / `MockBackend::with_test_key()` so
     // the gate's BLS pubkey validation and `Signature::from_bytes` succeed.
+    // RF2-17: v1 Unimplemented unit tests deleted with the dead v1 trait impl.
+    // Raw-root guard: `tests/no_raw_root_path.rs` greps generated signer.v2.rs.
 
     #[tokio::test]
     async fn test_v2_sign_beacon_block_happy_path() {
@@ -1728,53 +1646,6 @@ mod tests {
         let status = resp.into_inner();
         assert!(status.ready);
         assert_eq!(status.key_count, 1);
-    }
-
-    // --- Metrics (v1) — updated for SS-1 fix (Issue 2.2) ---
-
-    fn make_service_with_metrics(backend: MockBackend) -> (SignerServiceImpl, Arc<SignerMetrics>) {
-        let metrics = Arc::new(SignerMetrics::new());
-        let svc = SignerServiceImpl::new(Arc::new(backend), "basic".to_string())
-            .with_metrics(Arc::clone(&metrics));
-        (svc, metrics)
-    }
-
-    #[tokio::test]
-    async fn test_v1_sign_returns_unimplemented_no_counter_increment() {
-        let pubkey = test_pubkey_bytes();
-        let (svc, metrics) = make_service_with_metrics(MockBackend::with_test_key());
-
-        let req =
-            Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: pubkey.to_vec() });
-        let err = svc.sign(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-        assert_eq!(
-            metrics
-                .sign_total
-                .with_label_values(&["basic", grpc_sign_type::BEACON_BLOCK, "success"])
-                .get(),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn test_v1_sign_error_returns_unimplemented_no_error_counter() {
-        let (svc, metrics) = make_service_with_metrics(MockBackend::with_test_key());
-
-        let req = Request::new(SignRequest { signing_root: vec![0u8; 32], pubkey: vec![2u8; 48] });
-        let err = svc.sign(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-        assert_eq!(
-            metrics
-                .sign_total
-                .with_label_values(&["basic", grpc_sign_type::BEACON_BLOCK, "error"])
-                .get(),
-            0
-        );
-        assert_eq!(
-            metrics.sign_errors_total.with_label_values(&["basic", "key_not_found"]).get(),
-            0
-        );
     }
 
     // ── RF1-09: gRPC sign metrics via shared free-standing helper ─────────────

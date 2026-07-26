@@ -5,16 +5,16 @@
 //! - [`cn`]: mTLS client CN extraction (legacy DER scanner; swapped in M-4 / ISSUE-3.4)
 //! - [`log`]: structured audit log emission with `TruncatedPubkey` hooks
 //!
-//! # Backward-compatibility re-exports
+//! # Re-exports
 //!
-//! The v1 service handler (`SignerService`) uses `audit::extract_client_cn`,
-//! `audit::log_audit`, `audit::AuditEntry`, and `audit::now_rfc3339`.  These
-//! are re-exported here so the v1 code compiles unchanged.
+//! Handlers (gRPC v2 `SignerServiceImpl`, HTTP Web3Signer routes) and startup
+//! use these paths at the crate root of `audit`:
+//! - [`authorize_client_cn`], [`extract_client_cn`], [`ClientCnAllowList`],
+//!   [`log_missing_client_cn_allow_list_warning`] — SEC-4 CN allow-list
+//! - [`log_audit`], [`AuditEntry`], [`now_rfc3339`] — structured sign/deny audit lines
 
 pub mod cn;
 pub mod log;
-
-// ── Backward-compat re-exports for the v1 handler ────────────────────────────
 
 pub use cn::{
     authorize_client_cn, extract_client_cn, log_missing_client_cn_allow_list_warning,

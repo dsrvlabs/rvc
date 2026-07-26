@@ -18,13 +18,11 @@
 //!
 //! 1. The live listener serves **only** the v2 typed service
 //!    `signer.v2.SignerService` (and, under the `dvt` feature, the v2
-//!    `signer.v2.PeerSignerService`).  The v1 raw-root service
-//!    `signer.SignerService` is **not** registered on the live listener — its
-//!    handler is compiled (ADR-010) but every method returns
-//!    `Status::unimplemented` and it is never passed to `add_service`.
+//!    `signer.v2.PeerSignerService`).  RF2-17 deleted the v1 proto; the legacy
+//!    fully-qualified name `signer.SignerService` no longer exists in the build.
 //! 2. The live-listener enumeration shows **zero** v1 raw-root entries: no
 //!    `REGISTERED_METHODS` entry carries `MessageKind::V1RawRoot`, and no entry's
-//!    `service` string is the v1 service name.
+//!    `service` string is the retired v1 service name.
 //! 3. Every **slashable** signing handler routes through `SigningGate`
 //!    (`GateRouting::Gated`).  A slashable method classified `NonSlashable`
 //!    would be a method that can sign without slashing-DB consultation — the
@@ -47,9 +45,11 @@ use tonic::server::NamedService;
 // The v2 typed service — the ONLY signing service registered on the live
 // listener (see `bin/rvc-signer/src/main.rs`'s `add_service`).
 use rvc_signer_bin::SignerServiceServerV2;
-// The v1 raw-root service — compiled (ADR-010) but NOT registered on the live
-// listener (SS-1 / Issue 2.2).
-use rvc_signer_bin::SignerServiceServer as SignerServiceServerV1;
+
+/// Historical fully-qualified name of the retired v1 raw-root service.
+/// Kept as a string so the M4 gate can still assert the registry never
+/// reintroduces entries on that surface (RF2-17 deleted the generated type).
+const RETIRED_V1_SERVICE_NAME: &str = "signer.SignerService";
 
 /// The introspected name of the v2 service the live listener registers.
 ///
@@ -58,11 +58,6 @@ use rvc_signer_bin::SignerServiceServer as SignerServiceServerV1;
 /// wires on the live listener.
 fn live_listener_service_name() -> &'static str {
     <SignerServiceServerV2<()> as NamedService>::NAME
-}
-
-/// The introspected name of the v1 raw-root service (NOT registered live).
-fn unregistered_v1_service_name() -> &'static str {
-    <SignerServiceServerV1<()> as NamedService>::NAME
 }
 
 /// The slashable message kinds.  A handler for any of these MUST route through
@@ -78,31 +73,26 @@ fn is_slashable(kind: MessageKind) -> bool {
     SLASHABLE_KINDS.contains(&kind)
 }
 
-/// M4 sanity: the live listener introspects to the v2 typed service, which is
-/// distinct from the unregistered v1 raw-root service.
+/// M4 sanity: the live listener introspects to the v2 typed service only.
 #[test]
-fn live_listener_serves_v2_not_v1() {
+fn live_listener_serves_v2_only() {
     let live = live_listener_service_name();
-    let v1 = unregistered_v1_service_name();
 
     assert_eq!(
         live, "signer.v2.SignerService",
         "the live listener must serve the v2 typed service"
     );
-    assert_eq!(
-        v1, "signer.SignerService",
-        "the v1 raw-root service name is the legacy unregistered service"
+    assert_ne!(
+        live, RETIRED_V1_SERVICE_NAME,
+        "the live listener must not serve the retired v1 raw-root service"
     );
-    assert_ne!(live, v1, "the live listener must not serve the v1 raw-root service");
 }
 
 /// M4 core (zero v1 raw-root on the live listener): no enumerated method is a
 /// v1 raw-root entry — neither by `MessageKind::V1RawRoot` nor by carrying the
-/// v1 service name.
+/// retired v1 service name.
 #[test]
 fn live_listener_enumeration_has_zero_v1_raw_root_entries() {
-    let v1_service = unregistered_v1_service_name();
-
     let v1_kind_entries: Vec<&SigningMethod> =
         REGISTERED_METHODS.iter().filter(|m| m.message_kind == MessageKind::V1RawRoot).collect();
     assert!(
@@ -111,11 +101,11 @@ fn live_listener_enumeration_has_zero_v1_raw_root_entries() {
     );
 
     let v1_service_entries: Vec<&SigningMethod> =
-        REGISTERED_METHODS.iter().filter(|m| m.service == v1_service).collect();
+        REGISTERED_METHODS.iter().filter(|m| m.service == RETIRED_V1_SERVICE_NAME).collect();
     assert!(
         v1_service_entries.is_empty(),
-        "live-listener enumeration must contain ZERO entries on the v1 service \
-         '{v1_service}'; found: {v1_service_entries:?}"
+        "live-listener enumeration must contain ZERO entries on the retired v1 service \
+         '{RETIRED_V1_SERVICE_NAME}'; found: {v1_service_entries:?}"
     );
 }
 

@@ -607,10 +607,7 @@ async fn run_serve(
         None
     };
 
-    // Build the v2 service implementation.
-    // SS-1 (Issue 2.2): the v1 raw-root service is no longer registered on the
-    // live listener; `impl SignerService for SignerServiceImpl` is kept compiled
-    // but all v1 methods return `Unimplemented`.
+    // Build the v2 service implementation (RF2-17: v1 proto surface is gone).
     // Hoist (ADR-003, FR-26): build the ONE shared `SigningGate` at the
     // composition root, then inject the same `Arc` into BOTH the gRPC service and
     // the HTTP listener (Issue 3.5). `None` when slashing protection is disabled

@@ -12,8 +12,6 @@ mod tests {
     use crate::config::{self, CliOverrides};
     use crate::metrics::SignerMetrics;
     use crate::reload::KeystoreReloader;
-    use crate::service::SignerServiceImpl;
-    use crate::SignerService;
 
     // --- Helpers ---
 
@@ -284,64 +282,7 @@ reload_interval_secs = 60
         reloader_handle.await.unwrap();
     }
 
-    // --- 4. Metrics: v1 sign returns Unimplemented without touching counters ---
-    // SS-1 (Issue 2.2): v1 sign no longer drives the metrics counters.
-    // The metrics system is independently tested; this test confirms v1 calls
-    // return Unimplemented immediately and leave counters at zero.
-
-    #[tokio::test]
-    async fn test_v1_sign_returns_unimplemented_leaves_counters_at_zero() {
-        let dir = TempDir::new().unwrap();
-        let password = Zeroizing::new("test-password".to_string());
-        let pubkey = create_test_keystore(dir.path(), &password);
-
-        let signer = Arc::new(BasicSigner::load(dir.path(), &password).unwrap());
-        let metrics = Arc::new(SignerMetrics::new());
-
-        let svc = SignerServiceImpl::new(
-            Arc::clone(&signer) as Arc<dyn SigningBackend>,
-            "basic".to_string(),
-        )
-        .with_metrics(Arc::clone(&metrics));
-
-        // v1 sign — must return Unimplemented
-        let req = tonic::Request::new(crate::SignRequest {
-            signing_root: vec![0u8; 32],
-            pubkey: pubkey.to_vec(),
-        });
-        let err = svc.sign(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented, "v1 sign must return Unimplemented");
-
-        // v1 sign with unknown key — also Unimplemented (not NotFound)
-        let req = tonic::Request::new(crate::SignRequest {
-            signing_root: vec![0u8; 32],
-            pubkey: vec![0u8; 48],
-        });
-        let err = svc.sign(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-
-        // Counters must remain at zero — Unimplemented path does not touch metrics
-        assert_eq!(
-            metrics.sign_total.with_label_values(&["basic", "beacon_block", "success"]).get(),
-            0
-        );
-        assert_eq!(
-            metrics.sign_total.with_label_values(&["basic", "beacon_block", "error"]).get(),
-            0
-        );
-        assert_eq!(
-            metrics.sign_errors_total.with_label_values(&["basic", "key_not_found"]).get(),
-            0
-        );
-        assert_eq!(
-            metrics
-                .sign_duration_seconds
-                .with_label_values(&["basic", "beacon_block"])
-                .get_sample_count(),
-            0,
-            "Unimplemented path must not record duration"
-        );
-    }
+    // --- 4. Metrics endpoint ---
 
     #[tokio::test]
     async fn test_metrics_endpoint_serves_prometheus_text() {
@@ -528,32 +469,7 @@ keystore_dir = "{}"
         assert_eq!(entry.duration_ms, 42);
     }
 
-    // SS-1 (Issue 2.2): v1 sign is Unimplemented — no audit log is emitted.
-    // The test is repurposed to confirm v1 returns Unimplemented immediately.
     // Audit-log coverage for v2 sign paths is in `bin/rvc-signer/tests/audit_log_m5.rs`.
-    #[tokio::test]
-    async fn test_v1_sign_returns_unimplemented_no_audit_log() {
-        let dir = TempDir::new().unwrap();
-        let password = Zeroizing::new("test-password".to_string());
-        let pubkey = create_test_keystore(dir.path(), &password);
-
-        let signer = Arc::new(BasicSigner::load(dir.path(), &password).unwrap());
-        let svc = SignerServiceImpl::new(
-            Arc::clone(&signer) as Arc<dyn SigningBackend>,
-            "basic".to_string(),
-        );
-
-        let req = tonic::Request::new(crate::SignRequest {
-            signing_root: vec![0u8; 32],
-            pubkey: pubkey.to_vec(),
-        });
-        let err = svc.sign(req).await.unwrap_err();
-        assert_eq!(
-            err.code(),
-            tonic::Code::Unimplemented,
-            "v1 sign must return Unimplemented (SS-1 fix)"
-        );
-    }
 
     #[test]
     fn test_audit_extract_cn_without_tls_returns_unknown() {
@@ -576,64 +492,15 @@ keystore_dir = "{}"
         assert_eq!(cn, Some("integration-test-client".to_string()));
     }
 
-    // --- Cross-cutting: v1 methods return Unimplemented; metrics/keys_loaded still work ---
-    // SS-1 (Issue 2.2): v1 sign and get_status are Unimplemented.
-    // This test was previously a full v1 sign round-trip; it now confirms the Unimplemented
-    // behavior and that the metrics infrastructure (keys_loaded, encode) is unaffected.
-
+    /// Metrics infrastructure (keys_loaded, encode) still works after RF2-17
+    /// removed the v1 sign surface that previously exercised counters here.
     #[tokio::test]
-    async fn test_v1_sign_and_get_status_unimplemented_metrics_infra_intact() {
-        let dir = TempDir::new().unwrap();
-        let password = Zeroizing::new("test-password".to_string());
-        let pubkey = create_test_keystore(dir.path(), &password);
-
-        let signer = Arc::new(BasicSigner::load(dir.path(), &password).unwrap());
+    async fn test_metrics_keys_loaded_and_encode_intact() {
         let metrics = Arc::new(SignerMetrics::new());
         metrics.keys_loaded.with_label_values(&["basic"]).set(1.0);
 
-        let svc = SignerServiceImpl::new(
-            Arc::clone(&signer) as Arc<dyn SigningBackend>,
-            "basic".to_string(),
-        )
-        .with_metrics(Arc::clone(&metrics));
-
-        // v1 sign — must return Unimplemented (3 calls, all Unimplemented)
-        for _ in 0..3 {
-            let req = tonic::Request::new(crate::SignRequest {
-                signing_root: vec![42u8; 32],
-                pubkey: pubkey.to_vec(),
-            });
-            let err = svc.sign(req).await.unwrap_err();
-            assert_eq!(err.code(), tonic::Code::Unimplemented);
-        }
-
-        // v1 sign unknown key — also Unimplemented (not NotFound)
-        let req = tonic::Request::new(crate::SignRequest {
-            signing_root: vec![0u8; 32],
-            pubkey: vec![99u8; 48],
-        });
-        let err = svc.sign(req).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-
-        // v1 sign counters must remain at zero
-        assert_eq!(
-            metrics.sign_total.with_label_values(&["basic", "beacon_block", "success"]).get(),
-            0
-        );
-        assert_eq!(
-            metrics.sign_total.with_label_values(&["basic", "beacon_block", "error"]).get(),
-            0
-        );
-
-        // keys_loaded gauge still works (set above)
         assert_eq!(metrics.keys_loaded.with_label_values(&["basic"]).get(), 1.0);
 
-        // v1 get_status — also Unimplemented
-        let err =
-            svc.get_status(tonic::Request::new(crate::GetStatusRequest {})).await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-
-        // Metrics scrape still encodes correctly (metrics infra not broken)
         let encoded = metrics.encode().unwrap();
         let text = String::from_utf8(encoded).unwrap();
         assert!(text.contains("rvc_signer_keys_loaded"));

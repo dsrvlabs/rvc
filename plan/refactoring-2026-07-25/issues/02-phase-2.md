@@ -1397,21 +1397,21 @@ itself, so C4 can compile signer.v2.proto exactly once.
 7. **GREEN:** `cargo build --release --all-features`; the server starts and serves v2 only.
 
 **Acceptance criteria:**
-- [ ] `proto/` contains exactly `duty_tracker.proto` and `signer.v2.proto`.
-- [ ] Neither `build.rs` in the workspace references `signer.proto`; each has one `tonic_build`
+- [x] `proto/` contains exactly `duty_tracker.proto` and `signer.v2.proto`.
+- [x] Neither `build.rs` in the workspace references `signer.proto`; each has one `tonic_build`
       invocation per proto it still compiles.
-- [ ] `rg "proto::signer::signer_service_server"` returns zero hits; `service.rs` retains exactly one
+- [x] `rg "proto::signer::signer_service_server"` returns zero hits; `service.rs` retains exactly one
       `impl … for SignerServiceImpl` gRPC trait block, the v2 one at `:485` (`SignerServiceV2`).
-- [ ] `no_raw_root_path.rs` is green and unmodified — the raw-root guard survives the deletion.
-- [ ] `audit/mod.rs`'s module doc no longer cites the v1 handler; every surviving re-export has a
+- [x] `no_raw_root_path.rs` is green and unmodified — the raw-root guard survives the deletion.
+- [x] `audit/mod.rs`'s module doc no longer cites the v1 handler; every surviving re-export has a
       named v2 consumer listed in the PR.
-- [ ] The server starts and all v2 signing integration tests (`sign_*_v2.rs`, nine files) pass
+- [x] The server starts and all v2 signing integration tests (`sign_*_v2.rs`, nine files) pass
       unchanged.
-- [ ] **Test-count delta stated and justified:** expected ≈ −8 to −12 — the v1 `Unimplemented`
+- [x] **Test-count delta stated and justified:** expected ≈ −8 to −12 — the v1 `Unimplemented`
       assertions in `service.rs` and the whole of `v1_raw_root_bypass.rs`, all
       *deleted-with-the-dead-code*, with `no_raw_root_path.rs` named as the surviving guard for the
       security intent.
-- [ ] Standing invariant green, including `--all-features`.
+- [x] Standing invariant green, including `--all-features`.
 
 **Risks:**
 - ADR-010 is the stated reason v1 was kept. Deleting it is a documented decision reversal, not an
