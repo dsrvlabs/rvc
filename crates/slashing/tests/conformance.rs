@@ -5,32 +5,37 @@
 //!
 //! # Runner → strategy mapping
 //!
-//! - **`complete`** — full-history EIP-3076 strategy. Interchange is imported into
-//!   the history tables via [`SlashingDb::import`]; every block/attestation verdict
-//!   comes from the production `stage_* → commit()/discard()` path.
+//! - **`complete`** — full-history EIP-3076 strategy. Interchange history is loaded
+//!   via `record_block` / `record_attestation` (no watermarks) so verdicts certify
+//!   **history-only** complete-strategy decisions. Validation (version / GVR) mirrors
+//!   production [`SlashingDb::import`]. Every block/attestation verdict comes from the
+//!   production `stage_* → commit()/discard()` path.
 //! - **`minimal_conservative`** — watermark (minified) EIP-3076 strategy. Interchange
 //!   maxima are projected onto the real `set_block_watermark` /
-//!   `set_attestation_watermark` API (harness-side projection only); every verdict
+//!   `set_attestation_watermark` API (harness-side projection; production
+//!   [`SlashingDb::import`] now does the same raise-only projection). Every verdict
 //!   comes from the same production `stage_* → commit()/discard()` path. After a
 //!   successful stage commit the harness raises the corresponding watermark so later
-//!   steps see the post-sign high-water mark (production signing does not yet auto-
-//!   raise watermarks — that remains history-table driven on the complete path).
+//!   steps see the post-sign high-water mark (production signing does not auto-raise
+//!   watermarks after each sign — that remains history-table driven on the complete
+//!   path).
 //!
 //! Both runners therefore certify the **production decision path**. They still diverge
 //! on strategy-sensitive fixtures (`*_iff_minified`, `*_fail_iff_imported`, resign /
 //! gap cases, etc.) because the *import* side differs (full history vs watermark
-//! maxima).
+//! maxima). Production `import` is hybrid (history + watermark floor); the complete
+//! runner loads history without watermarks to isolate pure complete-strategy
+//! semantics (RF2-12-M1: no public `clear_watermarks` wipe API).
 //!
-//! # B5 handoff (Phase 2)
+//! # B5 / RF2-12
 //!
-//! Moving the interchange → watermark *projection* from this harness into production
-//! import code is Phase 2 issue **B5** ("Interchange import sets watermarks from
-//! interchange maxima"). RF1-04 deliberately leaves projection in the test so B5 has
-//! a single, explicit place to absorb it.
+//! Production [`SlashingDb::import`] raises watermarks from interchange maxima
+//! (raise-only, same transaction as row inserts). Covered by unit tests. The minimal
+//! harness still projects maxima explicitly so it does not depend on history rows.
 
 use serde::Deserialize;
 
-use rvc_slashing::{InterchangeFormat, SlashingDb};
+use rvc_slashing::{InterchangeFormat, SlashingDb, SlashingError};
 
 mod common;
 use common::{stage_and_commit_attestation, stage_and_commit_block};
@@ -104,12 +109,75 @@ fn load_test_case(name: &str) -> TestCase {
 // Complete strategy runner (production stage_* → commit/discard path)
 // ---------------------------------------------------------------------------
 
+/// Load interchange into history tables **without** raising watermarks.
+///
+/// Mirrors production [`SlashingDb::import`] validation (version + GVR + parse)
+/// and idempotent history inserts, but deliberately skips the RF2-12 watermark
+/// raise so this runner certifies pure complete / history-table strategy.
+/// Production hybrid import (history + watermark floor) is covered by unit tests.
+///
+/// RF2-12-M1: avoids any public wipe API — `clear_watermarks` is `#[cfg(test)]`
+/// `pub(crate)` only and is not reachable from this integration test.
+fn complete_import_history_only(
+    db: &SlashingDb,
+    interchange: &InterchangeFormat,
+    expected_gvr: &str,
+) -> Result<(), SlashingError> {
+    if interchange.metadata.interchange_format_version != "5" {
+        return Err(SlashingError::InvalidInterchangeFormat(format!(
+            "unsupported interchange_format_version: expected \"5\", got \"{}\"",
+            interchange.metadata.interchange_format_version
+        )));
+    }
+
+    if interchange.metadata.genesis_validators_root != expected_gvr {
+        return Err(SlashingError::GenesisValidatorsRootMismatch {
+            expected: expected_gvr.to_string(),
+            actual: interchange.metadata.genesis_validators_root.clone(),
+        });
+    }
+
+    for validator in &interchange.data {
+        for attestation in &validator.signed_attestations {
+            let source_epoch: u64 = attestation.source_epoch.parse().map_err(|_| {
+                SlashingError::InvalidInterchangeFormat(format!(
+                    "invalid source_epoch: {}",
+                    attestation.source_epoch
+                ))
+            })?;
+            let target_epoch: u64 = attestation.target_epoch.parse().map_err(|_| {
+                SlashingError::InvalidInterchangeFormat(format!(
+                    "invalid target_epoch: {}",
+                    attestation.target_epoch
+                ))
+            })?;
+            db.record_attestation(
+                &validator.pubkey,
+                source_epoch,
+                target_epoch,
+                attestation.signing_root.clone(),
+                SIGN_GVR,
+            )?;
+        }
+
+        for block in &validator.signed_blocks {
+            let slot: u64 = block.slot.parse().map_err(|_| {
+                SlashingError::InvalidInterchangeFormat(format!("invalid slot: {}", block.slot))
+            })?;
+            db.record_block(&validator.pubkey, slot, block.signing_root.clone(), SIGN_GVR)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn run_complete(test: &TestCase) {
     let db = SlashingDb::open_in_memory().expect("failed to open db");
     let gvr = &test.genesis_validators_root;
 
     for (step_idx, step) in test.steps.iter().enumerate() {
-        let import_result = db.import(&step.interchange, gvr);
+        // History-only load (no watermark floor) for pure complete-strategy isolation.
+        let import_result = complete_import_history_only(&db, &step.interchange, gvr);
 
         if !step.should_succeed {
             if !step.contains_slashable_data {

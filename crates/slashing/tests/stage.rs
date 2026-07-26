@@ -420,7 +420,9 @@ fn test_stage_block_at_block_watermark_is_rejected() {
         .expect_err("slot equal to block watermark must be rejected");
 
     match err {
-        SlashingError::BelowBlockWatermark { slot, watermark_slot } => {
+        // RF2-12: error names the pubkey and offending values.
+        SlashingError::BelowBlockWatermark { pubkey: ref err_pk, slot, watermark_slot } => {
+            assert!(err_pk.contains("deadbeef01"), "pubkey in error: {err_pk}");
             assert_eq!(slot, 1000);
             assert_eq!(watermark_slot, 1000);
         }
@@ -440,7 +442,9 @@ fn test_stage_block_strictly_below_block_watermark_is_rejected() {
         .expect_err("slot strictly below block watermark must be rejected");
 
     match err {
-        SlashingError::BelowBlockWatermark { slot, watermark_slot } => {
+        // RF2-12: error names the pubkey and offending values.
+        // (pubkey is asserted in the equality test; field presence is required here.)
+        SlashingError::BelowBlockWatermark { slot, watermark_slot, .. } => {
             assert_eq!(slot, 999);
             assert_eq!(watermark_slot, 1000);
         }
@@ -459,7 +463,12 @@ fn test_stage_attestation_at_target_watermark_is_rejected() {
         .expect_err("target equal to att-target watermark must be rejected");
 
     match err {
-        SlashingError::BelowAttestationWatermark { target_epoch, watermark_target } => {
+        SlashingError::BelowAttestationWatermark {
+            pubkey: ref err_pk,
+            target_epoch,
+            watermark_target,
+        } => {
+            assert!(err_pk.contains("deadbeef01"), "pubkey in error: {err_pk}");
             assert_eq!(target_epoch, 200);
             assert_eq!(watermark_target, 200);
         }
@@ -480,7 +489,7 @@ fn test_stage_attestation_strictly_below_target_watermark_is_rejected() {
         .expect_err("target strictly below att-target watermark must be rejected");
 
     match err {
-        SlashingError::BelowAttestationWatermark { target_epoch, watermark_target } => {
+        SlashingError::BelowAttestationWatermark { target_epoch, watermark_target, .. } => {
             assert_eq!(target_epoch, 199);
             assert_eq!(watermark_target, 200);
         }
@@ -537,7 +546,13 @@ fn test_stage_attestation_below_source_watermark_is_rejected() {
 
     match err {
         // Check-only path: stage returns the watermark error; no commit needed.
-        SlashingError::BelowAttestationSourceWatermark { source_epoch, watermark_source } => {
+        // RF2-12: error names the pubkey and offending values.
+        SlashingError::BelowAttestationSourceWatermark {
+            pubkey: ref err_pk,
+            source_epoch,
+            watermark_source,
+        } => {
+            assert!(err_pk.contains("deadbeef01"), "pubkey in error: {err_pk}");
             assert_eq!(source_epoch, 1);
             assert_eq!(watermark_source, 20);
         }
@@ -592,14 +607,14 @@ fn test_stage_and_check_and_record_agree_on_watermark_equality() {
         assert!(
             matches!(
                 stage_err,
-                SlashingError::BelowBlockWatermark { slot: 1000, watermark_slot: 1000 }
+                SlashingError::BelowBlockWatermark { slot: 1000, watermark_slot: 1000, .. }
             ),
             "stage: {stage_err:?}"
         );
         assert!(
             matches!(
                 check_err,
-                SlashingError::BelowBlockWatermark { slot: 1000, watermark_slot: 1000 }
+                SlashingError::BelowBlockWatermark { slot: 1000, watermark_slot: 1000, .. }
             ),
             "check_and_record: {check_err:?}"
         );
@@ -622,7 +637,8 @@ fn test_stage_and_check_and_record_agree_on_watermark_equality() {
                 stage_err,
                 SlashingError::BelowAttestationWatermark {
                     target_epoch: 200,
-                    watermark_target: 200
+                    watermark_target: 200,
+                    ..
                 }
             ),
             "stage: {stage_err:?}"
@@ -632,7 +648,8 @@ fn test_stage_and_check_and_record_agree_on_watermark_equality() {
                 check_err,
                 SlashingError::BelowAttestationWatermark {
                     target_epoch: 200,
-                    watermark_target: 200
+                    watermark_target: 200,
+                    ..
                 }
             ),
             "check_and_record: {check_err:?}"

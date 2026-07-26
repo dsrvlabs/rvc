@@ -1012,6 +1012,20 @@ impl SlashingDb {
     }
 
     #[tracing::instrument(name = "slashing.db.import", skip_all)]
+    /// Import an EIP-3076 interchange into the history tables and raise per-pubkey
+    /// watermarks to the interchange maxima.
+    ///
+    /// # Watermarks (RF2-12 / B5)
+    ///
+    /// For each validator in the interchange, after inserting rows:
+    /// - block watermark ← `MAX(signed_blocks.slot)`
+    /// - attestation watermarks ← `(MAX(source_epoch), MAX(target_epoch))`
+    ///
+    /// Watermark updates are **raise-only** and share the same transaction as the
+    /// row inserts: a partial import cannot leave watermarks ahead of rows, and
+    /// re-importing an older (lower-maxima) interchange **does not lower**
+    /// watermarks and **does not fail** the import (EIP-3076 import is additive;
+    /// `WatermarkLowered` is reserved for the explicit `set_*_watermark` APIs).
     pub fn import(
         &self,
         interchange: &InterchangeFormat,
@@ -1043,6 +1057,9 @@ impl SlashingDb {
 
         for validator in &interchange.data {
             let pubkey = normalize_pubkey(&validator.pubkey);
+            let mut max_slot: Option<Slot> = None;
+            let mut max_source: Option<Epoch> = None;
+            let mut max_target: Option<Epoch> = None;
 
             for attestation in &validator.signed_attestations {
                 let source_epoch: Epoch = attestation.source_epoch.parse().map_err(|_| {
@@ -1058,6 +1075,9 @@ impl SlashingDb {
                         attestation.target_epoch
                     ))
                 })?;
+
+                max_source = Some(max_source.map_or(source_epoch, |m| m.max(source_epoch)));
+                max_target = Some(max_target.map_or(target_epoch, |m| m.max(target_epoch)));
 
                 tx.execute(
                     "INSERT INTO attestations \
@@ -1081,6 +1101,8 @@ impl SlashingDb {
                     SlashingError::InvalidInterchangeFormat(format!("invalid slot: {}", block.slot))
                 })?;
 
+                max_slot = Some(max_slot.map_or(slot, |m| m.max(slot)));
+
                 tx.execute(
                     "INSERT INTO blocks \
                      (client_cn, pubkey, slot, signing_root, genesis_validators_root)
@@ -1091,6 +1113,16 @@ impl SlashingDb {
                     (&pubkey, slot as i64, &block.signing_root, &gvr_hex),
                 )?;
             }
+
+            // Raise watermarks from this interchange's maxima (same transaction).
+            // Raise-only SQL: re-import of older maxima is a silent no-op.
+            if let Some(slot) = max_slot {
+                Self::raise_watermark_in_tx(&tx, &pubkey, "block", slot as i64)?;
+            }
+            if let (Some(source), Some(target)) = (max_source, max_target) {
+                Self::raise_watermark_in_tx(&tx, &pubkey, "att_source", source as i64)?;
+                Self::raise_watermark_in_tx(&tx, &pubkey, "att_target", target as i64)?;
+            }
         }
 
         tx.commit()?;
@@ -1100,6 +1132,25 @@ impl SlashingDb {
             path = self.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             "slashing DB import completed"
         );
+        Ok(())
+    }
+
+    /// Raise a single watermark row inside an open transaction (import path).
+    ///
+    /// Uses `MAX(existing, new)` on conflict so older interchange re-imports
+    /// never lower watermarks and never surface `WatermarkLowered`.
+    fn raise_watermark_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        pubkey: &str,
+        watermark_type: &str,
+        value: i64,
+    ) -> Result<(), SlashingError> {
+        tx.execute(
+            "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, ?2, ?3)
+             ON CONFLICT(pubkey, watermark_type) DO UPDATE
+             SET value = MAX(watermarks.value, excluded.value)",
+            (pubkey, watermark_type, value),
+        )?;
         Ok(())
     }
 
@@ -1329,6 +1380,8 @@ impl SlashingDb {
                 return Err(SlashingError::WatermarkLowered {
                     pubkey: pubkey.to_string(),
                     watermark_type: "block".to_string(),
+                    current: current as u64,
+                    attempted: slot,
                 });
             }
             tx.execute(
@@ -1342,6 +1395,19 @@ impl SlashingDb {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Delete all watermark rows.
+    ///
+    /// Test-only (`#[cfg(test)]` + `pub(crate)`): production release builds do not
+    /// compile this API, so nothing outside the crate's unit tests can wipe the
+    /// RF2-12 import floor. The complete-strategy integration harness loads history
+    /// via `record_*` instead of calling this.
+    #[cfg(test)]
+    pub(crate) fn clear_watermarks(&self) -> Result<(), SlashingError> {
+        let conn = self.conn.lock();
+        conn.execute("DELETE FROM watermarks", [])?;
         Ok(())
     }
 
@@ -1393,6 +1459,8 @@ impl SlashingDb {
                 return Err(SlashingError::WatermarkLowered {
                     pubkey: pubkey.clone(),
                     watermark_type: "att_source".to_string(),
+                    current: current_source as u64,
+                    attempted: source_epoch,
                 });
             }
         }
@@ -1401,6 +1469,8 @@ impl SlashingDb {
                 return Err(SlashingError::WatermarkLowered {
                     pubkey: pubkey.clone(),
                     watermark_type: "att_target".to_string(),
+                    current: current_target as u64,
+                    attempted: target_epoch,
                 });
             }
         }
@@ -2292,6 +2362,310 @@ mod tests {
 
         let attestations = db.get_attestations(pubkey).expect("get should succeed");
         assert_eq!(attestations.len(), 1);
+    }
+
+    // ── RF2-12: interchange import raises watermarks from maxima ─────────────
+
+    /// RF2-12: import sets block and attestation watermarks to interchange maxima.
+    #[test]
+    fn test_import_sets_watermarks_from_interchange_maxima() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data: vec![ValidatorRecord {
+                pubkey: pubkey.to_string(),
+                signed_blocks: vec![
+                    InterchangeBlock { slot: "100".to_string(), signing_root: None },
+                    InterchangeBlock { slot: "500".to_string(), signing_root: None },
+                    InterchangeBlock { slot: "250".to_string(), signing_root: None },
+                ],
+                signed_attestations: vec![
+                    InterchangeAttestation {
+                        source_epoch: "10".to_string(),
+                        target_epoch: "20".to_string(),
+                        signing_root: None,
+                    },
+                    InterchangeAttestation {
+                        source_epoch: "30".to_string(),
+                        target_epoch: "40".to_string(),
+                        signing_root: None,
+                    },
+                    InterchangeAttestation {
+                        source_epoch: "15".to_string(),
+                        target_epoch: "35".to_string(),
+                        signing_root: None,
+                    },
+                ],
+            }],
+        };
+
+        assert!(db.get_block_watermark(pubkey).unwrap().is_none());
+        assert!(db.get_attestation_watermark(pubkey).unwrap().is_none());
+
+        db.import(&interchange, genesis_root).expect("import");
+
+        assert_eq!(db.get_block_watermark(pubkey).unwrap(), Some(500));
+        assert_eq!(db.get_attestation_watermark(pubkey).unwrap(), Some((30, 40)));
+        // Rows also landed.
+        assert_eq!(db.get_blocks(pubkey).unwrap().len(), 3);
+        assert_eq!(db.get_attestations(pubkey).unwrap().len(), 3);
+    }
+
+    /// RF2-12 / A1: after import with max target T, stage at T is blocked and T+1 is allowed.
+    #[test]
+    fn test_import_watermark_blocks_stage_at_equality_allows_above() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let genesis_root = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+        const T: u64 = 200;
+        const BLOCK_MAX: u64 = 1000;
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data: vec![ValidatorRecord {
+                pubkey: pubkey.to_string(),
+                signed_blocks: vec![InterchangeBlock {
+                    slot: BLOCK_MAX.to_string(),
+                    signing_root: None,
+                }],
+                signed_attestations: vec![InterchangeAttestation {
+                    source_epoch: "100".to_string(),
+                    target_epoch: T.to_string(),
+                    signing_root: None,
+                }],
+            }],
+        };
+
+        db.import(&interchange, genesis_root).expect("import");
+
+        // Attestation at target == T blocked (A1 `<=`).
+        let err = db
+            .stage_attestation(pubkey, 100, T, Some("0xat_eq".into()), &TEST_GVR)
+            .expect_err("target == watermark must be blocked");
+        let msg = err.to_string();
+        assert!(msg.contains("b845089a"), "msg names pubkey: {msg}");
+        assert!(msg.contains(&T.to_string()), "msg names target: {msg}");
+        match err {
+            SlashingError::BelowAttestationWatermark {
+                pubkey: ref err_pk,
+                target_epoch,
+                watermark_target,
+            } => {
+                assert!(err_pk.contains("b845089a"), "pubkey in error: {err_pk}");
+                assert_eq!(target_epoch, T);
+                assert_eq!(watermark_target, T);
+            }
+            other => panic!("expected BelowAttestationWatermark, got: {other:?}"),
+        }
+
+        // Attestation at target T+1 allowed.
+        db.stage_attestation(pubkey, 100, T + 1, Some("0xat_above".into()), &TEST_GVR)
+            .expect("target T+1 must stage")
+            .discard();
+
+        // Block at slot == max blocked.
+        let err = db
+            .stage_block(pubkey, BLOCK_MAX, Some("0xblk_eq".into()), &TEST_GVR)
+            .expect_err("slot == watermark must be blocked");
+        match err {
+            SlashingError::BelowBlockWatermark { pubkey: ref err_pk, slot, watermark_slot } => {
+                assert!(err_pk.contains("b845089a"), "pubkey in error: {err_pk}");
+                assert_eq!(slot, BLOCK_MAX);
+                assert_eq!(watermark_slot, BLOCK_MAX);
+            }
+            other => panic!("expected BelowBlockWatermark, got: {other:?}"),
+        }
+
+        // Block at max+1 allowed.
+        db.stage_block(pubkey, BLOCK_MAX + 1, Some("0xblk_above".into()), &TEST_GVR)
+            .expect("slot max+1 must stage")
+            .discard();
+    }
+
+    /// RF2-12: re-importing an older interchange does not lower watermarks and succeeds.
+    #[test]
+    fn test_reimport_older_interchange_does_not_lower_watermarks() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+
+        let newer = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data: vec![ValidatorRecord {
+                pubkey: pubkey.to_string(),
+                signed_blocks: vec![InterchangeBlock {
+                    slot: "9000".to_string(),
+                    signing_root: None,
+                }],
+                signed_attestations: vec![InterchangeAttestation {
+                    source_epoch: "500".to_string(),
+                    target_epoch: "600".to_string(),
+                    signing_root: None,
+                }],
+            }],
+        };
+        let older = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data: vec![ValidatorRecord {
+                pubkey: pubkey.to_string(),
+                signed_blocks: vec![InterchangeBlock {
+                    slot: "100".to_string(),
+                    signing_root: None,
+                }],
+                signed_attestations: vec![InterchangeAttestation {
+                    source_epoch: "10".to_string(),
+                    target_epoch: "20".to_string(),
+                    signing_root: None,
+                }],
+            }],
+        };
+
+        db.import(&newer, genesis_root).expect("import newer");
+        assert_eq!(db.get_block_watermark(pubkey).unwrap(), Some(9000));
+        assert_eq!(db.get_attestation_watermark(pubkey).unwrap(), Some((500, 600)));
+
+        // Re-import older maxima: must succeed and leave watermarks raised.
+        db.import(&older, genesis_root).expect("re-import older must not fail");
+        assert_eq!(db.get_block_watermark(pubkey).unwrap(), Some(9000));
+        assert_eq!(db.get_attestation_watermark(pubkey).unwrap(), Some((500, 600)));
+
+        // Older rows are still additive.
+        assert!(db.get_blocks(pubkey).unwrap().iter().any(|b| b.slot == 100));
+        assert!(db.get_attestations(pubkey).unwrap().iter().any(|a| a.target_epoch == 20));
+    }
+
+    /// RF2-12: import of only blocks sets block watermark; att watermark stays unset.
+    #[test]
+    fn test_import_blocks_only_sets_block_watermark() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data: vec![ValidatorRecord {
+                pubkey: pubkey.to_string(),
+                signed_blocks: vec![InterchangeBlock {
+                    slot: "42".to_string(),
+                    signing_root: Some("0xef".to_string()),
+                }],
+                signed_attestations: vec![],
+            }],
+        };
+
+        db.import(&interchange, genesis_root).expect("import");
+        assert_eq!(db.get_block_watermark(pubkey).unwrap(), Some(42));
+        assert!(db.get_attestation_watermark(pubkey).unwrap().is_none());
+    }
+
+    /// RF2-12: import of only attestations sets att watermarks; block watermark stays unset.
+    #[test]
+    fn test_import_attestations_only_sets_attestation_watermark() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data: vec![ValidatorRecord {
+                pubkey: pubkey.to_string(),
+                signed_blocks: vec![],
+                signed_attestations: vec![InterchangeAttestation {
+                    source_epoch: "7".to_string(),
+                    target_epoch: "9".to_string(),
+                    signing_root: None,
+                }],
+            }],
+        };
+
+        db.import(&interchange, genesis_root).expect("import");
+        assert!(db.get_block_watermark(pubkey).unwrap().is_none());
+        assert_eq!(db.get_attestation_watermark(pubkey).unwrap(), Some((7, 9)));
+    }
+
+    /// RF2-12-M1: clear_watermarks is test-only and wipes import floors (strategy isolation).
+    #[test]
+    fn test_clear_watermarks_wipes_import_floors() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: genesis_root.to_string(),
+            },
+            data: vec![ValidatorRecord {
+                pubkey: pubkey.to_string(),
+                signed_blocks: vec![InterchangeBlock {
+                    slot: "100".to_string(),
+                    signing_root: None,
+                }],
+                signed_attestations: vec![InterchangeAttestation {
+                    source_epoch: "1".to_string(),
+                    target_epoch: "2".to_string(),
+                    signing_root: None,
+                }],
+            }],
+        };
+
+        db.import(&interchange, genesis_root).expect("import");
+        assert_eq!(db.get_block_watermark(pubkey).unwrap(), Some(100));
+        assert_eq!(db.get_attestation_watermark(pubkey).unwrap(), Some((1, 2)));
+
+        db.clear_watermarks().expect("clear");
+        assert!(db.get_block_watermark(pubkey).unwrap().is_none());
+        assert!(db.get_attestation_watermark(pubkey).unwrap().is_none());
+        // History rows remain.
+        assert_eq!(db.get_blocks(pubkey).unwrap().len(), 1);
+        assert_eq!(db.get_attestations(pubkey).unwrap().len(), 1);
+    }
+
+    /// RF2-12: WatermarkLowered error message names pubkey and offending values.
+    #[test]
+    fn test_watermark_lowered_error_names_pubkey_and_values() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_block_watermark("0xabc", 1000).expect("set");
+        let err = db.set_block_watermark("0xabc", 500).expect_err("must not lower");
+        let msg = err.to_string();
+        assert!(msg.contains("0xabc") || msg.contains("abc"), "names pubkey: {msg}");
+        assert!(msg.contains("1000"), "names current: {msg}");
+        assert!(msg.contains("500"), "names attempted: {msg}");
+        match err {
+            SlashingError::WatermarkLowered {
+                ref pubkey,
+                ref watermark_type,
+                current,
+                attempted,
+            } => {
+                assert!(pubkey.contains("abc"));
+                assert_eq!(watermark_type, "block");
+                assert_eq!(current, 1000);
+                assert_eq!(attempted, 500);
+            }
+            other => panic!("expected WatermarkLowered, got: {other:?}"),
+        }
     }
 
     #[test]

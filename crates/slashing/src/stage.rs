@@ -356,6 +356,7 @@ impl SlashingDb {
                 // SEC-9 / M-1: equality is also blocked (strictly increasing block watermark).
                 if (slot as i64) <= wm {
                     return Err(SlashingError::BelowBlockWatermark {
+                        pubkey: pubkey.clone(),
                         slot,
                         watermark_slot: wm as Slot,
                     });
@@ -490,6 +491,7 @@ impl SlashingDb {
             if let Some(ws) = wm_source {
                 if (source_epoch as i64) < ws {
                     return Err(SlashingError::BelowAttestationSourceWatermark {
+                        pubkey: pubkey.clone(),
                         source_epoch,
                         watermark_source: ws as Epoch,
                     });
@@ -507,6 +509,7 @@ impl SlashingDb {
                 // SEC-9 / M-1: equality is also blocked (strictly increasing target watermark).
                 if (target_epoch as i64) <= wt {
                     return Err(SlashingError::BelowAttestationWatermark {
+                        pubkey: pubkey.clone(),
                         target_epoch,
                         watermark_target: wt as Epoch,
                     });

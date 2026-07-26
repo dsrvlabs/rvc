@@ -41,20 +41,31 @@ pub enum SlashingError {
     #[error("database integrity check failed: {0}")]
     IntegrityCheckFailed(String),
 
-    #[error("watermark can only be raised: attempted to lower {watermark_type} for {pubkey}")]
-    WatermarkLowered { pubkey: String, watermark_type: String },
+    #[error(
+        "watermark can only be raised: attempted to lower {watermark_type} for {pubkey} \
+         (current={current}, attempted={attempted})"
+    )]
+    WatermarkLowered { pubkey: String, watermark_type: String, current: u64, attempted: u64 },
 
     #[error("no watermarks set: pruning without watermarks would delete all records")]
     NoWatermarksSet,
 
-    #[error("block at slot {slot} is below watermark slot {watermark_slot}")]
-    BelowBlockWatermark { slot: Slot, watermark_slot: Slot },
+    #[error(
+        "block at slot {slot} is at or below watermark slot {watermark_slot} for pubkey {pubkey}"
+    )]
+    BelowBlockWatermark { pubkey: String, slot: Slot, watermark_slot: Slot },
 
-    #[error("attestation with target epoch {target_epoch} is below watermark target epoch {watermark_target}")]
-    BelowAttestationWatermark { target_epoch: Epoch, watermark_target: Epoch },
+    #[error(
+        "attestation with target epoch {target_epoch} is at or below watermark target epoch \
+         {watermark_target} for pubkey {pubkey}"
+    )]
+    BelowAttestationWatermark { pubkey: String, target_epoch: Epoch, watermark_target: Epoch },
 
-    #[error("attestation with source epoch {source_epoch} is below watermark source epoch {watermark_source}")]
-    BelowAttestationSourceWatermark { source_epoch: Epoch, watermark_source: Epoch },
+    #[error(
+        "attestation with source epoch {source_epoch} is below watermark source epoch \
+         {watermark_source} for pubkey {pubkey}"
+    )]
+    BelowAttestationSourceWatermark { pubkey: String, source_epoch: Epoch, watermark_source: Epoch },
 
     #[error("unsafe file permissions on {path} (mode {mode}): group or world accessible")]
     UnsafePermissions { path: String, mode: String },

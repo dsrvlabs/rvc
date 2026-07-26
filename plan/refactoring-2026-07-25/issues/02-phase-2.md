@@ -1037,19 +1037,19 @@ to sign.
 5. **GREEN:** conformance suite green *without modification*; the new tests pass.
 
 **Acceptance criteria:**
-- [ ] Importing an EIP-3076 interchange sets block and attestation watermarks from the imported
+- [x] Importing an EIP-3076 interchange sets block and attestation watermarks from the imported
       maxima, atomically with the row inserts.
-- [ ] The 38 minimal-strategy conformance cases pass against real watermark code with **no changes
+- [x] The 38 minimal-strategy conformance cases pass against real watermark code with **no changes
       to `conformance.rs`**.
-- [ ] A named test proves the A1 interaction explicitly: after importing an interchange whose
+- [x] A named test proves the A1 interaction explicitly: after importing an interchange whose
       maximum target epoch is `T`, signing an attestation with target epoch `T` is **blocked**
       (watermark equality, per A1's `<=`) and target `T+1` is allowed.
-- [ ] Re-importing an older interchange does not lower watermarks and does not fail the import (or
+- [x] Re-importing an older interchange does not lower watermarks and does not fail the import (or
       fails with a documented, tested error — one branch, stated).
-- [ ] The `WatermarkLowered` / `BelowBlockWatermark` / `BelowAttestation*Watermark` error messages
+- [x] The `WatermarkLowered` / `BelowBlockWatermark` / `BelowAttestation*Watermark` error messages
       name the pubkey and the offending value.
-- [ ] **Test-count delta stated and justified:** expected +4 to +8 *newly added*; zero deletions.
-- [ ] Standing invariant green; Phase 1's A3 pipeline tests green.
+- [x] **Test-count delta stated and justified:** expected +4 to +8 *newly added*; zero deletions.
+- [x] Standing invariant green; Phase 1's A3 pipeline tests green.
 
 **Risks:**
 - **The A1 interaction is the thing to get right.** Setting `att_target` to the interchange maximum,

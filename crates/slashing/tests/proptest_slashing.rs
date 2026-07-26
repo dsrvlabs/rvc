@@ -402,6 +402,7 @@ proptest! {
                         Err(SlashingError::BelowBlockWatermark {
                             slot,
                             watermark_slot,
+                            ..
                         }) if slot == t && watermark_slot == w
                     ),
                     "block slot T={t} <= W={w} must be BelowBlockWatermark, got {result:?}",
@@ -432,6 +433,7 @@ proptest! {
                         Err(SlashingError::BelowAttestationWatermark {
                             target_epoch,
                             watermark_target,
+                            ..
                         }) if target_epoch == t && watermark_target == w
                     ),
                     "att target T={t} <= W={w} must be BelowAttestationWatermark, got {result:?}",
