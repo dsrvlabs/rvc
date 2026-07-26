@@ -1276,12 +1276,12 @@ accidentally builds two gates reintroduces a double-signing path across transpor
 4. Preserve the SIGHUP log-reload wiring and the shutdown ordering exactly.
 
 **Acceptance criteria:**
-- [ ] One `SigningGate` instance is shared by gRPC and HTTP (test asserts pointer equality via
+- [x] One `SigningGate` instance is shared by gRPC and HTTP (test asserts pointer equality via
       `Arc::ptr_eq`).
-- [ ] One `SignerMetrics` registry serves both transports (one scrape shows both series).
-- [ ] HTTP API without a gate refuses at startup, as today.
-- [ ] Hardened-builder limits and the 1 MiB decode cap are unchanged (assert the configured values).
-- [ ] The H-9 gate still requires env var + loopback and runs in Refuse mode.
+- [x] One `SignerMetrics` registry serves both transports (one scrape shows both series).
+- [x] HTTP API without a gate refuses at startup, as today.
+- [x] Hardened-builder limits and the 1 MiB decode cap are unchanged (assert the configured values).
+- [x] The H-9 gate still requires env var + loopback and runs in Refuse mode.
 
 **TDD test plan** (RED first):
 - `test_grpc_and_http_share_one_signing_gate` — **RED**: not expressible today, since neither builder

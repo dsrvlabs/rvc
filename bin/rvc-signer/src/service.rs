@@ -225,6 +225,20 @@ impl SignerServiceImpl {
         self
     }
 
+    /// The shared [`SigningGate`] injected at the composition root (FR-26), if any.
+    ///
+    /// Used by server-phase tests to assert gRPC and HTTP hold the same `Arc`.
+    #[cfg(test)]
+    pub(crate) fn shared_gate(&self) -> Option<&Arc<SigningGate>> {
+        self.gate.as_ref()
+    }
+
+    /// The shared [`SignerMetrics`] registry injected at the composition root.
+    #[cfg(test)]
+    pub(crate) fn shared_metrics(&self) -> Option<&Arc<SignerMetrics>> {
+        self.metrics.as_ref()
+    }
+
     /// Set the network genesis fork version used for builder registration.
     ///
     /// Both gRPC and HTTP must be configured with the same value (typically from

@@ -2,12 +2,16 @@
 //!
 //! RF5-19 moved the former `main::run_serve` body into the library target.
 //! RF5-20 decomposes the first two phases into [`open_slashing_db`] and
-//! [`build_backend`]; further decomposition (gRPC / HTTP) is RF5-21+.
+//! [`build_backend`]; RF5-21 adds [`build_grpc_router`] and [`spawn_http_api`].
 
 mod backend;
+mod grpc;
+mod http;
 mod slashing;
 
 pub(crate) use backend::build_backend;
+pub(crate) use grpc::build_grpc_router;
+pub(crate) use http::spawn_http_api;
 pub(crate) use slashing::open_slashing_db;
 
 /// Process-global env mutations in server unit tests must take this lock so
@@ -22,20 +26,16 @@ pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 
 use std::sync::Arc;
 
-use tracing::{error, info};
+use tracing::info;
 
 use crate::error::ServerError;
-use crate::{
-    config, http_api, insecure_startup, metrics, reload, service, tls, SignerServiceServerV2,
-};
-#[cfg(feature = "dvt")]
-use crate::{dvt, PeerSignerServiceServerV2};
+use crate::{config, http_api, metrics, reload, service};
 
 /// Run the signer server until `shutdown` is cancelled.
 ///
 /// Composition root: crypto-provider install → password → TLS material →
-/// [`build_backend`] → hot-reload / metrics → [`open_slashing_db`] → gate +
-/// services → serve until `shutdown` is cancelled.
+/// [`build_backend`] → hot-reload / metrics → [`open_slashing_db`] → one shared
+/// gate → [`spawn_http_api`] + [`build_grpc_router`] → serve until `shutdown`.
 pub async fn run(
     resolved: crate::config::ResolvedConfig,
     shutdown: tokio_util::sync::CancellationToken,
@@ -191,88 +191,21 @@ pub async fn run(
             None
         };
 
-    let svc_v2 = if let Some(ref shared_gate) = shared_gate {
-        service::SignerServiceImpl::new_v2_with_gate(
-            Arc::clone(&signing_backend),
-            resolved.backend.clone(),
-            Arc::clone(shared_gate),
-        )
-        .with_metrics(Arc::clone(&signer_metrics))
-        .with_client_cn_allow_list(client_cn_allow_list.clone())
-        .with_genesis_fork_version(resolved.genesis_fork_version)
-    } else {
-        service::SignerServiceImpl::new(Arc::clone(&signing_backend), resolved.backend.clone())
-            .with_metrics(Arc::clone(&signer_metrics))
-            .with_client_cn_allow_list(client_cn_allow_list.clone())
-            .with_genesis_fork_version(resolved.genesis_fork_version)
-    };
-
-    // Build the PeerSignerService (DVT) now that we have the slashing DB.
-    // The allow-list was already loaded and validated above (hoisted from here
-    // to avoid a double file-read — ISSUE-4.1 / L-1 DRY fix).
-    #[cfg(feature = "dvt")]
-    let peer_signer_service: Option<dvt::peer_service::PeerSignerServiceImpl> = if let Some(
-        share_map,
-    ) =
-        dvt_share_map_opt
-    {
-        // Reuse the Arc loaded in build_backend.
-        let allow_list = dvt_allow_list_opt.ok_or_else(|| {
-                ServerError::config(
-                    "DVT is enabled but --dvt-allowed-peers was not provided. \
-                     Create a dvt-allowed-peers.toml file and pass its path via --dvt-allowed-peers.",
-                )
-            })?;
-        let peer_svc = dvt::peer_service::PeerSignerServiceImpl::new(
-            share_map,
-            allow_list,
-            slashing_db_opt.clone(),
-        );
-        Some(peer_svc)
-    } else {
-        None
-    };
-
-    let addr: std::net::SocketAddr = resolved
-        .listen_address
-        .parse()
-        .map_err(|e| ServerError::bind(format!("invalid listen address: {e}")))?;
-
-    // ── M-10: hardened server builder (concurrency + timeout limits) ──────────
-    //
-    // `hardened_server_builder()` applies per research/05 §"Recommended values":
-    //   - concurrency_limit_per_connection(32) — Tower-level cap per connection
-    //   - max_concurrent_streams(Some(64))     — H2 SETTINGS frame to clients
-    //   - timeout(Duration::from_secs(10))     — per-request timeout via Tower
-    //
-    // Per-service max_decoding_message_size(1 MiB) is set on each ServiceServer
-    // below (Tonic exposes it only at the service level, not the builder level).
-    let mut builder = tls::server_builder::hardened_server_builder();
-
-    if let Some(ref tls_cfg) = tls_config {
-        let server_tls =
-            tls_cfg.to_server_tls_config().map_err(|e| ServerError::tls(e.to_string()))?;
-        builder = builder.tls_config(server_tls).map_err(|e| ServerError::tls(e.to_string()))?;
-        info!("mTLS enabled");
-    } else if resolved.insecure {
-        // ── H-9: env-var double-confirm + loopback gate ───────────────────
-        //
-        // `--insecure` requires BOTH `RVC_SIGNER_ALLOW_INSECURE=true` in the
-        // environment AND a loopback bind address.  Per NFR-10 / ISSUE-3.13
-        // (GA tag) the gate now runs in Refuse mode: startup hard-fails when
-        // the opt-in conditions are not fully met.
-        insecure_startup::check_insecure_startup(true, addr, crypto::InsecureMode::Refuse)
-            .map_err(|e| {
-                error!(error = %e, "insecure startup refused by gate");
-                ServerError::config(e.to_string())
-            })?;
-        tracing::warn!("TLS disabled via --insecure flag. Do NOT use in production!");
-    } else {
-        return Err(ServerError::tls(
-            "TLS is required. Provide --tls-cert, --tls-key, and --tls-ca-cert, \
-             or use --insecure to disable (NOT recommended for production).",
-        ));
-    }
+    // Build the gRPC router first (TLS / H-9 insecure gate / services) so a
+    // transport-config failure never leaves an HTTP listener half-started.
+    let built_grpc = build_grpc_router(grpc::GrpcRouterDeps {
+        resolved: &resolved,
+        tls_config: tls_config.as_ref(),
+        signing_backend: Arc::clone(&signing_backend),
+        shared_gate: shared_gate.clone(),
+        client_cn_allow_list: client_cn_allow_list.clone(),
+        signer_metrics: Arc::clone(&signer_metrics),
+        slashing_db: slashing_db_opt,
+        #[cfg(feature = "dvt")]
+        dvt_share_map: dvt_share_map_opt,
+        #[cfg(feature = "dvt")]
+        dvt_allow_list: dvt_allow_list_opt,
+    })?;
 
     // ── Web3Signer HTTP API listener (Issue 3.5, FR-25/26/27, ADR-001) ────────
     //
@@ -282,87 +215,23 @@ pub async fn run(
     // unified across both transports. A panic in an HTTP connection task is
     // isolated and never touches the gRPC accept loop (Issue 3.3).
     let http_shutdown = tokio_util::sync::CancellationToken::new();
-    let http_handle = if resolved.http_enabled {
-        // Fail closed: the HTTP API requires the shared gate. Running a remote
-        // signer's HTTP API without slashing protection is refused at startup
-        // (stricter than the gRPC per-request `require_gate()` 500).
-        let gate = shared_gate.clone().ok_or_else(|| {
-            ServerError::config(
-                "[signer.http] is enabled but slashing protection is disabled. The HTTP \
-                 API requires the shared signing gate; enable slashing protection or \
-                 disable the HTTP API.",
-            )
-        })?;
-        let cert = resolved.http_tls_cert.as_deref().ok_or_else(|| {
-            ServerError::config("[signer.http] enabled but http.tls_cert is not set")
-        })?;
-        let key = resolved.http_tls_key.as_deref().ok_or_else(|| {
-            ServerError::config("[signer.http] enabled but http.tls_key is not set")
-        })?;
-        let ca = resolved.http_tls_ca_cert.as_deref().ok_or_else(|| {
-            ServerError::config("[signer.http] enabled but http.tls_ca_cert is not set")
-        })?;
+    let http_handle = spawn_http_api(
+        http::HttpApiDeps {
+            resolved: &resolved,
+            shared_gate,
+            signing_backend: Arc::clone(&signing_backend),
+            signer_metrics: Arc::clone(&signer_metrics),
+            client_cn_allow_list,
+        },
+        http_shutdown.clone(),
+    )
+    .await?;
 
-        let state = http_api::Web3SignerState {
-            gate,
-            backend: Arc::clone(&signing_backend),
-            // Record the active backend label ("basic"/"dvt") in HTTP audit lines
-            // so they line up with the gRPC metrics `backend` label (Issue 4.4).
-            audit: http_api::AuditCfg {
-                backend_name: resolved.backend.clone(),
-                ..http_api::AuditCfg::default()
-            },
-            // Share the one SignerMetrics registry so HTTP-path series land on the
-            // same `:9101` scrape as the gRPC series (Issue 4.5).
-            metrics: Arc::clone(&signer_metrics),
-            // SEC-4 residual F1: same primary client-CN allow-list as gRPC so
-            // HTTP cannot bypass `--allowed-client-cns` as a parallel oracle.
-            client_cn_allow_list: client_cn_allow_list.clone(),
-            // Same network genesis as gRPC for builder-registration equality.
-            genesis_fork_version: resolved.genesis_fork_version,
-        };
-        let (bound, handle) = http_api::tls::spawn_https_listener(
-            &resolved.http_listen_address,
-            cert,
-            key,
-            ca,
-            resolved.http_tls_mode,
-            state,
-            http_shutdown.clone(),
-        )
-        .await
-        .map_err(|e| ServerError::bind(e.to_string()))?;
-        info!(address = %bound, tls_mode = ?resolved.http_tls_mode, "Web3Signer HTTP API listening");
-        Some(handle)
-    } else {
-        None
-    };
+    info!(address = %built_grpc.listen_addr, "gRPC server listening");
 
-    info!(address = %addr, "gRPC server listening");
-
-    // 1 MiB per-message decode cap (M-10): blocks memory-pressure via oversized
-    // request bodies.  Signing a BeaconBlock is well under 1 MiB after SSZ
-    // encoding; 1 MiB is a comfortable upper bound per research/05.
-    const MAX_DECODE_BYTES: usize = 1 << 20; // 1 MiB
-
-    // SS-1 (Issue 2.2): only the v2 typed-RPC service is registered.
-    // The v1 raw-root service has been removed from the live listener.
-    let router = builder.add_service(
-        SignerServiceServerV2::new(svc_v2).max_decoding_message_size(MAX_DECODE_BYTES),
-    );
-
-    #[cfg(feature = "dvt")]
-    let router = if let Some(peer_svc) = peer_signer_service {
-        info!("PeerSignerService v2 registered for DVT");
-        router.add_service(
-            PeerSignerServiceServerV2::new(peer_svc).max_decoding_message_size(MAX_DECODE_BYTES),
-        )
-    } else {
-        router
-    };
-
-    router
-        .serve_with_shutdown(addr, async move { shutdown.cancelled().await })
+    built_grpc
+        .router
+        .serve_with_shutdown(built_grpc.listen_addr, async move { shutdown.cancelled().await })
         .await
         .map_err(|e| ServerError::bind(e.to_string()))?;
 
