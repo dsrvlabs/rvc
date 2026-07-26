@@ -534,12 +534,12 @@ RF5-08 stop reaching into `run_validator`'s locals.
 4. Unit-test the phase against a mock liveness source rather than the full binary.
 
 **Acceptance criteria:**
-- [ ] Doppelganger opt-out still yields an explicit always-enabled enablement, and the default with the
+- [x] Doppelganger opt-out still yields an explicit always-enabled enablement, and the default with the
       feature on is still fail-closed for unregistered keys.
-- [ ] Epoch-0 bypass and restart safe-skip behavior are unchanged (tests assert both).
-- [ ] The liveness loop is spawned with the same cancellation wiring and terminates on shutdown.
-- [ ] `BootstrapCtx` gains at most 3 named fields from this phase.
-- [ ] RF5-01 smoke tests green.
+- [x] Epoch-0 bypass and restart safe-skip behavior are unchanged (tests assert both).
+- [x] The liveness loop is spawned with the same cancellation wiring and terminates on shutdown.
+- [x] `BootstrapCtx` gains at most 3 named fields from this phase.
+- [x] RF5-01 smoke tests green.
 
 **TDD test plan** (RED first):
 - `test_wire_signing_enablement_returns_fail_closed_machine_by_default` — **RED**: no phase function.

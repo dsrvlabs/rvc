@@ -1187,14 +1187,6 @@ async fn run_validator(
                 return Err(e.into());
             }
         };
-    let rvc::bootstrap::BeaconHandles {
-        beacon_client,
-        bn_manager,
-        genesis_validators_root,
-        genesis_validators_root_hex: _,
-        genesis_time,
-    } = beacon_handles;
-
     // Keystore-dir + secret providers + CompositeSigner + optional gRPC remote.
     // Health updates stay in the binary (see `rvc::bootstrap` health-status policy).
     let loaded_keys = match rvc::bootstrap::load_signing_keys(&config, &deletion_denylist).await {
@@ -1209,147 +1201,48 @@ async fn run_validator(
             return Err(e.into());
         }
     };
+
+    // Step 6: SEC-2b/2c enablement + liveness loop + secret-provider refresh.
+    // Health updates stay in the binary (see `rvc::bootstrap` health-status policy).
+    let enablement = match rvc::bootstrap::wire_signing_enablement(
+        &config,
+        &loaded_keys,
+        &beacon_handles,
+        std::sync::Arc::clone(&slashing_db),
+        std::sync::Arc::clone(&deletion_denylist),
+        &shutdown_token,
+    )
+    .await
+    {
+        Ok(handles) => handles,
+        Err(e) => return Err(e.into()),
+    };
+
+    let rvc::bootstrap::BeaconHandles {
+        beacon_client,
+        bn_manager,
+        genesis_validators_root,
+        genesis_validators_root_hex: _,
+        genesis_time: _,
+    } = beacon_handles;
+
     let rvc::bootstrap::LoadedKeys {
         composite_signer,
         validator_count: _,
-        local_pubkeys: known_pubkeys,
+        local_pubkeys: _,
         pubkey_map,
-        secret_providers,
+        secret_providers: _,
         grpc_signer: _grpc_remote_signer,
     } = loaded_keys;
 
-    // Resolve validator indices using BnManager (via trait)
-    let beacon_for_resolve: &dyn BeaconNodeClient = bn_manager.as_ref();
-    let validator_index_map = resolve_validator_indices(beacon_for_resolve, &pubkey_map).await;
-
-    // Step 6: SEC-2b/2c ForwardWindowMachine + liveness observation loop
-    //
-    // SEC-2b: construct ForwardWindowMachine (or operator opt-out) and wire it as
-    // the production SignerService SigningEnablement.
-    // SEC-2c: a background per-slot loop ticks the machine and feeds
-    // observe_liveness from POST /eth/v1/validator/liveness via bn-manager
-    // (multi-BN query_first failover). Detected liveness permanently closes the
-    // gate for that key; a clean fully-observed window opens it.
-    //
-    // The backward one-shot DoppelgangerService is no longer the production
-    // mechanism (subsumed by the forward-window loop).
-    // Cost when on: ~2 epochs ≈ 12.8 min of withheld signing on mainnet.
-    //
-    // Shared monotonic epoch clock (M-7) for boot register + keymanager import
-    // so NTP cannot compress the window and wall-clock alone cannot force epoch 0.
-    let genesis_time_for_epoch = genesis_time;
-    let epoch_clock =
-        std::sync::Arc::new(doppelganger::MonotonicEpochClock::new(genesis_time_for_epoch));
-    let enablement_epoch = epoch_clock.current_epoch();
-
-    // Resolve index map for the liveness loop (fail closed if required and missing).
-    let resolved_index_map: std::collections::HashMap<String, String> = if doppelganger_enabled
-        && !pubkey_map.read().is_empty()
-    {
-        match validator_index_map {
-            Ok(ref map) if !map.is_empty() => map.clone(),
-            Ok(_) => {
-                warn!(
-                    total = pubkey_map.read().len(),
-                    "No validator indices resolved; validators may be pending activation. \
-                         Forward-window liveness loop will not start (gate stays fail-safe closed \
-                         for Pending keys)"
-                );
-                std::collections::HashMap::new()
-            }
-            Err(ref e) => {
-                error!("Failed to resolve validator indices: {}", e);
-                return Err(anyhow::anyhow!(
-                        "validator index resolution failed; doppelganger detection requires indices: {}", e
-                    ));
-            }
-        }
-    } else {
-        std::collections::HashMap::new()
-    };
-
-    if enablement_epoch == 0 && doppelganger_enabled {
-        info!(
-            "Doppelganger detection: pre-genesis (epoch 0) startup — \
-             validators will be marked Safe without a monitoring window (boot register)"
-        );
-    } else if !doppelganger_enabled {
-        warn!("Doppelganger detection is disabled");
-    }
-
-    // SEC-2b: construct enablement (ForwardWindowMachine or operator opt-out)
-    // and hand it to the production SignerService.
-    //
-    // Restart-aware safe-skip (boot register only): if local slashing history
-    // shows a recent attestation under this GVR, the key is marked Safe without
-    // network observation. Do NOT copy a live slashing DB to a second VC — that
-    // would open a dual-instance fail-open. API import uses register_for_import
-    // (always Pending).
-    let (signing_enablement, forward_window_machine) = builder.build_signing_enablement(
-        slashing_db.clone(),
-        genesis_validators_root,
-        enablement_epoch,
-        &pubkey_map,
-    );
-
-    // SEC-2c: spawn the per-slot liveness observation loop (sole production mechanism).
-    // bn_manager is Arc; clone for the loop and keep the original for later duties.
-    // Pass pubkey_map so the loop re-resolves indices after keymanager import /
-    // delayed activation (review Finding 3).
-    if doppelganger_enabled {
-        let _liveness_loop_handle = rvc::liveness_loop::spawn_liveness_loop(
-            forward_window_machine.clone(),
-            std::sync::Arc::clone(&bn_manager) as std::sync::Arc<dyn BeaconNodeClient>,
-            &resolved_index_map,
-            Some(std::sync::Arc::clone(&pubkey_map)),
-            std::sync::Arc::clone(&epoch_clock),
-            shutdown_token.clone(),
-        );
-    }
-
-    // Secret-provider refresh: after machine is available, register newly
-    // discovered local keys (import-strict) so they are not permanently Unmonitored.
-    let refresh_interval = config.secret_provider.refresh_interval.unwrap_or(0);
-    if refresh_interval > 0 && !secret_providers.is_empty() {
-        let denylist_for_refresh = std::sync::Arc::clone(&deletion_denylist);
-        let is_denied: secret_provider::DenylistCheck =
-            std::sync::Arc::new(move |pk: &[u8; 48]| denylist_for_refresh.contains(pk));
-        let refresh_service = secret_provider::RefreshService::with_denylist(
-            secret_providers,
-            known_pubkeys,
-            Some(is_denied),
-            std::time::Duration::from_secs(refresh_interval),
-            shutdown_token.clone(),
-        );
-        let signer_for_refresh = std::sync::Arc::clone(&composite_signer);
-        let denylist_for_callback = std::sync::Arc::clone(&deletion_denylist);
-        let machine_for_refresh = forward_window_machine.clone();
-        let epoch_clock_for_refresh = std::sync::Arc::clone(&epoch_clock);
-        tokio::spawn(async move {
-            refresh_service
-                .run(move |sk| {
-                    let pk_bytes = sk.public_key().to_bytes();
-                    if denylist_for_callback.contains(&pk_bytes) {
-                        tracing::info!(
-                            pubkey = %observability::logging::TruncatedPubkey::new(&format!(
-                                "0x{}",
-                                hex::encode(pk_bytes)
-                            )),
-                            "Skipping denylisted key at refresh callback (DELETE raced refresh)"
-                        );
-                        return;
-                    }
-                    let pk = sk.public_key();
-                    if let Some(ref machine) = machine_for_refresh {
-                        // Import-strict: no restart Safe-skip for dynamically added keys.
-                        machine.register_for_import(&pk, epoch_clock_for_refresh.current_epoch());
-                    }
-                    signer_for_refresh.add_local_key(sk);
-                })
-                .await;
-        });
-        info!(interval_secs = refresh_interval, "Secret provider refresh task started");
-    }
+    let rvc::bootstrap::EnablementHandles {
+        signing_enablement,
+        forward_window_machine,
+        epoch_clock,
+        pubkey_map: _,
+        liveness_task: _liveness_loop_handle,
+        validator_index_map,
+    } = enablement;
 
     // Step 7: Build remaining services
     let signer =
@@ -1370,10 +1263,7 @@ async fn run_validator(
     // Main-pool trait object for duties and (when no dedicated proposer pool)
     // block production.
     let beacon: std::sync::Arc<dyn BeaconNodeClient> = bn_manager;
-    let validator_indices: Vec<String> = match validator_index_map {
-        Ok(ref map) => map.values().cloned().collect(),
-        Err(_) => Vec::new(),
-    };
+    let validator_indices: Vec<String> = validator_index_map.values().cloned().collect();
     let duty_tracker = builder.build_duty_tracker(beacon.clone(), validator_indices);
 
     let slot_clock = match builder.build_slot_clock() {
@@ -1844,33 +1734,6 @@ async fn run_validator(
 
     info!(uptime_secs = startup_time.elapsed().as_secs(), "Validator client shut down complete");
     Ok(())
-}
-
-async fn resolve_validator_indices(
-    beacon_client: &dyn BeaconNodeClient,
-    pubkey_map: &rvc::orchestrator::PubkeyMap,
-) -> Result<std::collections::HashMap<String, String>, anyhow::Error> {
-    let pubkeys: Vec<String> = {
-        let map = pubkey_map.read();
-        if map.is_empty() {
-            return Ok(std::collections::HashMap::new());
-        }
-        map.keys().cloned().collect()
-    };
-    let response = beacon_client.get_validators(&pubkeys).await?;
-
-    let index_map: std::collections::HashMap<String, String> =
-        response.data.iter().map(|v| (v.validator.pubkey.clone(), v.index.clone())).collect();
-
-    if index_map.len() < pubkeys.len() {
-        warn!(
-            resolved = index_map.len(),
-            total = pubkeys.len(),
-            "Some validator public keys could not be resolved to indices"
-        );
-    }
-    info!(count = index_map.len(), "Resolved validator indices");
-    Ok(index_map)
 }
 
 /// Spawn the opt-in `SIGHUP` log-reload handler (issue 5.4 / P2-2).

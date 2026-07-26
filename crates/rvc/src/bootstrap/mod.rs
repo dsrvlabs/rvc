@@ -13,10 +13,12 @@
 //! while unit tests can exercise phases without a metrics server.
 
 mod beacon;
+mod enablement;
 mod keys;
 mod slashing;
 
 pub use beacon::{connect_beacon, BeaconHandles};
+pub use enablement::{wire_signing_enablement, EnablementHandles};
 pub use keys::{load_signing_keys, LoadedKeys};
 pub use slashing::{open_slashing_db, KeystoreLockGuard, SlashingDbHandles};
 
@@ -79,6 +81,10 @@ pub enum BootstrapError {
 
     #[error(transparent)]
     Slashing(#[from] ::slashing::SlashingError),
+
+    /// Validator index resolution failed while doppelganger detection is on.
+    #[error("validator index resolution failed; doppelganger detection requires indices: {0}")]
+    IndexResolution(String),
 }
 
 impl BootstrapError {
