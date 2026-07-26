@@ -455,14 +455,14 @@ enum TimeoutPolicy {
    the service already has (`lib.rs:300-303`).
 
 **Acceptance criteria:**
-- [ ] Every existing `SigningGate` test passes **without modification** — this is the characterization
+- [x] Every existing `SigningGate` test passes **without modification** — this is the characterization
       oracle for the extraction.
-- [ ] The gate's timeout path still discards the staged row, and a test asserts no phantom row remains.
-- [ ] The gate now records the same metric families the service records (feature-parity table in the PR
+- [x] The gate's timeout path still discards the staged row, and a test asserts no phantom row remains.
+- [x] The gate now records the same metric families the service records (feature-parity table in the PR
       description, per the plan's acceptance criteria).
-- [ ] The gate re-checks enablement under the per-validator lock.
-- [ ] `TimeoutPolicy` is an explicit parameter with no default — a new call site cannot get it by accident.
-- [ ] Standing invariant green.
+- [x] The gate re-checks enablement under the per-validator lock.
+- [x] `TimeoutPolicy` is an explicit parameter with no default — a new call site cannot get it by accident.
+- [x] Standing invariant green.
 
 **TDD test plan** (`crates/signer/src/core.rs` + existing `gate.rs` tests as characterization):
 - **RED first:** `test_core_retain_policy_keeps_staged_row_on_timeout` — the new behavior the core must

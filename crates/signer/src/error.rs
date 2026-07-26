@@ -60,16 +60,36 @@ pub enum SigningGateError {
         source: SlashingError,
     },
 
-    /// The BLS signing backend returned an error that is not `KeyNotFound`.
+    /// The BLS signing backend failed, timed out, or the blocking task panicked.
     ///
-    /// The staged slashing-DB row was discarded; no phantom row was committed.
-    /// Same-root retry is safe once the backend recovers.
+    /// # Staged-row fate (do not assume discard)
+    ///
+    /// Whether a staged slashing-DB row was discarded depends on **how** this
+    /// variant was produced by [`crate::sign_slashable`]:
+    ///
+    /// | Cause | Typical row fate |
+    /// |---|---|
+    /// | Backend error path (today) | Discarded (ROLLBACK) |
+    /// | Sign **timeout** + [`crate::TimeoutPolicy::DiscardStagedRow`] | Discarded |
+    /// | Sign **timeout** + [`crate::TimeoutPolicy::RetainStagedRow`] | **Committed** (fail-closed history; slot/epoch consumed) |
+    /// | Panic of the blocking task after stage | Unspecified — treat history as possibly written |
+    ///
+    /// Callers **must not** treat `SigningFailed` as “slot free / different-root
+    /// retry safe.” After a retain-on-timeout path, a conflicting different-root
+    /// retry is blocked by stage (EIP-3076); only same-root re-sign may apply.
+    /// [`SigningGateError::permits_retry_with_root`] does **not** special-case
+    /// this variant (it only authorizes `CommitFailed` same-root retry).
+    ///
+    /// See [`crate::TimeoutPolicy`]: policy currently applies to the **timeout**
+    /// arm only; non-timeout `SigningError` arms still discard today (RF4-06 must
+    /// decide retain for ambiguous remote errors).
     #[error("signing backend failed: {0}")]
     SigningFailed(String),
 
     /// The signing backend has no key for the requested pubkey.
     ///
-    /// The staged slashing-DB row was discarded; no phantom row was committed.
+    /// On the slashable core path the staged row is discarded (no signature was
+    /// produced for this key). Not used for retain-on-timeout.
     #[error("key not found in signing backend")]
     KeyNotFound,
 
