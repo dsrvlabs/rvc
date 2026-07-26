@@ -373,25 +373,36 @@ impl SlashingDb {
     // ── GVR per-call re-check helpers (M-6 / ISSUE-3.5) ─────────────────────
 
     /// Encode a `Root` ([u8; 32]) as a lowercase `0x`-prefixed hex string for DB storage.
+    ///
+    /// Uses [`eth_types::canonical::gvr_hex::GvrHex`] so metadata and row writes
+    /// share one normalised representation (RF3-17).
     pub(crate) fn root_to_hex(root: &Root) -> String {
-        format!("0x{}", hex::encode(root))
+        eth_types::canonical::gvr_hex::GvrHex::from_root(*root).as_normalised_hex().to_string()
     }
 
     /// Parse a hex string (with or without `0x` prefix) into a `Root`.
     ///
+    /// Delegates length/prefix/hex validation to
+    /// [`eth_types::canonical::gvr_hex::parse_gvr_hex`], then rejects the all-zeros
+    /// builder-registration sentinel (slashing-specific policy, not in eth-types).
+    ///
     /// Returns `SlashingError::InvalidInterchangeFormat` if the string is not
-    /// valid hex or not exactly 32 bytes.
+    /// valid hex, not exactly 32 bytes, or all zeros.
     fn parse_gvr_hex(s: &str) -> Result<Root, SlashingError> {
-        let stripped = s.strip_prefix("0x").unwrap_or(s);
-        let bytes = hex::decode(stripped).map_err(|e| {
-            SlashingError::InvalidInterchangeFormat(format!(
-                "genesis_validators_root is not valid hex: {e}"
-            ))
-        })?;
-        let root: Root = bytes.try_into().map_err(|_| {
-            SlashingError::InvalidInterchangeFormat(
-                "genesis_validators_root must be exactly 32 bytes".to_string(),
-            )
+        use eth_types::canonical::{gvr_hex, ParseError};
+        let root = gvr_hex::parse_gvr_hex(s).map_err(|e| {
+            let msg = match e {
+                ParseError::DoublePrefix => {
+                    "genesis_validators_root has double 0x prefix".to_string()
+                }
+                ParseError::InvalidHex(detail) => {
+                    format!("genesis_validators_root is not valid hex: {detail}")
+                }
+                ParseError::InvalidLength { expected, got } => {
+                    format!("genesis_validators_root must be exactly {expected} bytes, got {got}")
+                }
+            };
+            SlashingError::InvalidInterchangeFormat(msg)
         })?;
         // All-zeros is the builder-registration sentinel and never a real chain
         // identifier. Reject it to catch operator misconfiguration.
@@ -1333,11 +1344,20 @@ impl SlashingDb {
 
     /// Store the genesis validators root in the metadata table.
     ///
-    /// On first run, the root is stored. On subsequent runs, the stored root
-    /// is compared against the provided root. If they differ, an error is returned.
+    /// Comparison is **byte-based** (RF3-17): bare hex, `0x`-prefixed, and mixed-case
+    /// hex that decode to the same 32 bytes are treated as the same chain. On first
+    /// insert the value is written in canonical form (`0x` + lowercase hex). On a
+    /// match against a non-canonical stored form, the row is rewritten to canonical
+    /// in the same transaction (one-time upgrade compatibility).
+    ///
+    /// All-zeros is rejected (builder-registration sentinel, not a real chain id).
     pub fn set_genesis_validators_root(&self, root: &str) -> Result<(), SlashingError> {
-        let conn = self.conn.lock();
-        let existing: Option<String> = conn
+        let incoming = Self::parse_gvr_hex(root)?;
+        let canonical_hex = Self::root_to_hex(&incoming);
+
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<String> = tx
             .query_row(
                 "SELECT value FROM metadata WHERE key = 'genesis_validators_root'",
                 [],
@@ -1345,16 +1365,30 @@ impl SlashingDb {
             )
             .optional()?;
         match existing {
-            Some(stored) if stored != root => Err(SlashingError::GenesisValidatorsRootMismatch {
-                expected: stored,
-                actual: root.to_string(),
-            }),
-            Some(_) => Ok(()),
+            Some(stored) => {
+                let stored_root = Self::parse_gvr_hex(&stored)?;
+                if stored_root != incoming {
+                    return Err(SlashingError::GenesisValidatorsRootMismatch {
+                        expected: stored,
+                        actual: root.to_string(),
+                    });
+                }
+                // Same chain: normalise legacy bare/mixed-case metadata to canonical.
+                if stored != canonical_hex {
+                    tx.execute(
+                        "UPDATE metadata SET value = ?1 WHERE key = 'genesis_validators_root'",
+                        [&canonical_hex],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            }
             None => {
-                conn.execute(
+                tx.execute(
                     "INSERT INTO metadata (key, value) VALUES ('genesis_validators_root', ?1)",
-                    [root],
+                    [&canonical_hex],
                 )?;
+                tx.commit()?;
                 Ok(())
             }
         }
@@ -3503,19 +3537,143 @@ mod tests {
     fn test_integrity_genesis_validators_root_mismatch() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
         let root1 = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
-        let root2 = "0xdifferent00000000000000000000000000000000000000000000000000000000";
+        // Must be valid 32-byte hex that differs by value (parse-before-compare).
+        let root2 = "0xd1ffe00000000000000000000000000000000000000000000000000000000000";
 
         db.set_genesis_validators_root(root1).expect("first set should succeed");
         let result = db.set_genesis_validators_root(root2);
         assert!(result.is_err());
 
         match result.unwrap_err() {
+            // Stored form is canonical (0x + lowercase); root1 already is.
             SlashingError::GenesisValidatorsRootMismatch { expected, actual } => {
                 assert_eq!(expected, root1);
                 assert_eq!(actual, root2);
             }
             other => panic!("expected GenesisValidatorsRootMismatch, got: {other:?}"),
         }
+    }
+
+    // ── RF3-17: byte-based GVR metadata comparison + upgrade compatibility ──
+
+    /// Upgrade hazard: existing nodes store bare lowercase hex (startup pre-RF3-17).
+    /// A release that starts passing `0x`-prefixed form must not fail to start.
+    #[test]
+    fn test_existing_bare_hex_metadata_matches_canonical_prefixed_root() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("bare_gvr.db");
+        let bare = "04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let prefixed = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        // Simulate pre-RF3-17 startup write: bare lowercase hex in metadata.
+        {
+            let db = SlashingDb::open(&path).expect("open");
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO metadata (key, value) VALUES ('genesis_validators_root', ?1)",
+                [bare],
+            )
+            .expect("insert bare-hex metadata");
+        }
+
+        let db = SlashingDb::open(&path).expect("reopen");
+        db.set_genesis_validators_root(prefixed)
+            .expect("bare stored + 0x input must match by bytes");
+    }
+
+    /// On a successful match against non-canonical metadata, rewrite to canonical.
+    #[test]
+    fn test_metadata_normalised_to_canonical_on_first_match() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("normalize_gvr.db");
+        let bare = "04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let prefixed = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        {
+            let db = SlashingDb::open(&path).expect("open");
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO metadata (key, value) VALUES ('genesis_validators_root', ?1)",
+                [bare],
+            )
+            .expect("insert bare-hex metadata");
+        }
+
+        let db = SlashingDb::open(&path).expect("reopen");
+        db.set_genesis_validators_root(prefixed).expect("match");
+
+        let stored = db.genesis_validators_root().expect("read");
+        assert_eq!(stored.as_deref(), Some(prefixed));
+    }
+
+    /// First-run insert always writes canonical form regardless of input encoding.
+    #[test]
+    fn test_first_insert_writes_canonical_form() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let bare = "04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let canonical = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        db.set_genesis_validators_root(bare).expect("set bare");
+        assert_eq!(db.genesis_validators_root().expect("read").as_deref(), Some(canonical));
+    }
+
+    #[test]
+    fn test_different_chain_still_rejected() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let chain_a = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        // Valid 32-byte hex that differs by bytes from chain_a.
+        let chain_b = "0xd1ffe00000000000000000000000000000000000000000000000000000000000";
+        let chain_b_bare = "d1ffe00000000000000000000000000000000000000000000000000000000000";
+
+        db.set_genesis_validators_root(chain_a).expect("pin chain A");
+        let err = db.set_genesis_validators_root(chain_b).expect_err("different chain");
+        match err {
+            SlashingError::GenesisValidatorsRootMismatch { expected, actual } => {
+                assert_eq!(expected, chain_a);
+                assert_eq!(actual, chain_b);
+            }
+            other => panic!("expected GenesisValidatorsRootMismatch, got: {other:?}"),
+        }
+        // Bare form of a different root must also mismatch (not a false positive from
+        // encoding-only differences).
+        let err = db.set_genesis_validators_root(chain_b_bare).expect_err("bare different chain");
+        assert!(matches!(err, SlashingError::GenesisValidatorsRootMismatch { .. }));
+    }
+
+    #[test]
+    fn test_all_zero_gvr_still_rejected() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let zeros = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        let err = db.set_genesis_validators_root(zeros).expect_err("all zeros");
+        match err {
+            SlashingError::InvalidInterchangeFormat(msg) => {
+                assert!(msg.contains("all zeros"), "msg={msg}");
+            }
+            other => panic!("expected InvalidInterchangeFormat, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_mixed_case_stored_value_matches() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("mixed_gvr.db");
+        let mixed = "0x04700007FaBc8282644AeD6d1c7c9E21d38a03a0c4Ba193f3AfE428824B3a673";
+        let canonical = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+        {
+            let db = SlashingDb::open(&path).expect("open");
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO metadata (key, value) VALUES ('genesis_validators_root', ?1)",
+                [mixed],
+            )
+            .expect("insert mixed-case metadata");
+        }
+
+        let db = SlashingDb::open(&path).expect("reopen");
+        db.set_genesis_validators_root(canonical)
+            .expect("mixed-case stored must match lowercase input");
+        assert_eq!(db.genesis_validators_root().expect("read").as_deref(), Some(canonical));
     }
 
     #[test]

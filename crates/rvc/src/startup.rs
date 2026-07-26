@@ -112,7 +112,8 @@ pub async fn validate_genesis_root(
         });
     }
 
-    // Store normalized value (lowercase, no 0x prefix) for consistent comparisons
+    // SlashingDb compares GVR by bytes and stores the canonical form
+    // (`0x` + lowercase hex). Bare or mixed-case legacy metadata remains compatible.
     slashing_db.set_genesis_validators_root(&local_normalized)?;
 
     info!("Genesis validators root validated successfully");
@@ -656,10 +657,10 @@ mod tests {
 
         let stored = db.genesis_validators_root().unwrap();
         assert!(stored.is_some());
-        // Stored value should be normalized: lowercase without 0x prefix
+        // RF3-17: stored value is canonical lowercase `0x`-prefixed hex
         assert_eq!(
             stored.unwrap(),
-            "4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+            "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
         );
     }
 
