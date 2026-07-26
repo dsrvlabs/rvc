@@ -116,7 +116,7 @@ pub(crate) fn open_slashing_db(
 #[allow(unsafe_code)]
 mod tests {
     use super::*;
-    use crate::config::{HttpTlsMode, ResolvedConfig};
+    use crate::config::{Backend, HttpTlsMode, ResolvedConfig};
     use crate::server::env_lock;
     use tempfile::TempDir;
 
@@ -130,7 +130,7 @@ mod tests {
             listen_address: "127.0.0.1:0".to_string(),
             keystore_dir,
             password_file: None,
-            backend: "basic".to_string(),
+            backend: Backend::Basic,
             dry_run: false,
             tls_cert: None,
             tls_key: None,

@@ -1420,10 +1420,10 @@ comparisons in between. A typo in a comparison is a runtime bug the compiler cou
 3. Keep `Display` for logging and metric labels only.
 
 **Acceptance criteria:**
-- [ ] `rg 'parse_backend|== "dvt"|== "basic"' bin/rvc-signer/` returns nothing.
-- [ ] `ResolvedConfig.backend` is `Backend`; matches on it are exhaustive.
-- [ ] Metric/audit labels still emit the same strings.
-- [ ] An invalid backend in TOML fails at deserialization with a clear message.
+- [x] `rg 'parse_backend|== "dvt"|== "basic"' bin/rvc-signer/` returns nothing.
+- [x] `ResolvedConfig.backend` is `Backend`; matches on it are exhaustive.
+- [x] Metric/audit labels still emit the same strings.
+- [x] An invalid backend in TOML fails at deserialization with a clear message.
 
 **TDD test plan** (RED first):
 - `test_backend_deserializes_from_toml_as_enum` — **RED**: the field is a `String` today.

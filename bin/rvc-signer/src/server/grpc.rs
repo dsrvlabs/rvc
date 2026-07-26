@@ -64,17 +64,20 @@ pub(crate) fn build_v2_signer_service(deps: &GrpcRouterDeps<'_>) -> SignerServic
     if let Some(ref shared_gate) = deps.shared_gate {
         SignerServiceImpl::new_v2_with_gate(
             Arc::clone(&deps.signing_backend),
-            deps.resolved.backend.clone(),
+            deps.resolved.backend.to_string(),
             Arc::clone(shared_gate),
         )
         .with_metrics(Arc::clone(&deps.signer_metrics))
         .with_client_cn_allow_list(deps.client_cn_allow_list.clone())
         .with_genesis_fork_version(deps.resolved.genesis_fork_version)
     } else {
-        SignerServiceImpl::new(Arc::clone(&deps.signing_backend), deps.resolved.backend.clone())
-            .with_metrics(Arc::clone(&deps.signer_metrics))
-            .with_client_cn_allow_list(deps.client_cn_allow_list.clone())
-            .with_genesis_fork_version(deps.resolved.genesis_fork_version)
+        SignerServiceImpl::new(
+            Arc::clone(&deps.signing_backend),
+            deps.resolved.backend.to_string(),
+        )
+        .with_metrics(Arc::clone(&deps.signer_metrics))
+        .with_client_cn_allow_list(deps.client_cn_allow_list.clone())
+        .with_genesis_fork_version(deps.resolved.genesis_fork_version)
     }
 }
 
@@ -189,7 +192,7 @@ pub(crate) fn build_grpc_router(deps: GrpcRouterDeps<'_>) -> Result<BuiltGrpcRou
 #[allow(unsafe_code, clippy::await_holding_lock)]
 mod tests {
     use super::*;
-    use crate::config::{HttpTlsMode, ResolvedConfig};
+    use crate::config::{Backend, HttpTlsMode, ResolvedConfig};
     use crate::server::env_lock;
     use crate::service::SignerServiceImpl;
     use std::sync::Arc;
@@ -217,7 +220,7 @@ mod tests {
             listen_address: listen.to_string(),
             keystore_dir: std::path::PathBuf::from("/tmp/unused"),
             password_file: None,
-            backend: "basic".to_string(),
+            backend: Backend::Basic,
             dry_run: false,
             tls_cert: None,
             tls_key: None,

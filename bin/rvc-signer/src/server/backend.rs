@@ -9,7 +9,7 @@ use std::sync::Arc;
 use zeroize::Zeroizing;
 
 use crate::backend;
-use crate::config::ResolvedConfig;
+use crate::config::{Backend, ResolvedConfig};
 use crate::error::ServerError;
 use crate::metrics::SignerMetrics;
 
@@ -19,14 +19,6 @@ use crate::dvt;
 /// Aggregate public key → share-info map used by `PeerSignerService`.
 #[cfg(feature = "dvt")]
 pub(crate) type ShareMap = Arc<std::collections::HashMap<[u8; 48], dvt::types::ShareInfo>>;
-
-/// Signing backend type (mirrors the CLI enum; string-parsed from `ResolvedConfig`).
-#[cfg(feature = "dvt")]
-#[derive(Clone, Debug)]
-enum BackendKind {
-    Basic,
-    Dvt,
-}
 
 /// Result of [`build_backend`].
 ///
@@ -83,59 +75,47 @@ pub(crate) async fn build_backend(
     // PeerSignerService (constructed by the caller).  This avoids a TOCTOU
     // double-read and ensures both paths see the same allow-list snapshot
     // (ISSUE-4.1 / L-1).
-    #[cfg(feature = "dvt")]
-    {
-        match parse_backend(&resolved.backend)? {
-            BackendKind::Basic => {
-                let signer = Arc::new(
-                    backend::basic::BasicSigner::load(&resolved.keystore_dir, password)
-                        .map_err(|e| ServerError::backend(e.to_string()))?,
-                );
-                Ok(BuiltBackend {
-                    signing_backend: Arc::clone(&signer) as Arc<dyn crate::backend::SigningBackend>,
-                    basic_signer: Some(signer),
-                    dvt_share_map: None,
-                    dvt_allow_list: None,
-                })
-            }
-            BackendKind::Dvt => {
-                let allow_list: Option<Arc<dvt::allow_list::AllowedPeers>> =
-                    if let Some(path) = resolved.dvt_allowed_peers.as_deref() {
-                        Some(load_dvt_allow_list(path)?)
-                    } else {
-                        None
-                    };
-
-                let (backend, share_map) = build_dvt_backend(
-                    resolved,
-                    password,
-                    tls_config,
-                    Arc::new(metrics.dvt.clone()),
-                    allow_list.clone(),
-                )
-                .await?;
-
-                Ok(BuiltBackend {
-                    signing_backend: backend,
-                    basic_signer: None,
-                    dvt_share_map: Some(share_map),
-                    dvt_allow_list: allow_list,
-                })
-            }
+    match resolved.backend {
+        Backend::Basic => {
+            let _ = (metrics, tls_config);
+            let signer = Arc::new(
+                backend::basic::BasicSigner::load(&resolved.keystore_dir, password)
+                    .map_err(|e| ServerError::backend(e.to_string()))?,
+            );
+            Ok(BuiltBackend {
+                signing_backend: Arc::clone(&signer) as Arc<dyn crate::backend::SigningBackend>,
+                basic_signer: Some(signer),
+                #[cfg(feature = "dvt")]
+                dvt_share_map: None,
+                #[cfg(feature = "dvt")]
+                dvt_allow_list: None,
+            })
         }
-    }
+        #[cfg(feature = "dvt")]
+        Backend::Dvt => {
+            let allow_list: Option<Arc<dvt::allow_list::AllowedPeers>> =
+                if let Some(path) = resolved.dvt_allowed_peers.as_deref() {
+                    Some(load_dvt_allow_list(path)?)
+                } else {
+                    None
+                };
 
-    #[cfg(not(feature = "dvt"))]
-    {
-        let _ = (metrics, tls_config);
-        let signer = Arc::new(
-            backend::basic::BasicSigner::load(&resolved.keystore_dir, password)
-                .map_err(|e| ServerError::backend(e.to_string()))?,
-        );
-        Ok(BuiltBackend {
-            signing_backend: Arc::clone(&signer) as Arc<dyn crate::backend::SigningBackend>,
-            basic_signer: Some(signer),
-        })
+            let (backend, share_map) = build_dvt_backend(
+                resolved,
+                password,
+                tls_config,
+                Arc::new(metrics.dvt.clone()),
+                allow_list.clone(),
+            )
+            .await?;
+
+            Ok(BuiltBackend {
+                signing_backend: backend,
+                basic_signer: None,
+                dvt_share_map: Some(share_map),
+                dvt_allow_list: allow_list,
+            })
+        }
     }
 }
 
@@ -223,22 +203,10 @@ pub(crate) async fn build_dvt_backend(
     Ok((Arc::new(dvt_signer), share_map))
 }
 
-/// Parse the backend string into a `BackendKind` enum.
-#[cfg(feature = "dvt")]
-fn parse_backend(backend: &str) -> Result<BackendKind, ServerError> {
-    match backend {
-        "basic" => Ok(BackendKind::Basic),
-        "dvt" => Ok(BackendKind::Dvt),
-        other => {
-            Err(ServerError::config(format!("unknown backend: {other}; expected 'basic' or 'dvt'")))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HttpTlsMode, ResolvedConfig};
+    use crate::config::{Backend, HttpTlsMode, ResolvedConfig};
     use crate::metrics::SignerMetrics;
     use tempfile::TempDir;
 
@@ -276,7 +244,7 @@ mod tests {
             listen_address: "127.0.0.1:0".to_string(),
             keystore_dir,
             password_file: Some(password_file),
-            backend: "basic".to_string(),
+            backend: Backend::Basic,
             dry_run: false,
             tls_cert: None,
             tls_key: None,
@@ -377,7 +345,7 @@ share_index = 1
         )
         .unwrap();
 
-        resolved.backend = "dvt".to_string();
+        resolved.backend = Backend::Dvt;
         resolved.dvt_index = Some(1);
         resolved.dvt_allowed_peers = Some(allow_path);
         // No dvt_peers → standalone mode (no network).
@@ -425,7 +393,7 @@ share_index = 1
         )
         .unwrap();
 
-        resolved.backend = "dvt".to_string();
+        resolved.backend = Backend::Dvt;
         resolved.dvt_index = Some(1);
         resolved.dvt_allowed_peers = Some(allow_path);
 

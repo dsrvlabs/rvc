@@ -41,7 +41,12 @@ pub const DEFAULT_LOG_FORMAT: &str = "pretty";
 // ── Signing backend ──────────────────────────────────────────────────────────
 
 /// Signing backend type.
-#[derive(Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+///
+/// Kept as an enum end-to-end (CLI → TOML → [`ResolvedConfig`] → `server::build_backend`)
+/// so selection is exhaustively matched at compile time. `Display` / [`Self::as_str`]
+/// exist only for metric labels, audit logs, and operator-facing text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Backend {
     /// Local keystore-based signing
     #[default]
@@ -51,13 +56,20 @@ pub enum Backend {
     Dvt,
 }
 
+impl Backend {
+    /// Stable wire/label string for metrics and audit logs (`"basic"` / `"dvt"`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Basic => "basic",
+            #[cfg(feature = "dvt")]
+            Self::Dvt => "dvt",
+        }
+    }
+}
+
 impl std::fmt::Display for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Basic => write!(f, "basic"),
-            #[cfg(feature = "dvt")]
-            Self::Dvt => write!(f, "dvt"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -103,7 +115,7 @@ pub struct SignerSection {
     pub listen_address: Option<String>,
     pub keystore_dir: Option<PathBuf>,
     pub password_file: Option<PathBuf>,
-    pub backend: Option<String>,
+    pub backend: Option<Backend>,
     pub dry_run: Option<bool>,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
@@ -158,7 +170,7 @@ pub struct ResolvedConfig {
     pub listen_address: String,
     pub keystore_dir: PathBuf,
     pub password_file: Option<PathBuf>,
-    pub backend: String,
+    pub backend: Backend,
     pub dry_run: bool,
     pub tls_cert: Option<PathBuf>,
     pub tls_key: Option<PathBuf>,
@@ -430,12 +442,7 @@ pub fn merge_with_cli(
 
     let password_file = cli.password_file.clone().or(section.password_file);
 
-    let backend = cli
-        .backend
-        .as_ref()
-        .map(|b| b.to_string())
-        .or(section.backend)
-        .unwrap_or_else(|| Backend::Basic.to_string());
+    let backend = cli.backend.or(section.backend).unwrap_or(Backend::Basic);
 
     // Opt-in flags: CLI SetTrue OR TOML true (cannot cleanly pass explicit false).
     let dry_run = cli.dry_run || section.dry_run.unwrap_or(false);
@@ -602,7 +609,7 @@ mod tests {
 listen_address = "0.0.0.0:9000"
 keystore_dir = "/data/keystores"
 password_file = "/data/password.txt"
-backend = "dvt"
+backend = "basic"
 tls_cert = "/tls/cert.pem"
 tls_key = "/tls/key.pem"
 tls_ca_cert = "/tls/ca.pem"
@@ -620,7 +627,7 @@ timeout_ms = 5000
         assert_eq!(s.listen_address.unwrap(), "0.0.0.0:9000");
         assert_eq!(s.keystore_dir.unwrap(), PathBuf::from("/data/keystores"));
         assert_eq!(s.password_file.unwrap(), PathBuf::from("/data/password.txt"));
-        assert_eq!(s.backend.unwrap(), "dvt");
+        assert_eq!(s.backend.unwrap(), Backend::Basic);
         assert_eq!(s.tls_cert.unwrap(), PathBuf::from("/tls/cert.pem"));
         assert_eq!(s.tls_key.unwrap(), PathBuf::from("/tls/key.pem"));
         assert_eq!(s.tls_ca_cert.unwrap(), PathBuf::from("/tls/ca.pem"));
@@ -700,7 +707,7 @@ index = 1
         let resolved = merge_with_cli(SignerConfig::default(), &cli).unwrap();
         assert_eq!(resolved.listen_address, DEFAULT_LISTEN_ADDRESS);
         assert_eq!(resolved.keystore_dir, PathBuf::from("/cli/keystores"));
-        assert_eq!(resolved.backend, "basic");
+        assert_eq!(resolved.backend, Backend::Basic);
         assert_eq!(resolved.dvt_timeout_ms, DEFAULT_DVT_TIMEOUT_MS);
         assert!(resolved.dvt_peers.is_empty());
         assert_eq!(
@@ -788,7 +795,10 @@ index = 1
                 listen_address: Some("0.0.0.0:9000".to_string()),
                 keystore_dir: Some(PathBuf::from("/config/ks")),
                 password_file: Some(PathBuf::from("/config/pw.txt")),
-                backend: Some("dvt".to_string()),
+                #[cfg(feature = "dvt")]
+                backend: Some(Backend::Dvt),
+                #[cfg(not(feature = "dvt"))]
+                backend: Some(Backend::Basic),
                 tls_cert: Some(PathBuf::from("/config/cert.pem")),
                 dvt: Some(DvtConfig {
                     peers: Some(vec!["p1:5000".to_string()]),
@@ -805,7 +815,10 @@ index = 1
         assert_eq!(resolved.listen_address, "0.0.0.0:9000");
         assert_eq!(resolved.keystore_dir, PathBuf::from("/config/ks"));
         assert_eq!(resolved.password_file.unwrap(), PathBuf::from("/config/pw.txt"));
-        assert_eq!(resolved.backend, "dvt");
+        #[cfg(feature = "dvt")]
+        assert_eq!(resolved.backend, Backend::Dvt);
+        #[cfg(not(feature = "dvt"))]
+        assert_eq!(resolved.backend, Backend::Basic);
         assert_eq!(resolved.tls_cert.unwrap(), PathBuf::from("/config/cert.pem"));
         assert_eq!(resolved.dvt_peers, vec!["p1:5000"]);
         assert_eq!(resolved.dvt_threshold.unwrap(), 2);
@@ -819,7 +832,10 @@ index = 1
             signer: Some(SignerSection {
                 listen_address: Some("0.0.0.0:9000".to_string()),
                 keystore_dir: Some(PathBuf::from("/config/ks")),
-                backend: Some("dvt".to_string()),
+                #[cfg(feature = "dvt")]
+                backend: Some(Backend::Dvt),
+                #[cfg(not(feature = "dvt"))]
+                backend: Some(Backend::Basic),
                 dvt: Some(DvtConfig {
                     peers: Some(vec!["config-peer:5000".to_string()]),
                     threshold: Some(2),
@@ -852,7 +868,7 @@ index = 1
         assert_eq!(resolved.listen_address, "10.0.0.1:8080");
         assert_eq!(resolved.keystore_dir, PathBuf::from("/cli/ks"));
         assert_eq!(resolved.password_file.unwrap(), PathBuf::from("/cli/pw.txt"));
-        assert_eq!(resolved.backend, "basic");
+        assert_eq!(resolved.backend, Backend::Basic);
         assert_eq!(resolved.tls_cert.unwrap(), PathBuf::from("/cli/cert.pem"));
         #[cfg(feature = "dvt")]
         {
@@ -1026,7 +1042,7 @@ tls_ca_cert = "/http/ca.pem"
         assert!(resolved.http_tls_ca_cert.is_none());
         // gRPC-side resolution unchanged by the absent HTTP block.
         assert_eq!(resolved.listen_address, DEFAULT_LISTEN_ADDRESS);
-        assert_eq!(resolved.backend, "basic");
+        assert_eq!(resolved.backend, Backend::Basic);
     }
 
     #[test]
@@ -1128,7 +1144,10 @@ tls_ca_cert = "/http/ca.pem"
                 listen_address: Some("0.0.0.0:9999".to_string()),
                 network: Some("holesky".to_string()),
                 reload_interval_secs: Some(99),
-                backend: Some("dvt".to_string()),
+                #[cfg(feature = "dvt")]
+                backend: Some(Backend::Dvt),
+                #[cfg(not(feature = "dvt"))]
+                backend: Some(Backend::Basic),
                 http: Some(HttpSection {
                     listen_address: Some("0.0.0.0:1".to_string()),
                     tls_mode: Some("server-tls-only".to_string()),
@@ -1158,7 +1177,7 @@ tls_ca_cert = "/http/ca.pem"
             "explicit --network mainnet must beat file holesky"
         );
         assert_eq!(resolved.reload_interval_secs, DEFAULT_RELOAD_INTERVAL_SECS);
-        assert_eq!(resolved.backend, "basic");
+        assert_eq!(resolved.backend, Backend::Basic);
         assert_eq!(resolved.http_listen_address, DEFAULT_HTTP_LISTEN_ADDRESS);
         assert_eq!(resolved.http_tls_mode, HttpTlsMode::Mtls);
     }
@@ -1188,7 +1207,7 @@ tls_ca_cert = "/http/ca.pem"
         let cli = cli_with_keystore("/ks");
         let resolved = merge_with_cli(SignerConfig::default(), &cli).unwrap();
         assert_eq!(resolved.listen_address, DEFAULT_LISTEN_ADDRESS);
-        assert_eq!(resolved.backend, "basic");
+        assert_eq!(resolved.backend, Backend::Basic);
         assert_eq!(resolved.reload_interval_secs, DEFAULT_RELOAD_INTERVAL_SECS);
         assert_eq!(resolved.dvt_timeout_ms, DEFAULT_DVT_TIMEOUT_MS);
         assert_eq!(resolved.http_listen_address, DEFAULT_HTTP_LISTEN_ADDRESS);
@@ -1284,7 +1303,7 @@ tls_ca_cert = "/http/ca.pem"
         assert_eq!(resolved.metrics_address, DEFAULT_METRICS_ADDRESS);
         assert_eq!(resolved.http_listen_address, DEFAULT_HTTP_LISTEN_ADDRESS);
         assert_eq!(resolved.http_tls_mode, HttpTlsMode::Mtls);
-        assert_eq!(resolved.backend, Backend::Basic.to_string());
+        assert_eq!(resolved.backend, Backend::Basic);
     }
 
     /// Clap parse: omitting a defaulted flag leaves `None` / false, not the
@@ -1359,5 +1378,71 @@ listen_address = "0.0.0.0:1"
             resolved.listen_address, DEFAULT_LISTEN_ADDRESS,
             "explicit CLI default-equal must beat file via resolve_config"
         );
+    }
+
+    // ── RF5-24: Backend stays an enum through ResolvedConfig ─────────────────
+
+    #[test]
+    fn test_backend_deserializes_from_toml_as_enum() {
+        let f = write_toml(
+            r#"
+[signer]
+keystore_dir = "/ks"
+backend = "basic"
+"#,
+        );
+        let cfg = load_config(f.path()).unwrap();
+        assert_eq!(cfg.signer.as_ref().unwrap().backend, Some(Backend::Basic));
+        let resolved = merge_with_cli(cfg, &empty_cli()).unwrap();
+        assert_eq!(resolved.backend, Backend::Basic);
+        assert_eq!(resolved.backend.as_str(), "basic");
+    }
+
+    #[test]
+    fn test_invalid_backend_value_rejected_at_deserialization() {
+        let f = write_toml(
+            r#"
+[signer]
+keystore_dir = "/ks"
+backend = "not-a-backend"
+"#,
+        );
+        let err = load_config(f.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("backend") || err.contains("not-a-backend") || err.contains("unknown"),
+            "invalid backend must fail deserialization clearly: {err}"
+        );
+    }
+
+    #[test]
+    fn test_backend_label_strings_unchanged_in_metrics() {
+        // External contract: metric/audit label tokens are exactly these strings.
+        assert_eq!(Backend::Basic.as_str(), "basic");
+        assert_eq!(Backend::Basic.to_string(), "basic");
+        #[cfg(feature = "dvt")]
+        {
+            assert_eq!(Backend::Dvt.as_str(), "dvt");
+            assert_eq!(Backend::Dvt.to_string(), "dvt");
+        }
+    }
+
+    #[cfg(feature = "dvt")]
+    #[test]
+    fn test_dvt_backend_selected_by_enum_match() {
+        let f = write_toml(
+            r#"
+[signer]
+keystore_dir = "/ks"
+backend = "dvt"
+"#,
+        );
+        let cfg = load_config(f.path()).unwrap();
+        assert_eq!(cfg.signer.as_ref().unwrap().backend, Some(Backend::Dvt));
+        let resolved = merge_with_cli(cfg, &empty_cli()).unwrap();
+        assert_eq!(resolved.backend, Backend::Dvt);
+        match resolved.backend {
+            Backend::Dvt => {}
+            Backend::Basic => panic!("TOML backend=dvt must resolve to Backend::Dvt"),
+        }
     }
 }

@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 
 use rvc_signer_bin::backend::basic::BasicSigner;
 use rvc_signer_bin::backend::SigningBackend;
-use rvc_signer_bin::config::{self, ServeArgs};
+use rvc_signer_bin::config::{self, Backend, ServeArgs};
 use rvc_signer_bin::metrics::SignerMetrics;
 use rvc_signer_bin::reload::KeystoreReloader;
 
@@ -61,7 +61,7 @@ reload_interval_secs = 10
     assert_eq!(resolved.listen_address, "0.0.0.0:9999");
     assert_eq!(resolved.keystore_dir, ks_dir);
     assert_eq!(resolved.password_file.unwrap(), pw_path);
-    assert_eq!(resolved.backend, "basic");
+    assert_eq!(resolved.backend, Backend::Basic);
     assert_eq!(resolved.reload_interval_secs, 10);
     assert!(!resolved.dry_run);
 }
@@ -419,7 +419,7 @@ reload_interval_secs = 5
     let resolved = config::merge_with_cli(cfg, &empty_cli()).unwrap();
 
     assert_eq!(resolved.listen_address, "0.0.0.0:50052");
-    assert_eq!(resolved.backend, "basic");
+    assert_eq!(resolved.backend, Backend::Basic);
     assert!(!resolved.dry_run);
     assert_eq!(resolved.reload_interval_secs, 5);
 }

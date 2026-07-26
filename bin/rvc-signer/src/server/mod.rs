@@ -98,7 +98,7 @@ pub async fn run(
             println!("  TLS: disabled");
         }
         #[cfg(feature = "dvt")]
-        if resolved.backend == "dvt" {
+        if matches!(resolved.backend, config::Backend::Dvt) {
             println!("  DVT peers: {}", resolved.dvt_peers.len());
             if let Some(threshold) = resolved.dvt_threshold {
                 println!("  DVT threshold: {}", threshold);
@@ -147,7 +147,8 @@ pub async fn run(
 
     // Set up Prometheus metrics server
     let key_count = signing_backend.public_keys().len() as f64;
-    signer_metrics.keys_loaded.with_label_values(&[&resolved.backend]).set(key_count);
+    let backend_label = resolved.backend.as_str();
+    signer_metrics.keys_loaded.with_label_values(&[backend_label]).set(key_count);
 
     let metrics_addr: std::net::SocketAddr = resolved
         .metrics_address
@@ -253,7 +254,7 @@ pub async fn run(
 #[allow(unsafe_code, clippy::await_holding_lock)]
 mod tests {
     use super::*;
-    use crate::config::{HttpTlsMode, ResolvedConfig};
+    use crate::config::{Backend, HttpTlsMode, ResolvedConfig};
     use crate::error::ServerError;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -301,7 +302,7 @@ mod tests {
             listen_address: format!("127.0.0.1:{listen}"),
             keystore_dir,
             password_file: Some(password_file),
-            backend: "basic".to_string(),
+            backend: Backend::Basic,
             dry_run: false,
             tls_cert: None,
             tls_key: None,

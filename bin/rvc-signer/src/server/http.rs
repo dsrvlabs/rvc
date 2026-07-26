@@ -49,7 +49,7 @@ pub(crate) fn build_http_state(deps: &HttpApiDeps<'_>) -> Result<Web3SignerState
         // Record the active backend label ("basic"/"dvt") in HTTP audit lines
         // so they line up with the gRPC metrics `backend` label (Issue 4.4).
         audit: http_api::AuditCfg {
-            backend_name: deps.resolved.backend.clone(),
+            backend_name: deps.resolved.backend.to_string(),
             ..http_api::AuditCfg::default()
         },
         // Share the one SignerMetrics registry so HTTP-path series land on the
@@ -113,7 +113,7 @@ pub(crate) async fn spawn_http_api(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{HttpTlsMode, ResolvedConfig};
+    use crate::config::{Backend, HttpTlsMode, ResolvedConfig};
     use crate::server::grpc::build_v2_signer_service;
     use crate::server::grpc::GrpcRouterDeps;
     use crate::service::SignerServiceImpl;
@@ -142,7 +142,7 @@ mod tests {
             listen_address: "127.0.0.1:0".to_string(),
             keystore_dir: std::path::PathBuf::from("/tmp/unused"),
             password_file: None,
-            backend: "basic".to_string(),
+            backend: Backend::Basic,
             dry_run: false,
             tls_cert: None,
             tls_key: None,
