@@ -56,20 +56,29 @@ pub fn init_logging(
         Vec::new();
 
     let tracing_guard = match tracing_config {
-        Some(config) => match telemetry::init_tracing(config) {
-            Ok((otel_layer, guard)) => {
-                boxed_layers.push(otel_layer);
-                eprintln!("OpenTelemetry tracing enabled (endpoint: {})", config.endpoint);
-                Some(guard)
+        Some(config) => {
+            // Log resolved sample_rate before init so operators (and CLI e2e
+            // tests) can confirm CLI/file/OTEL precedence even if exporter
+            // construction fails (RF5-15 / F20 / RF6-20).
+            eprintln!(
+                "OpenTelemetry tracing config (endpoint: {}, sample_rate: {})",
+                config.endpoint, config.sample_rate
+            );
+            match telemetry::init_tracing(config) {
+                Ok((otel_layer, guard)) => {
+                    boxed_layers.push(otel_layer);
+                    eprintln!("OpenTelemetry tracing enabled (endpoint: {})", config.endpoint);
+                    Some(guard)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "WARNING: Failed to initialize OpenTelemetry tracing: {e}. \
+                         Falling back to fmt-only logging."
+                    );
+                    None
+                }
             }
-            Err(e) => {
-                eprintln!(
-                    "WARNING: Failed to initialize OpenTelemetry tracing: {e}. \
-                     Falling back to fmt-only logging."
-                );
-                None
-            }
-        },
+        }
         None => None,
     };
 

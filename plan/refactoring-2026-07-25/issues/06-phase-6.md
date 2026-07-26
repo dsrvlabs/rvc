@@ -986,10 +986,10 @@ a missing slashing DB refuses to start (fail-closed, per Phase 1); SIGTERM produ
 these few and fast — a binary-spawning suite is the slowest thing in CI.
 
 **Acceptance criteria:**
-- [ ] ≥ 5 CLI-level cases, all spawning the real binary; none shells out to `cargo build`.
-- [ ] The suite runs in < 30s on a warm target dir (state the measured number in the PR).
-- [ ] Test count: +N, itemised (these are genuinely new).
-- [ ] Workspace green.
+- [x] ≥ 5 CLI-level cases, all spawning the real binary; none shells out to `cargo build`.
+- [x] The suite runs in < 30s on a warm target dir (state the measured number in the PR).
+- [x] Test count: +N, itemised (these are genuinely new).
+- [x] Workspace green.
 
 **Test/verification plan:** These tests *are* the deliverable, so verify they can fail. For each case,
 demonstrate the negative in the PR: temporarily break the behaviour (reject a valid flag, remove the
