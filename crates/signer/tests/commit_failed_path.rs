@@ -4,41 +4,20 @@
 //! successful BLS sign; asserts the gate returns `CommitFailed` with the
 //! caller-supplied signing root (not `SlashingBlocked`).
 
+mod common;
+
 use std::sync::Arc;
 
-use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey};
-use doppelganger::SigningEnablement;
+use crypto::SecretKey;
 use eth_types::Root;
-use rvc_signer::{SigningGate, SigningGateError, ValidatorLockMap};
-use slashing::SlashingDb;
+use rvc_signer::SigningGateError;
 
 const GVR: Root = [0xd3; 32];
 
-struct AlwaysAllowed;
-impl SigningEnablement for AlwaysAllowed {
-    fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
-        true
-    }
-}
-
-fn make_gate_with_key(sk: SecretKey, db: Arc<SlashingDb>) -> (PublicKey, SigningGate) {
-    let pubkey = sk.public_key();
-    let mut km = KeyManager::new();
-    km.insert(sk);
-    let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(km)));
-    let gate = SigningGate::new(
-        Arc::clone(&db),
-        Arc::new(AlwaysAllowed),
-        Arc::clone(&signer),
-        Arc::new(ValidatorLockMap::new()),
-    );
-    (pubkey, gate)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gate_sign_block_commit_failure_is_commit_failed() {
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let (pubkey, gate) = make_gate_with_key(SecretKey::generate(), Arc::clone(&db));
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_allowed(SecretKey::generate(), Arc::clone(&db));
     let pubkey_hex = hex::encode(pubkey.to_bytes());
     let signing_root: Root = [0xaa; 32];
     let slot = 42u64;
@@ -78,8 +57,8 @@ async fn test_gate_sign_block_commit_failure_is_commit_failed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gate_sign_attestation_commit_failure_is_commit_failed() {
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let (pubkey, gate) = make_gate_with_key(SecretKey::generate(), Arc::clone(&db));
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_allowed(SecretKey::generate(), Arc::clone(&db));
     let pubkey_hex = hex::encode(pubkey.to_bytes());
     let signing_root: Root = [0xcc; 32];
 

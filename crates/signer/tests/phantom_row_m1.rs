@@ -9,25 +9,14 @@
 //! the row is only committed if `signer.sign` succeeds; on signer failure
 //! `discard()` rolls the transaction back, leaving the DB pristine.
 
+mod common;
+
 use std::sync::Arc;
 
-use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey};
+use crypto::{KeyManager, LocalSigner, SecretKey};
 use eth_types::{AttestationData, Checkpoint, ForkSchedule, Root};
 use rvc_signer::{SignerService, ValidatorSigner};
 use slashing::SlashingDb;
-
-use rvc_signer::SigningEnablement;
-
-/// Local always-on enablement for this integration test (lib helper is feature-gated).
-struct AlwaysEnabled;
-impl SigningEnablement for AlwaysEnabled {
-    fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
-        true
-    }
-}
-fn always_enabled() -> std::sync::Arc<dyn SigningEnablement> {
-    std::sync::Arc::new(AlwaysEnabled)
-}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -73,7 +62,7 @@ async fn test_signer_failure_does_not_commit_row_attestation() {
     let empty_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
     let service = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db))
-        .with_enablement(always_enabled());
+        .with_enablement(common::always_allowed());
 
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();
@@ -101,7 +90,7 @@ async fn test_signer_failure_does_not_commit_row_block() {
     let empty_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
     let service = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db))
-        .with_enablement(always_enabled());
+        .with_enablement(common::always_allowed());
 
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();
@@ -138,7 +127,7 @@ async fn test_retry_after_signer_failure_succeeds() {
     let empty_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
     let service_fail = SignerService::new(Arc::clone(&empty_signer), Arc::clone(&db))
-        .with_enablement(always_enabled());
+        .with_enablement(common::always_allowed());
 
     let data_first = make_attestation_data(10, 11);
     let fs = make_fork_schedule();
@@ -155,7 +144,7 @@ async fn test_retry_after_signer_failure_succeeds() {
     manager.insert(sk);
     let real_signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(manager)));
     let service_ok = SignerService::new(Arc::clone(&real_signer), Arc::clone(&db))
-        .with_enablement(always_enabled());
+        .with_enablement(common::always_allowed());
 
     let data_retry = make_attestation_data(10, 11);
     let ok_result = service_ok.sign_attestation(&data_retry, &pubkey, &fs, &GVR).await;
@@ -186,8 +175,8 @@ async fn test_successful_sign_commits_row_and_double_vote_rejected() {
     manager.insert(sk);
     let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(manager)));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let service =
-        SignerService::new(Arc::clone(&signer), Arc::clone(&db)).with_enablement(always_enabled());
+    let service = SignerService::new(Arc::clone(&signer), Arc::clone(&db))
+        .with_enablement(common::always_allowed());
 
     let data_first = make_attestation_data(20, 30);
     let fs = make_fork_schedule();
@@ -229,8 +218,8 @@ async fn test_successful_sign_block_commits_row_and_double_proposal_rejected() {
     manager.insert(sk);
     let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(manager)));
     let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let service =
-        SignerService::new(Arc::clone(&signer), Arc::clone(&db)).with_enablement(always_enabled());
+    let service = SignerService::new(Arc::clone(&signer), Arc::clone(&db))
+        .with_enablement(common::always_allowed());
 
     let block_root_a: Root = [0xaa; 32];
     let slot = 200u64;

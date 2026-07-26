@@ -569,12 +569,8 @@ mod tests {
     const TEST_TIMEOUT: Duration = Duration::from_millis(50);
     const SIGNER_SLEEP: Duration = Duration::from_millis(400);
 
-    struct AlwaysAllowed;
-    impl SigningEnablement for AlwaysAllowed {
-        fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
-            true
-        }
-    }
+    // Prefer the crate test helper (AlwaysEnabled) over a local twin.
+    use crate::AlwaysEnabled;
 
     struct FlipEnablement {
         enabled: AtomicBool,
@@ -668,7 +664,7 @@ mod tests {
             SignSlashableRequest {
                 locks: &locks,
                 pubkey: &pubkey,
-                enablement: &AlwaysAllowed,
+                enablement: &AlwaysEnabled,
                 signer,
                 signing_root,
                 sign_timeout: TEST_TIMEOUT,
@@ -747,7 +743,7 @@ mod tests {
             SignSlashableRequest {
                 locks: &locks,
                 pubkey: &pubkey,
-                enablement: &AlwaysAllowed,
+                enablement: &AlwaysEnabled,
                 signer,
                 signing_root,
                 sign_timeout: Duration::from_secs(4),
@@ -790,7 +786,7 @@ mod tests {
             SignSlashableRequest {
                 locks: &locks,
                 pubkey: &pubkey,
-                enablement: &AlwaysAllowed,
+                enablement: &AlwaysEnabled,
                 signer,
                 signing_root,
                 sign_timeout: Duration::from_secs(4),
@@ -843,7 +839,7 @@ mod tests {
             SignSlashableRequest {
                 locks: &locks,
                 pubkey: &pubkey,
-                enablement: &AlwaysAllowed,
+                enablement: &AlwaysEnabled,
                 signer,
                 signing_root,
                 sign_timeout: TEST_TIMEOUT,
@@ -889,7 +885,7 @@ mod tests {
             SignSlashableRequest {
                 locks: &locks,
                 pubkey: &pubkey,
-                enablement: &AlwaysAllowed,
+                enablement: &AlwaysEnabled,
                 signer,
                 signing_root,
                 sign_timeout: Duration::from_secs(4),

@@ -6,46 +6,15 @@
 //! (b) Signer failure (key not found) → Err(KeyNotFound) returned and NO
 //!     slashing-DB row committed (phantom-row guarantee for the attestation path).
 
+mod common;
+
 use std::sync::Arc;
 
-use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey};
-use doppelganger::SigningEnablement;
+use crypto::SecretKey;
 use eth_types::Root;
-use rvc_signer::{SigningGate, SigningGateError, ValidatorLockMap};
-use slashing::SlashingDb;
+use rvc_signer::SigningGateError;
 
 const GVR: Root = [0xd3; 32];
-
-struct AlwaysAllowed;
-impl SigningEnablement for AlwaysAllowed {
-    fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
-        true
-    }
-}
-
-fn make_gate_with_key(sk: SecretKey, db: Arc<SlashingDb>) -> (PublicKey, SigningGate) {
-    let pubkey = sk.public_key();
-    let mut km = KeyManager::new();
-    km.insert(sk);
-    let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(km)));
-    let gate = SigningGate::new(
-        Arc::clone(&db),
-        Arc::new(AlwaysAllowed),
-        Arc::clone(&signer),
-        Arc::new(ValidatorLockMap::new()),
-    );
-    (pubkey, gate)
-}
-
-fn make_gate_empty_signer(db: Arc<SlashingDb>) -> SigningGate {
-    let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(KeyManager::new())));
-    SigningGate::new(
-        Arc::clone(&db),
-        Arc::new(AlwaysAllowed),
-        Arc::clone(&signer),
-        Arc::new(ValidatorLockMap::new()),
-    )
-}
 
 // ── (a) Happy path ─────────────────────────────────────────────────────────────
 
@@ -53,8 +22,8 @@ fn make_gate_empty_signer(db: Arc<SlashingDb>) -> SigningGate {
 /// subsequent conflicting attestation for the same target epoch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_sign_attestation_happy_path_commits_row_and_blocks_conflict() {
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let (pubkey, gate) = make_gate_with_key(SecretKey::generate(), Arc::clone(&db));
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_allowed(SecretKey::generate(), Arc::clone(&db));
     let pubkey_hex = hex::encode(pubkey.to_bytes());
 
     let signing_root: Root = [0xaa; 32];
@@ -98,8 +67,8 @@ async fn test_sign_attestation_happy_path_commits_row_and_blocks_conflict() {
 /// `Err(KeyNotFound)` and leave the slashing DB empty (no phantom row).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_sign_attestation_signer_failure_no_phantom_row() {
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let gate = make_gate_empty_signer(Arc::clone(&db));
+    let db = common::open_db();
+    let gate = common::gate_empty_signer(Arc::clone(&db));
 
     // Generate a pubkey that is NOT in the signer.
     let sk = SecretKey::generate();

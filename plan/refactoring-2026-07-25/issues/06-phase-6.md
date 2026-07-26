@@ -843,11 +843,11 @@ files hold a single test each, paying separate link/compile cost as their own in
    re-stubbing 11 methods each.
 
 **Acceptance criteria:**
-- [ ] One `AlwaysAllowed`/`AlwaysDenied` definition in `crates/signer` (`rg -c` = 1 each).
-- [ ] Integration-test binary count drops by ≥ 3; **test count unchanged**.
-- [ ] The `test-helpers`/`test-utils` items are actually consumed (the dead-helper condition F46 flags is
+- [x] One `AlwaysAllowed`/`AlwaysDenied` definition in `crates/signer` (`rg -c` = 1 each).
+- [x] Integration-test binary count drops by ≥ 3; **test count unchanged**.
+- [x] The `test-helpers`/`test-utils` items are actually consumed (the dead-helper condition F46 flags is
       resolved, not preserved).
-- [ ] Workspace green.
+- [x] Workspace green.
 
 **Risks:** `tests/common/mod.rs` is compiled into every integration binary in the crate; keep it small.
 

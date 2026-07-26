@@ -1,5 +1,7 @@
 //! RF4-05: SigningGate delegates to `sign_slashable` — metrics + enablement recheck.
 
+mod common;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,16 +14,8 @@ use metrics::definitions::{
     RVC_SIGNING_DURATION_SECONDS, RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
 };
 use rvc_signer::{SigningGate, SigningGateError, ValidatorLockMap};
-use slashing::SlashingDb;
 
 const GVR: Root = [0xa5; 32];
-
-struct AlwaysAllowed;
-impl SigningEnablement for AlwaysAllowed {
-    fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
-        true
-    }
-}
 
 struct FlipEnablement {
     enabled: AtomicBool,
@@ -32,29 +26,11 @@ impl SigningEnablement for FlipEnablement {
     }
 }
 
-fn make_gate(
-    sk: SecretKey,
-    db: Arc<SlashingDb>,
-) -> (PublicKey, SigningGate, Arc<ValidatorLockMap>) {
-    let pubkey = sk.public_key();
-    let mut km = KeyManager::new();
-    km.insert(sk);
-    let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(km)));
-    let locks = Arc::new(ValidatorLockMap::new());
-    let gate = SigningGate::new(
-        Arc::clone(&db),
-        Arc::new(AlwaysAllowed),
-        Arc::clone(&signer),
-        Arc::clone(&locks),
-    );
-    (pubkey, gate, locks)
-}
-
 /// Gate records the same metric families as SignerService on success and on block.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gate_metrics_recorded_on_success_and_on_block() {
-    let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
-    let (pubkey, gate, _) = make_gate(SecretKey::generate(), Arc::clone(&db));
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_allowed(SecretKey::generate(), Arc::clone(&db));
 
     let safe_before =
         RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::SAFE]).get();
@@ -106,7 +82,7 @@ async fn test_gate_reenables_check_under_lock() {
     let mut km = KeyManager::new();
     km.insert(sk);
     let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(km)));
-    let db = Arc::new(SlashingDb::open_in_memory().expect("db"));
+    let db = common::open_db();
     let locks = Arc::new(ValidatorLockMap::new());
     let enablement = Arc::new(FlipEnablement { enabled: AtomicBool::new(true) });
     let gate = SigningGate::new(

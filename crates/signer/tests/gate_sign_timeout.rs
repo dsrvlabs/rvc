@@ -9,28 +9,21 @@
 //! We simulate a slow signer with a custom `Signer` impl that sleeps longer
 //! than the configured timeout, injected via `SigningGate::new_with_raw_signer`.
 
+mod common;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey, Signature, Signer, SigningError};
-use doppelganger::SigningEnablement;
+use crypto::{KeyManager, LocalSigner, SecretKey, Signature, Signer, SigningError};
 use eth_types::Root;
-use rvc_signer::{SigningGate, SigningGateError, ValidatorLockMap};
-use slashing::SlashingDb;
+use rvc_signer::SigningGateError;
 
 const GVR: Root = [0xd3; 32];
 /// Gate timeout: 50 ms — fast for tests, still a meaningful bound.
 const TEST_TIMEOUT: Duration = Duration::from_millis(50);
 /// Signer delay: much longer than `TEST_TIMEOUT`.
 const SIGNER_SLEEP: Duration = Duration::from_millis(400);
-
-struct AlwaysAllowed;
-impl SigningEnablement for AlwaysAllowed {
-    fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
-        true
-    }
-}
 
 /// A signer that sleeps `sleep` before delegating to a real local signer.
 ///
@@ -57,22 +50,12 @@ impl Signer for SlowSigner {
     }
 }
 
-fn make_gate(
-    sk: SecretKey,
-    db: Arc<SlashingDb>,
-    timeout: Duration,
-    sleep: Duration,
-) -> SigningGate {
+fn make_gate(sk: SecretKey, db: Arc<slashing::SlashingDb>) -> rvc_signer::SigningGate {
     let mut km = KeyManager::new();
     km.insert(sk);
-    let slow: Arc<dyn Signer> = Arc::new(SlowSigner { inner: LocalSigner::new(km), sleep });
-    SigningGate::new_with_raw_signer(
-        Arc::clone(&db),
-        Arc::new(AlwaysAllowed),
-        slow,
-        Arc::new(ValidatorLockMap::new()),
-        timeout,
-    )
+    let slow: Arc<dyn Signer> =
+        Arc::new(SlowSigner { inner: LocalSigner::new(km), sleep: SIGNER_SLEEP });
+    common::gate_with_raw_signer(db, common::always_allowed(), slow, TEST_TIMEOUT)
 }
 
 /// BUG-003 regression — block: a stalled signer must not commit a phantom row.
@@ -81,9 +64,9 @@ async fn test_sign_block_timeout_discards_staged_row() {
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
+    let db = common::open_db();
 
-    let gate = make_gate(sk, Arc::clone(&db), TEST_TIMEOUT, SIGNER_SLEEP);
+    let gate = make_gate(sk, Arc::clone(&db));
 
     let result = gate.sign_block(&pubkey, 42, [0xde; 32], GVR, "test").await;
 
@@ -102,9 +85,9 @@ async fn test_sign_attestation_timeout_discards_staged_row() {
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();
     let pubkey_hex = hex::encode(pubkey.to_bytes());
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
+    let db = common::open_db();
 
-    let gate = make_gate(sk, Arc::clone(&db), TEST_TIMEOUT, SIGNER_SLEEP);
+    let gate = make_gate(sk, Arc::clone(&db));
 
     let result = gate.sign_attestation(&pubkey, 10, 11, [0xde; 32], GVR, "test").await;
 
@@ -130,9 +113,9 @@ async fn test_sign_attestation_timeout_discards_staged_row() {
 async fn test_sign_sync_committee_message_timeout() {
     let sk = SecretKey::generate();
     let pubkey = sk.public_key();
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
+    let db = common::open_db();
 
-    let gate = make_gate(sk, Arc::clone(&db), TEST_TIMEOUT, SIGNER_SLEEP);
+    let gate = make_gate(sk, Arc::clone(&db));
 
     let result = gate.sign_sync_committee_message(&pubkey, [0xde; 32]).await;
 

@@ -16,6 +16,9 @@ mod gate;
 mod locks;
 mod traits;
 
+#[cfg(any(test, feature = "test-utils"))]
+mod test_utils;
+
 pub use crypto::is_aggregator;
 // SigningEnablement was relocated from rvc-signer to rvc-doppelganger (Issue 2.6)
 // to allow ForwardWindowMachine to implement it without a doppelganger→signer cycle.
@@ -29,6 +32,10 @@ pub use fail_closed::FailClosedDefault;
 pub use gate::{SigningGate, AUDIT_CN_DEFAULT};
 pub use locks::ValidatorLockMap;
 pub use traits::ValidatorSigner;
+
+/// Test-only stubs (`StubValidatorSigner`, `mock_sig`). Enable via `test-utils`.
+#[cfg(any(test, feature = "test-utils"))]
+pub use test_utils::{mock_sig, StubValidatorSigner};
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

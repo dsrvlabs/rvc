@@ -24,45 +24,18 @@
 //! phantom row — the gate refuses BEFORE staging).
 //!
 //! This is the M1 milestone artifact for PRD M6; the per-path unit RED tests
-//! from Issues 2.9a/2.9b (`gate_*_doppelganger_blocked.rs`) cover the same
-//! methods individually — this file is the single auditor-facing "every entry
-//! point, gate off" assertion.
+//! in `gate_doppelganger.rs` cover the same methods individually — this file is
+//! the single auditor-facing "every entry point, gate off" assertion.
+
+mod common;
 
 use std::sync::Arc;
 
-use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey};
-use doppelganger::SigningEnablement;
+use crypto::SecretKey;
 use eth_types::Root;
-use rvc_signer::{SigningGate, SigningGateError, ValidatorLockMap};
-use slashing::SlashingDb;
+use rvc_signer::SigningGateError;
 
 const GVR: Root = [0xd3; 32];
-
-/// `SigningEnablement` that denies every pubkey — models both an active
-/// doppelganger forward window and an unknown pubkey (fail-closed default).
-struct GateOff;
-impl SigningEnablement for GateOff {
-    fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
-        false
-    }
-}
-
-/// Build a `SigningGate` whose BLS backend genuinely holds the key (so the only
-/// thing standing between the caller and a signature is the gate decision) and
-/// whose enablement denies everything.
-fn make_gate_off(sk: SecretKey, db: Arc<SlashingDb>) -> (PublicKey, SigningGate) {
-    let pubkey = sk.public_key();
-    let mut km = KeyManager::new();
-    km.insert(sk);
-    let signer = Arc::new(crypto::CompositeSigner::new(LocalSigner::new(km)));
-    let gate = SigningGate::new(
-        Arc::clone(&db),
-        Arc::new(GateOff),
-        Arc::clone(&signer),
-        Arc::new(ValidatorLockMap::new()),
-    );
-    (pubkey, gate)
-}
 
 fn assert_blocked(label: &str, result: Result<Vec<u8>, SigningGateError>) {
     assert!(
@@ -76,8 +49,8 @@ fn assert_blocked(label: &str, result: Result<Vec<u8>, SigningGateError>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m6_block_path_refuses_and_writes_no_row() {
     let sk = SecretKey::generate();
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let (pubkey, gate) = make_gate_off(sk, Arc::clone(&db));
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_denied(sk, Arc::clone(&db));
     let pubkey_hex = hex::encode(pubkey.to_bytes());
 
     let result = gate.sign_block(&pubkey, 42, [0xb1; 32], GVR, "test").await;
@@ -95,8 +68,8 @@ async fn m6_block_path_refuses_and_writes_no_row() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m6_attestation_path_refuses_and_writes_no_row() {
     let sk = SecretKey::generate();
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let (pubkey, gate) = make_gate_off(sk, Arc::clone(&db));
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_denied(sk, Arc::clone(&db));
     let pubkey_hex = hex::encode(pubkey.to_bytes());
 
     let result = gate.sign_attestation(&pubkey, 3, 4, [0xa7; 32], GVR, "test").await;
@@ -114,8 +87,8 @@ async fn m6_attestation_path_refuses_and_writes_no_row() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m6_sync_committee_message_path_refuses() {
     let sk = SecretKey::generate();
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let (pubkey, gate) = make_gate_off(sk, db);
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_denied(sk, db);
 
     let result = gate.sign_sync_committee_message(&pubkey, [0x33; 32]).await;
     assert_blocked("sign_sync_committee_message", result);
@@ -126,8 +99,8 @@ async fn m6_sync_committee_message_path_refuses() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m6_sync_contribution_path_refuses() {
     let sk = SecretKey::generate();
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let (pubkey, gate) = make_gate_off(sk, db);
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_denied(sk, db);
 
     let result = gate.sign_contribution_and_proof(&pubkey, [0x44; 32]).await;
     assert_blocked("sign_contribution_and_proof", result);
@@ -138,8 +111,8 @@ async fn m6_sync_contribution_path_refuses() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m6_aggregate_and_proof_path_refuses() {
     let sk = SecretKey::generate();
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let (pubkey, gate) = make_gate_off(sk, db);
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_denied(sk, db);
 
     let result = gate.sign_aggregate_and_proof(&pubkey, [0x55; 32]).await;
     assert_blocked("sign_aggregate_and_proof", result);
@@ -150,8 +123,8 @@ async fn m6_aggregate_and_proof_path_refuses() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m6_selection_proof_path_refuses() {
     let sk = SecretKey::generate();
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let (pubkey, gate) = make_gate_off(sk, db);
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_denied(sk, db);
 
     let result = gate.sign_selection_proof(&pubkey, [0x66; 32]).await;
     assert_blocked("sign_selection_proof", result);
@@ -165,8 +138,8 @@ async fn m6_selection_proof_path_refuses() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn m6_all_six_paths_refuse_under_one_gate_off() {
     let sk = SecretKey::generate();
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
-    let (pubkey, gate) = make_gate_off(sk, Arc::clone(&db));
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_denied(sk, Arc::clone(&db));
     let pubkey_hex = hex::encode(pubkey.to_bytes());
 
     assert_blocked("block", gate.sign_block(&pubkey, 1, [0x01; 32], GVR, "t").await);

@@ -11,8 +11,9 @@ workspace = true
 
 [features]
 default = []
-# Exposes AlwaysEnabled / always_enabled() for cross-crate tests. Never enable
-# in production binary dependency lines (SEC-2a Finding 2).
+# Exposes AlwaysEnabled / always_enabled() and StubValidatorSigner for
+# cross-crate tests. Never enable in production binary dependency lines
+# (SEC-2a Finding 2).
 test-utils = []
 
 [dependencies]

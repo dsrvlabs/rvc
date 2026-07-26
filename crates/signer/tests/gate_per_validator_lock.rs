@@ -15,28 +15,15 @@
 //! invariant (no race-induced UNIQUE violation, no double row, no lost write)
 //! under concurrency, including under heavy parallel `cargo test --workspace` load.
 
+mod common;
+
 use std::sync::Arc;
 
-use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey};
-use doppelganger::SigningEnablement;
+use crypto::SecretKey;
 use eth_types::Root;
 use rvc_signer::{SigningGate, ValidatorLockMap};
-use slashing::SlashingDb;
 
 const GVR: Root = [0xd3; 32];
-
-struct AlwaysAllowed;
-impl SigningEnablement for AlwaysAllowed {
-    fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
-        true
-    }
-}
-
-fn make_signer_with_key(sk: SecretKey) -> Arc<crypto::CompositeSigner> {
-    let mut km = KeyManager::new();
-    km.insert(sk);
-    Arc::new(crypto::CompositeSigner::new(LocalSigner::new(km)))
-}
 
 /// Both concurrent sign_block calls must complete successfully and each commit
 /// exactly one row.  The per-validator lock ensures they serialize so that the
@@ -44,11 +31,10 @@ fn make_signer_with_key(sk: SecretKey) -> Arc<crypto::CompositeSigner> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_sign_block_per_validator_lock_serializes_concurrent_calls() {
     let sk = SecretKey::generate();
-    let pubkey = sk.public_key();
+    let (pubkey, signer) = common::composite_with_key(sk);
     let pubkey_hex = hex::encode(pubkey.to_bytes());
 
-    let signer = make_signer_with_key(sk);
-    let db = Arc::new(SlashingDb::open_in_memory().expect("open in-memory DB"));
+    let db = common::open_db();
     let lock_map = Arc::new(ValidatorLockMap::new());
 
     // Build two gate references sharing the same underlying resources.
@@ -60,7 +46,7 @@ async fn test_sign_block_per_validator_lock_serializes_concurrent_calls() {
     let gate = Arc::new(
         SigningGate::new(
             Arc::clone(&db),
-            Arc::new(AlwaysAllowed),
+            common::always_allowed(),
             Arc::clone(&signer),
             Arc::clone(&lock_map),
         )
