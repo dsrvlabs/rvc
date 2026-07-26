@@ -89,6 +89,7 @@ async fn http_sign_block(
         audit: AuditCfg::default(),
         metrics: Arc::new(crate::metrics::SignerMetrics::new()),
         client_cn_allow_list: None,
+        genesis_fork_version: crate::sign_plan::BUILDER_FORK_VERSION_MAINNET,
     };
     let id = format!("0x{}", hex::encode(pubkey));
     let body = format!(

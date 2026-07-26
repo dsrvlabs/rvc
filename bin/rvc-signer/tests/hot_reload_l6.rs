@@ -56,6 +56,8 @@ fn cli(enable_hot_reload: bool, reload_interval: u64) -> CliOverrides<'static> {
         http_tls_cert: None,
         http_tls_key: None,
         http_tls_ca_cert: None,
+        network: "mainnet",
+        network_is_default: true,
     }
 }
 

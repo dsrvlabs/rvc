@@ -33,6 +33,12 @@ pub static KNOWN_PUBKEY_BYTES: std::sync::LazyLock<[u8; 48]> =
 /// Build a `SignerServiceImpl` backed by an in-memory key manager and an
 /// on-disk slashing DB (tempfile, caller gets the path to re-open for assertions).
 pub fn make_service_with_db() -> (SignerServiceImpl, PathBuf) {
+    make_service_with_genesis(eth_types::NetworkPreset::MAINNET.genesis_fork_version)
+}
+
+/// Like [`make_service_with_db`] but with an explicit network genesis fork version
+/// (builder-registration domain source).
+pub fn make_service_with_genesis(genesis_fork_version: [u8; 4]) -> (SignerServiceImpl, PathBuf) {
     let sk = known_secret_key();
     let db_path = make_temp_db_path();
 
@@ -42,7 +48,8 @@ pub fn make_service_with_db() -> (SignerServiceImpl, PathBuf) {
     let backend = Arc::new(TestBackend { km: Arc::new(km) });
     let db = Arc::new(SlashingDb::open(&db_path).expect("open test DB"));
 
-    let svc = SignerServiceImpl::new_v2(backend as Arc<dyn SigningBackend>, "test".to_string(), db);
+    let svc = SignerServiceImpl::new_v2(backend as Arc<dyn SigningBackend>, "test".to_string(), db)
+        .with_genesis_fork_version(genesis_fork_version);
     (svc, db_path)
 }
 

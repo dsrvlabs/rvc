@@ -66,6 +66,9 @@ pub struct SignerSection {
     /// ISSUE-4.6 / L-6: keystore hot-reload is opt-in. When unset (or false)
     /// the reloader is not spawned regardless of `reload_interval_secs`.
     pub enable_hot_reload: Option<bool>,
+    /// Network name for builder-registration genesis fork version
+    /// (`mainnet` / `hoodi` / `holesky` / `sepolia`). Default `mainnet`.
+    pub network: Option<String>,
     pub dvt: Option<DvtConfig>,
     /// Opt-in Web3Signer HTTP API listener block (FR-25/27/28/30). Absent =
     /// HTTP disabled; gRPC stays default-on.
@@ -127,6 +130,8 @@ pub struct ResolvedConfig {
     pub http_tls_cert: Option<PathBuf>,
     pub http_tls_key: Option<PathBuf>,
     pub http_tls_ca_cert: Option<PathBuf>,
+    /// Network genesis fork version for builder registration (from NetworkPreset).
+    pub genesis_fork_version: [u8; 4],
 }
 
 pub struct CliOverrides<'a> {
@@ -160,6 +165,9 @@ pub struct CliOverrides<'a> {
     pub http_tls_cert: Option<&'a Path>,
     pub http_tls_key: Option<&'a Path>,
     pub http_tls_ca_cert: Option<&'a Path>,
+    /// `--network` CLI value (`mainnet` default). When default, TOML may supply.
+    pub network: &'a str,
+    pub network_is_default: bool,
 }
 
 pub fn load_config(path: &Path) -> Result<SignerConfig, Box<dyn std::error::Error>> {
@@ -257,6 +265,14 @@ pub fn merge_with_cli(
     let http_tls_key = cli.http_tls_key.map(PathBuf::from).or(http.tls_key);
     let http_tls_ca_cert = cli.http_tls_ca_cert.map(PathBuf::from).or(http.tls_ca_cert);
 
+    // Network genesis for builder registration: CLI > TOML > mainnet.
+    let network_name = if !cli.network_is_default {
+        cli.network.to_string()
+    } else {
+        section.network.unwrap_or_else(|| cli.network.to_string())
+    };
+    let genesis_fork_version = resolve_network_genesis_fork_version(&network_name)?;
+
     Ok(ResolvedConfig {
         listen_address,
         keystore_dir,
@@ -278,6 +294,16 @@ pub fn merge_with_cli(
         http_tls_cert,
         http_tls_key,
         http_tls_ca_cert,
+        genesis_fork_version,
+    })
+}
+
+/// Map a network name onto [`eth_types::NetworkPreset`] genesis fork version.
+pub fn resolve_network_genesis_fork_version(
+    name: &str,
+) -> Result<[u8; 4], Box<dyn std::error::Error>> {
+    eth_types::network_from_name(name).map(|p| p.genesis_fork_version).ok_or_else(|| {
+        format!("unknown network {name:?}: expected mainnet, hoodi, holesky, or sepolia").into()
     })
 }
 
@@ -339,6 +365,8 @@ mod tests {
             http_tls_cert: None,
             http_tls_key: None,
             http_tls_ca_cert: None,
+            network: "mainnet",
+            network_is_default: true,
         }
     }
 
@@ -456,6 +484,84 @@ index = 1
         assert_eq!(resolved.backend, "basic");
         assert_eq!(resolved.dvt_timeout_ms, 2000);
         assert!(resolved.dvt_peers.is_empty());
+        // Default network is mainnet genesis for builder registration.
+        assert_eq!(
+            resolved.genesis_fork_version,
+            eth_types::NetworkPreset::MAINNET.genesis_fork_version
+        );
+    }
+
+    #[test]
+    fn test_network_toml_holesky_when_cli_default() {
+        let config = SignerConfig {
+            signer: Some(SignerSection {
+                keystore_dir: Some(PathBuf::from("/ks")),
+                network: Some("holesky".to_string()),
+                ..Default::default()
+            }),
+        };
+        let resolved = merge_with_cli(config, &default_cli_overrides()).unwrap();
+        assert_eq!(
+            resolved.genesis_fork_version,
+            eth_types::NetworkPreset::HOLESKY.genesis_fork_version
+        );
+    }
+
+    #[test]
+    fn test_network_cli_overrides_toml() {
+        let config = SignerConfig {
+            signer: Some(SignerSection {
+                keystore_dir: Some(PathBuf::from("/ks")),
+                network: Some("mainnet".to_string()),
+                ..Default::default()
+            }),
+        };
+        let cli = CliOverrides {
+            keystore_dir: Some(Path::new("/ks")),
+            network: "sepolia",
+            network_is_default: false,
+            ..default_cli_overrides()
+        };
+        let resolved = merge_with_cli(config, &cli).unwrap();
+        assert_eq!(
+            resolved.genesis_fork_version,
+            eth_types::NetworkPreset::SEPOLIA.genesis_fork_version
+        );
+    }
+
+    #[test]
+    fn test_network_unknown_is_hard_error() {
+        let config = SignerConfig {
+            signer: Some(SignerSection {
+                keystore_dir: Some(PathBuf::from("/ks")),
+                network: Some("not-a-network".to_string()),
+                ..Default::default()
+            }),
+        };
+        let err = merge_with_cli(config, &default_cli_overrides()).unwrap_err().to_string();
+        assert!(err.contains("unknown network"), "error: {err}");
+        assert!(err.contains("not-a-network"), "error: {err}");
+    }
+
+    #[test]
+    fn test_resolve_network_genesis_fork_version_table() {
+        assert_eq!(
+            resolve_network_genesis_fork_version("mainnet").unwrap(),
+            eth_types::NetworkPreset::MAINNET.genesis_fork_version
+        );
+        assert_eq!(
+            resolve_network_genesis_fork_version("hoodi").unwrap(),
+            eth_types::NetworkPreset::HOODI.genesis_fork_version
+        );
+        assert_eq!(
+            resolve_network_genesis_fork_version("holesky").unwrap(),
+            eth_types::NetworkPreset::HOLESKY.genesis_fork_version
+        );
+        assert_eq!(
+            resolve_network_genesis_fork_version("sepolia").unwrap(),
+            eth_types::NetworkPreset::SEPOLIA.genesis_fork_version
+        );
+        assert!(resolve_network_genesis_fork_version("goerli").is_err());
     }
 
     #[test]

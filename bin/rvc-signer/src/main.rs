@@ -229,6 +229,13 @@ struct ServeArgs {
     /// accepted (backward compatible). mTLS remains mandatory either way.
     #[arg(long)]
     allowed_client_cns: Option<PathBuf>,
+
+    /// Network name for builder-registration genesis fork version
+    /// (`mainnet`, `hoodi`, `holesky`, `sepolia`). Default `mainnet`.
+    /// Both gRPC and HTTP use this single source so identical registrations
+    /// produce identical signatures across transports.
+    #[arg(long, default_value = "mainnet")]
+    network: String,
 }
 
 #[cfg(feature = "dvt")]
@@ -644,10 +651,12 @@ async fn run_serve(
         )
         .with_metrics(Arc::clone(&signer_metrics))
         .with_client_cn_allow_list(client_cn_allow_list.clone())
+        .with_genesis_fork_version(resolved.genesis_fork_version)
     } else {
         service::SignerServiceImpl::new(Arc::clone(&signing_backend), resolved.backend.clone())
             .with_metrics(Arc::clone(&signer_metrics))
             .with_client_cn_allow_list(client_cn_allow_list.clone())
+            .with_genesis_fork_version(resolved.genesis_fork_version)
     };
 
     // Build the PeerSignerService (DVT) now that we have the slashing DB.
@@ -752,6 +761,8 @@ async fn run_serve(
             // SEC-4 residual F1: same primary client-CN allow-list as gRPC so
             // HTTP cannot bypass `--allowed-client-cns` as a parallel oracle.
             client_cn_allow_list: client_cn_allow_list.clone(),
+            // Same network genesis as gRPC for builder-registration equality.
+            genesis_fork_version: resolved.genesis_fork_version,
         };
         let (bound, handle) = http_api::tls::spawn_https_listener(
             &resolved.http_listen_address,
@@ -972,6 +983,7 @@ fn resolve_config(args: &ServeArgs) -> Result<config::ResolvedConfig, Box<dyn st
         has_config && args.http_listen_address == config::DEFAULT_HTTP_LISTEN_ADDRESS;
     let http_tls_mode_is_default =
         has_config && args.http_tls_mode == config::DEFAULT_HTTP_TLS_MODE;
+    let network_is_default = has_config && args.network == "mainnet";
 
     #[cfg(feature = "dvt")]
     let dvt_timeout_is_default = has_config && args.dvt_timeout == 2000;
@@ -1016,6 +1028,8 @@ fn resolve_config(args: &ServeArgs) -> Result<config::ResolvedConfig, Box<dyn st
         http_tls_cert: args.http_tls_cert.as_deref(),
         http_tls_key: args.http_tls_key.as_deref(),
         http_tls_ca_cert: args.http_tls_ca_cert.as_deref(),
+        network: &args.network,
+        network_is_default,
     };
 
     config::merge_with_cli(file_config, &cli)

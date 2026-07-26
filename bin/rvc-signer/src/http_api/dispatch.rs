@@ -11,9 +11,7 @@
 
 use tree_hash::TreeHash;
 
-use crate::sign_plan::{
-    self, client_signing_root_matches, PlanInput, SignPlan, BUILDER_FORK_VERSION_MAINNET,
-};
+use crate::sign_plan::{self, client_signing_root_matches, PlanInput, SignPlan};
 
 use super::request::{SignPayload, SignRequest, WireForkInfo};
 use super::response::HttpSignError;
@@ -22,10 +20,17 @@ use super::response::HttpSignError;
 /// `fork_info` requirement, and apply the `signingRoot` verification policy
 /// (FR-15, FR-16, ADR-007).
 ///
+/// `genesis_fork_version` is the server network genesis (from
+/// [`super::Web3SignerState`]); it is the sole source for builder-registration
+/// domain computation.
+///
 /// Returns the shared [`SignPlan`] for the gate, or a pre-gate `400`
 /// ([`HttpSignError::BadRequest`]) that never reaches the gate.
-pub(super) fn plan_sign(req: &SignRequest) -> Result<SignPlan, HttpSignError> {
-    let input = to_plan_input(req)?;
+pub(super) fn plan_sign(
+    req: &SignRequest,
+    genesis_fork_version: [u8; 4],
+) -> Result<SignPlan, HttpSignError> {
+    let input = to_plan_input(req, genesis_fork_version)?;
     let plan = sign_plan::plan_sign(&input);
     if !client_signing_root_matches(req.signing_root, plan.signing_root) {
         return Err(HttpSignError::BadRequest(
@@ -36,7 +41,10 @@ pub(super) fn plan_sign(req: &SignRequest) -> Result<SignPlan, HttpSignError> {
 }
 
 /// Map a Web3Signer `SignRequest` onto the transport-neutral [`PlanInput`].
-fn to_plan_input(req: &SignRequest) -> Result<PlanInput, HttpSignError> {
+fn to_plan_input(
+    req: &SignRequest,
+    genesis_fork_version: [u8; 4],
+) -> Result<PlanInput, HttpSignError> {
     match &req.payload {
         SignPayload::BlockV2 { beacon_block } => {
             let (fork_version, gvr) = require_fork_info(req)?;
@@ -92,13 +100,10 @@ fn to_plan_input(req: &SignRequest) -> Result<PlanInput, HttpSignError> {
             })
         }
         SignPayload::ValidatorRegistration { validator_registration } => {
-            // NO fork_info (ADR-008): builder domain is fixed over mainnet genesis
-            // fork version + zero gvr. RF4-10 threads per-network genesis.
+            // NO fork_info (ADR-008): builder domain uses the server network
+            // genesis fork version + zero gvr (same source as gRPC).
             let object_root = validator_registration.tree_hash_root().0;
-            Ok(PlanInput::BuilderRegistration {
-                object_root,
-                genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
-            })
+            Ok(PlanInput::BuilderRegistration { object_root, genesis_fork_version })
         }
         SignPayload::VoluntaryExit { voluntary_exit } => {
             let (fork_version, gvr) = require_fork_info(req)?;
@@ -125,6 +130,8 @@ fn require_fork_info(req: &SignRequest) -> Result<([u8; 4], eth_types::Root), Ht
 
 #[cfg(test)]
 mod tests {
+    use crate::sign_plan::BUILDER_FORK_VERSION_MAINNET;
+
     use super::*;
     use crate::sign_plan::Slashing;
     use axum::http::StatusCode;
@@ -210,7 +217,7 @@ mod tests {
     #[test]
     fn block_v2_uses_proposer_domain_and_block_header_root() {
         let req = block_v2(None);
-        let plan = plan_sign(&req).expect("block plan");
+        let plan = plan_sign(&req, BUILDER_FORK_VERSION_MAINNET).expect("block plan");
 
         let SignPayload::BlockV2 { beacon_block } = &req.payload else { panic!("block payload") };
         let domain = compute_domain(DOMAIN_BEACON_PROPOSER, CURRENT_VERSION, expected_gvr());
@@ -223,7 +230,7 @@ mod tests {
     #[test]
     fn attestation_uses_attester_domain_and_carries_epochs() {
         let req = attestation();
-        let plan = plan_sign(&req).expect("attestation plan");
+        let plan = plan_sign(&req, BUILDER_FORK_VERSION_MAINNET).expect("attestation plan");
 
         let SignPayload::Attestation { attestation } = &req.payload else { panic!("att payload") };
         let domain = compute_domain(DOMAIN_BEACON_ATTESTER, CURRENT_VERSION, expected_gvr());
@@ -238,7 +245,8 @@ mod tests {
 
     #[test]
     fn randao_and_aggregation_slot_are_nonslashable_with_distinct_domains() {
-        let randao_plan = plan_sign(&randao(true)).expect("randao plan");
+        let randao_plan =
+            plan_sign(&randao(true), BUILDER_FORK_VERSION_MAINNET).expect("randao plan");
         assert_eq!(randao_plan.slashing, Slashing::NonSlashable);
         let randao_want = compute_signing_root(
             &42u64,
@@ -246,7 +254,8 @@ mod tests {
         );
         assert_eq!(randao_plan.signing_root, randao_want);
 
-        let agg_plan = plan_sign(&aggregation_slot()).expect("aggregation plan");
+        let agg_plan =
+            plan_sign(&aggregation_slot(), BUILDER_FORK_VERSION_MAINNET).expect("aggregation plan");
         assert_eq!(agg_plan.slashing, Slashing::NonSlashable);
         let agg_want = compute_signing_root(
             &77u64,
@@ -267,30 +276,40 @@ mod tests {
 
     #[test]
     fn matching_signing_root_proceeds() {
-        let server_root = plan_sign(&block_v2(None)).unwrap().signing_root;
+        let server_root =
+            plan_sign(&block_v2(None), BUILDER_FORK_VERSION_MAINNET).unwrap().signing_root;
         let req = block_v2(Some(&format!("0x{}", hex::encode(server_root))));
-        let plan = plan_sign(&req).expect("matching signingRoot proceeds");
+        let plan =
+            plan_sign(&req, BUILDER_FORK_VERSION_MAINNET).expect("matching signingRoot proceeds");
         assert_eq!(plan.signing_root, server_root);
     }
 
     #[test]
     fn mismatching_signing_root_is_400_and_no_plan() {
         let bad = format!("0x{}", "ff".repeat(32));
-        let err = plan_sign(&block_v2(Some(&bad))).expect_err("mismatch must 400");
+        let err = plan_sign(&block_v2(Some(&bad)), BUILDER_FORK_VERSION_MAINNET)
+            .expect_err("mismatch must 400");
         let (status, _) = err.status_and_body();
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
     fn absent_or_zero_signing_root_proceeds() {
-        assert!(plan_sign(&block_v2(None)).is_ok(), "absent signingRoot proceeds");
+        assert!(
+            plan_sign(&block_v2(None), BUILDER_FORK_VERSION_MAINNET).is_ok(),
+            "absent signingRoot proceeds"
+        );
         let zero = format!("0x{}", "00".repeat(32));
-        assert!(plan_sign(&block_v2(Some(&zero))).is_ok(), "zero signingRoot proceeds");
+        assert!(
+            plan_sign(&block_v2(Some(&zero)), BUILDER_FORK_VERSION_MAINNET).is_ok(),
+            "zero signingRoot proceeds"
+        );
     }
 
     #[test]
     fn missing_fork_info_is_400() {
-        let err = plan_sign(&randao(false)).expect_err("missing fork_info must 400");
+        let err = plan_sign(&randao(false), BUILDER_FORK_VERSION_MAINNET)
+            .expect_err("missing fork_info must 400");
         let (status, _) = err.status_and_body();
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
@@ -300,12 +319,15 @@ mod tests {
     fn bad_request_bodies_are_static_and_leak_free() {
         let bad_hex = "ff".repeat(32);
         let (_, mismatch_body) =
-            plan_sign(&block_v2(Some(&format!("0x{bad_hex}")))).unwrap_err().status_and_body();
+            plan_sign(&block_v2(Some(&format!("0x{bad_hex}"))), BUILDER_FORK_VERSION_MAINNET)
+                .unwrap_err()
+                .status_and_body();
         assert_eq!(mismatch_body, "signingRoot does not match the server-computed signing root");
         assert!(!mismatch_body.contains(&bad_hex), "must not echo the supplied root");
         assert!(!mismatch_body.contains("0x"), "no hex/material in the body");
 
-        let (_, missing_body) = plan_sign(&randao(false)).unwrap_err().status_and_body();
+        let (_, missing_body) =
+            plan_sign(&randao(false), BUILDER_FORK_VERSION_MAINNET).unwrap_err().status_and_body();
         assert_eq!(missing_body, "fork_info is required for this request type");
     }
 }

@@ -132,6 +132,11 @@ pub struct SignerServiceImpl {
     /// When `None`, all mTLS clients are accepted (backward compatible; startup
     /// logs a warning). mTLS remains mandatory either way.
     client_cn_allow_list: Option<Arc<audit::ClientCnAllowList>>,
+    /// Network genesis fork version ([`eth_types::NetworkPreset`]).
+    ///
+    /// Sole source for builder-registration domain computation across gRPC and
+    /// HTTP. Default is mainnet (`0x00000000`).
+    genesis_fork_version: [u8; 4],
 }
 
 impl SignerServiceImpl {
@@ -141,7 +146,14 @@ impl SignerServiceImpl {
     /// Without a gate, slashable RPCs fail closed; non-slashable RPCs fall
     /// through to the backend (BUG-001).
     pub fn new(backend: Arc<dyn SigningBackend>, backend_name: String) -> Self {
-        Self { backend, backend_name, metrics: None, gate: None, client_cn_allow_list: None }
+        Self {
+            backend,
+            backend_name,
+            metrics: None,
+            gate: None,
+            client_cn_allow_list: None,
+            genesis_fork_version: crate::sign_plan::BUILDER_FORK_VERSION_MAINNET,
+        }
     }
 
     /// Create a v2-capable service with an embedded slashing DB and `SigningGate`.
@@ -198,11 +210,28 @@ impl SignerServiceImpl {
         backend_name: String,
         gate: Arc<SigningGate>,
     ) -> Self {
-        Self { backend, backend_name, metrics: None, gate: Some(gate), client_cn_allow_list: None }
+        Self {
+            backend,
+            backend_name,
+            metrics: None,
+            gate: Some(gate),
+            client_cn_allow_list: None,
+            genesis_fork_version: crate::sign_plan::BUILDER_FORK_VERSION_MAINNET,
+        }
     }
 
     pub fn with_metrics(mut self, metrics: Arc<SignerMetrics>) -> Self {
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Set the network genesis fork version used for builder registration.
+    ///
+    /// Both gRPC and HTTP must be configured with the same value (typically from
+    /// [`eth_types::NetworkPreset`]) so identical registrations produce identical
+    /// signatures across transports.
+    pub fn with_genesis_fork_version(mut self, genesis_fork_version: [u8; 4]) -> Self {
+        self.genesis_fork_version = genesis_fork_version;
         self
     }
 
@@ -215,6 +244,50 @@ impl SignerServiceImpl {
     ) -> Self {
         self.client_cn_allow_list = allow_list;
         self
+    }
+
+    /// Build a [`RequestCtx`] with this service's network genesis fork version.
+    fn request_ctx(
+        &self,
+        client_cn: String,
+        pubkey: PublicKey,
+        pubkey_bytes: [u8; 48],
+        rpc_type: &'static str,
+    ) -> RequestCtx {
+        RequestCtx {
+            client_cn,
+            pubkey,
+            pubkey_bytes,
+            rpc_type,
+            genesis_fork_version: self.genesis_fork_version,
+        }
+    }
+
+    /// Resolve builder-registration genesis fork version.
+    ///
+    /// The configured network genesis is the sole source. An empty request field
+    /// accepts the server value; a non-empty field must be exactly 4 bytes and
+    /// equal the server network (catches client/server network mismatch).
+    #[allow(clippy::result_large_err)]
+    fn resolve_builder_genesis_fork_version(
+        &self,
+        request_bytes: &[u8],
+    ) -> Result<[u8; 4], Status> {
+        if request_bytes.is_empty() {
+            return Ok(self.genesis_fork_version);
+        }
+        let requested: [u8; 4] = request_bytes.try_into().map_err(|_| {
+            Status::invalid_argument(format!(
+                "genesis_fork_version must be 4 bytes, got {}",
+                request_bytes.len()
+            ))
+        })?;
+        if requested != self.genesis_fork_version {
+            return Err(Status::invalid_argument(
+                "genesis_fork_version does not match server network configuration",
+            ));
+        }
+        Ok(self.genesis_fork_version)
     }
 
     /// Override the sign timeout on the embedded gate (builder style).
@@ -406,12 +479,12 @@ impl SignerServiceV2 for SignerServiceImpl {
         let plan =
             plan_sign(&PlanInput::Block { object_root: object_root.0, slot, fork_version, gvr });
 
-        let ctx = RequestCtx {
-            client_cn: client_cn.clone(),
-            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+        let ctx = self.request_ctx(
+            client_cn.clone(),
+            pubkey_from_bytes(&pubkey_bytes)?,
             pubkey_bytes,
-            rpc_type: grpc_sign_type::BEACON_BLOCK,
-        };
+            grpc_sign_type::BEACON_BLOCK,
+        );
         let sig = dispatch_slashable(
             self.require_gate()?,
             self.metrics.as_deref(),
@@ -462,12 +535,12 @@ impl SignerServiceV2 for SignerServiceImpl {
         let plan =
             plan_sign(&PlanInput::Block { object_root: object_root.0, slot, fork_version, gvr });
 
-        let ctx = RequestCtx {
-            client_cn: client_cn.clone(),
-            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+        let ctx = self.request_ctx(
+            client_cn.clone(),
+            pubkey_from_bytes(&pubkey_bytes)?,
             pubkey_bytes,
-            rpc_type: grpc_sign_type::BLINDED_BEACON_BLOCK,
-        };
+            grpc_sign_type::BLINDED_BEACON_BLOCK,
+        );
         let sig = dispatch_slashable(
             self.require_gate()?,
             self.metrics.as_deref(),
@@ -507,12 +580,12 @@ impl SignerServiceV2 for SignerServiceImpl {
         Span::current().record("epoch", epoch);
 
         let plan = plan_sign(&PlanInput::Randao { epoch, fork_version, gvr });
-        let ctx = RequestCtx {
+        let ctx = self.request_ctx(
             client_cn,
-            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_from_bytes(&pubkey_bytes)?,
             pubkey_bytes,
-            rpc_type: grpc_sign_type::RANDAO_REVEAL,
-        };
+            grpc_sign_type::RANDAO_REVEAL,
+        );
         let sig = dispatch_non_slashable(
             self.gate.as_deref(),
             self.backend.as_ref(),
@@ -560,12 +633,12 @@ impl SignerServiceV2 for SignerServiceImpl {
         Span::current().record("target_epoch", target_epoch);
 
         let plan = plan_sign(&PlanInput::Attestation { data: att_data, fork_version, gvr });
-        let ctx = RequestCtx {
-            client_cn: client_cn.clone(),
-            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+        let ctx = self.request_ctx(
+            client_cn.clone(),
+            pubkey_from_bytes(&pubkey_bytes)?,
             pubkey_bytes,
-            rpc_type: grpc_sign_type::ATTESTATION_DATA,
-        };
+            grpc_sign_type::ATTESTATION_DATA,
+        );
         let sig = dispatch_slashable(
             self.require_gate()?,
             self.metrics.as_deref(),
@@ -631,12 +704,12 @@ impl SignerServiceV2 for SignerServiceImpl {
             gvr,
         });
 
-        let ctx = RequestCtx {
-            client_cn: client_cn.clone(),
-            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+        let ctx = self.request_ctx(
+            client_cn.clone(),
+            pubkey_from_bytes(&pubkey_bytes)?,
             pubkey_bytes,
-            rpc_type: grpc_sign_type::AGGREGATE_AND_PROOF,
-        };
+            grpc_sign_type::AGGREGATE_AND_PROOF,
+        );
         let sig = dispatch_non_slashable(
             self.gate.as_deref(),
             self.backend.as_ref(),
@@ -688,12 +761,12 @@ impl SignerServiceV2 for SignerServiceImpl {
 
         let plan =
             plan_sign(&PlanInput::SyncCommitteeMessage { beacon_block_root, fork_version, gvr });
-        let ctx = RequestCtx {
-            client_cn: client_cn.clone(),
-            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+        let ctx = self.request_ctx(
+            client_cn.clone(),
+            pubkey_from_bytes(&pubkey_bytes)?,
             pubkey_bytes,
-            rpc_type: grpc_sign_type::SYNC_COMMITTEE_MESSAGE,
-        };
+            grpc_sign_type::SYNC_COMMITTEE_MESSAGE,
+        );
         let sig = dispatch_non_slashable(
             self.gate.as_deref(),
             self.backend.as_ref(),
@@ -746,12 +819,12 @@ impl SignerServiceV2 for SignerServiceImpl {
             fork_version,
             gvr,
         });
-        let ctx = RequestCtx {
-            client_cn: client_cn.clone(),
-            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+        let ctx = self.request_ctx(
+            client_cn.clone(),
+            pubkey_from_bytes(&pubkey_bytes)?,
             pubkey_bytes,
-            rpc_type: grpc_sign_type::SYNC_AGGREGATOR_SELECTION_DATA,
-        };
+            grpc_sign_type::SYNC_AGGREGATOR_SELECTION_DATA,
+        );
         let sig = dispatch_non_slashable(
             self.gate.as_deref(),
             self.backend.as_ref(),
@@ -814,12 +887,12 @@ impl SignerServiceV2 for SignerServiceImpl {
         let object_root = cap.tree_hash_root().0;
         let plan = plan_sign(&PlanInput::ContributionAndProof { object_root, fork_version, gvr });
 
-        let ctx = RequestCtx {
-            client_cn: client_cn.clone(),
-            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+        let ctx = self.request_ctx(
+            client_cn.clone(),
+            pubkey_from_bytes(&pubkey_bytes)?,
             pubkey_bytes,
-            rpc_type: grpc_sign_type::CONTRIBUTION_AND_PROOF,
-        };
+            grpc_sign_type::CONTRIBUTION_AND_PROOF,
+        );
         let sig = dispatch_non_slashable(
             self.gate.as_deref(),
             self.backend.as_ref(),
@@ -844,8 +917,9 @@ impl SignerServiceV2 for SignerServiceImpl {
 
     // ── SignBuilderRegistration ────────────────────────────────────────────────
     //
-    // domain = DOMAIN_APPLICATION_BUILDER + GENESIS_FORK_VERSION + ZERO_HASH.
-    // Empty genesis_fork_version ⇒ mainnet. Not slashable.
+    // domain = DOMAIN_APPLICATION_BUILDER + network genesis fork version + ZERO_HASH.
+    // Network genesis comes from server config (NetworkPreset); request field if
+    // present must match. Not slashable.
     #[tracing::instrument(name = "signer.v2.sign_builder_registration", skip_all, fields(pubkey))]
     async fn sign_builder_registration(
         &self,
@@ -873,24 +947,17 @@ impl SignerServiceV2 for SignerServiceImpl {
             pubkey: pubkey_bytes,
         };
 
-        let genesis_fork_version: [u8; 4] = if r.genesis_fork_version.is_empty() {
-            [0u8; 4]
-        } else {
-            r.genesis_fork_version.as_slice().try_into().map_err(|_| {
-                Status::invalid_argument(format!(
-                    "genesis_fork_version must be 4 bytes, got {}",
-                    r.genesis_fork_version.len()
-                ))
-            })?
-        };
+        // Sole source: server network config. Non-empty request must match.
+        let genesis_fork_version =
+            self.resolve_builder_genesis_fork_version(&r.genesis_fork_version)?;
         let plan = plan_builder_registration(&registration, genesis_fork_version);
 
-        let ctx = RequestCtx {
+        let ctx = self.request_ctx(
             client_cn,
-            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_from_bytes(&pubkey_bytes)?,
             pubkey_bytes,
-            rpc_type: grpc_sign_type::BUILDER_REGISTRATION,
-        };
+            grpc_sign_type::BUILDER_REGISTRATION,
+        );
         let sig = dispatch_non_slashable(
             self.gate.as_deref(),
             self.backend.as_ref(),
@@ -939,12 +1006,12 @@ impl SignerServiceV2 for SignerServiceImpl {
         let exit = VoluntaryExit { epoch, validator_index };
         let plan = plan_voluntary_exit(&exit, fork_version, gvr);
 
-        let ctx = RequestCtx {
+        let ctx = self.request_ctx(
             client_cn,
-            pubkey: pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_from_bytes(&pubkey_bytes)?,
             pubkey_bytes,
-            rpc_type: grpc_sign_type::VOLUNTARY_EXIT,
-        };
+            grpc_sign_type::VOLUNTARY_EXIT,
+        );
         let sig = dispatch_non_slashable(
             self.gate.as_deref(),
             self.backend.as_ref(),

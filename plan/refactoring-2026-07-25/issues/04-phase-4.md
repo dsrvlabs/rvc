@@ -703,13 +703,13 @@ cross-transport oracle.
 3. Write the cross-transport equality test as a first-class integration test, not a unit test.
 
 **Acceptance criteria:**
-- [ ] **Cross-transport signature-equality test (phase-gate criterion):** the same builder registration
+- [x] **Cross-transport signature-equality test (phase-gate criterion):** the same builder registration
       submitted over gRPC, HTTP and DVT yields byte-identical signatures — and the same test covers at
       least one slashable duty (attestation) and one other non-slashable duty.
-- [ ] Mainnet builder-registration signatures are unchanged (KAT); non-mainnet networks change
+- [x] Mainnet builder-registration signatures are unchanged (KAT); non-mainnet networks change
       deliberately and the change is release-noted.
-- [ ] `rg` shows exactly one source for the builder fork version.
-- [ ] Standing invariant green.
+- [x] `rg` shows exactly one source for the builder fork version.
+- [x] Standing invariant green.
 
 **TDD test plan** (`bin/rvc-signer/tests/cross_transport.rs`, extending the existing
 `bin/rvc-signer/src/cross_transport.rs` harness):

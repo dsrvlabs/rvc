@@ -75,6 +75,11 @@ pub struct Web3SignerState {
     pub metrics: Arc<crate::metrics::SignerMetrics>,
     /// Optional primary client-CN allow-list (SEC-4). Same Arc as gRPC when set.
     pub client_cn_allow_list: Option<Arc<crate::audit::ClientCnAllowList>>,
+    /// Network genesis fork version ([`eth_types::NetworkPreset`]).
+    ///
+    /// Sole source for builder-registration domain computation (must match the
+    /// gRPC service configuration for cross-transport signature equality).
+    pub genesis_fork_version: [u8; 4],
 }
 
 /// Build the Web3Signer HTTP API `Router`.
@@ -226,6 +231,7 @@ pub(crate) mod test_support {
             audit: AuditCfg::default(),
             metrics: Arc::new(crate::metrics::SignerMetrics::new()),
             client_cn_allow_list: None,
+            genesis_fork_version: crate::sign_plan::BUILDER_FORK_VERSION_MAINNET,
         }
     }
 }

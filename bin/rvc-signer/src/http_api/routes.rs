@@ -277,7 +277,8 @@ async fn sign_inner(
 
     // 3. Compute the signing root + slashing inputs; enforce the signingRoot /
     //    fork_info policy (the shared SignPlan engine owns the domain).
-    let plan = plan_sign(&req)?;
+    //    Builder registration uses state.genesis_fork_version (network config).
+    let plan = plan_sign(&req, state.genesis_fork_version)?;
 
     // 4. Shared dispatcher (same A7 metrics path as gRPC). Gate method selection
     //    is carried on `plan.non_slashable_op` — no second payload→gate match here.
@@ -287,6 +288,7 @@ async fn sign_inner(
         pubkey,
         pubkey_bytes,
         rpc_type: http_a7_sign_type(&req.payload),
+        genesis_fork_version: state.genesis_fork_version,
     };
     let sig = dispatch_sign(
         Some(state.gate.as_ref()),

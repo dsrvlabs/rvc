@@ -27,11 +27,13 @@ use signer::{SigningGate, SigningGateError};
 use crate::backend::{SigningBackend, SigningBackendError};
 use crate::metrics::{classify_error, classify_gate_error, record_sign, SignerMetrics};
 
-/// Fixed application-builder fork version used when the caller does not supply
-/// a network-specific genesis fork version (mainnet `0x00000000`). Matches the
-/// historical HTTP / gRPC "empty ⇒ mainnet" default. Per-network genesis fork
-/// threading is RF4-10.
-pub const BUILDER_FORK_VERSION_MAINNET: [u8; 4] = [0, 0, 0, 0];
+/// Default builder / network genesis fork version (mainnet `0x00000000`).
+///
+/// Single source for the default: [`eth_types::NetworkPreset::MAINNET`]. All
+/// transports read the configured network genesis from service state (see
+/// [`RequestCtx::genesis_fork_version`]); they do not hardcode a fork version.
+pub const BUILDER_FORK_VERSION_MAINNET: [u8; 4] =
+    eth_types::NetworkPreset::MAINNET.genesis_fork_version;
 
 /// The 32-byte zero root — builder registration uses a zero GVR; a present-but
 /// zero client `signingRoot` means "do not verify".
@@ -203,6 +205,14 @@ pub struct RequestCtx {
     pub pubkey_bytes: [u8; 48],
     /// Bounded metrics `type` label ([`crate::metrics::grpc_sign_type`]).
     pub rpc_type: &'static str,
+    /// Network genesis fork version from server config ([`eth_types::NetworkPreset`]).
+    ///
+    /// Sole source for builder-registration domain computation. Transports copy
+    /// this into [`PlanInput::BuilderRegistration`] before dispatch (the signing
+    /// root already embeds the domain; this field keeps the network identity on
+    /// the request context for equality / audit).
+    #[allow(dead_code)]
+    pub genesis_fork_version: [u8; 4],
 }
 
 /// Which non-slashable gate method to invoke for a planned root.

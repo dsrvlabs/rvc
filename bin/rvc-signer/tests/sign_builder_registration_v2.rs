@@ -2,17 +2,24 @@
 //! `sign_builder_registration`.
 //!
 //! Builder-registration domain:
-//! domain = DOMAIN_APPLICATION_BUILDER + GENESIS_FORK_VERSION + ZERO_HASH
-//! `GENESIS_FORK_VERSION` is a per-network config value (mainnet 0x00000000,
-//! Holesky 0x01017000, …), carried on the request, NOT a spec-fixed constant.
+//! `domain = DOMAIN_APPLICATION_BUILDER + network_genesis_fork_version + ZERO_HASH`
+//!
+//! The **server network config** (`--network` / `[signer].network`, default
+//! mainnet) is the sole source for `network_genesis_fork_version`. The request's
+//! `genesis_fork_version` field, if empty, means "use server config"; if
+//! non-empty (exactly 4 bytes) it must **equal** the server network (mismatch
+//! → `InvalidArgument`). HTTP has no request field and always uses server config.
+//!
 //! The caller supplies `pubkey` in the top-level proto field AND that same
-//! pubkey is used as the registration body's pubkey.  If they differ the
-//! server returns `Status::invalid_argument`.
+//! pubkey is used as the registration body's pubkey.
 
 use tonic::Request;
 
 mod helpers;
-use helpers::{make_service_with_db, make_service_with_db_unknown_key, KNOWN_PUBKEY_BYTES};
+use helpers::{
+    make_service_with_db, make_service_with_db_unknown_key, make_service_with_genesis,
+    KNOWN_PUBKEY_BYTES,
+};
 
 use crypto::{compute_domain, compute_signing_root};
 use eth_types::{ValidatorRegistrationV1, DOMAIN_APPLICATION_BUILDER};
@@ -23,8 +30,8 @@ use rvc_signer_bin::proto::signer_v2::signer_service_server::SignerService;
 
 /// Build a canonical builder-registration request using the known test key.
 ///
-/// `genesis_fork_version` is the 4-byte per-network value carried on the
-/// request; an empty `Vec` means mainnet (`0x00000000`).
+/// `genesis_fork_version`: empty → use server network config; non-empty must be
+/// exactly 4 bytes and equal the server's configured genesis.
 fn canonical_request(
     pubkey: Vec<u8>,
     genesis_fork_version: Vec<u8>,
@@ -55,9 +62,9 @@ fn expected_signing_root(pubkey: [u8; 48], genesis_fork_version: [u8; 4]) -> [u8
 
 // ── Test 1: happy path (mainnet KAT) — signature verifies against pubkey ──────
 //
-// Mainnet GENESIS_FORK_VERSION = 0x00000000. The request omits the field
-// (empty `Vec`), which the server must treat as `[0u8; 4]`. This pins mainnet
-// so the per-network GREEN fix cannot silently change mainnet behavior.
+// Default server network is mainnet (genesis 0x00000000). Empty request field
+// uses that config. Pins mainnet so non-mainnet network wiring cannot silently
+// change mainnet signatures.
 
 #[tokio::test]
 async fn test_builder_registration_happy_path() {
@@ -86,27 +93,22 @@ async fn test_builder_registration_happy_path() {
     );
 }
 
-// ── Test 1b: Holesky KAT — server must use the per-network fork version ───────
+// ── Test 1b: Holesky KAT — server network config supplies the genesis fork ───
 //
-// Holesky GENESIS_FORK_VERSION = 0x01017000 (report §4.2 network table;
-// Lighthouse `consensus/types/src/core/chain_spec.rs`). The request carries the
-// 4-byte version and the returned signature must verify against a domain built
-// from the byte-pinned literal `[0x01, 0x01, 0x70, 0x00]` — NOT an oracle that
-// re-derives the version through the server path. This is RED until the server
-// reads `genesis_fork_version` (issue 2.3): the unfixed server signs over the
-// mainnet `[0u8; 4]` domain, so the Holesky verification fails.
+// Holesky GENESIS_FORK_VERSION = 0x01017000 (NetworkPreset::HOLESKY). The
+// server is configured with that genesis; request field may be empty or must
+// match. Signature verifies against the byte-pinned holesky domain.
 
 #[tokio::test]
 async fn sign_builder_registration_holesky_domain() {
-    const HOLESKY_GENESIS_FORK_VERSION: [u8; 4] = [0x01, 0x01, 0x70, 0x00];
+    const HOLESKY_GENESIS_FORK_VERSION: [u8; 4] =
+        eth_types::NetworkPreset::HOLESKY.genesis_fork_version;
 
-    let (svc, _db_path) = make_service_with_db();
+    let (svc, _db_path) = make_service_with_genesis(HOLESKY_GENESIS_FORK_VERSION);
     let pubkey_bytes = KNOWN_PUBKEY_BYTES.to_vec();
 
-    let req = Request::new(canonical_request(
-        pubkey_bytes.clone(),
-        HOLESKY_GENESIS_FORK_VERSION.to_vec(),
-    ));
+    // Empty request field → server network config.
+    let req = Request::new(canonical_request(pubkey_bytes.clone(), vec![]));
 
     let resp = svc
         .sign_builder_registration(req)
@@ -124,6 +126,52 @@ async fn sign_builder_registration_holesky_domain() {
         "signature must verify against the Holesky DOMAIN_APPLICATION_BUILDER \
          signing root with GENESIS_FORK_VERSION=0x01017000 and ZERO_HASH"
     );
+}
+
+// ── Test 1c: request genesis_fork_version must match server network ───────────
+
+#[tokio::test]
+async fn sign_builder_registration_mismatched_request_genesis_rejected() {
+    let (svc, _db_path) = make_service_with_db(); // mainnet default
+    let holesky = eth_types::NetworkPreset::HOLESKY.genesis_fork_version;
+    let req = Request::new(canonical_request(KNOWN_PUBKEY_BYTES.to_vec(), holesky.to_vec()));
+    let err = svc
+        .sign_builder_registration(req)
+        .await
+        .expect_err("request genesis must match server network");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+}
+
+// ── Test 1d: non-empty request genesis equal to server config is accepted ─────
+
+#[tokio::test]
+async fn sign_builder_registration_matching_request_genesis_accepted() {
+    const HOLESKY: [u8; 4] = eth_types::NetworkPreset::HOLESKY.genesis_fork_version;
+    let (svc, _db_path) = make_service_with_genesis(HOLESKY);
+    let pubkey_bytes = KNOWN_PUBKEY_BYTES.to_vec();
+
+    let empty = Request::new(canonical_request(pubkey_bytes.clone(), vec![]));
+    let matching = Request::new(canonical_request(pubkey_bytes.clone(), HOLESKY.to_vec()));
+
+    let sig_empty = svc
+        .sign_builder_registration(empty)
+        .await
+        .expect("empty request uses server holesky")
+        .into_inner()
+        .signature;
+    let sig_match = svc
+        .sign_builder_registration(matching)
+        .await
+        .expect("matching request genesis accepted")
+        .into_inner()
+        .signature;
+    assert_eq!(sig_empty, sig_match, "empty and matching request must sign identically");
+
+    let pubkey_arr: [u8; 48] = pubkey_bytes.try_into().unwrap();
+    let root = expected_signing_root(pubkey_arr, HOLESKY);
+    let pk = crypto::PublicKey::from_bytes(&pubkey_arr).unwrap();
+    let sig = crypto::Signature::from_bytes(&sig_match).unwrap();
+    assert!(sig.verify(&pk, &root).is_ok());
 }
 
 // ── Test 2: pubkey mismatch — request.pubkey != registration.pubkey ───────────
@@ -194,9 +242,9 @@ async fn test_fee_recipient_wrong_length_rejected() {
 
 // ── Test 3b: non-empty, non-4-byte genesis_fork_version is rejected ───────────
 //
-// Empty ⇒ mainnet (covered by the happy path); exactly 4 bytes ⇒ that network
-// (covered by the Holesky KAT). Any other length must fail closed with
-// `InvalidArgument`, mirroring the fee_recipient length check.
+// Empty ⇒ use server network (happy path / Holesky KAT). Non-empty must be
+// exactly 4 bytes and equal the server; any other length fails closed with
+// `InvalidArgument`.
 
 #[tokio::test]
 async fn test_genesis_fork_version_wrong_length_rejected() {
