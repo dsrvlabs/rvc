@@ -46,10 +46,13 @@ use crate::proto::signer_v2::{
 use crypto::{
     compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
 };
-use eth_types::{
-    decode_beacon_block_ssz, AttestationData, Checkpoint, SszDecodeError, DOMAIN_SYNC_COMMITTEE,
-};
+use eth_types::DOMAIN_SYNC_COMMITTEE;
 use slashing::SlashingDb;
+
+use crate::grpc_common::{
+    decode_attestation_data, decode_beacon_block, decode_fork_info, validate_pubkey,
+    validate_root32,
+};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PeerSignerServiceImpl (v2)
@@ -101,33 +104,7 @@ impl PeerSignerServiceImpl {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[allow(clippy::result_large_err)]
-fn validate_pubkey(pubkey: &[u8]) -> Result<[u8; 48], Status> {
-    pubkey.try_into().map_err(|_| {
-        Status::invalid_argument(format!("pubkey must be 48 bytes, got {}", pubkey.len()))
-    })
-}
-
-#[allow(clippy::result_large_err)]
-fn validate_fork_version(bytes: &[u8], field_name: &str) -> Result<[u8; 4], Status> {
-    bytes.try_into().map_err(|_| {
-        Status::invalid_argument(format!("{field_name} must be 4 bytes, got {}", bytes.len()))
-    })
-}
-
-#[allow(clippy::result_large_err)]
-fn validate_gvr(gvr: &[u8]) -> Result<[u8; 32], Status> {
-    gvr.try_into().map_err(|_| {
-        Status::invalid_argument(format!(
-            "genesis_validators_root must be 32 bytes, got {}",
-            gvr.len()
-        ))
-    })
-}
-
-fn ssz_err(e: SszDecodeError) -> Status {
-    Status::invalid_argument(format!("SSZ decode error: {e}"))
-}
+// Field validators + proto decode live in `crate::grpc_common` (shared with SignerService).
 
 fn slashing_err(e: slashing::SlashingError) -> Status {
     use slashing::SlashingError;
@@ -227,13 +204,10 @@ impl PeerSignerService for PeerSignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let fork_info =
-            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
-        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
-        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
 
         // 3. Decode block and compute signing root.
-        let block = decode_beacon_block_ssz(&r.block_ssz, r.fork_id).map_err(ssz_err)?;
+        let block = decode_beacon_block(&r.block_ssz, r.fork_id)?;
         let slot = block.slot;
         Span::current().record("slot", slot);
 
@@ -327,53 +301,12 @@ impl PeerSignerService for PeerSignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let fork_info =
-            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
-        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
-        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
 
         // 3. Decode AttestationData from proto fields.
-        let proto_data =
-            r.data.ok_or_else(|| Status::invalid_argument("attestation data required"))?;
-        let proto_source = proto_data
-            .source
-            .ok_or_else(|| Status::invalid_argument("source checkpoint required"))?;
-        let proto_target = proto_data
-            .target
-            .ok_or_else(|| Status::invalid_argument("target checkpoint required"))?;
-
-        let source_root: [u8; 32] = proto_source.root.as_slice().try_into().map_err(|_| {
-            Status::invalid_argument(format!(
-                "source.root must be 32 bytes, got {}",
-                proto_source.root.len()
-            ))
-        })?;
-        let target_root: [u8; 32] = proto_target.root.as_slice().try_into().map_err(|_| {
-            Status::invalid_argument(format!(
-                "target.root must be 32 bytes, got {}",
-                proto_target.root.len()
-            ))
-        })?;
-        let beacon_block_root: [u8; 32] =
-            proto_data.beacon_block_root.as_slice().try_into().map_err(|_| {
-                Status::invalid_argument(format!(
-                    "beacon_block_root must be 32 bytes, got {}",
-                    proto_data.beacon_block_root.len()
-                ))
-            })?;
-
-        let source_epoch = proto_source.epoch;
-        let target_epoch = proto_target.epoch;
+        let (att_data, source_epoch, target_epoch) = decode_attestation_data(r.data)?;
         Span::current().record("source_epoch", source_epoch);
         Span::current().record("target_epoch", target_epoch);
-
-        let att_data = AttestationData {
-            slot: proto_data.slot,
-            index: proto_data.index,
-            beacon_block_root,
-            source: Checkpoint { epoch: source_epoch, root: source_root },
-            target: Checkpoint { epoch: target_epoch, root: target_root },
-        };
 
         let domain = compute_domain(DOMAIN_BEACON_ATTESTER, current_version, gvr);
         let signing_root = compute_signing_root(&att_data, domain);
@@ -461,19 +394,10 @@ impl PeerSignerService for PeerSignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let fork_info =
-            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
-        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
-        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
 
         let slot = r.slot;
-        let beacon_block_root: [u8; 32] =
-            r.beacon_block_root.as_slice().try_into().map_err(|_| {
-                Status::invalid_argument(format!(
-                    "beacon_block_root must be 32 bytes, got {}",
-                    r.beacon_block_root.len()
-                ))
-            })?;
+        let beacon_block_root = validate_root32(&r.beacon_block_root, "beacon_block_root")?;
         Span::current().record("slot", slot);
 
         // 3. Compute signing root for sync committee message.
@@ -562,10 +486,8 @@ mod tests {
     }
 
     fn make_db() -> Arc<SlashingDb> {
-        let f = tempfile::NamedTempFile::new().unwrap();
-        let path = f.path().to_path_buf();
-        std::mem::forget(f);
-        Arc::new(SlashingDb::open(&path).expect("open test DB"))
+        // In-memory: avoids SEC-3 CorruptOrEmpty on 0-byte NamedTempFile paths.
+        Arc::new(SlashingDb::open_in_memory().expect("open test DB"))
     }
 
     fn make_service(

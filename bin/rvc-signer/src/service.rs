@@ -48,6 +48,11 @@ use tracing::Span;
 use crate::audit;
 use crate::backend::signer_adapter::SigningBackendAsSigner;
 use crate::backend::{SigningBackend, SigningBackendError};
+use crate::grpc_common::{
+    decode_attestation, decode_attestation_data, decode_beacon_block, decode_blinded_beacon_block,
+    decode_fork_info, decode_sync_committee_contribution, validate_pubkey, validate_root32,
+    validate_selection_proof,
+};
 use crate::metrics::{
     classify_error, classify_gate_error, grpc_sign_type, record_sign, SignerMetrics,
 };
@@ -69,9 +74,7 @@ use crypto::{
     DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO,
 };
 use eth_types::{
-    decode_attestation_ssz, decode_beacon_block_ssz, decode_blinded_beacon_block_ssz,
-    decode_sync_committee_contribution_ssz, AggregateAndProof, AttestationData, Checkpoint,
-    ContributionAndProof, SszDecodeError, SyncAggregatorSelectionData, ValidatorRegistrationV1,
+    AggregateAndProof, ContributionAndProof, SyncAggregatorSelectionData, ValidatorRegistrationV1,
     VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
     DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
     DOMAIN_VOLUNTARY_EXIT,
@@ -353,55 +356,7 @@ fn finish_backend_sign(
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Validate that `pubkey` is exactly 48 bytes.
-#[allow(clippy::result_large_err)]
-fn validate_pubkey(pubkey: &[u8]) -> Result<[u8; 48], Status> {
-    pubkey.try_into().map_err(|_| {
-        Status::invalid_argument(format!("pubkey must be 48 bytes, got {}", pubkey.len()))
-    })
-}
-
-/// Validate that a byte slice is exactly 4 bytes (fork version).
-#[allow(clippy::result_large_err)]
-fn validate_fork_version(bytes: &[u8], field_name: &str) -> Result<[u8; 4], Status> {
-    bytes.try_into().map_err(|_| {
-        Status::invalid_argument(format!("{field_name} must be 4 bytes, got {}", bytes.len()))
-    })
-}
-
-/// Validate that `gvr` is exactly 32 bytes.
-#[allow(clippy::result_large_err)]
-fn validate_gvr(gvr: &[u8]) -> Result<[u8; 32], Status> {
-    gvr.try_into().map_err(|_| {
-        Status::invalid_argument(format!(
-            "genesis_validators_root must be 32 bytes, got {}",
-            gvr.len()
-        ))
-    })
-}
-
-/// Validate that `selection_proof` is exactly 96 bytes (a BLS signature share).
-///
-/// The proto schema for `AggregateAndProof` and `ContributionAndProof` documents
-/// `selection_proof` as a 96-byte BLS signature. The server does NOT verify the
-/// signature itself — that is the client's responsibility — but the length must
-/// be enforced because `vec_u8_tree_hash_root` is permissive and would silently
-/// produce a wrong signing root for any other length.
-#[allow(clippy::result_large_err)]
-fn validate_selection_proof(bytes: &[u8]) -> Result<Vec<u8>, Status> {
-    if bytes.len() != 96 {
-        return Err(Status::invalid_argument(format!(
-            "selection_proof must be 96 bytes, got {}",
-            bytes.len()
-        )));
-    }
-    Ok(bytes.to_vec())
-}
-
-/// Convert a `SszDecodeError` to a gRPC `Status::invalid_argument`.
-fn ssz_err(e: SszDecodeError) -> Status {
-    Status::invalid_argument(format!("SSZ decode error: {e}"))
-}
+// Field validators + proto decode live in `crate::grpc_common` (shared with DVT).
 
 /// Map a `SigningGateError` to a gRPC `Status`.
 ///
@@ -502,12 +457,9 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let fork_info =
-            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
-        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
-        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
 
-        let block = decode_beacon_block_ssz(&r.block_ssz, r.fork_id).map_err(ssz_err)?;
+        let block = decode_beacon_block(&r.block_ssz, r.fork_id)?;
         let slot = block.slot;
         Span::current().record("slot", slot);
 
@@ -558,12 +510,9 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let fork_info =
-            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
-        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
-        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
 
-        let block = decode_blinded_beacon_block_ssz(&r.block_ssz, r.fork_id).map_err(ssz_err)?;
+        let block = decode_blinded_beacon_block(&r.block_ssz, r.fork_id)?;
         let slot = block.slot;
         Span::current().record("slot", slot);
 
@@ -609,10 +558,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let fork_info =
-            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
-        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
-        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
 
         let epoch = r.epoch;
         Span::current().record("epoch", epoch);
@@ -669,55 +615,14 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let fork_info =
-            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
-        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
-        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
 
         // Decode AttestationData from proto message fields.
         // Per ISSUE-1.6b spec: the proto carries AttestationData as explicit fields.
         // EIP-7549 index-zeroing is the client's responsibility (H-2 / Phase 2).
-        let proto_data =
-            r.data.ok_or_else(|| Status::invalid_argument("attestation data required"))?;
-        let proto_source = proto_data
-            .source
-            .ok_or_else(|| Status::invalid_argument("source checkpoint required"))?;
-        let proto_target = proto_data
-            .target
-            .ok_or_else(|| Status::invalid_argument("target checkpoint required"))?;
-
-        let source_root: [u8; 32] = proto_source.root.as_slice().try_into().map_err(|_| {
-            Status::invalid_argument(format!(
-                "source.root must be 32 bytes, got {}",
-                proto_source.root.len()
-            ))
-        })?;
-        let target_root: [u8; 32] = proto_target.root.as_slice().try_into().map_err(|_| {
-            Status::invalid_argument(format!(
-                "target.root must be 32 bytes, got {}",
-                proto_target.root.len()
-            ))
-        })?;
-        let beacon_block_root: [u8; 32] =
-            proto_data.beacon_block_root.as_slice().try_into().map_err(|_| {
-                Status::invalid_argument(format!(
-                    "beacon_block_root must be 32 bytes, got {}",
-                    proto_data.beacon_block_root.len()
-                ))
-            })?;
-
-        let source_epoch = proto_source.epoch;
-        let target_epoch = proto_target.epoch;
+        let (att_data, source_epoch, target_epoch) = decode_attestation_data(r.data)?;
         Span::current().record("source_epoch", source_epoch);
         Span::current().record("target_epoch", target_epoch);
-
-        let att_data = AttestationData {
-            slot: proto_data.slot,
-            index: proto_data.index,
-            beacon_block_root,
-            source: Checkpoint { epoch: source_epoch, root: source_root },
-            target: Checkpoint { epoch: target_epoch, root: target_root },
-        };
 
         let domain = compute_domain(DOMAIN_BEACON_ATTESTER, current_version, gvr);
         let signing_root = compute_signing_root(&att_data, domain);
@@ -777,13 +682,10 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let fork_info =
-            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
-        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
-        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
 
         // Decode the inner Attestation from aggregate_ssz.
-        let attestation = decode_attestation_ssz(&r.aggregate_ssz, r.fork_id).map_err(ssz_err)?;
+        let attestation = decode_attestation(&r.aggregate_ssz, r.fork_id)?;
 
         let source_epoch = attestation.data.source.epoch;
         let target_epoch = attestation.data.target.epoch;
@@ -855,21 +757,12 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let fork_info =
-            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
-        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
-        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
 
         let slot = r.slot;
         Span::current().record("slot", slot);
 
-        let beacon_block_root: [u8; 32] =
-            r.beacon_block_root.as_slice().try_into().map_err(|_| {
-                Status::invalid_argument(format!(
-                    "beacon_block_root must be 32 bytes, got {}",
-                    r.beacon_block_root.len()
-                ))
-            })?;
+        let beacon_block_root = validate_root32(&r.beacon_block_root, "beacon_block_root")?;
 
         // Sync committee messages sign over beacon_block_root directly.
         // Domain: DOMAIN_SYNC_COMMITTEE (0x07000000).
@@ -927,10 +820,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let fork_info =
-            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
-        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
-        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
 
         let slot = r.slot;
         Span::current().record("slot", slot);
@@ -998,13 +888,9 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let fork_info =
-            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
-        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
-        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
 
-        let contribution = decode_sync_committee_contribution_ssz(&r.contribution_ssz, r.fork_id)
-            .map_err(ssz_err)?;
+        let contribution = decode_sync_committee_contribution(&r.contribution_ssz, r.fork_id)?;
 
         let slot = contribution.slot;
         Span::current().record("slot", slot);
@@ -1155,10 +1041,7 @@ impl SignerServiceV2 for SignerServiceImpl {
         let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
         Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let fork_info =
-            r.fork_info.ok_or_else(|| Status::invalid_argument("fork_info required"))?;
-        let current_version = validate_fork_version(&fork_info.current_version, "current_version")?;
-        let gvr = validate_gvr(&fork_info.genesis_validators_root)?;
+        let (current_version, gvr) = decode_fork_info(r.fork_info)?;
 
         let epoch = r.epoch;
         let validator_index = r.validator_index;
@@ -1798,8 +1681,8 @@ mod tests {
         // recording fails the test (RF1-09 / D4 safety net).
         use eth_types::{
             encode_attestation_ssz, encode_blinded_beacon_block_ssz,
-            encode_sync_committee_contribution_ssz, Attestation, BlindedBeaconBlock,
-            SyncCommitteeContribution,
+            encode_sync_committee_contribution_ssz, Attestation, AttestationData,
+            BlindedBeaconBlock, Checkpoint, SyncCommitteeContribution,
         };
 
         let pubkey = test_pubkey_bytes();

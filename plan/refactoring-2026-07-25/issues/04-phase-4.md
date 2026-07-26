@@ -610,12 +610,12 @@ authorization gap on the other transport.
 3. Delete the duplicates; `rg` proves single definition.
 
 **Acceptance criteria:**
-- [ ] Each validator is defined exactly once (`rg 'fn validate_pubkey'` == 1).
-- [ ] Existing rejection tests for both `service.rs` and `peer_service.rs` pass unchanged, including the
+- [x] Each validator is defined exactly once (`rg 'fn validate_pubkey'` == 1).
+- [x] Existing rejection tests for both `service.rs` and `peer_service.rs` pass unchanged, including the
       length-boundary cases (`test_validate_selection_proof_rejects_short/long/empty`,
       `service.rs:1137-1150`).
-- [ ] Error strings are byte-identical to the current ones (asserted) so clients see no change.
-- [ ] Standing invariant green.
+- [x] Error strings are byte-identical to the current ones (asserted) so clients see no change.
+- [x] Standing invariant green.
 
 **TDD test plan** (`bin/rvc-signer/src/grpc_common.rs` `#[cfg(test)]`):
 - **RED first:** `test_dvt_and_signer_service_share_one_pubkey_validator` — a test asserting a single
