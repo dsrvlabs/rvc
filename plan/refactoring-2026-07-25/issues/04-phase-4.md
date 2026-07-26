@@ -748,13 +748,13 @@ One generic `sign_rpc` helper collapses each method to request construction plus
    config conditionally.
 
 **Acceptance criteria:**
-- [ ] Each of the 10 methods is ≤ ~15 lines.
-- [ ] `connect()` has one channel-construction path.
-- [ ] Existing grpc-signer tests pass unchanged, including
+- [x] Each of the 10 methods is ≤ ~15 lines.
+- [x] `connect()` has one channel-construction path.
+- [x] Existing grpc-signer tests pass unchanged, including
       `test_grpc_remote_signer_not_implements_raw_signer` (`client.rs:873`) and the redaction tests
       (`:849-866`).
-- [ ] Wire-level integration test green against the existing harness.
-- [ ] Standing invariant green.
+- [x] Wire-level integration test green against the existing harness.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_all_typed_signer_methods_route_through_sign_rpc` — behavioral proxy: inject a
