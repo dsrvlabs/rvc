@@ -358,65 +358,33 @@ fn finish_backend_sign(
 
 // Field validators + proto decode live in `crate::grpc_common` (shared with DVT).
 
-/// Map a `SigningGateError` to a gRPC `Status`.
+/// Map a `SigningGateError` to a gRPC `Status` via shared [`signer::classify`].
 ///
-/// # Error sanitization
+/// Does **not** match on `SigningGateError` variants — only on [`GateErrClass`].
+/// Sanitization, client messages, and server-side detail logging are owned by
+/// the library classifier so HTTP cannot drift.
 ///
-/// SQLite paths, rusqlite internals, and other low-level DB details MUST NOT
-/// be forwarded to gRPC callers.  Only slashing-violation details
-/// (`SlashableBlock`/`SlashableAttestation` — which carry epoch/slot numbers
-/// safe to surface) are included in the response body.  All other DB errors
-/// are logged server-side and a generic message is returned to the caller.
+/// # Status mapping
 ///
-/// # Mapping rationale
+/// | [`GateErrClass`] | gRPC code |
+/// |---|---|
+/// | `BlockedByDoppelganger` / `SlashingBlocked` | `FailedPrecondition` |
+/// | `CommitFailed` / `Internal` | `Internal` |
+/// | `KeyNotFound` | `NotFound` |
+/// Map a gate error to gRPC `Status` via [`signer::classify`].
 ///
-/// - `BlockedByDoppelganger` → `FailedPrecondition`: validator not yet cleared;
-///   caller should back off and retry after the monitoring window.
-/// - `SlashingBlocked(SlashableBlock|SlashableAttestation)` →
-///   `FailedPrecondition` with violation details: slashable conflict detected.
-///   Caller MUST NOT retry with a different root for the same slot/epoch.
-/// - `SlashingBlocked(other)` → `FailedPrecondition` generic: DB I/O error
-///   during staging — detail is logged server-side to avoid leaking rusqlite paths.
-/// - `CommitFailed` → `Internal` generic: sign succeeded but DB write
-///   failed; same-root retry is safe.  Detail logged server-side.
-/// - `KeyNotFound` → `NotFound`: pubkey not loaded in backend.
-/// - `SigningFailed` → `Internal`: BLS backend error or sign timeout.  Detail
-///   logged server-side.
-/// - `UnknownPubkey` → `NotFound`: consistent with `KeyNotFound`.  Currently
-///   unreachable (the gate returns `BlockedByDoppelganger` for unknown pubkeys
-///   because `is_signing_enabled` returns `false` for them).
-fn gate_err_to_status(e: SigningGateError) -> Status {
-    use slashing::SlashingError;
-    match e {
-        SigningGateError::BlockedByDoppelganger => {
-            Status::failed_precondition("signing blocked by doppelganger gate")
+/// `pub(crate)` so the HTTP mapper's agreement test can call the same path.
+pub(crate) fn gate_err_to_status(e: SigningGateError) -> Status {
+    use signer::GateErrClass;
+    let class = signer::classify(&e);
+    class.emit_server_log();
+    let msg = class.client_message().to_string();
+    match class {
+        GateErrClass::BlockedByDoppelganger | GateErrClass::SlashingBlocked { .. } => {
+            Status::failed_precondition(msg)
         }
-        SigningGateError::SlashingBlocked(inner) => match &inner {
-            // Slashing-violation details (epoch/slot numbers) are safe to surface.
-            SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => {
-                Status::failed_precondition(format!("slashing protection violation: {inner}"))
-            }
-            // All other DB errors (DatabaseError, MigrationFailed, etc.) may contain
-            // rusqlite internals or file paths — log server-side, return generic.
-            other => {
-                tracing::error!(error = %other, "slashing DB error during staging");
-                Status::failed_precondition("slashing protection error")
-            }
-        },
-        SigningGateError::CommitFailed { source: inner, .. } => {
-            // Commit error: same-root retry is safe.  Log detail, return generic.
-            tracing::error!(error = %inner, "slashing DB commit failed after successful sign");
-            Status::internal("slashing DB commit failed; same-root retry is safe")
-        }
-        SigningGateError::KeyNotFound => Status::not_found("unknown public key"),
-        SigningGateError::SigningFailed(msg) => {
-            tracing::error!(error = %msg, "signing backend error");
-            Status::internal("internal signing error")
-        }
-        // Currently unreachable: unknown pubkeys return BlockedByDoppelganger because
-        // AlwaysEnabled returns false for them.  Mapped to NotFound for consistency
-        // with KeyNotFound if the gate ever distinguishes the two cases.
-        SigningGateError::UnknownPubkey => Status::not_found("unknown public key"),
+        GateErrClass::CommitFailed { .. } | GateErrClass::Internal { .. } => Status::internal(msg),
+        GateErrClass::KeyNotFound => Status::not_found(msg),
     }
 }
 

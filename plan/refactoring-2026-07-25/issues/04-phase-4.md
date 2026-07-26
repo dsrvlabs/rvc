@@ -568,12 +568,12 @@ produces it.
 3. Move `SigningError` to `crypto/src/error.rs` with a deprecated re-export for one release.
 
 **Acceptance criteria:**
-- [ ] Both transport mappers consume `classify()`; neither matches `SigningGateError` variants directly
+- [x] Both transport mappers consume `classify()`; neither matches `SigningGateError` variants directly
       (`rg` proof in PR).
-- [ ] A table-driven test asserts gRPC and HTTP return *corresponding* statuses for every `GateErrClass`,
+- [x] A table-driven test asserts gRPC and HTTP return *corresponding* statuses for every `GateErrClass`,
       and that no message leaks slashing-DB internals (the existing leak-free assertions in
       `dispatch.rs:395` stay green).
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_grpc_and_http_agree_on_every_gate_error_class` — fails today where the two mappers

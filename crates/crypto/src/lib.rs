@@ -51,7 +51,7 @@ pub use bls::{
     SIGNATURE_BYTES_LEN,
 };
 pub use composite_signer::CompositeSigner;
-pub use error::{BlsError, KeyManagerError, KeystoreError};
+pub use error::{BlsError, KeyManagerError, KeystoreError, SigningError};
 pub use eth_types::{DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
 pub use insecure::{InsecureGate, InsecureGateError, InsecureMode};
 pub use key_manager::{KeyManager, WILDCARD_KEY};
@@ -66,7 +66,7 @@ pub use remote_signer::{
     RemoteSignerConfig, SignRequestJson, SyncSelectionPayload, Web3SignerPayload,
     Web3SignerSignRequest, WireForkInfo, WireForkInfoExt, REMOTE_SIGNER_INSECURE_ENV_VAR,
 };
-pub use signer_trait::{LocalSigner, Signer, SigningError};
+pub use signer_trait::{LocalSigner, Signer};
 pub use signing::{compute_domain, compute_fork_data_root, compute_signing_root};
 pub use signing_root::{
     capella_capped_fork_version, signing_root_for, signing_root_with_fork_version, DutyRef,

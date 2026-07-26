@@ -24,7 +24,7 @@ pub use core::{
     StagedRow, StandardSlashableHooks, TimeoutPolicy, TimeoutPolicySource,
 };
 pub use doppelganger::SigningEnablement;
-pub use error::SigningGateError;
+pub use error::{classify, GateErrClass, SigningGateError};
 pub use fail_closed::FailClosedDefault;
 pub use gate::{SigningGate, AUDIT_CN_DEFAULT};
 pub use locks::ValidatorLockMap;

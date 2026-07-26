@@ -247,18 +247,8 @@ pub fn classify_error(err: &crate::backend::SigningBackendError) -> &'static str
 /// All values are code-derived constants (never request-derived); cardinality
 /// stays fixed regardless of error message content.
 pub fn classify_gate_error(err: &signer::SigningGateError) -> &'static str {
-    use signer::SigningGateError;
-    use slashing::SlashingError;
-    match err {
-        SigningGateError::BlockedByDoppelganger => "doppelganger",
-        SigningGateError::SlashingBlocked(inner) => match inner {
-            SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => "slashing",
-            _ => "slashing_db_error",
-        },
-        SigningGateError::CommitFailed { .. } => "internal",
-        SigningGateError::KeyNotFound | SigningGateError::UnknownPubkey => "key_not_found",
-        SigningGateError::SigningFailed(_) => "internal",
-    }
+    // Shared library classifier — same labels as HTTP audit via GateErrClass.
+    signer::classify(err).metrics_label()
 }
 
 /// Record one gRPC sign attempt on the shared collectors (RF1-09).

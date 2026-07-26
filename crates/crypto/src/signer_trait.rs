@@ -1,47 +1,15 @@
 use async_trait::async_trait;
 use parking_lot::RwLock;
-use thiserror::Error;
 
 use super::bls::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
 use super::key_manager::KeyManager;
 use eth_types::Root;
 
-#[derive(Debug, Error)]
-pub enum SigningError {
-    #[error("key not found: {0}")]
-    KeyNotFound(String),
-
-    /// Local precondition failed with **no remote I/O** and no signature produced.
-    ///
-    /// Examples: raw-root `Signer::sign` called for a gRPC-only key (TypedSigner
-    /// required). Safe to discard a staged slashing row — the remote was never
-    /// contacted. Distinct from [`Self::RemoteSignerError`], which may follow
-    /// a possible remote sign.
-    #[error("signing rejected locally (no remote contact): {0}")]
-    LocalRejected(String),
-
-    #[error("remote signer error: {0}")]
-    RemoteSignerError(String),
-
-    #[error("remote signer returned invalid signature")]
-    InvalidRemoteSignature,
-
-    /// The requested duty type cannot be encoded as a Web3Signer HTTP body
-    /// (SEC-8). Never falls back to a bare `{signing_root}` body.
-    #[error("unsupported remote signing type: {0}")]
-    UnsupportedSigningType(String),
-}
-
-impl SigningError {
-    /// True when no remote signature can have been produced (safe to discard staged rows).
-    #[must_use]
-    pub fn is_unambiguous_no_signature(&self) -> bool {
-        matches!(
-            self,
-            Self::KeyNotFound(_) | Self::LocalRejected(_) | Self::UnsupportedSigningType(_)
-        )
-    }
-}
+// Canonical home is `crate::error::SigningError` (re-exported as `crypto::SigningError`).
+// This re-export keeps in-crate `use super::signer_trait::SigningError` compiling for
+// one release while call sites migrate. Includes RF4-06 `LocalRejected` /
+// `is_unambiguous_no_signature` on the enum in `error.rs`.
+pub use super::error::SigningError;
 
 #[async_trait]
 pub trait Signer: Send + Sync {

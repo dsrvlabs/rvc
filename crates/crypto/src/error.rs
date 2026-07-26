@@ -2,6 +2,48 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+/// Errors from a raw [`crate::Signer`] backend (local, remote, or composite).
+///
+/// Lives next to the trait that produces it. Prefer `crypto::SigningError` at
+/// call sites; a deprecated re-export may remain on the former module path for
+/// one release.
+#[derive(Debug, Error)]
+pub enum SigningError {
+    #[error("key not found: {0}")]
+    KeyNotFound(String),
+
+    /// Local precondition failed with **no remote I/O** and no signature produced.
+    ///
+    /// Examples: raw-root `Signer::sign` called for a gRPC-only key (TypedSigner
+    /// required). Safe to discard a staged slashing row — the remote was never
+    /// contacted. Distinct from [`Self::RemoteSignerError`], which may follow
+    /// a possible remote sign.
+    #[error("signing rejected locally (no remote contact): {0}")]
+    LocalRejected(String),
+
+    #[error("remote signer error: {0}")]
+    RemoteSignerError(String),
+
+    #[error("remote signer returned invalid signature")]
+    InvalidRemoteSignature,
+
+    /// The requested duty type cannot be encoded as a Web3Signer HTTP body
+    /// (SEC-8). Never falls back to a bare `{signing_root}` body.
+    #[error("unsupported remote signing type: {0}")]
+    UnsupportedSigningType(String),
+}
+
+impl SigningError {
+    /// True when no remote signature can have been produced (safe to discard staged rows).
+    #[must_use]
+    pub fn is_unambiguous_no_signature(&self) -> bool {
+        matches!(
+            self,
+            Self::KeyNotFound(_) | Self::LocalRejected(_) | Self::UnsupportedSigningType(_)
+        )
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum BlsError {
     #[error("Invalid public key: {0}")]

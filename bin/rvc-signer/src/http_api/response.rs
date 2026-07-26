@@ -1,9 +1,8 @@
 //! HTTP status mapping for `POST /sign/{identifier}` (FR-20..FR-24).
 //!
-//! This is a *fresh* `SigningGateError -> (StatusCode, body)` translation for
-//! the HTTP edge — NOT a literal reuse of the gRPC `tonic::Status` table. It
-//! reuses the error *categories* and *sanitization rules* (so both transports
-//! agree on what is surfaced vs. logged) and emits HTTP statuses + safe bodies.
+//! Gate errors are classified once via [`signer::classify`] (shared with the
+//! gRPC edge). This module maps [`signer::GateErrClass`] to HTTP statuses +
+//! safe bodies — it does **not** match on `SigningGateError` variants.
 //!
 //! Only slashing-violation slot/epoch detail (already deemed safe on the gRPC
 //! path) is surfaced; SQLite paths, rusqlite internals, and lock messages are
@@ -11,15 +10,14 @@
 //!
 //! The success / `Accept`-negotiated half (`sign_response`) shapes the body per
 //! the request `Accept` header (FR-17). Both halves are consumed by the live
-//! `routes::sign` handler (Issue 2.8).
+//! `routes::sign` handler.
 
 use axum::http::header::CONTENT_TYPE;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
-use signer::SigningGateError;
-use slashing::SlashingError;
+use signer::{classify, GateErrClass, SigningGateError};
 
 /// An error from the HTTP sign path, mapped to an exact HTTP status.
 #[derive(Debug)]
@@ -50,66 +48,47 @@ impl HttpSignError {
         }
     }
 
-    /// Stable, low-cardinality outcome label for the audit `result` field (Issue
-    /// 4.4). `success` and the backend categories `key_not_found` / `internal`
-    /// are kept byte-identical to the gRPC metrics labels so the two transports'
-    /// audit lines are comparable; the gate-specific rejections the HTTP path can
-    /// distinguish (`bad_request`, `doppelganger`, `slashing`) get their own
-    /// labels. Every non-`success` label logs at `warn` via [`super::super::audit::log_audit`].
+    /// Stable, low-cardinality outcome label for the audit `result` field.
+    ///
+    /// Gate errors reuse [`GateErrClass::metrics_label`] so HTTP audit lines
+    /// stay byte-identical to gRPC `sign_errors_total` labels. Pre-gate labels
+    /// (`bad_request`, `client_cn_not_allowed`) are HTTP-only.
     pub(super) fn audit_label(&self) -> &'static str {
         match self {
             HttpSignError::BadRequest(_) => "bad_request",
             HttpSignError::UnknownKey => "key_not_found",
             HttpSignError::Unauthorized(_) => "client_cn_not_allowed",
-            HttpSignError::Gate(SigningGateError::BlockedByDoppelganger) => "doppelganger",
-            HttpSignError::Gate(SigningGateError::SlashingBlocked(inner)) => match inner {
-                SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => {
-                    "slashing"
-                }
-                _ => "slashing_db_error",
-            },
-            HttpSignError::Gate(SigningGateError::CommitFailed { .. }) => "internal",
-            HttpSignError::Gate(SigningGateError::KeyNotFound)
-            | HttpSignError::Gate(SigningGateError::UnknownPubkey) => "key_not_found",
-            HttpSignError::Gate(SigningGateError::SigningFailed(_)) => "internal",
+            HttpSignError::Gate(e) => classify(e).metrics_label(),
         }
     }
 }
 
-/// Map a gate result error to `(status, safe-body)` (FR-20..FR-24), mirroring
-/// the gRPC `gate_err_to_status` categories.
+/// Map a gate result error to `(status, safe-body)` via shared [`classify`].
+///
+/// # HTTP status mapping
+///
+/// | [`GateErrClass`] | HTTP status |
+/// |---|---|
+/// | `BlockedByDoppelganger` / `SlashingBlocked` | `412 Precondition Failed` |
+/// | `CommitFailed` / `Internal` | `500 Internal Server Error` |
+/// | `KeyNotFound` | `404 Not Found` |
+///
+/// `CommitFailed` → 500 matches gRPC `Internal` so same-root retry is treated
+/// as a retriable server fault rather than a permanent precondition rejection.
 fn gate_err_to_http(e: &SigningGateError) -> (StatusCode, String) {
-    match e {
-        SigningGateError::BlockedByDoppelganger => {
-            (StatusCode::PRECONDITION_FAILED, "signing blocked by doppelganger gate".to_string())
+    let class = classify(e);
+    class.emit_server_log();
+    let body = class.client_message().to_string();
+    let status = match &class {
+        GateErrClass::BlockedByDoppelganger | GateErrClass::SlashingBlocked { .. } => {
+            StatusCode::PRECONDITION_FAILED
         }
-        SigningGateError::SlashingBlocked(inner) => match inner {
-            // Slashing-violation detail (slot/epoch numbers) is safe to surface.
-            SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => {
-                (StatusCode::PRECONDITION_FAILED, format!("slashing protection violation: {inner}"))
-            }
-            // Other DB errors may contain rusqlite internals / file paths — log
-            // server-side, return a generic message.
-            other => {
-                tracing::error!(error = %other, "slashing DB error during staging");
-                (StatusCode::PRECONDITION_FAILED, "slashing protection error".to_string())
-            }
-        },
-        SigningGateError::CommitFailed { source: inner, .. } => {
-            tracing::error!(error = %inner, "slashing DB commit failed after successful sign");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "slashing DB commit failed; same-root retry is safe".to_string(),
-            )
+        GateErrClass::CommitFailed { .. } | GateErrClass::Internal { .. } => {
+            StatusCode::INTERNAL_SERVER_ERROR
         }
-        SigningGateError::KeyNotFound | SigningGateError::UnknownPubkey => {
-            (StatusCode::NOT_FOUND, "unknown public key".to_string())
-        }
-        SigningGateError::SigningFailed(msg) => {
-            tracing::error!(error = %msg, "signing backend error");
-            (StatusCode::INTERNAL_SERVER_ERROR, "internal signing error".to_string())
-        }
-    }
+        GateErrClass::KeyNotFound => StatusCode::NOT_FOUND,
+    };
+    (status, body)
 }
 
 impl IntoResponse for HttpSignError {
@@ -161,7 +140,9 @@ fn wants_text_plain(accept: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slashing::{AttestationSlashingViolation, BlockSlashingViolation};
+    use crate::service::gate_err_to_status;
+    use slashing::{AttestationSlashingViolation, BlockSlashingViolation, SlashingError};
+    use tonic::Code;
 
     // ── Success response shaping (Issue 2.7, FR-17) ──────────────────────────
 
@@ -323,5 +304,108 @@ mod tests {
             HttpSignError::Unauthorized("x".to_string()).audit_label(),
             "client_cn_not_allowed"
         );
+    }
+
+    /// Corresponding status pairs for the shared [`GateErrClass`] taxonomy.
+    ///
+    /// gRPC and HTTP must agree on *category* (precondition / not-found /
+    /// internal) and on the sanitized client message for every gate error.
+    fn corresponding_http(code: Code) -> StatusCode {
+        match code {
+            Code::FailedPrecondition => StatusCode::PRECONDITION_FAILED,
+            Code::NotFound => StatusCode::NOT_FOUND,
+            Code::Internal => StatusCode::INTERNAL_SERVER_ERROR,
+            other => panic!("unexpected gRPC code in gate mapping: {other:?}"),
+        }
+    }
+
+    fn every_gate_error() -> Vec<SigningGateError> {
+        vec![
+            SigningGateError::BlockedByDoppelganger,
+            SigningGateError::SlashingBlocked(SlashingError::SlashableBlock(
+                BlockSlashingViolation::DoubleBlockProposal { slot: 42 },
+            )),
+            SigningGateError::SlashingBlocked(SlashingError::SlashableAttestation(
+                AttestationSlashingViolation::DoubleVote { target_epoch: 7 },
+            )),
+            SigningGateError::SlashingBlocked(SlashingError::MigrationFailed(
+                "/var/lib/rvc/slashing.db lock contention".into(),
+            )),
+            SigningGateError::CommitFailed {
+                signing_root: [0u8; 32],
+                source: SlashingError::MigrationFailed("/var/lib/rvc/slashing.db disk full".into()),
+            },
+            SigningGateError::KeyNotFound,
+            SigningGateError::UnknownPubkey,
+            SigningGateError::SigningFailed("blst internal x0042".into()),
+        ]
+    }
+
+    #[test]
+    fn test_grpc_and_http_agree_on_every_gate_error_class() {
+        for err in every_gate_error() {
+            let class = classify(&err);
+            let grpc = gate_err_to_status(clone_gate_err(&err));
+            let (http_status, http_body) =
+                HttpSignError::Gate(clone_gate_err(&err)).status_and_body();
+
+            assert_eq!(
+                http_status,
+                corresponding_http(grpc.code()),
+                "status category mismatch for {class:?}: grpc={:?} http={http_status}",
+                grpc.code()
+            );
+            assert_eq!(http_body, grpc.message(), "sanitized body mismatch for {class:?}");
+            assert_eq!(
+                http_body,
+                class.client_message(),
+                "body must equal classifier client_message for {class:?}"
+            );
+            // Leak-free: no SQLite path or backend internal token on the wire.
+            assert!(!http_body.contains(".db"), "path leak: {http_body}");
+            assert!(!http_body.contains("x0042"), "backend leak: {http_body}");
+            assert!(!http_body.contains("/var/lib"), "path leak: {http_body}");
+        }
+    }
+
+    /// `SigningGateError` is not `Clone`; rebuild the variants we need for dual mapping.
+    fn clone_gate_err(err: &SigningGateError) -> SigningGateError {
+        match err {
+            SigningGateError::BlockedByDoppelganger => SigningGateError::BlockedByDoppelganger,
+            SigningGateError::SlashingBlocked(inner) => {
+                SigningGateError::SlashingBlocked(match inner {
+                    SlashingError::SlashableBlock(
+                        BlockSlashingViolation::DoubleBlockProposal { slot },
+                    ) => {
+                        SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal {
+                            slot: *slot,
+                        })
+                    }
+                    SlashingError::SlashableAttestation(
+                        AttestationSlashingViolation::DoubleVote { target_epoch },
+                    ) => SlashingError::SlashableAttestation(
+                        AttestationSlashingViolation::DoubleVote { target_epoch: *target_epoch },
+                    ),
+                    SlashingError::MigrationFailed(msg) => {
+                        SlashingError::MigrationFailed(msg.clone())
+                    }
+                    other => panic!("unexpected SlashingError in test fixture: {other}"),
+                })
+            }
+            SigningGateError::CommitFailed { signing_root, source } => {
+                SigningGateError::CommitFailed {
+                    signing_root: *signing_root,
+                    source: match source {
+                        SlashingError::MigrationFailed(msg) => {
+                            SlashingError::MigrationFailed(msg.clone())
+                        }
+                        other => panic!("unexpected CommitFailed source: {other}"),
+                    },
+                }
+            }
+            SigningGateError::KeyNotFound => SigningGateError::KeyNotFound,
+            SigningGateError::UnknownPubkey => SigningGateError::UnknownPubkey,
+            SigningGateError::SigningFailed(msg) => SigningGateError::SigningFailed(msg.clone()),
+        }
     }
 }
