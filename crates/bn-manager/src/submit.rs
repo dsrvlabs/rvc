@@ -1,22 +1,33 @@
-//! Propagator service for submitting attestations to the beacon node.
+//! Attestation submission (propagator) helpers for the beacon node pool.
 //!
-//! This module provides the [`Propagator`] service which handles submitting
-//! signed attestations to the beacon node's attestation pool.
-
-mod error;
+//! Folded from the former `rvc-propagator` crate: metrics/logging around
+//! [`AttestationApi::submit_attestation`] for plain attestations. Aggregate
+//! proofs and sync messages still call the manager APIs directly.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
-use bn_manager::{
-    AttestationApi, BeaconError, BeaconNodeClient, SubmitAttestationResult, VersionedAttestation,
-};
+use beacon::{BeaconError, SubmitAttestationResult, VersionedAttestation};
 use metrics::definitions::{attestation_status, RVC_ATTESTATIONS_TOTAL};
 
-pub use error::PropagatorError;
+use crate::traits::{AttestationApi, BeaconNodeClient};
+
+/// Errors that can occur during attestation propagation.
+#[derive(Error, Debug)]
+pub enum PropagatorError {
+    #[error("Beacon client error: {0}")]
+    BeaconError(#[from] BeaconError),
+
+    #[error("Partial attestation failure: {success_count} succeeded, {failure_count} failed")]
+    PartialFailure { success_count: usize, failure_count: usize },
+
+    #[error("All attestations failed submission")]
+    AllAttestationsFailed,
+}
 
 /// Trait for attestation submission, enabling dependency injection for testing.
 pub trait AttestationSubmitter: Send + Sync {
@@ -58,20 +69,17 @@ impl PropagationResult {
     }
 }
 
-fn extract_attestation_context(attestations: &VersionedAttestation) -> (String, String, String) {
+/// Slot and target epoch for log context (committee index is unused by callers).
+fn extract_attestation_context(attestations: &VersionedAttestation) -> (String, String) {
     match attestations {
         VersionedAttestation::PreElectra(atts) => match atts.first() {
-            Some(a) => (a.data.slot.clone(), a.data.target.epoch.clone(), a.data.index.clone()),
-            None => ("unknown".into(), "unknown".into(), "unknown".into()),
+            Some(a) => (a.data.slot.clone(), a.data.target.epoch.clone()),
+            None => ("unknown".into(), "unknown".into()),
         },
         VersionedAttestation::Electra(atts) | VersionedAttestation::Fulu(atts) => {
             match atts.first() {
-                Some(a) => (
-                    a.data.slot.clone(),
-                    a.data.target.epoch.clone(),
-                    a.committee_index.to_string(),
-                ),
-                None => ("unknown".into(), "unknown".into(), "unknown".into()),
+                Some(a) => (a.data.slot.clone(), a.data.target.epoch.clone()),
+                None => ("unknown".into(), "unknown".into()),
             }
         }
     }
@@ -98,13 +106,12 @@ impl<S: AttestationSubmitter> Propagator<S> {
             VersionedAttestation::Electra(a) | VersionedAttestation::Fulu(a) => a.len(),
         };
 
-        // Late-bind the count onto the span. propagator has no crypto dep, so this uses the
-        // raw record() directly (not observability::logging::record_debug); the key "count" matches
-        // the field::Empty declared on the #[instrument] above so the record lands.
+        // Late-bind the count onto the span. Uses raw record() (not
+        // observability::logging::record_debug); the key "count" matches the
+        // field::Empty declared on the #[instrument] above so the record lands.
         tracing::Span::current().record("count", total);
 
-        let (batch_slot, batch_target_epoch, _batch_committee_index) =
-            extract_attestation_context(attestations);
+        let (batch_slot, batch_target_epoch) = extract_attestation_context(attestations);
 
         if total == 0 {
             debug!("No attestations to propagate");
@@ -190,11 +197,11 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use bn_manager::{AttestationData, Checkpoint, IndexedAttestationError, LegacyAttestation};
+    use beacon::{AttestationData, Checkpoint, IndexedAttestationError, LegacyAttestation};
 
     /// The `propagator.propagate` span declares `count = field::Empty` and the run late-binds
-    /// it via a raw `Span::record("count", ..)` (propagator has no crypto dep for the kit
-    /// helper). This proves the record lands — the key MUST match the declared field name.
+    /// it via a raw `Span::record("count", ..)`. This proves the record lands — the key MUST
+    /// match the declared field name.
     #[test]
     fn propagate_span_late_binds_count() {
         use std::sync::{Arc, Mutex};
@@ -552,8 +559,8 @@ mod tests {
         slot: &str,
         committee_index: u64,
         attester_index: u64,
-    ) -> bn_manager::SingleAttestation {
-        bn_manager::SingleAttestation {
+    ) -> beacon::SingleAttestation {
+        beacon::SingleAttestation {
             committee_index,
             attester_index,
             data: AttestationData {
@@ -644,5 +651,31 @@ mod tests {
             }
             other => panic!("Expected Fulu variant, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_propagator_error_display_beacon_error() {
+        let beacon_err = BeaconError::Timeout;
+        let err = PropagatorError::BeaconError(beacon_err);
+        assert_eq!(err.to_string(), "Beacon client error: Request timeout");
+    }
+
+    #[test]
+    fn test_propagator_error_display_partial_failure() {
+        let err = PropagatorError::PartialFailure { success_count: 5, failure_count: 2 };
+        assert_eq!(err.to_string(), "Partial attestation failure: 5 succeeded, 2 failed");
+    }
+
+    #[test]
+    fn test_propagator_error_display_all_failed() {
+        let err = PropagatorError::AllAttestationsFailed;
+        assert_eq!(err.to_string(), "All attestations failed submission");
+    }
+
+    #[test]
+    fn test_from_beacon_error() {
+        let beacon_err = BeaconError::HttpError("connection refused".to_string());
+        let err: PropagatorError = beacon_err.into();
+        assert!(matches!(err, PropagatorError::BeaconError(_)));
     }
 }

@@ -13,12 +13,13 @@ pub(super) use ::async_trait::async_trait;
 pub(super) use ::beacon::{AttesterDuty, BeaconClient, BeaconClientConfig, VersionedAttestation};
 pub(super) use ::block_service::BeaconBlockClient;
 pub(super) use ::block_service::ProduceBlockResponse;
-pub(super) use ::bn_manager::{BeaconNodeClient, OperationTimeouts};
+pub(super) use ::bn_manager::{
+    AttestationSubmitter, BeaconNodeClient, OperationTimeouts, Propagator,
+};
 pub(super) use ::builder::BuilderService;
 pub(super) use ::crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
 pub(super) use ::duty_tracker::DutyTracker;
 pub(super) use ::eth_types::{ForkName, ForkSchedule, Root, Slot};
-pub(super) use ::propagator::{AttestationSubmitter, Propagator};
 pub(super) use ::signer::{always_enabled, CircuitBreakerState, SignerService, ValidatorSigner};
 pub(super) use ::slashing::SlashingDb;
 pub(super) use ::timing::MockSlotClock;

@@ -8,10 +8,9 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use bn_manager::{BeaconNodeClient, BnManager, OperationTimeouts};
+use bn_manager::{BeaconNodeClient, BnManager, OperationTimeouts, Propagator};
 use builder::BuilderService;
 use duty_tracker::DutyTracker;
-use propagator::Propagator;
 use signer::SignerService;
 use slashing::SlashingDb;
 use timing::SystemSlotClock;

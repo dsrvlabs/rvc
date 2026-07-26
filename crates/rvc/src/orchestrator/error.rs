@@ -4,8 +4,8 @@ use thiserror::Error;
 
 use beacon::BeaconError;
 use block_service::BlockServiceError;
+use bn_manager::PropagatorError;
 use duty_tracker::DutyTrackerError;
-use propagator::PropagatorError;
 use signer::SignerError;
 use timing::TimingError;
 

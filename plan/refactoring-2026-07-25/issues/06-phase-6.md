@@ -1161,11 +1161,11 @@ follows. Delete `extract_attestation_context`'s committee-index computation, whi
 `lib.rs:104`. Remove the crate from `Cargo.toml` `members`.
 
 **Acceptance criteria:**
-- [ ] `crates/propagator/` is deleted; `cargo metadata` shows one fewer member.
-- [ ] `bn-manager`'s `submit` module carries the propagator's tests (test count unchanged).
-- [ ] The `PROP → BNM` / `PROP → METRICS` edges disappear from the generated graph (RF6-23's test
+- [x] `crates/propagator/` is deleted; `cargo metadata` shows one fewer member.
+- [x] `bn-manager`'s `submit` module carries the propagator's tests (test count unchanged).
+- [x] The `PROP → BNM` / `PROP → METRICS` edges disappear from the generated graph (RF6-23's test
       catches this automatically if RF6-23 landed first).
-- [ ] Workspace green including `crates/rvc/tests/sync_independent_of_attesting.rs`.
+- [x] Workspace green including `crates/rvc/tests/sync_independent_of_attesting.rs`.
 
 **Risks:** Touches `coordinator.rs` — sequence against RF6-27/28/31 within Stream B. Adding a *new*
 bn-manager module does not conflict with RF6-08's `manager.rs` test move, but do them in order anyway.

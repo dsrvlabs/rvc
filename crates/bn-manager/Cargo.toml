@@ -22,6 +22,7 @@ test-utils = []
 beacon = { workspace = true }
 observability = { workspace = true }
 eth-types = { workspace = true }
+metrics = { workspace = true }
 async-trait = { workspace = true }
 futures.workspace = true
 reqwest-eventsource = { workspace = true }
@@ -35,5 +36,5 @@ url = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 wiremock = { workspace = true }
-tracing-test = { workspace = true }
+tracing-test = { workspace = true, features = ["no-env-filter"] }
 tracing-subscriber = { workspace = true, features = ["registry"] }

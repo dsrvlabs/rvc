@@ -66,7 +66,6 @@ const CLASSIFICATION: &[(&str, Layer, &str, &str)] = &[
     ("rvc-builder", Layer::Domain, "builder", "MEV registration"),
     ("rvc-doppelganger", Layer::Domain, "doppelganger", "duplicate detection"),
     ("rvc-duty-tracker", Layer::Domain, "duty-tracker", "duty cache"),
-    ("rvc-propagator", Layer::Domain, "propagator", "message submit"),
     ("rvc-signer", Layer::Domain, "signer", "safe signing"),
     ("rvc-signer-server", Layer::Domain, "signer-server", "remote signing lib"),
     ("rvc-sync-service", Layer::Domain, "sync-service", "sync committees"),

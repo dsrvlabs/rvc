@@ -18,12 +18,11 @@ use beacon::{
     Checkpoint as BeaconCheckpoint, DataResponse, SubmitAttestationResult, VersionedAttestation,
 };
 use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse as BlockProdResp};
-use bn_manager::{BeaconNodeClient, MockBeaconNodeClient};
+use bn_manager::{AttestationSubmitter, BeaconNodeClient, MockBeaconNodeClient, Propagator};
 use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
 use doppelganger::SigningEnablement;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkSchedule, Slot};
-use propagator::{AttestationSubmitter, Propagator};
 use rvc::orchestrator::{
     DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorHandle, PubkeyMap,
 };

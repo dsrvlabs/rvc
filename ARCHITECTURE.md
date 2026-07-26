@@ -1,7 +1,7 @@
 # Architecture
 
 <!-- BEGIN GENERATED -->
-RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 30 crates (3 binaries + 27 libraries).
+RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 29 crates (3 binaries + 26 libraries).
 
 > **Generated section.** Crate count and the dependency graph below are produced from `cargo metadata --format-version=1 --no-deps`. Do not hand-edit this block (the HTML comment markers that wrap it). Regenerate with:
 > ```
@@ -28,7 +28,6 @@ graph TD
     RVC_KEYMANAGER_API["keymanager-api<br/><i>key mgmt REST</i>"]
     RVC_METRICS["metrics<br/><i>prometheus</i>"]
     RVC_OBSERVABILITY["observability<br/><i>logging helpers</i>"]
-    RVC_PROPAGATOR["propagator<br/><i>message submit</i>"]
     RVC_SECRET_PROVIDER["secret-provider<br/><i>cloud key mgmt</i>"]
     RVC_SIGNER["signer<br/><i>safe signing</i>"]
     RVC_SIGNER_BIN["bin/rvc-signer<br/><i>gRPC signing server</i>"]
@@ -58,7 +57,6 @@ graph TD
     RVC --> RVC_KEYMANAGER_API
     RVC --> RVC_METRICS
     RVC --> RVC_OBSERVABILITY
-    RVC --> RVC_PROPAGATOR
     RVC --> RVC_SECRET_PROVIDER
     RVC --> RVC_SIGNER
     RVC --> RVC_SLASHING
@@ -88,6 +86,7 @@ graph TD
     RVC_BLOCK_SERVICE --> RVC_VALIDATOR_STORE
     RVC_BN_MANAGER --> BEACON
     RVC_BN_MANAGER --> RVC_ETH_TYPES
+    RVC_BN_MANAGER --> RVC_METRICS
     RVC_BN_MANAGER --> RVC_OBSERVABILITY
     RVC_BUILDER --> RVC_BN_MANAGER
     RVC_BUILDER --> RVC_CRYPTO
@@ -114,8 +113,6 @@ graph TD
     RVC_KEYMANAGER_API --> RVC_ETH_TYPES
     RVC_KEYMANAGER_API --> RVC_METRICS
     RVC_KEYMANAGER_API --> RVC_OBSERVABILITY
-    RVC_PROPAGATOR --> RVC_BN_MANAGER
-    RVC_PROPAGATOR --> RVC_METRICS
     RVC_SECRET_PROVIDER --> RVC_CRYPTO
     RVC_SECRET_PROVIDER --> RVC_ETH_TYPES
     RVC_SECRET_PROVIDER --> RVC_METRICS
@@ -160,7 +157,6 @@ graph TD
     style RVC_KEYMANAGER_API fill:#51cf66,color:#fff
     style RVC_METRICS fill:#51cf66,color:#fff
     style RVC_OBSERVABILITY fill:#51cf66,color:#fff
-    style RVC_PROPAGATOR fill:#ffd43b,color:#333
     style RVC_SECRET_PROVIDER fill:#51cf66,color:#fff
     style RVC_SIGNER fill:#ffd43b,color:#333
     style RVC_SIGNER_BIN fill:#4a9eff,color:#fff

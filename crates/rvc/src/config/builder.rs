@@ -13,7 +13,7 @@ use observability::logging::RedactedUrl;
 
 use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
 use beacon::{BeaconClient, BeaconClientConfig};
-use bn_manager::{BeaconNodeClient, BnManager, BnManagerConfig};
+use bn_manager::{AttestationSubmitter, BeaconNodeClient, BnManager, BnManagerConfig, Propagator};
 use builder::BuilderService;
 use crypto::{CompositeSigner, KeyManager};
 use doppelganger::{
@@ -22,7 +22,6 @@ use doppelganger::{
 };
 use duty_tracker::DutyTracker;
 use eth_types::{Epoch, ForkSchedule, Root};
-use propagator::{AttestationSubmitter, Propagator};
 use signer::{SignerService, ValidatorSigner};
 use slashing::SlashingDb;
 use timing::SystemSlotClock;

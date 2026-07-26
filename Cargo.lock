@@ -4117,7 +4117,6 @@ dependencies = [
  "rvc-keymanager-api",
  "rvc-metrics",
  "rvc-observability",
- "rvc-propagator",
  "rvc-secret-provider",
  "rvc-signer",
  "rvc-slashing",
@@ -4225,6 +4224,7 @@ dependencies = [
  "futures",
  "reqwest-eventsource",
  "rvc-eth-types",
+ "rvc-metrics",
  "rvc-observability",
  "serde",
  "serde_json",
@@ -4452,19 +4452,6 @@ dependencies = [
  "tracing-test",
  "url",
  "uuid",
-]
-
-[[package]]
-name = "rvc-propagator"
-version = "0.6.0"
-dependencies = [
- "rvc-bn-manager",
- "rvc-metrics",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "tracing-test",
 ]
 
 [[package]]
