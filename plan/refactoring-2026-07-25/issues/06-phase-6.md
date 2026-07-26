@@ -1115,13 +1115,13 @@ C5 in Phase 3; F2 in Phase 5; RF6-14 `+1` and RF6-24 `−1` here).
    fail-closed convention (Phase 1's slashing-DB and enablement defaults).
 
 **Acceptance criteria:**
-- [ ] The crate count and the mermaid graph are generated; the count matches `cargo metadata` exactly.
-- [ ] The doc no longer contradicts `REQUIRED_EDGE` (`signer→doppelganger` present) and shows every real
+- [x] The crate count and the mermaid graph are generated; the count matches `cargo metadata` exactly.
+- [x] The doc no longer contradicts `REQUIRED_EDGE` (`signer→doppelganger` present) and shows every real
       production edge.
-- [ ] `cargo test -p architecture-tests` fails on a hand-edit inside the generated markers (prove it by
+- [x] `cargo test -p architecture-tests` fails on a hand-edit inside the generated markers (prove it by
       hand-editing in the PR and pasting the failure).
-- [ ] Fail-closed and shutdown-idiom conventions recorded.
-- [ ] Workspace green.
+- [x] Fail-closed and shutdown-idiom conventions recorded.
+- [x] Workspace green.
 
 **Test/verification plan:** The gate must be shown to bite, since a generator whose test silently passes
 on stale input is worse than no generator. In the PR: (1) hand-edit one edge inside the generated markers,

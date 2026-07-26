@@ -7,8 +7,14 @@ publish = false
 [lints]
 workspace = true
 
-[dev-dependencies]
+[dependencies]
 serde_json.workspace = true
+
+[dev-dependencies]
 observability.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["registry"] }
+
+[[bin]]
+name = "generate-architecture-md"
+path = "src/bin/generate_architecture_md.rs"
