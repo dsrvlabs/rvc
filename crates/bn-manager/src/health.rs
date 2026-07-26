@@ -1,11 +1,12 @@
 //! Per-BN health tracking: EMA latency, sliding window error rate, composite score.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use observability::logging::RedactedUrl;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tracing::{debug, info, warn};
 
 /// Default EMA smoothing factor (alpha). Higher = more weight on recent samples.
@@ -146,11 +147,42 @@ impl BnHealthTracker {
 }
 
 /// Shared health trackers for all BNs.
-pub type SharedHealthTrackers = Arc<RwLock<Vec<BnHealthTracker>>>;
+///
+/// Write-lock acquisitions are counted so selection strategies can assert
+/// batched updates (one write per selection round) under test.
+#[derive(Clone, Debug)]
+pub struct SharedHealthTrackers {
+    inner: Arc<RwLock<Vec<BnHealthTracker>>>,
+    write_lock_count: Arc<AtomicUsize>,
+}
+
+impl SharedHealthTrackers {
+    pub async fn read(&self) -> RwLockReadGuard<'_, Vec<BnHealthTracker>> {
+        self.inner.read().await
+    }
+
+    pub async fn write(&self) -> RwLockWriteGuard<'_, Vec<BnHealthTracker>> {
+        self.write_lock_count.fetch_add(1, Ordering::Relaxed);
+        self.inner.write().await
+    }
+
+    /// Number of write-lock acquisitions since creation or the last reset.
+    pub fn write_lock_count(&self) -> usize {
+        self.write_lock_count.load(Ordering::Relaxed)
+    }
+
+    /// Resets the write-lock counter (test instrumentation).
+    pub fn reset_write_lock_count(&self) {
+        self.write_lock_count.store(0, Ordering::Relaxed);
+    }
+}
 
 pub fn new_shared_health_trackers(endpoints: &[String]) -> SharedHealthTrackers {
     let trackers = endpoints.iter().map(|e| BnHealthTracker::new(e.clone())).collect();
-    Arc::new(RwLock::new(trackers))
+    SharedHealthTrackers {
+        inner: Arc::new(RwLock::new(trackers)),
+        write_lock_count: Arc::new(AtomicUsize::new(0)),
+    }
 }
 
 #[cfg(test)]

@@ -1468,13 +1468,13 @@ tracker's write lock once per result (F68) instead of batching.
    `query_best` and `fallback_unsynced`.
 
 **Acceptance criteria:**
-- [ ] The five submission methods are ≤ ~10 lines each and share one dispatch helper.
-- [ ] Broadcast-vs-query_first behavior per topic is unchanged (existing multi-BN tests green:
+- [x] The five submission methods are ≤ ~10 lines each and share one dispatch helper.
+- [x] Broadcast-vs-query_first behavior per topic is unchanged (existing multi-BN tests green:
       `test_multi_query_first_uses_primary` `:1912`, `..._failover_on_error` `:1938`,
       `..._all_fail` `:1965`, `..._failover_three_bns` `:2020`).
-- [ ] The health write lock is taken once per selection round, asserted by a test or a documented
+- [x] The health write lock is taken once per selection round, asserted by a test or a documented
       lock-count instrument.
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_health_tracker_write_lock_taken_once_per_selection_round` — fails today

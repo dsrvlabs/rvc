@@ -41,6 +41,13 @@ type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, BeaconError>> + Send 
 type IndexedTimedResultFut<'a, T> =
     Pin<Box<dyn Future<Output = (usize, String, Result<T, BeaconError>, Duration)> + Send + 'a>>;
 
+/// Health-tracker outcome for one BN attempt (success with latency, or error).
+#[derive(Debug, Clone, Copy)]
+enum TrackerOutcome {
+    Success(Duration),
+    Error,
+}
+
 /// Default sync check interval: once per epoch (~384 seconds).
 const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 
@@ -193,6 +200,48 @@ impl BnManager {
     /// Returns the per-operation timeout for a given field selector.
     fn op_timeout(&self, f: impl FnOnce(&OperationTimeouts) -> Duration) -> Option<Duration> {
         self.operation_timeouts.as_ref().map(f)
+    }
+
+    /// Apply health-tracker updates under a single write lock.
+    ///
+    /// Selection strategies collect outcomes during the round and call this once
+    /// so the health write lock is taken at most once per selection round.
+    async fn record_outcomes(&self, outcomes: &[(usize, TrackerOutcome)]) {
+        if outcomes.is_empty() {
+            return;
+        }
+        let mut trackers = self.health_trackers.write().await;
+        for &(idx, outcome) in outcomes {
+            match outcome {
+                TrackerOutcome::Success(latency) => trackers[idx].record_success(latency),
+                TrackerOutcome::Error => trackers[idx].record_error(),
+            }
+        }
+    }
+
+    /// Dispatch a submission via broadcast or query_first based on the topic flag.
+    ///
+    /// Encapsulates the repeated `if broadcast_topics.X { broadcast } else { query_first }`
+    /// branch and wraps it in the per-operation timeout.
+    async fn submit<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        topic_enabled: bool,
+        role: BnRole,
+        min_tier: HealthTier,
+        timeout: Option<Duration>,
+        op: F,
+    ) -> Result<T, BeaconError>
+    where
+        T: Send + 'static,
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+    {
+        if topic_enabled {
+            self.with_op_timeout(op_name, timeout, self.broadcast_with_result(op_name, op)).await
+        } else {
+            self.with_op_timeout(op_name, timeout, self.query_first(op_name, role, min_tier, op))
+                .await
+        }
     }
 
     /// Returns current health scores for all BNs.
@@ -432,13 +481,10 @@ impl BnManager {
                 Ok(result) => {
                     let elapsed = start.elapsed();
                     // Batch update: record success + all prior errors in one lock acquisition
-                    {
-                        let mut trackers = self.health_trackers.write().await;
-                        for fi in &failed_indices {
-                            trackers[*fi].record_error();
-                        }
-                        trackers[i].record_success(elapsed);
-                    }
+                    let mut outcomes: Vec<(usize, TrackerOutcome)> =
+                        failed_indices.iter().map(|&fi| (fi, TrackerOutcome::Error)).collect();
+                    outcomes.push((i, TrackerOutcome::Success(elapsed)));
+                    self.record_outcomes(&outcomes).await;
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -474,12 +520,9 @@ impl BnManager {
         }
 
         // All failed — batch record errors
-        if !failed_indices.is_empty() {
-            let mut trackers = self.health_trackers.write().await;
-            for fi in &failed_indices {
-                trackers[*fi].record_error();
-            }
-        }
+        let outcomes: Vec<(usize, TrackerOutcome)> =
+            failed_indices.iter().map(|&fi| (fi, TrackerOutcome::Error)).collect();
+        self.record_outcomes(&outcomes).await;
 
         tracing::Span::current().record("tried", tried);
         Err(last_err.expect("at least one client exists"))
@@ -537,7 +580,7 @@ impl BnManager {
             let start = tokio::time::Instant::now();
             match op(client).instrument(attempt_span).await {
                 Ok(result) => {
-                    self.health_trackers.write().await[i].record_success(start.elapsed());
+                    self.record_outcomes(&[(i, TrackerOutcome::Success(start.elapsed()))]).await;
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -547,7 +590,7 @@ impl BnManager {
                     return Ok(result);
                 }
                 Err(e) => {
-                    self.health_trackers.write().await[i].record_error();
+                    self.record_outcomes(&[(i, TrackerOutcome::Error)]).await;
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -585,11 +628,12 @@ impl BnManager {
         let results = join_all(futs).await;
 
         let mut best: Option<(usize, T)> = None;
+        let mut outcomes: Vec<(usize, TrackerOutcome)> = Vec::with_capacity(results.len());
 
         for (i, endpoint, result, elapsed) in results {
             match result {
                 Ok(value) => {
-                    self.health_trackers.write().await[i].record_success(elapsed);
+                    outcomes.push((i, TrackerOutcome::Success(elapsed)));
                     best = Some(match best {
                         None => (i, value),
                         Some((prev_i, prev_value)) => {
@@ -602,7 +646,7 @@ impl BnManager {
                     });
                 }
                 Err(e) => {
-                    self.health_trackers.write().await[i].record_error();
+                    outcomes.push((i, TrackerOutcome::Error));
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -613,6 +657,8 @@ impl BnManager {
                 }
             }
         }
+
+        self.record_outcomes(&outcomes).await;
 
         match best {
             Some((i, value)) => {
@@ -653,13 +699,15 @@ impl BnManager {
 
         warn!(op = op_name, "all synced BNs failed, falling back to unsynced BNs");
 
+        let mut outcomes: Vec<(usize, TrackerOutcome)> = Vec::new();
         for i in unsynced {
             let client = &self.clients[i];
             let start = tokio::time::Instant::now();
             match op(client).await {
                 Ok(result) => {
                     let elapsed = start.elapsed();
-                    self.health_trackers.write().await[i].record_success(elapsed);
+                    outcomes.push((i, TrackerOutcome::Success(elapsed)));
+                    self.record_outcomes(&outcomes).await;
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -670,7 +718,7 @@ impl BnManager {
                     return Some(result);
                 }
                 Err(e) => {
-                    self.health_trackers.write().await[i].record_error();
+                    outcomes.push((i, TrackerOutcome::Error));
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -682,6 +730,7 @@ impl BnManager {
             }
         }
 
+        self.record_outcomes(&outcomes).await;
         None
     }
 
@@ -732,36 +781,35 @@ impl BnManager {
 
         let results = join_all(futs).await;
 
+        let mut health_outcomes = Vec::with_capacity(results.len());
         let mut outcomes = Vec::with_capacity(results.len());
-        {
-            let mut guard = self.health_trackers.write().await;
-            for (i, endpoint, result, elapsed) in results {
-                match &result {
-                    Ok(_) => {
-                        guard[i].record_success(elapsed);
-                        // Per-BN broadcast success scales with node count, so it
-                        // is `trace` (the per-item loop rule), not `debug`.
-                        trace!(
-                            op = op_name,
-                            bn_index = i,
-                            endpoint = %RedactedUrl(&endpoint),
-                            "broadcast succeeded on BN"
-                        );
-                    }
-                    Err(e) => {
-                        guard[i].record_error();
-                        warn!(
-                            op = op_name,
-                            bn_index = i,
-                            endpoint = %RedactedUrl(&endpoint),
-                            error = %e,
-                            "broadcast failed on BN"
-                        );
-                    }
+        for (i, endpoint, result, elapsed) in results {
+            match &result {
+                Ok(_) => {
+                    health_outcomes.push((i, TrackerOutcome::Success(elapsed)));
+                    // Per-BN broadcast success scales with node count, so it
+                    // is `trace` (the per-item loop rule), not `debug`.
+                    trace!(
+                        op = op_name,
+                        bn_index = i,
+                        endpoint = %RedactedUrl(&endpoint),
+                        "broadcast succeeded on BN"
+                    );
                 }
-                outcomes.push(BnOutcome { endpoint, result, latency: elapsed });
+                Err(e) => {
+                    health_outcomes.push((i, TrackerOutcome::Error));
+                    warn!(
+                        op = op_name,
+                        bn_index = i,
+                        endpoint = %RedactedUrl(&endpoint),
+                        error = %e,
+                        "broadcast failed on BN"
+                    );
+                }
             }
+            outcomes.push(BnOutcome { endpoint, result, latency: elapsed });
         }
+        self.record_outcomes(&health_outcomes).await;
 
         BroadcastResult { outcomes }
     }
@@ -975,32 +1023,22 @@ impl BlockProducer for BnManager {
         .await
     }
 
-    // -- Submissions: broadcast + block_publication timeout, accept LargeLag --
+    // -- Submissions: broadcast or query_first via submit() helper --
 
     async fn publish_block(
         &self,
         signed_block: &SignedBeaconBlock,
         consensus_version: &str,
     ) -> Result<(), BeaconError> {
-        if self.broadcast_topics.blocks {
-            self.with_op_timeout(
-                "publish_block",
-                self.op_timeout(|t| t.block_publication),
-                self.broadcast("publish_block", |c| {
-                    Box::pin(c.publish_block(signed_block, consensus_version))
-                }),
-            )
-            .await
-        } else {
-            self.with_op_timeout(
-                "publish_block",
-                self.op_timeout(|t| t.block_publication),
-                self.query_first("publish_block", BnRole::Submission, HealthTier::LargeLag, |c| {
-                    Box::pin(c.publish_block(signed_block, consensus_version))
-                }),
-            )
-            .await
-        }
+        self.submit(
+            "publish_block",
+            self.broadcast_topics.blocks,
+            BnRole::Submission,
+            HealthTier::LargeLag,
+            self.op_timeout(|t| t.block_publication),
+            |c| Box::pin(c.publish_block(signed_block, consensus_version)),
+        )
+        .await
     }
 
     async fn publish_blinded_block(
@@ -1008,28 +1046,15 @@ impl BlockProducer for BnManager {
         signed_blinded_block: &SignedBlindedBeaconBlock,
         consensus_version: &str,
     ) -> Result<(), BeaconError> {
-        if self.broadcast_topics.blocks {
-            self.with_op_timeout(
-                "publish_blinded_block",
-                self.op_timeout(|t| t.block_publication),
-                self.broadcast("publish_blinded_block", |c| {
-                    Box::pin(c.publish_blinded_block(signed_blinded_block, consensus_version))
-                }),
-            )
-            .await
-        } else {
-            self.with_op_timeout(
-                "publish_blinded_block",
-                self.op_timeout(|t| t.block_publication),
-                self.query_first(
-                    "publish_blinded_block",
-                    BnRole::Submission,
-                    HealthTier::LargeLag,
-                    |c| Box::pin(c.publish_blinded_block(signed_blinded_block, consensus_version)),
-                ),
-            )
-            .await
-        }
+        self.submit(
+            "publish_blinded_block",
+            self.broadcast_topics.blocks,
+            BnRole::Submission,
+            HealthTier::LargeLag,
+            self.op_timeout(|t| t.block_publication),
+            |c| Box::pin(c.publish_blinded_block(signed_blinded_block, consensus_version)),
+        )
+        .await
     }
 
     async fn publish_block_ssz(
@@ -1123,28 +1148,15 @@ impl AttestationApi for BnManager {
         &self,
         attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError> {
-        if self.broadcast_topics.attestations {
-            self.with_op_timeout(
-                "submit_attestation",
-                self.op_timeout(|t| t.attestation_submit),
-                self.broadcast_with_result("submit_attestation", |c| {
-                    Box::pin(c.submit_attestation(attestations))
-                }),
-            )
-            .await
-        } else {
-            self.with_op_timeout(
-                "submit_attestation",
-                self.op_timeout(|t| t.attestation_submit),
-                self.query_first(
-                    "submit_attestation",
-                    BnRole::Submission,
-                    HealthTier::LargeLag,
-                    |c| Box::pin(c.submit_attestation(attestations)),
-                ),
-            )
-            .await
-        }
+        self.submit(
+            "submit_attestation",
+            self.broadcast_topics.attestations,
+            BnRole::Submission,
+            HealthTier::LargeLag,
+            self.op_timeout(|t| t.attestation_submit),
+            |c| Box::pin(c.submit_attestation(attestations)),
+        )
+        .await
     }
 
     // -- Aggregation: Aggregation role, accept SmallLag for fetch; broadcast for submit --
@@ -1194,28 +1206,15 @@ impl AttestationApi for BnManager {
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
-        if self.broadcast_topics.subscriptions {
-            self.with_op_timeout(
-                "submit_beacon_committee_subscriptions",
-                self.op_timeout(|t| t.preparation),
-                self.broadcast("submit_beacon_committee_subscriptions", |c| {
-                    Box::pin(c.submit_beacon_committee_subscriptions(subscriptions))
-                }),
-            )
-            .await
-        } else {
-            self.with_op_timeout(
-                "submit_beacon_committee_subscriptions",
-                self.op_timeout(|t| t.preparation),
-                self.query_first(
-                    "submit_beacon_committee_subscriptions",
-                    BnRole::Submission,
-                    HealthTier::LargeLag,
-                    |c| Box::pin(c.submit_beacon_committee_subscriptions(subscriptions)),
-                ),
-            )
-            .await
-        }
+        self.submit(
+            "submit_beacon_committee_subscriptions",
+            self.broadcast_topics.subscriptions,
+            BnRole::Submission,
+            HealthTier::LargeLag,
+            self.op_timeout(|t| t.preparation),
+            |c| Box::pin(c.submit_beacon_committee_subscriptions(subscriptions)),
+        )
+        .await
     }
 }
 
@@ -1227,28 +1226,15 @@ impl SyncCommitteeApi for BnManager {
         &self,
         messages: &[SyncCommitteeMessage],
     ) -> Result<(), BeaconError> {
-        if self.broadcast_topics.sync_committee {
-            self.with_op_timeout(
-                "submit_sync_committee_messages",
-                self.op_timeout(|t| t.sync_message),
-                self.broadcast("submit_sync_committee_messages", |c| {
-                    Box::pin(c.submit_sync_committee_messages(messages))
-                }),
-            )
-            .await
-        } else {
-            self.with_op_timeout(
-                "submit_sync_committee_messages",
-                self.op_timeout(|t| t.sync_message),
-                self.query_first(
-                    "submit_sync_committee_messages",
-                    BnRole::SyncCommittee,
-                    HealthTier::SmallLag,
-                    |c| Box::pin(c.submit_sync_committee_messages(messages)),
-                ),
-            )
-            .await
-        }
+        self.submit(
+            "submit_sync_committee_messages",
+            self.broadcast_topics.sync_committee,
+            BnRole::SyncCommittee,
+            HealthTier::SmallLag,
+            self.op_timeout(|t| t.sync_message),
+            |c| Box::pin(c.submit_sync_committee_messages(messages)),
+        )
+        .await
     }
 
     async fn get_sync_committee_contribution(
@@ -3818,5 +3804,343 @@ mod tests {
         // BN1 should have error recorded, BN2 should have success
         let health = manager.health_trackers().read().await;
         assert!(health[0].score() < health[1].score());
+    }
+
+    // ===================================================================
+    // RF4-26: batched health updates + submit() topic dispatch
+    // ===================================================================
+
+    fn sample_signed_block() -> SignedBeaconBlock {
+        SignedBeaconBlock {
+            message: eth_types::BeaconBlock {
+                slot: 100,
+                proposer_index: 42,
+                parent_root: [1u8; 32],
+                state_root: [2u8; 32],
+                body: vec![0xde, 0xad],
+            },
+            signature: vec![0xaa; 96],
+        }
+    }
+
+    fn sample_signed_blinded_block() -> SignedBlindedBeaconBlock {
+        SignedBlindedBeaconBlock {
+            message: eth_types::BlindedBeaconBlock {
+                slot: 100,
+                proposer_index: 42,
+                parent_root: [1u8; 32],
+                state_root: [2u8; 32],
+                body: vec![0xbe, 0xef],
+            },
+            signature: vec![0xbb; 96],
+        }
+    }
+
+    /// query_best with N parallel BNs must take the health write lock once for
+    /// the selection round (not once per result).
+    #[tokio::test]
+    async fn test_health_tracker_write_lock_taken_once_per_selection_round() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+        let bn3 = MockServer::start().await;
+
+        for bn in [&bn1, &bn2, &bn3] {
+            Mock::given(method("GET"))
+                .and(path("/eth/v1/node/syncing"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+                .mount(bn)
+                .await;
+
+            Mock::given(method("GET"))
+                .and(path("/eth/v3/validator/blocks/1"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Eth-Consensus-Version", "deneb")
+                        .insert_header("Eth-Execution-Payload-Blinded", "false")
+                        .insert_header("Eth-Execution-Payload-Value", "1000")
+                        .set_body_string(
+                            r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#,
+                        ),
+                )
+                .expect(1)
+                .mount(bn)
+                .await;
+        }
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri(), &bn3.uri()]);
+        manager.check_sync_status().await;
+
+        manager.health_trackers().reset_write_lock_count();
+        let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
+        assert!(result.is_ok());
+
+        let writes = manager.health_trackers().write_lock_count();
+        assert_eq!(
+            writes, 1,
+            "query_best must batch health updates into a single write lock (got {writes})"
+        );
+    }
+
+    /// fallback_unsynced also records under one write per fallback round.
+    #[tokio::test]
+    async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+        let bn3 = MockServer::start().await;
+
+        // BN1: synced but production fails
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&bn1)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Error"))
+            .expect(1)
+            .mount(&bn1)
+            .await;
+
+        // BN2, BN3: unsynced; BN2 fails, BN3 succeeds
+        for bn in [&bn2, &bn3] {
+            Mock::given(method("GET"))
+                .and(path("/eth/v1/node/syncing"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
+                .mount(bn)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Error"))
+            .expect(1)
+            .mount(&bn2)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Eth-Consensus-Version", "deneb")
+                    .insert_header("Eth-Execution-Payload-Blinded", "false")
+                    .insert_header("Eth-Execution-Payload-Value", "7000")
+                    .set_body_string(
+                        r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#,
+                    ),
+            )
+            .expect(1)
+            .mount(&bn3)
+            .await;
+
+        let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri(), &bn3.uri()]);
+        manager.check_sync_status().await;
+
+        manager.health_trackers().reset_write_lock_count();
+        let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
+        assert!(result.is_ok());
+
+        // 1 write for the failed synced BN (query_best single path) +
+        // 1 write for the unsynced fallback round (BN2 err + BN3 ok batched).
+        let writes = manager.health_trackers().write_lock_count();
+        assert_eq!(
+            writes, 2,
+            "synced fail (1) + batched unsynced fallback (1) expected; got {writes}"
+        );
+    }
+
+    /// Each of the five topic-gated submission methods respects its broadcast flag:
+    /// topic on → both BNs receive; topic off → only the primary (query_first).
+    #[tokio::test]
+    async fn test_submit_helper_respects_each_broadcast_topic_flag() {
+        // -- sync_committee --
+        {
+            let bn1 = MockServer::start().await;
+            let bn2 = MockServer::start().await;
+            for bn in [&bn1, &bn2] {
+                Mock::given(method("POST"))
+                    .and(path("/eth/v1/beacon/pool/sync_committees"))
+                    .respond_with(ResponseTemplate::new(200))
+                    .expect(1)
+                    .mount(bn)
+                    .await;
+            }
+            let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+            config.broadcast_topics.sync_committee = true;
+            let manager = BnManager::new(config).unwrap();
+            assert!(manager.submit_sync_committee_messages(&[]).await.is_ok());
+        }
+        {
+            let bn1 = MockServer::start().await;
+            let bn2 = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/eth/v1/beacon/pool/sync_committees"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&bn1)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/eth/v1/beacon/pool/sync_committees"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&bn2)
+                .await;
+            let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+            config.broadcast_topics.sync_committee = false;
+            let manager = BnManager::new(config).unwrap();
+            assert!(manager.submit_sync_committee_messages(&[]).await.is_ok());
+        }
+
+        // -- subscriptions --
+        {
+            let bn1 = MockServer::start().await;
+            let bn2 = MockServer::start().await;
+            for bn in [&bn1, &bn2] {
+                Mock::given(method("POST"))
+                    .and(path("/eth/v1/validator/beacon_committee_subscriptions"))
+                    .respond_with(ResponseTemplate::new(200))
+                    .expect(1)
+                    .mount(bn)
+                    .await;
+            }
+            let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+            config.broadcast_topics.subscriptions = true;
+            let manager = BnManager::new(config).unwrap();
+            assert!(manager.submit_beacon_committee_subscriptions(&[]).await.is_ok());
+        }
+        {
+            let bn1 = MockServer::start().await;
+            let bn2 = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/eth/v1/validator/beacon_committee_subscriptions"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&bn1)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/eth/v1/validator/beacon_committee_subscriptions"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&bn2)
+                .await;
+            let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+            config.broadcast_topics.subscriptions = false;
+            let manager = BnManager::new(config).unwrap();
+            assert!(manager.submit_beacon_committee_subscriptions(&[]).await.is_ok());
+        }
+
+        // -- attestations --
+        let empty_atts = VersionedAttestation::Electra(vec![]);
+        {
+            let bn1 = MockServer::start().await;
+            let bn2 = MockServer::start().await;
+            for bn in [&bn1, &bn2] {
+                Mock::given(method("POST"))
+                    .and(path("/eth/v2/beacon/pool/attestations"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+                    .expect(1)
+                    .mount(bn)
+                    .await;
+            }
+            let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+            config.broadcast_topics.attestations = true;
+            let manager = BnManager::new(config).unwrap();
+            assert!(manager.submit_attestation(&empty_atts).await.is_ok());
+        }
+        {
+            let bn1 = MockServer::start().await;
+            let bn2 = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/eth/v2/beacon/pool/attestations"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+                .expect(1)
+                .mount(&bn1)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/eth/v2/beacon/pool/attestations"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+                .expect(0)
+                .mount(&bn2)
+                .await;
+            let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+            config.broadcast_topics.attestations = false;
+            let manager = BnManager::new(config).unwrap();
+            assert!(manager.submit_attestation(&empty_atts).await.is_ok());
+        }
+
+        // -- blocks (publish_block) --
+        let signed = sample_signed_block();
+        {
+            let bn1 = MockServer::start().await;
+            let bn2 = MockServer::start().await;
+            for bn in [&bn1, &bn2] {
+                Mock::given(method("POST"))
+                    .and(path("/eth/v2/beacon/blocks"))
+                    .respond_with(ResponseTemplate::new(200))
+                    .expect(1)
+                    .mount(bn)
+                    .await;
+            }
+            let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+            config.broadcast_topics.blocks = true;
+            let manager = BnManager::new(config).unwrap();
+            assert!(manager.publish_block(&signed, "deneb").await.is_ok());
+        }
+        {
+            let bn1 = MockServer::start().await;
+            let bn2 = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/eth/v2/beacon/blocks"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&bn1)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/eth/v2/beacon/blocks"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&bn2)
+                .await;
+            let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+            config.broadcast_topics.blocks = false;
+            let manager = BnManager::new(config).unwrap();
+            assert!(manager.publish_block(&signed, "deneb").await.is_ok());
+        }
+
+        // -- blocks (publish_blinded_block) shares the same topic flag --
+        let blinded = sample_signed_blinded_block();
+        {
+            let bn1 = MockServer::start().await;
+            let bn2 = MockServer::start().await;
+            for bn in [&bn1, &bn2] {
+                Mock::given(method("POST"))
+                    .and(path("/eth/v1/beacon/blinded_blocks"))
+                    .respond_with(ResponseTemplate::new(200))
+                    .expect(1)
+                    .mount(bn)
+                    .await;
+            }
+            let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+            config.broadcast_topics.blocks = true;
+            let manager = BnManager::new(config).unwrap();
+            assert!(manager.publish_blinded_block(&blinded, "deneb").await.is_ok());
+        }
+        {
+            let bn1 = MockServer::start().await;
+            let bn2 = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/eth/v1/beacon/blinded_blocks"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&bn1)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/eth/v1/beacon/blinded_blocks"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(&bn2)
+                .await;
+            let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+            config.broadcast_topics.blocks = false;
+            let manager = BnManager::new(config).unwrap();
+            assert!(manager.publish_blinded_block(&blinded, "deneb").await.is_ok());
+        }
     }
 }
