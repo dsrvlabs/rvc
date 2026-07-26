@@ -12,9 +12,9 @@ mod rules;
 mod scoped;
 mod stage;
 mod types;
-mod watermarks;
 
 pub use audit::audit_log;
+pub use db::watermarks::{raise_watermark, read_watermark, WatermarkKind};
 pub use db::SlashingDb;
 pub use error::{AttestationSlashingViolation, BlockSlashingViolation, SlashingError};
 pub use reader::{SlashingDbReader, TargetEpoch};
@@ -24,4 +24,3 @@ pub use types::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata, PruneStats,
     SignedAttestation, SignedBlock, ValidatorRecord,
 };
-pub use watermarks::{raise_watermark, read_watermark, WatermarkKind};

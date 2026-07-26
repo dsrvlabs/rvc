@@ -65,13 +65,13 @@
 use parking_lot::MutexGuard;
 use rusqlite::Connection;
 
+use crate::db::watermarks::{read_watermark, WatermarkKind};
 use crate::error::SlashingError;
 use crate::history::{TargetedSqlAttestationHistory, TargetedSqlBlockHistory};
 use crate::rules::{
     check_attestation, check_block, AttestationCandidate, AttestationVerdict,
     AttestationWatermarks, BlockCandidate, BlockVerdict, BlockWatermarks,
 };
-use crate::watermarks::{read_watermark, WatermarkKind};
 use crate::SlashingDb;
 use eth_types::{Epoch, Root, Slot};
 use observability::logging::TruncatedPubkey;

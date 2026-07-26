@@ -1185,12 +1185,12 @@ part of E2 that makes it an **L** rather than an **M**.
 3. `watermarks.rs` absorbs RF4-17's helpers so `WatermarkKind` lives next to its table.
 
 **Acceptance criteria:**
-- [ ] `git diff -M` reads as moves; no behavioral change.
-- [ ] `db/mod.rs` production code is under ~400 lines.
-- [ ] Every test moved with its code; total test count unchanged (CI diff attached).
-- [ ] Public API byte-identical.
-- [ ] A2 conformance suite + RF4-18's proptests green.
-- [ ] Standing invariant green.
+- [x] `git diff -M` reads as moves; no behavioral change.
+- [x] `db/mod.rs` production code is under ~400 lines.
+- [x] Every test moved with its code; total test count unchanged (CI diff attached).
+- [x] Public API byte-identical.
+- [x] A2 conformance suite + RF4-18's proptests green.
+- [x] Standing invariant green.
 
 **TDD test plan:** code motion — existing suite is the oracle.
 - **RED first:** `test_public_api_surface_unchanged` extended to enumerate every `pub fn` on `SlashingDb`
