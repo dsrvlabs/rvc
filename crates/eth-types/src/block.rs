@@ -53,12 +53,15 @@ pub enum BodyForkLayout {
 ///
 /// Returns `Some(Deneb)` for `"deneb"`, `Some(Electra)` for `"electra"` /
 /// `"fulu"`. Pre-Deneb forks have no blob commitments and return `None`.
+///
+/// Exact, case-sensitive match via [`ForkName::from_str`] + [`ForkName::body_layout`].
+/// Unrecognised strings (including wrong case) yield `None`.
 pub fn body_fork_layout(consensus_version: &str) -> Option<BodyForkLayout> {
-    match consensus_version {
-        "deneb" => Some(BodyForkLayout::Deneb),
-        "electra" | "fulu" => Some(BodyForkLayout::Electra),
-        _ => None,
-    }
+    use std::str::FromStr;
+
+    use crate::fork::ForkName;
+
+    ForkName::from_str(consensus_version).ok().and_then(ForkName::body_layout)
 }
 
 /// Extract blob KZG commitments from a raw SSZ-encoded `BeaconBlockBody`.
@@ -585,6 +588,36 @@ mod tests {
 
     fn sample_blob_sidecar() -> BlobSidecar {
         BlobSidecar { index: 0, blob: vec![0xab; 8] }
+    }
+
+    /// Pin `body_fork_layout` behaviour: exact, case-sensitive fork names only.
+    /// RF3-07 delegates onto `ForkName`; this table guards against accidental
+    /// leniency (lowercase, trimming) and against layout drift.
+    #[test]
+    fn test_body_fork_layout_unchanged_for_all_known_and_unknown_versions() {
+        let cases: &[(&str, Option<BodyForkLayout>)] = &[
+            ("phase0", None),
+            ("altair", None),
+            ("bellatrix", None),
+            ("capella", None),
+            ("deneb", Some(BodyForkLayout::Deneb)),
+            ("electra", Some(BodyForkLayout::Electra)),
+            ("fulu", Some(BodyForkLayout::Electra)),
+            // Exact-match only: trailing space / wrong case / empty / garbage → None
+            ("electra ", None),
+            ("Deneb", None),
+            ("ELECTRA", None),
+            ("", None),
+            ("not-a-fork", None),
+            ("deneb\n", None),
+        ];
+        for &(version, expected) in cases {
+            assert_eq!(
+                body_fork_layout(version),
+                expected,
+                "body_fork_layout({version:?}) mismatch"
+            );
+        }
     }
 
     #[test]

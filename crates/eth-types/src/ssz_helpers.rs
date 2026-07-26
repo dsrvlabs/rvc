@@ -1,9 +1,10 @@
 //! SSZ encode/decode helpers for consensus objects.
 //!
-//! These helpers dispatch by `fork_id` (PHASE0=0, ALTAIR=1, BELLATRIX=2,
-//! CAPELLA=3, DENEB=4, ELECTRA=5, FULU=6) and provide unified entry points
-//! that the signer service can use to deserialize SSZ bytes from proto fields
-//! without inspecting the bytes directly.
+//! These helpers take a numeric `fork_id` matching [`crate::ForkName::id`]
+//! (PHASE0=0 … FULU=6) and provide unified entry points that the signer
+//! service can use to deserialize SSZ bytes from proto fields without
+//! inspecting the bytes directly. Unknown ids are rejected via
+//! [`crate::ForkName`]'s `TryFrom<u32>` impl.
 //!
 //! The `BeaconBlock` and related types use a `body: Vec<u8>` representation
 //! internally. Their SSZ layout is a simple 5-field container with one
@@ -22,7 +23,8 @@
 use thiserror::Error;
 
 use crate::{
-    Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock, SyncCommitteeContribution,
+    Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock, ForkName,
+    SyncCommitteeContribution,
 };
 
 /// Errors that can occur when decoding SSZ bytes into a consensus type.
@@ -234,11 +236,9 @@ pub fn decode_sync_committee_contribution_ssz(
 /// (slot, proposer_index, parent_root, state_root, body)
 type BlockFields = (u64, u64, [u8; 32], [u8; 32], Vec<u8>);
 
-/// Validate that a `fork_id` is a known value (0..=6).
+/// Validate that a `fork_id` is a known [`ForkName`] id.
 fn validate_fork_id(fork_id: u32) -> Result<(), SszDecodeError> {
-    if fork_id > 6 {
-        return Err(SszDecodeError::UnknownForkId(fork_id));
-    }
+    ForkName::try_from(fork_id).map_err(|e| SszDecodeError::UnknownForkId(e.0))?;
     Ok(())
 }
 
@@ -382,6 +382,25 @@ mod tests {
         let encoded = encode_beacon_block_ssz(&block, 0);
         let result = decode_beacon_block_ssz(&encoded, 7);
         assert!(matches!(result, Err(SszDecodeError::UnknownForkId(7))));
+    }
+
+    /// RF3-07: `validate_fork_id` delegates to `ForkName::try_from`.
+    /// Accept 0..=6; reject 7 and `u32::MAX` with `UnknownForkId`.
+    #[test]
+    fn test_validate_fork_id_accepts_0_through_6_rejects_7_and_max() {
+        let block = sample_beacon_block();
+        let encoded = encode_beacon_block_ssz(&block, 0);
+        for fork_id in 0u32..=6 {
+            decode_beacon_block_ssz(&encoded, fork_id)
+                .unwrap_or_else(|e| panic!("fork_id={fork_id} should be accepted: {e}"));
+        }
+        for fork_id in [7u32, u32::MAX] {
+            let result = decode_beacon_block_ssz(&encoded, fork_id);
+            assert!(
+                matches!(result, Err(SszDecodeError::UnknownForkId(id)) if id == fork_id),
+                "fork_id={fork_id} should be UnknownForkId, got {result:?}"
+            );
+        }
     }
 
     #[test]

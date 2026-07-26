@@ -152,8 +152,8 @@ impl ForkName {
 
     /// Body SSZ layout for KZG extraction, if the fork has blob commitments.
     ///
-    /// Mirrors [`body_fork_layout`]: Deneb → Deneb layout; Electra/Fulu → Electra
-    /// layout; pre-Deneb → `None`.
+    /// Deneb → Deneb layout; Electra/Fulu → Electra layout; pre-Deneb → `None`.
+    /// [`crate::block::body_fork_layout`] delegates here after parsing the name.
     pub fn body_layout(self) -> Option<BodyForkLayout> {
         match self {
             Self::Deneb => Some(BodyForkLayout::Deneb),
