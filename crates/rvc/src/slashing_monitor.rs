@@ -10,28 +10,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use validator_store::ValidatorStore;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlashedAction {
-    DisableOnly,
-    Shutdown,
-    None,
-}
-
-impl std::str::FromStr for SlashedAction {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "disable-only" => Ok(Self::DisableOnly),
-            "shutdown" => Ok(Self::Shutdown),
-            "none" => Ok(Self::None),
-            other => Err(format!(
-                "invalid slashed-validators-action '{}': must be one of disable-only, shutdown, none",
-                other
-            )),
-        }
-    }
-}
+/// Re-export config-typed enum so callers keep a single definition.
+pub use crate::config::SlashedAction;
 
 /// Result of a single slashed-validator check pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -688,7 +688,11 @@ async fn main() -> anyhow::Result<()> {
                 remote_signer_allowed_hosts,
                 key_decrypt_threads,
                 tracing_endpoint,
-                tracing_exporter: Some(tracing_exporter),
+                tracing_exporter: Some(
+                    tracing_exporter
+                        .parse::<rvc::config::TracingExporter>()
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                ),
                 tracing_sample_rate: Some(tracing_sample_rate),
                 tracing_max_queue_size,
                 tracing_max_export_batch_size,
@@ -709,12 +713,24 @@ async fn main() -> anyhow::Result<()> {
                 grpc_signer_tls_key,
                 grpc_signer_tls_ca_cert,
                 disable_attesting: if disable_attesting { Some(true) } else { None },
-                slashed_validators_action: Some(slashed_validators_action),
+                slashed_validators_action: Some(
+                    slashed_validators_action
+                        .parse::<rvc::config::SlashedAction>()
+                        .map_err(|e| anyhow::anyhow!("{e}"))?,
+                ),
                 builder_circuit_breaker_consecutive_limit,
                 builder_circuit_breaker_epoch_limit,
                 disable_keystore_locking: if disable_keystore_locking { Some(true) } else { None },
                 proposer_nodes,
-                broadcast,
+                broadcast: broadcast
+                    .map(|topics| {
+                        topics
+                            .into_iter()
+                            .map(|s| s.parse::<rvc::config::BroadcastTopic>())
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?,
                 proposer_config_url,
                 proposer_config_file,
                 proposer_config_refresh_interval,
@@ -1015,21 +1031,17 @@ fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfig> {
         }
     }
 
-    let exporter = match config.tracing_exporter.as_str() {
-        "otlp" => telemetry::ExporterKind::Otlp,
+    let exporter = match config.tracing_exporter {
+        rvc::config::TracingExporter::Otlp => telemetry::ExporterKind::Otlp,
         #[cfg(feature = "gcp-trace")]
-        "gcp" => telemetry::ExporterKind::Gcp,
+        rvc::config::TracingExporter::Gcp => telemetry::ExporterKind::Gcp,
         #[cfg(not(feature = "gcp-trace"))]
-        "gcp" => {
+        rvc::config::TracingExporter::Gcp => {
             eprintln!(
                 "ERROR: --tracing-exporter=gcp requires the `gcp-trace` feature. \
                  Rebuild with: cargo build --features gcp-trace"
             );
             return None;
-        }
-        other => {
-            warn!(exporter = %other, "unknown tracing exporter, defaulting to otlp");
-            telemetry::ExporterKind::Otlp
         }
     };
 
@@ -1301,8 +1313,7 @@ async fn run_validator(
 
     // Step 8b: Spawn slashing monitor background task
     {
-        let slashed_action: rvc::slashing_monitor::SlashedAction =
-            config.slashed_validators_action.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+        let slashed_action = config.slashed_validators_action;
 
         if slashed_action != rvc::slashing_monitor::SlashedAction::None {
             rvc::slashing_monitor::spawn(
@@ -1312,7 +1323,7 @@ async fn run_validator(
                 shutdown_token.clone(),
             );
             info!(
-                action = %config.slashed_validators_action,
+                action = %slashed_action,
                 "Slashing monitor started"
             );
         }
@@ -1733,14 +1744,14 @@ mod tests {
     }
 
     #[test]
-    fn test_build_tracing_config_unknown_exporter_defaults_to_otlp() {
+    fn test_build_tracing_config_otlp_exporter() {
         let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
 
         let config = Config {
             tracing_endpoint: Some("http://localhost:4318".to_string()),
-            tracing_exporter: "unknown".to_string(),
+            tracing_exporter: rvc::config::TracingExporter::Otlp,
             ..Default::default()
         };
         let tc = build_tracing_config(&config).expect("should return Some");

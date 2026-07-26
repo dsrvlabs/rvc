@@ -1,10 +1,13 @@
 //! Configuration types for the validator client.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
+use bn_manager::BnRole;
 use observability::hex::{strip_prefix_strict, HexError};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -16,6 +19,117 @@ use beacon::ResponseCaps;
 
 use super::error::ConfigError;
 use super::network::Network;
+
+/// Action taken when a managed validator is detected as slashed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SlashedAction {
+    /// Disable the validator in the store and keep running.
+    #[default]
+    DisableOnly,
+    /// Request process shutdown.
+    Shutdown,
+    /// Do not monitor / take no action.
+    None,
+}
+
+impl fmt::Display for SlashedAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DisableOnly => write!(f, "disable-only"),
+            Self::Shutdown => write!(f, "shutdown"),
+            Self::None => write!(f, "none"),
+        }
+    }
+}
+
+impl FromStr for SlashedAction {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "disable-only" => Ok(Self::DisableOnly),
+            "shutdown" => Ok(Self::Shutdown),
+            "none" => Ok(Self::None),
+            other => Err(format!(
+                "invalid slashed-validators-action '{other}': must be one of disable-only, shutdown, none"
+            )),
+        }
+    }
+}
+
+/// Message types that may be broadcast to all beacon nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BroadcastTopic {
+    Attestations,
+    Blocks,
+    SyncCommittee,
+    Subscriptions,
+    /// Disable all broadcast (must appear alone).
+    None,
+}
+
+impl fmt::Display for BroadcastTopic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Attestations => write!(f, "attestations"),
+            Self::Blocks => write!(f, "blocks"),
+            Self::SyncCommittee => write!(f, "sync-committee"),
+            Self::Subscriptions => write!(f, "subscriptions"),
+            Self::None => write!(f, "none"),
+        }
+    }
+}
+
+impl FromStr for BroadcastTopic {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "attestations" => Ok(Self::Attestations),
+            "blocks" => Ok(Self::Blocks),
+            "sync-committee" => Ok(Self::SyncCommittee),
+            "subscriptions" => Ok(Self::Subscriptions),
+            "none" => Ok(Self::None),
+            other => Err(format!(
+                "invalid broadcast topic '{other}': must be one of attestations, blocks, sync-committee, subscriptions, none"
+            )),
+        }
+    }
+}
+
+/// OpenTelemetry exporter backend selected in config / CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TracingExporter {
+    /// OTLP over HTTP (default).
+    #[default]
+    Otlp,
+    /// Google Cloud Trace (requires the `gcp-trace` feature on the binary).
+    Gcp,
+}
+
+impl fmt::Display for TracingExporter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Otlp => write!(f, "otlp"),
+            Self::Gcp => write!(f, "gcp"),
+        }
+    }
+}
+
+impl FromStr for TracingExporter {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "otlp" => Ok(Self::Otlp),
+            "gcp" => Ok(Self::Gcp),
+            other => Err(format!("invalid tracing_exporter '{other}': must be one of otlp, gcp")),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -94,8 +208,8 @@ pub struct Config {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracing_endpoint: Option<String>,
 
-    #[serde(default = "default_tracing_exporter")]
-    pub tracing_exporter: String,
+    #[serde(default)]
+    pub tracing_exporter: TracingExporter,
 
     #[serde(default = "default_tracing_sample_rate")]
     pub tracing_sample_rate: f64,
@@ -133,8 +247,8 @@ pub struct Config {
     #[serde(default)]
     pub disable_attesting: bool,
 
-    #[serde(default = "default_slashed_validators_action")]
-    pub slashed_validators_action: String,
+    #[serde(default)]
+    pub slashed_validators_action: SlashedAction,
 
     #[serde(default = "default_circuit_breaker_consecutive_limit")]
     pub builder_circuit_breaker_consecutive_limit: u32,
@@ -161,7 +275,7 @@ pub struct Config {
 
     // --- Broadcast topics fields (T3.3/T3.4) ---
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub broadcast: Vec<String>,
+    pub broadcast: Vec<BroadcastTopic>,
 
     // --- Proposer config URL fields (T3.11/T3.12/T3.13) ---
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -250,20 +364,16 @@ fn default_logfile_max_number() -> usize {
     5
 }
 
-fn default_slashed_validators_action() -> String {
-    "disable-only".to_string()
-}
-
 /// Per-BN configuration entry for `[[beacon_nodes]]` TOML tables.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeaconNodeEntry {
     pub url: String,
     #[serde(default = "default_bn_roles")]
-    pub roles: Vec<String>,
+    pub roles: Vec<BnRole>,
 }
 
-fn default_bn_roles() -> Vec<String> {
-    vec!["all".to_string()]
+fn default_bn_roles() -> Vec<BnRole> {
+    vec![BnRole::All]
 }
 
 fn default_validator_registration_batch_size() -> usize {
@@ -327,10 +437,6 @@ fn default_circuit_breaker_epoch_limit() -> u32 {
     5
 }
 
-fn default_tracing_exporter() -> String {
-    "otlp".to_string()
-}
-
 fn default_tracing_sample_rate() -> f64 {
     0.01
 }
@@ -362,7 +468,7 @@ impl Default for Config {
             remote_signer_allowed_hosts: None,
             key_decrypt_threads: None,
             tracing_endpoint: None,
-            tracing_exporter: default_tracing_exporter(),
+            tracing_exporter: TracingExporter::default(),
             tracing_sample_rate: default_tracing_sample_rate(),
             tracing_max_queue_size: None,
             tracing_max_export_batch_size: None,
@@ -375,7 +481,7 @@ impl Default for Config {
             grpc_signer_tls_key: None,
             grpc_signer_tls_ca_cert: None,
             disable_attesting: false,
-            slashed_validators_action: default_slashed_validators_action(),
+            slashed_validators_action: SlashedAction::default(),
             builder_circuit_breaker_consecutive_limit: default_circuit_breaker_consecutive_limit(),
             builder_circuit_breaker_epoch_limit: default_circuit_breaker_epoch_limit(),
             disable_keystore_locking: false,
@@ -510,19 +616,9 @@ impl Config {
             ));
         }
 
-        // Validate broadcast topics
-        for topic in &self.broadcast {
-            match topic.as_str() {
-                "attestations" | "blocks" | "sync-committee" | "subscriptions" | "none" => {}
-                other => {
-                    return Err(ConfigError::MissingField(format!(
-                        "invalid broadcast topic '{}': must be one of attestations, blocks, sync-committee, subscriptions, none",
-                        other
-                    )));
-                }
-            }
-        }
-        if self.broadcast.contains(&"none".to_string()) && self.broadcast.len() > 1 {
+        // Broadcast topic values are typed (serde / FromStr). Cross-field rule only:
+        // `none` cannot be combined with other topics.
+        if self.broadcast.contains(&BroadcastTopic::None) && self.broadcast.len() > 1 {
             return Err(ConfigError::MissingField(
                 "broadcast topic 'none' cannot be combined with other topics".to_string(),
             ));
@@ -539,16 +635,6 @@ impl Config {
                 return Err(ConfigError::InvalidBeaconUrl(format!(
                     "proposer_nodes entry must start with http:// or https://: {}",
                     node_url
-                )));
-            }
-        }
-
-        match self.slashed_validators_action.as_str() {
-            "disable-only" | "shutdown" | "none" => {}
-            other => {
-                return Err(ConfigError::MissingField(format!(
-                    "invalid --slashed-validators-action '{}': must be one of disable-only, shutdown, none",
-                    other
                 )));
             }
         }
@@ -614,13 +700,13 @@ impl Config {
 
     /// Parses the `broadcast` config field into `BroadcastTopics`.
     ///
-    /// If empty, returns default (all enabled). If "none", all disabled.
+    /// If empty, returns default (all enabled). If `none`, all disabled.
     /// Otherwise, only listed topics are enabled.
     pub fn effective_broadcast_topics(&self) -> bn_manager::BroadcastTopics {
         if self.broadcast.is_empty() {
             return bn_manager::BroadcastTopics::default();
         }
-        if self.broadcast.len() == 1 && self.broadcast[0] == "none" {
+        if self.broadcast.len() == 1 && self.broadcast[0] == BroadcastTopic::None {
             return bn_manager::BroadcastTopics {
                 attestations: false,
                 blocks: false,
@@ -629,10 +715,10 @@ impl Config {
             };
         }
         bn_manager::BroadcastTopics {
-            attestations: self.broadcast.contains(&"attestations".to_string()),
-            blocks: self.broadcast.contains(&"blocks".to_string()),
-            sync_committee: self.broadcast.contains(&"sync-committee".to_string()),
-            subscriptions: self.broadcast.contains(&"subscriptions".to_string()),
+            attestations: self.broadcast.contains(&BroadcastTopic::Attestations),
+            blocks: self.broadcast.contains(&BroadcastTopic::Blocks),
+            sync_committee: self.broadcast.contains(&BroadcastTopic::SyncCommittee),
+            subscriptions: self.broadcast.contains(&BroadcastTopic::Subscriptions),
         }
     }
 
@@ -751,8 +837,8 @@ impl Config {
             self.tracing_endpoint = Some(tracing_endpoint.clone());
         }
 
-        if let Some(ref tracing_exporter) = cli.tracing_exporter {
-            self.tracing_exporter = tracing_exporter.clone();
+        if let Some(tracing_exporter) = cli.tracing_exporter {
+            self.tracing_exporter = tracing_exporter;
         }
 
         if let Some(tracing_sample_rate) = cli.tracing_sample_rate {
@@ -826,8 +912,8 @@ impl Config {
             self.disable_attesting = disable_attesting;
         }
 
-        if let Some(ref action) = cli.slashed_validators_action {
-            self.slashed_validators_action = action.clone();
+        if let Some(action) = cli.slashed_validators_action {
+            self.slashed_validators_action = action;
         }
 
         if let Some(limit) = cli.builder_circuit_breaker_consecutive_limit {
@@ -969,7 +1055,7 @@ pub struct CliOverrides {
     pub remote_signer_allowed_hosts: Option<String>,
     pub key_decrypt_threads: Option<usize>,
     pub tracing_endpoint: Option<String>,
-    pub tracing_exporter: Option<String>,
+    pub tracing_exporter: Option<TracingExporter>,
     pub tracing_sample_rate: Option<f64>,
     pub tracing_max_queue_size: Option<usize>,
     pub tracing_max_export_batch_size: Option<usize>,
@@ -987,12 +1073,12 @@ pub struct CliOverrides {
     pub grpc_signer_tls_key: Option<PathBuf>,
     pub grpc_signer_tls_ca_cert: Option<PathBuf>,
     pub disable_attesting: Option<bool>,
-    pub slashed_validators_action: Option<String>,
+    pub slashed_validators_action: Option<SlashedAction>,
     pub builder_circuit_breaker_consecutive_limit: Option<u32>,
     pub builder_circuit_breaker_epoch_limit: Option<u32>,
     pub disable_keystore_locking: Option<bool>,
     pub proposer_nodes: Option<Vec<String>>,
-    pub broadcast: Option<Vec<String>>,
+    pub broadcast: Option<Vec<BroadcastTopic>>,
     pub proposer_config_url: Option<String>,
     pub proposer_config_file: Option<String>,
     pub proposer_config_refresh_interval: Option<u64>,
@@ -1595,7 +1681,7 @@ key_decrypt_threads = 4
     fn test_default_config_tracing_fields() {
         let config = Config::default();
         assert!(config.tracing_endpoint.is_none());
-        assert_eq!(config.tracing_exporter, "otlp");
+        assert_eq!(config.tracing_exporter, TracingExporter::Otlp);
         assert!((config.tracing_sample_rate - 0.01).abs() < f64::EPSILON);
     }
 
@@ -1613,9 +1699,10 @@ key_decrypt_threads = 4
     #[test]
     fn test_merge_with_cli_tracing_exporter() {
         let mut config = Config::default();
-        let cli = CliOverrides { tracing_exporter: Some("gcp".to_string()), ..Default::default() };
+        let cli =
+            CliOverrides { tracing_exporter: Some(TracingExporter::Gcp), ..Default::default() };
         config.merge_with_cli(&cli);
-        assert_eq!(config.tracing_exporter, "gcp");
+        assert_eq!(config.tracing_exporter, TracingExporter::Gcp);
     }
 
     #[test]
@@ -1632,7 +1719,7 @@ key_decrypt_threads = 4
         let cli = CliOverrides::default();
         config.merge_with_cli(&cli);
         assert!(config.tracing_endpoint.is_none());
-        assert_eq!(config.tracing_exporter, "otlp");
+        assert_eq!(config.tracing_exporter, TracingExporter::Otlp);
         assert!((config.tracing_sample_rate - 0.01).abs() < f64::EPSILON);
     }
 
@@ -1656,7 +1743,7 @@ tracing_sample_rate = 0.1
 
         let config = Config::from_file(file.path()).unwrap();
         assert_eq!(config.tracing_endpoint.as_deref(), Some("http://otel-collector:4318"));
-        assert_eq!(config.tracing_exporter, "otlp");
+        assert_eq!(config.tracing_exporter, TracingExporter::Otlp);
         assert!((config.tracing_sample_rate - 0.1).abs() < f64::EPSILON);
     }
 
@@ -1677,7 +1764,7 @@ log_level = "info"
 
         let config = Config::from_file(file.path()).unwrap();
         assert!(config.tracing_endpoint.is_none());
-        assert_eq!(config.tracing_exporter, "otlp");
+        assert_eq!(config.tracing_exporter, TracingExporter::Otlp);
         assert!((config.tracing_sample_rate - 0.01).abs() < f64::EPSILON);
     }
 
@@ -2254,7 +2341,7 @@ disable_keystore_locking = true
 
     #[test]
     fn test_effective_broadcast_topics_none() {
-        let config = Config { broadcast: vec!["none".to_string()], ..Default::default() };
+        let config = Config { broadcast: vec![BroadcastTopic::None], ..Default::default() };
         let topics = config.effective_broadcast_topics();
         assert!(!topics.attestations);
         assert!(!topics.blocks);
@@ -2265,7 +2352,7 @@ disable_keystore_locking = true
     #[test]
     fn test_effective_broadcast_topics_partial() {
         let config = Config {
-            broadcast: vec!["blocks".to_string(), "attestations".to_string()],
+            broadcast: vec![BroadcastTopic::Blocks, BroadcastTopic::Attestations],
             ..Default::default()
         };
         let topics = config.effective_broadcast_topics();
@@ -2276,20 +2363,32 @@ disable_keystore_locking = true
     }
 
     #[test]
-    fn test_validate_invalid_broadcast_topic() {
-        let config = Config { broadcast: vec!["invalid-topic".to_string()], ..Default::default() };
-        let result = config.validate();
-        assert!(result.is_err());
+    fn test_invalid_broadcast_topic_fails_at_deserialization() {
+        let toml = r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+broadcast = ["invalid-topic"]
+"#;
+        let err = toml::from_str::<Config>(toml).unwrap_err().to_string();
+        assert!(
+            err.contains("broadcast") || err.contains("invalid-topic") || err.contains("unknown"),
+            "serde error should name the field or value: {err}"
+        );
     }
 
     #[test]
-    fn test_validate_broadcast_none_with_others_fails() {
+    fn test_broadcast_none_exclusivity_still_enforced_in_validate() {
         let config = Config {
-            broadcast: vec!["none".to_string(), "blocks".to_string()],
+            broadcast: vec![BroadcastTopic::None, BroadcastTopic::Blocks],
             ..Default::default()
         };
         let result = config.validate();
         assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("none"),
+            "error should mention none exclusivity"
+        );
     }
 
     #[test]
@@ -2366,7 +2465,7 @@ broadcast = ["blocks", "attestations"]
         let mut config = Config::default();
         let cli = CliOverrides {
             proposer_nodes: Some(vec!["http://p1:5052".to_string()]),
-            broadcast: Some(vec!["blocks".to_string()]),
+            broadcast: Some(vec![BroadcastTopic::Blocks]),
             proposer_config_url: Some("https://example.com/config".to_string()),
             proposer_config_refresh_interval: Some(60),
             proposer_config_url_token: Some("my-token".to_string()),
@@ -2375,11 +2474,175 @@ broadcast = ["blocks", "attestations"]
         };
         config.merge_with_cli(&cli);
         assert_eq!(config.proposer_nodes.len(), 1);
-        assert_eq!(config.broadcast, vec!["blocks".to_string()]);
+        assert_eq!(config.broadcast, vec![BroadcastTopic::Blocks]);
         assert_eq!(config.proposer_config_url, Some("https://example.com/config".to_string()));
         assert_eq!(config.proposer_config_refresh_interval, 60);
         assert_eq!(config.proposer_config_url_token, Some("my-token".to_string()));
         assert!(config.proposer_config_url_insecure);
+    }
+
+    // -- RF5-11: typed config enums (fail-early deserialize) --
+
+    #[test]
+    fn test_invalid_slashed_action_fails_at_deserialization_not_validate() {
+        let toml = r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+slashed_validators_action = "not-a-real-action"
+"#;
+        let err = toml::from_str::<Config>(toml).unwrap_err().to_string();
+        assert!(
+            err.contains("slashed_validators_action")
+                || err.contains("not-a-real-action")
+                || err.contains("unknown variant"),
+            "serde error should name the field or value: {err}"
+        );
+    }
+
+    #[test]
+    fn test_all_previously_accepted_slashed_actions_still_parse() {
+        for (literal, expected) in [
+            ("disable-only", SlashedAction::DisableOnly),
+            ("shutdown", SlashedAction::Shutdown),
+            ("none", SlashedAction::None),
+        ] {
+            let toml = format!(
+                r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+slashed_validators_action = "{literal}"
+"#
+            );
+            let config: Config = toml::from_str(&toml).unwrap_or_else(|e| {
+                panic!("accepted slashed action {literal:?} must still parse: {e}")
+            });
+            assert_eq!(config.slashed_validators_action, expected);
+            assert_eq!(literal.parse::<SlashedAction>().unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_all_previously_accepted_broadcast_topics_still_parse() {
+        for (literal, expected) in [
+            ("attestations", BroadcastTopic::Attestations),
+            ("blocks", BroadcastTopic::Blocks),
+            ("sync-committee", BroadcastTopic::SyncCommittee),
+            ("subscriptions", BroadcastTopic::Subscriptions),
+            ("none", BroadcastTopic::None),
+        ] {
+            assert_eq!(literal.parse::<BroadcastTopic>().unwrap(), expected);
+            let toml = format!(
+                r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+broadcast = ["{literal}"]
+"#
+            );
+            let config: Config = toml::from_str(&toml).unwrap_or_else(|e| {
+                panic!("accepted broadcast topic {literal:?} must still parse: {e}")
+            });
+            assert_eq!(config.broadcast, vec![expected]);
+        }
+    }
+
+    #[test]
+    fn test_bn_role_and_tracing_exporter_round_trip() {
+        for (literal, expected) in [
+            ("attestation", BnRole::Attestation),
+            ("proposal", BnRole::Proposal),
+            ("sync-committee", BnRole::SyncCommittee),
+            ("aggregation", BnRole::Aggregation),
+            ("submission", BnRole::Submission),
+            ("all", BnRole::All),
+        ] {
+            let toml = format!(
+                r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+
+[[beacon_nodes_config]]
+url = "http://bn:5052"
+roles = ["{literal}"]
+"#
+            );
+            let config: Config = toml::from_str(&toml)
+                .unwrap_or_else(|e| panic!("accepted BnRole {literal:?} must still parse: {e}"));
+            assert_eq!(config.beacon_nodes_config[0].roles, vec![expected]);
+        }
+
+        for (literal, expected) in [("otlp", TracingExporter::Otlp), ("gcp", TracingExporter::Gcp)]
+        {
+            let toml = format!(
+                r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+tracing_exporter = "{literal}"
+"#
+            );
+            let config: Config = toml::from_str(&toml).unwrap_or_else(|e| {
+                panic!("accepted tracing_exporter {literal:?} must still parse: {e}")
+            });
+            assert_eq!(config.tracing_exporter, expected);
+            assert_eq!(literal.parse::<TracingExporter>().unwrap(), expected);
+            let json = serde_json::to_string(&expected).unwrap();
+            let back: TracingExporter = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, expected);
+        }
+    }
+
+    #[test]
+    fn test_invalid_tracing_exporter_fails_at_deserialization() {
+        let toml = r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+tracing_exporter = "unknown"
+"#;
+        let err = toml::from_str::<Config>(toml).unwrap_err().to_string();
+        assert!(
+            err.contains("tracing_exporter") || err.contains("unknown") || err.contains("variant"),
+            "serde error should name the field or value: {err}"
+        );
+    }
+
+    #[test]
+    fn test_invalid_bn_role_fails_at_deserialization() {
+        let toml = r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "./keystores"
+slashing_db_path = "./slashing.sqlite"
+
+[[beacon_nodes_config]]
+url = "http://bn:5052"
+roles = ["not-a-role"]
+"#;
+        let err = toml::from_str::<Config>(toml).unwrap_err().to_string();
+        assert!(
+            err.contains("roles") || err.contains("not-a-role") || err.contains("variant"),
+            "serde error should name the field or value: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_no_longer_lists_typed_enum_values() {
+        // Typed enums cannot hold invalid variants, so validate only needs
+        // cross-field rules. A fully-valid typed config still validates.
+        let config = Config {
+            slashed_validators_action: SlashedAction::Shutdown,
+            tracing_exporter: TracingExporter::Gcp,
+            broadcast: vec![BroadcastTopic::Blocks, BroadcastTopic::Attestations],
+            beacon_nodes_config: vec![BeaconNodeEntry {
+                url: "http://bn:5052".to_string(),
+                roles: vec![BnRole::Proposal],
+            }],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
     }
 
     // -- CQ-2.5: strip_prefix_strict adoption test --

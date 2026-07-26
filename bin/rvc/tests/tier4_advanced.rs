@@ -719,7 +719,7 @@ roles = ["attestation"]
         assert_eq!(config.validator_registration_batch_delay, 100);
         assert_eq!(config.bn_sync_tolerances.as_deref(), Some("4,4,16"));
         assert_eq!(config.beacon_nodes_config.len(), 2);
-        assert_eq!(config.beacon_nodes_config[0].roles, vec!["proposal"]);
-        assert_eq!(config.beacon_nodes_config[1].roles, vec!["attestation"]);
+        assert_eq!(config.beacon_nodes_config[0].roles, vec![BnRole::Proposal]);
+        assert_eq!(config.beacon_nodes_config[1].roles, vec![BnRole::Attestation]);
     }
 }

@@ -2,6 +2,23 @@
 
 ## Behavior changes
 
+### Invalid config enum values fail at deserialization (not later in validate)
+
+Typed config enums now reject unknown values when the TOML/config is loaded
+(`slashed_validators_action`, `broadcast` topics, `tracing_exporter`, and
+`[[beacon_nodes_config]].roles` / `BnRole`). Previously these fields were
+plain strings: some invalid values were only rejected in `Config::validate()`,
+and unknown `tracing_exporter` values were warned and treated as `otlp` at
+runtime.
+
+The set of accepted spellings is unchanged (`disable-only` / `shutdown` /
+`none`; `attestations` / `blocks` / `sync-committee` / `subscriptions` /
+`none`; `otlp` / `gcp`; and BN roles such as `attestation`, `proposal`,
+`sync-committee`, `aggregation`, `submission`, `all`). Failure now happens at
+serde deserialize with an error that names the field/variant, so a typo fails
+before startup wiring. Cross-field rules (for example `broadcast = ["none"]`
+cannot be combined with other topics) remain in `Config::validate()`.
+
 ### rvc-signer CLI args that equal built-in defaults now win over the config file
 
 `rvc-signer serve` previously treated a CLI flag as “unset” when its value matched

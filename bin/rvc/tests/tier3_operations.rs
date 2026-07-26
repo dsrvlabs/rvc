@@ -168,7 +168,7 @@ proposer_nodes = ["http://p1:5052", "http://p2:5052"]
 
 mod broadcast_topics {
     use bn_manager::BroadcastTopics;
-    use rvc::config::Config;
+    use rvc::config::{BroadcastTopic, Config};
 
     #[test]
     fn default_all_broadcast() {
@@ -182,7 +182,7 @@ mod broadcast_topics {
 
     #[test]
     fn none_disables_all() {
-        let config = Config { broadcast: vec!["none".to_string()], ..Config::default() };
+        let config = Config { broadcast: vec![BroadcastTopic::None], ..Config::default() };
         let topics = config.effective_broadcast_topics();
         assert!(!topics.attestations);
         assert!(!topics.blocks);
@@ -193,7 +193,7 @@ mod broadcast_topics {
     #[test]
     fn selective_topics() {
         let config = Config {
-            broadcast: vec!["attestations".to_string(), "blocks".to_string()],
+            broadcast: vec![BroadcastTopic::Attestations, BroadcastTopic::Blocks],
             ..Config::default()
         };
         let topics = config.effective_broadcast_topics();
@@ -205,7 +205,7 @@ mod broadcast_topics {
 
     #[test]
     fn sync_committee_topic() {
-        let config = Config { broadcast: vec!["sync-committee".to_string()], ..Config::default() };
+        let config = Config { broadcast: vec![BroadcastTopic::SyncCommittee], ..Config::default() };
         let topics = config.effective_broadcast_topics();
         assert!(!topics.attestations);
         assert!(!topics.blocks);
@@ -215,7 +215,7 @@ mod broadcast_topics {
 
     #[test]
     fn subscriptions_topic() {
-        let config = Config { broadcast: vec!["subscriptions".to_string()], ..Config::default() };
+        let config = Config { broadcast: vec![BroadcastTopic::Subscriptions], ..Config::default() };
         let topics = config.effective_broadcast_topics();
         assert!(!topics.attestations);
         assert!(!topics.blocks);
@@ -227,10 +227,10 @@ mod broadcast_topics {
     fn all_topics_explicit() {
         let config = Config {
             broadcast: vec![
-                "attestations".to_string(),
-                "blocks".to_string(),
-                "sync-committee".to_string(),
-                "subscriptions".to_string(),
+                BroadcastTopic::Attestations,
+                BroadcastTopic::Blocks,
+                BroadcastTopic::SyncCommittee,
+                BroadcastTopic::Subscriptions,
             ],
             ..Config::default()
         };
@@ -263,7 +263,7 @@ broadcast = ["attestations", "blocks"]
 
         let mut config = Config::default();
         let cli =
-            CliOverrides { broadcast: Some(vec!["blocks".to_string()]), ..Default::default() };
+            CliOverrides { broadcast: Some(vec![BroadcastTopic::Blocks]), ..Default::default() };
         config.merge_with_cli(&cli);
 
         let topics = config.effective_broadcast_topics();
@@ -839,7 +839,7 @@ proposer_config_url_insecure = true
 
 mod composition {
     use bn_manager::{BnManager, BnManagerConfig};
-    use rvc::config::Config;
+    use rvc::config::{BroadcastTopic, Config};
     use rvc::monitoring::MonitoringConfig;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
@@ -849,7 +849,7 @@ mod composition {
         let config = Config {
             beacon_url: "http://main-bn:5052".to_string(),
             proposer_nodes: vec!["http://proposer-bn:5052".to_string()],
-            broadcast: vec!["attestations".to_string(), "blocks".to_string()],
+            broadcast: vec![BroadcastTopic::Attestations, BroadcastTopic::Blocks],
             ..Config::default()
         };
 
@@ -974,7 +974,7 @@ proposer_config_url_insecure = false
         let config: Config = toml::from_str(toml_str).unwrap();
 
         assert_eq!(config.proposer_nodes, vec!["http://proposer:5052"]);
-        assert_eq!(config.broadcast, vec!["attestations", "blocks"]);
+        assert_eq!(config.broadcast, vec![BroadcastTopic::Attestations, BroadcastTopic::Blocks]);
         assert_eq!(
             config.monitoring_endpoint.as_deref(),
             Some("https://beaconcha.in/api/v1/client/metrics")
@@ -998,7 +998,7 @@ proposer_config_url_insecure = false
         let mut config = Config::default();
         let cli = CliOverrides {
             proposer_nodes: Some(vec!["http://p:5052".to_string()]),
-            broadcast: Some(vec!["blocks".to_string()]),
+            broadcast: Some(vec![BroadcastTopic::Blocks]),
             monitoring_endpoint: Some("https://monitor.test".to_string()),
             monitoring_interval: Some(30),
             monitoring_endpoint_insecure: Some(true),
@@ -1015,7 +1015,7 @@ proposer_config_url_insecure = false
         config.merge_with_cli(&cli);
 
         assert_eq!(config.proposer_nodes, vec!["http://p:5052"]);
-        assert_eq!(config.broadcast, vec!["blocks"]);
+        assert_eq!(config.broadcast, vec![BroadcastTopic::Blocks]);
         assert_eq!(config.monitoring_endpoint.as_deref(), Some("https://monitor.test"));
         assert_eq!(config.monitoring_interval, 30);
         assert!(config.monitoring_endpoint_insecure);

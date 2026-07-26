@@ -1074,7 +1074,10 @@ mod tests {
     /// Proposer pool must honor the same global broadcast-topic policy as main.
     #[test]
     fn test_pool_bn_manager_config_forwards_broadcast_topics() {
-        let config = Config { broadcast: vec!["none".to_string()], ..create_minimal_config() };
+        let config = Config {
+            broadcast: vec![crate::config::BroadcastTopic::None],
+            ..create_minimal_config()
+        };
         let builder = ServiceBuilder::new(config);
         let expected = bn_manager::BroadcastTopics {
             attestations: false,

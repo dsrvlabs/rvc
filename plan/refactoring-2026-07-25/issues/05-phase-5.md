@@ -786,12 +786,12 @@ deserialization and deletes the duplicate arms.
    point and message change.
 
 **Acceptance criteria:**
-- [ ] Every value accepted before is accepted now (table-driven test over the current literal lists).
-- [ ] An invalid value fails at deserialization with the field named.
-- [ ] `Config::validate` no longer contains value lists for these four settings; cross-field rules
+- [x] Every value accepted before is accepted now (table-driven test over the current literal lists).
+- [x] An invalid value fails at deserialization with the field named.
+- [x] `Config::validate` no longer contains value lists for these four settings; cross-field rules
       remain.
-- [ ] `main.rs` does not re-parse an already-typed action.
-- [ ] Release-note item 3 drafted.
+- [x] `main.rs` does not re-parse an already-typed action.
+- [x] Release-note item 3 drafted.
 
 **TDD test plan** (RED first):
 - `test_invalid_slashed_action_fails_at_deserialization_not_validate` — **RED**: today a bad value

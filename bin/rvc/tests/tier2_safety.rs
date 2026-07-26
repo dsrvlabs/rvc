@@ -389,7 +389,7 @@ mod keystore_locking {
 // =============================================================================
 
 mod config_integration {
-    use rvc::config::Config;
+    use rvc::config::{Config, SlashedAction};
 
     #[test]
     fn default_config_has_all_safety_fields() {
@@ -403,25 +403,28 @@ mod config_integration {
         assert!(!config.disable_attesting);
 
         // FR-3: slashed monitor defaults to disable-only
-        assert_eq!(config.slashed_validators_action, "disable-only");
+        assert_eq!(config.slashed_validators_action, SlashedAction::DisableOnly);
 
         // FR-4: keystore locking enabled by default
         assert!(!config.disable_keystore_locking);
     }
 
     #[test]
-    fn invalid_slashed_action_rejected() {
-        let config =
-            Config { slashed_validators_action: "invalid-action".to_string(), ..Config::default() };
-        assert!(config.validate().is_err());
+    fn invalid_slashed_action_rejected_at_deserialization() {
+        let toml = r#"
+beacon_url = "http://localhost:5052"
+keystore_path = "/tmp/keystores"
+network = "mainnet"
+slashed_validators_action = "invalid-action"
+"#;
+        assert!(toml::from_str::<Config>(toml).is_err());
     }
 
     #[test]
     fn valid_slashed_actions_accepted() {
-        for action in &["disable-only", "shutdown", "none"] {
-            let config =
-                Config { slashed_validators_action: action.to_string(), ..Config::default() };
-            assert!(config.validate().is_ok(), "action '{}' should be valid", action);
+        for action in [SlashedAction::DisableOnly, SlashedAction::Shutdown, SlashedAction::None] {
+            let config = Config { slashed_validators_action: action, ..Config::default() };
+            assert!(config.validate().is_ok(), "action '{action}' should be valid");
         }
     }
 
@@ -442,7 +445,7 @@ slashed_validators_action = "shutdown"
         assert_eq!(config.builder_circuit_breaker_epoch_limit, 12);
         assert!(config.disable_keystore_locking);
         assert!(config.disable_attesting);
-        assert_eq!(config.slashed_validators_action, "shutdown");
+        assert_eq!(config.slashed_validators_action, SlashedAction::Shutdown);
     }
 
     #[test]
@@ -452,7 +455,7 @@ slashed_validators_action = "shutdown"
         let mut config = Config::default();
         let cli = CliOverrides {
             disable_attesting: Some(true),
-            slashed_validators_action: Some("shutdown".to_string()),
+            slashed_validators_action: Some(SlashedAction::Shutdown),
             builder_circuit_breaker_consecutive_limit: Some(10),
             builder_circuit_breaker_epoch_limit: Some(20),
             disable_keystore_locking: Some(true),
@@ -462,7 +465,7 @@ slashed_validators_action = "shutdown"
         config.merge_with_cli(&cli);
 
         assert!(config.disable_attesting);
-        assert_eq!(config.slashed_validators_action, "shutdown");
+        assert_eq!(config.slashed_validators_action, SlashedAction::Shutdown);
         assert_eq!(config.builder_circuit_breaker_consecutive_limit, 10);
         assert_eq!(config.builder_circuit_breaker_epoch_limit, 20);
         assert!(config.disable_keystore_locking);
