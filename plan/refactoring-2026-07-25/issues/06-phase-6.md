@@ -342,14 +342,14 @@ structural half of the fix (RF6-22 is the policy half).
 3. Convert the eight types; delete the scaffold.
 
 **Acceptance criteria:**
-- [ ] All eight use the macro; no `impl TreeHash for` remains in `aggregation.rs`, `attestation.rs`,
+- [x] All eight use the macro; no `impl TreeHash for` remains in `aggregation.rs`, `attestation.rs`,
       `sync_committee.rs`.
-- [ ] Every leaf order is byte-identical to the pre-change implementation, proven by the existing root
+- [x] Every leaf order is byte-identical to the pre-change implementation, proven by the existing root
       tests — including the ones the test-audit track adds (`docs/issues/phase-3-coverage-correctness.md`
       issue **3.14**, "Add TreeHash tests for sync committee types"). If 3.14 has not landed, say so in the
       PR and treat its absence as a coverage gap, not a blocker.
-- [ ] `crates/eth-types/src/block_body.rs`'s `Uint256` `TreeHash` (`:190`) is untouched (not a container).
-- [ ] Test count unchanged; workspace green.
+- [x] `crates/eth-types/src/block_body.rs`'s `Uint256` `TreeHash` (`:190`) is untouched (not a container).
+- [x] Test count unchanged; workspace green.
 
 **Risks:** `MerkleHasher::with_leaves(N)` takes a literal leaf count that must match the closure list
 length. Make the macro derive `N` from the list length rather than accepting it as a parameter, so the

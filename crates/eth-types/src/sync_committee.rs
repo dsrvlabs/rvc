@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tree_hash::{Hash256, MerkleHasher, TreeHash, TreeHashType};
+use tree_hash::TreeHash;
 
 use crate::hex_fixed::{bytes_32_hex, bytes_48_hex};
-use crate::tree_hash_utils::vec_u8_tree_hash_root;
+use crate::tree_hash_utils::{impl_container_tree_hash, vec_u8_tree_hash_root};
 use crate::{Root, Signature, Slot};
 
 /// Total validators in a sync committee (Altair+).
@@ -72,29 +72,18 @@ pub struct SyncCommitteeContribution {
     pub signature: Signature,
 }
 
-impl TreeHash for SyncCommitteeContribution {
-    fn tree_hash_type() -> TreeHashType {
-        TreeHashType::Container
-    }
-
-    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
-        unreachable!("containers cannot be packed")
-    }
-
-    fn tree_hash_packing_factor() -> usize {
-        1
-    }
-
-    fn tree_hash_root(&self) -> Hash256 {
-        let mut hasher = MerkleHasher::with_leaves(5);
-        hasher.write(self.slot.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.beacon_block_root.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.subcommittee_index.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.aggregation_bits).as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
-        hasher.finish().expect("valid root")
-    }
-}
+// Leaf order: slot, beacon_block_root, subcommittee_index, aggregation_bits, signature
+impl_container_tree_hash!(
+    SyncCommitteeContribution,
+    "valid SyncCommitteeContribution",
+    [
+        |s| Ok(s.slot.tree_hash_root()),
+        |s| Ok(s.beacon_block_root.tree_hash_root()),
+        |s| Ok(s.subcommittee_index.tree_hash_root()),
+        |s| Ok(vec_u8_tree_hash_root(&s.aggregation_bits)),
+        |s| Ok(vec_u8_tree_hash_root(&s.signature)),
+    ]
+);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncAggregatorSelectionData {
@@ -102,26 +91,12 @@ pub struct SyncAggregatorSelectionData {
     pub subcommittee_index: u64,
 }
 
-impl TreeHash for SyncAggregatorSelectionData {
-    fn tree_hash_type() -> TreeHashType {
-        TreeHashType::Container
-    }
-
-    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
-        unreachable!("containers cannot be packed")
-    }
-
-    fn tree_hash_packing_factor() -> usize {
-        1
-    }
-
-    fn tree_hash_root(&self) -> Hash256 {
-        let mut hasher = MerkleHasher::with_leaves(2);
-        hasher.write(self.slot.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.subcommittee_index.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.finish().expect("valid root")
-    }
-}
+// Leaf order: slot, subcommittee_index
+impl_container_tree_hash!(
+    SyncAggregatorSelectionData,
+    "valid SyncAggregatorSelectionData",
+    [|s| Ok(s.slot.tree_hash_root()), |s| Ok(s.subcommittee_index.tree_hash_root()),]
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContributionAndProof {
@@ -132,27 +107,16 @@ pub struct ContributionAndProof {
     pub selection_proof: Signature,
 }
 
-impl TreeHash for ContributionAndProof {
-    fn tree_hash_type() -> TreeHashType {
-        TreeHashType::Container
-    }
-
-    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
-        unreachable!("containers cannot be packed")
-    }
-
-    fn tree_hash_packing_factor() -> usize {
-        1
-    }
-
-    fn tree_hash_root(&self) -> Hash256 {
-        let mut hasher = MerkleHasher::with_leaves(3);
-        hasher.write(self.aggregator_index.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.contribution.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.selection_proof).as_slice()).expect("valid leaf");
-        hasher.finish().expect("valid root")
-    }
-}
+// Leaf order: aggregator_index, contribution, selection_proof
+impl_container_tree_hash!(
+    ContributionAndProof,
+    "valid ContributionAndProof",
+    [
+        |s| Ok(s.aggregator_index.tree_hash_root()),
+        |s| Ok(s.contribution.tree_hash_root()),
+        |s| Ok(vec_u8_tree_hash_root(&s.selection_proof)),
+    ]
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedContributionAndProof {
@@ -164,6 +128,7 @@ pub struct SignedContributionAndProof {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tree_hash::MerkleHasher;
 
     /// Pins `subcommittee_index` to the legacy expression that used to live in
     /// both `sync-service` and the orchestrator (F99 / RF3-20).

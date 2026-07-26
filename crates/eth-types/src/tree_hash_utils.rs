@@ -9,6 +9,70 @@ pub enum TreeHashError {
     InvalidBody { reason: String },
 }
 
+/// Implement `try_tree_hash_root` + `TreeHash` for an SSZ container.
+///
+/// Leaf order is merkleization-sensitive and must match the consensus-specs
+/// container field order. Each `$leaf` is a closure `|s: &Self| -> Result<Hash256,
+/// TreeHashError>` so helpers (`bitlist_tree_hash_root`, `vec_u8_tree_hash_root`)
+/// stay visible at the call site. Leaf count `N` is derived from the list length
+/// so it cannot disagree with `MerkleHasher::with_leaves(N)`.
+///
+/// `$panic_msg` is the `.expect(...)` string on the panicking `tree_hash_root`
+/// wrapper (production paths that can fail should call `try_tree_hash_root`).
+macro_rules! impl_container_tree_hash {
+    ($ty:ident, $panic_msg:literal, [ $($leaf:expr),+ $(,)? ]) => {
+        impl $ty {
+            pub fn try_tree_hash_root(
+                &self,
+            ) -> ::std::result::Result<::tree_hash::Hash256, $crate::TreeHashError> {
+                // Helper forces `|s| …` leaf closures to infer `s: &Self`.
+                #[inline(always)]
+                fn call_leaf<F>(
+                    this: &$ty,
+                    leaf: F,
+                ) -> ::std::result::Result<::tree_hash::Hash256, $crate::TreeHashError>
+                where
+                    F: ::std::ops::FnOnce(
+                        &$ty,
+                    )
+                        -> ::std::result::Result<::tree_hash::Hash256, $crate::TreeHashError>,
+                {
+                    leaf(this)
+                }
+
+                let mut hasher = ::tree_hash::MerkleHasher::with_leaves(
+                    0usize $(+ { let _ = ::core::stringify!($leaf); 1usize })+,
+                );
+                $(
+                    hasher
+                        .write(call_leaf(self, $leaf)?.as_slice())
+                        .expect("valid leaf");
+                )+
+                ::std::result::Result::Ok(hasher.finish().expect("valid root"))
+            }
+        }
+
+        impl ::tree_hash::TreeHash for $ty {
+            fn tree_hash_type() -> ::tree_hash::TreeHashType {
+                ::tree_hash::TreeHashType::Container
+            }
+
+            fn tree_hash_packed_encoding(&self) -> ::tree_hash::PackedEncoding {
+                ::core::unreachable!("containers cannot be packed")
+            }
+
+            fn tree_hash_packing_factor() -> usize {
+                1
+            }
+
+            fn tree_hash_root(&self) -> ::tree_hash::Hash256 {
+                self.try_tree_hash_root().expect($panic_msg)
+            }
+        }
+    };
+}
+pub(crate) use impl_container_tree_hash;
+
 pub(crate) fn vec_u8_tree_hash_root(bytes: &[u8]) -> Hash256 {
     let num_leaves = bytes.len().div_ceil(32);
     let mut hasher = MerkleHasher::with_leaves(num_leaves.max(1));

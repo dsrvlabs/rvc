@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use tree_hash::{Hash256, MerkleHasher, TreeHash, TreeHashType};
+use tree_hash::TreeHash;
 
-use crate::tree_hash_utils::vec_u8_tree_hash_root;
+use crate::tree_hash_utils::{impl_container_tree_hash, vec_u8_tree_hash_root};
 use crate::{AttestationData, Signature};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -15,28 +15,17 @@ pub struct SingleAttestation {
     pub signature: Signature,
 }
 
-impl TreeHash for SingleAttestation {
-    fn tree_hash_type() -> TreeHashType {
-        TreeHashType::Container
-    }
-
-    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
-        unreachable!("containers cannot be packed")
-    }
-
-    fn tree_hash_packing_factor() -> usize {
-        1
-    }
-
-    fn tree_hash_root(&self) -> Hash256 {
-        let mut hasher = MerkleHasher::with_leaves(4);
-        hasher.write(self.committee_index.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.attester_index.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.data.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
-        hasher.finish().expect("valid root")
-    }
-}
+// Leaf order: committee_index, attester_index, data, signature
+impl_container_tree_hash!(
+    SingleAttestation,
+    "valid SingleAttestation",
+    [
+        |s| Ok(s.committee_index.tree_hash_root()),
+        |s| Ok(s.attester_index.tree_hash_root()),
+        |s| Ok(s.data.tree_hash_root()),
+        |s| Ok(vec_u8_tree_hash_root(&s.signature)),
+    ]
+);
 
 #[cfg(test)]
 mod tests {

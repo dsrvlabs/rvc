@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
-use tree_hash::{Hash256, MerkleHasher, TreeHash, TreeHashType};
+use tree_hash::TreeHash;
 
-use crate::tree_hash_utils::{bitlist_tree_hash_root, vec_u8_tree_hash_root, TreeHashError};
+use crate::tree_hash_utils::{
+    bitlist_tree_hash_root, impl_container_tree_hash, vec_u8_tree_hash_root,
+};
 use crate::{AttestationData, Signature, MAX_COMMITTEES_PER_SLOT, MAX_VALIDATORS_PER_COMMITTEE};
 
 /// `Bitlist[N]` limit for a pre-Electra `Attestation.aggregation_bits` (chunk_count = 8).
@@ -19,38 +21,16 @@ pub struct Attestation {
     pub signature: Signature,
 }
 
-impl Attestation {
-    pub fn try_tree_hash_root(&self) -> Result<Hash256, TreeHashError> {
-        let mut hasher = MerkleHasher::with_leaves(3);
-        hasher
-            .write(
-                bitlist_tree_hash_root(&self.aggregation_bits, PRE_ELECTRA_AGG_BITS_LIMIT)?
-                    .as_slice(),
-            )
-            .expect("valid leaf");
-        hasher.write(self.data.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
-        Ok(hasher.finish().expect("valid root"))
-    }
-}
-
-impl TreeHash for Attestation {
-    fn tree_hash_type() -> TreeHashType {
-        TreeHashType::Container
-    }
-
-    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
-        unreachable!("containers cannot be packed")
-    }
-
-    fn tree_hash_packing_factor() -> usize {
-        1
-    }
-
-    fn tree_hash_root(&self) -> Hash256 {
-        self.try_tree_hash_root().expect("valid aggregation bits")
-    }
-}
+// Leaf order: aggregation_bits, data, signature
+impl_container_tree_hash!(
+    Attestation,
+    "valid aggregation bits",
+    [
+        |s| bitlist_tree_hash_root(&s.aggregation_bits, PRE_ELECTRA_AGG_BITS_LIMIT),
+        |s| Ok(s.data.tree_hash_root()),
+        |s| Ok(vec_u8_tree_hash_root(&s.signature)),
+    ]
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AggregateAndProof {
@@ -61,33 +41,16 @@ pub struct AggregateAndProof {
     pub selection_proof: Signature,
 }
 
-impl AggregateAndProof {
-    pub fn try_tree_hash_root(&self) -> Result<Hash256, TreeHashError> {
-        let mut hasher = MerkleHasher::with_leaves(3);
-        hasher.write(self.aggregator_index.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.aggregate.try_tree_hash_root()?.as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.selection_proof).as_slice()).expect("valid leaf");
-        Ok(hasher.finish().expect("valid root"))
-    }
-}
-
-impl TreeHash for AggregateAndProof {
-    fn tree_hash_type() -> TreeHashType {
-        TreeHashType::Container
-    }
-
-    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
-        unreachable!("containers cannot be packed")
-    }
-
-    fn tree_hash_packing_factor() -> usize {
-        1
-    }
-
-    fn tree_hash_root(&self) -> Hash256 {
-        self.try_tree_hash_root().expect("valid aggregation bits")
-    }
-}
+// Leaf order: aggregator_index, aggregate, selection_proof
+impl_container_tree_hash!(
+    AggregateAndProof,
+    "valid aggregation bits",
+    [
+        |s| Ok(s.aggregator_index.tree_hash_root()),
+        |s| s.aggregate.try_tree_hash_root(),
+        |s| Ok(vec_u8_tree_hash_root(&s.selection_proof)),
+    ]
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedAggregateAndProof {
@@ -107,39 +70,17 @@ pub struct ElectraAttestation {
     pub committee_bits: Vec<u8>,
 }
 
-impl ElectraAttestation {
-    pub fn try_tree_hash_root(&self) -> Result<Hash256, TreeHashError> {
-        let mut hasher = MerkleHasher::with_leaves(4);
-        hasher
-            .write(
-                bitlist_tree_hash_root(&self.aggregation_bits, ELECTRA_AGG_BITS_LIMIT)?.as_slice(),
-            )
-            .expect("valid leaf");
-        hasher.write(self.data.tree_hash_root().as_slice()).expect("valid leaf");
-        // EIP-7549 container field order: leaf 2 = signature, leaf 3 = committee_bits
-        hasher.write(vec_u8_tree_hash_root(&self.signature).as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.committee_bits).as_slice()).expect("valid leaf");
-        Ok(hasher.finish().expect("valid root"))
-    }
-}
-
-impl TreeHash for ElectraAttestation {
-    fn tree_hash_type() -> TreeHashType {
-        TreeHashType::Container
-    }
-
-    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
-        unreachable!("containers cannot be packed")
-    }
-
-    fn tree_hash_packing_factor() -> usize {
-        1
-    }
-
-    fn tree_hash_root(&self) -> Hash256 {
-        self.try_tree_hash_root().expect("valid aggregation bits")
-    }
-}
+// EIP-7549 container field order: aggregation_bits, data, signature, committee_bits
+impl_container_tree_hash!(
+    ElectraAttestation,
+    "valid aggregation bits",
+    [
+        |s| bitlist_tree_hash_root(&s.aggregation_bits, ELECTRA_AGG_BITS_LIMIT),
+        |s| Ok(s.data.tree_hash_root()),
+        |s| Ok(vec_u8_tree_hash_root(&s.signature)),
+        |s| Ok(vec_u8_tree_hash_root(&s.committee_bits)),
+    ]
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ElectraAggregateAndProof {
@@ -150,33 +91,16 @@ pub struct ElectraAggregateAndProof {
     pub selection_proof: Signature,
 }
 
-impl ElectraAggregateAndProof {
-    pub fn try_tree_hash_root(&self) -> Result<Hash256, TreeHashError> {
-        let mut hasher = MerkleHasher::with_leaves(3);
-        hasher.write(self.aggregator_index.tree_hash_root().as_slice()).expect("valid leaf");
-        hasher.write(self.aggregate.try_tree_hash_root()?.as_slice()).expect("valid leaf");
-        hasher.write(vec_u8_tree_hash_root(&self.selection_proof).as_slice()).expect("valid leaf");
-        Ok(hasher.finish().expect("valid root"))
-    }
-}
-
-impl TreeHash for ElectraAggregateAndProof {
-    fn tree_hash_type() -> TreeHashType {
-        TreeHashType::Container
-    }
-
-    fn tree_hash_packed_encoding(&self) -> tree_hash::PackedEncoding {
-        unreachable!("containers cannot be packed")
-    }
-
-    fn tree_hash_packing_factor() -> usize {
-        1
-    }
-
-    fn tree_hash_root(&self) -> Hash256 {
-        self.try_tree_hash_root().expect("valid aggregation bits")
-    }
-}
+// Leaf order: aggregator_index, aggregate, selection_proof
+impl_container_tree_hash!(
+    ElectraAggregateAndProof,
+    "valid aggregation bits",
+    [
+        |s| Ok(s.aggregator_index.tree_hash_root()),
+        |s| s.aggregate.try_tree_hash_root(),
+        |s| Ok(vec_u8_tree_hash_root(&s.selection_proof)),
+    ]
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedElectraAggregateAndProof {
@@ -190,6 +114,7 @@ mod tests {
     use super::*;
     use crate::tree_hash_utils::bitlist_tree_hash_root;
     use crate::Checkpoint;
+    use tree_hash::MerkleHasher;
 
     fn sample_attestation() -> Attestation {
         Attestation {
