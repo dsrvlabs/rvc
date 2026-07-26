@@ -19,7 +19,8 @@ path = "src/lib.rs"
 
 [features]
 default = []
-dvt = ["vsss-rs", "bls12_381_plus", "rand"]
+# Enables PeerSignerService client stubs (DVT dial-out) via the shared proto crate.
+dvt = ["vsss-rs", "bls12_381_plus", "rand", "signer-proto/client"]
 
 [dependencies]
 async-trait.workspace = true
@@ -32,6 +33,7 @@ prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 signer.workspace = true
+signer-proto = { workspace = true, features = ["server"] }
 slashing.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -132,6 +134,3 @@ bls12_381_plus.workspace = true
 
 # M4 enumeration gate (SS-1, Issue 2.2) — dev-only; must NOT be a production edge
 signer-registry.workspace = true
-
-[build-dependencies]
-tonic-build.workspace = true

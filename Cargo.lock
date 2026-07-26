@@ -4359,13 +4359,13 @@ dependencies = [
  "rcgen",
  "rvc-crypto",
  "rvc-eth-types",
+ "rvc-signer-proto",
  "rvc-slashing",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tonic 0.12.3",
- "tonic-build",
  "tracing",
  "tracing-subscriber",
  "url",
@@ -4536,6 +4536,7 @@ dependencies = [
  "rvc-eth-types",
  "rvc-grpc-signer",
  "rvc-signer",
+ "rvc-signer-proto",
  "rvc-signer-registry",
  "rvc-slashing",
  "rvc-telemetry",
@@ -4549,7 +4550,6 @@ dependencies = [
  "tokio-util",
  "toml",
  "tonic 0.12.3",
- "tonic-build",
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
@@ -4557,6 +4557,15 @@ dependencies = [
  "vsss-rs",
  "x509-parser",
  "zeroize",
+]
+
+[[package]]
+name = "rvc-signer-proto"
+version = "0.6.0"
+dependencies = [
+ "prost 0.13.5",
+ "tonic 0.12.3",
+ "tonic-build",
 ]
 
 [[package]]

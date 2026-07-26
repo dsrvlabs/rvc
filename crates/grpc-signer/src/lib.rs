@@ -1,8 +1,8 @@
 pub mod client;
+
+/// Re-export of the shared v2 signer proto bindings (compiled once in `rvc-signer-proto`).
 pub mod proto {
-    pub mod signer_v2 {
-        tonic::include_proto!("signer.v2");
-    }
+    pub use signer_proto::signer_v2;
 }
 
 pub use client::{

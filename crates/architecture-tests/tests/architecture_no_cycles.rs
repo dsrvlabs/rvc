@@ -58,8 +58,8 @@ const FORBIDDEN: &[(&str, &str)] =
 /// - `rvc-observability`: logging/hex/pubkey leaf sink (RF3-01); zero workspace out-edges so
 ///   dependents can take the light path without pulling BLS/KDF/HTTP via crypto.
 const ZERO_OUT_EDGE_IF_PRESENT: &[&str] =
-    &["rvc-eth-types", "rvc-signer-registry", "rvc-telemetry", "rvc-observability"];
-
+    &["rvc-eth-types", "rvc-signer-registry", "rvc-telemetry", "rvc-observability"];/// - `rvc-signer-proto`: sole tonic_build home for signer.v2.proto (RF3-14); leaf sink.
+    &["rvc-eth-types", "rvc-signer-registry", "rvc-telemetry", "rvc-signer-proto"];
 /// Edge that MUST be present (Issue 1.5 regression guard).
 const REQUIRED_EDGE: (&str, &str) = ("rvc-signer", "rvc-doppelganger");
 

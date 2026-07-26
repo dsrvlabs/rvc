@@ -1,0 +1,24 @@
+[package]
+name = "rvc-signer-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared tonic/prost bindings for proto/signer.v2.proto (compiled once)"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Additive: cargo feature-unifies when both consumers appear in one graph.
+server = []
+client = []
+
+[dependencies]
+prost.workspace = true
+tonic = { workspace = true }
+
+[build-dependencies]
+tonic-build.workspace = true
