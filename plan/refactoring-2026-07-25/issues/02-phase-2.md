@@ -674,17 +674,17 @@ deletion with nothing to justify. D1 in Phase 4 re-homes these same KATs a secon
    vectors were transcribed correctly, not re-derived from the new code path.
 
 **Acceptance criteria:**
-- [ ] `crates/crypto/tests/signing_root_kat.rs` exists and covers every duty type the ten free
+- [x] `crates/crypto/tests/signing_root_kat.rs` exists and covers every duty type the ten free
       `sign_*` functions covered, at every fork boundary they covered, including the EIP-7044
       Capella cap.
-- [ ] Every ported assertion uses the *same literal vector bytes* as the test it replaces — a
+- [x] Every ported assertion uses the *same literal vector bytes* as the test it replaces — a
       reviewer can diff the constants.
-- [ ] The classification table (port-as-root / port-as-signature / drop-as-self-consistency) appears
+- [x] The classification table (port-as-root / port-as-signature / drop-as-self-consistency) appears
       in the PR description with a line per source test.
-- [ ] The suite is green **before** any production code is deleted (this PR deletes none).
-- [ ] **Test-count delta stated and justified:** net positive or neutral; new KAT file adds tests,
+- [x] The suite is green **before** any production code is deleted (this PR deletes none).
+- [x] **Test-count delta stated and justified:** net positive or neutral; new KAT file adds tests,
       no existing test is removed in this PR.
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **Risks:**
 - The triage is the work, and bucket (c) is where a reviewer will push back — dropping a test always
