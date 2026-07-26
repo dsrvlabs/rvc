@@ -223,37 +223,44 @@ where
 
     async fn process_attestation_duty(&self, duty: AttesterDuty) -> AttestationResult {
         let validator_index = duty.validator_index.clone();
+        // Updated as soon as the duty slot parses successfully; stays 0 on
+        // that first failure so the outer result still has a defined slot.
+        let mut slot: Slot = 0;
 
-        let slot: Slot = match duty.slot.parse() {
-            Ok(s) => s,
-            Err(_) => {
-                return AttestationResult {
-                    validator_index,
-                    slot: 0,
-                    success: false,
-                    error: Some(format!("Invalid slot in duty: {}", duty.slot)),
-                };
+        match self.attest(&duty, &validator_index, &mut slot).await {
+            Ok(()) => AttestationResult { validator_index, slot, success: true, error: None },
+            Err(error) => {
+                AttestationResult { validator_index, slot, success: false, error: Some(error) }
             }
-        };
+        }
+    }
 
-        let committee_index: u64 = match duty.committee_index.parse() {
-            Ok(c) => c,
-            Err(_) => {
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!(
-                        "Invalid committee_index in duty: {}",
-                        duty.committee_index
-                    )),
-                };
-            }
-        };
+    /// Produce, sign, and submit a single attestation duty.
+    ///
+    /// Returns `Ok(())` on success. On failure returns a user-visible error
+    /// string (logged by the caller via `AttestationResult`). Side-effecting
+    /// error paths (metrics-free `error!` / `warn!` logs) run here before the
+    /// `Err` is returned so the outer `AttestationResult` construction stays
+    /// free of per-path duplication.
+    ///
+    /// `slot` is written once the duty's slot field parses; callers leave it
+    /// at `0` when that parse is the failing step.
+    async fn attest(
+        &self,
+        duty: &AttesterDuty,
+        validator_index: &str,
+        slot: &mut Slot,
+    ) -> Result<(), String> {
+        *slot = duty.slot.parse().map_err(|_| format!("Invalid slot in duty: {}", duty.slot))?;
+
+        let committee_index: u64 = duty
+            .committee_index
+            .parse()
+            .map_err(|_| format!("Invalid committee_index in duty: {}", duty.committee_index))?;
 
         let att_span = info_span!(
             "attestation.produce",
-            slot = slot,
+            slot = *slot,
             validator_index = %validator_index,
             pubkey = %TruncatedPubkey::new(&duty.pubkey),
         );
@@ -262,28 +269,19 @@ where
             let _guard = att_span.enter();
             debug!(
                 validator_index = %validator_index,
-                slot = slot,
+                slot = *slot,
                 committee_index = committee_index,
                 "Processing attestation duty"
             );
         }
 
-        let pubkey = match utils::find_pubkey(&self.pubkey_map, &duty.pubkey) {
-            Some(pk) => pk,
-            None => {
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!("Public key not found: {}", duty.pubkey)),
-                };
-            }
-        };
+        let pubkey = utils::find_pubkey(&self.pubkey_map, &duty.pubkey)
+            .ok_or_else(|| format!("Public key not found: {}", duty.pubkey))?;
 
         // Apply timeout to beacon client call to prevent blocking
         let attestation_data_result = tokio::time::timeout(
             self.config.timeouts.attestation_fetch,
-            self.beacon.get_attestation_data(slot, committee_index),
+            self.beacon.get_attestation_data(*slot, committee_index),
         )
         .instrument(info_span!(parent: &att_span, "beacon.get_attestation_data"))
         .await;
@@ -291,20 +289,10 @@ where
         let attestation_data_response = match attestation_data_result {
             Ok(Ok(response)) => response,
             Ok(Err(e)) => {
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!("Failed to get attestation data: {}", e)),
-                };
+                return Err(format!("Failed to get attestation data: {}", e));
             }
             Err(_) => {
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some("Timeout getting attestation data from beacon node".to_string()),
-                };
+                return Err("Timeout getting attestation data from beacon node".to_string());
             }
         };
 
@@ -325,20 +313,9 @@ where
         // Pre-parse target epoch to derive the fork before full conversion.
         // This allows `convert_and_normalize_attestation_data` to handle the
         // EIP-7549 index-zeroing in one place for both attestation and aggregation paths.
-        let target_epoch: u64 = match beacon_attestation_data.target.epoch.parse() {
-            Ok(e) => e,
-            Err(_) => {
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!(
-                        "Failed to parse target epoch: {}",
-                        beacon_attestation_data.target.epoch
-                    )),
-                };
-            }
-        };
+        let target_epoch: u64 = beacon_attestation_data.target.epoch.parse().map_err(|_| {
+            format!("Failed to parse target epoch: {}", beacon_attestation_data.target.epoch)
+        })?;
 
         let fork_name = ForkName::from_epoch(target_epoch, &self.config.fork_schedule);
         let is_electra = fork_name >= ForkName::Electra;
@@ -354,20 +331,9 @@ where
         // EIP-7549: For Electra+, `AttestationData.index` must be zeroed before
         // signing. `convert_and_normalize_attestation_data` handles this centrally
         // so both the attestation and aggregation paths stay in sync.
-        let crypto_attestation_data = match utils::convert_and_normalize_attestation_data(
-            &beacon_attestation_data,
-            fork_name,
-        ) {
-            Ok(data) => data,
-            Err(e) => {
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!("Failed to convert attestation data: {}", e)),
-                };
-            }
-        };
+        let crypto_attestation_data =
+            utils::convert_and_normalize_attestation_data(&beacon_attestation_data, fork_name)
+                .map_err(|e| format!("Failed to convert attestation data: {}", e))?;
 
         debug!(
             validator_index = %validator_index,
@@ -387,34 +353,24 @@ where
                 tracing::error!(
                     error = %e,
                     validator_index = %validator_index,
-                    slot,
+                    slot = *slot,
                     "Failed to read clock slot for AttestationData sanity check; \
                      dropping duty"
                 );
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!("Clock error during attestation validation: {e}")),
-                };
+                return Err(format!("Clock error during attestation validation: {e}"));
             }
         };
         if let Err(e) =
-            validate_attestation_data(&crypto_attestation_data, slot, current_clock_slot)
+            validate_attestation_data(&crypto_attestation_data, *slot, current_clock_slot)
         {
             tracing::error!(
                 error = %e,
                 validator_index = %validator_index,
                 pubkey = %observability::logging::TruncatedPubkey::new(&duty.pubkey),
-                slot,
+                slot = *slot,
                 "AttestationData failed sanity check (M-2); dropping duty"
             );
-            return AttestationResult {
-                validator_index,
-                slot,
-                success: false,
-                error: Some(format!("AttestationData sanity check failed: {e}")),
-            };
+            return Err(format!("AttestationData sanity check failed: {e}"));
         }
 
         let signature = match self
@@ -438,68 +394,50 @@ where
                 sig
             }
             Err(e) => {
-                tracing::error!(error = %e, validator_index = %validator_index, slot, "Attestation signing failed");
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!("Failed to sign attestation: {}", e)),
-                };
+                tracing::error!(
+                    error = %e,
+                    validator_index = %validator_index,
+                    slot = *slot,
+                    "Attestation signing failed"
+                );
+                return Err(format!("Failed to sign attestation: {}", e));
             }
         };
 
-        let attester_index: u64 = match validator_index.parse() {
-            Ok(v) => v,
-            Err(_) => {
-                let error = format!("Invalid validator_index in duty: {}", validator_index);
-                return AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(error),
-                };
-            }
-        };
+        let attester_index: u64 = validator_index
+            .parse()
+            .map_err(|_| format!("Invalid validator_index in duty: {}", validator_index))?;
 
         let sig_hex = format!("0x{}", hex::encode(signature.to_bytes()));
 
-        let versioned = if fork_name >= ForkName::Fulu {
-            let mut fulu_data = beacon_attestation_data.clone();
-            fulu_data.index = "0".to_string();
-            VersionedAttestation::Fulu(vec![SingleAttestation {
+        // Electra and Fulu share SingleAttestation + EIP-7549 index-zeroing;
+        // only the VersionedAttestation constructor differs.
+        let versioned = if is_electra {
+            let mut single_data = beacon_attestation_data.clone();
+            single_data.index = "0".to_string();
+            let single = SingleAttestation {
                 committee_index,
                 attester_index,
-                data: fulu_data,
+                data: single_data,
                 signature: sig_hex,
-            }])
-        } else if is_electra {
-            let mut electra_data = beacon_attestation_data.clone();
-            electra_data.index = "0".to_string();
-            VersionedAttestation::Electra(vec![SingleAttestation {
-                committee_index,
-                attester_index,
-                data: electra_data,
-                signature: sig_hex,
-            }])
+            };
+            if fork_name >= ForkName::Fulu {
+                VersionedAttestation::Fulu(vec![single])
+            } else {
+                VersionedAttestation::Electra(vec![single])
+            }
         } else {
-            let aggregation_bits = match utils::make_aggregation_bits(&duty) {
+            let aggregation_bits = match utils::make_aggregation_bits(duty) {
                 Some(bits) => bits,
                 None => {
                     warn!(
                         validator_index = %validator_index,
-                        slot,
+                        slot = *slot,
                         "Skipping attestation: could not produce aggregation bits"
                     );
-                    return AttestationResult {
-                        validator_index,
-                        slot,
-                        success: false,
-                        error: Some(
-                            "could not produce aggregation bits (committee_length=0 \
-                             or validator_committee_index out of range)"
-                                .to_string(),
-                        ),
-                    };
+                    return Err("could not produce aggregation bits (committee_length=0 \
+                         or validator_committee_index out of range)"
+                        .to_string());
                 }
             };
             VersionedAttestation::PreElectra(vec![LegacyAttestation {
@@ -528,27 +466,26 @@ where
         .await;
 
         match submit_result {
-            Ok(Ok(_)) => AttestationResult { validator_index, slot, success: true, error: None },
+            Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => {
-                tracing::error!(error = %e, validator_index = %validator_index, slot, "Attestation submission failed");
-                AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!("Failed to propagate attestation: {}", e)),
-                }
+                tracing::error!(
+                    error = %e,
+                    validator_index = %validator_index,
+                    slot = *slot,
+                    "Attestation submission failed"
+                );
+                Err(format!("Failed to propagate attestation: {}", e))
             }
             Err(_) => {
-                tracing::error!(validator_index = %validator_index, slot, "Attestation submission timed out");
-                AttestationResult {
-                    validator_index,
-                    slot,
-                    success: false,
-                    error: Some(format!(
-                        "Attestation submit timed out after {}s",
-                        self.config.timeouts.attestation_submit.as_secs()
-                    )),
-                }
+                tracing::error!(
+                    validator_index = %validator_index,
+                    slot = *slot,
+                    "Attestation submission timed out"
+                );
+                Err(format!(
+                    "Attestation submit timed out after {}s",
+                    self.config.timeouts.attestation_submit.as_secs()
+                ))
             }
         }
     }

@@ -1386,12 +1386,12 @@ Fulu/Electra arms into one block that builds the shared `SingleAttestation` and 
 constructor.
 
 **Acceptance criteria:**
-- [ ] Exactly one `AttestationResult { … success: false … }` construction in the file.
-- [ ] Every error string is preserved verbatim (they are user-visible in logs — grep-diff proof).
-- [ ] One index-zeroing block covering both forks.
-- [ ] Test count unchanged; the attestation-data validation tests
+- [x] Exactly one `AttestationResult { … success: false … }` construction in the file.
+- [x] Every error string is preserved verbatim (they are user-visible in logs — grep-diff proof).
+- [x] One index-zeroing block covering both forks.
+- [x] Test count unchanged; the attestation-data validation tests
       (`crates/rvc/tests/attestation_data_validation_m2.rs`) pass unmodified.
-- [ ] Workspace green.
+- [x] Workspace green.
 
 **Risks:** Some of the twelve returns may carry side effects (a metric increment, a log) before returning.
 Enumerate them first; side effects move into the inner function, not into the `?` boundary.
