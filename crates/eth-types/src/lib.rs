@@ -13,6 +13,7 @@ mod deposit;
 mod domains;
 mod duties;
 mod fork;
+pub mod networks;
 pub(crate) mod hex_fixed;
 pub(crate) mod serde_signature;
 pub mod ssz_helpers;
