@@ -592,7 +592,7 @@ mod log_rotation {
     #[test]
     fn logfile_config_defaults() {
         let config = rvc::config::Config::default();
-        assert!(config.logfile.is_none());
+        assert!(config.logfile.path.is_none());
         assert_eq!(config.logfile_max_size, 200);
         assert_eq!(config.logfile_max_number, 5);
         assert!(!config.logfile_compress);
@@ -612,7 +612,7 @@ logfile_compress = true
 logfile_level = "debug"
 "#;
         let config: rvc::config::Config = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.logfile.as_ref().unwrap().to_str().unwrap(), "/var/log/rvc/rvc.log");
+        assert_eq!(config.logfile.path.as_ref().unwrap().to_str().unwrap(), "/var/log/rvc/rvc.log");
         assert_eq!(config.logfile_max_size, 100);
         assert_eq!(config.logfile_max_number, 10);
         assert!(config.logfile_compress);
@@ -635,7 +635,7 @@ logfile_level = "debug"
         };
         config.merge_with_cli(&cli);
 
-        assert_eq!(config.logfile.as_ref().unwrap().to_str().unwrap(), "/tmp/test.log");
+        assert_eq!(config.logfile.path.as_ref().unwrap().to_str().unwrap(), "/tmp/test.log");
         assert_eq!(config.logfile_max_size, 50);
         assert_eq!(config.logfile_max_number, 3);
         assert!(config.logfile_compress);
@@ -955,7 +955,7 @@ mod composition {
         assert!(!config.monitoring_endpoint_insecure);
 
         // Log rotation
-        assert!(config.logfile.is_none());
+        assert!(config.logfile.path.is_none());
         assert_eq!(config.logfile_max_size, 200);
         assert_eq!(config.logfile_max_number, 5);
         assert!(!config.logfile_compress);

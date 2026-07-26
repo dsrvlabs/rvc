@@ -10,7 +10,8 @@ pub use builder::ServiceBuilder;
 pub use error::ConfigError;
 pub use network::Network;
 pub use types::{
-    redact_url, BeaconNodeEntry, BroadcastTopic, CliOverrides, Config, GcpSecretConfig,
-    SecretProviderConfig, SlashedAction, TracingExporter,
+    redact_url, BeaconNodeEntry, BroadcastTopic, BuilderLimits, CliOverrides, Config,
+    GcpSecretConfig, GrpcSignerConfig, KeymanagerConfig, LogfileConfig, MonitoringConfig,
+    ProposerConfigSource, SecretProviderConfig, SlashedAction, TracingConfig, TracingExporter,
 };
 pub use validator_store::BlockSelectionMode;

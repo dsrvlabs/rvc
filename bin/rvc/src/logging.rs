@@ -179,7 +179,7 @@ pub fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfi
 }
 
 pub fn build_file_layer_config(config: &Config) -> Option<telemetry::FileAppenderConfig> {
-    let logfile = config.logfile.as_ref()?;
+    let logfile = config.logfile.path.as_ref()?;
 
     let directory = logfile
         .parent()

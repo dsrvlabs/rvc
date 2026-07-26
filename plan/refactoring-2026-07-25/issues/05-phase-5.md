@@ -840,12 +840,12 @@ load-bearing part of this issue** — not the struct surgery.
 4. `Default` is rebuilt from the sub-structs' own `Default` impls.
 
 **Acceptance criteria:**
-- [ ] A pre-phase production `rvc.toml` loads unchanged and produces field-for-field identical values
+- [x] A pre-phase production `rvc.toml` loads unchanged and produces field-for-field identical values
       (fixture test).
-- [ ] Both the old flat key and the new nested key are accepted for every moved setting.
-- [ ] `Config::default()` is unchanged in value for every field (assert field-by-field).
-- [ ] Every accessor shim carries the RF5-13 removal marker.
-- [ ] Workspace green with no call-site changes outside `types.rs`.
+- [x] Both the old flat key and the new nested key are accepted for every moved setting.
+- [x] `Config::default()` is unchanged in value for every field (assert field-by-field).
+- [x] Every accessor shim carries the RF5-13 removal marker.
+- [x] Workspace green with no call-site changes outside `types.rs`.
 
 **TDD test plan** (RED first):
 - `test_production_config_fixture_loads_with_flat_keys` — **RED**: written against the nested structs

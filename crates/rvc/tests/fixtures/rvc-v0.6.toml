@@ -1,0 +1,71 @@
+# Captured shape of a pre-RF5-12 production rvc.toml (flat keys).
+# Used by config_backward_compat to pin operator-file compatibility.
+
+beacon_url = "http://bn.example:5052"
+beacon_nodes = ["http://bn1.example:5052", "http://bn2.example:5052"]
+keystore_path = "/var/lib/rvc/keystores"
+password_file = "/var/lib/rvc/passwords.txt"
+slashing_db_path = "/var/lib/rvc/slashing_protection.sqlite"
+allow_fresh_db = false
+metrics_address = "127.0.0.1"
+metrics_port = 8080
+grpc_port = 50051
+grpc_address = "127.0.0.1"
+network = "mainnet"
+graffiti = "rvc-prod"
+log_level = "info"
+doppelganger_detection = true
+
+# Keymanager (flat)
+keymanager_enabled = true
+keymanager_address = "127.0.0.1:5062"
+keymanager_token_file = "/var/lib/rvc/keymanager-api-token.txt"
+remote_signer_url = "https://web3signer:9000"
+remote_signer_allowed_hosts = ["web3signer.example"]
+allow_insecure_remote_signer = false
+keymanager_cors_origins = ["https://ops.example"]
+keymanager_body_limit = 10485760
+
+# Tracing (flat)
+tracing_endpoint = "http://otel-collector:4318"
+tracing_exporter = "otlp"
+tracing_sample_rate = 0.05
+tracing_max_queue_size = 4096
+tracing_max_export_batch_size = 1024
+
+# gRPC signer (flat)
+grpc_signer_url = "https://signer:50051"
+grpc_signer_tls_cert = "/etc/rvc/signer-client.crt"
+grpc_signer_tls_key = "/etc/rvc/signer-client.key"
+grpc_signer_tls_ca_cert = "/etc/rvc/signer-ca.crt"
+
+# Builder circuit breaker (flat)
+builder_circuit_breaker_consecutive_limit = 7
+builder_circuit_breaker_epoch_limit = 12
+
+# Monitoring (flat)
+monitoring_endpoint = "https://monitor.example/api/v1/client/metrics"
+monitoring_interval = 192
+monitoring_endpoint_insecure = false
+
+# Proposer config source (flat)
+proposer_config_url = "https://config.example/proposer.json"
+proposer_config_refresh_interval = 96
+proposer_config_url_token = "prod-token"
+proposer_config_url_insecure = false
+
+# Log rotation (flat)
+logfile = "/var/log/rvc/rvc.log"
+logfile_max_size = 100
+logfile_max_number = 10
+logfile_compress = true
+logfile_level = "debug"
+
+# Other
+disable_attesting = false
+slashed_validators_action = "disable-only"
+broadcast = ["attestations", "blocks"]
+proposer_nodes = ["http://proposer.example:5052"]
+block_selection_mode = "max-profit"
+validator_registration_batch_size = 500
+validator_registration_batch_delay = 500
