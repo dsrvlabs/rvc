@@ -2,6 +2,23 @@
 
 ## Behavior changes
 
+### rvc-signer CLI args that equal built-in defaults now win over the config file
+
+`rvc-signer serve` previously treated a CLI flag as “unset” when its value matched
+the clap built-in default (the `*_is_default` heuristic). That meant an operator who
+explicitly passed e.g. `--listen-address 127.0.0.1:50052` or `--network mainnet`
+could still have those values overwritten by `config.toml`.
+
+CLI arguments that are present on the command line now always win over the file,
+even when the value equals the built-in default. Unpassed flags still fall back to
+the config file, then to the built-in default. Defaults live in one place
+(`bin/rvc-signer` `config` constants / merge); clap no longer fills them via
+`default_value` for the option-typed flags.
+
+Affected flags include at least: `--listen-address`, `--backend`,
+`--reload-interval`, `--http-listen-address`, `--http-tls-mode`, `--network`,
+and (with the `dvt` feature) `--dvt-timeout`.
+
 ### rvc-signer builder registration uses network genesis on all transports
 
 `VALIDATOR_REGISTRATION` / `sign_builder_registration` now derive the

@@ -1379,12 +1379,12 @@ plus the mirror struct.
 4. Cover the dvt/non-dvt permutations in both directions.
 
 **Acceptance criteria:**
-- [ ] `rg '_is_default' bin/rvc-signer/` returns nothing.
-- [ ] `config::CliOverrides` is deleted.
-- [ ] An explicitly passed value equal to the default beats the config file (the F31 bug fix).
-- [ ] An unpassed flag falls back to file, then to the built-in default.
-- [ ] `--help` still shows every flag; if default text changed, the diff is shown in the PR.
-- [ ] Both feature sets green; release-note item 1 drafted.
+- [x] `rg '_is_default' bin/rvc-signer/` returns nothing.
+- [x] `config::CliOverrides` is deleted.
+- [x] An explicitly passed value equal to the default beats the config file (the F31 bug fix).
+- [x] An unpassed flag falls back to file, then to the built-in default.
+- [x] `--help` still shows every flag; if default text changed, the diff is shown in the PR.
+- [x] Both feature sets green; release-note item 1 drafted.
 
 **TDD test plan** (RED first):
 - `test_explicit_cli_value_equal_to_default_beats_config_file` — **RED**: fails today; this is the bug.

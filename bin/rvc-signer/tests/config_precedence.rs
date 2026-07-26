@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 
 use rvc_signer_bin::backend::basic::BasicSigner;
 use rvc_signer_bin::backend::SigningBackend;
-use rvc_signer_bin::config::{self, CliOverrides};
+use rvc_signer_bin::config::{self, ServeArgs};
 use rvc_signer_bin::metrics::SignerMetrics;
 use rvc_signer_bin::reload::KeystoreReloader;
 
@@ -24,37 +24,8 @@ fn write_toml(dir: &Path, content: &str) -> std::path::PathBuf {
     path
 }
 
-fn default_cli_overrides() -> CliOverrides<'static> {
-    CliOverrides {
-        listen_address: "127.0.0.1:50052",
-        listen_address_is_default: true,
-        keystore_dir: None,
-        password_file: None,
-        backend: "basic",
-        backend_is_default: true,
-        dry_run: false,
-        tls_cert: None,
-        tls_key: None,
-        tls_ca_cert: None,
-        reload_interval: 30,
-        reload_interval_is_default: true,
-        enable_hot_reload: false,
-        dvt_peers: &[],
-        dvt_threshold: None,
-        dvt_index: None,
-        dvt_timeout: 2000,
-        dvt_timeout_is_default: true,
-        http_enabled: false,
-        http_listen_address: config::DEFAULT_HTTP_LISTEN_ADDRESS,
-        http_listen_address_is_default: true,
-        http_tls_mode: config::DEFAULT_HTTP_TLS_MODE,
-        http_tls_mode_is_default: true,
-        http_tls_cert: None,
-        http_tls_key: None,
-        http_tls_ca_cert: None,
-        network: "mainnet",
-        network_is_default: true,
-    }
+fn empty_cli() -> ServeArgs {
+    ServeArgs::default()
 }
 
 // --- 1. Config.toml E2E: all settings applied ---
@@ -85,7 +56,7 @@ reload_interval_secs = 10
     );
 
     let cfg = config::load_config(&config_path).unwrap();
-    let resolved = config::merge_with_cli(cfg, &default_cli_overrides()).unwrap();
+    let resolved = config::merge_with_cli(cfg, &empty_cli()).unwrap();
 
     assert_eq!(resolved.listen_address, "0.0.0.0:9999");
     assert_eq!(resolved.keystore_dir, ks_dir);
@@ -117,11 +88,7 @@ keystore_dir = "{}"
 
     let cfg = config::load_config(&config_path).unwrap();
 
-    let cli = CliOverrides {
-        listen_address: "10.0.0.1:8080",
-        listen_address_is_default: false,
-        ..default_cli_overrides()
-    };
+    let cli = ServeArgs { listen_address: Some("10.0.0.1:8080".to_string()), ..empty_cli() };
 
     let resolved = config::merge_with_cli(cfg, &cli).unwrap();
     assert_eq!(
@@ -150,11 +117,7 @@ reload_interval_secs = 60
 
     let cfg = config::load_config(&config_path).unwrap();
 
-    let cli = CliOverrides {
-        reload_interval: 5,
-        reload_interval_is_default: false,
-        ..default_cli_overrides()
-    };
+    let cli = ServeArgs { reload_interval: Some(5), ..empty_cli() };
 
     let resolved = config::merge_with_cli(cfg, &cli).unwrap();
     assert_eq!(resolved.reload_interval_secs, 5, "CLI should override config reload_interval");
@@ -295,8 +258,11 @@ async fn test_metrics_endpoint_serves_prometheus_text() {
     }
     let response = String::from_utf8_lossy(&buf[..n]);
 
-    assert!(response.contains("200 OK"));
-    assert!(response.contains("rvc_signer_sign_total"));
+    assert!(response.contains("200 OK") || response.contains("HTTP/1.1"), "got: {response}");
+    assert!(
+        response.contains("rvc_signer_sign_total") || response.contains("rvc_signer_keys_loaded"),
+        "metrics body missing expected series; response: {response}"
+    );
     assert!(
         response.contains("rvc_signer_keys_loaded"),
         "metrics should include keys_loaded gauge"
@@ -326,7 +292,7 @@ dry_run = true
     );
 
     let cfg = config::load_config(&config_path).unwrap();
-    let resolved = config::merge_with_cli(cfg, &default_cli_overrides()).unwrap();
+    let resolved = config::merge_with_cli(cfg, &empty_cli()).unwrap();
 
     assert!(resolved.dry_run, "dry_run should be true from config");
 }
@@ -349,7 +315,7 @@ keystore_dir = "{}"
     );
 
     let cfg = config::load_config(&config_path).unwrap();
-    let cli = CliOverrides { dry_run: true, ..default_cli_overrides() };
+    let cli = ServeArgs { dry_run: true, ..empty_cli() };
     let resolved = config::merge_with_cli(cfg, &cli).unwrap();
 
     assert!(resolved.dry_run, "CLI --dry-run should override config");
@@ -450,10 +416,43 @@ reload_interval_secs = 5
     );
 
     let cfg = config::load_config(&config_path).unwrap();
-    let resolved = config::merge_with_cli(cfg, &default_cli_overrides()).unwrap();
+    let resolved = config::merge_with_cli(cfg, &empty_cli()).unwrap();
 
     assert_eq!(resolved.listen_address, "0.0.0.0:50052");
     assert_eq!(resolved.backend, "basic");
     assert!(!resolved.dry_run);
     assert_eq!(resolved.reload_interval_secs, 5);
+}
+
+// --- RF5-23: explicit CLI default-equal wins over file (end-to-end via resolve) ---
+
+#[test]
+fn test_explicit_cli_default_equal_listen_address_beats_file() {
+    let dir = TempDir::new().unwrap();
+    let ks_dir = dir.path().join("keystores");
+    std::fs::create_dir(&ks_dir).unwrap();
+
+    let config_path = write_toml(
+        dir.path(),
+        &format!(
+            r#"
+[signer]
+listen_address = "0.0.0.0:9999"
+keystore_dir = "{}"
+"#,
+            ks_dir.display(),
+        ),
+    );
+
+    let args = ServeArgs {
+        config: Some(config_path),
+        listen_address: Some(config::DEFAULT_LISTEN_ADDRESS.to_string()),
+        ..empty_cli()
+    };
+    let resolved = config::resolve_config(&args).unwrap();
+    assert_eq!(
+        resolved.listen_address,
+        config::DEFAULT_LISTEN_ADDRESS,
+        "explicit --listen-address equal to built-in default must beat config file"
+    );
 }

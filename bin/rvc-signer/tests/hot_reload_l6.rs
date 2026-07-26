@@ -19,46 +19,13 @@
 
 use std::os::unix::fs::PermissionsExt;
 
-use rvc_signer_bin::config::{
-    merge_with_cli, CliOverrides, SignerConfig, DEFAULT_HTTP_LISTEN_ADDRESS, DEFAULT_HTTP_TLS_MODE,
-};
+use rvc_signer_bin::config::{merge_with_cli, ServeArgs, SignerConfig};
 use tempfile::TempDir;
 
-/// Build a minimal CLI-overrides struct for `merge_with_cli` so the
-/// resolution truth-table can be exercised in tests.
-fn cli(enable_hot_reload: bool, reload_interval: u64) -> CliOverrides<'static> {
-    static ADDR: &str = "127.0.0.1:50052";
-    static BACKEND: &str = "basic";
-    CliOverrides {
-        listen_address: ADDR,
-        listen_address_is_default: true,
-        keystore_dir: None,
-        password_file: None,
-        backend: BACKEND,
-        backend_is_default: true,
-        dry_run: false,
-        tls_cert: None,
-        tls_key: None,
-        tls_ca_cert: None,
-        reload_interval,
-        reload_interval_is_default: false,
-        enable_hot_reload,
-        dvt_peers: &[],
-        dvt_threshold: None,
-        dvt_index: None,
-        dvt_timeout: 2000,
-        dvt_timeout_is_default: true,
-        http_enabled: false,
-        http_listen_address: DEFAULT_HTTP_LISTEN_ADDRESS,
-        http_listen_address_is_default: true,
-        http_tls_mode: DEFAULT_HTTP_TLS_MODE,
-        http_tls_mode_is_default: true,
-        http_tls_cert: None,
-        http_tls_key: None,
-        http_tls_ca_cert: None,
-        network: "mainnet",
-        network_is_default: true,
-    }
+/// Build a minimal CLI args struct for `merge_with_cli` so the resolution
+/// truth-table can be exercised in tests.
+fn cli(enable_hot_reload: bool, reload_interval: u64) -> ServeArgs {
+    ServeArgs { enable_hot_reload, reload_interval: Some(reload_interval), ..ServeArgs::default() }
 }
 
 /// A minimal SignerConfig with `keystore_dir` set so `merge_with_cli` succeeds.

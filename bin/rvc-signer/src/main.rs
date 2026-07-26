@@ -3,35 +3,12 @@
 //! All implementation lives in `lib.rs` (crate root for the library target).
 //! This file only handles CLI parsing and wires up the library.
 
+use rvc_signer_bin::config::ServeArgs;
 use rvc_signer_bin::{config, server, ServerError};
-
-use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
-
-const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:50052";
-
-/// Signing backend type.
-#[derive(Clone, Debug, clap::ValueEnum)]
-pub enum Backend {
-    /// Local keystore-based signing
-    Basic,
-    /// Distributed Validator Technology (DVT) signing
-    #[cfg(feature = "dvt")]
-    Dvt,
-}
-
-impl std::fmt::Display for Backend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Basic => write!(f, "basic"),
-            #[cfg(feature = "dvt")]
-            Self::Dvt => write!(f, "dvt"),
-        }
-    }
-}
 
 #[derive(Parser)]
 #[command(name = "rvc-signer")]
@@ -58,185 +35,12 @@ enum Command {
     SplitKey(SplitKeyCliArgs),
 }
 
-#[derive(Parser)]
-struct ServeArgs {
-    /// Path to config.toml file
-    #[arg(long)]
-    config: Option<PathBuf>,
-
-    /// gRPC listen address (host:port)
-    #[arg(long, default_value = DEFAULT_LISTEN_ADDRESS)]
-    listen_address: String,
-
-    /// Path to the keystore directory
-    #[arg(long)]
-    keystore_dir: Option<PathBuf>,
-
-    /// Path to a single password file used for all keystores
-    #[arg(long)]
-    password_file: Option<PathBuf>,
-
-    /// Path to the TLS certificate file (PEM)
-    #[arg(long)]
-    tls_cert: Option<PathBuf>,
-
-    /// Path to the TLS private key file (PEM)
-    #[arg(long)]
-    tls_key: Option<PathBuf>,
-
-    /// Path to the TLS CA certificate file for client authentication (PEM)
-    #[arg(long)]
-    tls_ca_cert: Option<PathBuf>,
-
-    /// Enable the Web3Signer HTTP Remote Signing API (opt-in; gRPC stays on).
-    /// Parsed/resolved only for now; the listener is wired in a later phase.
-    #[arg(long, default_value_t = false)]
-    http_enabled: bool,
-
-    /// HTTP Remote Signing API listen address (host:port). Default :9000.
-    #[arg(long, default_value = config::DEFAULT_HTTP_LISTEN_ADDRESS)]
-    http_listen_address: String,
-
-    /// HTTP API TLS mode: "mtls" (default) or "server-tls-only".
-    #[arg(long, default_value = config::DEFAULT_HTTP_TLS_MODE)]
-    http_tls_mode: String,
-
-    /// HTTP API server certificate (PEM). Independent of the gRPC TLS material.
-    #[arg(long)]
-    http_tls_cert: Option<PathBuf>,
-
-    /// HTTP API server private key (PEM). Independent of the gRPC TLS material.
-    #[arg(long)]
-    http_tls_key: Option<PathBuf>,
-
-    /// HTTP API client CA certificate (PEM). Required in both TLS modes.
-    #[arg(long)]
-    http_tls_ca_cert: Option<PathBuf>,
-
-    /// Validate configuration and exit without starting the server
-    #[arg(long)]
-    dry_run: bool,
-
-    /// Allow starting without TLS (NOT recommended for production)
-    #[arg(long)]
-    insecure: bool,
-
-    /// Data directory for signer state (default: parent of keystore_dir).
-    /// The slashing protection DB is stored here as signer-slashing.db.
-    #[arg(long)]
-    data_dir: Option<PathBuf>,
-
-    /// Disable slashing protection (UNSAFE).
-    /// Requires ALSO setting RVC_ALLOW_INSECURE=true in the environment.
-    /// Both checks are required to prevent accidental opt-out.
-    #[arg(long)]
-    disable_slashing_protection: bool,
-
-    /// Allow creating a fresh empty signer slashing DB when the path is missing
-    /// (SEC-3). DANGEROUS on a previously-active signer: the new DB has zero
-    /// signing history and can enable double-signing / slashing. Use only for
-    /// genuine first-time deployments. A 0-byte or corrupt DB is always a hard
-    /// error regardless of this flag.
-    #[arg(long, default_value_t = false)]
-    init_slashing_db: bool,
-
-    /// Signing backend to use
-    #[arg(long, value_enum, default_value_t = Backend::Basic)]
-    backend: Backend,
-
-    /// Prometheus metrics listen address (host:port)
-    #[arg(long, default_value = "127.0.0.1:9101")]
-    metrics_address: String,
-
-    /// Enable keystore hot-reload (ISSUE-4.6 / L-6).
-    ///
-    /// Disabled by default. When enabled, the signer periodically rescans
-    /// `keystore_dir` and reconciles the loaded set with files on disk —
-    /// a key-injection vector if the directory is writable by anyone other
-    /// than the signer UID. Requires the directory to be 0o700 and owned
-    /// by the signer UID at every reload pass; otherwise the reload is
-    /// skipped with a warn log.
-    #[arg(long, default_value_t = false)]
-    enable_hot_reload: bool,
-
-    /// Keystore hot-reload interval in seconds (only honoured when
-    /// `--enable-hot-reload` is set).
-    #[arg(long, default_value = "30")]
-    reload_interval: u64,
-
-    /// Enable runtime log-level reload on SIGHUP (opt-in; issue 5.4).
-    ///
-    /// When set, sending `SIGHUP` to the process re-reads `RUST_LOG` and swaps
-    /// the active log filter in place — raising or lowering verbosity without a
-    /// restart. Disabled by default so the steady-state log path is unchanged;
-    /// the always-on reload *layer* is free on the disabled hot path either way.
-    /// Distinct from `--enable-hot-reload` (which reloads keystores, not logs).
-    #[arg(long, default_value_t = false)]
-    enable_log_reload: bool,
-
-    /// Console log output format: `pretty` (default, human-readable) or `json`
-    /// (one structured object per event, for log-aggregation backends). Also
-    /// settable via the `RVC_LOG_FORMAT` env var; an explicit flag wins. Identical
-    /// to `bin/rvc`'s `--log-format` (issue 5.5); console-only (rvc-signer wires no
-    /// file appender, see ADR-004 / OPERATOR_GUIDE §7).
-    #[arg(long, default_value = "pretty")]
-    log_format: String,
-
-    /// Comma-separated list of DVT peer addresses (host:port)
-    #[cfg(feature = "dvt")]
-    #[arg(long, value_delimiter = ',')]
-    dvt_peers: Vec<String>,
-
-    /// DVT threshold for signature reconstruction
-    #[cfg(feature = "dvt")]
-    #[arg(long)]
-    dvt_threshold: Option<u64>,
-
-    /// This node's DVT share index
-    #[cfg(feature = "dvt")]
-    #[arg(long)]
-    dvt_index: Option<u64>,
-
-    /// DVT per-peer RPC timeout in milliseconds
-    #[cfg(feature = "dvt")]
-    #[arg(long, default_value = "2000")]
-    dvt_timeout: u64,
-
-    /// Path to the DVT allow-list TOML file (required when backend=dvt).
-    /// Format: [[peer]] entries with peer_cn and share_index.
-    #[cfg(feature = "dvt")]
-    #[arg(long)]
-    dvt_allowed_peers: Option<PathBuf>,
-
-    /// Path to the primary (non-DVT) client-CN allow-list TOML (SEC-4).
-    ///
-    /// Optional. When set, only listed mTLS Common Names may invoke signing
-    /// RPCs on the primary `SignerService`. Format:
-    ///
-    /// ```toml
-    /// [[client]]
-    /// client_cn = "validator-client-1.local"
-    /// ```
-    ///
-    /// When unset, a startup warning is logged and any CA-issued client cert is
-    /// accepted (backward compatible). mTLS remains mandatory either way.
-    #[arg(long)]
-    allowed_client_cns: Option<PathBuf>,
-
-    /// Network name for builder-registration genesis fork version
-    /// (`mainnet`, `hoodi`, `holesky`, `sepolia`). Default `mainnet`.
-    /// Both gRPC and HTTP use this single source so identical registrations
-    /// produce identical signatures across transports.
-    #[arg(long, default_value = "mainnet")]
-    network: String,
-}
-
 #[cfg(feature = "dvt")]
 #[derive(Parser)]
 struct SplitKeyCliArgs {
     /// Path to the source EIP-2335 keystore
     #[arg(long)]
-    keystore: PathBuf,
+    keystore: std::path::PathBuf,
 
     /// Password for the source keystore
     #[arg(long, group = "src_password")]
@@ -244,7 +48,7 @@ struct SplitKeyCliArgs {
 
     /// Path to a file containing the source keystore password
     #[arg(long, group = "src_password")]
-    password_file: Option<PathBuf>,
+    password_file: Option<std::path::PathBuf>,
 
     /// Threshold (t) for Shamir secret sharing
     #[arg(long)]
@@ -256,7 +60,7 @@ struct SplitKeyCliArgs {
 
     /// Output directory for share keystores
     #[arg(long)]
-    output_dir: PathBuf,
+    output_dir: std::path::PathBuf,
 
     /// Password for the output share keystores
     #[arg(long, group = "out_password")]
@@ -264,7 +68,7 @@ struct SplitKeyCliArgs {
 
     /// Path to a file containing the password for output share keystores
     #[arg(long, group = "out_password")]
-    output_password_file: Option<PathBuf>,
+    output_password_file: Option<std::path::PathBuf>,
 }
 
 #[tokio::main]
@@ -292,7 +96,7 @@ async fn main() {
     let cli = Cli::parse();
 
     let log_format = match &cli.command {
-        Command::Serve(args) => telemetry::LogFormat::resolve(Some(&args.log_format)),
+        Command::Serve(args) => telemetry::LogFormat::resolve(args.log_format.as_deref()),
         #[cfg(feature = "dvt")]
         Command::SplitKey(_) => telemetry::LogFormat::resolve(None),
     };
@@ -302,7 +106,7 @@ async fn main() {
     match cli.command {
         Command::Serve(args) => {
             let enable_log_reload = args.enable_log_reload;
-            let resolved = match resolve_config(&args) {
+            let resolved = match config::resolve_config(&args) {
                 Ok(r) => r,
                 Err(e) => {
                     error!(error = %e, "rvc-signer failed");
@@ -434,86 +238,6 @@ fn spawn_log_reload_handler(
             "--enable-log-reload set, but SIGHUP-based reload is only supported on Unix"
         );
     }
-}
-
-fn resolve_config(args: &ServeArgs) -> Result<config::ResolvedConfig, Box<dyn std::error::Error>> {
-    let file_config = if let Some(ref path) = args.config {
-        config::load_config(path)?
-    } else {
-        config::SignerConfig::default()
-    };
-
-    let has_config = args.config.is_some();
-    let listen_address_is_default = has_config && args.listen_address == DEFAULT_LISTEN_ADDRESS;
-    let backend_is_default = has_config && matches!(args.backend, Backend::Basic);
-    let reload_interval_is_default = has_config && args.reload_interval == 30;
-    let http_listen_address_is_default =
-        has_config && args.http_listen_address == config::DEFAULT_HTTP_LISTEN_ADDRESS;
-    let http_tls_mode_is_default =
-        has_config && args.http_tls_mode == config::DEFAULT_HTTP_TLS_MODE;
-    let network_is_default = has_config && args.network == "mainnet";
-
-    #[cfg(feature = "dvt")]
-    let dvt_timeout_is_default = has_config && args.dvt_timeout == 2000;
-    #[cfg(not(feature = "dvt"))]
-    let dvt_timeout_is_default = true;
-
-    #[cfg(feature = "dvt")]
-    let (dvt_peers, dvt_threshold, dvt_index, dvt_timeout) =
-        (&args.dvt_peers[..], args.dvt_threshold, args.dvt_index, args.dvt_timeout);
-    #[cfg(not(feature = "dvt"))]
-    let (dvt_peers, dvt_threshold, dvt_index, dvt_timeout): (
-        &[String],
-        Option<u64>,
-        Option<u64>,
-        u64,
-    ) = (&[], None, None, 2000);
-
-    let cli = config::CliOverrides {
-        listen_address: &args.listen_address,
-        listen_address_is_default,
-        keystore_dir: args.keystore_dir.as_deref(),
-        password_file: args.password_file.as_deref(),
-        backend: &args.backend.to_string(),
-        backend_is_default,
-        dry_run: args.dry_run,
-        tls_cert: args.tls_cert.as_deref(),
-        tls_key: args.tls_key.as_deref(),
-        tls_ca_cert: args.tls_ca_cert.as_deref(),
-        reload_interval: args.reload_interval,
-        reload_interval_is_default,
-        enable_hot_reload: args.enable_hot_reload,
-        dvt_peers,
-        dvt_threshold,
-        dvt_index,
-        dvt_timeout,
-        dvt_timeout_is_default,
-        http_enabled: args.http_enabled,
-        http_listen_address: &args.http_listen_address,
-        http_listen_address_is_default,
-        http_tls_mode: &args.http_tls_mode,
-        http_tls_mode_is_default,
-        http_tls_cert: args.http_tls_cert.as_deref(),
-        http_tls_key: args.http_tls_key.as_deref(),
-        http_tls_ca_cert: args.http_tls_ca_cert.as_deref(),
-        network: &args.network,
-        network_is_default,
-    };
-
-    let mut resolved = config::merge_with_cli(file_config, &cli)?;
-    // Serve-runtime fields stay CLI-only until RF5-23 folds them into merge.
-    resolved.insecure = args.insecure;
-    resolved.data_dir = args.data_dir.clone();
-    resolved.disable_slashing_protection = args.disable_slashing_protection;
-    resolved.init_slashing_db = args.init_slashing_db;
-    resolved.metrics_address = args.metrics_address.clone();
-    resolved.enable_log_reload = args.enable_log_reload;
-    resolved.allowed_client_cns = args.allowed_client_cns.clone();
-    #[cfg(feature = "dvt")]
-    {
-        resolved.dvt_allowed_peers = args.dvt_allowed_peers.clone();
-    }
-    Ok(resolved)
 }
 
 /// Map each `ServerError` class to a process exit code.
@@ -686,16 +410,19 @@ mod tests {
             .expect("serve --log-format json should parse");
         let args = serve_args(cli);
         assert_eq!(
-            telemetry::LogFormat::resolve(Some(&args.log_format)),
+            telemetry::LogFormat::resolve(args.log_format.as_deref()),
             telemetry::LogFormat::Json
         );
 
         let cli = super::Cli::try_parse_from(["rvc-signer", "serve"])
             .expect("serve default should parse");
         let args = serve_args(cli);
-        assert_eq!(args.log_format, "pretty", "default --log-format must be pretty");
+        assert!(
+            args.log_format.is_none(),
+            "omitted --log-format must be None (resolved later to pretty)"
+        );
         assert_eq!(
-            telemetry::LogFormat::resolve(Some(&args.log_format)),
+            telemetry::LogFormat::resolve(args.log_format.as_deref()),
             telemetry::LogFormat::Pretty
         );
     }

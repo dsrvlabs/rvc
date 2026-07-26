@@ -1,7 +1,13 @@
 use std::path::{Path, PathBuf};
 
+use clap::Parser;
 use serde::Deserialize;
 use zeroize::Zeroizing;
+
+// ── Built-in defaults (single source of truth for merge + docs) ──────────────
+
+/// Default gRPC listen address (loopback).
+pub const DEFAULT_LISTEN_ADDRESS: &str = "127.0.0.1:50052";
 
 /// Default HTTP Remote Signing API listen address: **loopback** on the
 /// Web3Signer port 9000.
@@ -16,6 +22,46 @@ pub const DEFAULT_HTTP_LISTEN_ADDRESS: &str = "127.0.0.1:9000";
 
 /// Default HTTP TLS mode: mutual TLS (the recommended posture, FR-29).
 pub const DEFAULT_HTTP_TLS_MODE: &str = "mtls";
+
+/// Default keystore hot-reload interval (seconds).
+pub const DEFAULT_RELOAD_INTERVAL_SECS: u64 = 30;
+
+/// Default DVT per-peer RPC timeout (milliseconds).
+pub const DEFAULT_DVT_TIMEOUT_MS: u64 = 2000;
+
+/// Default Prometheus metrics listen address.
+pub const DEFAULT_METRICS_ADDRESS: &str = "127.0.0.1:9101";
+
+/// Default network name for builder-registration genesis fork version.
+pub const DEFAULT_NETWORK: &str = "mainnet";
+
+/// Default console log format token.
+pub const DEFAULT_LOG_FORMAT: &str = "pretty";
+
+// ── Signing backend ──────────────────────────────────────────────────────────
+
+/// Signing backend type.
+#[derive(Clone, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum Backend {
+    /// Local keystore-based signing
+    #[default]
+    Basic,
+    /// Distributed Validator Technology (DVT) signing
+    #[cfg(feature = "dvt")]
+    Dvt,
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Basic => write!(f, "basic"),
+            #[cfg(feature = "dvt")]
+            Self::Dvt => write!(f, "dvt"),
+        }
+    }
+}
+
+// ── TOML config surface ──────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Deserialize)]
 pub struct SignerConfig {
@@ -105,6 +151,8 @@ pub struct DvtConfig {
     pub timeout_ms: Option<u64>,
 }
 
+// ── Resolved runtime config ──────────────────────────────────────────────────
+
 #[derive(Debug)]
 pub struct ResolvedConfig {
     pub listen_address: String,
@@ -133,7 +181,7 @@ pub struct ResolvedConfig {
     /// Network genesis fork version for builder registration (from NetworkPreset).
     pub genesis_fork_version: [u8; 4],
 
-    // ── Serve-runtime fields (CLI-only today; folded for `server::run`, RF5-19) ──
+    // ── Serve-runtime fields ─────────────────────────────────────────────────
     /// Allow starting without TLS (`--insecure`).
     pub insecure: bool,
     /// Data directory for signer state (default: parent of keystore_dir).
@@ -153,41 +201,193 @@ pub struct ResolvedConfig {
     pub dvt_allowed_peers: Option<PathBuf>,
 }
 
-pub struct CliOverrides<'a> {
-    pub listen_address: &'a str,
-    pub listen_address_is_default: bool,
-    pub keystore_dir: Option<&'a Path>,
-    pub password_file: Option<&'a Path>,
-    pub backend: &'a str,
-    pub backend_is_default: bool,
-    pub dry_run: bool,
-    pub tls_cert: Option<&'a Path>,
-    pub tls_key: Option<&'a Path>,
-    pub tls_ca_cert: Option<&'a Path>,
-    pub reload_interval: u64,
-    pub reload_interval_is_default: bool,
-    pub enable_hot_reload: bool,
-    pub dvt_peers: &'a [String],
-    pub dvt_threshold: Option<u64>,
-    pub dvt_index: Option<u64>,
-    pub dvt_timeout: u64,
-    pub dvt_timeout_is_default: bool,
-    // --- Web3Signer HTTP API overrides (FR-25/27/28/30) ---
-    /// `--http-enabled`. Combined with the TOML value via OR (mirrors
-    /// `enable_hot_reload`): a clap bool can't distinguish explicit-false from
-    /// default-false, so the policy is "CLI flag set OR TOML `enabled = true`".
+// ── CLI args (serve subcommand) ──────────────────────────────────────────────
+
+/// Arguments for `rvc-signer serve`.
+///
+/// Fields that previously carried clap `default_value` / `default_value_t` are
+/// now `Option<T>` (or plain `bool` with `SetTrue` for pure opt-in flags) so
+/// "not passed" is representable. Built-in defaults live only in
+/// [`merge_with_cli`] / the `DEFAULT_*` constants — never inferred by comparing
+/// a filled clap default against a magic string.
+///
+/// Precedence: **explicit CLI > config file > built-in default**. An operator
+/// who passes `--listen-address 127.0.0.1:50052` (the built-in default value)
+/// still wins over a config-file override.
+#[derive(Parser, Debug, Clone, Default)]
+pub struct ServeArgs {
+    /// Path to config.toml file
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
+    /// gRPC listen address (host:port) [default: 127.0.0.1:50052]
+    #[arg(long)]
+    pub listen_address: Option<String>,
+
+    /// Path to the keystore directory
+    #[arg(long)]
+    pub keystore_dir: Option<PathBuf>,
+
+    /// Path to a single password file used for all keystores
+    #[arg(long)]
+    pub password_file: Option<PathBuf>,
+
+    /// Path to the TLS certificate file (PEM)
+    #[arg(long)]
+    pub tls_cert: Option<PathBuf>,
+
+    /// Path to the TLS private key file (PEM)
+    #[arg(long)]
+    pub tls_key: Option<PathBuf>,
+
+    /// Path to the TLS CA certificate file for client authentication (PEM)
+    #[arg(long)]
+    pub tls_ca_cert: Option<PathBuf>,
+
+    /// Enable the Web3Signer HTTP Remote Signing API (opt-in; gRPC stays on).
+    /// Parsed/resolved only for now; the listener is wired in a later phase.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
     pub http_enabled: bool,
-    pub http_listen_address: &'a str,
-    pub http_listen_address_is_default: bool,
-    pub http_tls_mode: &'a str,
-    pub http_tls_mode_is_default: bool,
-    pub http_tls_cert: Option<&'a Path>,
-    pub http_tls_key: Option<&'a Path>,
-    pub http_tls_ca_cert: Option<&'a Path>,
-    /// `--network` CLI value (`mainnet` default). When default, TOML may supply.
-    pub network: &'a str,
-    pub network_is_default: bool,
+
+    /// HTTP Remote Signing API listen address (host:port) [default: 127.0.0.1:9000]
+    #[arg(long)]
+    pub http_listen_address: Option<String>,
+
+    /// HTTP API TLS mode: "mtls" (default) or "server-tls-only"
+    #[arg(long)]
+    pub http_tls_mode: Option<String>,
+
+    /// HTTP API server certificate (PEM). Independent of the gRPC TLS material.
+    #[arg(long)]
+    pub http_tls_cert: Option<PathBuf>,
+
+    /// HTTP API server private key (PEM). Independent of the gRPC TLS material.
+    #[arg(long)]
+    pub http_tls_key: Option<PathBuf>,
+
+    /// HTTP API client CA certificate (PEM). Required in both TLS modes.
+    #[arg(long)]
+    pub http_tls_ca_cert: Option<PathBuf>,
+
+    /// Validate configuration and exit without starting the server
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub dry_run: bool,
+
+    /// Allow starting without TLS (NOT recommended for production)
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub insecure: bool,
+
+    /// Data directory for signer state (default: parent of keystore_dir).
+    /// The slashing protection DB is stored here as signer-slashing.db.
+    #[arg(long)]
+    pub data_dir: Option<PathBuf>,
+
+    /// Disable slashing protection (UNSAFE).
+    /// Requires ALSO setting RVC_ALLOW_INSECURE=true in the environment.
+    /// Both checks are required to prevent accidental opt-out.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub disable_slashing_protection: bool,
+
+    /// Allow creating a fresh empty signer slashing DB when the path is missing
+    /// (SEC-3). DANGEROUS on a previously-active signer: the new DB has zero
+    /// signing history and can enable double-signing / slashing. Use only for
+    /// genuine first-time deployments. A 0-byte or corrupt DB is always a hard
+    /// error regardless of this flag.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub init_slashing_db: bool,
+
+    /// Signing backend to use [default: basic]
+    #[arg(long, value_enum)]
+    pub backend: Option<Backend>,
+
+    /// Prometheus metrics listen address (host:port) [default: 127.0.0.1:9101]
+    #[arg(long)]
+    pub metrics_address: Option<String>,
+
+    /// Enable keystore hot-reload (ISSUE-4.6 / L-6).
+    ///
+    /// Disabled by default. When enabled, the signer periodically rescans
+    /// `keystore_dir` and reconciles the loaded set with files on disk —
+    /// a key-injection vector if the directory is writable by anyone other
+    /// than the signer UID. Requires the directory to be 0o700 and owned
+    /// by the signer UID at every reload pass; otherwise the reload is
+    /// skipped with a warn log.
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub enable_hot_reload: bool,
+
+    /// Keystore hot-reload interval in seconds (only honoured when
+    /// `--enable-hot-reload` is set) [default: 30]
+    #[arg(long)]
+    pub reload_interval: Option<u64>,
+
+    /// Enable runtime log-level reload on SIGHUP (opt-in; issue 5.4).
+    ///
+    /// When set, sending `SIGHUP` to the process re-reads `RUST_LOG` and swaps
+    /// the active log filter in place — raising or lowering verbosity without a
+    /// restart. Disabled by default so the steady-state log path is unchanged;
+    /// the always-on reload *layer* is free on the disabled hot path either way.
+    /// Distinct from `--enable-hot-reload` (which reloads keystores, not logs).
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    pub enable_log_reload: bool,
+
+    /// Console log output format: `pretty` (default, human-readable) or `json`
+    /// (one structured object per event, for log-aggregation backends). Also
+    /// settable via the `RVC_LOG_FORMAT` env var; an explicit flag wins. Identical
+    /// to `bin/rvc`'s `--log-format` (issue 5.5); console-only (rvc-signer wires no
+    /// file appender, see ADR-004 / OPERATOR_GUIDE §7).
+    #[arg(long)]
+    pub log_format: Option<String>,
+
+    /// Comma-separated list of DVT peer addresses (host:port)
+    #[cfg(feature = "dvt")]
+    #[arg(long, value_delimiter = ',')]
+    pub dvt_peers: Vec<String>,
+
+    /// DVT threshold for signature reconstruction
+    #[cfg(feature = "dvt")]
+    #[arg(long)]
+    pub dvt_threshold: Option<u64>,
+
+    /// This node's DVT share index
+    #[cfg(feature = "dvt")]
+    #[arg(long)]
+    pub dvt_index: Option<u64>,
+
+    /// DVT per-peer RPC timeout in milliseconds [default: 2000]
+    #[cfg(feature = "dvt")]
+    #[arg(long)]
+    pub dvt_timeout: Option<u64>,
+
+    /// Path to the DVT allow-list TOML file (required when backend=dvt).
+    /// Format: [[peer]] entries with peer_cn and share_index.
+    #[cfg(feature = "dvt")]
+    #[arg(long)]
+    pub dvt_allowed_peers: Option<PathBuf>,
+
+    /// Path to the primary (non-DVT) client-CN allow-list TOML (SEC-4).
+    ///
+    /// Optional. When set, only listed mTLS Common Names may invoke signing
+    /// RPCs on the primary `SignerService`. Format:
+    ///
+    /// ```toml
+    /// [[client]]
+    /// client_cn = "validator-client-1.local"
+    /// ```
+    ///
+    /// When unset, a startup warning is logged and any CA-issued client cert is
+    /// accepted (backward compatible). mTLS remains mandatory either way.
+    #[arg(long)]
+    pub allowed_client_cns: Option<PathBuf>,
+
+    /// Network name for builder-registration genesis fork version
+    /// (`mainnet`, `hoodi`, `holesky`, `sepolia`) [default: mainnet].
+    /// Both gRPC and HTTP use this single source so identical registrations
+    /// produce identical signatures across transports.
+    #[arg(long)]
+    pub network: Option<String>,
 }
+
+// ── Load / merge ─────────────────────────────────────────────────────────────
 
 pub fn load_config(path: &Path) -> Result<SignerConfig, Box<dyn std::error::Error>> {
     let content = std::fs::read_to_string(path)
@@ -197,99 +397,114 @@ pub fn load_config(path: &Path) -> Result<SignerConfig, Box<dyn std::error::Erro
     Ok(config)
 }
 
+/// Load the config file (if any) and merge with CLI args.
+///
+/// Precedence: explicit CLI (`Some` / flag set) > file > built-in default.
+pub fn resolve_config(args: &ServeArgs) -> Result<ResolvedConfig, Box<dyn std::error::Error>> {
+    let file_config =
+        if let Some(ref path) = args.config { load_config(path)? } else { SignerConfig::default() };
+    merge_with_cli(file_config, args)
+}
+
+/// Merge file config with CLI args into a fully-resolved runtime config.
+///
+/// An explicitly-passed CLI value **always wins**, even when it equals the
+/// built-in default (fixes the previous "value equals default ⇒ not passed"
+/// heuristic).
 pub fn merge_with_cli(
     config: SignerConfig,
-    cli: &CliOverrides<'_>,
+    cli: &ServeArgs,
 ) -> Result<ResolvedConfig, Box<dyn std::error::Error>> {
     let section = config.signer.unwrap_or_default();
     let dvt = section.dvt.unwrap_or_default();
 
-    let listen_address = if !cli.listen_address_is_default {
-        cli.listen_address.to_string()
-    } else {
-        section.listen_address.unwrap_or_else(|| cli.listen_address.to_string())
-    };
+    let listen_address = cli
+        .listen_address
+        .clone()
+        .or(section.listen_address)
+        .unwrap_or_else(|| DEFAULT_LISTEN_ADDRESS.to_string());
 
-    let keystore_dir = cli.keystore_dir.map(PathBuf::from).or(section.keystore_dir).ok_or(
+    let keystore_dir = cli.keystore_dir.clone().or(section.keystore_dir).ok_or(
         "keystore_dir is required (set via --keystore-dir or config [signer].keystore_dir)",
     )?;
 
-    let password_file = cli.password_file.map(PathBuf::from).or(section.password_file);
+    let password_file = cli.password_file.clone().or(section.password_file);
 
-    let backend = if !cli.backend_is_default {
-        cli.backend.to_string()
-    } else {
-        section.backend.unwrap_or_else(|| cli.backend.to_string())
-    };
+    let backend = cli
+        .backend
+        .as_ref()
+        .map(|b| b.to_string())
+        .or(section.backend)
+        .unwrap_or_else(|| Backend::Basic.to_string());
 
+    // Opt-in flags: CLI SetTrue OR TOML true (cannot cleanly pass explicit false).
     let dry_run = cli.dry_run || section.dry_run.unwrap_or(false);
 
-    let tls_cert = cli.tls_cert.map(PathBuf::from).or(section.tls_cert);
-    let tls_key = cli.tls_key.map(PathBuf::from).or(section.tls_key);
-    let tls_ca_cert = cli.tls_ca_cert.map(PathBuf::from).or(section.tls_ca_cert);
+    let tls_cert = cli.tls_cert.clone().or(section.tls_cert);
+    let tls_key = cli.tls_key.clone().or(section.tls_key);
+    let tls_ca_cert = cli.tls_ca_cert.clone().or(section.tls_ca_cert);
 
-    let reload_interval_secs = if !cli.reload_interval_is_default {
-        cli.reload_interval
-    } else {
-        section.reload_interval_secs.unwrap_or(cli.reload_interval)
-    };
+    let reload_interval_secs = cli
+        .reload_interval
+        .or(section.reload_interval_secs)
+        .unwrap_or(DEFAULT_RELOAD_INTERVAL_SECS);
 
-    // ISSUE-4.6 / L-6: hot-reload opt-in.  CLI flag wins; otherwise the TOML
-    // setting; otherwise off.  An explicit CLI `--enable-hot-reload` (or
-    // future `--no-...`) cannot be cleanly distinguished from the default
-    // boolean false in clap, so the policy is "either the CLI flag is set
-    // OR the TOML key is set true".
+    // ISSUE-4.6 / L-6: hot-reload opt-in. CLI flag OR TOML true.
     let enable_hot_reload = cli.enable_hot_reload || section.enable_hot_reload.unwrap_or(false);
 
+    #[cfg(feature = "dvt")]
     let dvt_peers = if !cli.dvt_peers.is_empty() {
-        cli.dvt_peers.to_vec()
+        cli.dvt_peers.clone()
     } else {
         dvt.peers.unwrap_or_default()
     };
+    #[cfg(not(feature = "dvt"))]
+    let dvt_peers = dvt.peers.unwrap_or_default();
 
+    #[cfg(feature = "dvt")]
     let dvt_threshold = cli.dvt_threshold.or(dvt.threshold);
+    #[cfg(not(feature = "dvt"))]
+    let dvt_threshold = dvt.threshold;
+
+    #[cfg(feature = "dvt")]
     let dvt_index = cli.dvt_index.or(dvt.index);
+    #[cfg(not(feature = "dvt"))]
+    let dvt_index = dvt.index;
 
-    let dvt_timeout_ms = if !cli.dvt_timeout_is_default {
-        cli.dvt_timeout
-    } else {
-        dvt.timeout_ms.unwrap_or(cli.dvt_timeout)
-    };
+    #[cfg(feature = "dvt")]
+    let dvt_timeout_ms = cli.dvt_timeout.or(dvt.timeout_ms).unwrap_or(DEFAULT_DVT_TIMEOUT_MS);
+    #[cfg(not(feature = "dvt"))]
+    let dvt_timeout_ms = dvt.timeout_ms.unwrap_or(DEFAULT_DVT_TIMEOUT_MS);
 
-    // --- Web3Signer HTTP API (opt-in; FR-25/27/28/30). Listener not bound this
-    // phase; an absent [signer.http] block leaves HTTP disabled and does not
-    // affect any gRPC-side resolution. ---
+    // --- Web3Signer HTTP API (opt-in; FR-25/27/28/30). ---
     let http = section.http.unwrap_or_default();
 
     // Opt-in: CLI flag OR TOML `enabled = true` (mirrors `enable_hot_reload`).
     let http_enabled = cli.http_enabled || http.enabled.unwrap_or(false);
 
-    let http_listen_address = if !cli.http_listen_address_is_default {
-        cli.http_listen_address.to_string()
-    } else {
-        http.listen_address.unwrap_or_else(|| cli.http_listen_address.to_string())
-    };
+    let http_listen_address = cli
+        .http_listen_address
+        .clone()
+        .or(http.listen_address)
+        .unwrap_or_else(|| DEFAULT_HTTP_LISTEN_ADDRESS.to_string());
 
     // CLI > TOML > default; the resolved string is then parsed into the enum,
     // so an invalid value is a hard error rather than a silent fallback.
-    let http_tls_mode_str = if !cli.http_tls_mode_is_default {
-        cli.http_tls_mode.to_string()
-    } else {
-        http.tls_mode.unwrap_or_else(|| cli.http_tls_mode.to_string())
-    };
+    let http_tls_mode_str = cli
+        .http_tls_mode
+        .clone()
+        .or(http.tls_mode)
+        .unwrap_or_else(|| DEFAULT_HTTP_TLS_MODE.to_string());
     let http_tls_mode = HttpTlsMode::parse(&http_tls_mode_str)?;
 
     // Independent of the gRPC TLS material (FR-30) — do not alias the gRPC paths.
-    let http_tls_cert = cli.http_tls_cert.map(PathBuf::from).or(http.tls_cert);
-    let http_tls_key = cli.http_tls_key.map(PathBuf::from).or(http.tls_key);
-    let http_tls_ca_cert = cli.http_tls_ca_cert.map(PathBuf::from).or(http.tls_ca_cert);
+    let http_tls_cert = cli.http_tls_cert.clone().or(http.tls_cert);
+    let http_tls_key = cli.http_tls_key.clone().or(http.tls_key);
+    let http_tls_ca_cert = cli.http_tls_ca_cert.clone().or(http.tls_ca_cert);
 
     // Network genesis for builder registration: CLI > TOML > mainnet.
-    let network_name = if !cli.network_is_default {
-        cli.network.to_string()
-    } else {
-        section.network.unwrap_or_else(|| cli.network.to_string())
-    };
+    let network_name =
+        cli.network.clone().or(section.network).unwrap_or_else(|| DEFAULT_NETWORK.to_string());
     let genesis_fork_version = resolve_network_genesis_fork_version(&network_name)?;
 
     Ok(ResolvedConfig {
@@ -314,16 +529,18 @@ pub fn merge_with_cli(
         http_tls_key,
         http_tls_ca_cert,
         genesis_fork_version,
-        // Serve-runtime fields are filled by the binary after merge (CLI-only).
-        insecure: false,
-        data_dir: None,
-        disable_slashing_protection: false,
-        init_slashing_db: false,
-        metrics_address: "127.0.0.1:9101".to_string(),
-        enable_log_reload: false,
-        allowed_client_cns: None,
+        insecure: cli.insecure,
+        data_dir: cli.data_dir.clone(),
+        disable_slashing_protection: cli.disable_slashing_protection,
+        init_slashing_db: cli.init_slashing_db,
+        metrics_address: cli
+            .metrics_address
+            .clone()
+            .unwrap_or_else(|| DEFAULT_METRICS_ADDRESS.to_string()),
+        enable_log_reload: cli.enable_log_reload,
+        allowed_client_cns: cli.allowed_client_cns.clone(),
         #[cfg(feature = "dvt")]
-        dvt_allowed_peers: None,
+        dvt_allowed_peers: cli.dvt_allowed_peers.clone(),
     })
 }
 
@@ -366,37 +583,13 @@ mod tests {
         f
     }
 
-    fn default_cli_overrides() -> CliOverrides<'static> {
-        CliOverrides {
-            listen_address: "127.0.0.1:50052",
-            listen_address_is_default: true,
-            keystore_dir: None,
-            password_file: None,
-            backend: "basic",
-            backend_is_default: true,
-            dry_run: false,
-            tls_cert: None,
-            tls_key: None,
-            tls_ca_cert: None,
-            reload_interval: 30,
-            reload_interval_is_default: true,
-            enable_hot_reload: false,
-            dvt_peers: &[],
-            dvt_threshold: None,
-            dvt_index: None,
-            dvt_timeout: 2000,
-            dvt_timeout_is_default: true,
-            http_enabled: false,
-            http_listen_address: DEFAULT_HTTP_LISTEN_ADDRESS,
-            http_listen_address_is_default: true,
-            http_tls_mode: DEFAULT_HTTP_TLS_MODE,
-            http_tls_mode_is_default: true,
-            http_tls_cert: None,
-            http_tls_key: None,
-            http_tls_ca_cert: None,
-            network: "mainnet",
-            network_is_default: true,
-        }
+    /// Empty CLI args (= nothing passed): all Options None, flags false.
+    fn empty_cli() -> ServeArgs {
+        ServeArgs::default()
+    }
+
+    fn cli_with_keystore(dir: &str) -> ServeArgs {
+        ServeArgs { keystore_dir: Some(PathBuf::from(dir)), ..empty_cli() }
     }
 
     // --- load_config tests ---
@@ -503,17 +696,13 @@ index = 1
 
     #[test]
     fn test_merge_defaults_only() {
-        let cli = CliOverrides {
-            keystore_dir: Some(Path::new("/cli/keystores")),
-            ..default_cli_overrides()
-        };
+        let cli = cli_with_keystore("/cli/keystores");
         let resolved = merge_with_cli(SignerConfig::default(), &cli).unwrap();
-        assert_eq!(resolved.listen_address, "127.0.0.1:50052");
+        assert_eq!(resolved.listen_address, DEFAULT_LISTEN_ADDRESS);
         assert_eq!(resolved.keystore_dir, PathBuf::from("/cli/keystores"));
         assert_eq!(resolved.backend, "basic");
-        assert_eq!(resolved.dvt_timeout_ms, 2000);
+        assert_eq!(resolved.dvt_timeout_ms, DEFAULT_DVT_TIMEOUT_MS);
         assert!(resolved.dvt_peers.is_empty());
-        // Default network is mainnet genesis for builder registration.
         assert_eq!(
             resolved.genesis_fork_version,
             eth_types::NetworkPreset::MAINNET.genesis_fork_version
@@ -529,7 +718,7 @@ index = 1
                 ..Default::default()
             }),
         };
-        let resolved = merge_with_cli(config, &default_cli_overrides()).unwrap();
+        let resolved = merge_with_cli(config, &empty_cli()).unwrap();
         assert_eq!(
             resolved.genesis_fork_version,
             eth_types::NetworkPreset::HOLESKY.genesis_fork_version
@@ -545,11 +734,10 @@ index = 1
                 ..Default::default()
             }),
         };
-        let cli = CliOverrides {
-            keystore_dir: Some(Path::new("/ks")),
-            network: "sepolia",
-            network_is_default: false,
-            ..default_cli_overrides()
+        let cli = ServeArgs {
+            keystore_dir: Some(PathBuf::from("/ks")),
+            network: Some("sepolia".to_string()),
+            ..empty_cli()
         };
         let resolved = merge_with_cli(config, &cli).unwrap();
         assert_eq!(
@@ -567,7 +755,7 @@ index = 1
                 ..Default::default()
             }),
         };
-        let err = merge_with_cli(config, &default_cli_overrides()).unwrap_err().to_string();
+        let err = merge_with_cli(config, &empty_cli()).unwrap_err().to_string();
         assert!(err.contains("unknown network"), "error: {err}");
         assert!(err.contains("not-a-network"), "error: {err}");
     }
@@ -594,7 +782,7 @@ index = 1
     }
 
     #[test]
-    fn test_merge_config_values_used_when_cli_is_default() {
+    fn test_merge_config_values_used_when_cli_unset() {
         let config = SignerConfig {
             signer: Some(SignerSection {
                 listen_address: Some("0.0.0.0:9000".to_string()),
@@ -612,7 +800,7 @@ index = 1
             }),
         };
 
-        let resolved = merge_with_cli(config, &default_cli_overrides()).unwrap();
+        let resolved = merge_with_cli(config, &empty_cli()).unwrap();
 
         assert_eq!(resolved.listen_address, "0.0.0.0:9000");
         assert_eq!(resolved.keystore_dir, PathBuf::from("/config/ks"));
@@ -642,21 +830,21 @@ index = 1
             }),
         };
 
-        let peers = vec!["cli-peer:6000".to_string()];
-        let cli = CliOverrides {
-            listen_address: "10.0.0.1:8080",
-            listen_address_is_default: false,
-            keystore_dir: Some(Path::new("/cli/ks")),
-            password_file: Some(Path::new("/cli/pw.txt")),
-            backend: "basic",
-            backend_is_default: false,
-            tls_cert: Some(Path::new("/cli/cert.pem")),
-            dvt_peers: &peers,
+        let cli = ServeArgs {
+            listen_address: Some("10.0.0.1:8080".to_string()),
+            keystore_dir: Some(PathBuf::from("/cli/ks")),
+            password_file: Some(PathBuf::from("/cli/pw.txt")),
+            backend: Some(Backend::Basic),
+            tls_cert: Some(PathBuf::from("/cli/cert.pem")),
+            #[cfg(feature = "dvt")]
+            dvt_peers: vec!["cli-peer:6000".to_string()],
+            #[cfg(feature = "dvt")]
             dvt_threshold: Some(3),
+            #[cfg(feature = "dvt")]
             dvt_index: Some(0),
-            dvt_timeout: 5000,
-            dvt_timeout_is_default: false,
-            ..default_cli_overrides()
+            #[cfg(feature = "dvt")]
+            dvt_timeout: Some(5000),
+            ..empty_cli()
         };
 
         let resolved = merge_with_cli(config, &cli).unwrap();
@@ -666,10 +854,13 @@ index = 1
         assert_eq!(resolved.password_file.unwrap(), PathBuf::from("/cli/pw.txt"));
         assert_eq!(resolved.backend, "basic");
         assert_eq!(resolved.tls_cert.unwrap(), PathBuf::from("/cli/cert.pem"));
-        assert_eq!(resolved.dvt_peers, vec!["cli-peer:6000"]);
-        assert_eq!(resolved.dvt_threshold.unwrap(), 3);
-        assert_eq!(resolved.dvt_index.unwrap(), 0);
-        assert_eq!(resolved.dvt_timeout_ms, 5000);
+        #[cfg(feature = "dvt")]
+        {
+            assert_eq!(resolved.dvt_peers, vec!["cli-peer:6000"]);
+            assert_eq!(resolved.dvt_threshold.unwrap(), 3);
+            assert_eq!(resolved.dvt_index.unwrap(), 0);
+            assert_eq!(resolved.dvt_timeout_ms, 5000);
+        }
     }
 
     #[test]
@@ -697,7 +888,7 @@ dry_run = true
             }),
         };
 
-        let resolved = merge_with_cli(config, &default_cli_overrides()).unwrap();
+        let resolved = merge_with_cli(config, &empty_cli()).unwrap();
         assert!(resolved.dry_run);
     }
 
@@ -711,21 +902,21 @@ dry_run = true
             }),
         };
 
-        let cli = CliOverrides { dry_run: true, ..default_cli_overrides() };
+        let cli = ServeArgs { dry_run: true, ..empty_cli() };
         let resolved = merge_with_cli(config, &cli).unwrap();
         assert!(resolved.dry_run);
     }
 
     #[test]
     fn test_merge_dry_run_defaults_false() {
-        let cli = CliOverrides { keystore_dir: Some(Path::new("/ks")), ..default_cli_overrides() };
+        let cli = cli_with_keystore("/ks");
         let resolved = merge_with_cli(SignerConfig::default(), &cli).unwrap();
         assert!(!resolved.dry_run);
     }
 
     #[test]
     fn test_merge_missing_keystore_dir_errors() {
-        let result = merge_with_cli(SignerConfig::default(), &default_cli_overrides());
+        let result = merge_with_cli(SignerConfig::default(), &empty_cli());
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("keystore_dir is required"));
@@ -736,7 +927,7 @@ dry_run = true
 
     #[test]
     fn test_missing_password_source_is_startup_error() {
-        let cli = CliOverrides { keystore_dir: Some(Path::new("/ks")), ..default_cli_overrides() };
+        let cli = cli_with_keystore("/ks");
         let resolved = merge_with_cli(SignerConfig::default(), &cli).unwrap();
         assert!(resolved.password_file.is_none());
 
@@ -758,10 +949,10 @@ dry_run = true
         f.write_all(b"s3cret\n").unwrap();
         let path = f.path().to_path_buf();
 
-        let cli = CliOverrides {
-            keystore_dir: Some(Path::new("/ks")),
-            password_file: Some(path.as_path()),
-            ..default_cli_overrides()
+        let cli = ServeArgs {
+            keystore_dir: Some(PathBuf::from("/ks")),
+            password_file: Some(path),
+            ..empty_cli()
         };
         let resolved = merge_with_cli(SignerConfig::default(), &cli).unwrap();
         let password = load_serve_password(&resolved).unwrap();
@@ -785,7 +976,7 @@ password_dir = "/legacy/pwdir"
         assert_eq!(section.keystore_dir.as_ref().unwrap(), &PathBuf::from("/ks"));
         assert!(section.password_file.is_none());
 
-        let resolved = merge_with_cli(cfg, &default_cli_overrides()).unwrap();
+        let resolved = merge_with_cli(cfg, &empty_cli()).unwrap();
         assert!(resolved.password_file.is_none());
         let err = load_serve_password(&resolved).unwrap_err();
         assert!(
@@ -825,16 +1016,16 @@ tls_ca_cert = "/http/ca.pem"
     #[test]
     fn test_http_defaults_when_block_absent() {
         // No [signer.http]: HTTP disabled, default address/mode, gRPC untouched.
-        let cli = CliOverrides { keystore_dir: Some(Path::new("/ks")), ..default_cli_overrides() };
+        let cli = cli_with_keystore("/ks");
         let resolved = merge_with_cli(SignerConfig::default(), &cli).unwrap();
         assert!(!resolved.http_enabled);
-        assert_eq!(resolved.http_listen_address, "127.0.0.1:9000");
+        assert_eq!(resolved.http_listen_address, DEFAULT_HTTP_LISTEN_ADDRESS);
         assert_eq!(resolved.http_tls_mode, HttpTlsMode::Mtls);
         assert!(resolved.http_tls_cert.is_none());
         assert!(resolved.http_tls_key.is_none());
         assert!(resolved.http_tls_ca_cert.is_none());
         // gRPC-side resolution unchanged by the absent HTTP block.
-        assert_eq!(resolved.listen_address, "127.0.0.1:50052");
+        assert_eq!(resolved.listen_address, DEFAULT_LISTEN_ADDRESS);
         assert_eq!(resolved.backend, "basic");
     }
 
@@ -854,7 +1045,7 @@ tls_ca_cert = "/http/ca.pem"
                 ..Default::default()
             }),
         };
-        let resolved = merge_with_cli(config, &default_cli_overrides()).unwrap();
+        let resolved = merge_with_cli(config, &empty_cli()).unwrap();
         assert!(resolved.http_enabled);
         assert_eq!(resolved.http_listen_address, "0.0.0.0:9000");
         assert_eq!(resolved.http_tls_mode, HttpTlsMode::ServerTlsOnly);
@@ -878,15 +1069,13 @@ tls_ca_cert = "/http/ca.pem"
                 ..Default::default()
             }),
         };
-        let cli = CliOverrides {
-            keystore_dir: Some(Path::new("/ks")),
-            http_enabled: true, // CLI flag set
-            http_listen_address: "127.0.0.1:7000",
-            http_listen_address_is_default: false,
-            http_tls_mode: "server-tls-only",
-            http_tls_mode_is_default: false,
-            http_tls_cert: Some(Path::new("/cli/cert.pem")),
-            ..default_cli_overrides()
+        let cli = ServeArgs {
+            keystore_dir: Some(PathBuf::from("/ks")),
+            http_enabled: true,
+            http_listen_address: Some("127.0.0.1:7000".to_string()),
+            http_tls_mode: Some("server-tls-only".to_string()),
+            http_tls_cert: Some(PathBuf::from("/cli/cert.pem")),
+            ..empty_cli()
         };
         let resolved = merge_with_cli(config, &cli).unwrap();
         assert!(resolved.http_enabled); // CLI flag OR file → enabled
@@ -907,7 +1096,7 @@ tls_ca_cert = "/http/ca.pem"
                 ..Default::default()
             }),
         };
-        let err = merge_with_cli(config, &default_cli_overrides()).unwrap_err().to_string();
+        let err = merge_with_cli(config, &empty_cli()).unwrap_err().to_string();
         assert!(err.contains("tls_mode"), "error must name the offending field: {err}");
         assert!(err.contains("none"), "error must name the bad value: {err}");
     }
@@ -921,9 +1110,254 @@ tls_ca_cert = "/http/ca.pem"
                 ..Default::default()
             }),
         };
-        let resolved = merge_with_cli(config, &default_cli_overrides()).unwrap();
+        let resolved = merge_with_cli(config, &empty_cli()).unwrap();
         assert!(resolved.http_enabled);
         assert_eq!(resolved.http_tls_mode, HttpTlsMode::Mtls);
-        assert_eq!(resolved.http_listen_address, "127.0.0.1:9000");
+        assert_eq!(resolved.http_listen_address, DEFAULT_HTTP_LISTEN_ADDRESS);
+    }
+
+    // ── RF5-23: Option-CLI precedence (F31 bug fix) ──────────────────────────
+
+    /// An explicitly passed CLI value that equals the built-in default must
+    /// beat the config file (the F31 default-equals-unset bug).
+    #[test]
+    fn test_explicit_cli_value_equal_to_default_beats_config_file() {
+        let config = SignerConfig {
+            signer: Some(SignerSection {
+                keystore_dir: Some(PathBuf::from("/ks")),
+                listen_address: Some("0.0.0.0:9999".to_string()),
+                network: Some("holesky".to_string()),
+                reload_interval_secs: Some(99),
+                backend: Some("dvt".to_string()),
+                http: Some(HttpSection {
+                    listen_address: Some("0.0.0.0:1".to_string()),
+                    tls_mode: Some("server-tls-only".to_string()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        // Explicitly pass values that equal the built-in defaults.
+        let cli = ServeArgs {
+            listen_address: Some(DEFAULT_LISTEN_ADDRESS.to_string()),
+            network: Some(DEFAULT_NETWORK.to_string()),
+            reload_interval: Some(DEFAULT_RELOAD_INTERVAL_SECS),
+            backend: Some(Backend::Basic),
+            http_listen_address: Some(DEFAULT_HTTP_LISTEN_ADDRESS.to_string()),
+            http_tls_mode: Some(DEFAULT_HTTP_TLS_MODE.to_string()),
+            ..empty_cli()
+        };
+        let resolved = merge_with_cli(config, &cli).unwrap();
+        assert_eq!(
+            resolved.listen_address, DEFAULT_LISTEN_ADDRESS,
+            "explicit CLI default-equal value must beat file"
+        );
+        assert_eq!(
+            resolved.genesis_fork_version,
+            eth_types::NetworkPreset::MAINNET.genesis_fork_version,
+            "explicit --network mainnet must beat file holesky"
+        );
+        assert_eq!(resolved.reload_interval_secs, DEFAULT_RELOAD_INTERVAL_SECS);
+        assert_eq!(resolved.backend, "basic");
+        assert_eq!(resolved.http_listen_address, DEFAULT_HTTP_LISTEN_ADDRESS);
+        assert_eq!(resolved.http_tls_mode, HttpTlsMode::Mtls);
+    }
+
+    #[test]
+    fn test_unset_flag_falls_back_to_config_file() {
+        let config = SignerConfig {
+            signer: Some(SignerSection {
+                keystore_dir: Some(PathBuf::from("/ks")),
+                listen_address: Some("10.1.2.3:4444".to_string()),
+                reload_interval_secs: Some(7),
+                network: Some("sepolia".to_string()),
+                ..Default::default()
+            }),
+        };
+        let resolved = merge_with_cli(config, &empty_cli()).unwrap();
+        assert_eq!(resolved.listen_address, "10.1.2.3:4444");
+        assert_eq!(resolved.reload_interval_secs, 7);
+        assert_eq!(
+            resolved.genesis_fork_version,
+            eth_types::NetworkPreset::SEPOLIA.genesis_fork_version
+        );
+    }
+
+    #[test]
+    fn test_unset_flag_and_no_file_uses_builtin_default() {
+        let cli = cli_with_keystore("/ks");
+        let resolved = merge_with_cli(SignerConfig::default(), &cli).unwrap();
+        assert_eq!(resolved.listen_address, DEFAULT_LISTEN_ADDRESS);
+        assert_eq!(resolved.backend, "basic");
+        assert_eq!(resolved.reload_interval_secs, DEFAULT_RELOAD_INTERVAL_SECS);
+        assert_eq!(resolved.dvt_timeout_ms, DEFAULT_DVT_TIMEOUT_MS);
+        assert_eq!(resolved.http_listen_address, DEFAULT_HTTP_LISTEN_ADDRESS);
+        assert_eq!(resolved.http_tls_mode, HttpTlsMode::Mtls);
+        assert_eq!(resolved.metrics_address, DEFAULT_METRICS_ADDRESS);
+        assert_eq!(
+            resolved.genesis_fork_version,
+            eth_types::NetworkPreset::MAINNET.genesis_fork_version
+        );
+    }
+
+    #[test]
+    fn test_dvt_flags_resolve_under_both_feature_sets() {
+        // Non-dvt (and dvt) builds always resolve timeout from file/default when
+        // the CLI flag is absent. With the dvt feature, an explicit CLI value wins.
+        let config = SignerConfig {
+            signer: Some(SignerSection {
+                keystore_dir: Some(PathBuf::from("/ks")),
+                dvt: Some(DvtConfig {
+                    timeout_ms: Some(4242),
+                    peers: Some(vec!["file-peer:1".to_string()]),
+                    threshold: Some(2),
+                    index: Some(1),
+                }),
+                ..Default::default()
+            }),
+        };
+        let resolved_file = merge_with_cli(config, &empty_cli()).unwrap();
+        assert_eq!(resolved_file.dvt_timeout_ms, 4242);
+        assert_eq!(resolved_file.dvt_peers, vec!["file-peer:1"]);
+        assert_eq!(resolved_file.dvt_threshold, Some(2));
+        assert_eq!(resolved_file.dvt_index, Some(1));
+
+        #[cfg(feature = "dvt")]
+        {
+            let config = SignerConfig {
+                signer: Some(SignerSection {
+                    keystore_dir: Some(PathBuf::from("/ks")),
+                    dvt: Some(DvtConfig {
+                        timeout_ms: Some(4242),
+                        peers: Some(vec!["file-peer:1".to_string()]),
+                        threshold: Some(2),
+                        index: Some(1),
+                    }),
+                    ..Default::default()
+                }),
+            };
+            let cli = ServeArgs {
+                dvt_timeout: Some(DEFAULT_DVT_TIMEOUT_MS),
+                dvt_peers: vec!["cli-peer:9".to_string()],
+                dvt_threshold: Some(3),
+                dvt_index: Some(0),
+                ..empty_cli()
+            };
+            let resolved = merge_with_cli(config, &cli).unwrap();
+            assert_eq!(
+                resolved.dvt_timeout_ms, DEFAULT_DVT_TIMEOUT_MS,
+                "explicit CLI default-equal dvt timeout must beat file"
+            );
+            assert_eq!(resolved.dvt_peers, vec!["cli-peer:9"]);
+            assert_eq!(resolved.dvt_threshold, Some(3));
+            assert_eq!(resolved.dvt_index, Some(0));
+        }
+    }
+
+    /// Defaults are named constants in this module — a source-level pin so
+    /// they are not reintroduced as clap `default_value` magic elsewhere.
+    #[test]
+    fn test_defaults_defined_in_exactly_one_place() {
+        // Table-driven pin of the constants merge uses.
+        let table: &[(&str, &str)] = &[
+            ("listen", DEFAULT_LISTEN_ADDRESS),
+            ("http_listen", DEFAULT_HTTP_LISTEN_ADDRESS),
+            ("http_tls_mode", DEFAULT_HTTP_TLS_MODE),
+            ("metrics", DEFAULT_METRICS_ADDRESS),
+            ("network", DEFAULT_NETWORK),
+            ("log_format", DEFAULT_LOG_FORMAT),
+        ];
+        assert_eq!(table[0].1, "127.0.0.1:50052");
+        assert_eq!(table[1].1, "127.0.0.1:9000");
+        assert_eq!(table[2].1, "mtls");
+        assert_eq!(table[3].1, "127.0.0.1:9101");
+        assert_eq!(table[4].1, "mainnet");
+        assert_eq!(table[5].1, "pretty");
+        assert_eq!(DEFAULT_RELOAD_INTERVAL_SECS, 30);
+        assert_eq!(DEFAULT_DVT_TIMEOUT_MS, 2000);
+
+        // Empty CLI + empty file must resolve to those constants.
+        let resolved = merge_with_cli(SignerConfig::default(), &cli_with_keystore("/ks")).unwrap();
+        assert_eq!(resolved.listen_address, DEFAULT_LISTEN_ADDRESS);
+        assert_eq!(resolved.reload_interval_secs, DEFAULT_RELOAD_INTERVAL_SECS);
+        assert_eq!(resolved.dvt_timeout_ms, DEFAULT_DVT_TIMEOUT_MS);
+        assert_eq!(resolved.metrics_address, DEFAULT_METRICS_ADDRESS);
+        assert_eq!(resolved.http_listen_address, DEFAULT_HTTP_LISTEN_ADDRESS);
+        assert_eq!(resolved.http_tls_mode, HttpTlsMode::Mtls);
+        assert_eq!(resolved.backend, Backend::Basic.to_string());
+    }
+
+    /// Clap parse: omitting a defaulted flag leaves `None` / false, not the
+    /// filled default string.
+    #[test]
+    fn test_serve_args_parse_leaves_defaults_as_none() {
+        // `ServeArgs` is an `Args`/`Parser` struct (subcommand body); the first
+        // token is the binary name and is ignored by clap.
+        let args = ServeArgs::try_parse_from(["rvc-signer"]).expect("empty serve args parse");
+        assert!(args.listen_address.is_none());
+        assert!(args.backend.is_none());
+        assert!(args.reload_interval.is_none());
+        assert!(args.http_listen_address.is_none());
+        assert!(args.http_tls_mode.is_none());
+        assert!(args.network.is_none());
+        assert!(args.metrics_address.is_none());
+        assert!(args.log_format.is_none());
+        assert!(!args.dry_run);
+        assert!(!args.http_enabled);
+        assert!(!args.enable_hot_reload);
+    }
+
+    #[test]
+    fn test_serve_args_parse_explicit_default_equal_values() {
+        let args = ServeArgs::try_parse_from([
+            "serve",
+            "--listen-address",
+            DEFAULT_LISTEN_ADDRESS,
+            "--backend",
+            "basic",
+            "--reload-interval",
+            "30",
+            "--network",
+            "mainnet",
+            "--http-listen-address",
+            DEFAULT_HTTP_LISTEN_ADDRESS,
+            "--http-tls-mode",
+            DEFAULT_HTTP_TLS_MODE,
+            "--metrics-address",
+            DEFAULT_METRICS_ADDRESS,
+            "--log-format",
+            "pretty",
+        ])
+        .expect("explicit default-equal flags must parse");
+        assert_eq!(args.listen_address.as_deref(), Some(DEFAULT_LISTEN_ADDRESS));
+        assert_eq!(args.backend, Some(Backend::Basic));
+        assert_eq!(args.reload_interval, Some(30));
+        assert_eq!(args.network.as_deref(), Some("mainnet"));
+        assert_eq!(args.http_listen_address.as_deref(), Some(DEFAULT_HTTP_LISTEN_ADDRESS));
+        assert_eq!(args.http_tls_mode.as_deref(), Some(DEFAULT_HTTP_TLS_MODE));
+        assert_eq!(args.metrics_address.as_deref(), Some(DEFAULT_METRICS_ADDRESS));
+        assert_eq!(args.log_format.as_deref(), Some("pretty"));
+    }
+
+    #[test]
+    fn test_resolve_config_loads_file_and_merges() {
+        let f = write_toml(
+            r#"
+[signer]
+keystore_dir = "/from-file/ks"
+listen_address = "0.0.0.0:1"
+"#,
+        );
+        let args = ServeArgs {
+            config: Some(f.path().to_path_buf()),
+            listen_address: Some(DEFAULT_LISTEN_ADDRESS.to_string()),
+            ..empty_cli()
+        };
+        let resolved = resolve_config(&args).unwrap();
+        assert_eq!(resolved.keystore_dir, PathBuf::from("/from-file/ks"));
+        assert_eq!(
+            resolved.listen_address, DEFAULT_LISTEN_ADDRESS,
+            "explicit CLI default-equal must beat file via resolve_config"
+        );
     }
 }
