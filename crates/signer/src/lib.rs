@@ -28,12 +28,13 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tracing::{debug, error, warn};
 
-use crypto::{CompositeSigner, PublicKey, Signature, Signer, SigningError};
+use crypto::{
+    signing_root_for, signing_root_with_fork_version, CompositeSigner, DutyRef, PublicKey,
+    Signature, Signer, SigningCtx, SigningError,
+};
 use eth_types::{
     AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
-    ForkSchedule, Root, Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
-    DOMAIN_APPLICATION_BUILDER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_SYNC_COMMITTEE,
-    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SLOTS_PER_EPOCH,
+    ForkSchedule, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
 };
 use metrics::definitions::{
     slashing_result, tx_hold_kind, RVC_ATTESTATIONS_TOTAL, RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS,
@@ -306,30 +307,14 @@ impl SignerService {
         let source_epoch = attestation_data.source.epoch;
         let target_epoch = attestation_data.target.epoch;
 
-        let fork_name = eth_types::ForkName::from_epoch(target_epoch, fork_schedule);
-        let fork_version = fork_name.fork_version(fork_schedule);
-        let domain = crypto::compute_domain(
-            crypto::DOMAIN_BEACON_ATTESTER,
-            fork_version,
-            *genesis_validators_root,
-        );
-
-        debug!(
-            pubkey = %TruncatedPubkey::new(&pubkey_hex),
-            fork_version_used = %TruncatedRoot::new(&fork_version),
-            genesis_validators_root = %TruncatedRoot::new(genesis_validators_root),
-            domain = %TruncatedRoot::new(&domain),
-            fork_name = ?fork_name,
-            target_epoch = target_epoch,
-            "Computed attestation domain"
-        );
-
-        let signing_root = crypto::compute_signing_root(attestation_data, domain);
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(&DutyRef::Attestation(attestation_data), &ctx);
         let signing_root_hex = hex::encode(signing_root);
 
         debug!(
             pubkey = %TruncatedPubkey::new(&pubkey_hex),
             signing_root = %TruncatedRoot::new(&signing_root),
+            genesis_validators_root = %TruncatedRoot::new(genesis_validators_root),
             slot = attestation_data.slot,
             index = attestation_data.index,
             source_epoch = attestation_data.source.epoch,
@@ -545,15 +530,8 @@ impl SignerService {
             "Signing block"
         );
 
-        let epoch = slot / SLOTS_PER_EPOCH;
-        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
-        let fork_version = fork_name.fork_version(fork_schedule);
-        let domain = crypto::compute_domain(
-            eth_types::DOMAIN_BEACON_PROPOSER,
-            fork_version,
-            *genesis_validators_root,
-        );
-        let signing_root = crypto::compute_signing_root(block_root, domain);
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(&DutyRef::BlockRoot { root: block_root, slot }, &ctx);
         let signing_root_hex = hex::encode(signing_root);
 
         // Acquire per-validator lock (owned so it can move into spawn_blocking).
@@ -704,14 +682,8 @@ impl SignerService {
             "Signing RANDAO reveal"
         );
 
-        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
-        let fork_version = fork_name.fork_version(fork_schedule);
-        let domain = crypto::compute_domain(
-            eth_types::DOMAIN_RANDAO,
-            fork_version,
-            *genesis_validators_root,
-        );
-        let signing_root = crypto::compute_signing_root(&epoch, domain);
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(&DutyRef::Randao(epoch), &ctx);
 
         match self.signer.sign(&signing_root, &pubkey_bytes).await {
             Ok(sig) => {
@@ -758,12 +730,9 @@ impl SignerService {
             "Signing sync committee message"
         );
 
-        let epoch = slot / SLOTS_PER_EPOCH;
-        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
-        let fork_version = fork_name.fork_version(fork_schedule);
-        let domain =
-            crypto::compute_domain(DOMAIN_SYNC_COMMITTEE, fork_version, *genesis_validators_root);
-        let signing_root = crypto::compute_signing_root(beacon_block_root, domain);
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root =
+            signing_root_for(&DutyRef::SyncMessage { beacon_block_root, slot }, &ctx);
 
         match self.signer.sign(&signing_root, &pubkey_bytes).await {
             Ok(sig) => {
@@ -809,15 +778,8 @@ impl SignerService {
             "Signing selection proof"
         );
 
-        let epoch = slot / SLOTS_PER_EPOCH;
-        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
-        let fork_version = fork_name.fork_version(fork_schedule);
-        let domain = crypto::compute_domain(
-            eth_types::DOMAIN_SELECTION_PROOF,
-            fork_version,
-            *genesis_validators_root,
-        );
-        let signing_root = crypto::compute_signing_root(&slot, domain);
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(&DutyRef::SelectionProof(slot), &ctx);
 
         match self.signer.sign(&signing_root, &pubkey_bytes).await {
             Ok(sig) => {
@@ -864,15 +826,8 @@ impl SignerService {
             "Signing aggregate and proof"
         );
 
-        let epoch = slot / SLOTS_PER_EPOCH;
-        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
-        let fork_version = fork_name.fork_version(fork_schedule);
-        let domain = crypto::compute_domain(
-            eth_types::DOMAIN_AGGREGATE_AND_PROOF,
-            fork_version,
-            *genesis_validators_root,
-        );
-        let signing_root = crypto::compute_signing_root(aggregate_and_proof, domain);
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(&DutyRef::AggregateAndProof(aggregate_and_proof), &ctx);
 
         match self.signer.sign(&signing_root, &pubkey_bytes).await {
             Ok(sig) => {
@@ -919,15 +874,9 @@ impl SignerService {
             "Signing Electra aggregate and proof"
         );
 
-        let epoch = slot / SLOTS_PER_EPOCH;
-        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
-        let fork_version = fork_name.fork_version(fork_schedule);
-        let domain = crypto::compute_domain(
-            eth_types::DOMAIN_AGGREGATE_AND_PROOF,
-            fork_version,
-            *genesis_validators_root,
-        );
-        let signing_root = crypto::compute_signing_root(aggregate_and_proof, domain);
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root =
+            signing_root_for(&DutyRef::ElectraAggregateAndProof(aggregate_and_proof), &ctx);
 
         match self.signer.sign(&signing_root, &pubkey_bytes).await {
             Ok(sig) => {
@@ -984,20 +933,9 @@ impl SignerService {
             "Signing voluntary exit"
         );
 
-        let fork_name = eth_types::ForkName::from_epoch(voluntary_exit.epoch, fork_schedule);
-        // EIP-7044: cap fork version at Capella for voluntary exits
-        let capped = if fork_name >= eth_types::ForkName::Capella {
-            eth_types::ForkName::Capella
-        } else {
-            fork_name
-        };
-        let fork_version = capped.fork_version(fork_schedule);
-        let domain = crypto::compute_domain(
-            eth_types::DOMAIN_VOLUNTARY_EXIT,
-            fork_version,
-            *genesis_validators_root,
-        );
-        let signing_root = crypto::compute_signing_root(voluntary_exit, domain);
+        // EIP-7044 Capella cap is applied inside signing_root_for.
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(&DutyRef::VoluntaryExit(voluntary_exit), &ctx);
 
         // C2: signer errors are propagated directly — no stage to discard.
         match self.signer.sign(&signing_root, &pubkey_bytes).await {
@@ -1044,10 +982,14 @@ impl SignerService {
             "Signing builder registration"
         );
 
-        let zeroed_genesis_root = [0u8; 32];
-        let domain =
-            crypto::compute_domain(DOMAIN_APPLICATION_BUILDER, fork_version, zeroed_genesis_root);
-        let signing_root = crypto::compute_signing_root(registration, domain);
+        // Per-transport fork version preserved (RF4-10 unifies deliberately).
+        // Builder domain uses zero GVR per MEV-Boost / builder-specs.
+        let signing_root = signing_root_with_fork_version(
+            registration,
+            eth_types::DOMAIN_APPLICATION_BUILDER,
+            fork_version,
+            [0u8; 32],
+        );
 
         match self.signer.sign(&signing_root, &pubkey_bytes).await {
             Ok(sig) => {
@@ -1095,16 +1037,9 @@ impl SignerService {
             "Signing sync committee selection proof"
         );
 
-        let epoch = slot / SLOTS_PER_EPOCH;
-        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
-        let fork_version = fork_name.fork_version(fork_schedule);
-        let domain = crypto::compute_domain(
-            DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
-            fork_version,
-            *genesis_validators_root,
-        );
-        let selection_data = SyncAggregatorSelectionData { slot, subcommittee_index };
-        let signing_root = crypto::compute_signing_root(&selection_data, domain);
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root =
+            signing_root_for(&DutyRef::SyncSelection { slot, subcommittee_index }, &ctx);
 
         match self.signer.sign(&signing_root, &pubkey_bytes).await {
             Ok(sig) => {
@@ -1151,15 +1086,9 @@ impl SignerService {
             "Signing contribution and proof"
         );
 
-        let epoch = slot / SLOTS_PER_EPOCH;
-        let fork_name = eth_types::ForkName::from_epoch(epoch, fork_schedule);
-        let fork_version = fork_name.fork_version(fork_schedule);
-        let domain = crypto::compute_domain(
-            DOMAIN_CONTRIBUTION_AND_PROOF,
-            fork_version,
-            *genesis_validators_root,
-        );
-        let signing_root = crypto::compute_signing_root(contribution_and_proof, domain);
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root =
+            signing_root_for(&DutyRef::ContributionAndProof(contribution_and_proof), &ctx);
 
         match self.signer.sign(&signing_root, &pubkey_bytes).await {
             Ok(sig) => {
@@ -1703,10 +1632,13 @@ mod tests {
         assert_eq!(rejection.level, tracing::Level::ERROR, "a slashing rejection must be error");
     }
     use crypto::{
-        compute_domain, compute_signing_root, KeyManager, LocalSigner, SecretKey,
-        DOMAIN_BEACON_ATTESTER,
+        compute_domain, compute_signing_root, signing_root_for, DutyRef, KeyManager, LocalSigner,
+        SecretKey, SigningCtx, DOMAIN_BEACON_ATTESTER,
     };
-    use eth_types::Checkpoint;
+    use eth_types::{
+        Checkpoint, SyncAggregatorSelectionData, DOMAIN_CONTRIBUTION_AND_PROOF,
+        DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SLOTS_PER_EPOCH,
+    };
 
     fn create_test_composite_signer_with_key(secret_key: SecretKey) -> Arc<CompositeSigner> {
         let mut manager = KeyManager::new();
@@ -3330,6 +3262,85 @@ mod tests {
         assert!(
             attestations.is_empty(),
             "under-lock denial must not stage a row; found: {attestations:?}"
+        );
+    }
+
+    /// Characterization: every schedule-aware `SignerService` method derives its
+    /// root via `signing_root_for` — proven by verifying the signature against
+    /// the shared helper under a non-default fork schedule.
+    #[tokio::test]
+    async fn test_all_sign_methods_derive_roots_via_signing_root_for() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
+
+        // Compressed, non-default schedule so an accidental hardcoded fork fails.
+        let schedule = ForkSchedule {
+            genesis_fork_version: [0x10, 0, 0, 0],
+            altair_fork_epoch: 10,
+            altair_fork_version: [0x11, 0, 0, 0],
+            bellatrix_fork_epoch: 20,
+            bellatrix_fork_version: [0x12, 0, 0, 0],
+            capella_fork_epoch: 30,
+            capella_fork_version: [0x13, 0, 0, 0],
+            deneb_fork_epoch: 40,
+            deneb_fork_version: [0x14, 0, 0, 0],
+            electra_fork_epoch: 50,
+            electra_fork_version: [0x15, 0, 0, 0],
+            fulu_fork_epoch: 60,
+            fulu_fork_version: [0x16, 0, 0, 0],
+        };
+        let gvr: Root = [0xbb; 32];
+        let ctx = SigningCtx { fork_schedule: &schedule, genesis_validators_root: gvr };
+
+        // Attestation at Altair.
+        let att = create_test_attestation_data(9, 10);
+        let sig = service.sign_attestation(&att, &pubkey, &schedule, &gvr).await.unwrap();
+        let root = signing_root_for(&DutyRef::Attestation(&att), &ctx);
+        assert!(sig.verify(&pubkey, &root).is_ok(), "attestation root must match signing_root_for");
+
+        // Block at Capella.
+        let block_root: Root = [0x11; 32];
+        let slot = 30 * SLOTS_PER_EPOCH;
+        let sig = service.sign_block(&block_root, slot, &pubkey, &schedule, &gvr).await.unwrap();
+        let root = signing_root_for(&DutyRef::BlockRoot { root: &block_root, slot }, &ctx);
+        assert!(sig.verify(&pubkey, &root).is_ok(), "block root must match signing_root_for");
+
+        // RANDAO at Deneb.
+        let epoch = 45u64;
+        let sig = service.sign_randao_reveal(epoch, &pubkey, &schedule, &gvr).await.unwrap();
+        let root = signing_root_for(&DutyRef::Randao(epoch), &ctx);
+        assert!(sig.verify(&pubkey, &root).is_ok(), "randao root must match signing_root_for");
+
+        // Voluntary exit post-Capella (auto Capella-cap).
+        let exit = VoluntaryExit { epoch: 55, validator_index: 1 };
+        let sig = service.sign_voluntary_exit(&exit, &pubkey, &schedule, &gvr).await.unwrap();
+        let root = signing_root_for(&DutyRef::VoluntaryExit(&exit), &ctx);
+        assert!(
+            sig.verify(&pubkey, &root).is_ok(),
+            "voluntary exit root must match signing_root_for (Capella-capped)"
+        );
+
+        // Builder registration preserves caller-supplied fork version.
+        let reg = ValidatorRegistrationV1 {
+            fee_recipient: [0xab; 20],
+            gas_limit: 30_000_000,
+            timestamp: 1,
+            pubkey: pubkey.to_bytes(),
+        };
+        let builder_fv = [0x99, 0, 0, 0];
+        let sig = service.sign_builder_registration(&reg, &pubkey, builder_fv).await.unwrap();
+        let root = crypto::signing_root_with_fork_version(
+            &reg,
+            eth_types::DOMAIN_APPLICATION_BUILDER,
+            builder_fv,
+            [0u8; 32],
+        );
+        assert!(
+            sig.verify(&pubkey, &root).is_ok(),
+            "builder registration must preserve per-transport fork version"
         );
     }
 }

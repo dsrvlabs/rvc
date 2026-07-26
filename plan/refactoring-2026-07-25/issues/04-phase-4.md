@@ -299,11 +299,11 @@ the duplication actually disappears, so it is where `rg` proves it.
 3. Update test mocks to call the shared helper so a mock can no longer disagree with production.
 
 **Acceptance criteria:**
-- [ ] `rg 'compute_domain\(' crates/ bin/ --type rust` returns only `signing_root.rs` and its tests
+- [x] `rg 'compute_domain\(' crates/ bin/ --type rust` returns only `signing_root.rs` and its tests
       (plus any deliberate non-signing use, enumerated in the PR).
-- [ ] `rg 'capella_capped_fork_version'` returns zero production call sites.
-- [ ] All existing signer tests pass **unchanged** — no test may be edited to accommodate a new root.
-- [ ] Standing invariant green.
+- [x] `rg 'capella_capped_fork_version'` returns zero production call sites.
+- [x] All existing signer tests pass **unchanged** — no test may be edited to accommodate a new root.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_all_sign_methods_derive_roots_via_signing_root_for` — an assertion-by-construction

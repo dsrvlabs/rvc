@@ -16,7 +16,7 @@ use eth_types::{
 
 use crate::bls::{PublicKey, Signature};
 use crate::signer_trait::{LocalSigner, Signer, SigningError};
-use crate::signing::{compute_domain, compute_signing_root};
+use crate::signing_root::signing_root_with_fork_version;
 use eth_types::{ForkName, ForkSchedule, SyncAggregatorSelectionData};
 
 // ============================================================
@@ -153,21 +153,14 @@ pub trait TypedSigner: Send + Sync {
 
     /// Sign a voluntary exit (DOMAIN_VOLUNTARY_EXIT).
     ///
-    /// # EIP-7044 caller responsibility (residual until RF4-02)
+    /// # EIP-7044
     ///
-    /// This trait method does **not** apply the Capella cap: it uses
-    /// `ctx.fork_info.current_version` as-is. Callers **MUST** pass a
-    /// `SignContext` whose `fork_info.current_version` is Capella-capped when
-    /// the exit's `epoch` is at or after Capella, or the BN will reject the
-    /// signature after a post-Capella fork.
-    ///
-    /// Use [`crate::capella_capped_fork_version`] before building the context,
-    /// or prefer the auto-capped paths:
-    /// - [`crate::signing_root_for`] with [`crate::DutyRef::VoluntaryExit`]
-    /// - [`crate::sign_voluntary_exit`] (free helper)
-    ///
-    /// RF4-02 repoints this method through `signing_root_for` and removes this
-    /// obligation.
+    /// This trait method uses `ctx.fork_info.current_version` as-is (no
+    /// schedule). Callers that hold a [`ForkSchedule`] should prefer
+    /// [`crate::sign_voluntary_exit`] or [`crate::signing_root_for`] with
+    /// [`crate::DutyRef::VoluntaryExit`], which apply the Capella cap
+    /// automatically. When building a [`SignContext`] for this path, set
+    /// `current_version` via [`crate::capella_capped_fork_version`].
     async fn sign_voluntary_exit(
         &self,
         exit: &VoluntaryExit,
@@ -186,12 +179,12 @@ impl TypedSigner for LocalSigner {
         block: &BeaconBlock,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
-        let domain = compute_domain(
+        let signing_root = signing_root_with_fork_version(
+            block,
             DOMAIN_BEACON_PROPOSER,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
         );
-        let signing_root = compute_signing_root(block, domain);
         let pk = ctx.pubkey.to_bytes();
         Signer::sign(self, &signing_root, &pk).await
     }
@@ -201,12 +194,12 @@ impl TypedSigner for LocalSigner {
         block: &BlindedBeaconBlock,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
-        let domain = compute_domain(
+        let signing_root = signing_root_with_fork_version(
+            block,
             DOMAIN_BEACON_PROPOSER,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
         );
-        let signing_root = compute_signing_root(block, domain);
         let pk = ctx.pubkey.to_bytes();
         Signer::sign(self, &signing_root, &pk).await
     }
@@ -216,12 +209,12 @@ impl TypedSigner for LocalSigner {
         data: &AttestationData,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
-        let domain = compute_domain(
+        let signing_root = signing_root_with_fork_version(
+            data,
             DOMAIN_BEACON_ATTESTER,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
         );
-        let signing_root = compute_signing_root(data, domain);
         let pk = ctx.pubkey.to_bytes();
         Signer::sign(self, &signing_root, &pk).await
     }
@@ -231,12 +224,12 @@ impl TypedSigner for LocalSigner {
         agg: &AggregateAndProof,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
-        let domain = compute_domain(
+        let signing_root = signing_root_with_fork_version(
+            agg,
             DOMAIN_AGGREGATE_AND_PROOF,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
         );
-        let signing_root = compute_signing_root(agg, domain);
         let pk = ctx.pubkey.to_bytes();
         Signer::sign(self, &signing_root, &pk).await
     }
@@ -247,12 +240,12 @@ impl TypedSigner for LocalSigner {
         beacon_block_root: Root,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
-        let domain = compute_domain(
+        let signing_root = signing_root_with_fork_version(
+            &beacon_block_root,
             DOMAIN_SYNC_COMMITTEE,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
         );
-        let signing_root = compute_signing_root(&beacon_block_root, domain);
         let pk = ctx.pubkey.to_bytes();
         Signer::sign(self, &signing_root, &pk).await
     }
@@ -263,13 +256,13 @@ impl TypedSigner for LocalSigner {
         subcommittee_index: u64,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
-        let domain = compute_domain(
+        let selection_data = SyncAggregatorSelectionData { slot, subcommittee_index };
+        let signing_root = signing_root_with_fork_version(
+            &selection_data,
             DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
         );
-        let selection_data = SyncAggregatorSelectionData { slot, subcommittee_index };
-        let signing_root = compute_signing_root(&selection_data, domain);
         let pk = ctx.pubkey.to_bytes();
         Signer::sign(self, &signing_root, &pk).await
     }
@@ -279,12 +272,12 @@ impl TypedSigner for LocalSigner {
         c: &ContributionAndProof,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
-        let domain = compute_domain(
+        let signing_root = signing_root_with_fork_version(
+            c,
             DOMAIN_CONTRIBUTION_AND_PROOF,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
         );
-        let signing_root = compute_signing_root(c, domain);
         let pk = ctx.pubkey.to_bytes();
         Signer::sign(self, &signing_root, &pk).await
     }
@@ -296,9 +289,12 @@ impl TypedSigner for LocalSigner {
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
         // Per MEV-Boost spec: DOMAIN_APPLICATION_BUILDER + GENESIS_FORK_VERSION + zero gvr
-        let zero_gvr = [0u8; 32];
-        let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_gvr);
-        let signing_root = compute_signing_root(reg, domain);
+        let signing_root = signing_root_with_fork_version(
+            reg,
+            DOMAIN_APPLICATION_BUILDER,
+            genesis_fork_version,
+            [0u8; 32],
+        );
         let pk = ctx.pubkey.to_bytes();
         Signer::sign(self, &signing_root, &pk).await
     }
@@ -308,12 +304,12 @@ impl TypedSigner for LocalSigner {
         epoch: Epoch,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
-        let domain = compute_domain(
+        let signing_root = signing_root_with_fork_version(
+            &epoch,
             DOMAIN_RANDAO,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
         );
-        let signing_root = compute_signing_root(&epoch, domain);
         let pk = ctx.pubkey.to_bytes();
         Signer::sign(self, &signing_root, &pk).await
     }
@@ -323,15 +319,14 @@ impl TypedSigner for LocalSigner {
         exit: &VoluntaryExit,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
-        // EIP-7044: no Capella cap here — caller MUST supply a Capella-capped
-        // current_version (see trait docs). RF4-02 routes this through
-        // signing_root_for, which applies the cap automatically.
-        let domain = compute_domain(
+        // Pre-resolved fork version path: Capella cap is the caller's duty
+        // (or use free `sign_voluntary_exit` / `signing_root_for` with schedule).
+        let signing_root = signing_root_with_fork_version(
+            exit,
             DOMAIN_VOLUNTARY_EXIT,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
         );
-        let signing_root = compute_signing_root(exit, domain);
         let pk = ctx.pubkey.to_bytes();
         Signer::sign(self, &signing_root, &pk).await
     }
@@ -343,6 +338,7 @@ mod tests {
     use crate::bls::SecretKey;
     use crate::capella_capped_fork_version;
     use crate::key_manager::KeyManager;
+    use crate::signing::{compute_domain, compute_signing_root};
 
     fn make_local_signer(sk: SecretKey) -> LocalSigner {
         let mut km = KeyManager::new();

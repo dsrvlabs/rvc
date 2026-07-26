@@ -26,7 +26,7 @@ pub use web3signer_wire::{SignPayload as Web3SignerPayload, SignRequest as Web3S
 use web3signer_wire::{SignPayload, SignRequest};
 
 use super::super::signer_trait::SigningError;
-use super::super::signing::{compute_domain, compute_signing_root};
+use super::super::signing_root::signing_root_with_fork_version;
 use super::super::typed_signer::SignContext;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 12;
@@ -139,12 +139,12 @@ pub fn build_block_v2_request(
     ctx: &SignContext,
 ) -> Result<(SignRequest, Root), SigningError> {
     let header = header_from_beacon_block(block)?;
-    let domain = compute_domain(
+    let signing_root = signing_root_with_fork_version(
+        &header,
         DOMAIN_BEACON_PROPOSER,
         ctx.fork_info.current_version,
         ctx.fork_info.genesis_validators_root,
     );
-    let signing_root = compute_signing_root(&header, domain);
     let req = SignRequest::with_fork(
         WireForkInfo::from_sign_context(ctx),
         signing_root,
@@ -164,12 +164,12 @@ pub fn build_blinded_block_v2_request(
     ctx: &SignContext,
 ) -> Result<(SignRequest, Root), SigningError> {
     let header = header_from_blinded_block(block)?;
-    let domain = compute_domain(
+    let signing_root = signing_root_with_fork_version(
+        &header,
         DOMAIN_BEACON_PROPOSER,
         ctx.fork_info.current_version,
         ctx.fork_info.genesis_validators_root,
     );
-    let signing_root = compute_signing_root(&header, domain);
     let req = SignRequest::with_fork(
         WireForkInfo::from_sign_context(ctx),
         signing_root,
@@ -185,12 +185,12 @@ pub fn build_blinded_block_v2_request(
 
 /// Build an `ATTESTATION` request.
 pub fn build_attestation_request(data: &AttestationData, ctx: &SignContext) -> (SignRequest, Root) {
-    let domain = compute_domain(
+    let signing_root = signing_root_with_fork_version(
+        data,
         DOMAIN_BEACON_ATTESTER,
         ctx.fork_info.current_version,
         ctx.fork_info.genesis_validators_root,
     );
-    let signing_root = compute_signing_root(data, domain);
     let req = SignRequest::with_fork(
         WireForkInfo::from_sign_context(ctx),
         signing_root,
@@ -201,12 +201,12 @@ pub fn build_attestation_request(data: &AttestationData, ctx: &SignContext) -> (
 
 /// Build a `RANDAO_REVEAL` request.
 pub fn build_randao_reveal_request(epoch: Epoch, ctx: &SignContext) -> (SignRequest, Root) {
-    let domain = compute_domain(
+    let signing_root = signing_root_with_fork_version(
+        &epoch,
         DOMAIN_RANDAO,
         ctx.fork_info.current_version,
         ctx.fork_info.genesis_validators_root,
     );
-    let signing_root = compute_signing_root(&epoch, domain);
     let req = SignRequest::with_fork(
         WireForkInfo::from_sign_context(ctx),
         signing_root,
@@ -220,12 +220,12 @@ pub fn build_aggregate_and_proof_request(
     agg: &AggregateAndProof,
     ctx: &SignContext,
 ) -> (SignRequest, Root) {
-    let domain = compute_domain(
+    let signing_root = signing_root_with_fork_version(
+        agg,
         DOMAIN_AGGREGATE_AND_PROOF,
         ctx.fork_info.current_version,
         ctx.fork_info.genesis_validators_root,
     );
-    let signing_root = compute_signing_root(agg, domain);
     let req = SignRequest::with_fork(
         WireForkInfo::from_sign_context(ctx),
         signing_root,
@@ -240,13 +240,13 @@ pub fn build_sync_committee_message_request(
     beacon_block_root: Root,
     ctx: &SignContext,
 ) -> (SignRequest, Root) {
-    let domain = compute_domain(
+    // Server signs the block root itself (not the message container).
+    let signing_root = signing_root_with_fork_version(
+        &beacon_block_root,
         DOMAIN_SYNC_COMMITTEE,
         ctx.fork_info.current_version,
         ctx.fork_info.genesis_validators_root,
     );
-    // Server signs the block root itself (not the message container).
-    let signing_root = compute_signing_root(&beacon_block_root, domain);
     let msg = SyncCommitteeMessage {
         slot,
         beacon_block_root,
@@ -268,13 +268,13 @@ pub fn build_sync_selection_proof_request(
     subcommittee_index: u64,
     ctx: &SignContext,
 ) -> (SignRequest, Root) {
-    let domain = compute_domain(
+    let selection = eth_types::SyncAggregatorSelectionData { slot, subcommittee_index };
+    let signing_root = signing_root_with_fork_version(
+        &selection,
         DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
         ctx.fork_info.current_version,
         ctx.fork_info.genesis_validators_root,
     );
-    let selection = eth_types::SyncAggregatorSelectionData { slot, subcommittee_index };
-    let signing_root = compute_signing_root(&selection, domain);
     let req = SignRequest::with_fork(
         WireForkInfo::from_sign_context(ctx),
         signing_root,
@@ -290,12 +290,12 @@ pub fn build_contribution_and_proof_request(
     c: &ContributionAndProof,
     ctx: &SignContext,
 ) -> (SignRequest, Root) {
-    let domain = compute_domain(
+    let signing_root = signing_root_with_fork_version(
+        c,
         DOMAIN_CONTRIBUTION_AND_PROOF,
         ctx.fork_info.current_version,
         ctx.fork_info.genesis_validators_root,
     );
-    let signing_root = compute_signing_root(c, domain);
     let req = SignRequest::with_fork(
         WireForkInfo::from_sign_context(ctx),
         signing_root,
@@ -309,9 +309,12 @@ pub fn build_validator_registration_request(
     reg: &ValidatorRegistrationV1,
     genesis_fork_version: [u8; 4],
 ) -> (SignRequest, Root) {
-    let zero_gvr = [0u8; 32];
-    let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_gvr);
-    let signing_root = compute_signing_root(reg, domain);
+    let signing_root = signing_root_with_fork_version(
+        reg,
+        DOMAIN_APPLICATION_BUILDER,
+        genesis_fork_version,
+        [0u8; 32],
+    );
     let req = SignRequest::without_fork(
         signing_root,
         SignPayload::ValidatorRegistration { validator_registration: reg.clone() },
@@ -324,12 +327,12 @@ pub fn build_voluntary_exit_request(
     exit: &VoluntaryExit,
     ctx: &SignContext,
 ) -> (SignRequest, Root) {
-    let domain = compute_domain(
+    let signing_root = signing_root_with_fork_version(
+        exit,
         DOMAIN_VOLUNTARY_EXIT,
         ctx.fork_info.current_version,
         ctx.fork_info.genesis_validators_root,
     );
-    let signing_root = compute_signing_root(exit, domain);
     let req = SignRequest::with_fork(
         WireForkInfo::from_sign_context(ctx),
         signing_root,
@@ -340,12 +343,12 @@ pub fn build_voluntary_exit_request(
 
 /// Build an `AGGREGATION_SLOT` request (attestation selection proof).
 pub fn build_aggregation_slot_request(slot: Slot, ctx: &SignContext) -> (SignRequest, Root) {
-    let domain = compute_domain(
+    let signing_root = signing_root_with_fork_version(
+        &slot,
         eth_types::DOMAIN_SELECTION_PROOF,
         ctx.fork_info.current_version,
         ctx.fork_info.genesis_validators_root,
     );
-    let signing_root = compute_signing_root(&slot, domain);
     let req = SignRequest::with_fork(
         WireForkInfo::from_sign_context(ctx),
         signing_root,
@@ -634,5 +637,42 @@ mod tests {
         let sk = SecretKey::generate();
         let ctx = test_ctx(&sk);
         let (_req, _root) = build_aggregation_slot_request(1, &ctx);
+    }
+
+    /// Web3Signer request roots must match the shared derivation helper so a
+    /// mock or remote cannot disagree with LocalSigner / SignerService.
+    #[test]
+    fn test_web3signer_request_root_matches_shared_derivation() {
+        let sk = SecretKey::generate();
+        let ctx = test_ctx(&sk);
+        let data = sample_attestation();
+        let (_req, root) = build_attestation_request(&data, &ctx);
+        let expected = signing_root_with_fork_version(
+            &data,
+            DOMAIN_BEACON_ATTESTER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        assert_eq!(root, expected);
+
+        let epoch = 42u64;
+        let (_req, root) = build_randao_reveal_request(epoch, &ctx);
+        let expected = signing_root_with_fork_version(
+            &epoch,
+            DOMAIN_RANDAO,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        assert_eq!(root, expected);
+
+        let exit = VoluntaryExit { epoch: 7, validator_index: 1 };
+        let (_req, root) = build_voluntary_exit_request(&exit, &ctx);
+        let expected = signing_root_with_fork_version(
+            &exit,
+            DOMAIN_VOLUNTARY_EXIT,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        assert_eq!(root, expected);
     }
 }

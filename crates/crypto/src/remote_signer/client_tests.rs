@@ -1,4 +1,3 @@
-
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use eth_types::{AttestationData, Checkpoint, ForkInfo};

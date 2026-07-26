@@ -7,13 +7,16 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use crypto::typed_signer::SignContext;
+use crypto::{signing_root_with_fork_version, SigningError, TypedSigner};
 use crypto::{InsecureGate, InsecureMode};
 use crypto::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
-use crypto::{SigningError, TypedSigner};
 use eth_types::{
     encode_attestation_ssz, encode_beacon_block_ssz, encode_blinded_beacon_block_ssz,
     encode_sync_committee_contribution_ssz, AggregateAndProof, AttestationData, BeaconBlock,
-    BlindedBeaconBlock, ContributionAndProof, Epoch, Slot, ValidatorRegistrationV1, VoluntaryExit,
+    BlindedBeaconBlock, ContributionAndProof, Epoch, Slot, SyncAggregatorSelectionData,
+    ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
+    DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO,
+    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 use observability::logging::TruncatedPubkey;
 
@@ -301,16 +304,13 @@ impl TypedSigner for GrpcRemoteSigner {
             tracing::debug!(pubkey = %TruncatedPubkey::new(&pubkey_hex), latency_ms, "sign_block response received");
 
             let sig_bytes = response.into_inner().signature;
-            // Verify signature using the signing root we compute locally.
-            // This matches the server-side computation.
-            use crypto::{compute_domain, compute_signing_root};
-            use eth_types::DOMAIN_BEACON_PROPOSER;
-            let domain = compute_domain(
+            // Local verify uses the shared pre-resolved helper (same as LocalSigner).
+            let signing_root = signing_root_with_fork_version(
+                block,
                 DOMAIN_BEACON_PROPOSER,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let signing_root = compute_signing_root(block, domain);
             Self::extract_signature(sig_bytes, &ctx.pubkey, &signing_root, &pubkey_hex)
         }
         .instrument(span)
@@ -356,14 +356,12 @@ impl TypedSigner for GrpcRemoteSigner {
             tracing::debug!(pubkey = %TruncatedPubkey::new(&pubkey_hex), latency_ms, "sign_blinded_block response received");
 
             let sig_bytes = response.into_inner().signature;
-            use crypto::{compute_domain, compute_signing_root};
-            use eth_types::DOMAIN_BEACON_PROPOSER;
-            let domain = compute_domain(
+            let signing_root = signing_root_with_fork_version(
+                block,
                 DOMAIN_BEACON_PROPOSER,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let signing_root = compute_signing_root(block, domain);
             Self::extract_signature(sig_bytes, &ctx.pubkey, &signing_root, &pubkey_hex)
         }
         .instrument(span)
@@ -422,13 +420,12 @@ impl TypedSigner for GrpcRemoteSigner {
             tracing::debug!(pubkey = %TruncatedPubkey::new(&pubkey_hex), latency_ms, "sign_attestation response received");
 
             let sig_bytes = response.into_inner().signature;
-            use crypto::{compute_domain, compute_signing_root, DOMAIN_BEACON_ATTESTER};
-            let domain = compute_domain(
+            let signing_root = signing_root_with_fork_version(
+                data,
                 DOMAIN_BEACON_ATTESTER,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let signing_root = compute_signing_root(data, domain);
             Self::extract_signature(sig_bytes, &ctx.pubkey, &signing_root, &pubkey_hex)
         }
         .instrument(span)
@@ -476,14 +473,12 @@ impl TypedSigner for GrpcRemoteSigner {
             tracing::debug!(pubkey = %TruncatedPubkey::new(&pubkey_hex), latency_ms, "sign_aggregate_and_proof response received");
 
             let sig_bytes = response.into_inner().signature;
-            use crypto::{compute_domain, compute_signing_root};
-            use eth_types::DOMAIN_AGGREGATE_AND_PROOF;
-            let domain = compute_domain(
+            let signing_root = signing_root_with_fork_version(
+                agg,
                 DOMAIN_AGGREGATE_AND_PROOF,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let signing_root = compute_signing_root(agg, domain);
             Self::extract_signature(sig_bytes, &ctx.pubkey, &signing_root, &pubkey_hex)
         }
         .instrument(span)
@@ -530,14 +525,12 @@ impl TypedSigner for GrpcRemoteSigner {
             tracing::debug!(pubkey = %TruncatedPubkey::new(&pubkey_hex), latency_ms, "sign_sync_committee_message response received");
 
             let sig_bytes = response.into_inner().signature;
-            use crypto::{compute_domain, compute_signing_root};
-            use eth_types::DOMAIN_SYNC_COMMITTEE;
-            let domain = compute_domain(
+            let signing_root = signing_root_with_fork_version(
+                &beacon_block_root,
                 DOMAIN_SYNC_COMMITTEE,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let signing_root = compute_signing_root(&beacon_block_root, domain);
             Self::extract_signature(sig_bytes, &ctx.pubkey, &signing_root, &pubkey_hex)
         }
         .instrument(span)
@@ -585,15 +578,13 @@ impl TypedSigner for GrpcRemoteSigner {
             tracing::debug!(pubkey = %TruncatedPubkey::new(&pubkey_hex), latency_ms, "sign_sync_aggregator_selection response received");
 
             let sig_bytes = response.into_inner().signature;
-            use crypto::{compute_domain, compute_signing_root};
-            use eth_types::{DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, SyncAggregatorSelectionData};
-            let domain = compute_domain(
+            let selection_data = SyncAggregatorSelectionData { slot, subcommittee_index };
+            let signing_root = signing_root_with_fork_version(
+                &selection_data,
                 DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let selection_data = SyncAggregatorSelectionData { slot, subcommittee_index };
-            let signing_root = compute_signing_root(&selection_data, domain);
             Self::extract_signature(sig_bytes, &ctx.pubkey, &signing_root, &pubkey_hex)
         }
         .instrument(span)
@@ -641,14 +632,12 @@ impl TypedSigner for GrpcRemoteSigner {
             tracing::debug!(pubkey = %TruncatedPubkey::new(&pubkey_hex), latency_ms, "sign_contribution_and_proof response received");
 
             let sig_bytes = response.into_inner().signature;
-            use crypto::{compute_domain, compute_signing_root};
-            use eth_types::DOMAIN_CONTRIBUTION_AND_PROOF;
-            let domain = compute_domain(
+            let signing_root = signing_root_with_fork_version(
+                c,
                 DOMAIN_CONTRIBUTION_AND_PROOF,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let signing_root = compute_signing_root(c, domain);
             Self::extract_signature(sig_bytes, &ctx.pubkey, &signing_root, &pubkey_hex)
         }
         .instrument(span)
@@ -694,11 +683,12 @@ impl TypedSigner for GrpcRemoteSigner {
             tracing::debug!(pubkey = %TruncatedPubkey::new(&pubkey_hex), latency_ms, "sign_builder_registration response received");
 
             let sig_bytes = response.into_inner().signature;
-            use crypto::{compute_domain, compute_signing_root};
-            use eth_types::DOMAIN_APPLICATION_BUILDER;
-            let zero_gvr = [0u8; 32];
-            let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_gvr);
-            let signing_root = compute_signing_root(reg, domain);
+            let signing_root = signing_root_with_fork_version(
+                reg,
+                DOMAIN_APPLICATION_BUILDER,
+                genesis_fork_version,
+                [0u8; 32],
+            );
             Self::extract_signature(sig_bytes, &ctx.pubkey, &signing_root, &pubkey_hex)
         }
         .instrument(span)
@@ -743,14 +733,12 @@ impl TypedSigner for GrpcRemoteSigner {
             tracing::debug!(pubkey = %TruncatedPubkey::new(&pubkey_hex), latency_ms, "sign_randao_reveal response received");
 
             let sig_bytes = response.into_inner().signature;
-            use crypto::{compute_domain, compute_signing_root};
-            use eth_types::DOMAIN_RANDAO;
-            let domain = compute_domain(
+            let signing_root = signing_root_with_fork_version(
+                &epoch,
                 DOMAIN_RANDAO,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let signing_root = compute_signing_root(&epoch, domain);
             Self::extract_signature(sig_bytes, &ctx.pubkey, &signing_root, &pubkey_hex)
         }
         .instrument(span)
@@ -796,14 +784,14 @@ impl TypedSigner for GrpcRemoteSigner {
             tracing::debug!(pubkey = %TruncatedPubkey::new(&pubkey_hex), latency_ms, "sign_voluntary_exit response received");
 
             let sig_bytes = response.into_inner().signature;
-            use crypto::{compute_domain, compute_signing_root};
-            use eth_types::DOMAIN_VOLUNTARY_EXIT;
-            let domain = compute_domain(
+            // Capella: caller must supply Capella-capped current_version (same
+            // contract as LocalSigner / wire). Prefer schedule path when available.
+            let signing_root = signing_root_with_fork_version(
+                exit,
                 DOMAIN_VOLUNTARY_EXIT,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let signing_root = compute_signing_root(exit, domain);
             Self::extract_signature(sig_bytes, &ctx.pubkey, &signing_root, &pubkey_hex)
         }
         .instrument(span)
@@ -1000,5 +988,162 @@ mod tests {
         assert_eq!(GrpcRemoteSigner::fork_id(&ctx), ctx.fork_name.id());
         // Version bytes alone are non-mainnet; fork_id must still come from fork_name.
         assert_ne!(ctx.fork_info.current_version, [0x05, 0x00, 0x00, 0x00]);
+    }
+
+    /// gRPC local-verify roots must match `signing_root_with_fork_version` for
+    /// every duty shape (prevents a third independent derivation path).
+    #[test]
+    fn test_grpc_signer_fork_info_matches_shared_derivation() {
+        use eth_types::{Attestation, Checkpoint, SyncCommitteeContribution};
+
+        let gvr = [0xaa; 32];
+        let fork_info = ForkInfo {
+            previous_version: [0x03, 0, 0, 0],
+            current_version: [0x04, 0, 0, 0], // Deneb
+            genesis_validators_root: gvr,
+        };
+        let ctx = SignContext::new(dummy_pubkey(), fork_info, ForkName::Deneb);
+        let fv = ctx.fork_info.current_version;
+
+        let data = AttestationData {
+            slot: 100,
+            index: 0,
+            beacon_block_root: [0x11; 32],
+            source: Checkpoint { epoch: 2, root: [0x22; 32] },
+            target: Checkpoint { epoch: 3, root: [0x33; 32] },
+        };
+        assert_eq!(
+            signing_root_with_fork_version(&data, DOMAIN_BEACON_ATTESTER, fv, gvr),
+            signing_root_with_fork_version(
+                &data,
+                DOMAIN_BEACON_ATTESTER,
+                ctx.fork_info.current_version,
+                ctx.fork_info.genesis_validators_root,
+            )
+        );
+
+        let block = BeaconBlock {
+            slot: 100,
+            proposer_index: 1,
+            parent_root: [0x11; 32],
+            state_root: [0x22; 32],
+            body: eth_types::external_vector_electra_body().as_ssz_bytes(),
+        };
+        let block_root = signing_root_with_fork_version(&block, DOMAIN_BEACON_PROPOSER, fv, gvr);
+        assert_eq!(
+            block_root,
+            signing_root_with_fork_version(
+                &block,
+                DOMAIN_BEACON_PROPOSER,
+                ctx.fork_info.current_version,
+                ctx.fork_info.genesis_validators_root,
+            )
+        );
+
+        let epoch: Epoch = 42;
+        assert_eq!(
+            signing_root_with_fork_version(&epoch, DOMAIN_RANDAO, fv, gvr),
+            signing_root_with_fork_version(
+                &epoch,
+                DOMAIN_RANDAO,
+                ctx.fork_info.current_version,
+                ctx.fork_info.genesis_validators_root,
+            )
+        );
+
+        let beacon_block_root = [0x44; 32];
+        assert_eq!(
+            signing_root_with_fork_version(&beacon_block_root, DOMAIN_SYNC_COMMITTEE, fv, gvr),
+            signing_root_with_fork_version(
+                &beacon_block_root,
+                DOMAIN_SYNC_COMMITTEE,
+                ctx.fork_info.current_version,
+                ctx.fork_info.genesis_validators_root,
+            )
+        );
+
+        let sel = SyncAggregatorSelectionData { slot: 100, subcommittee_index: 2 };
+        assert_eq!(
+            signing_root_with_fork_version(&sel, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, fv, gvr),
+            signing_root_with_fork_version(
+                &sel,
+                DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+                ctx.fork_info.current_version,
+                ctx.fork_info.genesis_validators_root,
+            )
+        );
+
+        let agg = AggregateAndProof {
+            aggregator_index: 1,
+            aggregate: Attestation {
+                aggregation_bits: vec![0xff; 4],
+                data: data.clone(),
+                signature: vec![0xaa; 96],
+            },
+            selection_proof: vec![0xbb; 96],
+        };
+        assert_eq!(
+            signing_root_with_fork_version(&agg, DOMAIN_AGGREGATE_AND_PROOF, fv, gvr),
+            signing_root_with_fork_version(
+                &agg,
+                DOMAIN_AGGREGATE_AND_PROOF,
+                ctx.fork_info.current_version,
+                ctx.fork_info.genesis_validators_root,
+            )
+        );
+
+        let cap = ContributionAndProof {
+            aggregator_index: 1,
+            contribution: SyncCommitteeContribution {
+                slot: 100,
+                beacon_block_root: [0x11; 32],
+                subcommittee_index: 0,
+                aggregation_bits: vec![0xff; 16],
+                signature: vec![0xcc; 96],
+            },
+            selection_proof: vec![0xdd; 96],
+        };
+        assert_eq!(
+            signing_root_with_fork_version(&cap, DOMAIN_CONTRIBUTION_AND_PROOF, fv, gvr),
+            signing_root_with_fork_version(
+                &cap,
+                DOMAIN_CONTRIBUTION_AND_PROOF,
+                ctx.fork_info.current_version,
+                ctx.fork_info.genesis_validators_root,
+            )
+        );
+
+        // Voluntary exit: pre-resolved path uses current_version as-is (caller Capella duty).
+        let exit = VoluntaryExit { epoch: 200_000, validator_index: 1 };
+        let exit_root = signing_root_with_fork_version(&exit, DOMAIN_VOLUNTARY_EXIT, fv, gvr);
+        assert_eq!(
+            exit_root,
+            signing_root_with_fork_version(
+                &exit,
+                DOMAIN_VOLUNTARY_EXIT,
+                ctx.fork_info.current_version,
+                ctx.fork_info.genesis_validators_root,
+            )
+        );
+        // Capella-capped version produces a different root than raw Deneb (documents S1 residual).
+        let capella_fv = [0x03, 0, 0, 0];
+        let capped_root =
+            signing_root_with_fork_version(&exit, DOMAIN_VOLUNTARY_EXIT, capella_fv, gvr);
+        assert_ne!(
+            exit_root, capped_root,
+            "post-Capella exit with Deneb current_version must not match Capella-capped domain"
+        );
+
+        let reg = ValidatorRegistrationV1 {
+            fee_recipient: [0xab; 20],
+            gas_limit: 30_000_000,
+            timestamp: 1,
+            pubkey: [0xcd; 48],
+        };
+        let genesis_fv = [0; 4];
+        assert_eq!(
+            signing_root_with_fork_version(&reg, DOMAIN_APPLICATION_BUILDER, genesis_fv, [0u8; 32]),
+            signing_root_with_fork_version(&reg, DOMAIN_APPLICATION_BUILDER, genesis_fv, [0u8; 32]),
+        );
     }
 }

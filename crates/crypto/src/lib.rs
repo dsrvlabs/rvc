@@ -39,6 +39,9 @@ pub use remote_signer::{
 };
 pub use signer_trait::{LocalSigner, Signer, SigningError};
 pub use signing::{compute_domain, compute_fork_data_root, compute_signing_root};
-pub use signing_root::{capella_capped_fork_version, signing_root_for, DutyRef, SigningCtx};
+pub use signing_root::{
+    capella_capped_fork_version, signing_root_for, signing_root_with_fork_version, DutyRef,
+    SigningCtx,
+};
 pub use typed_signer::{SignContext, TypedSigner};
 pub use voluntary_exit_signing::sign_voluntary_exit;

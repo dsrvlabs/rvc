@@ -1,21 +1,24 @@
-//! Single signing-root derivation for all consensus duties (RF4-01 / D1).
+//! Single signing-root derivation for all consensus duties (D1).
 //!
-//! [`signing_root_for`] is the sole **definition site** in this crate for
-//! fork-aware domain selection and the EIP-7044 Capella cap
-//! ([`capella_capped_fork_version`]). The cap is applied **automatically** only
-//! for [`DutyRef::VoluntaryExit`]; residual callers that still build domains
-//! inline (TypedSigner, SignerService, …) keep their own obligation until
-//! RF4-02 repoints them.
+//! [`signing_root_for`] is the sole **schedule-aware** derivation path: it
+//! resolves the active fork, applies the EIP-7044 Capella cap for
+//! [`DutyRef::VoluntaryExit`], and returns the BLS signing root.
+//!
+//! Paths that already hold a resolved fork version (TypedSigner / Web3Signer
+//! wire `ForkInfo`) use [`signing_root_with_fork_version`] so `compute_domain`
+//! is not scattered across consumers. Prefer [`signing_root_for`] whenever a
+//! [`ForkSchedule`] is available.
 
 use eth_types::{
     AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
-    ElectraAggregateAndProof, Epoch, ForkName, ForkSchedule, Root, Slot,
+    DomainType, ElectraAggregateAndProof, Epoch, ForkName, ForkSchedule, Root, Slot,
     SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
     DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
     DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
     SLOTS_PER_EPOCH,
 };
+use tree_hash::TreeHash;
 
 use crate::signing::{compute_domain, compute_signing_root};
 
@@ -189,12 +192,37 @@ fn fork_version_at(epoch: Epoch, schedule: &ForkSchedule) -> [u8; 4] {
     ForkName::from_epoch(epoch, schedule).fork_version(schedule)
 }
 
+/// Signing root when the active fork version is already resolved.
+///
+/// Used by TypedSigner / Web3Signer wire builders / gRPC remote local-verify
+/// that receive `ForkInfo` from the BN rather than a full [`ForkSchedule`].
+/// Call sites must not invoke [`compute_domain`] / [`compute_signing_root`]
+/// directly for consensus duties.
+///
+/// # EIP-7044 Capella (voluntary exits)
+///
+/// This helper does **not** apply the Capella cap: `fork_version` is used
+/// verbatim. Callers **must** pass a Capella-capped version (via
+/// [`capella_capped_fork_version`]) when signing a post-Capella exit over the
+/// pre-resolved path, or prefer [`signing_root_for`] +
+/// [`DutyRef::VoluntaryExit`] / free [`crate::sign_voluntary_exit`] which apply
+/// the cap automatically when a schedule is available.
+pub fn signing_root_with_fork_version<T: TreeHash>(
+    ssz_object: &T,
+    domain_type: DomainType,
+    fork_version: [u8; 4],
+    genesis_validators_root: Root,
+) -> Root {
+    let domain = compute_domain(domain_type, fork_version, genesis_validators_root);
+    compute_signing_root(ssz_object, domain)
+}
+
 /// EIP-7044: Capella-capped fork version for voluntary-exit domains.
 ///
 /// Sole **definition** of the cap in `crates/crypto`. Applied automatically
-/// only via [`signing_root_for`] + [`DutyRef::VoluntaryExit`]. Residual
-/// TypedSigner / wire callers that still take an explicit fork version must
-/// call this helper (or cap themselves) until RF4-02 repoints them.
+/// only via [`signing_root_for`] + [`DutyRef::VoluntaryExit`]. Exposed for
+/// KATs and residual pre-resolved-version callers that still need the cap
+/// bytes (e.g. to populate wire `ForkInfo.current_version`).
 pub fn capella_capped_fork_version(epoch: Epoch, schedule: &ForkSchedule) -> [u8; 4] {
     let fork_name = ForkName::from_epoch(epoch, schedule);
     let capped = if fork_name >= ForkName::Capella { ForkName::Capella } else { fork_name };

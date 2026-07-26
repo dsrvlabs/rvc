@@ -421,7 +421,7 @@ mod tests {
     // --- gRPC remote signer tests ---
     // MockGrpcSigner implements TypedSigner (not Signer) to mirror GrpcRemoteSigner.
 
-    use crate::signing::{compute_domain, compute_signing_root};
+    use crate::signing_root::signing_root_with_fork_version;
     use crate::typed_signer::SignContext;
     use eth_types::{
         AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
@@ -463,12 +463,12 @@ mod tests {
             block: &BeaconBlock,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                block,
                 DOMAIN_BEACON_PROPOSER,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(block, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_blinded_block(
@@ -476,12 +476,12 @@ mod tests {
             block: &BlindedBeaconBlock,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                block,
                 DOMAIN_BEACON_PROPOSER,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(block, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_attestation(
@@ -489,12 +489,12 @@ mod tests {
             data: &AttestationData,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                data,
                 DOMAIN_BEACON_ATTESTER,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(data, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_aggregate_and_proof(
@@ -502,12 +502,12 @@ mod tests {
             agg: &AggregateAndProof,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                agg,
                 DOMAIN_AGGREGATE_AND_PROOF,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(agg, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_sync_committee_message(
@@ -516,12 +516,12 @@ mod tests {
             beacon_block_root: EthRoot,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                &beacon_block_root,
                 DOMAIN_SYNC_COMMITTEE,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(&beacon_block_root, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_sync_aggregator_selection(
@@ -530,13 +530,13 @@ mod tests {
             subcommittee_index: u64,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let sel = SyncAggregatorSelectionData { slot, subcommittee_index };
+            let root = signing_root_with_fork_version(
+                &sel,
                 DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let sel = SyncAggregatorSelectionData { slot, subcommittee_index };
-            let root = compute_signing_root(&sel, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_contribution_and_proof(
@@ -544,12 +544,12 @@ mod tests {
             c: &ContributionAndProof,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                c,
                 DOMAIN_CONTRIBUTION_AND_PROOF,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(c, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_builder_registration(
@@ -558,9 +558,12 @@ mod tests {
             genesis_fork_version: [u8; 4],
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let zero_gvr = [0u8; 32];
-            let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_gvr);
-            let root = compute_signing_root(reg, domain);
+            let root = signing_root_with_fork_version(
+                reg,
+                DOMAIN_APPLICATION_BUILDER,
+                genesis_fork_version,
+                [0u8; 32],
+            );
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_randao_reveal(
@@ -568,12 +571,12 @@ mod tests {
             epoch: Epoch,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                &epoch,
                 DOMAIN_RANDAO,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(&epoch, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
         async fn sign_voluntary_exit(
@@ -581,12 +584,12 @@ mod tests {
             exit: &VoluntaryExit,
             ctx: &SignContext,
         ) -> Result<Signature, SigningError> {
-            let domain = compute_domain(
+            let root = signing_root_with_fork_version(
+                exit,
                 DOMAIN_VOLUNTARY_EXIT,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );
-            let root = compute_signing_root(exit, domain);
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
     }
@@ -740,13 +743,13 @@ mod tests {
         let typed = composite.get_grpc_remote(&pk_bytes).expect("should have grpc remote");
         let sig = typed.sign_block(&block, &ctx).await.unwrap();
 
-        // Verify the signature
-        let domain = compute_domain(
+        // Verify the signature against the shared derivation helper.
+        let signing_root = signing_root_with_fork_version(
+            &block,
             DOMAIN_BEACON_PROPOSER,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
         );
-        let signing_root = compute_signing_root(&block, domain);
         assert!(sig.verify(&pk, &signing_root).is_ok());
     }
 
