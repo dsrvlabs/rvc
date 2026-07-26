@@ -13,9 +13,11 @@
 //! while unit tests can exercise phases without a metrics server.
 
 mod beacon;
+mod keys;
 mod slashing;
 
 pub use beacon::{connect_beacon, BeaconHandles};
+pub use keys::{load_signing_keys, LoadedKeys};
 pub use slashing::{open_slashing_db, KeystoreLockGuard, SlashingDbHandles};
 
 use std::sync::Arc;

@@ -1169,7 +1169,6 @@ async fn run_validator(
     let slashing_db = slashing_handles.db;
     let _keystore_lock_guard = slashing_handles.keystore_lock;
     let deletion_denylist = slashing_handles.denylist;
-    let denylist_snapshot = deletion_denylist.snapshot();
 
     // Steps 3–5: beacon client, BnManager, single GVR parse, genesis gate,
     // reachability, version log. Health updates stay in the binary.
@@ -1196,125 +1195,28 @@ async fn run_validator(
         genesis_time,
     } = beacon_handles;
 
-    // Load validator keys (keystore-dir), consulting the deletion denylist.
-    let key_manager = match builder.build_key_manager_filtered(Some(&denylist_snapshot)) {
-        Ok(km) => {
-            let validator_count = km.len();
-            update_health_validators(&health_status, validator_count).await;
-            info!(count = validator_count, "Loaded validator keys");
-            km
+    // Keystore-dir + secret providers + CompositeSigner + optional gRPC remote.
+    // Health updates stay in the binary (see `rvc::bootstrap` health-status policy).
+    let loaded_keys = match rvc::bootstrap::load_signing_keys(&config, &deletion_denylist).await {
+        Ok(keys) => {
+            update_health_validators(&health_status, keys.validator_count).await;
+            keys
         }
         Err(e) => {
-            warn!("Failed to load keys, continuing without validators: {}", e);
-            update_health_validators(&health_status, 0).await;
-            std::sync::Arc::new(crypto::KeyManager::new())
+            if matches!(e, rvc::bootstrap::BootstrapError::Config(_)) {
+                update_health_error(&health_status, format!("Key load error: {}", e)).await;
+            }
+            return Err(e.into());
         }
     };
-
-    // Initialize secret provider metrics eagerly so they appear in /metrics output
-    secret_provider::metrics::init_secret_provider_metrics();
-
-    // Load keys from cloud secret providers (if configured), consulting denylist.
-    let secret_providers: Vec<std::sync::Arc<dyn secret_provider::SecretProvider>> =
-        builder.build_secret_providers().await?.into_iter().map(std::sync::Arc::from).collect();
-    let key_manager = {
-        if secret_providers.is_empty() {
-            key_manager
-        } else {
-            let mut km = std::sync::Arc::try_unwrap(key_manager).map_err(|_| {
-                anyhow::anyhow!(
-                    "cannot take ownership of key_manager: outstanding Arc references exist"
-                )
-            })?;
-            let ksm = secret_provider::KeySourceManager::from_arc(secret_providers.clone())
-                .with_strict(config.secret_provider.strict);
-            let summary = ksm.load_all_except(&mut km, Some(&denylist_snapshot)).await?;
-            let mut total_loaded = 0usize;
-            let mut total_skipped = 0usize;
-            let mut total_errors = 0usize;
-            for ps in &summary.per_provider {
-                info!(
-                    provider = %ps.name,
-                    loaded = ps.loaded,
-                    skipped = ps.skipped,
-                    "Loaded keys from cloud provider"
-                );
-                total_loaded += ps.loaded;
-                total_skipped += ps.skipped;
-                total_errors += ps.errors.len();
-            }
-            info!(
-                loaded = total_loaded,
-                providers = summary.per_provider.len(),
-                skipped = total_skipped,
-                errors = total_errors,
-                "Loaded keys from cloud providers"
-            );
-            std::sync::Arc::new(km)
-        }
-    };
-
-    let pubkey_map = builder.build_pubkey_map(&key_manager);
-
-    // Create shared CompositeSigner from loaded keys
-    let key_manager_owned = std::sync::Arc::try_unwrap(key_manager).map_err(|_| {
-        anyhow::anyhow!("cannot take ownership of key_manager: outstanding Arc references exist")
-    })?;
-    let known_pubkeys: std::collections::HashSet<[u8; 48]> =
-        key_manager_owned.list_public_keys().iter().map(|pk| pk.to_bytes()).collect();
-    let local_signer = crypto::LocalSigner::new(key_manager_owned);
-    let composite_signer = std::sync::Arc::new(crypto::CompositeSigner::new(local_signer));
-
-    // Connect gRPC remote signer if configured (non-fatal: lazy connection)
-    let _grpc_remote_signer = if let Some(ref grpc_url) = config.grpc_signer_url {
-        info!(url = %redact_url(grpc_url), "Configuring gRPC remote signer");
-
-        let mut grpc_config = grpc_signer::GrpcRemoteSignerConfig::new(grpc_url.clone());
-
-        if let (Some(ref cert_path), Some(ref key_path), Some(ref ca_path)) = (
-            &config.grpc_signer_tls_cert,
-            &config.grpc_signer_tls_key,
-            &config.grpc_signer_tls_ca_cert,
-        ) {
-            let cert = std::fs::read(cert_path)
-                .map_err(|e| anyhow::anyhow!("failed to read gRPC signer TLS cert: {e}"))?;
-            let key = std::fs::read(key_path)
-                .map_err(|e| anyhow::anyhow!("failed to read gRPC signer TLS key: {e}"))?;
-            let ca_cert = std::fs::read(ca_path)
-                .map_err(|e| anyhow::anyhow!("failed to read gRPC signer TLS CA cert: {e}"))?;
-            grpc_config = grpc_config.with_tls(cert, key, ca_cert);
-        }
-
-        // Log the v2 gRPC contract version and validate the signer is running v2.
-        info!("signer contract: v2 (typed RPCs)");
-
-        match grpc_signer::GrpcRemoteSigner::connect(grpc_config).await {
-            Ok(signer) => {
-                let key_count = signer.public_keys().len();
-                info!(
-                    url = %redact_url(grpc_url),
-                    key_count,
-                    "gRPC remote signer connected (v2 typed RPCs)"
-                );
-
-                // Register all keys from the remote signer in the composite signer.
-                let pubkeys = signer.public_keys();
-                let signer = std::sync::Arc::new(signer);
-                composite_signer.add_grpc_remote_signer(pubkeys, signer.clone());
-                Some(signer)
-            }
-            Err(e) => {
-                warn!(
-                    url = %redact_url(grpc_url),
-                    error = %e,
-                    "Failed to connect to gRPC remote signer; will retry on demand"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let rvc::bootstrap::LoadedKeys {
+        composite_signer,
+        validator_count: _,
+        local_pubkeys: known_pubkeys,
+        pubkey_map,
+        secret_providers,
+        grpc_signer: _grpc_remote_signer,
+    } = loaded_keys;
 
     // Resolve validator indices using BnManager (via trait)
     let beacon_for_resolve: &dyn BeaconNodeClient = bn_manager.as_ref();

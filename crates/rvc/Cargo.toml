@@ -25,6 +25,7 @@ crypto.workspace = true
 observability.workspace = true
 duty-tracker.workspace = true
 fd-lock.workspace = true
+grpc-signer.workspace = true
 hex.workspace = true
 keymanager-api.workspace = true
 metrics.workspace = true
@@ -62,10 +63,12 @@ http-body-util.workspace = true
 # Used by pipeline_slashing.rs to poison a file-backed SlashingDb (DROP TABLE)
 # for the RF1-02 fail-closed DB-error integration test.
 rusqlite = { workspace = true, features = ["bundled"] }
+secrecy.workspace = true
 serde_json.workspace = true
 # test-utils: AlwaysEnabled for orchestrator unit/integration tests (SEC-2a).
 signer = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
+tokio-stream.workspace = true
 tower = { workspace = true, features = ["util"] }
 tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }
 tracing-test.workspace = true

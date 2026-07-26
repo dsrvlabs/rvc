@@ -273,10 +273,14 @@ impl ServiceBuilder {
     }
 
     /// Load keystore-dir keys, skipping any pubkey in `denylist` (SEC-1b).
-    pub fn build_key_manager_filtered(
+    ///
+    /// Returns an owned [`KeyManager`] so callers (notably bootstrap
+    /// `load_signing_keys`) can build a [`CompositeSigner`] without
+    /// `Arc::try_unwrap`.
+    pub fn build_key_manager_owned_filtered(
         &self,
         denylist: Option<&std::collections::HashSet<[u8; 48]>>,
-    ) -> Result<Arc<KeyManager>, ConfigError> {
+    ) -> Result<KeyManager, ConfigError> {
         let passwords = self.config.load_passwords()?;
 
         if !self.config.keystore_path.exists() {
@@ -294,7 +298,15 @@ impl ServiceBuilder {
             path = ?self.config.keystore_path,
             "Loaded validator keys"
         );
-        Ok(Arc::new(key_manager))
+        Ok(key_manager)
+    }
+
+    /// Load keystore-dir keys, skipping any pubkey in `denylist` (SEC-1b).
+    pub fn build_key_manager_filtered(
+        &self,
+        denylist: Option<&std::collections::HashSet<[u8; 48]>>,
+    ) -> Result<Arc<KeyManager>, ConfigError> {
+        Ok(Arc::new(self.build_key_manager_owned_filtered(denylist)?))
     }
 
     pub fn build_slashing_db(&self) -> Result<Arc<SlashingDb>, ConfigError> {

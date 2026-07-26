@@ -479,13 +479,13 @@ keep that behavior, do not reintroduce a panic).
    unchanged.
 
 **Acceptance criteria:**
-- [ ] `rg 'Arc::try_unwrap' bin/rvc/src/main.rs` returns nothing.
-- [ ] No `panic!`/`expect` added; failure modes return `BootstrapError` variants.
-- [ ] Denylisted keys are still skipped for both keystore-dir and secret-provider sources (SEC-1b
+- [x] `rg 'Arc::try_unwrap' bin/rvc/src/main.rs` returns nothing.
+- [x] No `panic!`/`expect` added; failure modes return `BootstrapError` variants.
+- [x] Denylisted keys are still skipped for both keystore-dir and secret-provider sources (SEC-1b
       regression test moved or duplicated at the phase level).
-- [ ] gRPC signer connect failure is still non-fatal and logs identically.
-- [ ] `/metrics` still exposes the secret-provider series before any provider call.
-- [ ] RF5-01 smoke tests green.
+- [x] gRPC signer connect failure is still non-fatal and logs identically.
+- [x] `/metrics` still exposes the secret-provider series before any provider call.
+- [x] RF5-01 smoke tests green.
 
 **TDD test plan** (RED first):
 - `test_load_signing_keys_skips_denylisted_pubkeys` — **RED**: no phase function exists; today this is
