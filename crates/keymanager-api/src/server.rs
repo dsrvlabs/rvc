@@ -13,6 +13,7 @@ use zeroize::Zeroizing;
 
 use crate::auth;
 use crate::handlers::{self, AppState};
+use crate::lifecycle::DoppelgangerLifecycle;
 use crate::traits::{
     DoppelgangerMonitor, KeystoreManager, RemoteKeyManager, SlashingProtection,
     ValidatorConfigManager, ValidatorManager, VoluntaryExitManager,
@@ -75,12 +76,18 @@ pub struct KeymanagerServer {
 
 impl KeymanagerServer {
     pub fn new(deps: KeymanagerDeps, settings: KeymanagerSettings) -> Self {
+        let validator_manager = deps.validator_manager;
+        let doppelganger = Arc::new(DoppelgangerLifecycle::new(
+            settings.doppelganger_window,
+            deps.doppelganger_monitor,
+            Arc::clone(&validator_manager),
+        ));
         Self {
             state: Arc::new(AppState {
                 keystore_manager: deps.keystore_manager,
                 slashing_protection: deps.slashing_protection,
-                validator_manager: deps.validator_manager,
-                doppelganger_monitor: deps.doppelganger_monitor,
+                validator_manager,
+                doppelganger,
                 remote_key_manager: deps.remote_key_manager,
                 config_manager: deps.config_manager,
                 exit_manager: deps.exit_manager,
@@ -88,9 +95,6 @@ impl KeymanagerServer {
                 attesting_enabled: settings.attesting_enabled,
                 last_set_attesting_enabled: std::sync::Mutex::new(None),
                 import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-                doppelganger_window: settings.doppelganger_window,
-                cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-                doppelganger_state_lock: std::sync::Mutex::new(()),
             }),
             token: Arc::new(Zeroizing::new(settings.token)),
             addr: settings.addr,

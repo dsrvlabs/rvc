@@ -7,15 +7,14 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use observability::logging::{RedactedUrl, TruncatedPubkey};
 use serde::{Deserialize, Serialize};
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::error::ApiError;
+use crate::lifecycle::{DoppelgangerLifecycle, ImportKind};
 use crate::traits::{
-    DoppelgangerMonitor, ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey,
-    RemoteKeyManager, SlashingProtection, ValidatorConfigManager, ValidatorManager,
-    VoluntaryExitManager,
+    ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager,
+    SlashingProtection, ValidatorConfigManager, ValidatorManager, VoluntaryExitManager,
 };
 use crate::types::{
     DeleteKeystoreResult, DeleteKeystoresRequest, DeleteKeystoresResponse, DeleteRemoteKeyResult,
@@ -33,7 +32,11 @@ pub struct AppState {
     pub keystore_manager: Arc<dyn KeystoreManager>,
     pub slashing_protection: Arc<dyn SlashingProtection>,
     pub validator_manager: Arc<dyn ValidatorManager>,
-    pub doppelganger_monitor: Arc<dyn DoppelgangerMonitor>,
+    /// KM-2 / SF-3 lifecycle: window, cancel tokens, state lock, monitor.
+    ///
+    /// See [`DoppelgangerLifecycle`] for the lock-ordering invariant. Handlers
+    /// must not open-code token displacement or enable-task spawning.
+    pub doppelganger: Arc<DoppelgangerLifecycle>,
     pub remote_key_manager: Arc<dyn RemoteKeyManager>,
     pub config_manager: Arc<dyn ValidatorConfigManager>,
     pub exit_manager: Option<Arc<dyn VoluntaryExitManager>>,
@@ -50,49 +53,6 @@ pub struct AppState {
     /// from CPU-grinding the host on the keystore decrypt path.
     pub import_keystores_rate:
         Mutex<HashMap<[u8; 32], std::collections::VecDeque<tokio::time::Instant>>>,
-    /// Duration of the per-key doppelganger window applied to newly imported
-    /// keys.  Must match the window configured in the [`DoppelgangerMonitor`]
-    /// implementation.  `Duration::ZERO` disables the gate (keys are enabled
-    /// immediately, equivalent to turning off doppelganger detection).
-    pub doppelganger_window: std::time::Duration,
-    /// Per-key cancellation handles for doppelganger background tasks (SF-3).
-    ///
-    /// When a key is deleted before its window elapses, the associated
-    /// `CancellationToken` is cancelled so the stale background task does not
-    /// prematurely flip `enabled = true` on a re-imported key that has begun
-    /// a fresh doppelganger window.
-    pub cancel_tokens: Mutex<HashMap<Pubkey, CancellationToken>>,
-    /// KM-2 (ISSUE-2.12): serialises the doppelganger enable/disable state
-    /// transitions of `import_keystores` and `delete_keystores`.
-    ///
-    /// A concurrent delete + re-import could otherwise interleave such that a
-    /// re-import's cancel-token `insert` lands between the delete's keystore
-    /// removal and its cancel-token removal, leaving a stale background task
-    /// alive that later flips `enabled = true` on a key inside a fresh
-    /// doppelganger window (a slashing-safety hole).
-    ///
-    /// # Lock-ordering invariant
-    ///
-    /// This is the OUTERMOST doppelganger-state lock.  All three paths MUST
-    /// follow the invariant: acquire `doppelganger_state_lock` first, then (if
-    /// needed) `cancel_tokens` — never the reverse — to avoid deadlock.
-    ///   - `cancel_tokens` is ALWAYS taken while holding this lock on any path
-    ///     that mutates doppelganger state.
-    ///   - This lock is NEVER held across an `.await`; every guarded section is
-    ///     synchronous (the spawned task acquires it AFTER its `sleep_until`
-    ///     future resolves, so no std-Mutex spans an await point).
-    ///
-    /// The three protected paths are:
-    ///   - **import**: holds it across `add_validator` + `start_monitoring` +
-    ///     cancel-token insert (PRD §KM-2 (a)+(b)).
-    ///   - **delete**: holds it across `delete_keystore` + unconditional
-    ///     cancel-token remove/cancel (PRD §KM-2 (b)+(Finding 3)).
-    ///   - **spawned enable task** (timer branch): acquires it after
-    ///     `sleep_until` resolves, re-checks `is_cancelled()` under the lock
-    ///     before enabling, then holds it across `set_validator_enabled` +
-    ///     `stop_monitoring` + cancel-token self-prune (PRD §KM-2
-    ///     (c)+(Finding 1+2)).
-    pub doppelganger_state_lock: Mutex<()>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,7 +78,7 @@ pub async fn list_keystores(State(state): State<Arc<AppState>>) -> Json<ListKeys
         .into_iter()
         .map(|pk| {
             // M-12: expose whether this key has passed the doppelganger window.
-            let doppelganger_safe = state.doppelganger_monitor.is_doppelganger_safe(&pk);
+            let doppelganger_safe = state.doppelganger.is_doppelganger_safe(&pk);
             KeystoreInfo {
                 validating_pubkey: format!("0x{}", hex::encode(pk)),
                 derivation_path: None,
@@ -179,118 +139,11 @@ pub async fn import_keystores(
                     status = "imported",
                     "Keystore import result"
                 );
-                // M-12: add the validator as disabled and start doppelganger
-                // monitoring. A background task flips it to attesting-enabled
-                // once the window elapses.
-                //
-                // BEHAVIOR CHANGE (GA release): imported keys are no longer
-                // immediately active. They are held in the doppelganger window
-                // (default 2 epochs ≈ 768 s on mainnet) before attestation is
-                // enabled. Operators who relied on instant activation must
-                // account for this delay.
-                //
-                // KM-2 (ISSUE-2.12): the validator/monitor/cancel-token state
-                // transition runs under `doppelganger_state_lock` so a
-                // concurrent `delete_keystores` cannot interleave between this
-                // insert and its own removal+cancel. The guard is synchronous
-                // and dropped before `spawn` returns control to the loop (it is
-                // never held across an `.await`).
-                let cancel_token = CancellationToken::new();
-                {
-                    let _guard = state
-                        .doppelganger_state_lock
-                        .lock()
-                        .expect("doppelganger_state_lock poisoned");
-
-                    state.validator_manager.add_validator(pubkey, false);
-                    state.doppelganger_monitor.start_monitoring(pubkey);
-
-                    // SF-3 / KM-2 (a): register the cancellation token. If a
-                    // token was already present for this pubkey (e.g. a stale
-                    // task from a prior import that a racing delete had not yet
-                    // cancelled), cancel the DISPLACED token so it can never
-                    // enable a key that is now inside a fresh window. No token
-                    // is ever dropped from the map without being cancelled.
-                    //
-                    // The `.cancel()` runs WHILE the `cancel_tokens` guard is
-                    // held so that "insert new + cancel old" is atomic against a
-                    // concurrent task's self-prune (KM-2 (c)): a displaced task
-                    // observes its token cancelled before it can prune the fresh
-                    // entry.
-                    {
-                        let mut tokens =
-                            state.cancel_tokens.lock().expect("cancel_tokens poisoned");
-                        if let Some(displaced) = tokens.insert(pubkey, cancel_token.clone()) {
-                            displaced.cancel();
-                        }
-                    }
-
-                    let vm = Arc::clone(&state.validator_manager);
-                    let dm = Arc::clone(&state.doppelganger_monitor);
-                    let st = Arc::clone(&state);
-                    let token = cancel_token.clone();
-                    let window = state.doppelganger_window;
-                    let pk_hex = pubkey_hex.clone();
-                    // Capture the deadline NOW (before spawn) so that
-                    // `sleep_until(deadline)` resolves correctly even when the
-                    // tokio mock clock is paused in tests: the deadline is a
-                    // fixed instant, not a relative duration computed at
-                    // first-poll time.
-                    let deadline = tokio::time::Instant::now() + window;
-                    tokio::spawn(async move {
-                        tokio::select! {
-                            _ = tokio::time::sleep_until(deadline) => {
-                                // KM-2 (Finding 1+2): the sleep branch and a
-                                // concurrent cancel() can both be ready in the
-                                // same scheduler tick; `select!` does not
-                                // prioritize cancelled().  Re-check cancellation
-                                // under `doppelganger_state_lock` (the same lock
-                                // held by import's insert and delete's cancel) so
-                                // the enable is serialised against a concurrent
-                                // displacement.  The `sleep_until` future has
-                                // already resolved, so no std-Mutex is held across
-                                // any `.await`.
-                                let _g = st
-                                    .doppelganger_state_lock
-                                    .lock()
-                                    .expect("doppelganger_state_lock poisoned");
-                                // Displaced: a delete or re-import cancelled our
-                                // token under the same lock — never enable.
-                                if token.is_cancelled() {
-                                    return;
-                                }
-                                vm.set_validator_enabled(&pubkey, true);
-                                // SF-4 / SEC-2b: prune wall-clock pending only.
-                                // Must NOT cancel ForwardWindowMachine state —
-                                // M-12 elapsed ≠ forward-window satisfied.
-                                dm.stop_monitoring(&pubkey);
-                                // KM-2 (c): prune our OWN cancel-token entry now
-                                // that the window has elapsed.  We hold
-                                // `doppelganger_state_lock` here, consistent with
-                                // the lock-ordering invariant (outer lock, then
-                                // cancel_tokens).
-                                st.cancel_tokens
-                                    .lock()
-                                    .expect("cancel_tokens poisoned")
-                                    .remove(&pubkey);
-                                info!(
-                                    pubkey = %TruncatedPubkey::new(&pk_hex),
-                                    "Doppelganger window elapsed; enabling validator for attestation"
-                                );
-                            }
-                            _ = token.cancelled() => {
-                                // Key was deleted (or re-imported) before the window elapsed.
-                                // Do not enable: a fresh window is already running or the
-                                // key has been removed entirely. The displacer/deleter owns
-                                // the map slot, so we do not touch cancel_tokens here.
-                                info!(
-                                    pubkey = %TruncatedPubkey::new(&pk_hex),
-                                    "Doppelganger background task cancelled (key deleted or re-imported)"
-                                );
-                            }
-                        }
-                    });
-                }
+                // M-12 + KM-2: register disabled validator, start monitoring,
+                // displace any prior enable task, and spawn the window task.
+                // Owned by [`DoppelgangerLifecycle`] so local and remote imports
+                // share one path (ImportKind::Local).
+                state.doppelganger.on_import(pubkey, ImportKind::Local);
 
                 results.push(ImportKeystoreResult {
                     status: ImportStatus::Imported,
@@ -374,29 +227,16 @@ pub async fn delete_keystores(
         let pubkey_hex = &request.pubkeys[i];
         match parse_result {
             Ok(pubkey) => {
-                // KM-2 (ISSUE-2.12) (b): hold `doppelganger_state_lock` across
-                // BOTH the keystore removal AND the cancel-token removal/cancel,
-                // so a concurrent `import_keystores` cannot interleave its
-                // cancel-token insert between them and leave a stale background
-                // task alive. The guard is synchronous and released at the end
-                // of this iteration (never held across an `.await`).
-                let _guard =
-                    state.doppelganger_state_lock.lock().expect("doppelganger_state_lock poisoned");
-                let delete_result = state.keystore_manager.delete_keystore(pubkey);
-
-                // KM-2 Finding 3: cancel any live token unconditionally,
-                // regardless of the keystore-delete outcome (Ok(true/false) or
-                // Err).  A delete that returns NotFound or Err could still have a
-                // live background task from a prior import, and leaving it alive
-                // would allow it to enable the key after a concurrent re-import.
-                // This runs under `doppelganger_state_lock` so no concurrent
-                // import can insert a fresh token between the delete attempt and
-                // this cancel.
-                if let Some(token) =
-                    state.cancel_tokens.lock().expect("cancel_tokens poisoned").remove(pubkey)
-                {
-                    token.cancel();
-                }
+                // KM-2 (b)+(Finding 3): keystore removal + token cancel (+
+                // remove_validator / cancel_monitoring on success) are one
+                // critical section inside DoppelgangerLifecycle::on_delete.
+                let delete_result = state.doppelganger.on_delete(pubkey, ImportKind::Local, || {
+                    match state.keystore_manager.delete_keystore(pubkey) {
+                        Ok(true) => (true, Ok(true)),
+                        Ok(false) => (false, Ok(false)),
+                        Err(e) => (false, Err(e)),
+                    }
+                });
 
                 match delete_result {
                     Ok(true) => {
@@ -405,10 +245,6 @@ pub async fn delete_keystores(
                             status = "deleted",
                             "Keystore delete result"
                         );
-                        state.validator_manager.remove_validator(pubkey);
-                        // DELETE: hard-cancel forward-window / gate state so a
-                        // re-import starts a fresh monitoring window (KM-2).
-                        state.doppelganger_monitor.cancel_monitoring(pubkey);
                         results.push(DeleteKeystoreResult {
                             status: DeleteStatus::Deleted,
                             message: String::new(),
@@ -512,9 +348,10 @@ pub async fn import_remote_keys(
                 }
                 match state.remote_key_manager.import_remote_key(pubkey, key_import.url.clone()) {
                     Ok(()) => {
-                        // SEC-2b: register remote keys with the same enablement
-                        // gate as local imports (fail-closed until window).
-                        state.doppelganger_monitor.start_monitoring(pubkey);
+                        // SEC-2b: same enablement gate as local imports via
+                        // DoppelgangerLifecycle (ImportKind::Remote skips VM
+                        // registration; still starts monitoring + enable task).
+                        state.doppelganger.on_import(pubkey, ImportKind::Remote);
                         info!(
                             pubkey = %TruncatedPubkey::new(&key_import.pubkey),
                             url = %RedactedUrl(&key_import.url),
@@ -579,41 +416,50 @@ pub async fn delete_remote_keys(
 
     for pubkey_str in &request.pubkeys {
         match parse_pubkey(pubkey_str) {
-            Ok(pubkey) => match state.remote_key_manager.delete_remote_key(&pubkey) {
-                Ok(true) => {
-                    state.doppelganger_monitor.cancel_monitoring(&pubkey);
-                    warn!(
-                        pubkey = %TruncatedPubkey::new(pubkey_str),
-                        status = "deleted",
-                        "Remote key delete result"
-                    );
-                    results.push(DeleteRemoteKeyResult {
-                        status: DeleteRemoteKeyStatus::Deleted,
-                        message: String::new(),
+            Ok(pubkey) => {
+                let delete_result =
+                    state.doppelganger.on_delete(&pubkey, ImportKind::Remote, || {
+                        match state.remote_key_manager.delete_remote_key(&pubkey) {
+                            Ok(true) => (true, Ok(true)),
+                            Ok(false) => (false, Ok(false)),
+                            Err(e) => (false, Err(e)),
+                        }
                     });
+                match delete_result {
+                    Ok(true) => {
+                        warn!(
+                            pubkey = %TruncatedPubkey::new(pubkey_str),
+                            status = "deleted",
+                            "Remote key delete result"
+                        );
+                        results.push(DeleteRemoteKeyResult {
+                            status: DeleteRemoteKeyStatus::Deleted,
+                            message: String::new(),
+                        });
+                    }
+                    Ok(false) => {
+                        warn!(
+                            pubkey = %TruncatedPubkey::new(pubkey_str),
+                            status = "not_found",
+                            "Remote key delete result"
+                        );
+                        results.push(DeleteRemoteKeyResult {
+                            status: DeleteRemoteKeyStatus::NotFound,
+                            message: String::new(),
+                        });
+                    }
+                    Err(e) => {
+                        // M-8: DeleteRemoteKeyError::Other is `#[error("{0}")]`
+                        // — passes through whatever the backend put in the inner
+                        // String (DB sockets, internal service names). Sanitize.
+                        let message = sanitize_item_err(&e, "remote key delete failed");
+                        results.push(DeleteRemoteKeyResult {
+                            status: DeleteRemoteKeyStatus::Error,
+                            message,
+                        });
+                    }
                 }
-                Ok(false) => {
-                    warn!(
-                        pubkey = %TruncatedPubkey::new(pubkey_str),
-                        status = "not_found",
-                        "Remote key delete result"
-                    );
-                    results.push(DeleteRemoteKeyResult {
-                        status: DeleteRemoteKeyStatus::NotFound,
-                        message: String::new(),
-                    });
-                }
-                Err(e) => {
-                    // M-8: DeleteRemoteKeyError::Other is `#[error("{0}")]`
-                    // — passes through whatever the backend put in the inner
-                    // String (DB sockets, internal service names). Sanitize.
-                    let message = sanitize_item_err(&e, "remote key delete failed");
-                    results.push(DeleteRemoteKeyResult {
-                        status: DeleteRemoteKeyStatus::Error,
-                        message,
-                    });
-                }
-            },
+            }
             Err(e) => {
                 warn!(
                     pubkey = %TruncatedPubkey::new(pubkey_str),
@@ -977,7 +823,8 @@ mod tests {
     use super::*;
     use crate::auth;
     use crate::traits::{
-        DeleteKeystoreError, DeleteRemoteKeyError, ImportRemoteKeyError, RemoteKeyManager,
+        DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ImportRemoteKeyError,
+        RemoteKeyManager,
     };
     use crate::types::{
         DeleteRemoteKeyStatus, DeleteRemoteKeysResponse, ImportRemoteKeyStatus,
@@ -1400,7 +1247,11 @@ mod tests {
                 keystore_manager: self.keystore_manager.clone(),
                 slashing_protection: self.slashing_protection.clone(),
                 validator_manager: self.validator_manager.clone(),
-                doppelganger_monitor: self.doppelganger_monitor.clone(),
+                doppelganger: Arc::new(crate::DoppelgangerLifecycle::new(
+                    std::time::Duration::ZERO,
+                    self.doppelganger_monitor.clone(),
+                    self.validator_manager.clone(),
+                )),
                 remote_key_manager: self.remote_key_manager.clone(),
                 config_manager: self.config_manager.clone(),
                 exit_manager: None,
@@ -1408,9 +1259,6 @@ mod tests {
                 attesting_enabled: Arc::new(AtomicBool::new(true)),
                 last_set_attesting_enabled: std::sync::Mutex::new(None),
                 import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-                doppelganger_window: std::time::Duration::ZERO,
-                cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-                doppelganger_state_lock: std::sync::Mutex::new(()),
             });
             Router::new()
                 .route(
@@ -1723,11 +1571,16 @@ mod tests {
     // which would defeat any rate-limit assertion.
 
     fn make_shared_state() -> Arc<AppState> {
+        let validator_manager: Arc<dyn ValidatorManager> = Arc::new(MockValidatorManager::new());
         Arc::new(AppState {
             keystore_manager: Arc::new(MockKeystoreManager::new()),
             slashing_protection: Arc::new(MockSlashingProtection::new()),
-            validator_manager: Arc::new(MockValidatorManager::new()),
-            doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+            validator_manager: Arc::clone(&validator_manager),
+            doppelganger: Arc::new(crate::DoppelgangerLifecycle::new(
+                std::time::Duration::ZERO,
+                Arc::new(MockDoppelgangerMonitor::new()),
+                Arc::clone(&validator_manager),
+            )),
             remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
             config_manager: Arc::new(MockValidatorConfigManager::new()),
             exit_manager: None,
@@ -1735,9 +1588,6 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_window: std::time::Duration::ZERO,
-            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_state_lock: std::sync::Mutex::new(()),
         })
     }
 
@@ -2860,7 +2710,11 @@ mod tests {
             keystore_manager: app.keystore_manager.clone(),
             slashing_protection: app.slashing_protection.clone(),
             validator_manager: app.validator_manager.clone(),
-            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            doppelganger: Arc::new(crate::DoppelgangerLifecycle::new(
+                std::time::Duration::ZERO,
+                app.doppelganger_monitor.clone(),
+                app.validator_manager.clone(),
+            )),
             remote_key_manager: app.remote_key_manager.clone(),
             config_manager: app.config_manager.clone(),
             exit_manager: None,
@@ -2868,9 +2722,6 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_window: std::time::Duration::ZERO,
-            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_state_lock: std::sync::Mutex::new(()),
         });
 
         let router = Router::new()
@@ -2911,7 +2762,11 @@ mod tests {
             keystore_manager: app.keystore_manager.clone(),
             slashing_protection: app.slashing_protection.clone(),
             validator_manager: app.validator_manager.clone(),
-            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            doppelganger: Arc::new(crate::DoppelgangerLifecycle::new(
+                std::time::Duration::ZERO,
+                app.doppelganger_monitor.clone(),
+                app.validator_manager.clone(),
+            )),
             remote_key_manager: app.remote_key_manager.clone(),
             config_manager: app.config_manager.clone(),
             exit_manager: None,
@@ -2919,9 +2774,6 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_window: std::time::Duration::ZERO,
-            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_state_lock: std::sync::Mutex::new(()),
         });
 
         let router = Router::new()
@@ -2962,7 +2814,11 @@ mod tests {
             keystore_manager: app.keystore_manager.clone(),
             slashing_protection: app.slashing_protection.clone(),
             validator_manager: app.validator_manager.clone(),
-            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            doppelganger: Arc::new(crate::DoppelgangerLifecycle::new(
+                std::time::Duration::ZERO,
+                app.doppelganger_monitor.clone(),
+                app.validator_manager.clone(),
+            )),
             remote_key_manager: app.remote_key_manager.clone(),
             config_manager: app.config_manager.clone(),
             exit_manager: None,
@@ -2970,9 +2826,6 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_window: std::time::Duration::ZERO,
-            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_state_lock: std::sync::Mutex::new(()),
         });
 
         let router = Router::new()
@@ -3056,7 +2909,11 @@ mod tests {
             keystore_manager: app.keystore_manager.clone(),
             slashing_protection: app.slashing_protection.clone(),
             validator_manager: app.validator_manager.clone(),
-            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            doppelganger: Arc::new(crate::DoppelgangerLifecycle::new(
+                std::time::Duration::ZERO,
+                app.doppelganger_monitor.clone(),
+                app.validator_manager.clone(),
+            )),
             remote_key_manager: app.remote_key_manager.clone(),
             config_manager: app.config_manager.clone(),
             exit_manager: None,
@@ -3064,9 +2921,6 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_window: std::time::Duration::ZERO,
-            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_state_lock: std::sync::Mutex::new(()),
         });
         Router::new()
             .route(
@@ -3478,7 +3332,11 @@ mod tests {
             keystore_manager: app.keystore_manager.clone(),
             slashing_protection: app.slashing_protection.clone(),
             validator_manager: app.validator_manager.clone(),
-            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            doppelganger: Arc::new(crate::DoppelgangerLifecycle::new(
+                std::time::Duration::ZERO,
+                app.doppelganger_monitor.clone(),
+                app.validator_manager.clone(),
+            )),
             remote_key_manager: app.remote_key_manager.clone(),
             config_manager: app.config_manager.clone(),
             exit_manager,
@@ -3486,9 +3344,6 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_window: std::time::Duration::ZERO,
-            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_state_lock: std::sync::Mutex::new(()),
         });
         Router::new()
             .route(
@@ -3616,7 +3471,11 @@ mod tests {
             keystore_manager: app.keystore_manager.clone(),
             slashing_protection: app.slashing_protection.clone(),
             validator_manager: app.validator_manager.clone(),
-            doppelganger_monitor: app.doppelganger_monitor.clone(),
+            doppelganger: Arc::new(crate::DoppelgangerLifecycle::new(
+                std::time::Duration::ZERO,
+                app.doppelganger_monitor.clone(),
+                app.validator_manager.clone(),
+            )),
             remote_key_manager: app.remote_key_manager.clone(),
             config_manager: app.config_manager.clone(),
             exit_manager,
@@ -3624,9 +3483,6 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_window: std::time::Duration::ZERO,
-            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_state_lock: std::sync::Mutex::new(()),
         });
         Router::new()
             .route("/rvc/v1/validator/:pubkey/prepare_exit", axum::routing::post(prepare_exit))
@@ -3731,7 +3587,11 @@ mod tests {
             keystore_manager: Arc::new(MockKeystoreManager::new()),
             slashing_protection: Arc::new(MockSlashingProtection::new()),
             validator_manager: Arc::new(MockValidatorManager::new()),
-            doppelganger_monitor: Arc::new(MockDoppelgangerMonitor::new()),
+            doppelganger: Arc::new(crate::DoppelgangerLifecycle::new(
+                std::time::Duration::ZERO,
+                Arc::new(MockDoppelgangerMonitor::new()),
+                Arc::new(MockValidatorManager::new()),
+            )),
             remote_key_manager: Arc::new(MockRemoteKeyManager::new()),
             config_manager: Arc::new(config_manager),
             exit_manager,
@@ -3739,9 +3599,6 @@ mod tests {
             attesting_enabled: Arc::new(AtomicBool::new(true)),
             last_set_attesting_enabled: std::sync::Mutex::new(None),
             import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_window: std::time::Duration::ZERO,
-            cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-            doppelganger_state_lock: std::sync::Mutex::new(()),
         });
 
         let api = Router::new()

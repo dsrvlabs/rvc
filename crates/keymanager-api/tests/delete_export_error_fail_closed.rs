@@ -50,7 +50,11 @@ fn make_state(
         keystore_manager,
         slashing_protection,
         validator_manager: Arc::new(NoopValidatorManager),
-        doppelganger_monitor: Arc::new(NoopDoppelgangerMonitor),
+        doppelganger: Arc::new(rvc_keymanager_api::DoppelgangerLifecycle::new(
+            std::time::Duration::ZERO,
+            Arc::new(NoopDoppelgangerMonitor),
+            Arc::new(NoopValidatorManager),
+        )),
         remote_key_manager: Arc::new(NoopRemoteKeyManager),
         config_manager: Arc::new(NoopConfigManager),
         exit_manager: None,
@@ -58,9 +62,6 @@ fn make_state(
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         last_set_attesting_enabled: std::sync::Mutex::new(None),
         import_keystores_rate: std::sync::Mutex::new(std::collections::HashMap::new()),
-        doppelganger_window: std::time::Duration::ZERO,
-        cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-        doppelganger_state_lock: std::sync::Mutex::new(()),
     })
 }
 

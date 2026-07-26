@@ -1521,12 +1521,12 @@ window + cancel tokens + state lock in one type makes the invariant enforceable 
 5. Preserve the existing lock-ordering documentation by moving it onto the component type.
 
 **Acceptance criteria:**
-- [ ] Local and remote import go through one code path, differing only by `ImportKind`.
-- [ ] The KM-2 invariant (token displacement + cancel under the state lock) exists in exactly one place.
-- [ ] `km2_cancel_token_race` tests target the component; at least one HTTP-level test remains.
-- [ ] No behavior change: an import during an in-flight enable task still cancels the prior token; a
+- [x] Local and remote import go through one code path, differing only by `ImportKind`.
+- [x] The KM-2 invariant (token displacement + cancel under the state lock) exists in exactly one place.
+- [x] `km2_cancel_token_race` tests target the component; at least one HTTP-level test remains.
+- [x] No behavior change: an import during an in-flight enable task still cancels the prior token; a
       delete during the window still cancels.
-- [ ] Existing doppelganger and keymanager suites green.
+- [x] Existing doppelganger and keymanager suites green.
 
 **TDD test plan** (RED first):
 - `test_remote_import_registers_with_lifecycle_like_local` — **RED**: today `import_remote_keys` only
