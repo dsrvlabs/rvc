@@ -94,6 +94,27 @@ pub struct AttestationResult {
 /// Timeout for builder registration API calls.
 const BUILDER_REGISTRATION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Outcome of a timed wait that can be interrupted by shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WaitOutcome {
+    /// The wait completed (or was zero-length); continue the slot loop.
+    Continue,
+    /// Shutdown was requested; the caller must exit `run()`.
+    Shutdown,
+}
+
+/// Phase deadline relative to a slot: offset from slot start, remaining wait,
+/// and how far past the deadline we already are.
+#[derive(Debug, Clone, Copy)]
+struct PhaseDeadline {
+    /// Duration from slot start to this phase (bps → ms of slot duration).
+    offset: Duration,
+    /// Time remaining until the deadline (`ZERO` if already at/past it).
+    remaining: Duration,
+    /// How far past the deadline we are in ms (`0` if not past).
+    overrun_ms: u64,
+}
+
 /// Dependencies required to construct a [`DutyOrchestrator`].
 ///
 /// Bundling construction args into a single struct makes omissions (notably
@@ -360,34 +381,10 @@ where
 
                 let epoch_span =
                     info_span!(parent: &slot_span, "epoch.boundary", epoch = current_epoch);
-                async {
-                    self.duty_management.check_reorg_at_epoch_boundary(current_epoch).await;
-                    self.duty_management.prepare_proposers().await;
-                    self.duty_management.submit_committee_subscriptions(current_epoch).await;
-                    self.duty_management.submit_committee_subscriptions(current_epoch + 1).await;
-
-                    // Epoch boundary summary
-                    let mut attester_count = 0usize;
-                    for slot_offset in 0..SLOTS_PER_EPOCH {
-                        let slot = current_epoch * SLOTS_PER_EPOCH + slot_offset;
-                        attester_count += self.duty_tracker.get_duties_for_slot(slot).await.len();
-                    }
-                    let mut proposer_count = 0usize;
-                    for slot_offset in 0..SLOTS_PER_EPOCH {
-                        let slot = current_epoch * SLOTS_PER_EPOCH + slot_offset;
-                        if self.duty_tracker.get_proposer_duty(slot).await.is_some() {
-                            proposer_count += 1;
-                        }
-                    }
-                    let sync_count =
-                        self.duty_tracker.get_sync_committee_duties(current_slot).await.len();
-                    info!(
-                        epoch = current_epoch,
-                        attester_count, proposer_count, sync_count, "Epoch boundary summary"
-                    );
-                }
-                .instrument(epoch_span)
-                .await;
+                self.duty_management
+                    .on_epoch_boundary(current_epoch, current_slot)
+                    .instrument(epoch_span)
+                    .await;
             }
 
             // === Phase 1: t=0 — Block proposal ===
@@ -417,13 +414,13 @@ where
                     );
                     drop(_guard);
 
-                    tokio::select! {
-                        _ = tokio::time::sleep(time_until_attestation).instrument(att_phase_span.clone()) => {}
-                        _ = self.shutdown_rx.changed() => {
-                            if self.check_shutdown() {
-                                return Ok(());
-                            }
-                        }
+                    if matches!(
+                        self.wait_for(time_until_attestation)
+                            .instrument(att_phase_span.clone())
+                            .await,
+                        WaitOutcome::Shutdown
+                    ) {
+                        return Ok(());
                     }
                 }
 
@@ -435,18 +432,16 @@ where
                 // Basis-points formula in milliseconds (report §4.3), consistent
                 // with `time_until_attestation`: mainnet 1/3 = 3999 ms.
                 {
-                    let slot_duration_ms = self.clock.slot_duration().as_millis() as u64;
-                    let att_window_ms = due_ms(ATTESTATION_DUE_BPS, slot_duration_ms);
-                    let slot_start_ms = self.clock.slot_start_time(current_slot) * 1000;
-                    let expected_att_ms = slot_start_ms + att_window_ms;
-                    let now_ms = self.clock.current_time_secs() * 1000;
-                    if now_ms > expected_att_ms {
-                        let delay_ms = now_ms - expected_att_ms;
-                        // Only warn if the delay exceeds the expected attestation window
-                        // (i.e., we're past 2/3 of the slot).
-                        if delay_ms > att_window_ms {
-                            warn!(slot = current_slot, delay_ms, "Missed attestation deadline");
-                        }
+                    let deadline = self.phase_deadline(current_slot, ATTESTATION_DUE_BPS);
+                    let att_window_ms = deadline.offset.as_millis() as u64;
+                    // Only warn if the delay exceeds the expected attestation window
+                    // (i.e., we're past 2/3 of the slot).
+                    if deadline.overrun_ms > att_window_ms {
+                        warn!(
+                            slot = current_slot,
+                            delay_ms = deadline.overrun_ms,
+                            "Missed attestation deadline"
+                        );
                     }
                 }
 
@@ -496,30 +491,22 @@ where
                 // Basis-points formula in milliseconds (report §4.3): mainnet
                 // 2/3 = 6667 * 12000 / 10000 = 8000 ms (unchanged from the legacy
                 // `as_secs() * 2 / 3`), but exact for non-12 s / Gloas slots.
-                let slot_duration_ms = self.clock.slot_duration().as_millis() as u64;
-                let two_thirds_offset_ms = due_ms(AGGREGATE_DUE_BPS, slot_duration_ms);
-                let slot_start_ms = self.clock.slot_start_time(current_slot) * 1000;
-                let two_thirds_ms = slot_start_ms + two_thirds_offset_ms;
-                let now_ms = self.clock.current_time_secs() * 1000;
-
-                if now_ms < two_thirds_ms {
-                    let wait_duration = Duration::from_millis(two_thirds_ms - now_ms);
+                let deadline = self.phase_deadline(current_slot, AGGREGATE_DUE_BPS);
+                if !deadline.remaining.is_zero() {
                     {
                         let _guard = agg_phase_span.enter();
                         debug!(
                             slot = current_slot,
-                            wait_ms = wait_duration.as_millis(),
+                            wait_ms = deadline.remaining.as_millis(),
                             "Waiting for 2/3 slot time"
                         );
                     }
 
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait_duration).instrument(agg_phase_span.clone()) => {}
-                        _ = self.shutdown_rx.changed() => {
-                            if self.check_shutdown() {
-                                return Ok(());
-                            }
-                        }
+                    if matches!(
+                        self.wait_for(deadline.remaining).instrument(agg_phase_span.clone()).await,
+                        WaitOutcome::Shutdown
+                    ) {
+                        return Ok(());
                     }
                 }
 
@@ -551,7 +538,7 @@ where
             let should_register = current_slot % SLOTS_PER_EPOCH == 0;
 
             if should_register && !time_until_next_slot.is_zero() {
-                // Clone builder_service before borrowing self for shutdown_rx
+                // Clone builder_service before borrowing self for wait_for
                 let builder_service = self.builder_service.clone();
                 let builder_fut = async {
                     if let Some(bs) = builder_service {
@@ -580,24 +567,21 @@ where
                 };
                 tokio::pin!(builder_fut);
 
+                // Race next-slot wait (incl. shutdown) against registration so a
+                // long registration cannot block the slot loop; registration is
+                // abandoned if the next slot arrives first.
                 tokio::select! {
-                    _ = tokio::time::sleep(time_until_next_slot) => {}
+                    outcome = self.wait_for(time_until_next_slot) => {
+                        if matches!(outcome, WaitOutcome::Shutdown) {
+                            return Ok(());
+                        }
+                    }
                     _ = &mut builder_fut => {}
-                    _ = self.shutdown_rx.changed() => {
-                        if self.check_shutdown() {
-                            return Ok(());
-                        }
-                    }
                 }
-            } else if !time_until_next_slot.is_zero() {
-                tokio::select! {
-                    _ = tokio::time::sleep(time_until_next_slot) => {}
-                    _ = self.shutdown_rx.changed() => {
-                        if self.check_shutdown() {
-                            return Ok(());
-                        }
-                    }
-                }
+            } else if !time_until_next_slot.is_zero()
+                && matches!(self.wait_for(time_until_next_slot).await, WaitOutcome::Shutdown)
+            {
+                return Ok(());
             }
         }
     }
@@ -624,6 +608,49 @@ where
             true
         } else {
             false
+        }
+    }
+
+    /// Wait up to `duration`, returning early if shutdown is requested.
+    ///
+    /// Single implementation of the sleep / shutdown-watch race used by every
+    /// phase of the slot loop. Callers must handle [`WaitOutcome::Shutdown`]
+    /// explicitly (the enum forces it).
+    async fn wait_for(&mut self, duration: Duration) -> WaitOutcome {
+        if !duration.is_zero() {
+            tokio::select! {
+                _ = tokio::time::sleep(duration) => {}
+                _ = self.shutdown_rx.changed() => {}
+            }
+        }
+        if self.check_shutdown() {
+            WaitOutcome::Shutdown
+        } else {
+            WaitOutcome::Continue
+        }
+    }
+
+    /// Phase deadline at `bps` basis points into `slot`.
+    ///
+    /// Single source for the bps-in-milliseconds arithmetic previously inlined
+    /// at the attestation missed-deadline check and the aggregation 2/3 wait
+    /// (report §4.3). Mainnet examples: 1/3 → 3999 ms, 2/3 → 8000 ms.
+    fn phase_deadline(&self, slot: Slot, bps: u64) -> PhaseDeadline {
+        let offset_ms = due_ms(bps, self.clock.slot_duration().as_millis() as u64);
+        let deadline_ms = self.clock.slot_start_time(slot) * 1000 + offset_ms;
+        let now_ms = self.clock.current_time_secs() * 1000;
+        if now_ms < deadline_ms {
+            PhaseDeadline {
+                offset: Duration::from_millis(offset_ms),
+                remaining: Duration::from_millis(deadline_ms - now_ms),
+                overrun_ms: 0,
+            }
+        } else {
+            PhaseDeadline {
+                offset: Duration::from_millis(offset_ms),
+                remaining: Duration::ZERO,
+                overrun_ms: now_ms - deadline_ms,
+            }
         }
     }
 

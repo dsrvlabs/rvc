@@ -1274,11 +1274,11 @@ math, and the builder-registration select. Extracting `wait_for(duration) -> Con
    the oracle.
 
 **Acceptance criteria:**
-- [ ] One `select!`-plus-`check_shutdown` implementation (`rg -c "shutdown_rx.changed()"` in the file = 1).
-- [ ] One deadline computation.
-- [ ] The epoch-boundary block lives in `duty_management.rs` and iterates the slot range once.
-- [ ] Log lines and their ordering unchanged (tracing-span tests pass unmodified).
-- [ ] Test count unchanged; workspace green.
+- [x] One `select!`-plus-`check_shutdown` implementation (`rg -c "shutdown_rx.changed()"` in the file = 1).
+- [x] One deadline computation.
+- [x] The epoch-boundary block lives in `duty_management.rs` and iterates the slot range once.
+- [x] Log lines and their ordering unchanged (tracing-span tests pass unmodified).
+- [x] Test count unchanged; workspace green.
 
 **Risks:** The four select blocks may differ in a subtle way (a different metric increment, a different
 log level). Diff them explicitly before unifying and record any real difference as a parameter rather

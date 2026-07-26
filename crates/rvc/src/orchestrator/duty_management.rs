@@ -7,6 +7,7 @@ use tracing::{debug, info, warn};
 use beacon::{BeaconCommitteeSubscription, ProposerPreparation};
 use bn_manager::BeaconNodeClient;
 use duty_tracker::DutyTracker;
+use eth_types::Slot;
 use metrics::definitions::RVC_DUTY_REORG_DETECTED_TOTAL;
 use signer::{is_aggregator, SignerService, ValidatorSigner};
 use timing::{SlotClock, SLOTS_PER_EPOCH};
@@ -430,6 +431,57 @@ impl<C: SlotClock + 'static> DutyManagementService<C> {
             ),
         }
     }
+
+    /// Epoch-boundary work: reorg checks, proposer preparation, committee
+    /// subscriptions for the current and next epoch, then a duty summary.
+    ///
+    /// Extracted from the coordinator slot loop so the run path stays a pure
+    /// phase dispatcher. Circuit-breaker reset stays in the coordinator (it
+    /// owns that state).
+    #[tracing::instrument(name = "orchestrator.on_epoch_boundary", level = "debug", skip_all, fields(epoch = current_epoch))]
+    pub(crate) async fn on_epoch_boundary(&self, current_epoch: u64, current_slot: Slot) {
+        self.check_reorg_at_epoch_boundary(current_epoch).await;
+        self.prepare_proposers().await;
+        self.submit_committee_subscriptions(current_epoch).await;
+        self.submit_committee_subscriptions(current_epoch + 1).await;
+        self.log_epoch_boundary_summary(current_epoch, current_slot).await;
+    }
+
+    /// Count attester/proposer/sync duties for the epoch and emit the
+    /// `Epoch boundary summary` info line.
+    ///
+    /// Iterates the slot range once (attester + proposer per slot) rather than
+    /// two separate 32-slot loops.
+    pub(crate) async fn log_epoch_boundary_summary(&self, current_epoch: u64, current_slot: Slot) {
+        let (attester_count, proposer_count, sync_count) =
+            self.epoch_boundary_summary_counts(current_epoch, current_slot).await;
+        info!(
+            epoch = current_epoch,
+            attester_count, proposer_count, sync_count, "Epoch boundary summary"
+        );
+    }
+
+    /// Counts used by the epoch-boundary summary.
+    ///
+    /// Single pass over `[epoch * 32, epoch * 32 + 32)` for attester and
+    /// proposer duties; sync committee duties are read for `current_slot`.
+    pub(crate) async fn epoch_boundary_summary_counts(
+        &self,
+        epoch: u64,
+        current_slot: Slot,
+    ) -> (usize, usize, usize) {
+        let mut attester_count = 0usize;
+        let mut proposer_count = 0usize;
+        for slot_offset in 0..SLOTS_PER_EPOCH {
+            let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
+            attester_count += self.duty_tracker.get_duties_for_slot(slot).await.len();
+            if self.duty_tracker.get_proposer_duty(slot).await.is_some() {
+                proposer_count += 1;
+            }
+        }
+        let sync_count = self.duty_tracker.get_sync_committee_duties(current_slot).await.len();
+        (attester_count, proposer_count, sync_count)
+    }
 }
 
 #[cfg(test)]
@@ -748,5 +800,147 @@ mod tests {
         let service = build_service_no_validators(&server.uri()).await;
         service.fetch_epoch_duties(current_epoch).await;
         // wiremock asserts expect(1) for PERIOD sync duties on drop
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Epoch-boundary summary: single-pass counts match dual-loop baseline
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// RF6-27: collapsing the two 32-slot loops into one pass must not change
+    /// the attester/proposer/sync counts that feed `Epoch boundary summary`.
+    #[tokio::test]
+    async fn test_epoch_boundary_summary_counts_match_dual_loop() {
+        use bn_manager::{
+            AttesterDutiesResponse, AttesterDuty, MockBeaconNodeClient, ProposerDutiesResponse,
+            ProposerDuty, SyncCommitteeDutiesResponse,
+        };
+        use eth_types::SyncCommitteeDuty;
+
+        let epoch = 10u64;
+        let slot_base = epoch * SLOTS_PER_EPOCH;
+        // 3 attester duties on two slots (2 + 1), 2 proposer slots, 1 sync duty.
+        let attester_data = vec![
+            AttesterDuty {
+                pubkey: "0xpk1".into(),
+                validator_index: "1".into(),
+                committee_index: "0".into(),
+                committee_length: "128".into(),
+                committees_at_slot: "64".into(),
+                validator_committee_index: "0".into(),
+                slot: slot_base.to_string(),
+            },
+            AttesterDuty {
+                pubkey: "0xpk2".into(),
+                validator_index: "2".into(),
+                committee_index: "1".into(),
+                committee_length: "128".into(),
+                committees_at_slot: "64".into(),
+                validator_committee_index: "1".into(),
+                slot: slot_base.to_string(),
+            },
+            AttesterDuty {
+                pubkey: "0xpk1".into(),
+                validator_index: "1".into(),
+                committee_index: "0".into(),
+                committee_length: "128".into(),
+                committees_at_slot: "64".into(),
+                validator_committee_index: "0".into(),
+                slot: (slot_base + 5).to_string(),
+            },
+        ];
+        let proposer_data = vec![
+            ProposerDuty {
+                pubkey: "0xpk1".into(),
+                validator_index: "1".into(),
+                slot: slot_base.to_string(),
+            },
+            ProposerDuty {
+                pubkey: "0xpk2".into(),
+                validator_index: "2".into(),
+                slot: (slot_base + 7).to_string(),
+            },
+        ];
+        let sync_data = vec![SyncCommitteeDuty {
+            pubkey: [0x11; 48],
+            validator_index: 1,
+            validator_sync_committee_indices: vec![0],
+        }];
+
+        let beacon = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_get_attester_duties({
+                    let data = attester_data.clone();
+                    move |_epoch, _indices| {
+                        Ok(AttesterDutiesResponse {
+                            dependent_root: "0xdeproot".into(),
+                            execution_optimistic: false,
+                            data: data.clone(),
+                        })
+                    }
+                })
+                .with_get_proposer_duties({
+                    let data = proposer_data.clone();
+                    move |_epoch| {
+                        Ok(ProposerDutiesResponse {
+                            dependent_root: "0xdeproot".into(),
+                            execution_optimistic: false,
+                            data: data.clone(),
+                        })
+                    }
+                })
+                .with_post_sync_committee_duties({
+                    let data = sync_data.clone();
+                    move |_epoch, _indices| {
+                        Ok(SyncCommitteeDutiesResponse {
+                            execution_optimistic: false,
+                            data: data.clone(),
+                        })
+                    }
+                }),
+        ) as Arc<dyn BeaconNodeClient>;
+
+        let indices = vec!["1".to_string(), "2".to_string()];
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), indices));
+        duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+        duty_tracker.fetch_sync_committee_duties(epoch).await.unwrap();
+
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+        let clock = Arc::new(MockSlotClock::new(1606824023, Duration::from_secs(12), 0));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+        let service = DutyManagementService::new(
+            clock,
+            signer,
+            beacon,
+            duty_tracker.clone(),
+            validator_store,
+            pubkey_map,
+            make_config(),
+        );
+
+        let current_slot = slot_base;
+        let single_pass = service.epoch_boundary_summary_counts(epoch, current_slot).await;
+
+        // Dual-loop baseline: the pre-RF6-27 shape (two separate 32-slot walks).
+        let mut dual_attester = 0usize;
+        for slot_offset in 0..SLOTS_PER_EPOCH {
+            let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
+            dual_attester += duty_tracker.get_duties_for_slot(slot).await.len();
+        }
+        let mut dual_proposer = 0usize;
+        for slot_offset in 0..SLOTS_PER_EPOCH {
+            let slot = epoch * SLOTS_PER_EPOCH + slot_offset;
+            if duty_tracker.get_proposer_duty(slot).await.is_some() {
+                dual_proposer += 1;
+            }
+        }
+        let dual_sync = duty_tracker.get_sync_committee_duties(current_slot).await.len();
+
+        assert_eq!(single_pass, (dual_attester, dual_proposer, dual_sync));
+        assert_eq!(single_pass, (3, 2, 1), "known fixture counts");
     }
 }
