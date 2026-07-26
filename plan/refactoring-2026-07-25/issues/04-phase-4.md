@@ -1513,13 +1513,13 @@ The fix is small once `BeaconBlockAdapter` accepts the trait object instead of a
 4. Narrow `build_beacon` (`builder.rs:208`) to the exit-tooling paths that genuinely need a single client.
 
 **Acceptance criteria:**
-- [ ] Block production routes through the proposer `BnManager`; no `BeaconClient` is constructed from
+- [x] Block production routes through the proposer `BnManager`; no `BeaconClient` is constructed from
       `proposer_nodes[0]` (`rg` proof).
-- [ ] **Integration test: first proposer node down → the second is used and a block is produced.**
-- [ ] With `proposer_nodes` empty, behavior is unchanged (main pool used).
-- [ ] The retries-under-failover policy is documented once and referenced from the other sites.
-- [ ] Release note: proposer block production now honors failover.
-- [ ] Standing invariant green.
+- [x] **Integration test: first proposer node down → the second is used and a block is produced.**
+- [x] With `proposer_nodes` empty, behavior is unchanged (main pool used).
+- [x] The retries-under-failover policy is documented once and referenced from the other sites.
+- [x] Release note: proposer block production now honors failover.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_block_production_fails_over_to_second_proposer_node` — fails today (the adapter

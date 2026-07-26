@@ -1521,7 +1521,6 @@ async fn run_validator(
     // Step 7: Build remaining services
     let signer =
         builder.build_signer(composite_signer.clone(), slashing_db.clone(), signing_enablement);
-    let propagator = builder.build_propagator(beacon_client.clone());
     let validator_store = builder.build_validator_store(config.validators_config.as_deref())?;
 
     // D-3 (Issue 2.11): register every keystore-loaded validator so the
@@ -1530,6 +1529,13 @@ async fn run_validator(
     // loaded validator silently blocked from signing.
     builder.register_loaded_validators(&validator_store, &pubkey_map);
 
+    // Attestation submit path uses the main-pool BnManager (failover-aware).
+    // `build_beacon` remains only for single-client exit tooling
+    // (keymanager voluntary exit). Propagator needs a Sized submitter, so keep
+    // the concrete BnManager here rather than `dyn BeaconNodeClient`.
+    let propagator = builder.build_propagator(bn_manager.clone());
+    // Main-pool trait object for duties and (when no dedicated proposer pool)
+    // block production.
     let beacon: std::sync::Arc<dyn BeaconNodeClient> = bn_manager;
     let validator_indices: Vec<String> = match validator_index_map {
         Ok(ref map) => map.values().cloned().collect(),
@@ -1584,25 +1590,13 @@ async fn run_validator(
         }
     };
 
-    // Use proposer BnManager for block production if available, otherwise main beacon_client
+    // Block production goes through BnManager so multi-node failover applies.
+    // Prefer the dedicated proposer pool when configured; otherwise the main pool.
     let block_beacon = match &proposer_bn_manager {
-        Some(_proposer_mgr) => {
-            std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(
-                // We need an Arc<BeaconClient> - but proposer_mgr is an Arc<BnManager>.
-                // The BeaconBlockAdapter wraps a BeaconClient. For proposer nodes,
-                // we use the first proposer node endpoint to create a new BeaconClient.
-                {
-                    let proposer_endpoint = &config.proposer_nodes[0];
-                    let proposer_config =
-                        beacon::BeaconClientConfig::new(proposer_endpoint.clone())
-                            .with_timeout(std::time::Duration::from_secs(30))
-                            .with_max_retries(0)
-                            .with_max_body_bytes(config.beacon_max_body_bytes);
-                    std::sync::Arc::new(beacon::BeaconClient::new(proposer_config)?)
-                },
-            ))
-        }
-        None => std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(beacon_client.clone())),
+        Some(proposer_mgr) => std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(
+            proposer_mgr.clone() as std::sync::Arc<dyn BeaconNodeClient>,
+        )),
+        None => std::sync::Arc::new(rvc::beacon_adapter::BeaconBlockAdapter(beacon.clone())),
     };
 
     #[allow(clippy::arc_with_non_send_sync)]

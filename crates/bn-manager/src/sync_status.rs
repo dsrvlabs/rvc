@@ -569,6 +569,7 @@ mod tests {
     const OPTIMISTIC_RESPONSE: &str = r#"{"data":{"head_slot":"1000","sync_distance":"0","is_syncing":false,"is_optimistic":true,"el_offline":false}}"#;
 
     fn make_client(endpoint: &str) -> BeaconClient {
+        // max_retries=0 under multi-BN: see BnManager type docs (retries-under-failover).
         let config = BeaconClientConfig::new(endpoint).with_max_retries(0);
         BeaconClient::new(config).unwrap()
     }

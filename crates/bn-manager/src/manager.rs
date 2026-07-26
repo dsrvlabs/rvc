@@ -57,6 +57,17 @@ const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 ///   succeeds — attestations, blocks, sync committee messages, subscriptions,
 ///   preparations, validator registrations.
 ///
+/// # Retries under multi-BN failover
+///
+/// Every underlying `BeaconClient` is constructed with **`max_retries = 0`**.
+/// Transient failures are handled by this manager (try the next healthy BN /
+/// broadcast to peers), not by per-client HTTP retries. Stacking both would
+/// multiply tail latency on a dead primary. Single-client tooling that bypasses
+/// `BnManager` (e.g. voluntary-exit helpers via `ServiceBuilder::build_beacon`)
+/// may set a non-zero retry budget; that is the only intentional exception.
+/// Other call sites that need the same policy should link here rather than
+/// restate it.
+///
 /// Tracks per-BN sync status and skips unsynced BNs for query operations.
 /// In single-BN mode, logs warnings but continues with the only available BN.
 pub struct BnManager {
@@ -105,6 +116,8 @@ impl BnManager {
                 ));
             }
 
+            // max_retries=0: failover lives in BnManager, not per-client HTTP
+            // retries. See type-level docs on [`BnManager`].
             let client_config = beacon::BeaconClientConfig::new(endpoint.clone())
                 .with_timeout(config.timeout)
                 .with_max_retries(0)
@@ -1019,6 +1032,36 @@ impl BlockProducer for BnManager {
         }
     }
 
+    async fn publish_block_ssz(
+        &self,
+        ssz_bytes: &[u8],
+        consensus_version: &str,
+        is_blinded: bool,
+    ) -> Result<(), BeaconError> {
+        if self.broadcast_topics.blocks {
+            self.with_op_timeout(
+                "publish_block_ssz",
+                self.op_timeout(|t| t.block_publication),
+                self.broadcast("publish_block_ssz", |c| {
+                    Box::pin(c.publish_block_ssz(ssz_bytes, consensus_version, is_blinded))
+                }),
+            )
+            .await
+        } else {
+            self.with_op_timeout(
+                "publish_block_ssz",
+                self.op_timeout(|t| t.block_publication),
+                self.query_first(
+                    "publish_block_ssz",
+                    BnRole::Submission,
+                    HealthTier::LargeLag,
+                    |c| Box::pin(c.publish_block_ssz(ssz_bytes, consensus_version, is_blinded)),
+                ),
+            )
+            .await
+        }
+    }
+
     // -- Proposer preparation: broadcast --
 
     async fn prepare_beacon_proposer(
@@ -1352,6 +1395,15 @@ impl BlockProducer for BeaconClient {
         consensus_version: &str,
     ) -> Result<(), BeaconError> {
         BeaconClient::publish_blinded_block(self, signed_blinded_block, consensus_version).await
+    }
+
+    async fn publish_block_ssz(
+        &self,
+        ssz_bytes: &[u8],
+        consensus_version: &str,
+        is_blinded: bool,
+    ) -> Result<(), BeaconError> {
+        BeaconClient::publish_block_ssz(self, ssz_bytes, consensus_version, is_blinded).await
     }
 
     async fn prepare_beacon_proposer(

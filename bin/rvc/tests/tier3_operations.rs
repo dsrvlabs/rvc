@@ -108,6 +108,58 @@ proposer_nodes = ["http://p1:5052", "http://p2:5052"]
         assert!(result.is_ok());
         assert!(result.unwrap().is_none(), "should return None when proposer_nodes is empty");
     }
+
+    /// Call-site guard: block production must not construct a single-node client
+    /// from `proposer_nodes[0]`; it must wrap the proposer/main BnManager.
+    #[test]
+    fn test_block_production_does_not_use_proposer_nodes_zero() {
+        let main_src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("read bin/rvc/src/main.rs");
+
+        assert!(
+            !main_src.contains("proposer_nodes[0]"),
+            "bin/rvc/src/main.rs must not construct a BeaconClient from proposer_nodes[0]; \
+             block production must use the proposer BnManager for failover"
+        );
+        assert!(
+            main_src.contains("BeaconBlockAdapter"),
+            "expected BeaconBlockAdapter wiring in main"
+        );
+        assert!(
+            main_src.contains("proposer_mgr"),
+            "expected proposer BnManager to be passed into BeaconBlockAdapter"
+        );
+    }
+
+    /// Call-site guard: `build_beacon` in the VC binary is limited to exit tooling
+    /// (keymanager voluntary exit), not block production or the propagator path.
+    #[test]
+    fn test_build_beacon_only_used_by_exit_tooling() {
+        let main_src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
+            .expect("read bin/rvc/src/main.rs");
+
+        // Single build_beacon call site for the runtime VC path.
+        let build_beacon_count = main_src.matches("build_beacon()").count();
+        assert_eq!(
+            build_beacon_count, 1,
+            "expected exactly one build_beacon() call in bin/rvc/src/main.rs, found {build_beacon_count}"
+        );
+
+        // The resulting client must not be fed to BeaconBlockAdapter or the propagator.
+        assert!(
+            !main_src.contains("BeaconBlockAdapter(beacon_client"),
+            "BeaconBlockAdapter must not wrap build_beacon()'s BeaconClient"
+        );
+        assert!(
+            !main_src.contains("build_propagator(beacon_client"),
+            "propagator must not take the single-node build_beacon() client"
+        );
+        assert!(
+            main_src.contains("VoluntaryExitManagerAdapter::new")
+                && main_src.contains("beacon_client.clone()"),
+            "build_beacon() client should remain available for exit tooling"
+        );
+    }
 }
 
 // =============================================================================

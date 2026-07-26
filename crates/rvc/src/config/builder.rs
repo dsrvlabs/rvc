@@ -180,6 +180,16 @@ impl ServiceBuilder {
         }
     }
 
+    /// Build a single-endpoint [`BeaconClient`] for exit tooling.
+    ///
+    /// Runtime block production, duties, and attestation paths must use
+    /// [`Self::build_bn_manager`] / [`Self::build_proposer_bn_manager`] so
+    /// multi-BN failover applies. This helper is intentionally limited to
+    /// single-client needs (keymanager voluntary exit and similar).
+    ///
+    /// Unlike `BnManager` (which sets `max_retries = 0` and relies on pool
+    /// failover — see `bn_manager::BnManager`), a standalone client keeps a
+    /// small HTTP retry budget.
     pub fn build_beacon(&self) -> Result<Arc<BeaconClient>, ConfigError> {
         let beacon_config = BeaconClientConfig::new(&self.config.beacon_url)
             .with_timeout(Duration::from_secs(30))
@@ -190,16 +200,24 @@ impl ServiceBuilder {
         info!(
             url = %self.config.beacon_url,
             max_body_bytes = self.config.beacon_max_body_bytes,
-            "Created beacon client"
+            "Created beacon client (exit tooling)"
         );
         Ok(Arc::new(client))
     }
 
+    /// Shared pool config for main and proposer `BnManager`s: H-12 body cap and
+    /// global broadcast-topic policy (including `blocks` for publish path).
+    fn pool_bn_manager_config(&self, endpoints: Vec<String>) -> BnManagerConfig {
+        let mut config =
+            BnManagerConfig::new(endpoints).with_max_body_bytes(self.config.beacon_max_body_bytes);
+        config.broadcast_topics = self.config.effective_broadcast_topics();
+        config
+    }
+
     pub fn build_bn_manager(&self) -> Result<Arc<BnManager>, ConfigError> {
         let endpoints = self.config.effective_beacon_nodes();
-        let broadcast_topics = self.config.effective_broadcast_topics();
-        let mut config = BnManagerConfig::new(endpoints.clone());
-        config.broadcast_topics = broadcast_topics.clone();
+        let config = self.pool_bn_manager_config(endpoints.clone());
+        let broadcast_topics = config.broadcast_topics.clone();
         let manager = BnManager::new(config)
             .map_err(|e| {
                 ConfigError::InvalidBeaconUrl(format!("failed to create BnManager: {}", e))
@@ -208,6 +226,7 @@ impl ServiceBuilder {
         info!(
             endpoints = ?endpoints,
             broadcast_topics = ?broadcast_topics,
+            max_body_bytes = self.config.beacon_max_body_bytes,
             "Created BnManager with {} beacon nodes",
             endpoints.len()
         );
@@ -217,12 +236,16 @@ impl ServiceBuilder {
     /// Builds a separate BnManager for proposer nodes if configured.
     ///
     /// Returns `None` if `proposer_nodes` is empty (main pool handles all).
+    ///
+    /// Uses the same body-size cap and broadcast-topic policy as the main pool
+    /// so dedicated proposer publish/produce honor operator DoS and broadcast
+    /// settings (not `BnManagerConfig` defaults alone).
     pub fn build_proposer_bn_manager(&self) -> Result<Option<Arc<BnManager>>, ConfigError> {
         if self.config.proposer_nodes.is_empty() {
             return Ok(None);
         }
         let endpoints = self.config.proposer_nodes.clone();
-        let config = BnManagerConfig::new(endpoints.clone());
+        let config = self.pool_bn_manager_config(endpoints.clone());
         let manager = BnManager::new(config)
             .map_err(|e| {
                 ConfigError::InvalidBeaconUrl(format!("failed to create proposer BnManager: {}", e))
@@ -230,6 +253,7 @@ impl ServiceBuilder {
             .with_operation_timeouts(bn_manager::OperationTimeouts::default());
         info!(
             endpoints = ?endpoints,
+            max_body_bytes = self.config.beacon_max_body_bytes,
             "Created proposer BnManager with {} proposer nodes",
             endpoints.len()
         );
@@ -1010,6 +1034,131 @@ mod tests {
         let builder = ServiceBuilder::new(config);
         let result = builder.build_bn_manager();
         assert!(result.is_ok());
+    }
+
+    /// H-12: main + proposer pool construction must forward `beacon_max_body_bytes`
+    /// (not leave `BnManagerConfig` at the 32 MiB default).
+    #[test]
+    fn test_pool_bn_manager_config_forwards_body_cap() {
+        let cap = 64 * 1024;
+        let config = Config { beacon_max_body_bytes: cap, ..create_minimal_config() };
+        let builder = ServiceBuilder::new(config);
+
+        let main_cfg = builder.pool_bn_manager_config(vec!["http://main:5052".to_string()]);
+        assert_eq!(main_cfg.max_body_bytes, cap);
+
+        let proposer_cfg = builder.pool_bn_manager_config(vec!["http://proposer:5052".to_string()]);
+        assert_eq!(proposer_cfg.max_body_bytes, cap);
+    }
+
+    /// Proposer pool must honor the same global broadcast-topic policy as main.
+    #[test]
+    fn test_pool_bn_manager_config_forwards_broadcast_topics() {
+        let config = Config { broadcast: vec!["none".to_string()], ..create_minimal_config() };
+        let builder = ServiceBuilder::new(config);
+        let expected = bn_manager::BroadcastTopics {
+            attestations: false,
+            blocks: false,
+            sync_committee: false,
+            subscriptions: false,
+        };
+
+        let main_cfg = builder.pool_bn_manager_config(vec!["http://main:5052".to_string()]);
+        assert_eq!(main_cfg.broadcast_topics, expected);
+
+        let proposer_cfg = builder.pool_bn_manager_config(vec!["http://proposer:5052".to_string()]);
+        assert_eq!(proposer_cfg.broadcast_topics, expected);
+    }
+
+    /// End-to-end: `build_bn_manager` applies the operator body cap to clients.
+    #[tokio::test]
+    async fn test_build_bn_manager_applies_beacon_max_body_bytes() {
+        use beacon::BeaconError;
+        use bn_manager::NodeStatusApi;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let body = vec![b'x'; 100 * 1024];
+                    let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let chunk_header = format!("{:x}\r\n", body.len());
+                    let _ = stream.write_all(chunk_header.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.write_all(b"\r\n0\r\n\r\n").await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                });
+            }
+        });
+
+        let config = Config {
+            beacon_url: format!("http://127.0.0.1:{port}"),
+            beacon_max_body_bytes: 32 * 1024,
+            ..create_minimal_config()
+        };
+        let manager = ServiceBuilder::new(config).build_bn_manager().expect("main BnManager");
+        let result = manager.get_genesis().await;
+        server.abort();
+
+        assert!(
+            matches!(result, Err(BeaconError::BodyTooLarge { .. })),
+            "main pool must apply beacon_max_body_bytes; got {result:?}"
+        );
+    }
+
+    /// End-to-end: `build_proposer_bn_manager` applies the same body cap.
+    #[tokio::test]
+    async fn test_build_proposer_bn_manager_applies_beacon_max_body_bytes() {
+        use beacon::BeaconError;
+        use bn_manager::NodeStatusApi;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let body = vec![b'x'; 100 * 1024];
+                    let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+                    let _ = stream.write_all(header.as_bytes()).await;
+                    let chunk_header = format!("{:x}\r\n", body.len());
+                    let _ = stream.write_all(chunk_header.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.write_all(b"\r\n0\r\n\r\n").await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                });
+            }
+        });
+
+        let config = Config {
+            proposer_nodes: vec![format!("http://127.0.0.1:{port}")],
+            beacon_max_body_bytes: 32 * 1024,
+            ..create_minimal_config()
+        };
+        let manager = ServiceBuilder::new(config)
+            .build_proposer_bn_manager()
+            .expect("proposer BnManager ok")
+            .expect("proposer pool Some");
+        let result = manager.get_genesis().await;
+        server.abort();
+
+        assert!(
+            matches!(result, Err(BeaconError::BodyTooLarge { .. })),
+            "proposer pool must apply beacon_max_body_bytes; got {result:?}"
+        );
     }
 
     #[tokio::test]

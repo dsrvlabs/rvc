@@ -59,6 +59,21 @@ pub trait BlockProducer: Send + Sync {
         consensus_version: &str,
     ) -> Result<(), BeaconError>;
 
+    /// Publish a block as raw SSZ bytes (`Content-Type: application/octet-stream`).
+    ///
+    /// Default returns an error so role-narrow test stubs need not implement SSZ
+    /// publish. Production `BnManager` / `BeaconClient` override with real
+    /// failover-aware (or direct) implementations.
+    async fn publish_block_ssz(
+        &self,
+        ssz_bytes: &[u8],
+        consensus_version: &str,
+        is_blinded: bool,
+    ) -> Result<(), BeaconError> {
+        let _ = (ssz_bytes, consensus_version, is_blinded);
+        Err(BeaconError::HttpError("publish_block_ssz not implemented".to_string()))
+    }
+
     async fn prepare_beacon_proposer(
         &self,
         preparations: &[ProposerPreparation],
