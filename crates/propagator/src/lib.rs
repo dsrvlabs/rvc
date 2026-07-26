@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use tracing::{debug, error, info, warn};
 
-use bn_manager::{BeaconError, BeaconNodeClient, SubmitAttestationResult, VersionedAttestation};
+use bn_manager::{
+    AttestationApi, BeaconError, BeaconNodeClient, SubmitAttestationResult, VersionedAttestation,
+};
 use metrics::definitions::{attestation_status, RVC_ATTESTATIONS_TOTAL};
 
 pub use error::PropagatorError;
@@ -30,7 +32,7 @@ impl<T: BeaconNodeClient + ?Sized> AttestationSubmitter for T {
         attestations: &'a VersionedAttestation,
     ) -> Pin<Box<dyn Future<Output = Result<SubmitAttestationResult, BeaconError>> + Send + 'a>>
     {
-        Box::pin(async move { BeaconNodeClient::submit_attestation(self, attestations).await })
+        Box::pin(async move { AttestationApi::submit_attestation(self, attestations).await })
     }
 }
 

@@ -788,8 +788,9 @@ mod tests {
         GenesisResponse, ProposerDutiesResponse, ProposerPreparation,
         SignedContributionAndProof as BeaconSignedContributionAndProof, StateForkResponse,
         SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-        SyncCommitteeMessage as BeaconSyncCommitteeMessage, SyncingResponse, ValidatorsResponse,
-        VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+        SyncCommitteeMessage as BeaconSyncCommitteeMessage, SyncingResponse,
+        ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
+        VersionedAttestation, VersionedSignedAggregateAndProof,
     };
     use signer::always_enabled;
     // block_service::ProduceBlockResponse is used in MockBlockBeacon / BadProposerBlockBeacon
@@ -1020,43 +1021,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl bn_manager::BeaconNodeClient for SyncGuardBeacon {
-        async fn get_block_root(&self, _block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-            // Return a fixed root so SlotContext::capture succeeds.
-            Ok(DataResponse {
-                data: BlockRootData {
-                    root: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                        .to_string(),
-                },
-            })
-        }
-
-        async fn post_sync_committee_duties(
-            &self,
-            _epoch: u64,
-            _indices: &[String],
-        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-            Ok(ExecutionOptimisticResponse {
-                execution_optimistic: false,
-                data: vec![SyncCommitteeDuty {
-                    pubkey: self.duty_pubkey,
-                    validator_index: 1,
-                    validator_sync_committee_indices: vec![0],
-                }],
-            })
-        }
-
-        async fn submit_sync_committee_messages(
-            &self,
-            messages: &[BeaconSyncCommitteeMessage],
-        ) -> Result<(), BeaconError> {
-            let mut roots = self.submitted_roots.lock().unwrap();
-            for msg in messages {
-                roots.push(msg.beacon_block_root);
-            }
-            Ok(())
-        }
-
+    impl bn_manager::NodeStatusApi for SyncGuardBeacon {
         async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
@@ -1075,6 +1040,26 @@ mod tests {
         ) -> Result<ValidatorsResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
+
+        async fn get_block_root(&self, _block_id: &str) -> Result<BlockRootResponse, BeaconError> {
+            // Return a fixed root so SlotContext::capture succeeds.
+            Ok(DataResponse {
+                data: BlockRootData {
+                    root: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                },
+            })
+        }
+        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_version(&self) -> Result<String, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl bn_manager::DutiesProvider for SyncGuardBeacon {
         async fn get_attester_duties(
             &self,
             _epoch: u64,
@@ -1088,6 +1073,25 @@ mod tests {
         ) -> Result<ProposerDutiesResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
+
+        async fn post_sync_committee_duties(
+            &self,
+            _epoch: u64,
+            _indices: &[String],
+        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
+            Ok(ExecutionOptimisticResponse {
+                execution_optimistic: false,
+                data: vec![SyncCommitteeDuty {
+                    pubkey: self.duty_pubkey,
+                    validator_index: 1,
+                    validator_sync_committee_indices: vec![0],
+                }],
+            })
+        }
+    }
+
+    #[async_trait]
+    impl bn_manager::BlockProducer for SyncGuardBeacon {
         async fn produce_block_v3(
             &self,
             _slot: u64,
@@ -1111,6 +1115,22 @@ mod tests {
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
+        async fn prepare_beacon_proposer(
+            &self,
+            _preparations: &[ProposerPreparation],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn register_validators(
+            &self,
+            _registrations: &[SignedValidatorRegistration],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl bn_manager::AttestationApi for SyncGuardBeacon {
         async fn get_attestation_data(
             &self,
             _slot: u64,
@@ -1138,6 +1158,26 @@ mod tests {
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
+        async fn submit_beacon_committee_subscriptions(
+            &self,
+            _subscriptions: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl bn_manager::SyncCommitteeApi for SyncGuardBeacon {
+        async fn submit_sync_committee_messages(
+            &self,
+            messages: &[BeaconSyncCommitteeMessage],
+        ) -> Result<(), BeaconError> {
+            let mut roots = self.submitted_roots.lock().unwrap();
+            for msg in messages {
+                roots.push(msg.beacon_block_root);
+            }
+            Ok(())
+        }
         async fn get_sync_committee_contribution(
             &self,
             _slot: u64,
@@ -1152,31 +1192,20 @@ mod tests {
         ) -> Result<(), BeaconError> {
             Ok(())
         }
-        async fn prepare_beacon_proposer(
+    }
+
+    #[async_trait]
+    impl bn_manager::LivenessApi for SyncGuardBeacon {
+        async fn post_validator_liveness(
             &self,
-            _preparations: &[ProposerPreparation],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _subscriptions: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn register_validators(
-            &self,
-            _registrations: &[SignedValidatorRegistration],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
+            _epoch: u64,
+            _validator_indices: &[String],
+        ) -> Result<ValidatorLivenessResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
     }
+
+    impl bn_manager::BeaconNodeClient for SyncGuardBeacon {}
 
     #[test]
     fn test_orchestrator_config_new() {

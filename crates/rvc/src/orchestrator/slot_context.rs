@@ -63,6 +63,10 @@ impl SlotContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bn_manager::{
+        AttestationApi, BeaconNodeClient, BlockProducer, DutiesProvider, LivenessApi,
+        NodeStatusApi, SyncCommitteeApi,
+    };
 
     use async_trait::async_trait;
     use beacon::{
@@ -71,8 +75,8 @@ mod tests {
         ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation,
         SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
         SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-        SyncingResponse, ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
-        VersionedSignedAggregateAndProof,
+        SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
+        VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
     };
     use eth_types::{
         ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
@@ -88,13 +92,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl BeaconNodeClient for SlotVsHeadBeacon {
-        async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-            let root =
-                if block_id == "head" { self.head_root.clone() } else { self.slot_root.clone() };
-            Ok(DataResponse { data: BlockRootData { root } })
-        }
-
+    impl NodeStatusApi for SlotVsHeadBeacon {
         async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
@@ -113,6 +111,22 @@ mod tests {
         ) -> Result<ValidatorsResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
+
+        async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
+            let root =
+                if block_id == "head" { self.head_root.clone() } else { self.slot_root.clone() };
+            Ok(DataResponse { data: BlockRootData { root } })
+        }
+        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_version(&self) -> Result<String, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl DutiesProvider for SlotVsHeadBeacon {
         async fn get_attester_duties(
             &self,
             _epoch: u64,
@@ -133,6 +147,10 @@ mod tests {
         ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
+    }
+
+    #[async_trait]
+    impl BlockProducer for SlotVsHeadBeacon {
         async fn produce_block_v3(
             &self,
             _slot: u64,
@@ -156,6 +174,22 @@ mod tests {
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
+        async fn prepare_beacon_proposer(
+            &self,
+            _preparations: &[ProposerPreparation],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn register_validators(
+            &self,
+            _registrations: &[SignedValidatorRegistration],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl AttestationApi for SlotVsHeadBeacon {
         async fn get_attestation_data(
             &self,
             _slot: u64,
@@ -183,6 +217,16 @@ mod tests {
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
+        async fn submit_beacon_committee_subscriptions(
+            &self,
+            _subscriptions: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl SyncCommitteeApi for SlotVsHeadBeacon {
         async fn submit_sync_committee_messages(
             &self,
             _messages: &[SyncCommitteeMessage],
@@ -203,31 +247,20 @@ mod tests {
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
-        async fn prepare_beacon_proposer(
+    }
+
+    #[async_trait]
+    impl LivenessApi for SlotVsHeadBeacon {
+        async fn post_validator_liveness(
             &self,
-            _preparations: &[ProposerPreparation],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _subscriptions: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn register_validators(
-            &self,
-            _registrations: &[SignedValidatorRegistration],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
+            _epoch: u64,
+            _validator_indices: &[String],
+        ) -> Result<ValidatorLivenessResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
     }
+
+    impl BeaconNodeClient for SlotVsHeadBeacon {}
 
     // -----------------------------------------------------------------------
     // Mock: always returns an error from get_block_root
@@ -236,11 +269,7 @@ mod tests {
     struct ErrorBeacon;
 
     #[async_trait]
-    impl BeaconNodeClient for ErrorBeacon {
-        async fn get_block_root(&self, _block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-            Err(BeaconError::HttpError("simulated BN error".to_string()))
-        }
-
+    impl NodeStatusApi for ErrorBeacon {
         async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
@@ -259,6 +288,20 @@ mod tests {
         ) -> Result<ValidatorsResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
+
+        async fn get_block_root(&self, _block_id: &str) -> Result<BlockRootResponse, BeaconError> {
+            Err(BeaconError::HttpError("simulated BN error".to_string()))
+        }
+        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn get_node_version(&self) -> Result<String, BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl DutiesProvider for ErrorBeacon {
         async fn get_attester_duties(
             &self,
             _epoch: u64,
@@ -279,6 +322,10 @@ mod tests {
         ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
+    }
+
+    #[async_trait]
+    impl BlockProducer for ErrorBeacon {
         async fn produce_block_v3(
             &self,
             _slot: u64,
@@ -302,6 +349,22 @@ mod tests {
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
+        async fn prepare_beacon_proposer(
+            &self,
+            _preparations: &[ProposerPreparation],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+        async fn register_validators(
+            &self,
+            _registrations: &[SignedValidatorRegistration],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl AttestationApi for ErrorBeacon {
         async fn get_attestation_data(
             &self,
             _slot: u64,
@@ -329,6 +392,16 @@ mod tests {
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
+        async fn submit_beacon_committee_subscriptions(
+            &self,
+            _subscriptions: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".to_string()))
+        }
+    }
+
+    #[async_trait]
+    impl SyncCommitteeApi for ErrorBeacon {
         async fn submit_sync_committee_messages(
             &self,
             _messages: &[SyncCommitteeMessage],
@@ -349,31 +422,20 @@ mod tests {
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
-        async fn prepare_beacon_proposer(
+    }
+
+    #[async_trait]
+    impl LivenessApi for ErrorBeacon {
+        async fn post_validator_liveness(
             &self,
-            _preparations: &[ProposerPreparation],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _subscriptions: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn register_validators(
-            &self,
-            _registrations: &[SignedValidatorRegistration],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".to_string()))
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
+            _epoch: u64,
+            _validator_indices: &[String],
+        ) -> Result<ValidatorLivenessResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".to_string()))
         }
     }
+
+    impl BeaconNodeClient for ErrorBeacon {}
 
     // -----------------------------------------------------------------------
     // Tests

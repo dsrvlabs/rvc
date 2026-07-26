@@ -111,7 +111,10 @@ pub(crate) fn find_pubkey(pubkey_map: &PubkeyMap, duty_pubkey: &str) -> Option<P
 ///
 /// Compares against [`PublicKey::to_bytes`] so callers with `[u8; 48]` do not
 /// re-encode to hex solely for map lookup.
-pub(crate) fn find_pubkey_bytes(pubkey_map: &PubkeyMap, duty_pubkey: &[u8; 48]) -> Option<PublicKey> {
+pub(crate) fn find_pubkey_bytes(
+    pubkey_map: &PubkeyMap,
+    duty_pubkey: &[u8; 48],
+) -> Option<PublicKey> {
     let map = pubkey_map.read();
     map.values().find(|pk| &pk.to_bytes() == duty_pubkey).cloned()
 }

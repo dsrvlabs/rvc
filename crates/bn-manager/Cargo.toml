@@ -12,6 +12,12 @@ categories = ["cryptography::cryptocurrencies"]
 [lints]
 workspace = true
 
+[features]
+default = []
+# Exposes MockBeaconNodeClient for cross-crate tests. Do not enable on
+# production binary dependency lines.
+test-utils = []
+
 [dependencies]
 beacon = { workspace = true }
 observability = { workspace = true }

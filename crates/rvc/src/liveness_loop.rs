@@ -386,6 +386,10 @@ pub fn spawn_liveness_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bn_manager::{
+        AttestationApi, BeaconNodeClient, BlockProducer, DutiesProvider, LivenessApi,
+        NodeStatusApi, SyncCommitteeApi,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
@@ -482,7 +486,168 @@ mod tests {
     }
 
     #[async_trait]
-    impl BeaconNodeClient for MockLivenessBn {
+    impl NodeStatusApi for MockLivenessBn {
+        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn get_fork(&self, _: &str) -> Result<StateForkResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+
+        async fn get_validators(
+            &self,
+            pubkeys: &[String],
+        ) -> Result<ValidatorsResponse, BeaconError> {
+            let vmap = self.validators.read();
+            let data = pubkeys
+                .iter()
+                .filter_map(|pk| {
+                    let idx = vmap.get(pk)?;
+                    Some(ValidatorData {
+                        index: idx.clone(),
+                        status: "active_ongoing".to_string(),
+                        validator: ValidatorInfo { pubkey: pk.clone() },
+                    })
+                })
+                .collect();
+            Ok(ValidatorsResponse { data })
+        }
+        async fn get_block_root(&self, _: &str) -> Result<BlockRootResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn get_node_version(&self) -> Result<String, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+    }
+
+    #[async_trait]
+    impl DutiesProvider for MockLivenessBn {
+        async fn get_attester_duties(
+            &self,
+            _: u64,
+            _: &[String],
+        ) -> Result<AttesterDutiesResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn get_proposer_duties(&self, _: u64) -> Result<ProposerDutiesResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn post_sync_committee_duties(
+            &self,
+            _: u64,
+            _: &[String],
+        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+    }
+
+    #[async_trait]
+    impl BlockProducer for MockLivenessBn {
+        async fn produce_block_v3(
+            &self,
+            _: u64,
+            _: &str,
+            _: Option<&str>,
+            _: Option<u64>,
+        ) -> Result<ProduceBlockResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn publish_block(&self, _: &SignedBeaconBlock, _: &str) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn publish_blinded_block(
+            &self,
+            _: &SignedBlindedBeaconBlock,
+            _: &str,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn prepare_beacon_proposer(
+            &self,
+            _: &[ProposerPreparation],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn register_validators(
+            &self,
+            _: &[eth_types::SignedValidatorRegistration],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+    }
+
+    #[async_trait]
+    impl AttestationApi for MockLivenessBn {
+        async fn get_attestation_data(
+            &self,
+            _: u64,
+            _: u64,
+        ) -> Result<AttestationDataResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn submit_attestation(
+            &self,
+            _: &VersionedAttestation,
+        ) -> Result<SubmitAttestationResult, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn get_aggregate_attestation(
+            &self,
+            _: u64,
+            _: &str,
+            _: Option<u64>,
+        ) -> Result<VersionedAggregateAttestation, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn submit_aggregate_and_proofs(
+            &self,
+            _: &VersionedSignedAggregateAndProof,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn submit_beacon_committee_subscriptions(
+            &self,
+            _: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+    }
+
+    #[async_trait]
+    impl SyncCommitteeApi for MockLivenessBn {
+        async fn submit_sync_committee_messages(
+            &self,
+            _: &[SyncCommitteeMessage],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn get_sync_committee_contribution(
+            &self,
+            _: u64,
+            _: u64,
+            _: &str,
+        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn submit_contribution_and_proofs(
+            &self,
+            _: &[SignedContributionAndProof],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+    }
+
+    #[async_trait]
+    impl LivenessApi for MockLivenessBn {
         async fn post_validator_liveness(
             &self,
             _epoch: u64,
@@ -512,149 +677,9 @@ mod tests {
                 .collect();
             Ok(ValidatorLivenessResponse { data })
         }
-
-        async fn get_validators(
-            &self,
-            pubkeys: &[String],
-        ) -> Result<ValidatorsResponse, BeaconError> {
-            let vmap = self.validators.read();
-            let data = pubkeys
-                .iter()
-                .filter_map(|pk| {
-                    let idx = vmap.get(pk)?;
-                    Some(ValidatorData {
-                        index: idx.clone(),
-                        status: "active_ongoing".to_string(),
-                        validator: ValidatorInfo { pubkey: pk.clone() },
-                    })
-                })
-                .collect();
-            Ok(ValidatorsResponse { data })
-        }
-
-        async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_fork(&self, _: &str) -> Result<StateForkResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_attester_duties(
-            &self,
-            _: u64,
-            _: &[String],
-        ) -> Result<AttesterDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_proposer_duties(&self, _: u64) -> Result<ProposerDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn post_sync_committee_duties(
-            &self,
-            _: u64,
-            _: &[String],
-        ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn produce_block_v3(
-            &self,
-            _: u64,
-            _: &str,
-            _: Option<&str>,
-            _: Option<u64>,
-        ) -> Result<ProduceBlockResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn publish_block(&self, _: &SignedBeaconBlock, _: &str) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn publish_blinded_block(
-            &self,
-            _: &SignedBlindedBeaconBlock,
-            _: &str,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_attestation_data(
-            &self,
-            _: u64,
-            _: u64,
-        ) -> Result<AttestationDataResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_attestation(
-            &self,
-            _: &VersionedAttestation,
-        ) -> Result<SubmitAttestationResult, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_aggregate_attestation(
-            &self,
-            _: u64,
-            _: &str,
-            _: Option<u64>,
-        ) -> Result<VersionedAggregateAttestation, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_aggregate_and_proofs(
-            &self,
-            _: &VersionedSignedAggregateAndProof,
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_sync_committee_messages(
-            &self,
-            _: &[SyncCommitteeMessage],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_sync_committee_contribution(
-            &self,
-            _: u64,
-            _: u64,
-            _: &str,
-        ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_contribution_and_proofs(
-            &self,
-            _: &[SignedContributionAndProof],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_block_root(&self, _: &str) -> Result<BlockRootResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn prepare_beacon_proposer(
-            &self,
-            _: &[ProposerPreparation],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn register_validators(
-            &self,
-            _: &[eth_types::SignedValidatorRegistration],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
     }
+
+    impl BeaconNodeClient for MockLivenessBn {}
 
     /// Wrapper that implements failover: try primary, then secondary.
     struct FailoverLivenessClient {
@@ -663,18 +688,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl BeaconNodeClient for FailoverLivenessClient {
-        async fn post_validator_liveness(
-            &self,
-            epoch: u64,
-            validator_indices: &[String],
-        ) -> Result<ValidatorLivenessResponse, BeaconError> {
-            match self.primary.post_validator_liveness(epoch, validator_indices).await {
-                Ok(r) => Ok(r),
-                Err(_) => self.secondary.post_validator_liveness(epoch, validator_indices).await,
-            }
-        }
-
+    impl NodeStatusApi for FailoverLivenessClient {
         async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".into()))
         }
@@ -690,6 +704,19 @@ mod tests {
         async fn get_validators(&self, _: &[String]) -> Result<ValidatorsResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".into()))
         }
+        async fn get_block_root(&self, _: &str) -> Result<BlockRootResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn get_node_version(&self) -> Result<String, BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+    }
+
+    #[async_trait]
+    impl DutiesProvider for FailoverLivenessClient {
         async fn get_attester_duties(
             &self,
             _: u64,
@@ -707,6 +734,10 @@ mod tests {
         ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
             Err(BeaconError::HttpError("mock".into()))
         }
+    }
+
+    #[async_trait]
+    impl BlockProducer for FailoverLivenessClient {
         async fn produce_block_v3(
             &self,
             _: u64,
@@ -726,6 +757,22 @@ mod tests {
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".into()))
         }
+        async fn prepare_beacon_proposer(
+            &self,
+            _: &[ProposerPreparation],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+        async fn register_validators(
+            &self,
+            _: &[eth_types::SignedValidatorRegistration],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+    }
+
+    #[async_trait]
+    impl AttestationApi for FailoverLivenessClient {
         async fn get_attestation_data(
             &self,
             _: u64,
@@ -753,6 +800,16 @@ mod tests {
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".into()))
         }
+        async fn submit_beacon_committee_subscriptions(
+            &self,
+            _: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("mock".into()))
+        }
+    }
+
+    #[async_trait]
+    impl SyncCommitteeApi for FailoverLivenessClient {
         async fn submit_sync_committee_messages(
             &self,
             _: &[SyncCommitteeMessage],
@@ -773,34 +830,23 @@ mod tests {
         ) -> Result<(), BeaconError> {
             Err(BeaconError::HttpError("mock".into()))
         }
-        async fn get_block_root(&self, _: &str) -> Result<BlockRootResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn prepare_beacon_proposer(
+    }
+
+    #[async_trait]
+    impl LivenessApi for FailoverLivenessClient {
+        async fn post_validator_liveness(
             &self,
-            _: &[ProposerPreparation],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn submit_beacon_committee_subscriptions(
-            &self,
-            _: &[BeaconCommitteeSubscription],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn register_validators(
-            &self,
-            _: &[eth_types::SignedValidatorRegistration],
-        ) -> Result<(), BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
-        }
-        async fn get_node_version(&self) -> Result<String, BeaconError> {
-            Err(BeaconError::HttpError("mock".into()))
+            epoch: u64,
+            validator_indices: &[String],
+        ) -> Result<ValidatorLivenessResponse, BeaconError> {
+            match self.primary.post_validator_liveness(epoch, validator_indices).await {
+                Ok(r) => Ok(r),
+                Err(_) => self.secondary.post_validator_liveness(epoch, validator_indices).await,
+            }
         }
     }
+
+    impl BeaconNodeClient for FailoverLivenessClient {}
 
     fn loop_with(
         machine: Arc<ForwardWindowMachine>,

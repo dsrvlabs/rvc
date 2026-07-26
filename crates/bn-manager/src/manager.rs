@@ -30,7 +30,10 @@ use crate::sse::{self, SseConfig, SseEvent};
 use crate::sync_status::{
     check_all_sync_statuses, new_shared_sync_statuses, start_sync_monitor, SharedSyncStatuses,
 };
-use crate::traits::{BeaconNodeClient, BnHealthScore, BnManagerConfig, OperationTimeouts};
+use crate::traits::{
+    AttestationApi, BeaconNodeClient, BlockProducer, BnHealthScore, BnManagerConfig,
+    DutiesProvider, LivenessApi, NodeStatusApi, OperationTimeouts, SyncCommitteeApi,
+};
 use crate::types::{BnRole, HealthTier, TierThresholds};
 use crate::BnManagerError;
 
@@ -811,7 +814,7 @@ fn is_better_block(a: &ProduceBlockResponse, b: &ProduceBlockResponse) -> bool {
 }
 
 #[async_trait]
-impl BeaconNodeClient for BnManager {
+impl NodeStatusApi for BnManager {
     // -- State / Config: query(First), any role, accept SmallLag --
 
     async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
@@ -849,6 +852,34 @@ impl BeaconNodeClient for BnManager {
         .await
     }
 
+    // -- Blocks --
+
+    async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
+        self.query_first("get_block_root", BnRole::All, HealthTier::SmallLag, |c| {
+            Box::pin(c.get_block_root(block_id))
+        })
+        .await
+    }
+
+    // -- Node status: query(First), any role --
+
+    async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+        self.query_first("get_node_syncing", BnRole::All, HealthTier::Unsynced, |c| {
+            Box::pin(c.get_node_syncing())
+        })
+        .await
+    }
+
+    async fn get_node_version(&self) -> Result<String, BeaconError> {
+        self.query_first("get_node_version", BnRole::All, HealthTier::Unsynced, |c| {
+            Box::pin(c.get_node_version())
+        })
+        .await
+    }
+}
+
+#[async_trait]
+impl DutiesProvider for BnManager {
     // -- Duties: query(First) + duty_fetch timeout, accept SmallLag --
 
     async fn get_attester_duties(
@@ -897,7 +928,10 @@ impl BeaconNodeClient for BnManager {
         )
         .await
     }
+}
 
+#[async_trait]
+impl BlockProducer for BnManager {
     // -- Block production: query(Best), Proposal role, require Synced --
 
     async fn produce_block_v3(
@@ -985,6 +1019,41 @@ impl BeaconNodeClient for BnManager {
         }
     }
 
+    // -- Proposer preparation: broadcast --
+
+    async fn prepare_beacon_proposer(
+        &self,
+        preparations: &[ProposerPreparation],
+    ) -> Result<(), BeaconError> {
+        self.with_op_timeout(
+            "prepare_beacon_proposer",
+            self.op_timeout(|t| t.preparation),
+            self.broadcast("prepare_beacon_proposer", |c| {
+                Box::pin(c.prepare_beacon_proposer(preparations))
+            }),
+        )
+        .await
+    }
+
+    // -- Builder: broadcast --
+
+    async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistration],
+    ) -> Result<(), BeaconError> {
+        self.with_op_timeout(
+            "register_validators",
+            self.op_timeout(|t| t.preparation),
+            self.broadcast("register_validators", |c| {
+                Box::pin(c.register_validators(registrations))
+            }),
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl AttestationApi for BnManager {
     // -- Attestation data: query(First), Attestation role, accept SmallLag --
 
     async fn get_attestation_data(
@@ -1076,6 +1145,39 @@ impl BeaconNodeClient for BnManager {
         .await
     }
 
+    // -- Committee subscriptions: broadcast or Submission role --
+
+    async fn submit_beacon_committee_subscriptions(
+        &self,
+        subscriptions: &[BeaconCommitteeSubscription],
+    ) -> Result<(), BeaconError> {
+        if self.broadcast_topics.subscriptions {
+            self.with_op_timeout(
+                "submit_beacon_committee_subscriptions",
+                self.op_timeout(|t| t.preparation),
+                self.broadcast("submit_beacon_committee_subscriptions", |c| {
+                    Box::pin(c.submit_beacon_committee_subscriptions(subscriptions))
+                }),
+            )
+            .await
+        } else {
+            self.with_op_timeout(
+                "submit_beacon_committee_subscriptions",
+                self.op_timeout(|t| t.preparation),
+                self.query_first(
+                    "submit_beacon_committee_subscriptions",
+                    BnRole::Submission,
+                    HealthTier::LargeLag,
+                    |c| Box::pin(c.submit_beacon_committee_subscriptions(subscriptions)),
+                ),
+            )
+            .await
+        }
+    }
+}
+
+#[async_trait]
+impl SyncCommitteeApi for BnManager {
     // -- Sync committee: SyncCommittee role, accept SmallLag --
 
     async fn submit_sync_committee_messages(
@@ -1144,94 +1246,10 @@ impl BeaconNodeClient for BnManager {
         )
         .await
     }
+}
 
-    // -- Blocks --
-
-    async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-        self.query_first("get_block_root", BnRole::All, HealthTier::SmallLag, |c| {
-            Box::pin(c.get_block_root(block_id))
-        })
-        .await
-    }
-
-    // -- Proposer preparation: broadcast --
-
-    async fn prepare_beacon_proposer(
-        &self,
-        preparations: &[ProposerPreparation],
-    ) -> Result<(), BeaconError> {
-        self.with_op_timeout(
-            "prepare_beacon_proposer",
-            self.op_timeout(|t| t.preparation),
-            self.broadcast("prepare_beacon_proposer", |c| {
-                Box::pin(c.prepare_beacon_proposer(preparations))
-            }),
-        )
-        .await
-    }
-
-    // -- Committee subscriptions: broadcast or Submission role --
-
-    async fn submit_beacon_committee_subscriptions(
-        &self,
-        subscriptions: &[BeaconCommitteeSubscription],
-    ) -> Result<(), BeaconError> {
-        if self.broadcast_topics.subscriptions {
-            self.with_op_timeout(
-                "submit_beacon_committee_subscriptions",
-                self.op_timeout(|t| t.preparation),
-                self.broadcast("submit_beacon_committee_subscriptions", |c| {
-                    Box::pin(c.submit_beacon_committee_subscriptions(subscriptions))
-                }),
-            )
-            .await
-        } else {
-            self.with_op_timeout(
-                "submit_beacon_committee_subscriptions",
-                self.op_timeout(|t| t.preparation),
-                self.query_first(
-                    "submit_beacon_committee_subscriptions",
-                    BnRole::Submission,
-                    HealthTier::LargeLag,
-                    |c| Box::pin(c.submit_beacon_committee_subscriptions(subscriptions)),
-                ),
-            )
-            .await
-        }
-    }
-
-    // -- Builder: broadcast --
-
-    async fn register_validators(
-        &self,
-        registrations: &[SignedValidatorRegistration],
-    ) -> Result<(), BeaconError> {
-        self.with_op_timeout(
-            "register_validators",
-            self.op_timeout(|t| t.preparation),
-            self.broadcast("register_validators", |c| {
-                Box::pin(c.register_validators(registrations))
-            }),
-        )
-        .await
-    }
-
-    // -- Node status: query(First), any role --
-
-    async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-        self.query_first("get_node_syncing", BnRole::All, HealthTier::Unsynced, |c| {
-            Box::pin(c.get_node_syncing())
-        })
-        .await
-    }
-
-    async fn get_node_version(&self) -> Result<String, BeaconError> {
-        self.query_first("get_node_version", BnRole::All, HealthTier::Unsynced, |c| {
-            Box::pin(c.get_node_version())
-        })
-        .await
-    }
-
+#[async_trait]
+impl LivenessApi for BnManager {
     // -- Doppelganger / liveness (SEC-2c): query_first failover, SmallLag --
 
     async fn post_validator_liveness(
@@ -1246,10 +1264,12 @@ impl BeaconNodeClient for BnManager {
     }
 }
 
+impl BeaconNodeClient for BnManager {}
+
 /// Implements `BeaconNodeClient` for `BeaconClient` directly, useful for tests
 /// and cases where single-BN behavior without `BnManager` wrapping is desired.
 #[async_trait]
-impl BeaconNodeClient for BeaconClient {
+impl NodeStatusApi for BeaconClient {
     async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
         self.get_genesis().await
     }
@@ -1270,6 +1290,21 @@ impl BeaconNodeClient for BeaconClient {
         self.get_validators(pubkeys).await
     }
 
+    async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
+        self.get_block_root(block_id).await
+    }
+
+    async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+        self.get_node_syncing().await
+    }
+
+    async fn get_node_version(&self) -> Result<String, BeaconError> {
+        self.get_node_version().await
+    }
+}
+
+#[async_trait]
+impl DutiesProvider for BeaconClient {
     async fn get_attester_duties(
         &self,
         epoch: u64,
@@ -1289,7 +1324,10 @@ impl BeaconNodeClient for BeaconClient {
     ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
         self.post_sync_committee_duties(epoch, validator_indices).await
     }
+}
 
+#[async_trait]
+impl BlockProducer for BeaconClient {
     async fn produce_block_v3(
         &self,
         slot: u64,
@@ -1316,6 +1354,23 @@ impl BeaconNodeClient for BeaconClient {
         BeaconClient::publish_blinded_block(self, signed_blinded_block, consensus_version).await
     }
 
+    async fn prepare_beacon_proposer(
+        &self,
+        preparations: &[ProposerPreparation],
+    ) -> Result<(), BeaconError> {
+        self.prepare_beacon_proposer(preparations).await
+    }
+
+    async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistration],
+    ) -> Result<(), BeaconError> {
+        self.register_validators(registrations).await
+    }
+}
+
+#[async_trait]
+impl AttestationApi for BeaconClient {
     async fn get_attestation_data(
         &self,
         slot: u64,
@@ -1347,6 +1402,16 @@ impl BeaconNodeClient for BeaconClient {
         self.submit_aggregate_and_proofs(proofs).await
     }
 
+    async fn submit_beacon_committee_subscriptions(
+        &self,
+        subscriptions: &[BeaconCommitteeSubscription],
+    ) -> Result<(), BeaconError> {
+        self.submit_beacon_committee_subscriptions(subscriptions).await
+    }
+}
+
+#[async_trait]
+impl SyncCommitteeApi for BeaconClient {
     async fn submit_sync_committee_messages(
         &self,
         messages: &[SyncCommitteeMessage],
@@ -1369,40 +1434,10 @@ impl BeaconNodeClient for BeaconClient {
     ) -> Result<(), BeaconError> {
         self.submit_contribution_and_proofs(proofs).await
     }
+}
 
-    async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-        self.get_block_root(block_id).await
-    }
-
-    async fn prepare_beacon_proposer(
-        &self,
-        preparations: &[ProposerPreparation],
-    ) -> Result<(), BeaconError> {
-        self.prepare_beacon_proposer(preparations).await
-    }
-
-    async fn submit_beacon_committee_subscriptions(
-        &self,
-        subscriptions: &[BeaconCommitteeSubscription],
-    ) -> Result<(), BeaconError> {
-        self.submit_beacon_committee_subscriptions(subscriptions).await
-    }
-
-    async fn register_validators(
-        &self,
-        registrations: &[SignedValidatorRegistration],
-    ) -> Result<(), BeaconError> {
-        self.register_validators(registrations).await
-    }
-
-    async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-        self.get_node_syncing().await
-    }
-
-    async fn get_node_version(&self) -> Result<String, BeaconError> {
-        self.get_node_version().await
-    }
-
+#[async_trait]
+impl LivenessApi for BeaconClient {
     async fn post_validator_liveness(
         &self,
         epoch: u64,
@@ -1411,6 +1446,8 @@ impl BeaconNodeClient for BeaconClient {
         BeaconClient::post_validator_liveness(self, epoch, validator_indices).await
     }
 }
+
+impl BeaconNodeClient for BeaconClient {}
 
 #[cfg(test)]
 mod tests {

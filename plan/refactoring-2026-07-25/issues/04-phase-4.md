@@ -1340,14 +1340,14 @@ Supertrait composition keeps `dyn BeaconNodeClient` object-safe, keeps every cur
 4. Do **not** delete any hand mock here — that is RF4-24/25.
 
 **Acceptance criteria:**
-- [ ] Six role traits exist; `BeaconNodeClient` is their empty supertrait and remains object-safe
+- [x] Six role traits exist; `BeaconNodeClient` is their empty supertrait and remains object-safe
       (`fn _assert(_: &dyn BeaconNodeClient)` compiles, per `traits.rs:311`).
-- [ ] Every existing `Arc<dyn BeaconNodeClient>` call site compiles **unchanged**.
-- [ ] The shared mock is exported behind `test-utils`, errors by default, supports per-method overrides
+- [x] Every existing `Arc<dyn BeaconNodeClient>` call site compiles **unchanged**.
+- [x] The shared mock is exported behind `test-utils`, errors by default, supports per-method overrides
       and captures call arguments.
-- [ ] `post_validator_liveness`'s error-returning default impl (if present) is removed so an unimplemented
+- [x] `post_validator_liveness`'s error-returning default impl (if present) is removed so an unimplemented
       method is a compile error, not a runtime failure.
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_mock_with_only_duties_role_compiles_and_serves_duties` — a test implementing only

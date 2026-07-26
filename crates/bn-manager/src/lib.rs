@@ -4,6 +4,8 @@ mod broadcast;
 mod error;
 mod health;
 mod manager;
+#[cfg(any(test, feature = "test-utils"))]
+mod mock;
 pub mod sse;
 mod sync_status;
 mod traits;
@@ -11,13 +13,17 @@ pub mod types;
 
 pub use error::BnManagerError;
 pub use manager::BnManager;
+#[cfg(any(test, feature = "test-utils"))]
+pub use mock::MockBeaconNodeClient;
 pub use sse::{
     parse_sse_event, BlockEvent, ChainReorgEvent, FinalizedCheckpointEvent, HeadEvent, SseConfig,
     SseConnectionState, SseError, SseEvent, DEFAULT_SSE_TOPICS,
 };
 pub use sync_status::{BnSyncDetail, BnSyncStatus, SharedSyncStatuses};
 pub use traits::{
-    BeaconNodeClient, BnHealthScore, BnManagerConfig, BroadcastTopics, OperationTimeouts,
+    AttestationApi, BeaconNodeClient, BlockProducer, BnHealthScore, BnManagerConfig,
+    BroadcastTopics, DutiesProvider, LivenessApi, NodeStatusApi, OperationTimeouts,
+    SyncCommitteeApi,
 };
 pub use types::{BnRole, HealthTier, TierThresholds};
 

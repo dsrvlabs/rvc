@@ -7,7 +7,7 @@ mod commands;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
-use bn_manager::BeaconNodeClient;
+use bn_manager::{BeaconNodeClient, NodeStatusApi};
 use clap::{Parser, Subcommand};
 use metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
 use rvc::config::{redact_url, CliOverrides, Config, Network, ServiceBuilder};

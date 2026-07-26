@@ -1,0 +1,656 @@
+//! Shared configurable mock for [`crate::BeaconNodeClient`].
+//!
+//! Gated by `cfg(any(test, feature = "test-utils"))`. Errors by default for
+//! every method; override per method with the `with_*` builders. Call arguments
+//! are captured for assertions.
+
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+
+use beacon::{
+    AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
+    BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
+    ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof, StateForkResponse,
+    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+};
+use eth_types::{
+    ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
+};
+
+use crate::traits::{
+    AttestationApi, BeaconNodeClient, BlockProducer, DutiesProvider, LivenessApi, NodeStatusApi,
+    SyncCommitteeApi,
+};
+
+type Handler<A, R> = Arc<dyn Fn(A) -> Result<R, BeaconError> + Send + Sync>;
+
+struct MethodHook<A, R> {
+    handler: Mutex<Option<Handler<A, R>>>,
+    calls: Mutex<Vec<A>>,
+}
+
+impl<A, R> Default for MethodHook<A, R> {
+    fn default() -> Self {
+        Self { handler: Mutex::new(None), calls: Mutex::new(Vec::new()) }
+    }
+}
+
+impl<A: Clone, R> MethodHook<A, R> {
+    fn invoke(&self, method: &'static str, args: A) -> Result<R, BeaconError> {
+        self.calls.lock().expect("mock call log poisoned").push(args.clone());
+        match self.handler.lock().expect("mock handler poisoned").as_ref() {
+            Some(h) => h(args),
+            None => Err(BeaconError::HttpError(format!(
+                "MockBeaconNodeClient: {method} not configured"
+            ))),
+        }
+    }
+
+    fn set_handler(&self, f: Handler<A, R>) {
+        *self.handler.lock().expect("mock handler poisoned") = Some(f);
+    }
+
+    fn calls(&self) -> Vec<A> {
+        self.calls.lock().expect("mock call log poisoned").clone()
+    }
+}
+
+/// Erroring-by-default mock implementing all role traits and [`BeaconNodeClient`].
+///
+/// Configure responses with `with_*` builders; inspect captured arguments with
+/// `*_calls` accessors.
+#[derive(Default)]
+pub struct MockBeaconNodeClient {
+    // NodeStatusApi
+    get_genesis: MethodHook<(), GenesisResponse>,
+    get_config_spec: MethodHook<(), ConfigSpecResponse>,
+    get_fork_schedule: MethodHook<(), ForkSchedule>,
+    get_fork: MethodHook<String, StateForkResponse>,
+    get_validators: MethodHook<Vec<String>, ValidatorsResponse>,
+    get_block_root: MethodHook<String, BlockRootResponse>,
+    get_node_syncing: MethodHook<(), SyncingResponse>,
+    get_node_version: MethodHook<(), String>,
+    // DutiesProvider
+    get_attester_duties: MethodHook<(u64, Vec<String>), AttesterDutiesResponse>,
+    get_proposer_duties: MethodHook<u64, ProposerDutiesResponse>,
+    post_sync_committee_duties: MethodHook<(u64, Vec<String>), SyncCommitteeDutiesResponse>,
+    // BlockProducer
+    produce_block_v3: MethodHook<(u64, String, Option<String>, Option<u64>), ProduceBlockResponse>,
+    publish_block: MethodHook<(SignedBeaconBlock, String), ()>,
+    publish_blinded_block: MethodHook<(SignedBlindedBeaconBlock, String), ()>,
+    prepare_beacon_proposer: MethodHook<Vec<ProposerPreparation>, ()>,
+    register_validators: MethodHook<Vec<SignedValidatorRegistration>, ()>,
+    // AttestationApi
+    get_attestation_data: MethodHook<(u64, u64), AttestationDataResponse>,
+    submit_attestation: MethodHook<VersionedAttestation, SubmitAttestationResult>,
+    get_aggregate_attestation:
+        MethodHook<(u64, String, Option<u64>), VersionedAggregateAttestation>,
+    submit_aggregate_and_proofs: MethodHook<VersionedSignedAggregateAndProof, ()>,
+    submit_beacon_committee_subscriptions: MethodHook<Vec<BeaconCommitteeSubscription>, ()>,
+    // SyncCommitteeApi
+    submit_sync_committee_messages: MethodHook<Vec<SyncCommitteeMessage>, ()>,
+    get_sync_committee_contribution:
+        MethodHook<(u64, u64, String), SyncCommitteeContributionResponse>,
+    submit_contribution_and_proofs: MethodHook<Vec<SignedContributionAndProof>, ()>,
+    // LivenessApi
+    post_validator_liveness: MethodHook<(u64, Vec<String>), ValidatorLivenessResponse>,
+}
+
+impl MockBeaconNodeClient {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    // -- NodeStatusApi builders --
+
+    pub fn with_get_genesis(
+        self,
+        f: impl Fn() -> Result<GenesisResponse, BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_genesis.set_handler(Arc::new(move |()| f()));
+        self
+    }
+
+    pub fn with_get_config_spec(
+        self,
+        f: impl Fn() -> Result<ConfigSpecResponse, BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_config_spec.set_handler(Arc::new(move |()| f()));
+        self
+    }
+
+    pub fn with_get_fork_schedule(
+        self,
+        f: impl Fn() -> Result<ForkSchedule, BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_fork_schedule.set_handler(Arc::new(move |()| f()));
+        self
+    }
+
+    pub fn with_get_fork(
+        self,
+        f: impl Fn(String) -> Result<StateForkResponse, BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_fork.set_handler(Arc::new(f));
+        self
+    }
+
+    pub fn with_get_validators(
+        self,
+        f: impl Fn(Vec<String>) -> Result<ValidatorsResponse, BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_validators.set_handler(Arc::new(f));
+        self
+    }
+
+    pub fn with_get_block_root(
+        self,
+        f: impl Fn(String) -> Result<BlockRootResponse, BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_block_root.set_handler(Arc::new(f));
+        self
+    }
+
+    pub fn with_get_node_syncing(
+        self,
+        f: impl Fn() -> Result<SyncingResponse, BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_node_syncing.set_handler(Arc::new(move |()| f()));
+        self
+    }
+
+    pub fn with_get_node_version(
+        self,
+        f: impl Fn() -> Result<String, BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_node_version.set_handler(Arc::new(move |()| f()));
+        self
+    }
+
+    // -- DutiesProvider builders --
+
+    pub fn with_get_attester_duties(
+        self,
+        f: impl Fn(u64, Vec<String>) -> Result<AttesterDutiesResponse, BeaconError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.get_attester_duties.set_handler(Arc::new(move |(epoch, indices)| f(epoch, indices)));
+        self
+    }
+
+    pub fn with_get_proposer_duties(
+        self,
+        f: impl Fn(u64) -> Result<ProposerDutiesResponse, BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_proposer_duties.set_handler(Arc::new(f));
+        self
+    }
+
+    pub fn with_post_sync_committee_duties(
+        self,
+        f: impl Fn(u64, Vec<String>) -> Result<SyncCommitteeDutiesResponse, BeaconError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.post_sync_committee_duties
+            .set_handler(Arc::new(move |(epoch, indices)| f(epoch, indices)));
+        self
+    }
+
+    // -- BlockProducer builders --
+
+    pub fn with_produce_block_v3(
+        self,
+        f: impl Fn(
+                u64,
+                String,
+                Option<String>,
+                Option<u64>,
+            ) -> Result<ProduceBlockResponse, BeaconError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.produce_block_v3.set_handler(Arc::new(move |(slot, randao, graffiti, boost)| {
+            f(slot, randao, graffiti, boost)
+        }));
+        self
+    }
+
+    pub fn with_publish_block(
+        self,
+        f: impl Fn(SignedBeaconBlock, String) -> Result<(), BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.publish_block.set_handler(Arc::new(move |(block, version)| f(block, version)));
+        self
+    }
+
+    pub fn with_publish_blinded_block(
+        self,
+        f: impl Fn(SignedBlindedBeaconBlock, String) -> Result<(), BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.publish_blinded_block.set_handler(Arc::new(move |(block, version)| f(block, version)));
+        self
+    }
+
+    pub fn with_prepare_beacon_proposer(
+        self,
+        f: impl Fn(Vec<ProposerPreparation>) -> Result<(), BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.prepare_beacon_proposer.set_handler(Arc::new(f));
+        self
+    }
+
+    pub fn with_register_validators(
+        self,
+        f: impl Fn(Vec<SignedValidatorRegistration>) -> Result<(), BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.register_validators.set_handler(Arc::new(f));
+        self
+    }
+
+    // -- AttestationApi builders --
+
+    pub fn with_get_attestation_data(
+        self,
+        f: impl Fn(u64, u64) -> Result<AttestationDataResponse, BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_attestation_data
+            .set_handler(Arc::new(move |(slot, committee_index)| f(slot, committee_index)));
+        self
+    }
+
+    pub fn with_submit_attestation(
+        self,
+        f: impl Fn(VersionedAttestation) -> Result<SubmitAttestationResult, BeaconError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.submit_attestation.set_handler(Arc::new(f));
+        self
+    }
+
+    pub fn with_get_aggregate_attestation(
+        self,
+        f: impl Fn(u64, String, Option<u64>) -> Result<VersionedAggregateAttestation, BeaconError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.get_aggregate_attestation
+            .set_handler(Arc::new(move |(slot, root, idx)| f(slot, root, idx)));
+        self
+    }
+
+    pub fn with_submit_aggregate_and_proofs(
+        self,
+        f: impl Fn(VersionedSignedAggregateAndProof) -> Result<(), BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.submit_aggregate_and_proofs.set_handler(Arc::new(f));
+        self
+    }
+
+    pub fn with_submit_beacon_committee_subscriptions(
+        self,
+        f: impl Fn(Vec<BeaconCommitteeSubscription>) -> Result<(), BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.submit_beacon_committee_subscriptions.set_handler(Arc::new(f));
+        self
+    }
+
+    // -- SyncCommitteeApi builders --
+
+    pub fn with_submit_sync_committee_messages(
+        self,
+        f: impl Fn(Vec<SyncCommitteeMessage>) -> Result<(), BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.submit_sync_committee_messages.set_handler(Arc::new(f));
+        self
+    }
+
+    pub fn with_get_sync_committee_contribution(
+        self,
+        f: impl Fn(u64, u64, String) -> Result<SyncCommitteeContributionResponse, BeaconError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.get_sync_committee_contribution
+            .set_handler(Arc::new(move |(slot, sub, root)| f(slot, sub, root)));
+        self
+    }
+
+    pub fn with_submit_contribution_and_proofs(
+        self,
+        f: impl Fn(Vec<SignedContributionAndProof>) -> Result<(), BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.submit_contribution_and_proofs.set_handler(Arc::new(f));
+        self
+    }
+
+    // -- LivenessApi builders --
+
+    pub fn with_post_validator_liveness(
+        self,
+        f: impl Fn(u64, Vec<String>) -> Result<ValidatorLivenessResponse, BeaconError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.post_validator_liveness
+            .set_handler(Arc::new(move |(epoch, indices)| f(epoch, indices)));
+        self
+    }
+
+    // -- Call capture accessors --
+
+    pub fn get_genesis_calls(&self) -> usize {
+        self.get_genesis.calls().len()
+    }
+
+    pub fn get_attester_duties_calls(&self) -> Vec<(u64, Vec<String>)> {
+        self.get_attester_duties.calls()
+    }
+
+    pub fn get_proposer_duties_calls(&self) -> Vec<u64> {
+        self.get_proposer_duties.calls()
+    }
+
+    pub fn post_validator_liveness_calls(&self) -> Vec<(u64, Vec<String>)> {
+        self.post_validator_liveness.calls()
+    }
+
+    pub fn prepare_beacon_proposer_calls(&self) -> Vec<Vec<ProposerPreparation>> {
+        self.prepare_beacon_proposer.calls()
+    }
+
+    pub fn register_validators_calls(&self) -> Vec<Vec<SignedValidatorRegistration>> {
+        self.register_validators.calls()
+    }
+
+    pub fn get_block_root_calls(&self) -> Vec<String> {
+        self.get_block_root.calls()
+    }
+
+    pub fn get_fork_calls(&self) -> Vec<String> {
+        self.get_fork.calls()
+    }
+
+    pub fn get_attestation_data_calls(&self) -> Vec<(u64, u64)> {
+        self.get_attestation_data.calls()
+    }
+
+    pub fn produce_block_v3_calls(&self) -> Vec<(u64, String, Option<String>, Option<u64>)> {
+        self.produce_block_v3.calls()
+    }
+
+    pub fn submit_sync_committee_messages_calls(&self) -> Vec<Vec<SyncCommitteeMessage>> {
+        self.submit_sync_committee_messages.calls()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Role trait impls
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl NodeStatusApi for MockBeaconNodeClient {
+    async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
+        self.get_genesis.invoke("get_genesis", ())
+    }
+
+    async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
+        self.get_config_spec.invoke("get_config_spec", ())
+    }
+
+    async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
+        self.get_fork_schedule.invoke("get_fork_schedule", ())
+    }
+
+    async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError> {
+        self.get_fork.invoke("get_fork", state_id.to_string())
+    }
+
+    async fn get_validators(&self, pubkeys: &[String]) -> Result<ValidatorsResponse, BeaconError> {
+        self.get_validators.invoke("get_validators", pubkeys.to_vec())
+    }
+
+    async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
+        self.get_block_root.invoke("get_block_root", block_id.to_string())
+    }
+
+    async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+        self.get_node_syncing.invoke("get_node_syncing", ())
+    }
+
+    async fn get_node_version(&self) -> Result<String, BeaconError> {
+        self.get_node_version.invoke("get_node_version", ())
+    }
+}
+
+#[async_trait]
+impl DutiesProvider for MockBeaconNodeClient {
+    async fn get_attester_duties(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<AttesterDutiesResponse, BeaconError> {
+        self.get_attester_duties.invoke("get_attester_duties", (epoch, validator_indices.to_vec()))
+    }
+
+    async fn get_proposer_duties(&self, epoch: u64) -> Result<ProposerDutiesResponse, BeaconError> {
+        self.get_proposer_duties.invoke("get_proposer_duties", epoch)
+    }
+
+    async fn post_sync_committee_duties(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
+        self.post_sync_committee_duties
+            .invoke("post_sync_committee_duties", (epoch, validator_indices.to_vec()))
+    }
+}
+
+#[async_trait]
+impl BlockProducer for MockBeaconNodeClient {
+    async fn produce_block_v3(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        self.produce_block_v3.invoke(
+            "produce_block_v3",
+            (slot, randao_reveal.to_string(), graffiti.map(str::to_string), builder_boost_factor),
+        )
+    }
+
+    async fn publish_block(
+        &self,
+        signed_block: &SignedBeaconBlock,
+        consensus_version: &str,
+    ) -> Result<(), BeaconError> {
+        self.publish_block
+            .invoke("publish_block", (signed_block.clone(), consensus_version.to_string()))
+    }
+
+    async fn publish_blinded_block(
+        &self,
+        signed_blinded_block: &SignedBlindedBeaconBlock,
+        consensus_version: &str,
+    ) -> Result<(), BeaconError> {
+        self.publish_blinded_block.invoke(
+            "publish_blinded_block",
+            (signed_blinded_block.clone(), consensus_version.to_string()),
+        )
+    }
+
+    async fn prepare_beacon_proposer(
+        &self,
+        preparations: &[ProposerPreparation],
+    ) -> Result<(), BeaconError> {
+        self.prepare_beacon_proposer.invoke("prepare_beacon_proposer", preparations.to_vec())
+    }
+
+    async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistration],
+    ) -> Result<(), BeaconError> {
+        self.register_validators.invoke("register_validators", registrations.to_vec())
+    }
+}
+
+#[async_trait]
+impl AttestationApi for MockBeaconNodeClient {
+    async fn get_attestation_data(
+        &self,
+        slot: u64,
+        committee_index: u64,
+    ) -> Result<AttestationDataResponse, BeaconError> {
+        self.get_attestation_data.invoke("get_attestation_data", (slot, committee_index))
+    }
+
+    async fn submit_attestation(
+        &self,
+        attestations: &VersionedAttestation,
+    ) -> Result<SubmitAttestationResult, BeaconError> {
+        self.submit_attestation.invoke("submit_attestation", attestations.clone())
+    }
+
+    async fn get_aggregate_attestation(
+        &self,
+        slot: u64,
+        attestation_data_root: &str,
+        committee_index: Option<u64>,
+    ) -> Result<VersionedAggregateAttestation, BeaconError> {
+        self.get_aggregate_attestation.invoke(
+            "get_aggregate_attestation",
+            (slot, attestation_data_root.to_string(), committee_index),
+        )
+    }
+
+    async fn submit_aggregate_and_proofs(
+        &self,
+        proofs: &VersionedSignedAggregateAndProof,
+    ) -> Result<(), BeaconError> {
+        self.submit_aggregate_and_proofs.invoke("submit_aggregate_and_proofs", proofs.clone())
+    }
+
+    async fn submit_beacon_committee_subscriptions(
+        &self,
+        subscriptions: &[BeaconCommitteeSubscription],
+    ) -> Result<(), BeaconError> {
+        self.submit_beacon_committee_subscriptions
+            .invoke("submit_beacon_committee_subscriptions", subscriptions.to_vec())
+    }
+}
+
+#[async_trait]
+impl SyncCommitteeApi for MockBeaconNodeClient {
+    async fn submit_sync_committee_messages(
+        &self,
+        messages: &[SyncCommitteeMessage],
+    ) -> Result<(), BeaconError> {
+        self.submit_sync_committee_messages
+            .invoke("submit_sync_committee_messages", messages.to_vec())
+    }
+
+    async fn get_sync_committee_contribution(
+        &self,
+        slot: u64,
+        subcommittee_index: u64,
+        beacon_block_root: &str,
+    ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
+        self.get_sync_committee_contribution.invoke(
+            "get_sync_committee_contribution",
+            (slot, subcommittee_index, beacon_block_root.to_string()),
+        )
+    }
+
+    async fn submit_contribution_and_proofs(
+        &self,
+        proofs: &[SignedContributionAndProof],
+    ) -> Result<(), BeaconError> {
+        self.submit_contribution_and_proofs
+            .invoke("submit_contribution_and_proofs", proofs.to_vec())
+    }
+}
+
+#[async_trait]
+impl LivenessApi for MockBeaconNodeClient {
+    async fn post_validator_liveness(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<ValidatorLivenessResponse, BeaconError> {
+        self.post_validator_liveness
+            .invoke("post_validator_liveness", (epoch, validator_indices.to_vec()))
+    }
+}
+
+impl BeaconNodeClient for MockBeaconNodeClient {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_shared_mock_errors_by_default_for_unconfigured_methods() {
+        let mock = MockBeaconNodeClient::new();
+        let err = mock.get_genesis().await.unwrap_err();
+        match err {
+            BeaconError::HttpError(msg) => {
+                assert!(msg.contains("get_genesis"), "unexpected message: {msg}");
+                assert!(msg.contains("not configured"), "unexpected message: {msg}");
+            }
+            other => panic!("expected HttpError, got {other:?}"),
+        }
+        let err = mock.get_attester_duties(1, &["0".into()]).await.unwrap_err();
+        assert!(matches!(err, BeaconError::HttpError(_)));
+        let err = mock.post_validator_liveness(2, &["1".into()]).await.unwrap_err();
+        assert!(matches!(err, BeaconError::HttpError(_)));
+    }
+
+    #[tokio::test]
+    async fn test_shared_mock_captures_call_arguments() {
+        let mock = MockBeaconNodeClient::new().with_get_attester_duties(|epoch, _indices| {
+            Ok(AttesterDutiesResponse {
+                dependent_root: format!("0x{epoch}"),
+                execution_optimistic: false,
+                data: vec![],
+            })
+        });
+
+        let indices = vec!["42".into(), "7".into()];
+        let resp = mock.get_attester_duties(99, &indices).await.unwrap();
+        assert_eq!(resp.dependent_root, "0x99");
+
+        let calls = mock.get_attester_duties_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, 99);
+        assert_eq!(calls[0].1, indices);
+
+        // Unconfigured methods still error and capture
+        let _ = mock.get_fork("head").await;
+        assert_eq!(mock.get_fork_calls(), vec!["head".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_shared_mock_as_dyn_beacon_node_client() {
+        let mock: Arc<dyn BeaconNodeClient> = Arc::new(
+            MockBeaconNodeClient::new().with_get_node_version(|| Ok("MockBeacon/v0.0.0".into())),
+        );
+        assert_eq!(mock.get_node_version().await.unwrap(), "MockBeacon/v0.0.0");
+        let err = mock.get_genesis().await.unwrap_err();
+        assert!(matches!(err, BeaconError::HttpError(_)));
+    }
+}
