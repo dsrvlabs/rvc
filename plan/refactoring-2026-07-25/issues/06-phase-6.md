@@ -469,13 +469,13 @@ empty-list fingerprint for a corrupt body. The proposal path already pays for a 
    reviewed individually, not bulk-edited.
 
 **Acceptance criteria:**
-- [ ] Signature returns `Result`; malformed body is distinguishable from empty list at every caller.
-- [ ] The four duplicated offset/limit constants are gone from `block.rs`.
-- [ ] `crates/eth-types/tests/block_and_blobs_l3.rs` (commitment-substitution detection) still passes —
+- [x] Signature returns `Result`; malformed body is distinguishable from empty list at every caller.
+- [x] The four duplicated offset/limit constants are gone from `block.rs`.
+- [x] `crates/eth-types/tests/block_and_blobs_l3.rs` (commitment-substitution detection) still passes —
       the fingerprint value for well-formed input is unchanged.
-- [ ] Release note drafted: "a corrupt block body now surfaces an error where it previously produced the
+- [x] Release note drafted: "a corrupt block body now surfaces an error where it previously produced the
       empty-commitment fingerprint."
-- [ ] Test count: +2 or more (new error-vs-empty cases), each itemised.
+- [x] Test count: +2 or more (new error-vs-empty cases), each itemised.
 
 **Test/verification plan:** Two oracles pull in opposite directions and both must hold. (a) *Unchanged for
 well-formed input:* `crates/eth-types/tests/block_and_blobs_l3.rs`'s commitment-substitution and

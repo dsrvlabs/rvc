@@ -2,6 +2,19 @@
 
 ## Behavior changes
 
+### Corrupt block body no longer fingerprints as empty blob KZG commitments
+
+`extract_blob_kzg_commitments` and the `BlockContents` / `BeaconBlock`
+accessors (`blob_kzg_commitments`, `kzg_commitment_root`, `blob_kzg_count`) now
+return `Result` and decode the body through the typed Deneb/Electra SSZ
+containers. A **genuinely empty** commitment list is still `Ok([])`. A
+**malformed** body is `Err(BodySszError)` instead of silently producing the
+empty-commitment fingerprint (and the empty-list internal binding root).
+
+Call sites in block production propagate the error as a parse failure rather
+than logging a false empty binding. Well-formed bodies are unchanged: the
+internal KZG binding fingerprint for valid input is byte-identical.
+
 ### Invalid config enum values fail at deserialization (not later in validate)
 
 Typed config enums now reject unknown values when the TOML/config is loaded

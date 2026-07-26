@@ -341,8 +341,13 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             // see kzg_commitment_list_root doc) separate from the signing scope.
             if format == beacon::ssz_deser::SszBlockFormat::BlockContents {
                 if let Some(layout) = eth_types::body_fork_layout(&response.consensus_version) {
-                    let kzg_count = block.blob_kzg_count(layout);
-                    let commitment_root = block.kzg_commitment_root(layout);
+                    // Fail closed: malformed body must not fingerprint as empty list.
+                    let kzg_count = block
+                        .blob_kzg_count(layout)
+                        .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
+                    let commitment_root = block
+                        .kzg_commitment_root(layout)
+                        .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
                     debug!(
                         slot = slot,
                         kzg_count = kzg_count,
@@ -423,7 +428,10 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         // consistency check performed before the signature is created.
         if let eth_types::BlockContents::BlockAndBlobs { ref blob_sidecars, .. } = block_contents {
             if let Some(layout) = eth_types::body_fork_layout(&response.consensus_version) {
-                let kzg_commitments = block_contents.blob_kzg_commitments(layout);
+                // Fail closed: malformed body must not fingerprint as empty list.
+                let kzg_commitments = block_contents
+                    .blob_kzg_commitments(layout)
+                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
                 let commitment_root = eth_types::kzg_commitment_list_root(&kzg_commitments);
                 debug!(
                     slot = slot,

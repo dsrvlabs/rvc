@@ -15,6 +15,11 @@ workspace = true
 default = []
 test-fixtures = []
 
+# Integration tests that build typed bodies (L-3 KZG binding) need fixtures.
+[[test]]
+name = "block_and_blobs_l3"
+required-features = ["test-fixtures"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

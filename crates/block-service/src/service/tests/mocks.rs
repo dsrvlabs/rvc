@@ -510,11 +510,37 @@ pub(crate) fn test_body_ssz() -> Vec<u8> {
     eth_types::external_vector_electra_body().as_ssz_bytes()
 }
 
+/// Full body SSZ matching `consensus_version` (typed Deneb vs Electra).
+///
+/// Required so layout-specific accessors (e.g. blob KZG extract) decode the
+/// same schema the BN advertised.
+pub(crate) fn test_body_ssz_for_version(consensus_version: &str) -> Vec<u8> {
+    match consensus_version {
+        "electra" | "fulu" => eth_types::external_vector_electra_body().as_ssz_bytes(),
+        _ => eth_types::external_vector_deneb_body().as_ssz_bytes(),
+    }
+}
+
 pub(crate) fn test_blinded_body_ssz() -> Vec<u8> {
     // Distinct graffiti so full vs blinded roots differ when headers match.
     let mut body = eth_types::external_vector_blinded_electra_body();
     body.graffiti = [0xbe; 32];
     body.as_ssz_bytes()
+}
+
+pub(crate) fn test_blinded_body_ssz_for_version(consensus_version: &str) -> Vec<u8> {
+    match consensus_version {
+        "electra" | "fulu" => {
+            let mut body = eth_types::external_vector_blinded_electra_body();
+            body.graffiti = [0xbe; 32];
+            body.as_ssz_bytes()
+        }
+        _ => {
+            let mut body = eth_types::external_vector_blinded_deneb_body();
+            body.graffiti = [0xbe; 32];
+            body.as_ssz_bytes()
+        }
+    }
 }
 
 pub(crate) fn test_block(slot: Slot) -> BeaconBlock {
@@ -587,8 +613,8 @@ pub(crate) fn build_service_with_mode(
 
 /// Build synthetic SSZ bytes matching the expected wire format.
 ///
-/// Body is a valid Electra typed body (SEC-6c) so `compute_block_root` can
-/// decode and merkleize the body leaf.
+/// Body is a valid typed container for `consensus_version` (Deneb or Electra)
+/// so `compute_block_root` and layout-specific KZG extract can decode it.
 pub(crate) fn build_ssz_bytes(
     slot: Slot,
     proposer_index: u64,
@@ -597,7 +623,11 @@ pub(crate) fn build_ssz_bytes(
 ) -> Vec<u8> {
     let use_block_contents =
         !is_blinded && matches!(consensus_version, "deneb" | "electra" | "fulu");
-    let body = if is_blinded { test_blinded_body_ssz() } else { test_body_ssz() };
+    let body = if is_blinded {
+        test_blinded_body_ssz_for_version(consensus_version)
+    } else {
+        test_body_ssz_for_version(consensus_version)
+    };
     let body_offset: u32 = 84; // fixed portion size
 
     let mut block_bytes = Vec::new();

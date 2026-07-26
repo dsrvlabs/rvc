@@ -1038,7 +1038,7 @@ fn test_l3_kzg_commitment_root_nonzero_for_block_and_blobs() {
     let commitments = [[0xaa; 48], [0xbb; 48]];
     let response = block_and_blobs_response(slot, &commitments);
     let contents = response.parse_full_block().unwrap();
-    let root = contents.kzg_commitment_root(BodyForkLayout::Electra);
+    let root = contents.kzg_commitment_root(BodyForkLayout::Electra).unwrap();
     assert_ne!(root, [0u8; 32], "commitment root must be nonzero for non-empty blobs");
 }
 
@@ -1051,7 +1051,7 @@ fn test_l3_kzg_root_changes_on_any_commitment_mutation() {
     let original_commits = [[0xcc; 48], [0xdd; 48]];
     let base_root = {
         let response = block_and_blobs_response(slot, &original_commits);
-        response.parse_full_block().unwrap().kzg_commitment_root(BodyForkLayout::Electra)
+        response.parse_full_block().unwrap().kzg_commitment_root(BodyForkLayout::Electra).unwrap()
     };
 
     // Mutate one byte in each commitment and verify the root changes.
@@ -1060,7 +1060,11 @@ fn test_l3_kzg_root_changes_on_any_commitment_mutation() {
         mutated[ci][0] ^= 0x01;
         let mutated_root = {
             let response = block_and_blobs_response(slot, &mutated);
-            response.parse_full_block().unwrap().kzg_commitment_root(BodyForkLayout::Electra)
+            response
+                .parse_full_block()
+                .unwrap()
+                .kzg_commitment_root(BodyForkLayout::Electra)
+                .unwrap()
         };
         assert_ne!(
             base_root, mutated_root,
