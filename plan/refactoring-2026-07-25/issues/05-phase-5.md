@@ -1664,10 +1664,10 @@ the lock refactor operates on one parse path, not two.
 3. Pure deduplication; no locking change.
 
 **Acceptance criteria:**
-- [ ] The fallback constants are declared once.
-- [ ] Both paths call `parse_config`; neither re-implements parsing.
-- [ ] `reload_config` still parses fully before mutating any state.
-- [ ] Existing validator-store tests pass unchanged.
+- [x] The fallback constants are declared once.
+- [x] Both paths call `parse_config`; neither re-implements parsing.
+- [x] `reload_config` still parses fully before mutating any state.
+- [x] Existing validator-store tests pass unchanged.
 
 **TDD test plan** (RED first):
 - `test_load_and_reload_produce_identical_defaults_and_validators` — **RED**: written against

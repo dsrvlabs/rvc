@@ -50,6 +50,46 @@ fn parse_hex_bytes<const N: usize>(s: &str) -> Result<[u8; N], ValidatorStoreErr
     bytes.try_into().map_err(|_| ValidatorStoreError::Config(format!("expected {N} bytes")))
 }
 
+/// Fallback fee recipient when `[defaults]` omits `fee_recipient` (zero address).
+const DEFAULT_FEE_RECIPIENT: [u8; 20] = [0u8; 20];
+
+/// Fallback gas limit when `[defaults]` omits `gas_limit`.
+const DEFAULT_GAS_LIMIT: u64 = 30_000_000;
+
+/// Parse TOML validator config content into defaults and per-validator entries.
+///
+/// Fallback constants for missing default fields are defined once
+/// (`DEFAULT_FEE_RECIPIENT`, `DEFAULT_GAS_LIMIT`) and shared by
+/// [`ValidatorStore::load_from_config`] and [`ValidatorStore::reload_config`].
+fn parse_config(
+    content: &str,
+) -> Result<(ValidatorDefaults, Vec<ValidatorConfig>), ValidatorStoreError> {
+    let toml_config: TomlConfig = toml::from_str(content)?;
+
+    let mut fee_recipient = DEFAULT_FEE_RECIPIENT;
+    let mut gas_limit = DEFAULT_GAS_LIMIT;
+    let mut graffiti = None;
+
+    if let Some(defaults) = &toml_config.defaults {
+        if let Some(ref fr) = defaults.fee_recipient {
+            fee_recipient = parse_hex_bytes(fr)?;
+        }
+        if let Some(gl) = defaults.gas_limit {
+            gas_limit = gl;
+        }
+        if let Some(ref g) = defaults.graffiti {
+            graffiti = Some(parse_graffiti(g));
+        }
+    }
+
+    let mut validators = Vec::with_capacity(toml_config.validators.len());
+    for v in &toml_config.validators {
+        validators.push(parse_validator(v)?);
+    }
+
+    Ok((ValidatorDefaults { fee_recipient, gas_limit, graffiti }, validators))
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ValidatorDefaults {
     pub fee_recipient: [u8; 20],
@@ -87,36 +127,17 @@ impl ValidatorStore {
     #[tracing::instrument(name = "validator_store.load_from_config", skip_all)]
     pub fn load_from_config(path: &Path) -> Result<Self, ValidatorStoreError> {
         let content = std::fs::read_to_string(path)?;
-        let toml_config: TomlConfig = toml::from_str(&content)?;
-
-        let mut default_fee_recipient = [0u8; 20];
-        let mut default_gas_limit = 30_000_000u64;
-        let mut default_graffiti = None;
-
-        if let Some(defaults) = &toml_config.defaults {
-            if let Some(ref fr) = defaults.fee_recipient {
-                default_fee_recipient = parse_hex_bytes(fr)?;
-            }
-            if let Some(gl) = defaults.gas_limit {
-                default_gas_limit = gl;
-            }
-            if let Some(ref g) = defaults.graffiti {
-                default_graffiti = Some(parse_graffiti(g));
-            }
-        }
+        let (defaults, parsed_validators) = parse_config(&content)?;
 
         debug!(
-            default_gas_limit,
-            custom_fee_recipient = default_fee_recipient != [0u8; 20],
-            custom_graffiti = default_graffiti.is_some(),
+            default_gas_limit = defaults.gas_limit,
+            custom_fee_recipient = defaults.fee_recipient != DEFAULT_FEE_RECIPIENT,
+            custom_graffiti = defaults.graffiti.is_some(),
             "resolved effective validator defaults"
         );
 
-        let mut validators = HashMap::new();
-        for v in &toml_config.validators {
-            let config = parse_validator(v)?;
-            validators.insert(config.pubkey, config);
-        }
+        let validators: HashMap<_, _> =
+            parsed_validators.into_iter().map(|c| (c.pubkey, c)).collect();
 
         info!(
             validator_count = validators.len(),
@@ -126,11 +147,7 @@ impl ValidatorStore {
 
         Ok(Self {
             validators: RwLock::new(validators),
-            defaults: RwLock::new(ValidatorDefaults {
-                fee_recipient: default_fee_recipient,
-                gas_limit: default_gas_limit,
-                graffiti: default_graffiti,
-            }),
+            defaults: RwLock::new(defaults),
             config_path: Some(path.to_path_buf()),
             global_block_selection_mode: RwLock::new(BlockSelectionMode::default()),
             save_lock: Mutex::new(()),
@@ -368,39 +385,14 @@ impl ValidatorStore {
             warn!(path = %path.display(), error = %e, "config parse error");
             e
         })?;
-        let toml_config: TomlConfig = toml::from_str(&content).map_err(|e| {
+        // Parse-first: compute all new values before any mutation.
+        let (new_defaults, parsed_validators) = parse_config(&content).map_err(|e| {
             warn!(path = %path.display(), error = %e, "config parse error");
             e
         })?;
 
-        // Parse-first: compute all new values before any mutation.
-        let mut new_fee_recipient = [0u8; 20];
-        let mut new_gas_limit = 30_000_000u64;
-        let mut new_graffiti = None;
-
-        if let Some(defaults) = &toml_config.defaults {
-            if let Some(ref fr) = defaults.fee_recipient {
-                new_fee_recipient = parse_hex_bytes(fr)?;
-            }
-            if let Some(gl) = defaults.gas_limit {
-                new_gas_limit = gl;
-            }
-            if let Some(ref g) = defaults.graffiti {
-                new_graffiti = Some(parse_graffiti(g));
-            }
-        }
-
-        let mut parsed_validators = Vec::with_capacity(toml_config.validators.len());
-        for v in &toml_config.validators {
-            parsed_validators.push(parse_validator(v)?);
-        }
-
-        // Apply-second: all parsing succeeded, now mutate atomically.
-        *self.defaults.write() = ValidatorDefaults {
-            fee_recipient: new_fee_recipient,
-            gas_limit: new_gas_limit,
-            graffiti: new_graffiti,
-        };
+        // Apply-second: all parsing succeeded, now mutate under write locks.
+        *self.defaults.write() = new_defaults;
 
         let mut validators = self.validators.write();
         let existing_count = validators.len();
@@ -1347,6 +1339,148 @@ pubkey = "{}"
         assert_eq!(store.defaults.read().fee_recipient, [0u8; 20]);
         assert_eq!(store.defaults.read().gas_limit, 40_000_000);
         assert!(store.defaults.read().graffiti.is_none());
+    }
+
+    /// RF5-29: load and reload must share one parse path so defaults/validators
+    /// cannot drift between the two entry points (finding F78).
+    #[test]
+    fn test_load_and_reload_produce_identical_defaults_and_validators() {
+        let pubkey_hex = format!("0x{}", hex::encode([0x11u8; 48]));
+        let fr_hex = format!("0x{}", hex::encode([0xaau8; 20]));
+        let override_fr_hex = format!("0x{}", hex::encode([0xbbu8; 20]));
+
+        let content = format!(
+            r#"
+[defaults]
+fee_recipient = "{fr_hex}"
+gas_limit = 35000000
+graffiti = "shared parse"
+
+[[validators]]
+pubkey = "{pubkey_hex}"
+fee_recipient = "{override_fr_hex}"
+gas_limit = 40000000
+builder_proposals = true
+builder_boost_factor = 150
+enabled = true
+"#
+        );
+
+        let (parsed_defaults, parsed_validators) = parse_config(&content).unwrap();
+        assert_eq!(parsed_defaults.fee_recipient, [0xaau8; 20]);
+        assert_eq!(parsed_defaults.gas_limit, 35_000_000);
+        assert_eq!(parsed_validators.len(), 1);
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &content).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+        {
+            let defaults = store.defaults.read();
+            assert_eq!(defaults.fee_recipient, parsed_defaults.fee_recipient);
+            assert_eq!(defaults.gas_limit, parsed_defaults.gas_limit);
+            assert_eq!(defaults.graffiti, parsed_defaults.graffiti);
+        }
+        let pk = [0x11u8; 48];
+        let loaded = store.get_config(&pk).unwrap();
+        let expected = &parsed_validators[0];
+        assert_eq!(loaded.pubkey, expected.pubkey);
+        assert_eq!(loaded.fee_recipient, expected.fee_recipient);
+        assert_eq!(loaded.gas_limit, expected.gas_limit);
+        assert_eq!(loaded.builder_proposals, expected.builder_proposals);
+        assert_eq!(loaded.builder_boost_factor, expected.builder_boost_factor);
+        assert_eq!(loaded.enabled, expected.enabled);
+
+        // Mutate in-memory state so a broken reload would leave drift.
+        store.defaults.write().gas_limit = 1;
+        store.defaults.write().fee_recipient = [0xff; 20];
+        store.set_enabled(&pk, false);
+
+        store.reload_config().unwrap();
+
+        {
+            let defaults = store.defaults.read();
+            assert_eq!(defaults.fee_recipient, parsed_defaults.fee_recipient);
+            assert_eq!(defaults.gas_limit, parsed_defaults.gas_limit);
+            assert_eq!(defaults.graffiti, parsed_defaults.graffiti);
+        }
+        let reloaded = store.get_config(&pk).unwrap();
+        assert_eq!(reloaded.fee_recipient, expected.fee_recipient);
+        assert_eq!(reloaded.gas_limit, expected.gas_limit);
+        assert_eq!(reloaded.builder_proposals, expected.builder_proposals);
+        assert_eq!(reloaded.builder_boost_factor, expected.builder_boost_factor);
+        assert!(reloaded.enabled);
+    }
+
+    /// RF5-29: missing `[defaults]` fields resolve to the single declared consts.
+    #[test]
+    fn test_parse_config_applies_declared_fallback_constants() {
+        let pubkey_hex = format!("0x{}", hex::encode([1u8; 48]));
+        let content = format!(
+            r#"
+[[validators]]
+pubkey = "{pubkey_hex}"
+"#
+        );
+
+        let (defaults, validators) = parse_config(&content).unwrap();
+        assert_eq!(defaults.fee_recipient, DEFAULT_FEE_RECIPIENT);
+        assert_eq!(defaults.gas_limit, DEFAULT_GAS_LIMIT);
+        assert!(defaults.graffiti.is_none());
+        assert_eq!(validators.len(), 1);
+        assert_eq!(validators[0].pubkey, [1u8; 48]);
+
+        // Empty / partial defaults section also falls back field-wise.
+        let partial = format!(
+            r#"
+[defaults]
+gas_limit = 42000000
+
+[[validators]]
+pubkey = "{pubkey_hex}"
+"#
+        );
+        let (defaults, _) = parse_config(&partial).unwrap();
+        assert_eq!(defaults.fee_recipient, DEFAULT_FEE_RECIPIENT);
+        assert_eq!(defaults.gas_limit, 42_000_000);
+        assert!(defaults.graffiti.is_none());
+    }
+
+    /// RF5-29: invalid TOML on reload must fail before any state mutation.
+    #[test]
+    fn test_reload_rejects_invalid_toml_without_mutating_state() {
+        let pk_hex = format!("0x{}", hex::encode([1u8; 48]));
+        let fr_hex = format!("0x{}", hex::encode([0xaau8; 20]));
+        let valid = format!(
+            r#"
+[defaults]
+fee_recipient = "{fr_hex}"
+gas_limit = 30000000
+
+[[validators]]
+pubkey = "{pk_hex}"
+builder_proposals = true
+"#
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, &valid).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+        let pk = [1u8; 48];
+        assert_eq!(store.defaults.read().fee_recipient, [0xaau8; 20]);
+        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
+        assert!(store.is_builder_enabled(&pk));
+
+        std::fs::write(&config_path, "this is not valid toml [[[").unwrap();
+        assert!(store.reload_config().is_err());
+
+        assert_eq!(store.defaults.read().fee_recipient, [0xaau8; 20]);
+        assert_eq!(store.defaults.read().gas_limit, 30_000_000);
+        assert!(store.is_builder_enabled(&pk));
+        assert!(store.get_config(&pk).is_some());
     }
 
     #[test]
