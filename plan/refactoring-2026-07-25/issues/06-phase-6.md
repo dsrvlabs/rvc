@@ -1063,10 +1063,10 @@ have caught any of them, so this issue makes the policy falsifiable rather than 
 3. Add the review-checklist line.
 
 **Acceptance criteria:**
-- [ ] `cargo test -p architecture-tests kat_policy` green, with an exemption list that is enumerated and
+- [x] `cargo test -p architecture-tests kat_policy` green, with an exemption list that is enumerated and
       **shrinking-only** (a comment states that entries may be removed, never added).
-- [ ] The rule appears in CLAUDE.md's Testing section.
-- [ ] Workspace green.
+- [x] The rule appears in CLAUDE.md's Testing section.
+- [x] Workspace green.
 
 **Test/verification plan:** The gate is only as good as its seed, so step 2's discovery pass is the real
 work and must be evidenced: enumerate every workspace test matching the name pattern, classify each as

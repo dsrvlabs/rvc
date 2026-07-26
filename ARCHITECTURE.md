@@ -712,6 +712,7 @@ Provides distributed tracing infrastructure using OpenTelemetry:
 - **Pluggable secret providers** — `SecretProvider` trait enables cloud key management (GCP Secret Manager) with periodic refresh and `Zeroizing` key material.
 - **Remote signing isolation** — `rvc-signer` runs as a standalone process with mTLS; keys never leave the signer. Slashing protection remains in `rvc`.
 - **DVT threshold signing** — Optional Shamir Secret Sharing backend with peer-to-peer partial signature coordination and Lagrange interpolation.
+- **KAT-first root tests** — Signing-root and container `hash_tree_root` tests assert against reference-client / consensus-spec vectors (`EXTERNAL_*` / `KAT_*` / `SPEC_*`); self-consistency-only checks are banned as sole coverage. Enforced by `crates/architecture-tests/tests/kat_policy.rs` (RF6-22 / H5). Review checklist: new `*_root` / `*tree_hash*` / `*signing_root*` tests must be KAT-anchored or `// kat_exempt: reason`.
 
 ## Consensus Protocol Parameters
 

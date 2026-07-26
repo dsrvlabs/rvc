@@ -63,6 +63,22 @@ cargo test -- --nocapture         # Run with output
 - Place integration tests in `tests/` directory
 - Use descriptive test names: `test_function_does_expected_behavior`
 
+### KAT-first policy (signing / container roots)
+
+Every test that covers a **signing root** or **container `hash_tree_root`** must assert against a
+**known-answer vector** sourced from a reference client, `remerkleable`, or the official
+consensus-spec tests (`EXTERNAL_*` / `KAT_*` / `SPEC_*` constants). Self-consistency-only
+assertions (`compute_x(a) == a.tree_hash_root()`) are never the sole coverage for a spec-defined
+value — that pattern shipped green tests for wrong tree-hash / field-order bugs (F122).
+
+CI enforces a name-pattern scan (`.*(tree_hash|signing_root|_root)$`) in
+`crates/architecture-tests/tests/kat_policy.rs`. New matches need a KAT constant in the body, a
+documented `// kat_exempt: <reason>` marker, or (exceptional) a **removal** from the shrinking-only
+`EXEMPTIONS` list — never a silent addition.
+
+**Review checklist:** for any PR that adds or renames a `*_root` / `*tree_hash*` / `*signing_root*`
+test, confirm it is KAT-anchored or explicitly `kat_exempt` with a reason.
+
 ### TDD Cycle (Kent Beck)
 
 Follow the RED → GREEN → REFACTOR cycle:
