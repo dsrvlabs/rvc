@@ -1655,12 +1655,12 @@ typed against the legacy service.
    service is not in any production signature.
 
 **Acceptance criteria:**
-- [ ] One `current_epoch` implementation in `crates/doppelganger` (`rg` proof).
-- [ ] The restart-skip predicate is a named, separately tested function.
-- [ ] `crates/rvc/src/startup.rs` has no `DoppelgangerService` in a production signature.
-- [ ] **Lifecycle test: an imported or restarted key does not attest until its window clears** (the
+- [x] One `current_epoch` implementation in `crates/doppelganger` (`rg` proof).
+- [x] The restart-skip predicate is a named, separately tested function.
+- [x] `crates/rvc/src/startup.rs` has no `DoppelgangerService` in a production signature.
+- [x] **Lifecycle test: an imported or restarted key does not attest until its window clears** (the
       plan's E8c acceptance criterion — assert via the enablement gate, not via HTTP).
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_single_epoch_clock_used_by_all_doppelganger_paths` — a test asserting both paths
