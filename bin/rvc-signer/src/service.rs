@@ -417,12 +417,12 @@ fn ssz_err(e: SszDecodeError) -> Status {
 ///
 /// - `BlockedByDoppelganger` → `FailedPrecondition`: validator not yet cleared;
 ///   caller should back off and retry after the monitoring window.
-/// - `BlockedBySlashingDb(SlashableBlock|SlashableAttestation)` →
+/// - `SlashingBlocked(SlashableBlock|SlashableAttestation)` →
 ///   `FailedPrecondition` with violation details: slashable conflict detected.
 ///   Caller MUST NOT retry with a different root for the same slot/epoch.
-/// - `BlockedBySlashingDb(other)` → `FailedPrecondition` generic: DB I/O error
+/// - `SlashingBlocked(other)` → `FailedPrecondition` generic: DB I/O error
 ///   during staging — detail is logged server-side to avoid leaking rusqlite paths.
-/// - `SlashingDbCommitFailed` → `Internal` generic: sign succeeded but DB write
+/// - `CommitFailed` → `Internal` generic: sign succeeded but DB write
 ///   failed; same-root retry is safe.  Detail logged server-side.
 /// - `KeyNotFound` → `NotFound`: pubkey not loaded in backend.
 /// - `SigningFailed` → `Internal`: BLS backend error or sign timeout.  Detail
@@ -436,7 +436,7 @@ fn gate_err_to_status(e: SigningGateError) -> Status {
         SigningGateError::BlockedByDoppelganger => {
             Status::failed_precondition("signing blocked by doppelganger gate")
         }
-        SigningGateError::BlockedBySlashingDb(inner) => match &inner {
+        SigningGateError::SlashingBlocked(inner) => match &inner {
             // Slashing-violation details (epoch/slot numbers) are safe to surface.
             SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => {
                 Status::failed_precondition(format!("slashing protection violation: {inner}"))
@@ -448,7 +448,7 @@ fn gate_err_to_status(e: SigningGateError) -> Status {
                 Status::failed_precondition("slashing protection error")
             }
         },
-        SigningGateError::SlashingDbCommitFailed(inner) => {
+        SigningGateError::CommitFailed { source: inner, .. } => {
             // Commit error: same-root retry is safe.  Log detail, return generic.
             tracing::error!(error = %inner, "slashing DB commit failed after successful sign");
             Status::internal("slashing DB commit failed; same-root retry is safe")

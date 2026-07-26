@@ -1,5 +1,20 @@
-//! Error types for `SigningGate` operations.
+//! Error types for gate- and service-guarded signing operations.
+//!
+//! # Signing error taxonomy (D3 / RF4-03)
+//!
+//! Both [`SigningGateError`] (rvc-signer / external path) and
+//! [`crate::SignerError`] (VC / in-process path) distinguish two slashing-related
+//! failures with **opposite** retry semantics:
+//!
+//! | Concept | Variants | DB write | Retry contract |
+//! |---|---|---|---|
+//! | **SlashingBlocked** | `SigningGateError::SlashingBlocked`, `SignerError::SlashingBlocked` | Slashable/policy stage rejections leave history that consumes slot/epoch semantics; pure stage I/O errors write nothing | **Never** treat as `CommitFailed` same-root advertising. Different-root retry for the same slot/epoch is unsafe after a slashable stage rejection. EIP-3076 same-root re-sign after a prior successful commit is a separate stage path — not what [`SigningGateError::permits_retry_with_root`] / `SignerError::permits_retry_with_root` authorize. |
+//! | **CommitFailed** | `SigningGateError::CommitFailed`, `SignerError::CommitFailed` | Nothing written (txn rolled back) | Same-root retry is **safe**. Different-root retry must be refused by the caller (use the carried `signing_root`). |
+//!
+//! A shared `classify()` mapper over this taxonomy lands in RF4-07; keep the
+//! variant names and retry docs aligned so both transports consume one class set.
 
+use eth_types::Root;
 use slashing::SlashingError;
 use thiserror::Error;
 
@@ -18,31 +33,32 @@ pub enum SigningGateError {
     /// The slashing-protection database rejected the sign request at the *stage*
     /// step — a potential double-vote or double-block-proposal was detected.
     ///
-    /// The slot/epoch IS consumed by the EIP-3076 check: retrying with a
-    /// **different** signing root for the same slot/epoch is still blocked.
-    /// A `BlockedBySlashingDb` from `stage_*` means the signing root has
-    /// already been committed (or the current signing root conflicts with an
-    /// existing one).  Do NOT retry with a different root; the same root is
-    /// still safe on a re-sign path.
+    /// See module-level **SlashingBlocked** retry contract: do not retry with a
+    /// different root for the same slot/epoch.
     ///
     /// Display intentionally omits the raw `SlashingError` internals (which may
     /// contain SQLite paths or lock messages) so this variant is safe to surface
     /// to API callers.  The underlying error is available via `source()`.
     #[error("signing blocked by slashing protection")]
-    BlockedBySlashingDb(#[source] SlashingError),
+    SlashingBlocked(#[source] SlashingError),
 
     /// The slashing-protection database accepted the sign request (stage
     /// succeeded, signing succeeded) but the *commit* step failed with an I/O
     /// error.
     ///
-    /// This is the **opposite** of `BlockedBySlashingDb`: nothing was written to
-    /// the database, so retrying with the **same** signing root is safe.  The
-    /// BLS signature bytes are lost; the caller must obtain a new signature.
+    /// See module-level **CommitFailed** retry contract: same-root retry is safe;
+    /// `signing_root` is the only root a caller may retry with.  The BLS
+    /// signature bytes are lost; the caller must obtain a new signature.
     ///
     /// Display intentionally omits raw SQLite internals.  The underlying error
     /// is available via `source()`.
     #[error("slashing-protection commit failed (no row written; same-root retry is safe)")]
-    SlashingDbCommitFailed(#[source] SlashingError),
+    CommitFailed {
+        /// Signing root that was staged (and must be used for any retry).
+        signing_root: Root,
+        #[source]
+        source: SlashingError,
+    },
 
     /// The BLS signing backend returned an error that is not `KeyNotFound`.
     ///
@@ -71,4 +87,22 @@ pub enum SigningGateError {
     /// `BlockedByDoppelganger`.
     #[error("pubkey not registered with signing gate")]
     UnknownPubkey,
+}
+
+impl SigningGateError {
+    /// Taxonomy-level check for **commit-failure same-root retry** only.
+    ///
+    /// - `CommitFailed` → `true` only when `proposed_root` equals the carried root.
+    /// - `SlashingBlocked` → always `false` here (conservative; not an EIP-3076
+    ///   same-root re-sign oracle — that is a separate stage check).
+    /// - Other variants → `false`.
+    ///
+    /// Not a general oracle for stage I/O recoverability.
+    pub fn permits_retry_with_root(&self, proposed_root: &Root) -> bool {
+        match self {
+            Self::CommitFailed { signing_root, .. } => signing_root == proposed_root,
+            Self::SlashingBlocked(_) => false,
+            _ => false,
+        }
+    }
 }

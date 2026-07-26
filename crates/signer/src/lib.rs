@@ -43,14 +43,38 @@ use observability::logging::fields::Duty;
 use observability::logging::{TruncatedPubkey, TruncatedRoot};
 use slashing::{SlashingDb, SlashingError};
 
-/// Errors that can occur during signing operations.
+/// Errors that can occur during signing operations (VC / `SignerService` path).
+///
+/// Slashing-related variants share the D3 taxonomy documented on
+/// [`error`](crate::error): **`SlashingBlocked`** (never retry different root)
+/// vs **`CommitFailed`** (same-root retry safe; carries `signing_root`).
 #[derive(Debug, Error)]
 pub enum SignerError {
     #[error("key not found for pubkey: {0}")]
     KeyNotFound(String),
 
-    #[error("slashing protection blocked signing: {0}")]
-    SlashingProtectionBlocked(#[from] SlashingError),
+    /// Stage rejected the sign (double-vote / double-proposal / etc.).
+    ///
+    /// See [`error`](crate::error) module docs — **SlashingBlocked** retry contract.
+    ///
+    /// Display intentionally omits the raw `SlashingError` (which may contain
+    /// SQLite paths or lock messages on non-slashable variants). Use `source()`
+    /// for the full error; slashable variants carry safe slot/epoch detail there.
+    #[error("signing blocked by slashing protection")]
+    SlashingBlocked(#[source] SlashingError),
+
+    /// Sign succeeded but the slashing-DB commit failed (nothing written).
+    ///
+    /// See [`error`](crate::error) module docs — **CommitFailed** retry contract.
+    /// `signing_root` is the only root a VC caller may retry with.
+    #[error("slashing-protection commit failed (no row written; same-root retry is safe)")]
+    CommitFailed {
+        /// Signing root that was staged (and must be used for any retry).
+        signing_root: Root,
+        /// Underlying slashing-DB I/O error (available via `source()`).
+        #[source]
+        source: SlashingError,
+    },
 
     #[error("signing failed: {0}")]
     SigningFailed(String),
@@ -62,6 +86,26 @@ pub enum SignerError {
     /// No slashing-DB row was staged or committed.
     #[error("signing blocked by doppelganger gate")]
     BlockedByDoppelganger,
+}
+
+impl SignerError {
+    /// Taxonomy-level check for **commit-failure same-root retry** only.
+    ///
+    /// - `CommitFailed` → `true` only when `proposed_root` equals the carried root.
+    /// - `SlashingBlocked` → always `false` here (conservative; does not encode
+    ///   EIP-3076 same-root re-sign after a prior successful commit — that is a
+    ///   separate stage check on retry).
+    /// - Other variants → `false`.
+    ///
+    /// Not a general oracle for stage I/O recoverability: non-slashable stage
+    /// errors also map to `SlashingBlocked` and refuse via this helper.
+    pub fn permits_retry_with_root(&self, proposed_root: &Root) -> bool {
+        match self {
+            Self::CommitFailed { signing_root, .. } => signing_root == proposed_root,
+            Self::SlashingBlocked(_) => false,
+            _ => false,
+        }
+    }
 }
 
 /// Truncates an error message body to at most `max` bytes, appending
@@ -376,7 +420,7 @@ impl SignerService {
                         RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
                             .with_label_values(&[tx_hold_kind::ATTESTATION])
                             .observe(tx_start.elapsed().as_secs_f64() * 1000.0);
-                        SignerError::SlashingProtectionBlocked(e)
+                        SignerError::SlashingBlocked(e)
                     })?;
 
                 RVC_SLASHING_PROTECTION_CHECKS_TOTAL
@@ -402,7 +446,12 @@ impl SignerService {
                             RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
                                 .with_label_values(&[tx_hold_kind::ATTESTATION])
                                 .observe(tx_hold_ms);
-                            return Err(SignerError::SlashingProtectionBlocked(e));
+                            // Commit I/O failure is NOT a slashing rejection: nothing
+                            // was written, so same-root retry is safe (RF4-03 / D3).
+                            return Err(SignerError::CommitFailed {
+                                signing_root,
+                                source: e,
+                            });
                         }
                         RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
                             .with_label_values(&[tx_hold_kind::ATTESTATION])
@@ -440,7 +489,7 @@ impl SignerService {
         // `#[tracing::instrument]` span declared on this method, so recording
         // `slashing_result` actually lands on the instrument span.
         let outcome = inner_result.map_err(|e| {
-            if matches!(e, SignerError::SlashingProtectionBlocked(_)) {
+            if matches!(e, SignerError::SlashingBlocked(_)) {
                 observability::logging::record_display(
                     &tracing::Span::current(),
                     "slashing_result",
@@ -545,7 +594,7 @@ impl SignerService {
                         RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
                             .with_label_values(&[tx_hold_kind::BLOCK])
                             .observe(tx_start.elapsed().as_secs_f64() * 1000.0);
-                        SignerError::SlashingProtectionBlocked(e)
+                        SignerError::SlashingBlocked(e)
                     })?;
 
                 RVC_SLASHING_PROTECTION_CHECKS_TOTAL
@@ -569,7 +618,9 @@ impl SignerService {
                             RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
                                 .with_label_values(&[tx_hold_kind::BLOCK])
                                 .observe(tx_hold_ms);
-                            return Err(SignerError::SlashingProtectionBlocked(e));
+                            // Commit I/O failure is NOT a slashing rejection: nothing
+                            // was written, so same-root retry is safe (RF4-03 / D3).
+                            return Err(SignerError::CommitFailed { signing_root, source: e });
                         }
                         RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS
                             .with_label_values(&[tx_hold_kind::BLOCK])
@@ -603,7 +654,7 @@ impl SignerService {
             })?;
 
         let outcome = inner_result.map_err(|e| {
-            if matches!(e, SignerError::SlashingProtectionBlocked(_)) {
+            if matches!(e, SignerError::SlashingBlocked(_)) {
                 observability::logging::record_display(
                     &tracing::Span::current(),
                     "slashing_result",
@@ -1558,7 +1609,7 @@ mod tests {
         let blocked =
             service.sign_attestation(&conflicting, &pubkey, &fork_schedule, &genesis_root).await;
         assert!(
-            matches!(blocked, Err(SignerError::SlashingProtectionBlocked(_))),
+            matches!(blocked, Err(SignerError::SlashingBlocked(_))),
             "conflicting attestation must be slashing-blocked, got {blocked:?}"
         );
 
@@ -1812,8 +1863,8 @@ mod tests {
 
         assert!(result2.is_err());
         match result2.unwrap_err() {
-            SignerError::SlashingProtectionBlocked(_) => {}
-            _ => panic!("expected SlashingProtectionBlocked error"),
+            SignerError::SlashingBlocked(_) => {}
+            _ => panic!("expected SlashingBlocked error"),
         }
     }
 
@@ -1904,8 +1955,8 @@ mod tests {
 
         assert!(result.is_err());
         match result.unwrap_err() {
-            SignerError::SlashingProtectionBlocked(_) => {}
-            _ => panic!("expected SlashingProtectionBlocked error"),
+            SignerError::SlashingBlocked(_) => {}
+            _ => panic!("expected SlashingBlocked error"),
         }
     }
 
@@ -1948,11 +1999,262 @@ mod tests {
             SlashingError::SlashableAttestation(AttestationSlashingViolation::DoubleVote {
                 target_epoch: 100,
             });
-        let err = SignerError::SlashingProtectionBlocked(slashing_err);
-        assert!(err.to_string().contains("slashing protection blocked"));
+        let err = SignerError::SlashingBlocked(slashing_err);
+        assert!(err.to_string().contains("signing blocked by slashing protection"));
 
         let err = SignerError::SigningFailed("remote error".to_string());
         assert!(err.to_string().contains("signing failed"));
+    }
+
+    /// RF4-03 (M1): production `sign_block` commit arm returns `CommitFailed`
+    /// with the real signing root — not a hand-built enum.
+    #[tokio::test]
+    async fn test_sign_block_commit_failure_is_commit_failed_not_slashing_blocked() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service =
+            SignerService::new(signer, Arc::clone(&slashing_db)).with_enablement(always_enabled());
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let block_root = [0x11; 32];
+        let slot = 5u64;
+
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let fork_name = eth_types::ForkName::from_epoch(epoch, &schedule);
+        let fork_version = fork_name.fork_version(&schedule);
+        let expected_root = compute_signing_root(
+            &block_root,
+            compute_domain(eth_types::DOMAIN_BEACON_PROPOSER, fork_version, genesis_root),
+        );
+
+        slashing_db.fail_next_commits(1);
+        let err = service
+            .sign_block(&block_root, slot, &pubkey, &schedule, &genesis_root)
+            .await
+            .expect_err("injected commit failure must surface");
+
+        match &err {
+            SignerError::CommitFailed { signing_root, source } => {
+                assert_eq!(*signing_root, expected_root, "must carry the production signing root");
+                assert!(
+                    source.to_string().contains("injected commit failure"),
+                    "source should be the inject: {source}"
+                );
+            }
+            SignerError::SlashingBlocked(_) => {
+                panic!("commit failure must NOT be reported as SlashingBlocked")
+            }
+            other => panic!("expected CommitFailed from production path, got: {other:?}"),
+        }
+        assert!(err.permits_retry_with_root(&expected_root));
+        assert!(!err.permits_retry_with_root(&[0xff; 32]));
+
+        // Nothing written; same-root retry after inject is exhausted succeeds.
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        assert!(
+            slashing_db.get_blocks(&pubkey_hex).expect("query").is_empty(),
+            "failed commit must leave no row"
+        );
+        service
+            .sign_block(&block_root, slot, &pubkey, &schedule, &genesis_root)
+            .await
+            .expect("same-root retry after CommitFailed must succeed");
+        assert_eq!(slashing_db.get_blocks(&pubkey_hex).expect("query").len(), 1);
+    }
+
+    /// RF4-03 (M1): production `sign_attestation` commit arm returns `CommitFailed`.
+    #[tokio::test]
+    async fn test_sign_attestation_commit_failure_is_commit_failed_not_slashing_blocked() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service =
+            SignerService::new(signer, Arc::clone(&slashing_db)).with_enablement(always_enabled());
+
+        let attestation_data = create_test_attestation_data(100, 101);
+        let fork_schedule = create_test_fork_schedule_for_attestation();
+        let genesis_root = [0xaa; 32];
+
+        let epoch = attestation_data.target.epoch;
+        let fork_name = eth_types::ForkName::from_epoch(epoch, &fork_schedule);
+        let fork_version = fork_name.fork_version(&fork_schedule);
+        let expected_root = compute_signing_root(
+            &attestation_data,
+            compute_domain(DOMAIN_BEACON_ATTESTER, fork_version, genesis_root),
+        );
+
+        slashing_db.fail_next_commits(1);
+        let err = service
+            .sign_attestation(&attestation_data, &pubkey, &fork_schedule, &genesis_root)
+            .await
+            .expect_err("injected commit failure must surface");
+
+        match &err {
+            SignerError::CommitFailed { signing_root, .. } => {
+                assert_eq!(*signing_root, expected_root);
+            }
+            SignerError::SlashingBlocked(_) => {
+                panic!("commit failure must NOT be reported as SlashingBlocked")
+            }
+            other => panic!("expected CommitFailed from production path, got: {other:?}"),
+        }
+        assert!(err.permits_retry_with_root(&expected_root));
+        assert!(!err.permits_retry_with_root(&[0xee; 32]));
+
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        assert!(slashing_db.get_attestations(&pubkey_hex).expect("query").is_empty());
+        service
+            .sign_attestation(&attestation_data, &pubkey, &fork_schedule, &genesis_root)
+            .await
+            .expect("same-root retry after CommitFailed must succeed");
+    }
+
+    /// RF4-03: stage rejection maps to `SlashingBlocked` (never retry different root).
+    #[tokio::test]
+    async fn test_slashing_rejection_maps_to_slashing_blocked() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+
+        service
+            .sign_block(&[0x11; 32], 5, &pubkey, &schedule, &genesis_root)
+            .await
+            .expect("first proposal ok");
+
+        let blocked = service
+            .sign_block(&[0x22; 32], 5, &pubkey, &schedule, &genesis_root)
+            .await
+            .expect_err("double proposal must fail");
+        match &blocked {
+            SignerError::SlashingBlocked(_) => {}
+            other => panic!("stage rejection must be SlashingBlocked, got: {other:?}"),
+        }
+        // Retry semantics on the first blocked error (not a second call).
+        assert!(!blocked.permits_retry_with_root(&[0x11; 32]), "SlashingBlocked must refuse retry");
+        assert!(!blocked.permits_retry_with_root(&[0x22; 32]));
+    }
+
+    /// RF4-03: pure unit check that `CommitFailed` retry helper is root-equality only.
+    #[test]
+    fn test_commit_failed_carries_signing_root_for_same_root_retry() {
+        let signing_root = [0xcd; 32];
+        let other_root = [0xef; 32];
+        let err = SignerError::CommitFailed {
+            signing_root,
+            source: SlashingError::MigrationFailed("io".into()),
+        };
+
+        assert!(
+            err.permits_retry_with_root(&signing_root),
+            "same-root retry must be permitted after CommitFailed"
+        );
+        assert!(
+            !err.permits_retry_with_root(&other_root),
+            "different-root retry must be refused after CommitFailed"
+        );
+
+        match err {
+            SignerError::CommitFailed { signing_root: r, .. } => assert_eq!(r, signing_root),
+            other => panic!("expected CommitFailed, got {other:?}"),
+        }
+    }
+
+    /// RF4-03: gate and service taxonomies agree on the two slashing concepts
+    /// and their retry contracts (table-driven over both enums).
+    #[test]
+    fn test_gate_and_service_error_taxonomies_agree() {
+        use slashing::{AttestationSlashingViolation, BlockSlashingViolation};
+
+        let root_a = [0x11; 32];
+        let root_b = [0x22; 32];
+
+        let cases: &[(
+            &str,
+            SignerError,
+            SigningGateError,
+            /* same-root ok */ bool,
+            /* other-root ok */ bool,
+        )] = &[
+            (
+                "slashing_blocked_attestation",
+                SignerError::SlashingBlocked(SlashingError::SlashableAttestation(
+                    AttestationSlashingViolation::DoubleVote { target_epoch: 1 },
+                )),
+                SigningGateError::SlashingBlocked(SlashingError::SlashableAttestation(
+                    AttestationSlashingViolation::DoubleVote { target_epoch: 1 },
+                )),
+                false,
+                false,
+            ),
+            (
+                "slashing_blocked_block",
+                SignerError::SlashingBlocked(SlashingError::SlashableBlock(
+                    BlockSlashingViolation::DoubleBlockProposal { slot: 9 },
+                )),
+                SigningGateError::SlashingBlocked(SlashingError::SlashableBlock(
+                    BlockSlashingViolation::DoubleBlockProposal { slot: 9 },
+                )),
+                false,
+                false,
+            ),
+            (
+                "commit_failed",
+                SignerError::CommitFailed {
+                    signing_root: root_a,
+                    source: SlashingError::MigrationFailed("io".into()),
+                },
+                SigningGateError::CommitFailed {
+                    signing_root: root_a,
+                    source: SlashingError::MigrationFailed("io".into()),
+                },
+                true,
+                false,
+            ),
+        ];
+
+        for (name, service_err, gate_err, same_ok, other_ok) in cases {
+            assert_eq!(
+                service_err.permits_retry_with_root(&root_a),
+                *same_ok,
+                "{name}: service same-root"
+            );
+            assert_eq!(
+                service_err.permits_retry_with_root(&root_b),
+                *other_ok,
+                "{name}: service other-root"
+            );
+            assert_eq!(
+                gate_err.permits_retry_with_root(&root_a),
+                *same_ok,
+                "{name}: gate same-root"
+            );
+            assert_eq!(
+                gate_err.permits_retry_with_root(&root_b),
+                *other_ok,
+                "{name}: gate other-root"
+            );
+
+            // Both sides expose the same concept via discriminant-level matches.
+            match (service_err, gate_err) {
+                (SignerError::SlashingBlocked(_), SigningGateError::SlashingBlocked(_)) => {}
+                (
+                    SignerError::CommitFailed { signing_root: s, .. },
+                    SigningGateError::CommitFailed { signing_root: g, .. },
+                ) => {
+                    assert_eq!(s, g, "{name}: carried roots must match");
+                }
+                other => panic!("{name}: taxonomy mismatch: {other:?}"),
+            }
+        }
     }
 
     #[test]
@@ -2076,8 +2378,8 @@ mod tests {
         let result2 = service.sign_block(&[0x22; 32], 5, &pubkey, &schedule, &genesis_root).await;
         assert!(result2.is_err());
         match result2.unwrap_err() {
-            SignerError::SlashingProtectionBlocked(_) => {}
-            other => panic!("expected SlashingProtectionBlocked, got: {other:?}"),
+            SignerError::SlashingBlocked(_) => {}
+            other => panic!("expected SlashingBlocked, got: {other:?}"),
         }
     }
 
@@ -2921,7 +3223,7 @@ mod tests {
     #[tokio::test]
     async fn test_enablement_check_precedes_slashing_stage() {
         // When enablement is closed, stage is never reached: a different signing
-        // root at a pre-seeded slot would be SlashingProtectionBlocked *if*
+        // root at a pre-seeded slot would be SlashingBlocked *if*
         // stage ran; we assert the error is BlockedByDoppelganger instead, and
         // that the pre-seeded row count is unchanged.
         let secret_key = SecretKey::generate();
@@ -2939,13 +3241,13 @@ mod tests {
             .with_enablement(Arc::new(DenyAllEnablement));
         let fork_schedule = create_test_fork_schedule_for_attestation();
 
-        // Different root at same slot: would be SlashingProtectionBlocked if stage ran.
+        // Different root at same slot: would be SlashingBlocked if stage ran.
         let result = service.sign_block(&[0xbb; 32], 50, &pubkey, &fork_schedule, &gvr).await;
 
         assert!(
             matches!(result, Err(SignerError::BlockedByDoppelganger)),
             "enablement must refuse before stage; got: {result:?} \
-             (SlashingProtectionBlocked would mean stage ran first)"
+             (SlashingBlocked would mean stage ran first)"
         );
 
         // Only the pre-seeded row should exist (no additional stage/commit).

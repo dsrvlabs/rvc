@@ -213,8 +213,8 @@ async fn test_successful_sign_commits_row_and_double_vote_rejected() {
     let conflict = service.sign_attestation(&data_conflict, &pubkey, &fs, &GVR).await;
     assert!(conflict.is_err(), "conflicting sign must be rejected as DoubleVote after commit");
     match conflict.err().unwrap() {
-        rvc_signer::SignerError::SlashingProtectionBlocked(_) => {}
-        other => panic!("expected SlashingProtectionBlocked, got: {other}"),
+        rvc_signer::SignerError::SlashingBlocked(_) => {}
+        other => panic!("expected SlashingBlocked, got: {other}"),
     }
 }
 
@@ -249,7 +249,7 @@ async fn test_successful_sign_block_commits_row_and_double_proposal_rejected() {
     let conflict = service.sign_block(&block_root_b, slot, &pubkey, &fs, &GVR).await;
     assert!(conflict.is_err(), "double block proposal must be rejected");
     match conflict.err().unwrap() {
-        rvc_signer::SignerError::SlashingProtectionBlocked(_) => {}
-        other => panic!("expected SlashingProtectionBlocked, got: {other}"),
+        rvc_signer::SignerError::SlashingBlocked(_) => {}
+        other => panic!("expected SlashingBlocked, got: {other}"),
     }
 }

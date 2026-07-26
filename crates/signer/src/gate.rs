@@ -220,8 +220,8 @@ impl SigningGate {
     /// 1. Acquire per-pubkey async lock (see module doc on cancellation).
     /// 2. `gate_decision` — fails closed on false (unknown pubkey → denied).
     /// 3. Stage → sign (with timeout) → commit/discard (spawn_blocking +
-    ///    Handle::block_on).  On stage error → `BlockedBySlashingDb` (slot
-    ///    consumed).  On commit error → `SlashingDbCommitFailed` (nothing written;
+    ///    Handle::block_on).  On stage error → `SlashingBlocked` (slot
+    ///    consumed).  On commit error → `CommitFailed` (nothing written;
     ///    same-root retry safe).  On sign error → `discard()` (no phantom row).
     pub async fn sign_block(
         &self,
@@ -281,7 +281,7 @@ impl SigningGate {
                         rejection_reason = %e,
                         "SigningGate: sign_block blocked by slashing protection"
                     );
-                    SigningGateError::BlockedBySlashingDb(e)
+                    SigningGateError::SlashingBlocked(e)
                 })?;
 
             let sign_result = handle.block_on(tokio::time::timeout(
@@ -311,7 +311,7 @@ impl SigningGate {
                             error = %e,
                             "SigningGate: sign_block commit failed after successful sign"
                         );
-                        SigningGateError::SlashingDbCommitFailed(e)
+                        SigningGateError::CommitFailed { signing_root, source: e }
                     })?;
                     Ok(sig.to_bytes().to_vec())
                 }
@@ -366,8 +366,8 @@ impl SigningGate {
     ///
     /// Identical flow to `sign_block`: lock → gate_decision →
     /// stage + sign (with timeout) + commit/discard (spawn_blocking + Handle::block_on).
-    /// On stage error → `BlockedBySlashingDb` (epoch consumed).
-    /// On commit error → `SlashingDbCommitFailed` (nothing written; same-root retry safe).
+    /// On stage error → `SlashingBlocked` (epoch consumed).
+    /// On commit error → `CommitFailed` (nothing written; same-root retry safe).
     /// On sign error → `discard()` (no phantom row).
     pub async fn sign_attestation(
         &self,
@@ -422,7 +422,7 @@ impl SigningGate {
                         rejection_reason = %e,
                         "SigningGate: sign_attestation blocked by slashing protection"
                     );
-                    SigningGateError::BlockedBySlashingDb(e)
+                    SigningGateError::SlashingBlocked(e)
                 })?;
 
             let sign_result = handle.block_on(tokio::time::timeout(
@@ -454,7 +454,7 @@ impl SigningGate {
                             error = %e,
                             "SigningGate: sign_attestation commit failed after successful sign"
                         );
-                        SigningGateError::SlashingDbCommitFailed(e)
+                        SigningGateError::CommitFailed { signing_root, source: e }
                     })?;
                     Ok(sig.to_bytes().to_vec())
                 }

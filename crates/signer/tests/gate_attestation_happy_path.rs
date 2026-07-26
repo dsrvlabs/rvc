@@ -83,8 +83,8 @@ async fn test_sign_attestation_happy_path_commits_row_and_blocks_conflict() {
     let conflict_root: Root = [0xbb; 32];
     let conflict = gate.sign_attestation(&pubkey, 10, 11, conflict_root, GVR, "test").await;
     assert!(
-        matches!(conflict, Err(SigningGateError::BlockedBySlashingDb(_))),
-        "conflicting attestation must return BlockedBySlashingDb; got: {conflict:?}"
+        matches!(conflict, Err(SigningGateError::SlashingBlocked(_))),
+        "conflicting attestation must return SlashingBlocked; got: {conflict:?}"
     );
 
     // Still exactly one row — the conflict was rejected before any write.

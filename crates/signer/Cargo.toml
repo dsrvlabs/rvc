@@ -31,6 +31,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 crypto.workspace = true
+# Enables `slashing::fail_next_commits` for RF4-03 path-level CommitFailed tests.
+slashing = { workspace = true, features = ["test-utils"] }
 serde_json.workspace = true
 tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }
 tempfile.workspace = true

@@ -9,6 +9,12 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# Test-only injects (e.g. fail-next-commit). Never enable on production
+# dependency lines — only via consuming crates' [dev-dependencies].
+test-utils = []
+
 [dependencies]
 observability.workspace = true
 eth-types.workspace = true

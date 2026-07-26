@@ -47,6 +47,13 @@
 //! `tokio::time::timeout`) so a stalled signer does not hold the lock
 //! indefinitely.
 //!
+//! ## Test inject (`test-utils`)
+//!
+//! With the `test-utils` feature, [`SlashingDb::fail_next_commits`] forces the
+//! next N commits on **that** DB instance to fail before INSERT/`COMMIT`
+//! (snapshotted onto the staged guard at `stage_*`). Drop still rolls back.
+//! Used by RF4-03 path-level `CommitFailed` tests in `rvc-signer`.
+//!
 //! ## `!Send` guarantee
 //!
 //! `parking_lot::MutexGuard<'_, Connection>` is `!Send` (it must be released
@@ -134,6 +141,8 @@ pub struct StagedBlock<'db> {
     guard: Option<MutexGuard<'db, Connection>>,
     row: BlockRow,
     committed: bool,
+    /// Snapshotted from [`SlashingDb::take_injected_commit_failure`] at stage time.
+    inject_fail_commit: bool,
 }
 
 impl std::fmt::Debug for StagedBlock<'_> {
@@ -154,6 +163,12 @@ impl<'db> StagedBlock<'db> {
     ///
     /// Consumes the guard and releases the database mutex.
     pub fn commit(mut self) -> Result<(), SlashingError> {
+        if self.inject_fail_commit {
+            return Err(SlashingError::MigrationFailed(
+                "injected commit failure (test-utils)".into(),
+            ));
+        }
+
         let guard = self.guard.as_mut().expect("guard is always Some before Drop");
 
         if !self.row.is_resign {
@@ -211,6 +226,8 @@ pub struct StagedAttestation<'db> {
     guard: Option<MutexGuard<'db, Connection>>,
     row: AttestationRow,
     committed: bool,
+    /// Snapshotted from [`SlashingDb::take_injected_commit_failure`] at stage time.
+    inject_fail_commit: bool,
 }
 
 impl std::fmt::Debug for StagedAttestation<'_> {
@@ -228,6 +245,12 @@ impl<'db> StagedAttestation<'db> {
     /// Execute the staged INSERT (if not a duplicate re-sign) and commit the
     /// transaction.
     pub fn commit(mut self) -> Result<(), SlashingError> {
+        if self.inject_fail_commit {
+            return Err(SlashingError::MigrationFailed(
+                "injected commit failure (test-utils)".into(),
+            ));
+        }
+
         let guard = self.guard.as_mut().expect("guard is always Some before Drop");
 
         if !self.row.is_duplicate {
@@ -386,6 +409,7 @@ impl SlashingDb {
         // `commit()` skip the INSERT but still close the transaction. A
         // `discard()` or bare drop issues `ROLLBACK`, which is harmless on
         // a read-only transaction.
+        let inject_fail_commit = self.take_injected_commit_failure();
         Ok(StagedBlock {
             guard: Some(guard),
             row: BlockRow {
@@ -396,6 +420,7 @@ impl SlashingDb {
                 is_resign: matches!(outcome, BlockVerdict::Resign),
             },
             committed: false,
+            inject_fail_commit,
         })
     }
 
@@ -497,6 +522,7 @@ impl SlashingDb {
             }
         };
 
+        let inject_fail_commit = self.take_injected_commit_failure();
         Ok(StagedAttestation {
             guard: Some(guard),
             row: AttestationRow {
@@ -508,6 +534,7 @@ impl SlashingDb {
                 is_duplicate: matches!(verdict, AttestationVerdict::Duplicate),
             },
             committed: false,
+            inject_fail_commit,
         })
     }
 }

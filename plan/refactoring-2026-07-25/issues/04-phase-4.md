@@ -347,12 +347,12 @@ fail-closed remote-timeout rule in terms of it.
 4. Update every caller that matches on the old variants in the same PR.
 
 **Acceptance criteria:**
-- [ ] A commit failure and a slashing rejection are distinguishable at the VC call site by variant, and a
+- [x] A commit failure and a slashing rejection are distinguishable at the VC call site by variant, and a
       test asserts the retry semantics of each (blocked → refuse retry; commit-failed → same-root retry
       permitted, different-root retry refused).
-- [ ] `CommitFailed` carries the signing root.
-- [ ] No call site matches on a removed variant (compiler-enforced).
-- [ ] Standing invariant green.
+- [x] `CommitFailed` carries the signing root.
+- [x] No call site matches on a removed variant (compiler-enforced).
+- [x] Standing invariant green.
 
 **TDD test plan** (`crates/signer/src/lib.rs` `#[cfg(test)]`):
 - **RED first:** `test_commit_failure_is_not_reported_as_slashing_blocked` — fails today because

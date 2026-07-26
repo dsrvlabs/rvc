@@ -62,13 +62,13 @@ impl HttpSignError {
             HttpSignError::UnknownKey => "key_not_found",
             HttpSignError::Unauthorized(_) => "client_cn_not_allowed",
             HttpSignError::Gate(SigningGateError::BlockedByDoppelganger) => "doppelganger",
-            HttpSignError::Gate(SigningGateError::BlockedBySlashingDb(inner)) => match inner {
+            HttpSignError::Gate(SigningGateError::SlashingBlocked(inner)) => match inner {
                 SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => {
                     "slashing"
                 }
                 _ => "slashing_db_error",
             },
-            HttpSignError::Gate(SigningGateError::SlashingDbCommitFailed(_)) => "internal",
+            HttpSignError::Gate(SigningGateError::CommitFailed { .. }) => "internal",
             HttpSignError::Gate(SigningGateError::KeyNotFound)
             | HttpSignError::Gate(SigningGateError::UnknownPubkey) => "key_not_found",
             HttpSignError::Gate(SigningGateError::SigningFailed(_)) => "internal",
@@ -83,7 +83,7 @@ fn gate_err_to_http(e: &SigningGateError) -> (StatusCode, String) {
         SigningGateError::BlockedByDoppelganger => {
             (StatusCode::PRECONDITION_FAILED, "signing blocked by doppelganger gate".to_string())
         }
-        SigningGateError::BlockedBySlashingDb(inner) => match inner {
+        SigningGateError::SlashingBlocked(inner) => match inner {
             // Slashing-violation detail (slot/epoch numbers) is safe to surface.
             SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => {
                 (StatusCode::PRECONDITION_FAILED, format!("slashing protection violation: {inner}"))
@@ -95,7 +95,7 @@ fn gate_err_to_http(e: &SigningGateError) -> (StatusCode, String) {
                 (StatusCode::PRECONDITION_FAILED, "slashing protection error".to_string())
             }
         },
-        SigningGateError::SlashingDbCommitFailed(inner) => {
+        SigningGateError::CommitFailed { source: inner, .. } => {
             tracing::error!(error = %inner, "slashing DB commit failed after successful sign");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn slashable_block_is_412_with_safe_slot_detail() {
-        let err = HttpSignError::Gate(SigningGateError::BlockedBySlashingDb(
+        let err = HttpSignError::Gate(SigningGateError::SlashingBlocked(
             SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal { slot: 42 }),
         ));
         let (status, body) = err.status_and_body();
@@ -249,7 +249,7 @@ mod tests {
 
     #[test]
     fn slashable_attestation_is_412_with_safe_epoch_detail() {
-        let err = HttpSignError::Gate(SigningGateError::BlockedBySlashingDb(
+        let err = HttpSignError::Gate(SigningGateError::SlashingBlocked(
             SlashingError::SlashableAttestation(AttestationSlashingViolation::DoubleVote {
                 target_epoch: 7,
             }),
@@ -262,7 +262,7 @@ mod tests {
     #[test]
     fn generic_db_error_is_412_without_leaking_internals() {
         let secret = "/var/lib/rvc/slashing.db lock contention";
-        let err = HttpSignError::Gate(SigningGateError::BlockedBySlashingDb(
+        let err = HttpSignError::Gate(SigningGateError::SlashingBlocked(
             SlashingError::MigrationFailed(secret.to_string()),
         ));
         let (status, body) = err.status_and_body();
@@ -274,9 +274,10 @@ mod tests {
     #[test]
     fn commit_failed_is_500_generic() {
         let secret = "/var/lib/rvc/slashing.db disk full";
-        let (status, body) = HttpSignError::Gate(SigningGateError::SlashingDbCommitFailed(
-            SlashingError::MigrationFailed(secret.to_string()),
-        ))
+        let (status, body) = HttpSignError::Gate(SigningGateError::CommitFailed {
+            signing_root: [0u8; 32],
+            source: SlashingError::MigrationFailed(secret.to_string()),
+        })
         .status_and_body();
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(!body.contains(secret), "commit-failed body must not leak: {body}");

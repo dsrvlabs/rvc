@@ -251,11 +251,11 @@ pub fn classify_gate_error(err: &signer::SigningGateError) -> &'static str {
     use slashing::SlashingError;
     match err {
         SigningGateError::BlockedByDoppelganger => "doppelganger",
-        SigningGateError::BlockedBySlashingDb(inner) => match inner {
+        SigningGateError::SlashingBlocked(inner) => match inner {
             SlashingError::SlashableBlock(_) | SlashingError::SlashableAttestation(_) => "slashing",
             _ => "slashing_db_error",
         },
-        SigningGateError::SlashingDbCommitFailed(_) => "internal",
+        SigningGateError::CommitFailed { .. } => "internal",
         SigningGateError::KeyNotFound | SigningGateError::UnknownPubkey => "key_not_found",
         SigningGateError::SigningFailed(_) => "internal",
     }
@@ -504,23 +504,22 @@ mod tests {
 
         assert_eq!(classify_gate_error(&SigningGateError::BlockedByDoppelganger), "doppelganger");
         assert_eq!(
-            classify_gate_error(&SigningGateError::BlockedBySlashingDb(
-                SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal {
-                    slot: 1
-                })
-            )),
+            classify_gate_error(&SigningGateError::SlashingBlocked(SlashingError::SlashableBlock(
+                BlockSlashingViolation::DoubleBlockProposal { slot: 1 }
+            ))),
             "slashing"
         );
         assert_eq!(
-            classify_gate_error(&SigningGateError::BlockedBySlashingDb(
+            classify_gate_error(&SigningGateError::SlashingBlocked(
                 SlashingError::MigrationFailed("io".into())
             )),
             "slashing_db_error"
         );
         assert_eq!(
-            classify_gate_error(&SigningGateError::SlashingDbCommitFailed(
-                SlashingError::MigrationFailed("io".into())
-            )),
+            classify_gate_error(&SigningGateError::CommitFailed {
+                signing_root: [0u8; 32],
+                source: SlashingError::MigrationFailed("io".into()),
+            }),
             "internal"
         );
         assert_eq!(classify_gate_error(&SigningGateError::KeyNotFound), "key_not_found");

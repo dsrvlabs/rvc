@@ -8,7 +8,7 @@
 //! Two properties prove gate routing:
 //!
 //! (a) **Slashing protection is enforced**: A double-proposal (same slot, different
-//!     signing root) is blocked with `BlockedBySlashingDb`.  If the gate were not
+//!     signing root) is blocked with `SlashingBlocked`.  If the gate were not
 //!     in the path, the slashing check would be skipped and both signs would succeed.
 //!
 //! (b) **Doppelganger gate is enforced**: When the gate is built with `AlwaysEnabled`
@@ -89,8 +89,8 @@ async fn test_block_routing_slashing_protection_enforced_by_gate() {
     // Second sign — same slot, different root — must be blocked.
     let second = gate.sign_block(&pubkey, slot, signing_root_b, GVR, "test").await;
     assert!(
-        matches!(second, Err(SigningGateError::BlockedBySlashingDb(_))),
-        "double-proposal must return BlockedBySlashingDb; got: {second:?}"
+        matches!(second, Err(SigningGateError::SlashingBlocked(_))),
+        "double-proposal must return SlashingBlocked; got: {second:?}"
     );
 
     // Still exactly one row (the second was rejected before any write).

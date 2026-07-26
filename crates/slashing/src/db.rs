@@ -22,7 +22,7 @@
 use parking_lot::Mutex;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -75,9 +75,43 @@ pub struct SlashingDb {
     /// observes "no GVR pinned in metadata" so operators can detect a degraded
     /// chain-swap-protection state.
     gvr_skip_warned: OnceLock<()>,
+    /// Per-instance countdown of forced commit failures (`test-utils` only arms it).
+    ///
+    /// Scoped to this `SlashingDb` so parallel tests with separate in-memory DBs
+    /// cannot steal each other's inject. Snapshotted into `Staged*` at `stage_*`.
+    pub(crate) fail_next_commits: AtomicU32,
 }
 
 impl SlashingDb {
+    /// Force the next `n` `Staged*::commit` calls on **this** DB to fail before
+    /// INSERT/`COMMIT`. Drop still rolls back. Per-instance — safe under parallel
+    /// tests with separate `open_in_memory()` DBs.
+    ///
+    /// # Test-only
+    ///
+    /// Gated by the `test-utils` feature.
+    #[cfg(feature = "test-utils")]
+    pub fn fail_next_commits(&self, n: u32) {
+        self.fail_next_commits.store(n, Ordering::SeqCst);
+    }
+
+    /// Take one injected commit failure for this DB (used when building a staged guard).
+    pub(crate) fn take_injected_commit_failure(&self) -> bool {
+        loop {
+            let cur = self.fail_next_commits.load(Ordering::SeqCst);
+            if cur == 0 {
+                return false;
+            }
+            if self
+                .fail_next_commits
+                .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
     /// Open a database at the specified path.
     ///
     /// Creates the file and runs schema migrations if it doesn't exist or is at v1.
@@ -138,6 +172,7 @@ impl SlashingDb {
             strict_semantics: AtomicBool::new(false),
             gvr_cache: OnceLock::new(),
             gvr_skip_warned: OnceLock::new(),
+            fail_next_commits: AtomicU32::new(0),
         };
 
         // `migrate()` creates tables if they don't exist (v2-native CREATE TABLE).
@@ -323,6 +358,7 @@ impl SlashingDb {
             strict_semantics: AtomicBool::new(false),
             gvr_cache: OnceLock::new(),
             gvr_skip_warned: OnceLock::new(),
+            fail_next_commits: AtomicU32::new(0),
         };
         db.migrate()?;
         {
@@ -345,6 +381,7 @@ impl SlashingDb {
             strict_semantics: AtomicBool::new(false),
             gvr_cache: OnceLock::new(),
             gvr_skip_warned: OnceLock::new(),
+            fail_next_commits: AtomicU32::new(0),
         };
         // Create tables (v2-native layout).
         db.migrate()?;
