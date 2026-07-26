@@ -71,6 +71,7 @@ use crate::rules::{
     AttestationWatermarks, BlockCandidate, BlockVerdict, BlockWatermarks, ExistingAtt,
     FullScanAttestationHistory, FullScanBlockHistory,
 };
+use crate::watermarks::{read_watermark, WatermarkKind};
 use crate::SlashingDb;
 use eth_types::{Epoch, Root, Slot};
 use observability::logging::TruncatedPubkey;
@@ -363,13 +364,7 @@ impl SlashingDb {
         // drop the MutexGuard with the transaction still open, leaving the
         // connection in a broken "transaction within transaction" state.
         let outcome = (|| -> Result<BlockVerdict, SlashingError> {
-            let watermark: Option<i64> = guard
-                .query_row(
-                    "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
-                    [&pubkey],
-                    |row| row.get(0),
-                )
-                .optional()?;
+            let watermark = read_watermark(&guard, &pubkey, WatermarkKind::Block)?;
 
             let existing: Option<Option<String>> = guard
                 .query_row(
@@ -467,21 +462,8 @@ impl SlashingDb {
         // funnels through a single ROLLBACK before we return.  See the
         // matching note in `stage_block`.
         let outcome = (|| -> Result<AttestationVerdict, SlashingError> {
-            let wm_source: Option<i64> = guard
-                .query_row(
-                    "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
-                    [&pubkey],
-                    |row| row.get(0),
-                )
-                .optional()?;
-
-            let wm_target: Option<i64> = guard
-                .query_row(
-                    "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
-                    [&pubkey],
-                    |row| row.get(0),
-                )
-                .optional()?;
+            let wm_source = read_watermark(&guard, &pubkey, WatermarkKind::AttestationSource)?;
+            let wm_target = read_watermark(&guard, &pubkey, WatermarkKind::AttestationTarget)?;
 
             let existing: Vec<ExistingAtt> = {
                 let mut stmt = guard.prepare(

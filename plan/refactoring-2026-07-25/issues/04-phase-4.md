@@ -1040,11 +1040,11 @@ unrepresentable and gives B5's interchange-import wiring one place to call.
 3. Replace all 18 literal sites.
 
 **Acceptance criteria:**
-- [ ] `rg "watermark_type = '"` returns exactly one site (inside `as_sql_str`).
-- [ ] `raise_watermark` is monotonic: a lower value is a no-op (or a typed error), asserted by test.
-- [ ] Watermark behavior (including A1's `<=` equality blocking) is unchanged; the A2 conformance suite is
+- [x] `rg "watermark_type = '"` returns exactly one site (inside `as_sql_str`).
+- [x] `raise_watermark` is monotonic: a lower value is a no-op (or a typed error), asserted by test.
+- [x] Watermark behavior (including A1's `<=` equality blocking) is unchanged; the A2 conformance suite is
       green.
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **TDD test plan:**
 - **RED first:** `test_raise_watermark_rejects_backwards_move` — fails today (raw SQL will happily lower

@@ -40,6 +40,7 @@ use crate::types::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata, PruneStats,
     SignedAttestation, SignedBlock, ValidatorRecord,
 };
+use crate::watermarks::{raise_watermark, raise_watermark_max, read_watermark, WatermarkKind};
 use eth_types::{Epoch, Root, Slot};
 use metrics::definitions as metrics;
 
@@ -1183,11 +1184,11 @@ impl SlashingDb {
             // Raise watermarks from this interchange's maxima (same transaction).
             // Raise-only SQL: re-import of older maxima is a silent no-op.
             if let Some(slot) = max_slot {
-                Self::raise_watermark_in_tx(&tx, &pubkey, "block", slot as i64)?;
+                raise_watermark_max(&tx, &pubkey, WatermarkKind::Block, slot)?;
             }
             if let (Some(source), Some(target)) = (max_source, max_target) {
-                Self::raise_watermark_in_tx(&tx, &pubkey, "att_source", source as i64)?;
-                Self::raise_watermark_in_tx(&tx, &pubkey, "att_target", target as i64)?;
+                raise_watermark_max(&tx, &pubkey, WatermarkKind::AttestationSource, source)?;
+                raise_watermark_max(&tx, &pubkey, WatermarkKind::AttestationTarget, target)?;
             }
         }
 
@@ -1198,25 +1199,6 @@ impl SlashingDb {
             path = self.path.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
             "slashing DB import completed"
         );
-        Ok(())
-    }
-
-    /// Raise a single watermark row inside an open transaction (import path).
-    ///
-    /// Uses `MAX(existing, new)` on conflict so older interchange re-imports
-    /// never lower watermarks and never surface `WatermarkLowered`.
-    fn raise_watermark_in_tx(
-        tx: &rusqlite::Transaction<'_>,
-        pubkey: &str,
-        watermark_type: &str,
-        value: i64,
-    ) -> Result<(), SlashingError> {
-        tx.execute(
-            "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, ?2, ?3)
-             ON CONFLICT(pubkey, watermark_type) DO UPDATE
-             SET value = MAX(watermarks.value, excluded.value)",
-            (pubkey, watermark_type, value),
-        )?;
         Ok(())
     }
 
@@ -1463,33 +1445,7 @@ impl SlashingDb {
         let pubkey = normalize_pubkey(pubkey);
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing: Option<i64> = tx
-            .query_row(
-                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
-                [&pubkey],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        if let Some(current) = existing {
-            if (slot as i64) < current {
-                return Err(SlashingError::WatermarkLowered {
-                    pubkey: pubkey.to_string(),
-                    watermark_type: "block".to_string(),
-                    current: current as u64,
-                    attempted: slot,
-                });
-            }
-            tx.execute(
-                "UPDATE watermarks SET value = ?1 WHERE pubkey = ?2 AND watermark_type = 'block'",
-                (slot as i64, &pubkey),
-            )?;
-        } else {
-            tx.execute(
-                "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, 'block', ?2)",
-                (&pubkey, slot as i64),
-            )?;
-        }
+        raise_watermark(&tx, &pubkey, WatermarkKind::Block, slot)?;
         tx.commit()?;
         Ok(())
     }
@@ -1511,14 +1467,7 @@ impl SlashingDb {
     pub fn get_block_watermark(&self, pubkey: &str) -> Result<Option<Slot>, SlashingError> {
         let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock();
-        let result: Option<i64> = conn
-            .query_row(
-                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'block'",
-                [&pubkey],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(result.map(|v| v as Slot))
+        Ok(read_watermark(&conn, &pubkey, WatermarkKind::Block)?.map(|v| v as Slot))
     }
 
     /// Set an attestation watermark for a validator.
@@ -1533,55 +1482,8 @@ impl SlashingDb {
         let pubkey = normalize_pubkey(pubkey);
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-
-        let existing_source: Option<i64> = tx
-            .query_row(
-                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
-                [&pubkey],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        let existing_target: Option<i64> = tx
-            .query_row(
-                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
-                [&pubkey],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        if let Some(current_source) = existing_source {
-            if (source_epoch as i64) < current_source {
-                return Err(SlashingError::WatermarkLowered {
-                    pubkey: pubkey.clone(),
-                    watermark_type: "att_source".to_string(),
-                    current: current_source as u64,
-                    attempted: source_epoch,
-                });
-            }
-        }
-        if let Some(current_target) = existing_target {
-            if (target_epoch as i64) < current_target {
-                return Err(SlashingError::WatermarkLowered {
-                    pubkey: pubkey.clone(),
-                    watermark_type: "att_target".to_string(),
-                    current: current_target as u64,
-                    attempted: target_epoch,
-                });
-            }
-        }
-
-        tx.execute(
-            "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, 'att_source', ?2)
-             ON CONFLICT(pubkey, watermark_type) DO UPDATE SET value = ?2",
-            (&pubkey, source_epoch as i64),
-        )?;
-        tx.execute(
-            "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, 'att_target', ?2)
-             ON CONFLICT(pubkey, watermark_type) DO UPDATE SET value = ?2",
-            (&pubkey, target_epoch as i64),
-        )?;
-
+        raise_watermark(&tx, &pubkey, WatermarkKind::AttestationSource, source_epoch)?;
+        raise_watermark(&tx, &pubkey, WatermarkKind::AttestationTarget, target_epoch)?;
         tx.commit()?;
         Ok(())
     }
@@ -1596,21 +1498,8 @@ impl SlashingDb {
         let pubkey = normalize_pubkey(pubkey);
         let conn = self.conn.lock();
 
-        let source: Option<i64> = conn
-            .query_row(
-                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_source'",
-                [&pubkey],
-                |row| row.get(0),
-            )
-            .optional()?;
-
-        let target: Option<i64> = conn
-            .query_row(
-                "SELECT value FROM watermarks WHERE pubkey = ?1 AND watermark_type = 'att_target'",
-                [&pubkey],
-                |row| row.get(0),
-            )
-            .optional()?;
+        let source = read_watermark(&conn, &pubkey, WatermarkKind::AttestationSource)?;
+        let target = read_watermark(&conn, &pubkey, WatermarkKind::AttestationTarget)?;
 
         match (source, target) {
             (Some(s), Some(t)) => Ok(Some((s as Epoch, t as Epoch))),
@@ -1638,10 +1527,10 @@ impl SlashingDb {
             "DELETE FROM blocks WHERE EXISTS (
                 SELECT 1 FROM watermarks w
                 WHERE w.pubkey = blocks.pubkey
-                  AND w.watermark_type = 'block'
+                  AND w.watermark_type = ?1
                   AND blocks.slot < w.value
             )",
-            [],
+            [WatermarkKind::Block.as_sql_str()],
         )?;
 
         // Delete attestations below each validator's target epoch watermark
@@ -1649,10 +1538,10 @@ impl SlashingDb {
             "DELETE FROM attestations WHERE EXISTS (
                 SELECT 1 FROM watermarks w
                 WHERE w.pubkey = attestations.pubkey
-                  AND w.watermark_type = 'att_target'
+                  AND w.watermark_type = ?1
                   AND attestations.target_epoch < w.value
             )",
-            [],
+            [WatermarkKind::AttestationTarget.as_sql_str()],
         )?;
 
         tx.commit()?;
@@ -1697,10 +1586,10 @@ impl SlashingDb {
             "SELECT COUNT(*) FROM blocks WHERE EXISTS (
                 SELECT 1 FROM watermarks w
                 WHERE w.pubkey = blocks.pubkey
-                  AND w.watermark_type = 'block'
+                  AND w.watermark_type = ?1
                   AND blocks.slot < w.value
             )",
-            [],
+            [WatermarkKind::Block.as_sql_str()],
             |row| row.get(0),
         )?;
 
@@ -1708,10 +1597,10 @@ impl SlashingDb {
             "SELECT COUNT(*) FROM attestations WHERE EXISTS (
                 SELECT 1 FROM watermarks w
                 WHERE w.pubkey = attestations.pubkey
-                  AND w.watermark_type = 'att_target'
+                  AND w.watermark_type = ?1
                   AND attestations.target_epoch < w.value
             )",
-            [],
+            [WatermarkKind::AttestationTarget.as_sql_str()],
             |row| row.get(0),
         )?;
 
