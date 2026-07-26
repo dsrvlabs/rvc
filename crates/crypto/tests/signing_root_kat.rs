@@ -30,9 +30,9 @@
 
 use eth_types::{
     AggregateAndProof, Attestation, AttestationData, Checkpoint, ContributionAndProof, Domain,
-    ElectraAggregateAndProof, ElectraAttestation, Epoch, ForkInfo, ForkSchedule, Root, Slot,
-    SyncAggregatorSelectionData, SyncCommitteeContribution, ValidatorRegistrationV1, VoluntaryExit,
-    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
+    ElectraAggregateAndProof, ElectraAttestation, Epoch, ForkInfo, ForkName, ForkSchedule, Root,
+    Slot, SyncAggregatorSelectionData, SyncCommitteeContribution, ValidatorRegistrationV1,
+    VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
     DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
     DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
     SLOTS_PER_EPOCH,
@@ -641,6 +641,7 @@ async fn kat_typed_signer_attestation_matches_kat_root() {
             current_version: PHASE0,
             genesis_validators_root: GVR,
         },
+        fork_name: ForkName::Phase0,
     };
     let signer = make_local_signer(sk);
     let sig = TypedSigner::sign_attestation(&signer, &data, &ctx).await.unwrap();
@@ -667,6 +668,7 @@ async fn kat_typed_signer_randao_matches_kat_root() {
             current_version: PHASE0,
             genesis_validators_root: GVR,
         },
+        fork_name: ForkName::Phase0,
     };
     let signer = make_local_signer(sk);
     let sig = TypedSigner::sign_randao_reveal(&signer, epoch, &ctx).await.unwrap();
@@ -695,6 +697,7 @@ async fn kat_typed_signer_builder_registration_matches_kat_root() {
             current_version: ALTAIR,
             genesis_validators_root: GVR, // unused for builder; zero gvr is internal
         },
+        fork_name: ForkName::Altair,
     };
     let signer = make_local_signer(sk);
     let sig =
@@ -723,6 +726,7 @@ async fn kat_typed_signer_voluntary_exit_eip7044_matches_kat_root() {
             current_version: version, // Capella-capped (caller responsibility)
             genesis_validators_root: GVR,
         },
+        fork_name: ForkName::Capella,
     };
     let signer = make_local_signer(sk);
     let sig = TypedSigner::sign_voluntary_exit(&signer, &exit, &ctx).await.unwrap();
@@ -747,6 +751,7 @@ async fn kat_typed_signer_sync_message_matches_kat_root() {
             current_version: PHASE0,
             genesis_validators_root: GVR,
         },
+        fork_name: ForkName::Phase0,
     };
     let signer = make_local_signer(sk);
     let sig = TypedSigner::sign_sync_committee_message(&signer, slot, beacon_block_root, &ctx)

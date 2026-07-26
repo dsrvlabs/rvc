@@ -795,7 +795,11 @@ mod tests {
     }
 
     fn test_ctx(sk: &SecretKey) -> SignContext {
-        SignContext { pubkey: sk.public_key(), fork_info: test_fork_info() }
+        SignContext {
+            pubkey: sk.public_key(),
+            fork_info: test_fork_info(),
+            fork_name: eth_types::ForkName::Deneb,
+        }
     }
 
     fn sample_attestation() -> AttestationData {
@@ -983,7 +987,11 @@ mod tests {
         let unknown_sk = SecretKey::generate();
         let config = RemoteSignerConfig::new("http://localhost:9000");
         let signer = RemoteSigner::new_unchecked(config, vec![pk_bytes]);
-        let ctx = SignContext { pubkey: unknown_sk.public_key(), fork_info: test_fork_info() };
+        let ctx = SignContext {
+            pubkey: unknown_sk.public_key(),
+            fork_info: test_fork_info(),
+            fork_name: eth_types::ForkName::Deneb,
+        };
         let data = sample_attestation();
 
         let result = TypedSigner::sign_attestation(&signer, &data, &ctx).await;

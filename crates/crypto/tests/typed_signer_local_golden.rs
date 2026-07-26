@@ -15,7 +15,7 @@
 
 use eth_types::{
     AggregateAndProof, Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock, Checkpoint,
-    ContributionAndProof, ForkInfo, ForkSchedule, SyncAggregatorSelectionData,
+    ContributionAndProof, ForkInfo, ForkName, ForkSchedule, SyncAggregatorSelectionData,
     SyncCommitteeContribution, ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
     DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
     DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
@@ -69,7 +69,7 @@ fn deneb_fork_info() -> ForkInfo {
 }
 
 fn make_ctx(sk: &SecretKey, fork_info: ForkInfo) -> SignContext {
-    SignContext { pubkey: sk.public_key(), fork_info }
+    SignContext { pubkey: sk.public_key(), fork_info, fork_name: ForkName::Deneb }
 }
 
 // ============================================================
@@ -364,7 +364,7 @@ async fn test_typed_signer_local_voluntary_exit_golden() {
         current_version: capella_version,
         genesis_validators_root: GENESIS_VALIDATORS_ROOT,
     };
-    let ctx = SignContext { pubkey: sk.public_key(), fork_info };
+    let ctx = SignContext { pubkey: sk.public_key(), fork_info, fork_name: ForkName::Capella };
     let exit = VoluntaryExit { epoch: exit_epoch, validator_index: 999 };
     let signer = make_signer(sk);
 

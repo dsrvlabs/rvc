@@ -213,22 +213,13 @@ impl GrpcRemoteSigner {
         }
     }
 
+    /// SSZ / wire fork id from the resolved [`SignContext::fork_name`].
+    ///
+    /// Callers must populate `fork_name` (via schedule lookup or
+    /// [`SignContext::resolve`]); there is no silent mainnet-byte match and no
+    /// Deneb default for unknown versions.
     fn fork_id(ctx: &SignContext) -> u32 {
-        // Derive fork_id from fork version. These are the consensus-layer fork IDs.
-        // PHASE0=0, ALTAIR=1, BELLATRIX=2, CAPELLA=3, DENEB=4, ELECTRA=5, FULU=6
-        // We use the current_version bytes to identify the fork.
-        // This mapping is documented in the proto file comments.
-        match ctx.fork_info.current_version {
-            [0x00, 0x00, 0x00, 0x00] => 0, // Phase0 (mainnet)
-            [0x01, 0x00, 0x00, 0x00] => 1, // Altair (mainnet)
-            [0x02, 0x00, 0x00, 0x00] => 2, // Bellatrix (mainnet)
-            [0x03, 0x00, 0x00, 0x00] => 3, // Capella (mainnet)
-            [0x04, 0x00, 0x00, 0x00] => 4, // Deneb (mainnet)
-            [0x05, 0x00, 0x00, 0x00] => 5, // Electra (mainnet)
-            [0x06, 0x00, 0x00, 0x00] => 6, // Fulu (mainnet)
-            // Testnet and devnet fork versions all map to Deneb or latest — default to 4
-            _ => 4,
-        }
+        ctx.fork_name.id()
     }
 
     fn ensure_pubkey(&self, ctx: &SignContext) -> Result<(), SigningError> {
@@ -880,5 +871,134 @@ mod tests {
         // because GrpcRemoteSigner no longer implements Signer.
         // The presence of this comment + successful compilation IS the test.
         let _ = "GrpcRemoteSigner implements TypedSigner only — no raw Signer impl";
+    }
+
+    // ---- RF3-08: SignContext carries ForkName; no silent `_ => Deneb` ----
+
+    use crypto::typed_signer::SignContext;
+    use crypto::SecretKey;
+    use eth_types::{ForkInfo, ForkName, ForkSchedule};
+
+    /// Hoodi-style Electra version bytes (not mainnet `[0x05,0,0,0]`).
+    const HOODI_ELECTRA: [u8; 4] = [0x60, 0x00, 0x09, 0x10];
+    const HOODI_DENEB: [u8; 4] = [0x50, 0x00, 0x09, 0x10];
+    const HOODI_CAPELLA: [u8; 4] = [0x40, 0x00, 0x09, 0x10];
+    const HOODI_GENESIS: [u8; 4] = [0x10, 0x00, 0x09, 0x10];
+
+    fn mainnet_schedule() -> ForkSchedule {
+        ForkSchedule {
+            genesis_fork_version: [0x00, 0x00, 0x00, 0x00],
+            altair_fork_epoch: 74240,
+            altair_fork_version: [0x01, 0x00, 0x00, 0x00],
+            bellatrix_fork_epoch: 144896,
+            bellatrix_fork_version: [0x02, 0x00, 0x00, 0x00],
+            capella_fork_epoch: 194048,
+            capella_fork_version: [0x03, 0x00, 0x00, 0x00],
+            deneb_fork_epoch: 269568,
+            deneb_fork_version: [0x04, 0x00, 0x00, 0x00],
+            electra_fork_epoch: 364032,
+            electra_fork_version: [0x05, 0x00, 0x00, 0x00],
+            fulu_fork_epoch: u64::MAX,
+            fulu_fork_version: [0x06, 0x00, 0x00, 0x00],
+        }
+    }
+
+    fn hoodi_schedule() -> ForkSchedule {
+        ForkSchedule {
+            genesis_fork_version: HOODI_GENESIS,
+            altair_fork_epoch: 0,
+            altair_fork_version: [0x20, 0x00, 0x09, 0x10],
+            bellatrix_fork_epoch: 0,
+            bellatrix_fork_version: [0x30, 0x00, 0x09, 0x10],
+            capella_fork_epoch: 0,
+            capella_fork_version: HOODI_CAPELLA,
+            deneb_fork_epoch: 0,
+            deneb_fork_version: HOODI_DENEB,
+            electra_fork_epoch: 0,
+            electra_fork_version: HOODI_ELECTRA,
+            fulu_fork_epoch: u64::MAX,
+            fulu_fork_version: [0x70, 0x00, 0x09, 0x10],
+        }
+    }
+
+    fn dummy_pubkey() -> crypto::PublicKey {
+        SecretKey::generate().public_key()
+    }
+
+    #[test]
+    fn test_hoodi_electra_fork_version_maps_to_electra_not_deneb() {
+        // RED for the pre-fix bug: matching only mainnet bytes returned 4 (Deneb)
+        // for any non-mainnet Electra version.
+        let fork_info = ForkInfo {
+            previous_version: HOODI_DENEB,
+            current_version: HOODI_ELECTRA,
+            genesis_validators_root: [0xaa; 32],
+        };
+        let ctx = SignContext::resolve(dummy_pubkey(), fork_info, &hoodi_schedule())
+            .expect("Hoodi Electra version must resolve via schedule");
+        assert_eq!(ctx.fork_name, ForkName::Electra);
+        assert_eq!(GrpcRemoteSigner::fork_id(&ctx), 5);
+    }
+
+    #[test]
+    fn test_mainnet_fork_ids_unchanged_for_all_seven_versions() {
+        let schedule = mainnet_schedule();
+        let expected = [
+            (ForkName::Phase0, [0x00, 0x00, 0x00, 0x00], 0u32),
+            (ForkName::Altair, [0x01, 0x00, 0x00, 0x00], 1),
+            (ForkName::Bellatrix, [0x02, 0x00, 0x00, 0x00], 2),
+            (ForkName::Capella, [0x03, 0x00, 0x00, 0x00], 3),
+            (ForkName::Deneb, [0x04, 0x00, 0x00, 0x00], 4),
+            (ForkName::Electra, [0x05, 0x00, 0x00, 0x00], 5),
+            (ForkName::Fulu, [0x06, 0x00, 0x00, 0x00], 6),
+        ];
+        for (name, version, id) in expected {
+            let fork_info = ForkInfo {
+                previous_version: version,
+                current_version: version,
+                genesis_validators_root: [0xbb; 32],
+            };
+            let ctx = SignContext::resolve(dummy_pubkey(), fork_info, &schedule)
+                .unwrap_or_else(|_| panic!("mainnet {name:?} version must resolve"));
+            assert_eq!(ctx.fork_name, name);
+            assert_eq!(GrpcRemoteSigner::fork_id(&ctx), id, "mainnet {name:?}");
+            assert_eq!(name.id(), id);
+        }
+    }
+
+    #[test]
+    fn test_unknown_fork_version_is_warned_not_silently_defaulted() {
+        let schedule = mainnet_schedule();
+        let fork_info = ForkInfo {
+            previous_version: [0xde, 0xad, 0xbe, 0xef],
+            current_version: [0xde, 0xad, 0xbe, 0xef],
+            genesis_validators_root: [0xcc; 32],
+        };
+        let result = SignContext::resolve(dummy_pubkey(), fork_info, &schedule);
+        let err = match result {
+            Ok(_) => panic!("unknown version must not resolve"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("unresolvable fork version"), "typed error message, got: {msg}");
+        // No silent Deneb: there is no SignContext and therefore no fork_id == 4 path.
+    }
+
+    #[test]
+    fn test_sign_context_carries_resolved_fork_name() {
+        let ctx = SignContext::new(
+            dummy_pubkey(),
+            ForkInfo {
+                previous_version: HOODI_CAPELLA,
+                current_version: HOODI_ELECTRA,
+                genesis_validators_root: [0xdd; 32],
+            },
+            ForkName::Electra,
+        );
+        assert_eq!(ctx.fork_name, ForkName::Electra);
+        assert_eq!(ctx.fork_name.id(), 5);
+        assert_eq!(GrpcRemoteSigner::fork_id(&ctx), ctx.fork_name.id());
+        // Version bytes alone are non-mainnet; fork_id must still come from fork_name.
+        assert_ne!(ctx.fork_info.current_version, [0x05, 0x00, 0x00, 0x00]);
     }
 }

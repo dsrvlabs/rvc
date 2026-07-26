@@ -600,7 +600,11 @@ mod tests {
     }
 
     fn test_sign_ctx(pk: PublicKey) -> SignContext {
-        SignContext { pubkey: pk, fork_info: test_fork_info() }
+        SignContext {
+            pubkey: pk,
+            fork_info: test_fork_info(),
+            fork_name: eth_types::ForkName::Deneb,
+        }
     }
 
     #[tokio::test]

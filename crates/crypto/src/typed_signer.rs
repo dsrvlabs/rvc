@@ -24,11 +24,55 @@ use eth_types::{ForkName, ForkSchedule, SyncAggregatorSelectionData};
 // ============================================================
 
 /// Signing context passed to every [`TypedSigner`] method.
-/// Carries the signer's public key and the fork information required for
-/// domain computation.
+///
+/// Carries the signer's public key, the fork versions used for domain
+/// computation, and the resolved [`ForkName`] used for SSZ fork-id tagging
+/// (gRPC remote path). Callers that already know the active fork from a
+/// [`ForkSchedule`] should set [`Self::fork_name`] directly; use
+/// [`Self::resolve`] when only version bytes are available.
 pub struct SignContext {
     pub pubkey: PublicKey,
     pub fork_info: ForkInfo,
+    /// Resolved consensus fork for SSZ / wire `fork_id` (never inferred from
+    /// mainnet-only version bytes).
+    pub fork_name: ForkName,
+}
+
+impl SignContext {
+    /// Build a context with an already-resolved fork name.
+    pub fn new(pubkey: PublicKey, fork_info: ForkInfo, fork_name: ForkName) -> Self {
+        Self { pubkey, fork_info, fork_name }
+    }
+
+    /// Resolve [`Self::fork_name`] by matching `fork_info.current_version`
+    /// against `schedule.entries()`.
+    ///
+    /// Returns a typed error (and emits a `warn!`) when the version is not in
+    /// the schedule — never silently defaults to Deneb.
+    pub fn resolve(
+        pubkey: PublicKey,
+        fork_info: ForkInfo,
+        schedule: &ForkSchedule,
+    ) -> Result<Self, SigningError> {
+        match schedule
+            .entries()
+            .into_iter()
+            .find(|(_, _, version)| *version == fork_info.current_version)
+            .map(|(name, _, _)| name)
+        {
+            Some(fork_name) => Ok(Self { pubkey, fork_info, fork_name }),
+            None => {
+                tracing::warn!(
+                    current_version = %hex::encode(fork_info.current_version),
+                    "unresolvable fork version for SignContext; refusing silent Deneb default"
+                );
+                Err(SigningError::RemoteSignerError(format!(
+                    "unresolvable fork version 0x{}",
+                    hex::encode(fork_info.current_version)
+                )))
+            }
+        }
+    }
 }
 
 // ============================================================
@@ -321,7 +365,11 @@ mod tests {
     }
 
     fn test_ctx(sk: &SecretKey) -> SignContext {
-        SignContext { pubkey: sk.public_key(), fork_info: test_fork_info() }
+        SignContext {
+            pubkey: sk.public_key(),
+            fork_info: test_fork_info(),
+            fork_name: ForkName::Deneb,
+        }
     }
 
     // ---- TypedSigner::sign_block ----
@@ -583,7 +631,7 @@ mod tests {
             current_version: [0x03, 0x00, 0x00, 0x00], // Capella
             genesis_validators_root: [0xaa; 32],
         };
-        let ctx = SignContext { pubkey: sk.public_key(), fork_info };
+        let ctx = SignContext { pubkey: sk.public_key(), fork_info, fork_name: ForkName::Capella };
         let exit = VoluntaryExit { epoch: 200, validator_index: 99 };
         let signer = make_local_signer(sk);
 

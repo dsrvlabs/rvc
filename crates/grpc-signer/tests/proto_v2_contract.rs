@@ -341,7 +341,7 @@ fn test_fork_info() -> ForkInfo {
 }
 
 fn test_ctx(pk: crypto::PublicKey) -> SignContext {
-    SignContext { pubkey: pk, fork_info: test_fork_info() }
+    SignContext { pubkey: pk, fork_info: test_fork_info(), fork_name: eth_types::ForkName::Phase0 }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -254,6 +254,7 @@ fn test_sign_ctx(pk: crypto::PublicKey) -> SignContext {
             current_version: [0x00, 0x00, 0x00, 0x00], // Phase0
             genesis_validators_root: [0xaa; 32],
         },
+        fork_name: eth_types::ForkName::Phase0,
     }
 }
 
