@@ -17,8 +17,7 @@ const OTHER_GVR: &[u8; 32] = &[8u8; 32];
 
 fn open_db_with_gvr() -> SlashingDb {
     let db = SlashingDb::open_in_memory().expect("open_in_memory");
-    let hex = format!("0x{}", hex::encode(GVR));
-    db.set_genesis_validators_root(&hex).expect("set_genesis_validators_root");
+    db.set_genesis_validators_root(GVR).expect("set_genesis_validators_root");
     db
 }
 

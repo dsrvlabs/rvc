@@ -151,7 +151,7 @@ fn complete_import_history_only(
                     attestation.target_epoch
                 ))
             })?;
-            db.record_attestation(
+            db.seed_attestation(
                 &validator.pubkey,
                 source_epoch,
                 target_epoch,
@@ -164,7 +164,7 @@ fn complete_import_history_only(
             let slot: u64 = block.slot.parse().map_err(|_| {
                 SlashingError::InvalidInterchangeFormat(format!("invalid slot: {}", block.slot))
             })?;
-            db.record_block(&validator.pubkey, slot, block.signing_root.clone(), SIGN_GVR)?;
+            db.seed_block(&validator.pubkey, slot, block.signing_root.clone(), SIGN_GVR)?;
         }
     }
 

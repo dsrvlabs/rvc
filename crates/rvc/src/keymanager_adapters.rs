@@ -492,11 +492,11 @@ impl KeystoreManager for KeystoreManagerAdapter {
 
 pub struct SlashingProtectionAdapter {
     slashing_db: Arc<SlashingDb>,
-    genesis_validators_root: String,
+    genesis_validators_root: eth_types::Root,
 }
 
 impl SlashingProtectionAdapter {
-    pub fn new(slashing_db: Arc<SlashingDb>, genesis_validators_root: String) -> Self {
+    pub fn new(slashing_db: Arc<SlashingDb>, genesis_validators_root: eth_types::Root) -> Self {
         Self { slashing_db, genesis_validators_root }
     }
 }
@@ -1142,10 +1142,7 @@ mod tests {
     #[test]
     fn test_slashing_adapter_import_invalid_json() {
         let db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let adapter = SlashingProtectionAdapter::new(
-            db,
-            "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        );
+        let adapter = SlashingProtectionAdapter::new(db, [0u8; 32]);
         let result = adapter.import_interchange("not valid json");
         assert!(result.is_err());
     }
@@ -1153,10 +1150,7 @@ mod tests {
     #[test]
     fn test_slashing_adapter_import_valid() {
         let db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let adapter = SlashingProtectionAdapter::new(
-            db,
-            "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        );
+        let adapter = SlashingProtectionAdapter::new(db, [0u8; 32]);
         let interchange = serde_json::json!({
             "metadata": {
                 "interchange_format_version": "5",
@@ -1171,10 +1165,7 @@ mod tests {
     #[test]
     fn test_slashing_adapter_export_empty() {
         let db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let adapter = SlashingProtectionAdapter::new(
-            db,
-            "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        );
+        let adapter = SlashingProtectionAdapter::new(db, [0u8; 32]);
         let result = adapter.export_interchange(&[]);
         assert!(result.is_ok());
         let export: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();
@@ -1464,10 +1455,7 @@ mod tests {
         let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 100));
 
         let keystore_mgr = Arc::new(test_keystore_adapter(dir.keep(), composite.clone()).0);
-        let slashing_prot = Arc::new(SlashingProtectionAdapter::new(
-            slashing_db,
-            "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        ));
+        let slashing_prot = Arc::new(SlashingProtectionAdapter::new(slashing_db, [0u8; 32]));
         let validator_mgr = Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
         let doppelganger_mon = Arc::new(DoppelgangerMonitorAdapter::new());
         let remote_key_mgr = Arc::new(test_remote_adapter(composite, None).0);
@@ -1579,10 +1567,7 @@ mod tests {
         let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 100));
 
         let keystore_mgr = Arc::new(test_keystore_adapter(dir.keep(), composite.clone()).0);
-        let slashing_prot = Arc::new(SlashingProtectionAdapter::new(
-            slashing_db,
-            "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        ));
+        let slashing_prot = Arc::new(SlashingProtectionAdapter::new(slashing_db, [0u8; 32]));
         let validator_mgr = Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
         let doppelganger_mon = Arc::new(DoppelgangerMonitorAdapter::new());
         let remote_key_mgr = Arc::new(test_remote_adapter(composite.clone(), None).0);
@@ -2762,14 +2747,13 @@ mod tests {
         let (dir, composite, pk) = boot_load_keystore_dir_key();
         let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), composite);
 
-        let gvr_hex = "0x0000000000000000000000000000000000000000000000000000000000000000";
         let gvr_root = [0u8; 32];
         let db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let pk_hex = format!("0x{}", hex::encode(pk));
         db.seed_attestation(&pk_hex, 10, 11, None, &gvr_root).expect("seed history");
         db.seed_block(&pk_hex, 42, None, &gvr_root).expect("seed block history");
 
-        let slashing = SlashingProtectionAdapter::new(db, gvr_hex.to_string());
+        let slashing = SlashingProtectionAdapter::new(db, gvr_root);
 
         assert!(
             adapter.has_key(&pk),

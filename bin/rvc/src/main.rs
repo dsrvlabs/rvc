@@ -1685,7 +1685,7 @@ async fn run_validator(
         );
         let slashing_prot = std::sync::Arc::new(SlashingProtectionAdapter::new(
             slashing_db.clone(),
-            genesis_validators_root_hex.clone(),
+            genesis_validators_root,
         ));
         let validator_mgr =
             std::sync::Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));

@@ -112,9 +112,11 @@ pub async fn validate_genesis_root(
         });
     }
 
-    // SlashingDb compares GVR by bytes and stores the canonical form
-    // (`0x` + lowercase hex). Bare or mixed-case legacy metadata remains compatible.
-    slashing_db.set_genesis_validators_root(&local_normalized)?;
+    // SlashingDb takes a typed Root, compares by bytes, and stores canonical
+    // `0x` + lowercase hex. Bare or mixed-case legacy metadata remains compatible.
+    let local_root = eth_types::canonical::gvr_hex::parse_gvr_hex(&local_normalized)
+        .map_err(|e| StartupError::InvalidHexInput(format!("genesis_validators_root: {e}")))?;
+    slashing_db.set_genesis_validators_root(&local_root)?;
 
     info!("Genesis validators root validated successfully");
     Ok(())

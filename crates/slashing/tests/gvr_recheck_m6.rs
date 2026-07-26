@@ -25,16 +25,14 @@ const R2: &[u8; 32] = &[0x02u8; 32];
 /// data without going through the public API.
 fn open_file_db_with_pinned_gvr(path: &std::path::Path, gvr: &[u8; 32]) -> SlashingDb {
     let db = SlashingDb::open(path).expect("SlashingDb::open");
-    let hex = format!("0x{}", hex::encode(gvr));
-    db.set_genesis_validators_root(&hex).expect("set_genesis_validators_root");
+    db.set_genesis_validators_root(gvr).expect("set_genesis_validators_root");
     db
 }
 
 /// Helper: open an **in-memory** DB with GVR pinned in metadata.
 fn open_memory_db_with_pinned_gvr(gvr: &[u8; 32]) -> SlashingDb {
     let db = SlashingDb::open_in_memory().expect("open_in_memory");
-    let hex = format!("0x{}", hex::encode(gvr));
-    db.set_genesis_validators_root(&hex).expect("set_genesis_validators_root");
+    db.set_genesis_validators_root(gvr).expect("set_genesis_validators_root");
     db
 }
 
@@ -308,8 +306,7 @@ fn test_legacy_row_no_per_row_gvr_does_not_break_violation_checks() {
 
     let db = SlashingDb::open(&db_path).expect("SlashingDb::open");
     // GVR is already in metadata — set_genesis_validators_root is idempotent if matching.
-    let hex = format!("0x{}", hex::encode(R1));
-    db.set_genesis_validators_root(&hex).expect("set gvr");
+    db.set_genesis_validators_root(R1).expect("set gvr");
 
     // Step 3: A double-vote attempt (same target_epoch=5, different signing_root) must
     // still be caught by the violation check even though the existing row has NULL gvr.
@@ -373,7 +370,7 @@ fn test_gvr_cache_none_not_poisoned_after_set() {
         .expect("no pinned gvr: skipped → must succeed");
 
     // Now pin GVR R1.
-    db.set_genesis_validators_root(&format!("0x{}", hex::encode(R1))).expect("set should succeed");
+    db.set_genesis_validators_root(R1).expect("set should succeed");
 
     // Next call with a DIFFERENT gvr must now be rejected — the cache must
     // have re-read from DB rather than use the stale "no pinned gvr → skip".

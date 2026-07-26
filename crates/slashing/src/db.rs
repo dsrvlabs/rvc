@@ -974,7 +974,7 @@ impl SlashingDb {
     #[tracing::instrument(name = "slashing.db.export", skip_all)]
     pub fn export(
         &self,
-        genesis_validators_root: &str,
+        genesis_validators_root: &Root,
     ) -> Result<InterchangeFormat, SlashingError> {
         // KM-1/ADR-008: single held lock = consistent snapshot; no interleaved writes.
         let conn = self.conn.lock();
@@ -1007,10 +1007,13 @@ impl SlashingDb {
         }
 
         let record_count = data.len();
+        // Always emit canonical 0x+lowercase hex (RF3-18) so re-import compares
+        // cleanly against any accepted encoding of the same Root.
+        let gvr_hex = Self::root_to_hex(genesis_validators_root);
         let result = InterchangeFormat {
             metadata: InterchangeMetadata {
                 interchange_format_version: "5".to_string(),
-                genesis_validators_root: genesis_validators_root.to_string(),
+                genesis_validators_root: gvr_hex,
             },
             data,
         };
@@ -1040,7 +1043,7 @@ impl SlashingDb {
     pub fn import(
         &self,
         interchange: &InterchangeFormat,
-        expected_genesis_validators_root: &str,
+        expected_genesis_validators_root: &Root,
     ) -> Result<(), SlashingError> {
         if interchange.metadata.interchange_format_version != "5" {
             return Err(SlashingError::InvalidInterchangeFormat(format!(
@@ -1049,19 +1052,34 @@ impl SlashingDb {
             )));
         }
 
-        if interchange.metadata.genesis_validators_root != expected_genesis_validators_root {
+        // RF3-18: byte-based metadata compare — bare hex, 0x-prefixed, and mixed-case
+        // encodings of the same 32-byte root must not spuriously reject a valid import.
+        // Use eth-types parse (no all-zeros policy) so interchange wire forms stay open;
+        // row storage always uses the caller's typed Root in canonical form.
+        let expected_hex = Self::root_to_hex(expected_genesis_validators_root);
+        let actual_root = match eth_types::canonical::gvr_hex::parse_gvr_hex(
+            &interchange.metadata.genesis_validators_root,
+        ) {
+            Ok(root) => root,
+            Err(_) => {
+                return Err(SlashingError::GenesisValidatorsRootMismatch {
+                    expected: expected_hex,
+                    actual: interchange.metadata.genesis_validators_root.clone(),
+                });
+            }
+        };
+        if actual_root != *expected_genesis_validators_root {
             return Err(SlashingError::GenesisValidatorsRootMismatch {
-                expected: expected_genesis_validators_root.to_string(),
+                expected: expected_hex,
                 actual: interchange.metadata.genesis_validators_root.clone(),
             });
         }
 
-        // The gvr is already validated above against interchange.metadata.genesis_validators_root.
-        // Store it as a hex string to write into every inserted row.  Every row must carry a
-        // non-NULL genesis_validators_root so the v3 unique index
-        // (pubkey, genesis_validators_root, slot/target_epoch) actually fires — SQLite treats
-        // NULL as DISTINCT from all values, so a NULL gvr bypasses the index silently.
-        let gvr_hex = expected_genesis_validators_root.to_owned();
+        // Canonical 0x+lowercase for every imported row so the v3 unique index
+        // (pubkey, genesis_validators_root, slot/target_epoch) matches runtime
+        // inserts that also go through root_to_hex (RF3-18).  SQLite treats NULL
+        // as DISTINCT, so a NULL gvr would bypass the index silently.
+        let gvr_hex = expected_hex;
 
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1350,10 +1368,17 @@ impl SlashingDb {
     /// match against a non-canonical stored form, the row is rewritten to canonical
     /// in the same transaction (one-time upgrade compatibility).
     ///
-    /// All-zeros is rejected (builder-registration sentinel, not a real chain id).
-    pub fn set_genesis_validators_root(&self, root: &str) -> Result<(), SlashingError> {
-        let incoming = Self::parse_gvr_hex(root)?;
-        let canonical_hex = Self::root_to_hex(&incoming);
+    /// Takes a typed [`Root`] (RF3-18). All-zeros is rejected (builder-registration
+    /// sentinel, not a real chain id).
+    pub fn set_genesis_validators_root(&self, root: &Root) -> Result<(), SlashingError> {
+        // All-zeros is the builder-registration sentinel and never a real chain
+        // identifier. Reject it to catch operator misconfiguration.
+        if *root == [0u8; 32] {
+            return Err(SlashingError::InvalidInterchangeFormat(
+                "genesis_validators_root must not be all zeros".to_string(),
+            ));
+        }
+        let canonical_hex = Self::root_to_hex(root);
 
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1367,10 +1392,10 @@ impl SlashingDb {
         match existing {
             Some(stored) => {
                 let stored_root = Self::parse_gvr_hex(&stored)?;
-                if stored_root != incoming {
+                if stored_root != *root {
                     return Err(SlashingError::GenesisValidatorsRootMismatch {
                         expected: stored,
-                        actual: root.to_string(),
+                        actual: canonical_hex,
                     });
                 }
                 // Same chain: normalise legacy bare/mixed-case metadata to canonical.
@@ -1758,6 +1783,18 @@ mod tests {
     /// unit tests, so the M-6 per-call GVR check is skipped and this value is
     /// only written into the row's `genesis_validators_root` column.
     const TEST_GVR: Root = [0u8; 32];
+
+    /// Non-zero chain GVR used by import/export/set tests (RF3-18 typed API).
+    const CHAIN_GVR_HEX: &str =
+        "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+
+    fn chain_gvr() -> Root {
+        eth_types::canonical::gvr_hex::parse_gvr_hex(CHAIN_GVR_HEX).expect("chain gvr")
+    }
+
+    fn gvr_from_hex(hex: &str) -> Root {
+        eth_types::canonical::gvr_hex::parse_gvr_hex(hex).expect("valid gvr hex")
+    }
 
     /// The `slashing.db.block`/`slashing.db.attestation` spans declare
     /// `slashing_result = field::Empty` and late-bind it via Span::record. This proves the
@@ -2187,9 +2224,10 @@ mod tests {
     #[test]
     fn test_export_empty_db() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root = CHAIN_GVR_HEX;
+        let genesis_root_bytes = chain_gvr();
 
-        let interchange = db.export(genesis_root).expect("export should succeed");
+        let interchange = db.export(&genesis_root_bytes).expect("export should succeed");
 
         assert_eq!(interchange.metadata.interchange_format_version, "5");
         assert_eq!(interchange.metadata.genesis_validators_root, genesis_root);
@@ -2199,14 +2237,14 @@ mod tests {
     #[test]
     fn test_export_with_attestations() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root_bytes = chain_gvr();
 
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
         db.seed_attestation(pubkey, 100, 101, Some("0xabcd".to_string()), &TEST_GVR)
             .expect("record should succeed");
         db.seed_attestation(pubkey, 101, 102, None, &TEST_GVR).expect("record should succeed");
 
-        let interchange = db.export(genesis_root).expect("export should succeed");
+        let interchange = db.export(&genesis_root_bytes).expect("export should succeed");
 
         assert_eq!(interchange.data.len(), 1);
         let validator = &interchange.data[0];
@@ -2223,7 +2261,7 @@ mod tests {
     #[test]
     fn test_export_with_blocks() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root_bytes = chain_gvr();
 
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
         let block = SignedBlock {
@@ -2233,7 +2271,7 @@ mod tests {
         };
         db.insert_block(&block, &TEST_GVR).expect("insert should succeed");
 
-        let interchange = db.export(genesis_root).expect("export should succeed");
+        let interchange = db.export(&genesis_root_bytes).expect("export should succeed");
 
         assert_eq!(interchange.data.len(), 1);
         let validator = &interchange.data[0];
@@ -2246,7 +2284,7 @@ mod tests {
     #[test]
     fn test_export_multiple_validators() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root_bytes = chain_gvr();
 
         let pubkey1 = "0x1111";
         let pubkey2 = "0x2222";
@@ -2254,7 +2292,7 @@ mod tests {
         db.seed_attestation(pubkey1, 100, 101, None, &TEST_GVR).expect("record should succeed");
         db.seed_attestation(pubkey2, 200, 201, None, &TEST_GVR).expect("record should succeed");
 
-        let interchange = db.export(genesis_root).expect("export should succeed");
+        let interchange = db.export(&genesis_root_bytes).expect("export should succeed");
 
         assert_eq!(interchange.data.len(), 2);
     }
@@ -2262,7 +2300,8 @@ mod tests {
     #[test]
     fn test_import_empty_interchange() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root = CHAIN_GVR_HEX;
+        let genesis_root_bytes = chain_gvr();
 
         let interchange = InterchangeFormat {
             metadata: InterchangeMetadata {
@@ -2272,30 +2311,31 @@ mod tests {
             data: vec![],
         };
 
-        let result = db.import(&interchange, genesis_root);
+        let result = db.import(&interchange, &genesis_root_bytes);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_import_genesis_root_mismatch() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let expected_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let expected_root_hex = CHAIN_GVR_HEX;
+        let expected_root = chain_gvr();
         let actual_root = "0xdifferent00000000000000000000000000000000000000000000000000000000";
 
         let interchange = InterchangeFormat {
             metadata: InterchangeMetadata {
                 interchange_format_version: "5".to_string(),
-                genesis_validators_root: actual_root.to_string(),
+                genesis_validators_root: actual_root.to_string(), // mismatched chain
             },
             data: vec![],
         };
 
-        let result = db.import(&interchange, expected_root);
+        let result = db.import(&interchange, &expected_root);
         assert!(result.is_err());
 
         match result.unwrap_err() {
             SlashingError::GenesisValidatorsRootMismatch { expected, actual } => {
-                assert_eq!(expected, expected_root);
+                assert_eq!(expected, expected_root_hex);
                 assert_eq!(actual, actual_root);
             }
             _ => panic!("expected GenesisValidatorsRootMismatch error"),
@@ -2305,7 +2345,8 @@ mod tests {
     #[test]
     fn test_import_with_attestations() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root = CHAIN_GVR_HEX;
+        let genesis_root_bytes = chain_gvr();
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
 
         let interchange = InterchangeFormat {
@@ -2331,7 +2372,7 @@ mod tests {
             }],
         };
 
-        db.import(&interchange, genesis_root).expect("import should succeed");
+        db.import(&interchange, &genesis_root_bytes).expect("import should succeed");
 
         let attestations = db.get_attestations(pubkey).expect("get should succeed");
         assert_eq!(attestations.len(), 2);
@@ -2346,7 +2387,8 @@ mod tests {
     #[test]
     fn test_import_with_blocks() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root = CHAIN_GVR_HEX;
+        let genesis_root_bytes = chain_gvr();
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
 
         let interchange = InterchangeFormat {
@@ -2364,7 +2406,7 @@ mod tests {
             }],
         };
 
-        db.import(&interchange, genesis_root).expect("import should succeed");
+        db.import(&interchange, &genesis_root_bytes).expect("import should succeed");
 
         let blocks = db.get_blocks(pubkey).expect("get should succeed");
         assert_eq!(blocks.len(), 1);
@@ -2375,7 +2417,7 @@ mod tests {
     #[test]
     fn test_roundtrip_export_import() {
         let db1 = SlashingDb::open_in_memory().expect("failed to open db");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root_bytes = chain_gvr();
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
 
         db1.seed_attestation(pubkey, 100, 101, Some("0xabcd".to_string()), &TEST_GVR)
@@ -2389,7 +2431,7 @@ mod tests {
         };
         db1.insert_block(&block, &TEST_GVR).expect("insert should succeed");
 
-        let interchange = db1.export(genesis_root).expect("export should succeed");
+        let interchange = db1.export(&genesis_root_bytes).expect("export should succeed");
 
         let json =
             serde_json::to_string_pretty(&interchange).expect("serialization should succeed");
@@ -2397,7 +2439,7 @@ mod tests {
             serde_json::from_str(&json).expect("deserialization should succeed");
 
         let db2 = SlashingDb::open_in_memory().expect("failed to open db");
-        db2.import(&parsed, genesis_root).expect("import should succeed");
+        db2.import(&parsed, &genesis_root_bytes).expect("import should succeed");
 
         let attestations = db2.get_attestations(pubkey).expect("get should succeed");
         assert_eq!(attestations.len(), 2);
@@ -2414,7 +2456,8 @@ mod tests {
     #[test]
     fn test_import_idempotent() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root = CHAIN_GVR_HEX;
+        let genesis_root_bytes = chain_gvr();
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
 
         let interchange = InterchangeFormat {
@@ -2433,8 +2476,8 @@ mod tests {
             }],
         };
 
-        db.import(&interchange, genesis_root).expect("first import should succeed");
-        db.import(&interchange, genesis_root).expect("second import should succeed");
+        db.import(&interchange, &genesis_root_bytes).expect("first import should succeed");
+        db.import(&interchange, &genesis_root_bytes).expect("second import should succeed");
 
         let attestations = db.get_attestations(pubkey).expect("get should succeed");
         assert_eq!(attestations.len(), 1);
@@ -2446,7 +2489,8 @@ mod tests {
     #[test]
     fn test_import_sets_watermarks_from_interchange_maxima() {
         let db = SlashingDb::open_in_memory().expect("open");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root = CHAIN_GVR_HEX;
+        let genesis_root_bytes = chain_gvr();
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
 
         let interchange = InterchangeFormat {
@@ -2484,7 +2528,7 @@ mod tests {
         assert!(db.get_block_watermark(pubkey).unwrap().is_none());
         assert!(db.get_attestation_watermark(pubkey).unwrap().is_none());
 
-        db.import(&interchange, genesis_root).expect("import");
+        db.import(&interchange, &genesis_root_bytes).expect("import");
 
         assert_eq!(db.get_block_watermark(pubkey).unwrap(), Some(500));
         assert_eq!(db.get_attestation_watermark(pubkey).unwrap(), Some((30, 40)));
@@ -2498,6 +2542,7 @@ mod tests {
     fn test_import_watermark_blocks_stage_at_equality_allows_above() {
         let db = SlashingDb::open_in_memory().expect("open");
         let genesis_root = "0x0000000000000000000000000000000000000000000000000000000000000000";
+        let genesis_root_bytes = TEST_GVR;
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
         const T: u64 = 200;
         const BLOCK_MAX: u64 = 1000;
@@ -2521,7 +2566,7 @@ mod tests {
             }],
         };
 
-        db.import(&interchange, genesis_root).expect("import");
+        db.import(&interchange, &genesis_root_bytes).expect("import");
 
         // Attestation at target == T blocked (A1 `<=`).
         let err = db
@@ -2571,7 +2616,8 @@ mod tests {
     #[test]
     fn test_reimport_older_interchange_does_not_lower_watermarks() {
         let db = SlashingDb::open_in_memory().expect("open");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root = CHAIN_GVR_HEX;
+        let genesis_root_bytes = chain_gvr();
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
 
         let newer = InterchangeFormat {
@@ -2611,12 +2657,12 @@ mod tests {
             }],
         };
 
-        db.import(&newer, genesis_root).expect("import newer");
+        db.import(&newer, &genesis_root_bytes).expect("import newer");
         assert_eq!(db.get_block_watermark(pubkey).unwrap(), Some(9000));
         assert_eq!(db.get_attestation_watermark(pubkey).unwrap(), Some((500, 600)));
 
         // Re-import older maxima: must succeed and leave watermarks raised.
-        db.import(&older, genesis_root).expect("re-import older must not fail");
+        db.import(&older, &genesis_root_bytes).expect("re-import older must not fail");
         assert_eq!(db.get_block_watermark(pubkey).unwrap(), Some(9000));
         assert_eq!(db.get_attestation_watermark(pubkey).unwrap(), Some((500, 600)));
 
@@ -2629,7 +2675,8 @@ mod tests {
     #[test]
     fn test_import_blocks_only_sets_block_watermark() {
         let db = SlashingDb::open_in_memory().expect("open");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root = CHAIN_GVR_HEX;
+        let genesis_root_bytes = chain_gvr();
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
 
         let interchange = InterchangeFormat {
@@ -2647,7 +2694,7 @@ mod tests {
             }],
         };
 
-        db.import(&interchange, genesis_root).expect("import");
+        db.import(&interchange, &genesis_root_bytes).expect("import");
         assert_eq!(db.get_block_watermark(pubkey).unwrap(), Some(42));
         assert!(db.get_attestation_watermark(pubkey).unwrap().is_none());
     }
@@ -2656,7 +2703,8 @@ mod tests {
     #[test]
     fn test_import_attestations_only_sets_attestation_watermark() {
         let db = SlashingDb::open_in_memory().expect("open");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root = CHAIN_GVR_HEX;
+        let genesis_root_bytes = chain_gvr();
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
 
         let interchange = InterchangeFormat {
@@ -2675,7 +2723,7 @@ mod tests {
             }],
         };
 
-        db.import(&interchange, genesis_root).expect("import");
+        db.import(&interchange, &genesis_root_bytes).expect("import");
         assert!(db.get_block_watermark(pubkey).unwrap().is_none());
         assert_eq!(db.get_attestation_watermark(pubkey).unwrap(), Some((7, 9)));
     }
@@ -2684,7 +2732,8 @@ mod tests {
     #[test]
     fn test_clear_watermarks_wipes_import_floors() {
         let db = SlashingDb::open_in_memory().expect("open");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root = CHAIN_GVR_HEX;
+        let genesis_root_bytes = chain_gvr();
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
 
         let interchange = InterchangeFormat {
@@ -2706,7 +2755,7 @@ mod tests {
             }],
         };
 
-        db.import(&interchange, genesis_root).expect("import");
+        db.import(&interchange, &genesis_root_bytes).expect("import");
         assert_eq!(db.get_block_watermark(pubkey).unwrap(), Some(100));
         assert_eq!(db.get_attestation_watermark(pubkey).unwrap(), Some((1, 2)));
 
@@ -2747,7 +2796,8 @@ mod tests {
     #[test]
     fn test_import_invalid_epoch_format() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root = CHAIN_GVR_HEX;
+        let genesis_root_bytes = chain_gvr();
         let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
 
         let interchange = InterchangeFormat {
@@ -2766,7 +2816,7 @@ mod tests {
             }],
         };
 
-        let result = db.import(&interchange, genesis_root);
+        let result = db.import(&interchange, &genesis_root_bytes);
         assert!(result.is_err());
 
         match result.unwrap_err() {
@@ -3515,7 +3565,7 @@ mod tests {
     fn test_integrity_set_genesis_validators_root() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
         let root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
-        db.set_genesis_validators_root(root).expect("set should succeed");
+        db.set_genesis_validators_root(&gvr_from_hex(root)).expect("set should succeed");
 
         let stored = db.genesis_validators_root().expect("query should succeed");
         assert_eq!(stored, Some(root.to_string()));
@@ -3526,8 +3576,8 @@ mod tests {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
         let root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
 
-        db.set_genesis_validators_root(root).expect("first set should succeed");
-        db.set_genesis_validators_root(root).expect("same root should succeed");
+        db.set_genesis_validators_root(&gvr_from_hex(root)).expect("first set should succeed");
+        db.set_genesis_validators_root(&gvr_from_hex(root)).expect("same root should succeed");
 
         let stored = db.genesis_validators_root().expect("query should succeed");
         assert_eq!(stored, Some(root.to_string()));
@@ -3540,8 +3590,8 @@ mod tests {
         // Must be valid 32-byte hex that differs by value (parse-before-compare).
         let root2 = "0xd1ffe00000000000000000000000000000000000000000000000000000000000";
 
-        db.set_genesis_validators_root(root1).expect("first set should succeed");
-        let result = db.set_genesis_validators_root(root2);
+        db.set_genesis_validators_root(&gvr_from_hex(root1)).expect("first set should succeed");
+        let result = db.set_genesis_validators_root(&gvr_from_hex(root2));
         assert!(result.is_err());
 
         match result.unwrap_err() {
@@ -3577,7 +3627,7 @@ mod tests {
         }
 
         let db = SlashingDb::open(&path).expect("reopen");
-        db.set_genesis_validators_root(prefixed)
+        db.set_genesis_validators_root(&gvr_from_hex(prefixed))
             .expect("bare stored + 0x input must match by bytes");
     }
 
@@ -3600,7 +3650,7 @@ mod tests {
         }
 
         let db = SlashingDb::open(&path).expect("reopen");
-        db.set_genesis_validators_root(prefixed).expect("match");
+        db.set_genesis_validators_root(&gvr_from_hex(prefixed)).expect("match");
 
         let stored = db.genesis_validators_root().expect("read");
         assert_eq!(stored.as_deref(), Some(prefixed));
@@ -3613,7 +3663,7 @@ mod tests {
         let bare = "04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
         let canonical = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
 
-        db.set_genesis_validators_root(bare).expect("set bare");
+        db.set_genesis_validators_root(&gvr_from_hex(bare)).expect("set bare");
         assert_eq!(db.genesis_validators_root().expect("read").as_deref(), Some(canonical));
     }
 
@@ -3625,8 +3675,9 @@ mod tests {
         let chain_b = "0xd1ffe00000000000000000000000000000000000000000000000000000000000";
         let chain_b_bare = "d1ffe00000000000000000000000000000000000000000000000000000000000";
 
-        db.set_genesis_validators_root(chain_a).expect("pin chain A");
-        let err = db.set_genesis_validators_root(chain_b).expect_err("different chain");
+        db.set_genesis_validators_root(&gvr_from_hex(chain_a)).expect("pin chain A");
+        let err =
+            db.set_genesis_validators_root(&gvr_from_hex(chain_b)).expect_err("different chain");
         match err {
             SlashingError::GenesisValidatorsRootMismatch { expected, actual } => {
                 assert_eq!(expected, chain_a);
@@ -3636,7 +3687,9 @@ mod tests {
         }
         // Bare form of a different root must also mismatch (not a false positive from
         // encoding-only differences).
-        let err = db.set_genesis_validators_root(chain_b_bare).expect_err("bare different chain");
+        let err = db
+            .set_genesis_validators_root(&gvr_from_hex(chain_b_bare))
+            .expect_err("bare different chain");
         assert!(matches!(err, SlashingError::GenesisValidatorsRootMismatch { .. }));
     }
 
@@ -3644,7 +3697,7 @@ mod tests {
     fn test_all_zero_gvr_still_rejected() {
         let db = SlashingDb::open_in_memory().expect("open");
         let zeros = "0x0000000000000000000000000000000000000000000000000000000000000000";
-        let err = db.set_genesis_validators_root(zeros).expect_err("all zeros");
+        let err = db.set_genesis_validators_root(&gvr_from_hex(zeros)).expect_err("all zeros");
         match err {
             SlashingError::InvalidInterchangeFormat(msg) => {
                 assert!(msg.contains("all zeros"), "msg={msg}");
@@ -3671,9 +3724,175 @@ mod tests {
         }
 
         let db = SlashingDb::open(&path).expect("reopen");
-        db.set_genesis_validators_root(canonical)
+        db.set_genesis_validators_root(&gvr_from_hex(canonical))
             .expect("mixed-case stored must match lowercase input");
         assert_eq!(db.genesis_validators_root().expect("read").as_deref(), Some(canonical));
+    }
+
+    // ── RF3-18: typed GVR through rows, import/export, interchange compare ───
+
+    /// Spurious-rejection bug: interchange metadata with `0x` prefix against a bare
+    /// config (or vice versa) must import successfully via byte comparison.
+    #[test]
+    fn test_import_with_0x_prefixed_metadata_against_bare_config_succeeds() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let bare = "04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let prefixed = CHAIN_GVR_HEX;
+        let expected = chain_gvr();
+
+        // Interchange carries 0x-prefixed metadata; expected Root is the same chain.
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: prefixed.to_string(),
+            },
+            data: vec![],
+        };
+        db.import(&interchange, &expected)
+            .expect("0x-prefixed interchange must match bare-equivalent Root");
+
+        // Reverse encoding: bare-hex interchange metadata vs same Root.
+        let interchange_bare = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: bare.to_string(),
+            },
+            data: vec![],
+        };
+        db.import(&interchange_bare, &expected)
+            .expect("bare-hex interchange must match 0x-derived Root");
+
+        // Mixed-case metadata of the same chain also matches.
+        let mixed = "0x04700007FaBc8282644AeD6d1c7c9E21d38a03a0c4Ba193f3AfE428824B3a673";
+        let interchange_mixed = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: mixed.to_string(),
+            },
+            data: vec![],
+        };
+        db.import(&interchange_mixed, &expected)
+            .expect("mixed-case interchange must match by bytes");
+    }
+
+    /// Import-written and runtime-written rows for the same chain must share one
+    /// canonical GVR encoding so the v3 unique index actually fires across both paths.
+    #[test]
+    fn test_import_and_runtime_rows_share_one_gvr_encoding() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let gvr = chain_gvr();
+        // Simulate a bare-hex "config" encoding on the interchange wire form.
+        let bare_meta = "04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+        let target_epoch = 42u64;
+
+        let interchange = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: bare_meta.to_string(),
+            },
+            data: vec![ValidatorRecord {
+                pubkey: pubkey.to_string(),
+                signed_blocks: vec![],
+                signed_attestations: vec![InterchangeAttestation {
+                    source_epoch: "40".to_string(),
+                    target_epoch: target_epoch.to_string(),
+                    signing_root: Some("0ximport_root".to_string()),
+                }],
+            }],
+        };
+        db.import(&interchange, &gvr).expect("import with bare metadata");
+
+        // Prove the import path stored the *canonical* form (not the bare wire string).
+        let stored_gvr: String = {
+            let conn = db.conn.lock();
+            conn.query_row(
+                "SELECT genesis_validators_root FROM attestations WHERE pubkey = ?1 AND target_epoch = ?2",
+                (normalize_pubkey(pubkey), target_epoch as i64),
+                |row| row.get(0),
+            )
+            .expect("import row must exist")
+        };
+        assert_eq!(
+            stored_gvr,
+            SlashingDb::root_to_hex(&gvr),
+            "import must write canonical 0x+lowercase, not the wire form"
+        );
+
+        // Runtime path uses the same root_to_hex encoding; plain INSERT must hit the
+        // v3 unique index (pubkey, gvr, target_epoch). insert_attestation bypasses
+        // EIP-3076 checks so the unique-index backstop is what we measure.
+        let dup = SignedAttestation {
+            pubkey: pubkey.to_string(),
+            source_epoch: 41,
+            target_epoch,
+            signing_root: Some("0xruntime_root".to_string()),
+        };
+        let err = db
+            .insert_attestation(&dup, &gvr)
+            .expect_err("runtime insert of same (pubkey, target) must collide on unique index");
+        assert!(
+            err.to_string().contains("UNIQUE constraint failed")
+                || matches!(err, SlashingError::DatabaseError(_)),
+            "expected unique-constraint failure, got: {err:?}"
+        );
+    }
+
+    /// Export always emits canonical GVR metadata; re-import against the same Root
+    /// must succeed and preserve rows.
+    #[test]
+    fn test_export_roundtrips_through_import() {
+        let db1 = SlashingDb::open_in_memory().expect("open");
+        let gvr = chain_gvr();
+        let pubkey = "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed";
+
+        db1.seed_attestation(pubkey, 10, 11, Some("0xatt".into()), &gvr).expect("seed att");
+        db1.seed_block(pubkey, 99, Some("0xblk".into()), &gvr).expect("seed block");
+
+        let exported = db1.export(&gvr).expect("export");
+        assert_eq!(
+            exported.metadata.genesis_validators_root,
+            SlashingDb::root_to_hex(&gvr),
+            "export metadata must be canonical"
+        );
+
+        let db2 = SlashingDb::open_in_memory().expect("open db2");
+        db2.import(&exported, &gvr).expect("re-import");
+        assert_eq!(db2.get_attestations(pubkey).expect("atts").len(), 1);
+        assert_eq!(db2.get_blocks(pubkey).expect("blocks").len(), 1);
+    }
+
+    /// No bulk row rewrite is performed: legacy bare-hex GVR rows remain readable
+    /// by the stage path (which keys on pubkey, not the GVR TEXT encoding).
+    #[test]
+    fn test_existing_rows_with_legacy_encoding_still_readable() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        let gvr = chain_gvr();
+        let bare = "04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let pubkey = normalize_pubkey(
+            "0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed",
+        );
+
+        // Simulate a pre-RF3-18 import that wrote the bare wire form into the row.
+        {
+            let conn = db.conn.lock();
+            conn.execute(
+                "INSERT INTO attestations \
+                 (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root)
+                 VALUES ('local-vc', ?1, 1, 5, '0xlegacy', ?2)",
+                (&pubkey, bare),
+            )
+            .expect("insert legacy bare-gvr row");
+        }
+
+        // Stage path must still find the row and reject a double-vote at target 5.
+        let err = db
+            .check_and_record_attestation(&pubkey, 2, 5, Some("0xnew".into()), &gvr)
+            .expect_err("legacy bare-gvr row must still block double vote");
+        assert!(
+            matches!(err, SlashingError::SlashableAttestation(_)),
+            "expected double-vote rejection, got: {err:?}"
+        );
     }
 
     #[test]
@@ -3684,7 +3903,7 @@ mod tests {
 
         {
             let db = SlashingDb::open(&path).expect("failed to open db");
-            db.set_genesis_validators_root(root).expect("set should succeed");
+            db.set_genesis_validators_root(&gvr_from_hex(root)).expect("set should succeed");
         }
 
         {
@@ -4277,7 +4496,8 @@ mod tests {
     #[test]
     fn test_import_atomic_success() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root = CHAIN_GVR_HEX;
+        let genesis_root_bytes = chain_gvr();
 
         let interchange = InterchangeFormat {
             metadata: InterchangeMetadata {
@@ -4312,7 +4532,7 @@ mod tests {
             ],
         };
 
-        db.import(&interchange, genesis_root).expect("import should succeed");
+        db.import(&interchange, &genesis_root_bytes).expect("import should succeed");
 
         let att_a = db.get_attestations("0xaaa").expect("query failed");
         assert_eq!(att_a.len(), 1);
@@ -4326,7 +4546,8 @@ mod tests {
     #[test]
     fn test_import_atomic_rollback_on_error() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root = CHAIN_GVR_HEX;
+        let genesis_root_bytes = chain_gvr();
 
         // Validators 1-5 are valid, validator 6 has invalid epoch
         let mut data = Vec::new();
@@ -4363,7 +4584,7 @@ mod tests {
             data,
         };
 
-        let result = db.import(&interchange, genesis_root);
+        let result = db.import(&interchange, &genesis_root_bytes);
         assert!(result.is_err());
 
         // All 5 valid validators should have zero records due to rollback
@@ -4384,7 +4605,8 @@ mod tests {
     #[test]
     fn test_import_atomic_large_batch() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
-        let genesis_root = "0x04700007fabc8282644aed6d1c7c9e21d38a03a0c4ba193f3afe428824b3a673";
+        let genesis_root = CHAIN_GVR_HEX;
+        let genesis_root_bytes = chain_gvr();
 
         let mut data = Vec::new();
         for i in 0..1000 {
@@ -4410,7 +4632,7 @@ mod tests {
             data,
         };
 
-        db.import(&interchange, genesis_root).expect("large import should succeed");
+        db.import(&interchange, &genesis_root_bytes).expect("large import should succeed");
 
         // Spot-check a few validators
         let att_0 = db.get_attestations("0x000000").expect("query failed");
@@ -4616,14 +4838,16 @@ mod edge_case_tests {
     #[test]
     fn test_import_rejects_wrong_interchange_version() {
         let db = SlashingDb::open_in_memory().expect("open");
+        let gvr = [0xabu8; 32];
+        let gvr_hex = format!("0x{}", hex::encode(gvr));
         let interchange = InterchangeFormat {
             metadata: InterchangeMetadata {
                 interchange_format_version: "4".to_string(),
-                genesis_validators_root: "0xroot".to_string(),
+                genesis_validators_root: gvr_hex,
             },
             data: vec![],
         };
-        let err = db.import(&interchange, "0xroot").unwrap_err();
+        let err = db.import(&interchange, &gvr).unwrap_err();
         assert!(err.to_string().contains("unsupported interchange_format_version"));
         assert!(err.to_string().contains("\"4\""));
     }
@@ -4631,14 +4855,16 @@ mod edge_case_tests {
     #[test]
     fn test_import_accepts_version_5() {
         let db = SlashingDb::open_in_memory().expect("open");
+        let gvr = [0xabu8; 32];
+        let gvr_hex = format!("0x{}", hex::encode(gvr));
         let interchange = InterchangeFormat {
             metadata: InterchangeMetadata {
                 interchange_format_version: "5".to_string(),
-                genesis_validators_root: "0xroot".to_string(),
+                genesis_validators_root: gvr_hex,
             },
             data: vec![],
         };
-        assert!(db.import(&interchange, "0xroot").is_ok());
+        assert!(db.import(&interchange, &gvr).is_ok());
     }
 
     // LOW-14: Normalize pubkeys
