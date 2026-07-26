@@ -52,6 +52,34 @@ fn sample_aggregate_ssz(source_epoch: u64, target_epoch: u64) -> Vec<u8> {
     encode_attestation_ssz(&att, 4)
 }
 
+/// Hand-rolled Electra four-field attestation SSZ (agg_bits, data, sig, committee_bits).
+///
+/// Built from a legacy encoding so we do not depend on a separate SSZ crate in tests.
+fn electra_shaped_aggregate_ssz() -> Vec<u8> {
+    let legacy = sample_aggregate_ssz(9, 10);
+    // legacy: offset_agg(4)=136 | data(128) | offset_sig(4) | agg_bits | signature(96)
+    let data = &legacy[4..132];
+    let offset_sig_old = u32::from_le_bytes(legacy[132..136].try_into().unwrap()) as usize;
+    let aggregation_bits = &legacy[136..offset_sig_old];
+    let signature = &legacy[offset_sig_old..];
+    let committee_bits = [0x01u8; 8];
+
+    let fixed_size = 4 + data.len() + 4 + 4; // 140
+    let offset_agg = fixed_size as u32;
+    let offset_sig = offset_agg + aggregation_bits.len() as u32;
+    let offset_committee = offset_sig + signature.len() as u32;
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&offset_agg.to_le_bytes());
+    out.extend_from_slice(data);
+    out.extend_from_slice(&offset_sig.to_le_bytes());
+    out.extend_from_slice(&offset_committee.to_le_bytes());
+    out.extend_from_slice(aggregation_bits);
+    out.extend_from_slice(signature);
+    out.extend_from_slice(&committee_bits);
+    out
+}
+
 fn make_aggregate_req(source_epoch: u64, target_epoch: u64) -> sv2::SignAggregateAndProofRequest {
     sv2::SignAggregateAndProofRequest {
         pubkey: KNOWN_PUBKEY_BYTES.to_vec(),
@@ -102,6 +130,44 @@ async fn test_aggregate_typed_rpc_happy_path() {
 // --------------------------------------------------------------------------
 // Test 2: signer failure does NOT persist a row (A15 stage→sign→commit)
 // --------------------------------------------------------------------------
+
+// --------------------------------------------------------------------------
+// Test: Electra-shaped aggregate SSZ is a client error (RF3-09), not a bad sig
+// --------------------------------------------------------------------------
+
+/// RF3-09: an Electra four-field `aggregate_ssz` must surface as
+/// `invalid_argument` via `ssz_err`, never as a successful misparse or panic.
+#[tokio::test]
+async fn test_service_aggregate_path_returns_invalid_argument_for_electra_buffer() {
+    let (svc, _db_path) = make_service_with_db();
+
+    let req = Request::new(sv2::SignAggregateAndProofRequest {
+        pubkey: KNOWN_PUBKEY_BYTES.to_vec(),
+        fork_info: Some(sample_fork_info()),
+        aggregator_index: 42,
+        aggregate_ssz: electra_shaped_aggregate_ssz(),
+        selection_proof: vec![0xbb; 96],
+        // Live mainnet Electra tags fork_id=5; the buffer shape is what we reject.
+        fork_id: 5,
+    });
+
+    let err = svc
+        .sign_aggregate_and_proof(req)
+        .await
+        .expect_err("Electra-shaped aggregate must be rejected");
+    assert_eq!(
+        err.code(),
+        tonic::Code::InvalidArgument,
+        "expected invalid_argument from ssz_err, got {:?} ({})",
+        err.code(),
+        err.message()
+    );
+    assert!(
+        err.message().contains("Electra") || err.message().contains("SSZ decode"),
+        "error message should mention SSZ/Electra, got: {}",
+        err.message()
+    );
+}
 
 #[tokio::test]
 async fn test_aggregate_signer_failure_does_not_persist_row() {

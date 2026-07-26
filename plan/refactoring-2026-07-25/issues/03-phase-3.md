@@ -645,13 +645,13 @@ produces, since it carries a fourth `committee_bits` region — return
 `Attestation`. Document the parameter's real contract in the module doc.
 
 **Acceptance criteria.**
-- [ ] An Electra-shaped attestation buffer decoded at any `fork_id` returns the new typed error, not
+- [x] An Electra-shaped attestation buffer decoded at any `fork_id` returns the new typed error, not
       an `Ok(Attestation)`.
-- [ ] A legacy-shaped buffer at `fork_id = 5` still decodes successfully (the live mainnet path).
-- [ ] The module doc no longer claims dispatch it does not do.
-- [ ] `bin/rvc-signer/src/service.rs:750` surfaces the error as a client error, not a panic or a
+- [x] A legacy-shaped buffer at `fork_id = 5` still decodes successfully (the live mainnet path).
+- [x] The module doc no longer claims dispatch it does not do.
+- [x] `bin/rvc-signer/src/service.rs:750` surfaces the error as a client error, not a panic or a
       wrong signature.
-- [ ] Standing invariant green.
+- [x] Standing invariant green.
 
 **TDD test plan.**
 - **RED first:** `test_electra_shaped_aggregate_is_not_silently_misparsed` — construct an
