@@ -426,12 +426,12 @@ unit-testable home.
 4. Mock-BN-backed unit tests in `crates/rvc` using `wiremock` (already a dev-dependency there or add it).
 
 **Acceptance criteria:**
-- [ ] The genesis validators root is parsed in exactly one place
+- [x] The genesis validators root is parsed in exactly one place
       (`rg 'genesis_validators_root' bin/rvc/src/main.rs` shows no parse).
-- [ ] Chain-swap mismatch remains fatal, with the same message and exit path.
-- [ ] Beacon unreachable produces the same error as today.
-- [ ] RF5-01 smoke tests green, including the mismatch case added there.
-- [ ] Workspace green.
+- [x] Chain-swap mismatch remains fatal, with the same message and exit path.
+- [x] Beacon unreachable produces the same error as today.
+- [x] RF5-01 smoke tests green, including the mismatch case added there.
+- [x] Workspace green.
 
 **TDD test plan** (RED first):
 - `test_connect_beacon_rejects_genesis_root_mismatch` — **RED**: no such function today.

@@ -215,6 +215,14 @@ impl ServiceBuilder {
     }
 
     pub fn build_bn_manager(&self) -> Result<Arc<BnManager>, ConfigError> {
+        self.build_bn_manager_with_timeouts(bn_manager::OperationTimeouts::default())
+    }
+
+    /// Build the main-pool [`BnManager`] with operator-configured per-op timeouts.
+    pub fn build_bn_manager_with_timeouts(
+        &self,
+        timeouts: bn_manager::OperationTimeouts,
+    ) -> Result<Arc<BnManager>, ConfigError> {
         let endpoints = self.config.effective_beacon_nodes();
         let config = self.pool_bn_manager_config(endpoints.clone());
         let broadcast_topics = config.broadcast_topics.clone();
@@ -222,7 +230,7 @@ impl ServiceBuilder {
             .map_err(|e| {
                 ConfigError::InvalidBeaconUrl(format!("failed to create BnManager: {}", e))
             })?
-            .with_operation_timeouts(bn_manager::OperationTimeouts::default());
+            .with_operation_timeouts(timeouts);
         info!(
             endpoints = ?endpoints,
             broadcast_topics = ?broadcast_topics,

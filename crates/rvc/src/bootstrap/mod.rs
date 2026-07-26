@@ -12,8 +12,10 @@
 //! successful phase. This keeps `crates/rvc` free of binary-only health plumbing
 //! while unit tests can exercise phases without a metrics server.
 
+mod beacon;
 mod slashing;
 
+pub use beacon::{connect_beacon, BeaconHandles};
 pub use slashing::{open_slashing_db, KeystoreLockGuard, SlashingDbHandles};
 
 use std::sync::Arc;

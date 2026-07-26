@@ -7,7 +7,7 @@ mod commands;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
 
-use bn_manager::{BeaconNodeClient, NodeStatusApi};
+use bn_manager::BeaconNodeClient;
 use clap::{Parser, Subcommand};
 use metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
 use rvc::config::{redact_url, CliOverrides, Config, Network, ServiceBuilder};
@@ -1171,63 +1171,30 @@ async fn run_validator(
     let deletion_denylist = slashing_handles.denylist;
     let denylist_snapshot = deletion_denylist.snapshot();
 
-    // Step 3: Create beacon client and BnManager
-    let beacon_client = match builder.build_beacon() {
-        Ok(client) => {
-            update_health_beacon_connected(&health_status, true).await;
-            client
-        }
-        Err(e) => {
-            error!("Failed to create beacon client: {}", e);
-            update_health_error(&health_status, format!("Beacon client error: {}", e)).await;
-            return Err(e.into());
-        }
-    };
-
-    let bn_manager = match builder.build_bn_manager() {
-        Ok(manager) => manager,
-        Err(e) => {
-            error!("Failed to create BnManager: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    // Step 4: Validate genesis root against beacon node
-    let genesis_validators_root_hex = match builder.parse_genesis_validators_root() {
-        Ok(root) => format!("0x{}", hex::encode(root)),
-        Err(e) => {
-            error!("Failed to parse genesis validators root: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    if let Err(e) = startup::validate_genesis_root(
-        &slashing_db,
-        bn_manager.as_ref(),
-        &genesis_validators_root_hex,
-    )
-    .await
-    {
-        error!("Genesis root validation failed: {}", e);
-        return Err(e.into());
-    }
-
-    let genesis_validators_root = match builder.parse_genesis_validators_root() {
-        Ok(root) => root,
-        Err(e) => {
-            error!("Failed to parse genesis validators root: {}", e);
-            return Err(e.into());
-        }
-    };
-
-    // Step 5: Check beacon reachability
-    startup::check_beacon_reachability(bn_manager.as_ref()).await;
-
-    // Log beacon node version (non-fatal)
-    match bn_manager.get_node_version().await {
-        Ok(version) => info!(bn_version = %version, "connected to beacon node"),
-        Err(e) => warn!(error = %e, "failed to fetch beacon node version"),
-    }
+    // Steps 3–5: beacon client, BnManager, single GVR parse, genesis gate,
+    // reachability, version log. Health updates stay in the binary.
+    let beacon_handles =
+        match rvc::bootstrap::connect_beacon(&config, timeouts.clone(), slashing_db.as_ref()).await
+        {
+            Ok(handles) => {
+                update_health_beacon_connected(&health_status, true).await;
+                handles
+            }
+            Err(e) => {
+                if matches!(e, rvc::bootstrap::BootstrapError::Config(_)) {
+                    update_health_error(&health_status, format!("Beacon client error: {}", e))
+                        .await;
+                }
+                return Err(e.into());
+            }
+        };
+    let rvc::bootstrap::BeaconHandles {
+        beacon_client,
+        bn_manager,
+        genesis_validators_root,
+        genesis_validators_root_hex: _,
+        genesis_time,
+    } = beacon_handles;
 
     // Load validator keys (keystore-dir), consulting the deletion denylist.
     let key_manager = match builder.build_key_manager_filtered(Some(&denylist_snapshot)) {
@@ -1368,7 +1335,7 @@ async fn run_validator(
     //
     // Shared monotonic epoch clock (M-7) for boot register + keymanager import
     // so NTP cannot compress the window and wall-clock alone cannot force epoch 0.
-    let genesis_time_for_epoch = config.effective_genesis_time().unwrap_or(0);
+    let genesis_time_for_epoch = genesis_time;
     let epoch_clock =
         std::sync::Arc::new(doppelganger::MonotonicEpochClock::new(genesis_time_for_epoch));
     let enablement_epoch = epoch_clock.current_epoch();
