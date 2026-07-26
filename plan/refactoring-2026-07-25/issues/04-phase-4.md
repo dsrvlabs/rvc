@@ -1085,15 +1085,15 @@ surrounded; `SELECT MIN(target_epoch) …`) instead of materializing rows.
 4. Swap `stage_*` to the targeted impl.
 
 **Acceptance criteria:**
-- [ ] **Old-vs-new equivalence proptest (phase-gate criterion):** on randomly generated histories and
+- [x] **Old-vs-new equivalence proptest (phase-gate criterion):** on randomly generated histories and
       candidate attestations, `FullScan` and `TargetedSql` impls produce **identical verdicts**,
       including the exact violation variant.
-- [ ] `EXPLAIN QUERY PLAN` shows index use (no `SCAN TABLE attestations`) for every per-sign query.
-- [ ] A timing test shows per-sign work is bounded as history grows (e.g. 10 vs 10,000 rows within a
+- [x] `EXPLAIN QUERY PLAN` shows index use (no `SCAN TABLE attestations`) for every per-sign query.
+- [x] A timing test shows per-sign work is bounded as history grows (e.g. 10 vs 10,000 rows within a
       stated factor).
-- [ ] The full-scan impl remains available under `cfg(test)` as the oracle.
-- [ ] A2 conformance suite green.
-- [ ] Standing invariant green.
+- [x] The full-scan impl remains available under `cfg(test)` as the oracle.
+- [x] A2 conformance suite green.
+- [x] Standing invariant green.
 
 **TDD test plan** (`crates/slashing/tests/proptest_slashing.rs` extension):
 - **RED first:** `proptest_full_scan_and_targeted_sql_agree_on_random_histories` — written against the

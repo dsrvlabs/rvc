@@ -63,13 +63,13 @@
 //! thread (e.g. via `spawn_blocking`).
 
 use parking_lot::MutexGuard;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use crate::error::SlashingError;
+use crate::history::{TargetedSqlAttestationHistory, TargetedSqlBlockHistory};
 use crate::rules::{
     check_attestation, check_block, AttestationCandidate, AttestationVerdict,
-    AttestationWatermarks, BlockCandidate, BlockVerdict, BlockWatermarks, ExistingAtt,
-    FullScanAttestationHistory, FullScanBlockHistory,
+    AttestationWatermarks, BlockCandidate, BlockVerdict, BlockWatermarks,
 };
 use crate::watermarks::{read_watermark, WatermarkKind};
 use crate::SlashingDb;
@@ -366,27 +366,7 @@ impl SlashingDb {
         let outcome = (|| -> Result<BlockVerdict, SlashingError> {
             let watermark = read_watermark(&guard, &pubkey, WatermarkKind::Block)?;
 
-            let existing: Option<Option<String>> = guard
-                .query_row(
-                    "SELECT signing_root FROM blocks \
-                     WHERE pubkey = ?1 AND slot = ?2",
-                    (&pubkey, slot as i64),
-                    |row| row.get(0),
-                )
-                .optional()?;
-
-            let min_slot: Option<i64> = guard
-                .query_row("SELECT MIN(slot) FROM blocks WHERE pubkey = ?1", (&pubkey,), |row| {
-                    row.get(0)
-                })
-                .optional()?
-                .flatten();
-
-            let history = FullScanBlockHistory::from_slot_and_min(
-                slot,
-                existing,
-                min_slot.map(|s| s as Slot),
-            );
+            let history = TargetedSqlBlockHistory::new(&guard, &pubkey);
             let watermarks = BlockWatermarks { block: watermark.map(|w| w as Slot) };
             let candidate = BlockCandidate { slot, signing_root: signing_root_hex.clone() };
             check_block(&pubkey, &history, &watermarks, &candidate, strict)
@@ -465,25 +445,7 @@ impl SlashingDb {
             let wm_source = read_watermark(&guard, &pubkey, WatermarkKind::AttestationSource)?;
             let wm_target = read_watermark(&guard, &pubkey, WatermarkKind::AttestationTarget)?;
 
-            let existing: Vec<ExistingAtt> = {
-                let mut stmt = guard.prepare(
-                    "SELECT source_epoch, target_epoch, signing_root \
-                     FROM attestations \
-                     WHERE pubkey = ?1",
-                )?;
-                let rows = stmt
-                    .query_map((&pubkey,), |row| {
-                        Ok(ExistingAtt {
-                            source_epoch: row.get::<_, i64>(0)? as Epoch,
-                            target_epoch: row.get::<_, i64>(1)? as Epoch,
-                            signing_root: row.get::<_, Option<String>>(2)?,
-                        })
-                    })?
-                    .collect::<Result<Vec<_>, _>>()?;
-                rows
-            };
-
-            let history = FullScanAttestationHistory::new(existing);
+            let history = TargetedSqlAttestationHistory::new(&guard, &pubkey);
             let watermarks = AttestationWatermarks {
                 source: wm_source.map(|w| w as Epoch),
                 target: wm_target.map(|w| w as Epoch),

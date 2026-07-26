@@ -1,11 +1,11 @@
 //! Pure EIP-3076 rule checks behind a history-query seam.
 //!
-//! Rule evaluation is deliberately free of `rusqlite` so RF4-18 can swap the
-//! full-history scan for targeted `EXISTS`/`MIN` SQL without touching this
-//! module. [`stage_block`](crate::SlashingDb::stage_block) /
-//! [`stage_attestation`](crate::SlashingDb::stage_attestation) remain the only
-//! production entry points; they load watermarks, build a history impl, and
-//! translate the verdict.
+//! Rule evaluation is deliberately free of `rusqlite`. Production
+//! [`stage_block`](crate::SlashingDb::stage_block) /
+//! [`stage_attestation`](crate::SlashingDb::stage_attestation) build a
+//! targeted SQL history impl (see `history` module) and translate the verdict.
+//! The Vec-backed full-scan history types remain under `cfg(test)` as the
+//! old-vs-new equivalence oracle.
 
 use eth_types::{Epoch, Slot};
 use observability::logging::TruncatedPubkey;
@@ -105,20 +105,26 @@ pub(crate) enum AttestationVerdict {
     Duplicate,
 }
 
-// ── Full-scan history (Vec-backed; stage loads SQL into these) ────────────────
+// ── Full-scan history (Vec-backed oracle; production uses TargetedSql in history.rs) ─
+//
+// Kept under `cfg(test)` for one release as the RF4-18 old-vs-new equivalence
+// oracle. Production stage paths never construct these.
 
-/// Full-history attestation scan — behavior-preserving vs the former inline loop.
+/// Full-history attestation scan — equivalence oracle for RF4-18.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct FullScanAttestationHistory {
     rows: Vec<ExistingAtt>,
 }
 
+#[cfg(test)]
 impl FullScanAttestationHistory {
     pub(crate) fn new(rows: Vec<ExistingAtt>) -> Self {
         Self { rows }
     }
 }
 
+#[cfg(test)]
 impl AttestationHistory for FullScanAttestationHistory {
     fn conflicting_at_target(&self, target: Epoch) -> Result<Option<ExistingAtt>, SlashingError> {
         Ok(self.rows.iter().find(|r| r.target_epoch == target).cloned())
@@ -155,42 +161,23 @@ impl AttestationHistory for FullScanAttestationHistory {
     }
 }
 
-/// Full-history block scan.
+/// Full-history block scan — equivalence oracle for RF4-18.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct FullScanBlockHistory {
     /// `(slot, signing_root)` rows for one pubkey.
     rows: Vec<(Slot, Option<String>)>,
 }
 
+#[cfg(test)]
 impl FullScanBlockHistory {
     /// Construct from an arbitrary row list (unit tests and full-table loads).
-    #[cfg(test)]
     pub(crate) fn new(rows: Vec<(Slot, Option<String>)>) -> Self {
-        Self { rows }
-    }
-
-    /// Convenience when stage already has the single-slot lookup + min.
-    pub(crate) fn from_slot_and_min(
-        slot: Slot,
-        root_at_slot: Option<Option<String>>,
-        min_slot: Option<Slot>,
-    ) -> Self {
-        let mut rows = Vec::new();
-        if let Some(root) = root_at_slot {
-            rows.push((slot, root));
-        }
-        // Ensure min_slot is represented so min_slot() is correct even when the
-        // candidate slot has no row (and min is a different, lower slot).
-        if let Some(min) = min_slot {
-            if !rows.iter().any(|(s, _)| *s == min) {
-                // Root unused for min checks; placeholder keeps min accurate.
-                rows.push((min, None));
-            }
-        }
         Self { rows }
     }
 }
 
+#[cfg(test)]
 impl BlockHistory for FullScanBlockHistory {
     fn signing_root_at_slot(&self, slot: Slot) -> Result<Option<Option<String>>, SlashingError> {
         Ok(self.rows.iter().find(|(s, _)| *s == slot).map(|(_, r)| r.clone()))

@@ -184,6 +184,10 @@ impl SlashingDb {
         db.migrate()?;
         db.migrate_to_v2(path)?;
         db.migrate_to_v3()?;
+        {
+            let conn = db.conn.lock();
+            crate::history::ensure_history_indexes(&conn)?;
+        }
 
         // ISSUE-4.8 / L-8: chmod 0o600 on `<path>-wal` / `<path>-shm` sidecars.
         //
@@ -368,6 +372,10 @@ impl SlashingDb {
                 .map_err(|e| SlashingError::MigrationFailed(format!("{e}")))?;
         }
         db.migrate_to_v3()?;
+        {
+            let conn = db.conn.lock();
+            crate::history::ensure_history_indexes(&conn)?;
+        }
         Ok(db)
     }
 
@@ -396,6 +404,10 @@ impl SlashingDb {
         }
         // Migrate to v3: replace CN-keyed indices with pubkey+gvr-scoped indices.
         db.migrate_to_v3()?;
+        {
+            let conn = db.conn.lock();
+            crate::history::ensure_history_indexes(&conn)?;
+        }
         Ok(db)
     }
 
