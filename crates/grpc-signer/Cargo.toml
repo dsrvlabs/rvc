@@ -17,7 +17,6 @@ hex.workspace = true
 prost.workspace = true
 signer-proto = { workspace = true, features = ["server", "client"] }
 # RF3-14 incomplete on develop: lib.rs re-exports signer_proto without a dep.
-signer-proto = { workspace = true, features = ["client", "server"] }
 thiserror.workspace = true
 tonic = { workspace = true, features = ["transport", "tls"] }
 tracing.workspace = true
