@@ -11,11 +11,7 @@ use clap::{Parser, Subcommand};
 use metrics::{new_health_status, serve_metrics_with_health, SharedHealthStatus};
 use rvc::config::{redact_url, CliOverrides, Config, Network};
 use rvc::duty_tracker::DutyTrackerService;
-use rvc::keymanager_adapters::{
-    ForwardWindowMonitor, KeystoreManagerAdapter, RemoteKeyManagerAdapter,
-    SlashingProtectionAdapter, ValidatorConfigManagerAdapter, ValidatorManagerAdapter,
-    VoluntaryExitManagerAdapter,
-};
+
 use rvc::startup;
 use rvc::DutyTrackerServer;
 use tonic::transport::Server;
@@ -1115,7 +1111,6 @@ async fn run_validator(
     let grpc_port = config.grpc_port;
     let metrics_address = config.metrics_address;
     let metrics_port = config.metrics_port;
-    let doppelganger_enabled = config.doppelganger_detection;
 
     // Steps 1–2d: open slashing DB, integrity, permissions, keystore lock, denylist.
     // Health updates stay in the binary (see `rvc::bootstrap` health-status policy).
@@ -1253,141 +1248,25 @@ async fn run_validator(
 
     // Step 7c: Optionally start Keymanager API server
     if config.keymanager_enabled {
-        let token_path = config
-            .keymanager_token_file
-            .clone()
-            .unwrap_or_else(|| std::path::PathBuf::from("./keymanager-api-token.txt"));
-        let token = match keymanager_api::auth::ensure_token(&token_path) {
-            Ok(t) => {
-                keymanager_api::auth::warn_if_insecure_permissions(&token_path);
-                t
-            }
-            Err(e) => {
-                error!("Failed to ensure Keymanager API token: {}", e);
-                return Err(anyhow::anyhow!("keymanager token error: {}", e));
-            }
-        };
-
-        let km_addr: std::net::SocketAddr = config
-            .keymanager_address
-            .as_deref()
-            .unwrap_or("127.0.0.1:5062")
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid keymanager address: {}", e))?;
-
-        if !km_addr.ip().is_loopback() {
-            warn!(
-                addr = %km_addr,
-                "Keymanager API is bound to a non-loopback address; this exposes key management over the network"
-            );
-        }
-
-        let km_composite = composite_signer.clone();
-        let keystore_mgr = std::sync::Arc::new(
-            KeystoreManagerAdapter::new(
-                config.keystore_path.clone(),
-                km_composite.clone(),
-                pubkey_map.clone(),
-                key_gen_tx.clone(),
-            )
-            .with_denylist(std::sync::Arc::clone(&deletion_denylist)),
-        );
-        let slashing_prot = std::sync::Arc::new(SlashingProtectionAdapter::new(
-            slashing_db.clone(),
-            genesis_validators_root,
-        ));
-        let validator_mgr =
-            std::sync::Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
-        // M-12: time-based window for the delayed set_enabled task. When
-        // doppelganger is disabled the window is Duration::ZERO so keys are
-        // immediately enabled. When on: 2 epochs × 32 slots × 12 s = 768 s.
-        let doppelganger_window = if doppelganger_enabled {
-            std::time::Duration::from_secs(
-                2 * eth_types::SLOTS_PER_EPOCH * eth_types::SECONDS_PER_SLOT,
-            )
-        } else {
-            std::time::Duration::ZERO
-        };
-
-        // SEC-2b: when a ForwardWindowMachine is wired, keymanager imports
-        // register with it (signing gate). Same monotonic epoch_clock as boot.
-        // Fall back to the time-based DoppelgangerGate when doppelganger is opted out.
-        let doppelganger_mon: std::sync::Arc<dyn keymanager_api::traits::DoppelgangerMonitor> =
-            if let Some(machine) = forward_window_machine.clone() {
-                let clock = std::sync::Arc::clone(&epoch_clock);
-                let epoch_provider: std::sync::Arc<dyn Fn() -> u64 + Send + Sync> =
-                    std::sync::Arc::new(move || clock.current_epoch());
-                let mon = std::sync::Arc::new(ForwardWindowMonitor::new(machine, epoch_provider));
-                // Re-arm recently imported keys against the machine after restart
-                // (register_for_import → Pending, not Safe).
-                if !doppelganger_window.is_zero() {
-                    rvc::keymanager_adapters::scan_and_rearm_gate(
-                        &config.keystore_path,
-                        mon.as_ref(),
-                        doppelganger_window.as_secs(),
-                    );
-                }
-                mon
-            } else {
-                let gate = std::sync::Arc::new(keymanager_api::gate::DoppelgangerGate::new(
-                    doppelganger_window,
-                ));
-                if !doppelganger_window.is_zero() {
-                    rvc::keymanager_adapters::scan_and_rearm_gate(
-                        &config.keystore_path,
-                        gate.as_ref(),
-                        doppelganger_window.as_secs(),
-                    );
-                }
-                gate
-            };
-
-        let remote_key_mgr = std::sync::Arc::new(RemoteKeyManagerAdapter::new(
-            km_composite,
-            config.remote_signer_allowed_hosts.clone(),
-            pubkey_map.clone(),
-            key_gen_tx,
-        ));
-
-        let config_mgr =
-            std::sync::Arc::new(ValidatorConfigManagerAdapter::new(validator_store.clone()));
-
-        let exit_mgr: Option<std::sync::Arc<dyn keymanager_api::traits::VoluntaryExitManager>> =
-            Some(std::sync::Arc::new(VoluntaryExitManagerAdapter::new(
-                beacon_client.clone(),
-                signer.clone(),
-                orchestrator_config.fork_schedule.clone(),
+        rvc::keymanager_adapters::spawn_keymanager_api(
+            &config,
+            rvc::keymanager_adapters::KeymanagerApiDeps {
+                composite_signer: composite_signer.clone(),
+                slashing_db: slashing_db.clone(),
                 genesis_validators_root,
-            )));
-
-        let km_server = keymanager_api::KeymanagerServer::new(
-            keymanager_api::KeymanagerDeps {
-                keystore_manager: keystore_mgr,
-                slashing_protection: slashing_prot,
-                validator_manager: validator_mgr,
-                doppelganger_monitor: doppelganger_mon,
-                remote_key_manager: remote_key_mgr,
-                config_manager: config_mgr,
-                exit_manager: exit_mgr,
-            },
-            keymanager_api::KeymanagerSettings {
-                token: token.to_string(),
-                addr: km_addr,
-                cors_origins: config.keymanager_cors_origins.clone(),
-                body_limit: config.keymanager_body_limit,
-                allow_insecure_remote_signer: config.allow_insecure_remote_signer,
+                validator_store: validator_store.clone(),
+                beacon_client: beacon_client.clone(),
+                signer: signer.clone(),
+                fork_schedule: orchestrator_config.fork_schedule.clone(),
+                deletion_denylist: std::sync::Arc::clone(&deletion_denylist),
                 attesting_enabled: attesting_enabled.clone(),
-                doppelganger_window,
+                forward_window_machine: forward_window_machine.clone(),
+                epoch_clock: std::sync::Arc::clone(&epoch_clock),
+                pubkey_map: pubkey_map.clone(),
+                key_gen_tx,
             },
-        );
-
-        info!(addr = %km_addr, token_path = %token_path.display(), "Keymanager API enabled");
-
-        tokio::spawn(async move {
-            if let Err(e) = km_server.run().await {
-                error!("Keymanager API server error: {}", e);
-            }
-        });
+        )
+        .map_err(|e| anyhow::anyhow!(e))?;
     }
 
     // Step 8: Start main duty loop

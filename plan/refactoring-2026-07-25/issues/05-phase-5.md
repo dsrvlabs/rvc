@@ -638,13 +638,13 @@ motion plus the branch hoist.
 4. `main.rs` keeps only `if config.keymanager_enabled { rvc::keymanager_adapters::spawn_keymanager_api(&config, deps)?; }`.
 
 **Acceptance criteria:**
-- [ ] `scan_and_rearm_gate` is called from exactly one site
+- [x] `scan_and_rearm_gate` is called from exactly one site
       (`rg -c 'scan_and_rearm_gate' bin/rvc/src/main.rs` = 0; one call in `keymanager_adapters.rs`
       outside the definition).
-- [ ] Both monitor variants are still selectable and both re-arm on restart.
-- [ ] Token ensure + insecure-permission warning + non-loopback warning preserved verbatim.
-- [ ] With `keymanager_enabled = false`, nothing is constructed or spawned (test).
-- [ ] RF5-01 smoke tests green; add a keymanager-enabled variant.
+- [x] Both monitor variants are still selectable and both re-arm on restart.
+- [x] Token ensure + insecure-permission warning + non-loopback warning preserved verbatim.
+- [x] With `keymanager_enabled = false`, nothing is constructed or spawned (test).
+- [x] RF5-01 smoke tests green; add a keymanager-enabled variant.
 
 **TDD test plan** (RED first):
 - `test_spawn_keymanager_api_rearms_gate_exactly_once_for_both_monitors` — **RED**: the duplicated call

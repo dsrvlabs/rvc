@@ -1,13 +1,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
 use async_trait::async_trait;
 use beacon::BeaconClient;
 use crypto::{CompositeSigner, Keystore, PublicKey, RemoteSigner, RemoteSignerConfig};
-use doppelganger::{ForwardWindowMachine, SigningEnablement};
+use doppelganger::{ForwardWindowMachine, MonotonicEpochClock, SigningEnablement};
 use eth_types::{
     Epoch, ForkSchedule, Root, SignedVoluntaryExit, VoluntaryExit, SECONDS_PER_SLOT,
     SLOTS_PER_EPOCH,
@@ -25,6 +26,7 @@ use tokio::sync::watch;
 use tracing::{error, info, warn};
 use validator_store::{ValidatorConfigUpdate, ValidatorStore};
 
+use crate::config::Config;
 use crate::deletion_denylist::DeletionDenylist;
 use crate::orchestrator::PubkeyMap;
 
@@ -291,6 +293,230 @@ pub fn scan_and_rearm_gate(
             gate.start_monitoring(pubkey_bytes);
         }
     }
+}
+
+/// Runtime dependencies for [`spawn_keymanager_api`] / [`build_keymanager_api`].
+///
+/// Parameter object for one call site — not a shared god-object for other phases.
+pub struct KeymanagerApiDeps {
+    pub composite_signer: Arc<CompositeSigner>,
+    pub slashing_db: Arc<SlashingDb>,
+    pub genesis_validators_root: Root,
+    pub validator_store: Arc<ValidatorStore>,
+    pub beacon_client: Arc<BeaconClient>,
+    pub signer: Arc<SignerService>,
+    pub fork_schedule: Arc<ForkSchedule>,
+    pub deletion_denylist: Arc<DeletionDenylist>,
+    pub attesting_enabled: Arc<AtomicBool>,
+    pub forward_window_machine: Option<Arc<ForwardWindowMachine>>,
+    pub epoch_clock: Arc<MonotonicEpochClock>,
+    pub pubkey_map: PubkeyMap,
+    pub key_gen_tx: watch::Sender<u64>,
+}
+
+/// Which doppelganger monitor was selected when assembling the keymanager API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoppelgangerMonitorKind {
+    /// SEC-2b: imports register on the shared [`ForwardWindowMachine`].
+    ForwardWindow,
+    /// Time-based [`keymanager_api::gate::DoppelgangerGate`] (doppelganger opt-out path).
+    TimeBasedGate,
+}
+
+/// Assembled keymanager server + monitor (no bind yet).
+///
+/// Produced by [`build_keymanager_api`] so unit tests can assert re-arm and
+/// monitor selection without spawning the HTTP listener.
+pub struct BuiltKeymanagerApi {
+    pub server: keymanager_api::KeymanagerServer,
+    pub doppelganger_monitor: Arc<dyn DoppelgangerMonitor>,
+    pub monitor_kind: DoppelgangerMonitorKind,
+    pub doppelganger_window: Duration,
+    pub addr: std::net::SocketAddr,
+    pub token_path: PathBuf,
+}
+
+/// Errors from assembling or spawning the Keymanager API.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnKeymanagerApiError {
+    #[error("keymanager token error: {0}")]
+    Token(String),
+    #[error("invalid keymanager address: {0}")]
+    InvalidAddress(String),
+}
+
+/// Select the doppelganger monitor and re-arm recently imported keys **once**.
+///
+/// Hoists the previously duplicated `scan_and_rearm_gate` calls that lived in
+/// both branches of the forward-window vs time-based gate selection.
+fn select_and_rearm_doppelganger_monitor(
+    keystore_path: &Path,
+    doppelganger_window: Duration,
+    forward_window_machine: Option<Arc<ForwardWindowMachine>>,
+    epoch_clock: Arc<MonotonicEpochClock>,
+) -> (Arc<dyn DoppelgangerMonitor>, DoppelgangerMonitorKind) {
+    let (monitor, kind): (Arc<dyn DoppelgangerMonitor>, DoppelgangerMonitorKind) =
+        if let Some(machine) = forward_window_machine {
+            let clock = epoch_clock;
+            let epoch_provider: Arc<dyn Fn() -> Epoch + Send + Sync> =
+                Arc::new(move || clock.current_epoch());
+            let mon = Arc::new(ForwardWindowMonitor::new(machine, epoch_provider));
+            (mon, DoppelgangerMonitorKind::ForwardWindow)
+        } else {
+            let gate = Arc::new(keymanager_api::gate::DoppelgangerGate::new(doppelganger_window));
+            (gate, DoppelgangerMonitorKind::TimeBasedGate)
+        };
+
+    // Single re-arm after the branch (both monitor variants).
+    if !doppelganger_window.is_zero() {
+        scan_and_rearm_gate(keystore_path, monitor.as_ref(), doppelganger_window.as_secs());
+    }
+
+    (monitor, kind)
+}
+
+/// Assemble Keymanager adapters, settings, and server without spawning the bind loop.
+///
+/// Returns `Ok(None)` when `config.keymanager_enabled` is false — nothing is
+/// constructed (no token file, no adapters, no re-arm).
+pub fn build_keymanager_api(
+    config: &Config,
+    deps: KeymanagerApiDeps,
+) -> Result<Option<BuiltKeymanagerApi>, SpawnKeymanagerApiError> {
+    if !config.keymanager_enabled {
+        return Ok(None);
+    }
+
+    let token_path = config
+        .keymanager_token_file
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("./keymanager-api-token.txt"));
+    let token = match keymanager_api::auth::ensure_token(&token_path) {
+        Ok(t) => {
+            keymanager_api::auth::warn_if_insecure_permissions(&token_path);
+            t
+        }
+        Err(e) => return Err(SpawnKeymanagerApiError::Token(e.to_string())),
+    };
+
+    let km_addr: std::net::SocketAddr =
+        config.keymanager_address.as_deref().unwrap_or("127.0.0.1:5062").parse().map_err(
+            |e: std::net::AddrParseError| SpawnKeymanagerApiError::InvalidAddress(e.to_string()),
+        )?;
+
+    if !km_addr.ip().is_loopback() {
+        warn!(
+            addr = %km_addr,
+            "Keymanager API is bound to a non-loopback address; this exposes key management over the network"
+        );
+    }
+
+    let km_composite = deps.composite_signer;
+    let keystore_mgr = Arc::new(
+        KeystoreManagerAdapter::new(
+            config.keystore_path.clone(),
+            km_composite.clone(),
+            deps.pubkey_map.clone(),
+            deps.key_gen_tx.clone(),
+        )
+        .with_denylist(Arc::clone(&deps.deletion_denylist)),
+    );
+    let slashing_prot =
+        Arc::new(SlashingProtectionAdapter::new(deps.slashing_db, deps.genesis_validators_root));
+    let validator_mgr = Arc::new(ValidatorManagerAdapter::new(deps.validator_store.clone()));
+
+    // M-12: time-based window for the delayed set_enabled task. When
+    // doppelganger is disabled the window is Duration::ZERO so keys are
+    // immediately enabled. When on: 2 epochs × 32 slots × 12 s = 768 s.
+    let doppelganger_window = if config.doppelganger_detection {
+        Duration::from_secs(2 * SLOTS_PER_EPOCH * SECONDS_PER_SLOT)
+    } else {
+        Duration::ZERO
+    };
+
+    // SEC-2b: when a ForwardWindowMachine is wired, keymanager imports
+    // register with it (signing gate). Same monotonic epoch_clock as boot.
+    // Fall back to the time-based DoppelgangerGate when doppelganger is opted out.
+    let (doppelganger_mon, monitor_kind) = select_and_rearm_doppelganger_monitor(
+        &config.keystore_path,
+        doppelganger_window,
+        deps.forward_window_machine,
+        deps.epoch_clock,
+    );
+
+    let remote_key_mgr = Arc::new(RemoteKeyManagerAdapter::new(
+        km_composite,
+        config.remote_signer_allowed_hosts.clone(),
+        deps.pubkey_map,
+        deps.key_gen_tx,
+    ));
+
+    let config_mgr = Arc::new(ValidatorConfigManagerAdapter::new(deps.validator_store));
+
+    let exit_mgr: Option<Arc<dyn VoluntaryExitManager>> =
+        Some(Arc::new(VoluntaryExitManagerAdapter::new(
+            deps.beacon_client,
+            deps.signer,
+            deps.fork_schedule,
+            deps.genesis_validators_root,
+        )));
+
+    let server = keymanager_api::KeymanagerServer::new(
+        keymanager_api::KeymanagerDeps {
+            keystore_manager: keystore_mgr,
+            slashing_protection: slashing_prot,
+            validator_manager: validator_mgr,
+            doppelganger_monitor: Arc::clone(&doppelganger_mon),
+            remote_key_manager: remote_key_mgr,
+            config_manager: config_mgr,
+            exit_manager: exit_mgr,
+        },
+        keymanager_api::KeymanagerSettings {
+            token: token.to_string(),
+            addr: km_addr,
+            cors_origins: config.keymanager_cors_origins.clone(),
+            body_limit: config.keymanager_body_limit,
+            allow_insecure_remote_signer: config.allow_insecure_remote_signer,
+            attesting_enabled: deps.attesting_enabled,
+            doppelganger_window,
+        },
+    );
+
+    Ok(Some(BuiltKeymanagerApi {
+        server,
+        doppelganger_monitor: doppelganger_mon,
+        monitor_kind,
+        doppelganger_window,
+        addr: km_addr,
+        token_path,
+    }))
+}
+
+/// Bootstrap phase: optionally assemble and spawn the Keymanager API server.
+///
+/// When `config.keymanager_enabled` is false, returns immediately without
+/// constructing adapters or touching the token file.
+pub fn spawn_keymanager_api(
+    config: &Config,
+    deps: KeymanagerApiDeps,
+) -> Result<(), SpawnKeymanagerApiError> {
+    let Some(built) = build_keymanager_api(config, deps)? else {
+        return Ok(());
+    };
+
+    info!(
+        addr = %built.addr,
+        token_path = %built.token_path.display(),
+        "Keymanager API enabled"
+    );
+
+    tokio::spawn(async move {
+        if let Err(e) = built.server.run().await {
+            error!("Keymanager API server error: {}", e);
+        }
+    });
+
+    Ok(())
 }
 
 impl KeystoreManager for KeystoreManagerAdapter {
@@ -3101,5 +3327,191 @@ mod tests {
         // Service/adapter still responsive after the failed item.
         assert!(adapter.list_keys().is_empty());
         assert!(!adapter.has_key(&sk.public_key().to_bytes()));
+    }
+
+    // ── RF5-08: spawn_keymanager_api / build_keymanager_api ─────────────────
+
+    use crate::config::Config;
+    use crate::deletion_denylist::DeletionDenylist;
+    use doppelganger::MonotonicEpochClock;
+
+    fn test_fork_schedule() -> Arc<ForkSchedule> {
+        Arc::new(ForkSchedule {
+            genesis_fork_version: [0, 0, 0, 0],
+            altair_fork_epoch: 10,
+            altair_fork_version: [1, 0, 0, 0],
+            bellatrix_fork_epoch: 20,
+            bellatrix_fork_version: [2, 0, 0, 0],
+            capella_fork_epoch: 30,
+            capella_fork_version: [3, 0, 0, 0],
+            deneb_fork_epoch: 40,
+            deneb_fork_version: [4, 0, 0, 0],
+            electra_fork_epoch: 50,
+            electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: 60,
+            fulu_fork_version: [6, 0, 0, 0],
+        })
+    }
+
+    fn spawn_test_deps(
+        keystore_dir: &Path,
+        forward_window_machine: Option<Arc<ForwardWindowMachine>>,
+    ) -> KeymanagerApiDeps {
+        let composite = create_empty_composite_signer();
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer = Arc::new(
+            SignerService::new(composite.clone(), Arc::clone(&slashing_db))
+                .with_enablement(always_enabled()),
+        );
+        let beacon_config = beacon::BeaconClientConfig::new("http://127.0.0.1:9");
+        let beacon_client = Arc::new(BeaconClient::new(beacon_config).expect("test beacon client"));
+        let (key_gen_tx, _rx) = watch::channel(0u64);
+        KeymanagerApiDeps {
+            composite_signer: composite,
+            slashing_db,
+            genesis_validators_root: [0x11u8; 32],
+            validator_store: Arc::new(ValidatorStore::new([0u8; 20], 100)),
+            beacon_client,
+            signer,
+            fork_schedule: test_fork_schedule(),
+            deletion_denylist: Arc::new(DeletionDenylist::empty_at(
+                keystore_dir.join(".rvc.deleted_keys"),
+            )),
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            forward_window_machine,
+            epoch_clock: Arc::new(MonotonicEpochClock::new(0)),
+            pubkey_map: create_pubkey_map(),
+            key_gen_tx,
+        }
+    }
+
+    fn spawn_test_config(dir: &TempDir, enabled: bool, address: &str) -> Config {
+        Config {
+            keymanager_enabled: enabled,
+            keymanager_address: Some(address.to_string()),
+            keymanager_token_file: Some(dir.path().join("km-token.txt")),
+            keystore_path: dir.path().to_path_buf(),
+            doppelganger_detection: true,
+            disable_keystore_locking: true,
+            allow_fresh_db: true,
+            ..Default::default()
+        }
+    }
+
+    /// Disabled config must not construct adapters, token file, or re-arm.
+    #[test]
+    fn test_spawn_keymanager_api_disabled_constructs_nothing() {
+        let dir = TempDir::new().unwrap();
+        let config = spawn_test_config(&dir, false, "127.0.0.1:0");
+        let deps = spawn_test_deps(dir.path(), None);
+
+        let built = build_keymanager_api(&config, deps).expect("disabled must succeed");
+        assert!(built.is_none(), "disabled keymanager must construct nothing");
+        assert!(
+            !config.keymanager_token_file.as_ref().unwrap().exists(),
+            "token file must not be created when disabled"
+        );
+
+        // spawn path is also a no-op
+        let deps = spawn_test_deps(dir.path(), None);
+        spawn_keymanager_api(&config, deps).expect("disabled spawn is Ok");
+    }
+
+    /// Both monitor variants re-arm exactly once (single call site after branch).
+    #[test]
+    fn test_spawn_keymanager_api_rearms_gate_exactly_once_for_both_monitors() {
+        let dir = TempDir::new().unwrap();
+        // Real BLS key: ForwardWindowMonitor validates encoding; the time-based
+        // gate accepts any 48-byte array.
+        let crypto_pk = SecretKey::generate().public_key();
+        let pk: Pubkey = crypto_pk.to_bytes();
+        let now_unix =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        std::fs::write(
+            import_meta_path(dir.path(), &pk),
+            format!("{{\"imported_unix_seconds\":{now_unix}}}"),
+        )
+        .unwrap();
+
+        // 1) Time-based gate path (no ForwardWindowMachine)
+        {
+            let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+            let deps = spawn_test_deps(dir.path(), None);
+            let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+            assert_eq!(built.monitor_kind, DoppelgangerMonitorKind::TimeBasedGate);
+            assert!(!built.doppelganger_window.is_zero());
+            assert!(
+                !built.doppelganger_monitor.is_doppelganger_safe(&pk),
+                "time-based gate must re-arm recent import exactly once"
+            );
+        }
+
+        // 2) Forward-window path — same sidecar, fresh machine
+        {
+            struct NoPrior;
+            impl slashing::SlashingDbReader for NoPrior {
+                fn last_signed_attestation(
+                    &self,
+                    _pubkey: &str,
+                    _gvr: &Root,
+                ) -> Option<slashing::TargetEpoch> {
+                    None
+                }
+            }
+            let reader: Arc<dyn slashing::SlashingDbReader> = Arc::new(NoPrior);
+            let machine = Arc::new(ForwardWindowMachine::new(reader, 2, [0xefu8; 32]));
+            let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+            let deps = spawn_test_deps(dir.path(), Some(Arc::clone(&machine)));
+            let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+            assert_eq!(built.monitor_kind, DoppelgangerMonitorKind::ForwardWindow);
+            assert!(
+                !built.doppelganger_monitor.is_doppelganger_safe(&pk),
+                "forward-window monitor must re-arm recent import exactly once"
+            );
+            // Machine registered the key as Pending (import-strict)
+            assert_eq!(machine.status(&crypto_pk), doppelganger::ForwardWindowStatus::Pending);
+        }
+    }
+
+    /// Machine present → ForwardWindow monitor is selected.
+    #[test]
+    fn test_spawn_keymanager_api_uses_forward_window_monitor_when_machine_present() {
+        let dir = TempDir::new().unwrap();
+        struct NoPrior;
+        impl slashing::SlashingDbReader for NoPrior {
+            fn last_signed_attestation(
+                &self,
+                _pubkey: &str,
+                _gvr: &Root,
+            ) -> Option<slashing::TargetEpoch> {
+                None
+            }
+        }
+        let reader: Arc<dyn slashing::SlashingDbReader> = Arc::new(NoPrior);
+        let machine = Arc::new(ForwardWindowMachine::new(reader, 2, [0xabu8; 32]));
+        let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+        let deps = spawn_test_deps(dir.path(), Some(machine));
+        let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+        assert_eq!(
+            built.monitor_kind,
+            DoppelgangerMonitorKind::ForwardWindow,
+            "forward_window_machine must select ForwardWindow monitor"
+        );
+    }
+
+    /// Non-loopback bind emits the security warning (behavior preserved).
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_spawn_keymanager_api_warns_on_non_loopback_bind() {
+        let dir = TempDir::new().unwrap();
+        // 0.0.0.0:0 is non-loopback; bind is not attempted by build_keymanager_api.
+        let config = spawn_test_config(&dir, true, "0.0.0.0:0");
+        let deps = spawn_test_deps(dir.path(), None);
+        let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+        assert!(!built.addr.ip().is_loopback());
+        assert!(
+            logs_contain("non-loopback address"),
+            "must warn when Keymanager binds non-loopback"
+        );
     }
 }
