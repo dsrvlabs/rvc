@@ -117,7 +117,8 @@ log_level = "info"
 # tracing_exporter = "otlp"
 
 # Head-based sampling ratio 0.0–1.0 (default: 0.01 = 1%).
-# Env var fallback: OTEL_TRACES_SAMPLER_ARG (only if this field is at default)
+# Env var fallback: OTEL_TRACES_SAMPLER_ARG (only when this field is unset)
+# Explicit 0.01 is kept even if OTEL_TRACES_SAMPLER_ARG is set (RF5-15 / F20).
 # tracing_sample_rate = 0.01
 
 # Maximum number of spans queued for export (OTel SDK default: 2048).

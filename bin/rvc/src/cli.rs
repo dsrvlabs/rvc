@@ -377,9 +377,9 @@ pub struct TracingArgs {
     #[arg(long, default_value_t = TracingExporter::Otlp)]
     pub tracing_exporter: TracingExporter,
 
-    /// Head-based sampling ratio 0.0–1.0 (default: 0.01)
-    #[arg(long, default_value_t = 0.01)]
-    pub tracing_sample_rate: f64,
+    /// Head-based sampling ratio 0.0–1.0 (default: 0.01 when unset; see OTEL_TRACES_SAMPLER_ARG)
+    #[arg(long)]
+    pub tracing_sample_rate: Option<f64>,
 
     /// Maximum number of spans queued for export (OTel SDK default: 2048)
     #[arg(long)]
@@ -639,7 +639,7 @@ impl From<StartArgs> for CliOverrides {
             key_decrypt_threads: keys.key_decrypt_threads,
             tracing_endpoint: tracing.tracing_endpoint,
             tracing_exporter: Some(tracing.tracing_exporter),
-            tracing_sample_rate: Some(tracing.tracing_sample_rate),
+            tracing_sample_rate: tracing.tracing_sample_rate,
             tracing_max_queue_size: tracing.tracing_max_queue_size,
             tracing_max_export_batch_size: tracing.tracing_max_export_batch_size,
             secret_provider: keys.secret_provider,
@@ -1238,6 +1238,8 @@ mod tests {
         assert_eq!(ov.proposer_config_url_insecure, None);
         assert_eq!(ov.monitoring_endpoint_insecure, None);
         assert_eq!(ov.logfile_compress, None);
+        // RF5-15: no default_value_t — absent flag yields None (not Some(0.01)).
+        assert_eq!(ov.tracing_sample_rate, None);
     }
 
     #[test]

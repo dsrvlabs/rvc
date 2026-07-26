@@ -44,7 +44,7 @@ fn expected_production_config() -> Config {
         tracing: TracingConfig {
             endpoint: Some("http://otel-collector:4318".to_string()),
             exporter: TracingExporter::Otlp,
-            sample_rate: 0.05,
+            sample_rate: Some(0.05),
             max_queue_size: Some(4096),
             max_export_batch_size: Some(1024),
         },
@@ -94,7 +94,7 @@ fn assert_moved_fields_eq(a: &Config, b: &Config) {
     assert_eq!(a.keymanager, b.keymanager);
     assert_eq!(a.tracing.endpoint, b.tracing.endpoint);
     assert_eq!(a.tracing.exporter, b.tracing.exporter);
-    assert!((a.tracing.sample_rate - b.tracing.sample_rate).abs() < f64::EPSILON);
+    assert_eq!(a.tracing.sample_rate, b.tracing.sample_rate);
     assert_eq!(a.tracing.max_queue_size, b.tracing.max_queue_size);
     assert_eq!(a.tracing.max_export_batch_size, b.tracing.max_export_batch_size);
     assert_eq!(a.grpc_signer, b.grpc_signer);
@@ -117,7 +117,7 @@ fn test_production_config_fixture_loads_with_flat_keys() {
     assert_moved_fields_eq(&loaded, &expected);
 
     assert!(loaded.keymanager.enabled);
-    assert!((loaded.tracing.sample_rate - 0.05).abs() < f64::EPSILON);
+    assert_eq!(loaded.tracing.sample_rate, Some(0.05));
     assert_eq!(loaded.logfile.max_size, 100);
     assert_eq!(
         loaded.logfile.path.as_ref().map(|p| p.to_str().unwrap()),
@@ -204,7 +204,9 @@ fn test_default_config_field_values_unchanged() {
     assert_eq!(c.network, Network::Mainnet);
     assert!(c.doppelganger_detection);
     assert!(!c.keymanager.enabled);
-    assert!((c.tracing.sample_rate - 0.01).abs() < f64::EPSILON);
+    // RF5-15: unset sample_rate is None; resolved default remains 0.01.
+    assert!(c.tracing.sample_rate.is_none());
+    assert!((c.tracing.resolve_sample_rate() - 0.01).abs() < f64::EPSILON);
     assert_eq!(c.logfile.max_size, 200);
     assert_eq!(c.logfile.max_number, 5);
     assert_eq!(c.monitoring.interval, 384);

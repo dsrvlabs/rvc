@@ -32,19 +32,19 @@
     `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run --workspace`,
     `crates/architecture-tests`.
 - **Exit criteria (phase gate):**
-  - [ ] `bin/rvc/src/main.rs` < ~600 lines; it does CLI parse + logging init + one `rvc::bootstrap::run`
+  - [x] `bin/rvc/src/main.rs` < ~600 lines; it does CLI parse + logging init + one `rvc::bootstrap::run`
         call. No startup step remains inline in the binary.
-  - [ ] `bin/rvc-signer` server assembly lives in `crates/signer-server`; `bin/rvc-signer/src/main.rs`
+  - [x] `bin/rvc-signer` server assembly lives in `crates/signer-server`; `bin/rvc-signer/src/main.rs`
         is a CLI shim; no test shells out to `cargo build`.
-  - [ ] CLI startup smoke tests run **un-ignored** in CI against a mock beacon node (clean start, clean
+  - [x] CLI startup smoke tests run **un-ignored** in CI against a mock beacon node (clean start, clean
         SIGTERM shutdown, exit code 0) and pass at every step of the F1 and F2 chains.
-  - [ ] A production `rvc.toml` written before this phase still loads unchanged (fixture test), and
+  - [x] A production `rvc.toml` written before this phase still loads unchanged (fixture test), and
         `rvc-signer --config f.toml --listen-address <the default value>` keeps the CLI value.
-  - [ ] Adding a hypothetical flag to either binary = 1 struct field + 1 clap attribute (demonstrated in
+  - [x] Adding a hypothetical flag to either binary = 1 struct field + 1 clap attribute (demonstrated in
         the PR description of RF5-15 and RF5-23).
-  - [ ] Manual devnet/mock-BN boot performed and recorded before RF5-10 merges.
-  - [ ] Release notes drafted for the three deliberate behavior changes (see *Release-note items*).
-  - [ ] Workspace green on the standing invariant.
+  - [x] Manual devnet/mock-BN boot performed and recorded before RF5-10 merges.
+  - [x] Release notes drafted for the three deliberate behavior changes (see *Release-note items*).
+  - [x] Workspace green on the standing invariant.
 
 ## Assumptions (verified against HEAD `a7f8cdf`)
 
@@ -987,13 +987,13 @@ because "equals the default" is being used as a proxy for "not set".
    (§5, F116 first half) **only if** it stays under the point budget; otherwise split it out and say so.
 
 **Acceptance criteria:**
-- [ ] `merge_with_cli` is generated from one field list; adding a `CliOverrides` field without listing it
+- [x] `merge_with_cli` is generated from one field list; adding a `CliOverrides` field without listing it
       fails to compile.
-- [ ] `--tracing-sample-rate 0.01` survives `OTEL_TRACES_SAMPLER_ARG` being set (the F20 bug fix).
-- [ ] With no CLI flag and no config value, `OTEL_TRACES_SAMPLER_ARG` still applies; with neither, the
+- [x] `--tracing-sample-rate 0.01` survives `OTEL_TRACES_SAMPLER_ARG` being set (the F20 bug fix).
+- [x] With no CLI flag and no config value, `OTEL_TRACES_SAMPLER_ARG` still applies; with neither, the
       default is 0.01.
-- [ ] No env-precedence logic remains in `bin/rvc`.
-- [ ] Adding a hypothetical flag touches exactly one struct field + one clap attribute — demonstrated in
+- [x] No env-precedence logic remains in `bin/rvc`.
+- [x] Adding a hypothetical flag touches exactly one struct field + one clap attribute — demonstrated in
       the PR description.
 
 **TDD test plan** (RED first):

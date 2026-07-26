@@ -407,30 +407,56 @@ impl Default for LogfileConfig {
 }
 
 /// Distributed tracing / OpenTelemetry settings.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `sample_rate` is `Option` end-to-end so an explicit `0.01` is distinguishable
+/// from "unset" (RF5-15 / F20). Resolve with [`TracingConfig::resolve_sample_rate`]
+/// / [`TracingConfig::resolve_endpoint`] — precedence is CLI > file > `OTEL_*` env >
+/// built-in default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct TracingConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
     #[serde(default)]
     pub exporter: TracingExporter,
-    #[serde(default = "default_tracing_sample_rate")]
-    pub sample_rate: f64,
+    /// Head-based sampling ratio when set. `None` means "not configured" so
+    /// `OTEL_TRACES_SAMPLER_ARG` and the 0.01 built-in default can apply at
+    /// resolution time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sample_rate: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_queue_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_export_batch_size: Option<usize>,
 }
 
-impl Default for TracingConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: None,
-            exporter: TracingExporter::default(),
-            sample_rate: default_tracing_sample_rate(),
-            max_queue_size: None,
-            max_export_batch_size: None,
+impl TracingConfig {
+    /// Resolve the OTLP endpoint: explicit config/CLI > `OTEL_EXPORTER_OTLP_ENDPOINT`.
+    ///
+    /// Returns `None` when neither source provides a value (tracing stays disabled).
+    pub fn resolve_endpoint(&self) -> Option<String> {
+        self.endpoint.clone().or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())
+    }
+
+    /// Resolve the sample rate: explicit config/CLI > `OTEL_TRACES_SAMPLER_ARG` > 0.01.
+    ///
+    /// Values outside `0.0..=1.0` are clamped with a warning.
+    pub fn resolve_sample_rate(&self) -> f64 {
+        let mut rate = match self.sample_rate {
+            Some(rate) => rate,
+            None => match std::env::var("OTEL_TRACES_SAMPLER_ARG") {
+                Ok(env_rate) => {
+                    env_rate.parse::<f64>().unwrap_or_else(|_| default_tracing_sample_rate())
+                }
+                Err(_) => default_tracing_sample_rate(),
+            },
+        };
+
+        if !(0.0..=1.0).contains(&rate) {
+            warn!(sample_rate = rate, "tracing_sample_rate out of range 0.0..=1.0, clamping");
+            rate = rate.clamp(0.0, 1.0);
         }
+        rate
     }
 }
 
@@ -709,7 +735,7 @@ impl From<ConfigWire> for Config {
             tracing.exporter = v;
         }
         if let Some(v) = w.tracing_sample_rate {
-            tracing.sample_rate = v;
+            tracing.sample_rate = Some(v);
         }
         if let Some(v) = w.tracing_max_queue_size {
             tracing.max_queue_size = Some(v);
@@ -892,6 +918,66 @@ impl<'de> Deserialize<'de> for Config {
         }
         Ok(cfg)
     }
+}
+
+/// Generate `merge_with_cli` arms from a single field list.
+///
+/// Exhaustively destructures [`CliOverrides`] so a new override field that is not
+/// listed fails to compile. Handlers:
+/// - `set` — assign the unwrapped value (CLI `Option<T>` → dest `T`)
+/// - `set_some` — wrap in `Some` (CLI `Option<T>` → dest `Option<T>`)
+/// - `set_true` — only apply when `Some(true)`
+/// - `csv_opt` — comma-separated string → `Option<Vec<String>>`
+/// - `csv_vec` — comma-separated string → `Vec<String>`
+macro_rules! merge_cli_fields {
+    ($self:ident, $cli:ident; $( $field:ident => { $kind:ident : $dst:expr } ),* $(,)?) => {{
+        let CliOverrides {
+            $($field,)*
+        } = $cli;
+        $(
+            merge_cli_fields!(@arm $kind, $field, $dst);
+        )*
+    }};
+
+    (@arm set, $field:ident, $dst:expr) => {
+        if let Some(v) = $field {
+            $dst = v.clone();
+        }
+    };
+    (@arm set_some, $field:ident, $dst:expr) => {
+        if let Some(v) = $field {
+            $dst = Some(v.clone());
+        }
+    };
+    (@arm set_true, $field:ident, $dst:expr) => {
+        if let Some(true) = $field {
+            $dst = true;
+        }
+    };
+    (@arm csv_opt, $field:ident, $dst:expr) => {
+        if let Some(csv) = $field {
+            let items: Vec<String> = csv
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !items.is_empty() {
+                $dst = Some(items);
+            }
+        }
+    };
+    (@arm csv_vec, $field:ident, $dst:expr) => {
+        if let Some(csv) = $field {
+            let items: Vec<String> = csv
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !items.is_empty() {
+                $dst = items;
+            }
+        }
+    };
 }
 
 impl Config {
@@ -1116,279 +1202,92 @@ impl Config {
         }
     }
 
+    /// Merge present CLI overrides into this config.
+    ///
+    /// Generated from a single field list via [`merge_cli_fields!`]. Adding a
+    /// field to [`CliOverrides`] without listing it here fails to compile
+    /// (exhaustive destructure).
     pub fn merge_with_cli(&mut self, cli: &CliOverrides) {
-        if let Some(ref beacon_url) = cli.beacon_url {
-            self.beacon_url = beacon_url.clone();
-        }
-
-        if let Some(ref beacon_nodes) = cli.beacon_nodes {
-            self.beacon_nodes = beacon_nodes.clone();
-        }
-
-        if let Some(ref keystore_path) = cli.keystore_path {
-            self.keystore_path = keystore_path.clone();
-        }
-
-        if let Some(ref password_file) = cli.password_file {
-            self.password_file = Some(password_file.clone());
-        }
-
-        if let Some(ref slashing_db_path) = cli.slashing_db_path {
-            self.slashing_db_path = slashing_db_path.clone();
-        }
-
-        if let Some(true) = cli.init_slashing_db {
-            self.allow_fresh_db = true;
-        }
-
-        if let Some(true) = cli.allow_unsupported_fork {
-            self.allow_unsupported_fork = true;
-        }
-
-        if let Some(metrics_address) = cli.metrics_address {
-            self.metrics_address = metrics_address;
-        }
-
-        if let Some(metrics_port) = cli.metrics_port {
-            self.metrics_port = metrics_port;
-        }
-
-        if let Some(grpc_port) = cli.grpc_port {
-            self.grpc_port = grpc_port;
-        }
-
-        if let Some(ref grpc_address) = cli.grpc_address {
-            self.grpc_address = grpc_address.clone();
-        }
-
-        if let Some(network) = cli.network {
-            self.network = network;
-        }
-
-        if let Some(genesis_time) = cli.genesis_time {
-            self.genesis_time = Some(genesis_time);
-        }
-
-        if let Some(ref genesis_validators_root) = cli.genesis_validators_root {
-            self.genesis_validators_root = Some(genesis_validators_root.clone());
-        }
-
-        if let Some(ref graffiti) = cli.graffiti {
-            self.graffiti = Some(graffiti.clone());
-        }
-
-        if let Some(ref log_level) = cli.log_level {
-            self.log_level = log_level.clone();
-        }
-
-        if let Some(doppelganger_detection) = cli.doppelganger_detection {
-            self.doppelganger_detection = doppelganger_detection;
-        }
-
-        if let Some(keymanager_enabled) = cli.keymanager_enabled {
-            self.keymanager.enabled = keymanager_enabled;
-        }
-
-        if let Some(ref keymanager_address) = cli.keymanager_address {
-            self.keymanager.address = Some(keymanager_address.clone());
-        }
-
-        if let Some(ref keymanager_token_file) = cli.keymanager_token_file {
-            self.keymanager.token_file = Some(keymanager_token_file.clone());
-        }
-
-        if let Some(ref remote_signer_url) = cli.remote_signer_url {
-            self.keymanager.remote_signer_url = Some(remote_signer_url.clone());
-        }
-
-        if let Some(ref hosts_csv) = cli.remote_signer_allowed_hosts {
-            let hosts: Vec<String> = hosts_csv
-                .split(',')
-                .map(|h| h.trim().to_string())
-                .filter(|h| !h.is_empty())
-                .collect();
-            if !hosts.is_empty() {
-                self.keymanager.remote_signer_allowed_hosts = Some(hosts);
-            }
-        }
-
-        if let Some(n) = cli.key_decrypt_threads {
-            self.key_decrypt_threads = Some(n);
-        }
-
-        if let Some(ref tracing_endpoint) = cli.tracing_endpoint {
-            self.tracing.endpoint = Some(tracing_endpoint.clone());
-        }
-
-        if let Some(tracing_exporter) = cli.tracing_exporter {
-            self.tracing.exporter = tracing_exporter;
-        }
-
-        if let Some(tracing_sample_rate) = cli.tracing_sample_rate {
-            self.tracing.sample_rate = tracing_sample_rate;
-        }
-
-        if let Some(n) = cli.tracing_max_queue_size {
-            self.tracing.max_queue_size = Some(n);
-        }
-
-        if let Some(n) = cli.tracing_max_export_batch_size {
-            self.tracing.max_export_batch_size = Some(n);
-        }
-
-        if let Some(ref provider_csv) = cli.secret_provider {
-            let providers: Vec<String> = provider_csv
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !providers.is_empty() {
-                self.secret_provider.providers = providers;
-            }
-        }
-
-        if let Some(ref gcp_project_id) = cli.gcp_project_id {
-            self.secret_provider.gcp.project_id = Some(gcp_project_id.clone());
-        }
-
-        if let Some(ref gcp_secret_prefix) = cli.gcp_secret_prefix {
-            self.secret_provider.gcp.secret_prefix = gcp_secret_prefix.clone();
-        }
-
-        if let Some(interval) = cli.secret_refresh_interval {
-            self.secret_provider.refresh_interval = Some(interval);
-        }
-
-        if let Some(true) = cli.secret_provider_strict {
-            self.secret_provider.strict = true;
-        }
-
-        if let Some(allow) = cli.allow_insecure_remote_signer {
-            self.keymanager.allow_insecure_remote_signer = allow;
-        }
-
-        if let Some(ref origins) = cli.keymanager_cors_origins {
-            self.keymanager.cors_origins = origins.clone();
-        }
-
-        if let Some(limit) = cli.keymanager_body_limit {
-            self.keymanager.body_limit = limit;
-        }
-
-        if let Some(ref url) = cli.grpc_signer_url {
-            self.grpc_signer.url = Some(url.clone());
-        }
-
-        if let Some(ref path) = cli.grpc_signer_tls_cert {
-            self.grpc_signer.tls_cert = Some(path.clone());
-        }
-
-        if let Some(ref path) = cli.grpc_signer_tls_key {
-            self.grpc_signer.tls_key = Some(path.clone());
-        }
-
-        if let Some(ref path) = cli.grpc_signer_tls_ca_cert {
-            self.grpc_signer.tls_ca_cert = Some(path.clone());
-        }
-
-        if let Some(disable_attesting) = cli.disable_attesting {
-            self.disable_attesting = disable_attesting;
-        }
-
-        if let Some(action) = cli.slashed_validators_action {
-            self.slashed_validators_action = action;
-        }
-
-        if let Some(limit) = cli.builder_circuit_breaker_consecutive_limit {
-            self.builder_limits.circuit_breaker_consecutive_limit = limit;
-        }
-
-        if let Some(limit) = cli.builder_circuit_breaker_epoch_limit {
-            self.builder_limits.circuit_breaker_epoch_limit = limit;
-        }
-
-        if let Some(disable) = cli.disable_keystore_locking {
-            self.disable_keystore_locking = disable;
-        }
-
-        if let Some(ref nodes) = cli.proposer_nodes {
-            self.proposer_nodes = nodes.clone();
-        }
-
-        if let Some(ref topics) = cli.broadcast {
-            self.broadcast = topics.clone();
-        }
-
-        if let Some(ref url) = cli.proposer_config_url {
-            self.proposer_config.url = Some(url.clone());
-        }
-
-        if let Some(ref file) = cli.proposer_config_file {
-            self.proposer_config.file = Some(file.clone());
-        }
-
-        if let Some(interval) = cli.proposer_config_refresh_interval {
-            self.proposer_config.refresh_interval = interval;
-        }
-
-        if let Some(ref token) = cli.proposer_config_url_token {
-            self.proposer_config.url_token = Some(token.clone());
-        }
-
-        if let Some(insecure) = cli.proposer_config_url_insecure {
-            self.proposer_config.url_insecure = insecure;
-        }
-
-        if let Some(ref endpoint) = cli.monitoring_endpoint {
-            self.monitoring.endpoint = Some(endpoint.clone());
-        }
-
-        if let Some(interval) = cli.monitoring_interval {
-            self.monitoring.interval = interval;
-        }
-
-        if let Some(insecure) = cli.monitoring_endpoint_insecure {
-            self.monitoring.endpoint_insecure = insecure;
-        }
-
-        if let Some(ref logfile) = cli.logfile {
-            self.logfile.path = Some(logfile.clone());
-        }
-
-        if let Some(max_size) = cli.logfile_max_size {
-            self.logfile.max_size = max_size;
-        }
-
-        if let Some(max_number) = cli.logfile_max_number {
-            self.logfile.max_number = max_number;
-        }
-
-        if let Some(compress) = cli.logfile_compress {
-            self.logfile.compress = compress;
-        }
-
-        if let Some(ref level) = cli.logfile_level {
-            self.logfile.level = Some(level.clone());
-        }
-
-        if let Some(mode) = cli.block_selection_mode {
-            self.block_selection_mode = mode;
-        }
-
-        if let Some(size) = cli.validator_registration_batch_size {
-            self.validator_registration_batch_size = size;
-        }
-
-        if let Some(delay) = cli.validator_registration_batch_delay {
-            self.validator_registration_batch_delay = delay;
-        }
-
-        if let Some(ref path) = cli.validators_config {
-            self.validators_config = Some(path.clone());
-        }
-
-        if let Some(v) = cli.beacon_max_body_bytes {
-            self.beacon_max_body_bytes = v;
+        merge_cli_fields! {
+            self, cli;
+            // top-level
+            beacon_url => { set: self.beacon_url },
+            beacon_nodes => { set: self.beacon_nodes },
+            keystore_path => { set: self.keystore_path },
+            password_file => { set_some: self.password_file },
+            slashing_db_path => { set: self.slashing_db_path },
+            init_slashing_db => { set_true: self.allow_fresh_db },
+            allow_unsupported_fork => { set_true: self.allow_unsupported_fork },
+            metrics_address => { set: self.metrics_address },
+            metrics_port => { set: self.metrics_port },
+            grpc_port => { set: self.grpc_port },
+            grpc_address => { set: self.grpc_address },
+            network => { set: self.network },
+            genesis_time => { set_some: self.genesis_time },
+            genesis_validators_root => { set_some: self.genesis_validators_root },
+            graffiti => { set_some: self.graffiti },
+            log_level => { set: self.log_level },
+            doppelganger_detection => { set: self.doppelganger_detection },
+            key_decrypt_threads => { set_some: self.key_decrypt_threads },
+            disable_attesting => { set: self.disable_attesting },
+            slashed_validators_action => { set: self.slashed_validators_action },
+            disable_keystore_locking => { set: self.disable_keystore_locking },
+            proposer_nodes => { set: self.proposer_nodes },
+            broadcast => { set: self.broadcast },
+            block_selection_mode => { set: self.block_selection_mode },
+            validator_registration_batch_size => { set: self.validator_registration_batch_size },
+            validator_registration_batch_delay => { set: self.validator_registration_batch_delay },
+            validators_config => { set_some: self.validators_config },
+            beacon_max_body_bytes => { set: self.beacon_max_body_bytes },
+            // keymanager
+            keymanager_enabled => { set: self.keymanager.enabled },
+            keymanager_address => { set_some: self.keymanager.address },
+            keymanager_token_file => { set_some: self.keymanager.token_file },
+            remote_signer_url => { set_some: self.keymanager.remote_signer_url },
+            remote_signer_allowed_hosts => { csv_opt: self.keymanager.remote_signer_allowed_hosts },
+            allow_insecure_remote_signer => { set: self.keymanager.allow_insecure_remote_signer },
+            keymanager_cors_origins => { set: self.keymanager.cors_origins },
+            keymanager_body_limit => { set: self.keymanager.body_limit },
+            // tracing
+            tracing_endpoint => { set_some: self.tracing.endpoint },
+            tracing_exporter => { set: self.tracing.exporter },
+            tracing_sample_rate => { set_some: self.tracing.sample_rate },
+            tracing_max_queue_size => { set_some: self.tracing.max_queue_size },
+            tracing_max_export_batch_size => { set_some: self.tracing.max_export_batch_size },
+            // secret provider
+            secret_provider => { csv_vec: self.secret_provider.providers },
+            gcp_project_id => { set_some: self.secret_provider.gcp.project_id },
+            gcp_secret_prefix => { set: self.secret_provider.gcp.secret_prefix },
+            secret_refresh_interval => { set_some: self.secret_provider.refresh_interval },
+            secret_provider_strict => { set_true: self.secret_provider.strict },
+            // grpc_signer
+            grpc_signer_url => { set_some: self.grpc_signer.url },
+            grpc_signer_tls_cert => { set_some: self.grpc_signer.tls_cert },
+            grpc_signer_tls_key => { set_some: self.grpc_signer.tls_key },
+            grpc_signer_tls_ca_cert => { set_some: self.grpc_signer.tls_ca_cert },
+            // builder_limits
+            builder_circuit_breaker_consecutive_limit => {
+                set: self.builder_limits.circuit_breaker_consecutive_limit
+            },
+            builder_circuit_breaker_epoch_limit => {
+                set: self.builder_limits.circuit_breaker_epoch_limit
+            },
+            // proposer_config
+            proposer_config_url => { set_some: self.proposer_config.url },
+            proposer_config_file => { set_some: self.proposer_config.file },
+            proposer_config_refresh_interval => { set: self.proposer_config.refresh_interval },
+            proposer_config_url_token => { set_some: self.proposer_config.url_token },
+            proposer_config_url_insecure => { set: self.proposer_config.url_insecure },
+            // monitoring
+            monitoring_endpoint => { set_some: self.monitoring.endpoint },
+            monitoring_interval => { set: self.monitoring.interval },
+            monitoring_endpoint_insecure => { set: self.monitoring.endpoint_insecure },
+            // logfile
+            logfile => { set_some: self.logfile.path },
+            logfile_max_size => { set: self.logfile.max_size },
+            logfile_max_number => { set: self.logfile.max_number },
+            logfile_compress => { set: self.logfile.compress },
+            logfile_level => { set_some: self.logfile.level },
         }
     }
 }
@@ -2071,7 +1970,9 @@ key_decrypt_threads = 4
         let config = Config::default();
         assert!(config.tracing.endpoint.is_none());
         assert_eq!(config.tracing.exporter, TracingExporter::Otlp);
-        assert!((config.tracing.sample_rate - 0.01).abs() < f64::EPSILON);
+        // Unset end-to-end (RF5-15); resolved default is 0.01.
+        assert!(config.tracing.sample_rate.is_none());
+        assert!((config.tracing.resolve_sample_rate() - 0.01).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -2099,7 +2000,7 @@ key_decrypt_threads = 4
         let mut config = Config::default();
         let cli = CliOverrides { tracing_sample_rate: Some(0.5), ..Default::default() };
         config.merge_with_cli(&cli);
-        assert!((config.tracing.sample_rate - 0.5).abs() < f64::EPSILON);
+        assert_eq!(config.tracing.sample_rate, Some(0.5));
     }
 
     #[test]
@@ -2109,7 +2010,7 @@ key_decrypt_threads = 4
         config.merge_with_cli(&cli);
         assert!(config.tracing.endpoint.is_none());
         assert_eq!(config.tracing.exporter, TracingExporter::Otlp);
-        assert!((config.tracing.sample_rate - 0.01).abs() < f64::EPSILON);
+        assert!(config.tracing.sample_rate.is_none());
     }
 
     #[test]
@@ -2133,7 +2034,7 @@ tracing_sample_rate = 0.1
         let config = Config::from_file(file.path()).unwrap();
         assert_eq!(config.tracing.endpoint.as_deref(), Some("http://otel-collector:4318"));
         assert_eq!(config.tracing.exporter, TracingExporter::Otlp);
-        assert!((config.tracing.sample_rate - 0.1).abs() < f64::EPSILON);
+        assert_eq!(config.tracing.sample_rate, Some(0.1));
     }
 
     #[test]
@@ -2154,7 +2055,112 @@ log_level = "info"
         let config = Config::from_file(file.path()).unwrap();
         assert!(config.tracing.endpoint.is_none());
         assert_eq!(config.tracing.exporter, TracingExporter::Otlp);
-        assert!((config.tracing.sample_rate - 0.01).abs() < f64::EPSILON);
+        assert!(config.tracing.sample_rate.is_none());
+        assert!((config.tracing.resolve_sample_rate() - 0.01).abs() < f64::EPSILON);
+    }
+
+    // -- RF5-15: OTEL precedence + Option sample_rate --
+
+    /// Serialize tests that touch OTEL env vars.
+    fn otel_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn test_explicit_default_sample_rate_survives_env_override() {
+        let _guard = otel_env_lock();
+        std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.5");
+        // Explicit 0.01 (the old "default") must NOT be treated as unset.
+        let tracing = TracingConfig { sample_rate: Some(0.01), ..Default::default() };
+        assert!((tracing.resolve_sample_rate() - 0.01).abs() < f64::EPSILON);
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+    }
+
+    #[test]
+    fn test_env_sample_rate_applies_when_unset() {
+        let _guard = otel_env_lock();
+        std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.5");
+        let tracing = TracingConfig::default(); // sample_rate: None
+        assert!((tracing.resolve_sample_rate() - 0.5).abs() < f64::EPSILON);
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+    }
+
+    #[test]
+    fn test_sample_rate_default_is_0_01_when_unset_everywhere() {
+        let _guard = otel_env_lock();
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+        let tracing = TracingConfig::default();
+        assert!(tracing.sample_rate.is_none());
+        assert!((tracing.resolve_sample_rate() - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_otlp_endpoint_precedence_cli_over_file_over_env() {
+        let _guard = otel_env_lock();
+        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://env:4318");
+
+        // Env only
+        let env_only = TracingConfig::default();
+        assert_eq!(env_only.resolve_endpoint().as_deref(), Some("http://env:4318"));
+
+        // File/config beats env
+        let from_file =
+            TracingConfig { endpoint: Some("http://file:4318".into()), ..Default::default() };
+        assert_eq!(from_file.resolve_endpoint().as_deref(), Some("http://file:4318"));
+
+        // CLI merge beats file (and env)
+        let mut cfg = Config {
+            tracing: TracingConfig {
+                endpoint: Some("http://file:4318".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cfg.merge_with_cli(&CliOverrides {
+            tracing_endpoint: Some("http://cli:4318".into()),
+            ..Default::default()
+        });
+        assert_eq!(cfg.tracing.resolve_endpoint().as_deref(), Some("http://cli:4318"));
+
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+
+    #[test]
+    fn test_merge_covers_every_cli_override_field() {
+        // Compile-time exhaustiveness is enforced by merge_cli_fields!'s
+        // destructure of CliOverrides. This runtime smoke check ensures a
+        // representative override from each group still lands on Config.
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            beacon_url: Some("http://bn:5052".into()),
+            tracing_sample_rate: Some(0.01),
+            keymanager_enabled: Some(true),
+            logfile: Some(std::path::PathBuf::from("/tmp/rvc.log")),
+            monitoring_interval: Some(42),
+            ..Default::default()
+        };
+        config.merge_with_cli(&cli);
+        assert_eq!(config.beacon_url, "http://bn:5052");
+        assert_eq!(config.tracing.sample_rate, Some(0.01));
+        assert!(config.keymanager.enabled);
+        assert_eq!(config.logfile.path.as_deref(), Some(std::path::Path::new("/tmp/rvc.log")));
+        assert_eq!(config.monitoring.interval, 42);
+    }
+
+    #[test]
+    fn test_cli_sample_rate_0_01_survives_merge_and_env() {
+        let _guard = otel_env_lock();
+        std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.9");
+        let mut config = Config::default();
+        config.merge_with_cli(&CliOverrides {
+            tracing_sample_rate: Some(0.01),
+            ..Default::default()
+        });
+        assert_eq!(config.tracing.sample_rate, Some(0.01));
+        assert!((config.tracing.resolve_sample_rate() - 0.01).abs() < f64::EPSILON);
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
     }
 
     // -- tracing batch config tests --

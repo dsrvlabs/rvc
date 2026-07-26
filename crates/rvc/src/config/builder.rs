@@ -1569,7 +1569,7 @@ mod tests {
             tracing: TracingConfig {
                 endpoint: Some("http://otel:4318".to_string()),
                 exporter: TracingExporter::Gcp,
-                sample_rate: 0.25,
+                sample_rate: Some(0.25),
                 ..Default::default()
             },
             logfile: LogfileConfig {
@@ -1604,7 +1604,7 @@ mod tests {
         assert_eq!(config.keymanager.address.as_deref(), Some("127.0.0.1:5062"));
         assert_eq!(config.tracing.endpoint.as_deref(), Some("http://otel:4318"));
         assert_eq!(config.tracing.exporter, TracingExporter::Gcp);
-        assert!((config.tracing.sample_rate - 0.25).abs() < f64::EPSILON);
+        assert_eq!(config.tracing.sample_rate, Some(0.25));
         assert_eq!(config.logfile.max_size, 50);
         assert_eq!(config.logfile.max_number, 3);
         assert!(config.logfile.compress);

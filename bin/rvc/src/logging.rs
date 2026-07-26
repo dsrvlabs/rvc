@@ -119,26 +119,9 @@ pub fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
 }
 
 pub fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfig> {
-    let endpoint = config
-        .tracing
-        .endpoint
-        .clone()
-        .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())?;
-
-    let mut sample_rate = config.tracing.sample_rate;
-    // If sample_rate is still at default, check env var
-    if (sample_rate - 0.01).abs() < f64::EPSILON {
-        if let Ok(env_rate) = std::env::var("OTEL_TRACES_SAMPLER_ARG") {
-            if let Ok(parsed) = env_rate.parse::<f64>() {
-                sample_rate = parsed;
-            }
-        }
-    }
-
-    if !(0.0..=1.0).contains(&sample_rate) {
-        warn!(sample_rate, "tracing_sample_rate out of range 0.0..=1.0, clamping");
-        sample_rate = sample_rate.clamp(0.0, 1.0);
-    }
+    // OTEL env precedence lives on TracingConfig (RF5-15); the binary only maps.
+    let endpoint = config.tracing.resolve_endpoint()?;
+    let sample_rate = config.tracing.resolve_sample_rate();
 
     // Warn on non-localhost http://
     if endpoint.starts_with("http://") {
@@ -346,7 +329,7 @@ mod tests {
         let config = Config {
             tracing: TracingConfig {
                 endpoint: Some("http://localhost:4318".to_string()),
-                // sample_rate at default 0.01, so env var should be checked
+                // sample_rate unset → env applies
                 ..Default::default()
             },
             ..Default::default()
@@ -365,13 +348,33 @@ mod tests {
         let config = Config {
             tracing: TracingConfig {
                 endpoint: Some("http://localhost:4318".to_string()),
-                sample_rate: 0.75, // non-default, so env var should NOT be checked
+                sample_rate: Some(0.75),
                 ..Default::default()
             },
             ..Default::default()
         };
         let tc = build_tracing_config(&config).expect("should return Some");
         assert!((tc.sample_rate - 0.75).abs() < f64::EPSILON);
+
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+    }
+
+    #[test]
+    fn test_build_tracing_config_explicit_default_sample_rate_survives_env() {
+        let _guard = env_lock();
+        std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.5");
+
+        // F20: explicit 0.01 must not be treated as "unset".
+        let config = Config {
+            tracing: TracingConfig {
+                endpoint: Some("http://localhost:4318".to_string()),
+                sample_rate: Some(0.01),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert!((tc.sample_rate - 0.01).abs() < f64::EPSILON);
 
         std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
     }
@@ -385,7 +388,7 @@ mod tests {
         let config = Config {
             tracing: TracingConfig {
                 endpoint: Some("http://localhost:4318".to_string()),
-                sample_rate: 2.0,
+                sample_rate: Some(2.0),
                 ..Default::default()
             },
             ..Default::default()
@@ -403,7 +406,7 @@ mod tests {
         let config = Config {
             tracing: TracingConfig {
                 endpoint: Some("http://localhost:4318".to_string()),
-                sample_rate: -0.5,
+                sample_rate: Some(-0.5),
                 ..Default::default()
             },
             ..Default::default()
