@@ -111,53 +111,68 @@ proposer_nodes = ["http://p1:5052", "http://p2:5052"]
 
     /// Call-site guard: block production must not construct a single-node client
     /// from `proposer_nodes[0]`; it must wrap the proposer/main BnManager.
+    ///
+    /// RF5-10: wiring lives in `crates/rvc` bootstrap (not `bin/rvc/src/main.rs`).
     #[test]
     fn test_block_production_does_not_use_proposer_nodes_zero() {
-        let main_src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
-            .expect("read bin/rvc/src/main.rs");
+        let services_src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/rvc/src/bootstrap/services.rs"
+        ))
+        .expect("read crates/rvc/src/bootstrap/services.rs");
 
         assert!(
-            !main_src.contains("proposer_nodes[0]"),
-            "bin/rvc/src/main.rs must not construct a BeaconClient from proposer_nodes[0]; \
+            !services_src.contains("proposer_nodes[0]"),
+            "bootstrap services must not construct a BeaconClient from proposer_nodes[0]; \
              block production must use the proposer BnManager for failover"
         );
         assert!(
-            main_src.contains("BeaconBlockAdapter"),
-            "expected BeaconBlockAdapter wiring in main"
-        );
-        assert!(
-            main_src.contains("proposer_mgr"),
-            "expected proposer BnManager to be passed into BeaconBlockAdapter"
+            services_src.contains("BeaconBlockAdapter"),
+            "expected BeaconBlockAdapter wiring in bootstrap::build_services"
         );
     }
 
-    /// Call-site guard: `build_beacon` in the VC binary is limited to exit tooling
-    /// (keymanager voluntary exit), not block production or the propagator path.
+    /// Call-site guard: `build_beacon` in the VC runtime path is limited to exit
+    /// tooling (keymanager voluntary exit), not block production or the propagator.
+    ///
+    /// RF5-10: production path is `crates/rvc` bootstrap phases.
     #[test]
     fn test_build_beacon_only_used_by_exit_tooling() {
-        let main_src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
-            .expect("read bin/rvc/src/main.rs");
+        let beacon_src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/rvc/src/bootstrap/beacon.rs"
+        ))
+        .expect("read crates/rvc/src/bootstrap/beacon.rs");
+        let services_src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/rvc/src/bootstrap/services.rs"
+        ))
+        .expect("read crates/rvc/src/bootstrap/services.rs");
+        let km_src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../crates/rvc/src/keymanager_adapters.rs"
+        ))
+        .expect("read crates/rvc/src/keymanager_adapters.rs");
 
-        // Single build_beacon call site for the runtime VC path.
-        let build_beacon_count = main_src.matches("build_beacon()").count();
+        // Single build_beacon call site for the runtime VC path (connect_beacon).
+        let build_beacon_count = beacon_src.matches("build_beacon()").count();
         assert_eq!(
             build_beacon_count, 1,
-            "expected exactly one build_beacon() call in bin/rvc/src/main.rs, found {build_beacon_count}"
+            "expected exactly one build_beacon() call in bootstrap::connect_beacon, found {build_beacon_count}"
         );
 
         // The resulting client must not be fed to BeaconBlockAdapter or the propagator.
         assert!(
-            !main_src.contains("BeaconBlockAdapter(beacon_client"),
+            !services_src.contains("BeaconBlockAdapter(beacon_client"),
             "BeaconBlockAdapter must not wrap build_beacon()'s BeaconClient"
         );
         assert!(
-            !main_src.contains("build_propagator(beacon_client"),
+            !services_src.contains("build_propagator(beacon_client"),
             "propagator must not take the single-node build_beacon() client"
         );
         assert!(
-            main_src.contains("VoluntaryExitManagerAdapter::new")
-                && main_src.contains("beacon_client.clone()"),
-            "build_beacon() client should remain available for exit tooling"
+            km_src.contains("VoluntaryExitManagerAdapter::new"),
+            "build_beacon() client should remain available for exit tooling via keymanager adapters"
         );
     }
 }

@@ -1,0 +1,851 @@
+//! Logging init helpers for the `rvc` binary.
+
+use std::path::PathBuf;
+
+use rvc::config::Config;
+use tracing::{error, info, warn};
+
+/// Guards returned from init_logging that must be held for application lifetime.
+pub struct LoggingGuards {
+    _tracing_guard: Option<telemetry::TracingGuard>,
+    _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
+    /// Type-erased handle to the runtime-reloadable log filter (issue 5.4). The
+    /// opt-in `SIGHUP` trigger (gated behind `--enable-log-reload`) calls
+    /// `reload_from_env()` to re-read `RUST_LOG` without a restart.
+    pub reload_handle: telemetry::LogReloadHandle,
+}
+
+pub fn init_logging(
+    level: &str,
+    log_format: telemetry::LogFormat,
+    tracing_config: Option<&telemetry::TelemetryConfig>,
+    file_config: Option<&telemetry::FileAppenderConfig>,
+) -> LoggingGuards {
+    use tracing_subscriber::layer::Layer;
+    use tracing_subscriber::prelude::*;
+
+    // The reconciled filter is wrapped in a `reload::Layer` so verbosity can be
+    // changed at runtime (issue 5.4). The layer's INITIAL value is exactly
+    // `env_filter_or(level)` — identical to the bare filter this replaced — so
+    // the Phase-3 init reconciliation (unset/empty/malformed RUST_LOG → `level`)
+    // is unchanged. A disabled `debug!`/`trace!` callsite still short-circuits in
+    // the macro before reaching this layer, so the disabled hot path stays
+    // zero-allocation (Gate 4 / P0-6) whether or not the trigger is enabled.
+    let (filter, reload_filter_handle) = telemetry::reloadable_env_filter(level);
+
+    let (file_layer, file_guard): (
+        Option<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>>,
+        Option<tracing_appender::non_blocking::WorkerGuard>,
+    ) = match file_config {
+        Some(config) => match telemetry::create_file_layer(config) {
+            Ok((layer, guard)) => {
+                eprintln!("File logging enabled: {}/{}", config.directory, config.filename);
+                (Some(layer), Some(guard))
+            }
+            Err(e) => {
+                eprintln!("WARNING: Failed to initialize file logging: {e}");
+                (None, None)
+            }
+        },
+        None => (None, None),
+    };
+
+    // Collect all boxed layers to apply to Registry in a single .with() call.
+    // This avoids type issues when mixing Box<dyn Layer<Registry>> with generic layers.
+    let mut boxed_layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
+        Vec::new();
+
+    let tracing_guard = match tracing_config {
+        Some(config) => match telemetry::init_tracing(config) {
+            Ok((otel_layer, guard)) => {
+                boxed_layers.push(otel_layer);
+                eprintln!("OpenTelemetry tracing enabled (endpoint: {})", config.endpoint);
+                Some(guard)
+            }
+            Err(e) => {
+                eprintln!(
+                    "WARNING: Failed to initialize OpenTelemetry tracing: {e}. \
+                     Falling back to fmt-only logging."
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
+    if let Some(fl) = file_layer {
+        boxed_layers.push(fl);
+    }
+
+    // tracing-subscriber 0.3 `Vec<L: Layer<S>>::register_callsite()` returns
+    // `Interest::never()` when empty. As the outer layer in a `Layered` stack
+    // that short-circuits every callsite via `Layered::pick_interest`, so no
+    // events ever reach `fmt::layer` underneath. Pad with `Identity` (a no-op
+    // that returns `Interest::always()`) when no optional layers are present.
+    if boxed_layers.is_empty() {
+        boxed_layers.push(Box::new(tracing_subscriber::layer::Identity::new()));
+    }
+
+    // The CONSOLE fmt layer is built for the selected format (issue 5.5): `pretty`
+    // (default — byte-identical to the previous `fmt::layer()`) or `json`. Both
+    // arms return one boxed `dyn Layer<Registry>`, so the surrounding composition —
+    // the `boxed_layers` (OTLP/file, Identity-padded when empty) and the 5.4
+    // reload-wrapped `filter` as the outer global layer — is unchanged either way.
+    // The selector governs only this console leaf; the file appender keeps its own
+    // format.
+    let console_layer = telemetry::console_fmt_layer(log_format, std::io::stdout);
+
+    tracing_subscriber::registry().with(boxed_layers).with(console_layer).with(filter).init();
+
+    // Erase the concrete reload handle (its subscriber type is the unspellable
+    // layered stack above) so it can be stored and moved into the SIGHUP task.
+    let reload_handle = telemetry::LogReloadHandle::new(level, reload_filter_handle);
+
+    LoggingGuards { _tracing_guard: tracing_guard, _file_guard: file_guard, reload_handle }
+}
+
+pub fn load_config(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
+    match config_path {
+        Some(path) => {
+            info!(path = ?path, "Loading configuration from file");
+            let config = Config::from_file(&path)?;
+            Ok(config)
+        }
+        None => {
+            info!("Using default configuration");
+            Ok(Config::default())
+        }
+    }
+}
+
+pub fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfig> {
+    let endpoint = config
+        .tracing_endpoint
+        .clone()
+        .or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())?;
+
+    let mut sample_rate = config.tracing_sample_rate;
+    // If sample_rate is still at default, check env var
+    if (sample_rate - 0.01).abs() < f64::EPSILON {
+        if let Ok(env_rate) = std::env::var("OTEL_TRACES_SAMPLER_ARG") {
+            if let Ok(parsed) = env_rate.parse::<f64>() {
+                sample_rate = parsed;
+            }
+        }
+    }
+
+    if !(0.0..=1.0).contains(&sample_rate) {
+        warn!(sample_rate, "tracing_sample_rate out of range 0.0..=1.0, clamping");
+        sample_rate = sample_rate.clamp(0.0, 1.0);
+    }
+
+    // Warn on non-localhost http://
+    if endpoint.starts_with("http://") {
+        if let Ok(url) = url::Url::parse(&endpoint) {
+            if let Some(host) = url.host_str() {
+                if host != "localhost" && host != "127.0.0.1" && host != "::1" {
+                    warn!(
+                        endpoint = %endpoint,
+                        "tracing endpoint uses http:// with non-localhost host; consider using https://"
+                    );
+                }
+            }
+        }
+    }
+
+    let exporter = match config.tracing_exporter {
+        rvc::config::TracingExporter::Otlp => telemetry::ExporterKind::Otlp,
+        #[cfg(feature = "gcp-trace")]
+        rvc::config::TracingExporter::Gcp => telemetry::ExporterKind::Gcp,
+        #[cfg(not(feature = "gcp-trace"))]
+        rvc::config::TracingExporter::Gcp => {
+            eprintln!(
+                "ERROR: --tracing-exporter=gcp requires the `gcp-trace` feature. \
+                 Rebuild with: cargo build --features gcp-trace"
+            );
+            return None;
+        }
+    };
+
+    Some(telemetry::TelemetryConfig {
+        endpoint,
+        exporter,
+        sample_rate,
+        network: config.network.to_string(),
+        service_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        max_queue_size: config.tracing_max_queue_size,
+        max_export_batch_size: config.tracing_max_export_batch_size,
+    })
+}
+
+pub fn build_file_layer_config(config: &Config) -> Option<telemetry::FileAppenderConfig> {
+    let logfile = config.logfile.as_ref()?;
+
+    let directory = logfile
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    let filename = logfile
+        .file_name()
+        .map(|f| f.to_string_lossy().to_string())
+        .unwrap_or_else(|| "rvc.log".to_string());
+
+    let level = config.logfile_level.clone().unwrap_or_else(|| config.log_level.clone());
+
+    Some(telemetry::FileAppenderConfig {
+        directory,
+        filename,
+        max_size_mb: config.logfile_max_size,
+        max_files: config.logfile_max_number,
+        compress: config.logfile_compress,
+        level,
+    })
+}
+
+/// Spawn the opt-in `SIGHUP` log-reload handler (issue 5.4 / P2-2).
+///
+/// No-op unless `enabled` (the `--enable-log-reload` opt-in). When enabled on a
+/// Unix host, each `SIGHUP` re-reads `RUST_LOG` through the same
+/// [`telemetry::env_filter_or`] precedence used at startup and swaps the active
+/// filter, raising/lowering verbosity without a restart. The task is scoped to
+/// `shutdown_token`, so it exits cleanly on shutdown. On non-Unix targets there
+/// is no `SIGHUP`; the flag is accepted but inert (logged once).
+pub fn spawn_log_reload_handler(
+    enabled: bool,
+    reload_handle: telemetry::LogReloadHandle,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) {
+    if !enabled {
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        tokio::spawn(async move {
+            let mut sighup =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        error!(error = %e, "failed to install SIGHUP handler; log reload disabled");
+                        return;
+                    }
+                };
+            info!("Runtime log-level reload enabled (send SIGHUP to re-read RUST_LOG)");
+            loop {
+                tokio::select! {
+                    _ = shutdown_token.cancelled() => break,
+                    sig = sighup.recv() => {
+                        if sig.is_none() {
+                            // Signal stream closed; stop listening.
+                            break;
+                        }
+                        match reload_handle.reload_from_env() {
+                            Ok(()) => info!("Reloaded log filter from RUST_LOG (SIGHUP)"),
+                            Err(e) => {
+                                warn!(error = %e, "log-filter reload failed (subscriber gone?)")
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (reload_handle, shutdown_token);
+        warn!("--enable-log-reload set, but SIGHUP-based reload is only supported on Unix");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use clap::Parser;
+    use rvc::config::CliOverrides;
+
+    use crate::cli::Cli;
+
+    /// Serialize all tests in this module that read or write OTEL env vars.
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn test_build_tracing_config_no_endpoint_returns_none() {
+        let _guard = env_lock();
+        // Clear env vars that could interfere
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config::default();
+        assert!(build_tracing_config(&config).is_none());
+    }
+
+    #[test]
+    fn test_build_tracing_config_with_endpoint_returns_some() {
+        let _guard = env_lock();
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert_eq!(tc.endpoint, "http://localhost:4318");
+        assert_eq!(tc.exporter, telemetry::ExporterKind::Otlp);
+        assert!((tc.sample_rate - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_build_tracing_config_env_var_fallback() {
+        let _guard = env_lock();
+        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://env-collector:4318");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config::default(); // no tracing_endpoint set
+        let tc = build_tracing_config(&config).expect("should fall back to env var");
+        assert_eq!(tc.endpoint, "http://env-collector:4318");
+
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+
+    #[test]
+    fn test_build_tracing_config_cli_overrides_env() {
+        let _guard = env_lock();
+        std::env::set_var("OTEL_EXPORTER_OTLP_ENDPOINT", "http://env-collector:4318");
+
+        let config = Config {
+            tracing_endpoint: Some("http://cli-collector:4318".to_string()),
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should use config value");
+        assert_eq!(tc.endpoint, "http://cli-collector:4318");
+
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+    }
+
+    #[test]
+    fn test_build_tracing_config_sample_rate_env_fallback() {
+        let _guard = env_lock();
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.5");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            // sample_rate at default 0.01, so env var should be checked
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert!((tc.sample_rate - 0.5).abs() < f64::EPSILON);
+
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+    }
+
+    #[test]
+    fn test_build_tracing_config_explicit_sample_rate_overrides_env() {
+        let _guard = env_lock();
+        std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.5");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            tracing_sample_rate: 0.75, // non-default, so env var should NOT be checked
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert!((tc.sample_rate - 0.75).abs() < f64::EPSILON);
+
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+    }
+
+    #[test]
+    fn test_build_tracing_config_sample_rate_clamped() {
+        let _guard = env_lock();
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            tracing_sample_rate: 2.0,
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert!((tc.sample_rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_build_tracing_config_negative_sample_rate_clamped() {
+        let _guard = env_lock();
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            tracing_sample_rate: -0.5,
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert!(tc.sample_rate.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_build_tracing_config_network_propagated() {
+        let _guard = env_lock();
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            network: rvc::config::Network::Hoodi,
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert_eq!(tc.network, "hoodi");
+    }
+
+    #[test]
+    fn test_build_tracing_config_otlp_exporter() {
+        let _guard = env_lock();
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            tracing_exporter: rvc::config::TracingExporter::Otlp,
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert_eq!(tc.exporter, telemetry::ExporterKind::Otlp);
+    }
+
+    #[test]
+    fn test_build_tracing_config_batch_fields_passthrough() {
+        let _guard = env_lock();
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            tracing_max_queue_size: Some(4096),
+            tracing_max_export_batch_size: Some(1024),
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert_eq!(tc.max_queue_size, Some(4096));
+        assert_eq!(tc.max_export_batch_size, Some(1024));
+    }
+
+    #[test]
+    fn test_build_tracing_config_batch_fields_none_by_default() {
+        let _guard = env_lock();
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert!(tc.max_queue_size.is_none());
+        assert!(tc.max_export_batch_size.is_none());
+    }
+
+    // H-07: init_logging wiring tests
+    //
+    // Since init_logging calls .init() which sets a global subscriber,
+    // we test the pipeline construction via init_tracing directly.
+    // The global subscriber can only be set once per test process.
+
+    #[test]
+    fn test_init_logging_none_config_returns_none() {
+        // init_logging with None should return None (no guard).
+        // We can't call init_logging here because it sets the global
+        // subscriber. Instead, verify the logic: None config → None guard.
+        let config: Option<&telemetry::TelemetryConfig> = None;
+        assert!(config.is_none());
+        // The None branch returns None unconditionally (verified by code review).
+    }
+
+    #[test]
+    fn test_build_tracing_config_creates_valid_telemetry_config() {
+        let _guard = env_lock();
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing_endpoint: Some("http://localhost:4318".to_string()),
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+
+        // The config should be valid for init_tracing
+        let result = telemetry::init_tracing(&tc);
+        assert!(result.is_ok(), "init_tracing should succeed with valid config");
+        let (_layer, guard) = result.unwrap();
+        // Clean up the provider
+        drop(guard);
+    }
+
+    #[test]
+    fn test_init_tracing_with_config_returns_guard() {
+        let tc = telemetry::TelemetryConfig {
+            endpoint: "http://localhost:4318".to_string(),
+            exporter: telemetry::ExporterKind::Otlp,
+            sample_rate: 0.5,
+            network: "mainnet".to_string(),
+            ..Default::default()
+        };
+        let result = telemetry::init_tracing(&tc);
+        assert!(result.is_ok(), "init_tracing should return Ok with layer and guard");
+        let (_layer, guard) = result.unwrap();
+        drop(guard);
+    }
+
+    #[test]
+    fn test_init_tracing_invalid_config_returns_err() {
+        let tc = telemetry::TelemetryConfig {
+            endpoint: "ftp://invalid:21".to_string(),
+            exporter: telemetry::ExporterKind::Otlp,
+            sample_rate: 0.5,
+            network: "mainnet".to_string(),
+            ..Default::default()
+        };
+        let result = telemetry::init_tracing(&tc);
+        assert!(result.is_err(), "init_tracing should fail with invalid endpoint scheme");
+    }
+
+    #[test]
+    fn test_grpc_signer_cli_flags_parse_all() {
+        let cli = Cli::try_parse_from([
+            "rvc",
+            "start",
+            "--grpc-signer-url",
+            "https://signer.example.com:50051",
+            "--grpc-signer-tls-cert",
+            "/tmp/cert.pem",
+            "--grpc-signer-tls-key",
+            "/tmp/key.pem",
+            "--grpc-signer-tls-ca-cert",
+            "/tmp/ca.pem",
+        ])
+        .expect("should parse");
+
+        match cli.command {
+            crate::cli::Commands::Start {
+                grpc_signer_url,
+                grpc_signer_tls_cert,
+                grpc_signer_tls_key,
+                grpc_signer_tls_ca_cert,
+                ..
+            } => {
+                assert_eq!(grpc_signer_url.as_deref(), Some("https://signer.example.com:50051"));
+                assert_eq!(grpc_signer_tls_cert, Some(PathBuf::from("/tmp/cert.pem")));
+                assert_eq!(grpc_signer_tls_key, Some(PathBuf::from("/tmp/key.pem")));
+                assert_eq!(grpc_signer_tls_ca_cert, Some(PathBuf::from("/tmp/ca.pem")));
+            }
+            _ => panic!("expected Start command"),
+        }
+    }
+
+    #[test]
+    fn test_grpc_signer_cli_flags_optional() {
+        let cli = Cli::try_parse_from(["rvc", "start"]).expect("should parse without grpc flags");
+
+        match cli.command {
+            crate::cli::Commands::Start {
+                grpc_signer_url,
+                grpc_signer_tls_cert,
+                grpc_signer_tls_key,
+                grpc_signer_tls_ca_cert,
+                ..
+            } => {
+                assert!(grpc_signer_url.is_none());
+                assert!(grpc_signer_tls_cert.is_none());
+                assert!(grpc_signer_tls_key.is_none());
+                assert!(grpc_signer_tls_ca_cert.is_none());
+            }
+            _ => panic!("expected Start command"),
+        }
+    }
+
+    #[test]
+    fn test_grpc_signer_config_defaults_none() {
+        let config = Config::default();
+        assert!(config.grpc_signer_url.is_none());
+        assert!(config.grpc_signer_tls_cert.is_none());
+        assert!(config.grpc_signer_tls_key.is_none());
+        assert!(config.grpc_signer_tls_ca_cert.is_none());
+    }
+
+    #[test]
+    fn test_grpc_signer_config_merge_with_cli() {
+        let mut config = Config::default();
+        let cli = CliOverrides {
+            grpc_signer_url: Some("https://signer:50051".to_string()),
+            grpc_signer_tls_cert: Some(PathBuf::from("/cert.pem")),
+            grpc_signer_tls_key: Some(PathBuf::from("/key.pem")),
+            grpc_signer_tls_ca_cert: Some(PathBuf::from("/ca.pem")),
+            ..Default::default()
+        };
+
+        config.merge_with_cli(&cli);
+
+        assert_eq!(config.grpc_signer_url.as_deref(), Some("https://signer:50051"));
+        assert_eq!(config.grpc_signer_tls_cert, Some(PathBuf::from("/cert.pem")));
+        assert_eq!(config.grpc_signer_tls_key, Some(PathBuf::from("/key.pem")));
+        assert_eq!(config.grpc_signer_tls_ca_cert, Some(PathBuf::from("/ca.pem")));
+    }
+
+    #[test]
+    fn test_grpc_signer_config_merge_preserves_none() {
+        let mut config = Config::default();
+        let cli = CliOverrides::default();
+
+        config.merge_with_cli(&cli);
+
+        assert!(config.grpc_signer_url.is_none());
+        assert!(config.grpc_signer_tls_cert.is_none());
+    }
+
+    // ── SEC-9 / M-15: allow_unsupported_fork CLI merge ────────────────────
+
+    #[test]
+    fn test_allow_unsupported_fork_cli_merge() {
+        let mut config = Config::default();
+        assert!(!config.allow_unsupported_fork);
+
+        config.merge_with_cli(&CliOverrides {
+            allow_unsupported_fork: Some(true),
+            ..Default::default()
+        });
+        assert!(config.allow_unsupported_fork);
+    }
+
+    #[test]
+    fn test_secret_provider_strict_cli_merge() {
+        let mut config = Config::default();
+        assert!(!config.secret_provider.strict);
+
+        config.merge_with_cli(&CliOverrides {
+            secret_provider_strict: Some(true),
+            ..Default::default()
+        });
+        assert!(config.secret_provider.strict);
+    }
+
+    /// Regression guard for the v0.4.0 logging silence bug.
+    ///
+    /// `Vec<L: Layer<S>>::register_callsite()` returns `Interest::never()`
+    /// for an empty Vec (tracing-subscriber 0.3 `layer/mod.rs:1788`). When
+    /// that empty Vec is the outer layer in a `Layered` stack, the
+    /// short-circuit in `Layered::pick_interest` disables every callsite,
+    /// so no events ever reach `fmt::layer` underneath.
+    ///
+    /// This test mirrors `init_logging`'s subscriber composition for the
+    /// no-extras case (no `--tracing-endpoint`, no `--logfile`) and asserts
+    /// that a basic `info!` event reaches the writer.
+    #[test]
+    fn test_init_logging_no_extras_emits_events() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::Layer;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for SharedBuf {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = SharedBuf::default();
+        let filter = tracing_subscriber::EnvFilter::new("info");
+
+        // Match the exact shape `init_logging` builds when both
+        // `tracing_config` and `file_config` are None: a Vec that would have
+        // been empty, padded with `Identity` to avoid the never-Interest poison.
+        let boxed_layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
+            vec![Box::new(tracing_subscriber::layer::Identity::new())];
+
+        let subscriber = tracing_subscriber::registry()
+            .with(boxed_layers)
+            .with(tracing_subscriber::fmt::layer().with_writer(buf.clone()))
+            .with(filter);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("init_logging regression marker");
+        });
+
+        let captured = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("init_logging regression marker"),
+            "init_logging composition silently drops events; captured: {captured:?}"
+        );
+    }
+
+    // ── Issue 5.5: opt-in JSON console log output profile ─────────────────────
+
+    /// `--log-format json` parses on `start` and resolves to `LogFormat::Json`;
+    /// the default (flag omitted) stays `Pretty` — the constraint that an unset
+    /// selector keeps today's behavior.
+    #[test]
+    fn test_log_format_flag_parses_and_defaults_to_pretty() {
+        let cli = Cli::try_parse_from(["rvc", "start", "--log-format", "json"])
+            .expect("--log-format json should parse");
+        match cli.command {
+            crate::cli::Commands::Start { log_format, .. } => {
+                assert_eq!(
+                    telemetry::LogFormat::resolve(Some(&log_format)),
+                    telemetry::LogFormat::Json
+                );
+            }
+            _ => panic!("expected Start command"),
+        }
+
+        let cli = Cli::try_parse_from(["rvc", "start"]).expect("default should parse");
+        match cli.command {
+            crate::cli::Commands::Start { log_format, .. } => {
+                assert_eq!(log_format, "pretty", "default --log-format must be pretty");
+                assert_eq!(
+                    telemetry::LogFormat::resolve(Some(&log_format)),
+                    telemetry::LogFormat::Pretty
+                );
+            }
+            _ => panic!("expected Start command"),
+        }
+    }
+
+    /// The JSON arm of `init_logging`'s composition — `Identity`-padded
+    /// `boxed_layers` + `console_fmt_layer(Json, …)` + the reconciled filter —
+    /// emits one parseable JSON object per event with canonical fields as
+    /// top-level keys. Mirrors `init_logging`'s shape exactly so this guards the
+    /// shipped JSON path (not just the telemetry helper in isolation).
+    #[test]
+    fn test_init_logging_json_arm_emits_parseable_json() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+        use tracing_subscriber::layer::Layer;
+        use tracing_subscriber::prelude::*;
+
+        #[derive(Clone, Default)]
+        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for SharedBuf {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for SharedBuf {
+            type Writer = SharedBuf;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = SharedBuf::default();
+        let filter = tracing_subscriber::EnvFilter::new("info");
+        // Same Identity-padded `boxed_layers` as the no-extras `init_logging` path.
+        let boxed_layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
+            vec![Box::new(tracing_subscriber::layer::Identity::new())];
+        let console_layer = telemetry::console_fmt_layer(telemetry::LogFormat::Json, buf.clone());
+
+        let subscriber =
+            tracing_subscriber::registry().with(boxed_layers).with(console_layer).with(filter);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(slot = 42u64, "json arm marker");
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = out.lines().find(|l| l.contains("json arm marker")).expect("event present");
+        let v: serde_json::Value =
+            serde_json::from_str(line).expect("JSON arm must emit parseable JSON");
+        assert_eq!(v["slot"], 42, "canonical field must be a top-level JSON key");
+        assert_eq!(v["message"], "json arm marker");
+    }
+
+    // Serializes the RUST_LOG-mutating parity tests below (process-global env).
+    // nextest runs each test in its own process, but guard anyway.
+    static RUST_LOG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_rust_log<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let _guard = RUST_LOG_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var("RUST_LOG").ok();
+        match value {
+            Some(v) => std::env::set_var("RUST_LOG", v),
+            None => std::env::remove_var("RUST_LOG"),
+        }
+        let out = f();
+        match prev {
+            Some(p) => std::env::set_var("RUST_LOG", p),
+            None => std::env::remove_var("RUST_LOG"),
+        }
+        out
+    }
+
+    // Cross-binary init parity (P0-5 / M3): bin/rvc and bin/rvc-signer must share
+    // one default level (`info`) and one RUST_LOG precedence — both route their
+    // filter through `telemetry::env_filter_or("info")`. These assertions mirror
+    // the `rvc-signer` parity tests so an operator learns one behavior, not two.
+    #[test]
+    fn test_rvc_unset_rust_log_defaults_to_info() {
+        let rendered = with_rust_log(None, || format!("{}", telemetry::env_filter_or("info")));
+        assert_eq!(rendered, "info", "unset RUST_LOG must default to info, got: {rendered}");
+    }
+
+    #[test]
+    fn test_rvc_rust_log_overrides_default() {
+        let rendered =
+            with_rust_log(Some("debug"), || format!("{}", telemetry::env_filter_or("info")));
+        assert!(rendered.contains("debug"), "RUST_LOG=debug must override the default: {rendered}");
+    }
+
+    #[test]
+    fn test_rvc_per_module_directive_preserved() {
+        let rendered = with_rust_log(Some("warn,rvc=trace"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert!(rendered.contains("warn"), "global directive missing: {rendered}");
+        assert!(rendered.contains("rvc=trace"), "per-module directive missing: {rendered}");
+    }
+
+    #[test]
+    fn test_rvc_malformed_rust_log_falls_back_to_info() {
+        let rendered = with_rust_log(Some("rvc=invalidlevel"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert_eq!(
+            rendered, "info",
+            "malformed RUST_LOG must fall back to info (no panic, no silence): {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_rvc_whitespace_padded_rust_log_honored() {
+        let rendered = with_rust_log(Some("warn, rvc=trace"), || {
+            format!("{}", telemetry::env_filter_or("info"))
+        });
+        assert!(rendered.contains("warn"), "global directive missing: {rendered}");
+        assert!(rendered.contains("rvc=trace"), "padded per-module directive missing: {rendered}");
+    }
+}

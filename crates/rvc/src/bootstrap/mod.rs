@@ -1,28 +1,31 @@
-//! Validator-client bootstrap phases.
+//! Validator-client bootstrap phases and composition root.
 //!
 //! Each phase is a free function that takes [`Config`](crate::config::Config) (and
-//! explicit parameters) and returns a small named output struct. A future
-//! `run()` will move those outputs into [`BootstrapCtx`]. Phases never take
-//! `&mut BootstrapCtx`.
+//! explicit parameters) and returns a small named output struct. [`run`] composes
+//! the phases, owns the duty-loop `select!`, and performs graceful shutdown.
 //!
-//! # Health-status policy
-//!
-//! Health-status updates stay in `bin/rvc` for now: phase functions return
-//! `Result` only. Callers mark `slashing_db_initialized` (and similar) after a
-//! successful phase. This keeps `crates/rvc` free of binary-only health plumbing
-//! while unit tests can exercise phases without a metrics server.
+//! Phases never take `&mut BootstrapCtx`. Health-status updates for the production
+//! path live inside [`run`]; individual phase functions still return `Result` only
+//! so unit tests can exercise them without a metrics server.
 
 mod beacon;
 mod enablement;
 mod keys;
+mod run;
 mod services;
 mod slashing;
+mod tasks;
 
 pub use beacon::{connect_beacon, BeaconHandles};
 pub use enablement::{wire_signing_enablement, EnablementHandles};
 pub use keys::{load_signing_keys, LoadedKeys};
+pub use run::{run, RunOptions};
 pub use services::{build_services, ServiceHandles};
 pub use slashing::{open_slashing_db, KeystoreLockGuard, SlashingDbHandles};
+pub use tasks::{
+    check_metrics_bind_gate, spawn_background_tasks, BackgroundTasks,
+    METRICS_ALLOW_NON_LOOPBACK_ENV, METRICS_SHUTDOWN_TIMEOUT,
+};
 
 use std::sync::Arc;
 
@@ -31,6 +34,7 @@ use ::slashing::SlashingDb;
 
 use crate::config::ConfigError;
 use crate::deletion_denylist::{DeletionDenylist, DeletionDenylistError};
+use crate::keymanager_adapters::SpawnKeymanagerApiError;
 use crate::startup::StartupError;
 
 /// Values produced by bootstrap phases and consumed by later ones.
@@ -69,7 +73,7 @@ impl BootstrapCtx {
     }
 }
 
-/// Errors from bootstrap phase functions.
+/// Errors from bootstrap phase functions and [`run`].
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
     #[error(transparent)]
@@ -87,6 +91,16 @@ pub enum BootstrapError {
     /// Validator index resolution failed while doppelganger detection is on.
     #[error("validator index resolution failed; doppelganger detection requires indices: {0}")]
     IndexResolution(String),
+
+    #[error(transparent)]
+    Keymanager(#[from] SpawnKeymanagerApiError),
+
+    #[error(transparent)]
+    MetricsBind(#[from] crypto::InsecureGateError),
+
+    /// Invalid runtime configuration (e.g. slashed action string, gRPC address).
+    #[error("{0}")]
+    InvalidConfig(String),
 }
 
 impl BootstrapError {

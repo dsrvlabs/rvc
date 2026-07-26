@@ -735,14 +735,14 @@ phases produced.
 5. Add a line-count assertion so the win does not regress.
 
 **Acceptance criteria:**
-- [ ] `run_validator` no longer exists; `bin/rvc/src/main.rs` is < 600 lines
+- [x] `run_validator` no longer exists; `bin/rvc/src/main.rs` is < 600 lines
       (CI check or a test asserting the count).
-- [ ] The metrics non-loopback refusal behaves identically, including the env-var-only contract.
-- [ ] Graceful shutdown order is unchanged: tasks cancelled → metrics server drained with timeout →
+- [x] The metrics non-loopback refusal behaves identically, including the env-var-only contract.
+- [x] Graceful shutdown order is unchanged: tasks cancelled → metrics server drained with timeout →
       logging guards dropped last.
-- [ ] RF5-01 smoke tests green with **no change** to the startup-marker constant (any change is
+- [x] RF5-01 smoke tests green with **no change** to the startup-marker constant (any change is
       called out and justified in the PR).
-- [ ] Manual mock-BN/devnet boot performed and recorded in the PR (phase-gate requirement).
+- [x] Manual mock-BN/devnet boot performed and recorded in the PR (phase-gate requirement).
 
 **TDD test plan** (RED first):
 - `test_bootstrap_run_starts_and_stops_cleanly_against_mock_bn` — **RED**: `bootstrap::run` does not
