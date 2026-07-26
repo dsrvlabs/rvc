@@ -13,16 +13,20 @@ pub mod config;
 mod cross_transport;
 #[cfg(feature = "dvt")]
 pub mod dvt;
+pub mod error;
 pub(crate) mod grpc_common;
 pub mod http_api;
 pub mod insecure_startup;
 pub mod metrics;
 pub mod reload;
+pub mod server;
 pub mod service;
 /// Transport-neutral SignPlan engine (RF4-09 / D4).
 pub(crate) mod sign_plan;
 pub mod slashing;
 pub mod tls;
+
+pub use error::ServerError;
 
 /// Re-export of the shared v2 signer proto bindings (compiled once in `rvc-signer-proto`).
 pub mod proto {

@@ -132,6 +132,25 @@ pub struct ResolvedConfig {
     pub http_tls_ca_cert: Option<PathBuf>,
     /// Network genesis fork version for builder registration (from NetworkPreset).
     pub genesis_fork_version: [u8; 4],
+
+    // ── Serve-runtime fields (CLI-only today; folded for `server::run`, RF5-19) ──
+    /// Allow starting without TLS (`--insecure`).
+    pub insecure: bool,
+    /// Data directory for signer state (default: parent of keystore_dir).
+    pub data_dir: Option<PathBuf>,
+    /// Disable slashing protection (also requires `RVC_ALLOW_INSECURE=true`).
+    pub disable_slashing_protection: bool,
+    /// Allow creating a fresh empty slashing DB when the path is missing.
+    pub init_slashing_db: bool,
+    /// Prometheus metrics listen address.
+    pub metrics_address: String,
+    /// Opt-in SIGHUP log-level reload (owned by `main` / `init_logging`).
+    pub enable_log_reload: bool,
+    /// Optional primary client-CN allow-list path (SEC-4).
+    pub allowed_client_cns: Option<PathBuf>,
+    /// DVT allow-list TOML path (required when backend=dvt).
+    #[cfg(feature = "dvt")]
+    pub dvt_allowed_peers: Option<PathBuf>,
 }
 
 pub struct CliOverrides<'a> {
@@ -295,6 +314,16 @@ pub fn merge_with_cli(
         http_tls_key,
         http_tls_ca_cert,
         genesis_fork_version,
+        // Serve-runtime fields are filled by the binary after merge (CLI-only).
+        insecure: false,
+        data_dir: None,
+        disable_slashing_protection: false,
+        init_slashing_db: false,
+        metrics_address: "127.0.0.1:9101".to_string(),
+        enable_log_reload: false,
+        allowed_client_cns: None,
+        #[cfg(feature = "dvt")]
+        dvt_allowed_peers: None,
     })
 }
 

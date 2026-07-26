@@ -1178,12 +1178,12 @@ the boundary.
    RF5-20/21 so this diff stays a move.
 
 **Acceptance criteria:**
-- [ ] `server::run` is callable from a test in the lib target (a test calls it directly and shuts it
+- [x] `server::run` is callable from a test in the lib target (a test calls it directly and shuts it
       down via the token).
-- [ ] `main.rs` no longer contains server assembly.
-- [ ] `ServerError` is a thiserror enum; the process exit code for each failure class is unchanged.
-- [ ] Both feature sets build; RF5-18 tests green.
-- [ ] The diff is dominated by moved lines (git move detection).
+- [x] `main.rs` no longer contains server assembly.
+- [x] `ServerError` is a thiserror enum; the process exit code for each failure class is unchanged.
+- [x] Both feature sets build; RF5-18 tests green.
+- [x] The diff is dominated by moved lines (git move detection).
 
 **TDD test plan** (RED first):
 - `test_server_run_returns_slashing_db_error_variant_on_missing_db` — **RED**: `server::run` does not
