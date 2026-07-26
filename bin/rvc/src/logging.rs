@@ -246,10 +246,12 @@ pub fn spawn_log_reload_handler(
 mod tests {
     use super::*;
     use rvc::config::TracingConfig;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::io;
+    use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
     use clap::Parser;
     use rvc::config::CliOverrides;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use crate::cli::Cli;
 
@@ -257,6 +259,27 @@ mod tests {
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Shared capture writer for subscriber composition tests (defined once).
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for SharedBuf {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SharedBuf {
+        type Writer = SharedBuf;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
     }
 
     #[test]
@@ -489,21 +512,9 @@ mod tests {
         assert!(tc.max_export_batch_size.is_none());
     }
 
-    // H-07: init_logging wiring tests
-    //
-    // Since init_logging calls .init() which sets a global subscriber,
-    // we test the pipeline construction via init_tracing directly.
-    // The global subscriber can only be set once per test process.
-
-    #[test]
-    fn test_init_logging_none_config_returns_none() {
-        // init_logging with None should return None (no guard).
-        // We can't call init_logging here because it sets the global
-        // subscriber. Instead, verify the logic: None config → None guard.
-        let config: Option<&telemetry::TelemetryConfig> = None;
-        assert!(config.is_none());
-        // The None branch returns None unconditionally (verified by code review).
-    }
+    // H-07: binary-local mapping — `build_tracing_config` produces a config
+    // that `telemetry::init_tracing` accepts. Pure `init_tracing` behaviour
+    // lives in `crates/telemetry` (RF6-19).
 
     #[test]
     fn test_build_tracing_config_creates_valid_telemetry_config() {
@@ -526,34 +537,6 @@ mod tests {
         let (_layer, guard) = result.unwrap();
         // Clean up the provider
         drop(guard);
-    }
-
-    #[test]
-    fn test_init_tracing_with_config_returns_guard() {
-        let tc = telemetry::TelemetryConfig {
-            endpoint: "http://localhost:4318".to_string(),
-            exporter: telemetry::ExporterKind::Otlp,
-            sample_rate: 0.5,
-            network: "mainnet".to_string(),
-            ..Default::default()
-        };
-        let result = telemetry::init_tracing(&tc);
-        assert!(result.is_ok(), "init_tracing should return Ok with layer and guard");
-        let (_layer, guard) = result.unwrap();
-        drop(guard);
-    }
-
-    #[test]
-    fn test_init_tracing_invalid_config_returns_err() {
-        let tc = telemetry::TelemetryConfig {
-            endpoint: "ftp://invalid:21".to_string(),
-            exporter: telemetry::ExporterKind::Otlp,
-            sample_rate: 0.5,
-            network: "mainnet".to_string(),
-            ..Default::default()
-        };
-        let result = telemetry::init_tracing(&tc);
-        assert!(result.is_err(), "init_tracing should fail with invalid endpoint scheme");
     }
 
     #[test]
@@ -688,29 +671,8 @@ mod tests {
     /// that a basic `info!` event reaches the writer.
     #[test]
     fn test_init_logging_no_extras_emits_events() {
-        use std::io;
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::fmt::MakeWriter;
         use tracing_subscriber::layer::Layer;
         use tracing_subscriber::prelude::*;
-
-        #[derive(Clone, Default)]
-        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
-        impl io::Write for SharedBuf {
-            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for SharedBuf {
-            type Writer = SharedBuf;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
 
         let buf = SharedBuf::default();
         let filter = tracing_subscriber::EnvFilter::new("info");
@@ -779,29 +741,8 @@ mod tests {
     /// shipped JSON path (not just the telemetry helper in isolation).
     #[test]
     fn test_init_logging_json_arm_emits_parseable_json() {
-        use std::io;
-        use std::sync::{Arc, Mutex};
-        use tracing_subscriber::fmt::MakeWriter;
         use tracing_subscriber::layer::Layer;
         use tracing_subscriber::prelude::*;
-
-        #[derive(Clone, Default)]
-        struct SharedBuf(Arc<Mutex<Vec<u8>>>);
-        impl io::Write for SharedBuf {
-            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(b);
-                Ok(b.len())
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for SharedBuf {
-            type Writer = SharedBuf;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
 
         let buf = SharedBuf::default();
         let filter = tracing_subscriber::EnvFilter::new("info");
@@ -823,70 +764,5 @@ mod tests {
             serde_json::from_str(line).expect("JSON arm must emit parseable JSON");
         assert_eq!(v["slot"], 42, "canonical field must be a top-level JSON key");
         assert_eq!(v["message"], "json arm marker");
-    }
-
-    // Serializes the RUST_LOG-mutating parity tests below (process-global env).
-    // nextest runs each test in its own process, but guard anyway.
-    static RUST_LOG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_rust_log<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
-        let _guard = RUST_LOG_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let prev = std::env::var("RUST_LOG").ok();
-        match value {
-            Some(v) => std::env::set_var("RUST_LOG", v),
-            None => std::env::remove_var("RUST_LOG"),
-        }
-        let out = f();
-        match prev {
-            Some(p) => std::env::set_var("RUST_LOG", p),
-            None => std::env::remove_var("RUST_LOG"),
-        }
-        out
-    }
-
-    // Cross-binary init parity (P0-5 / M3): bin/rvc and bin/rvc-signer must share
-    // one default level (`info`) and one RUST_LOG precedence — both route their
-    // filter through `telemetry::env_filter_or("info")`. These assertions mirror
-    // the `rvc-signer` parity tests so an operator learns one behavior, not two.
-    #[test]
-    fn test_rvc_unset_rust_log_defaults_to_info() {
-        let rendered = with_rust_log(None, || format!("{}", telemetry::env_filter_or("info")));
-        assert_eq!(rendered, "info", "unset RUST_LOG must default to info, got: {rendered}");
-    }
-
-    #[test]
-    fn test_rvc_rust_log_overrides_default() {
-        let rendered =
-            with_rust_log(Some("debug"), || format!("{}", telemetry::env_filter_or("info")));
-        assert!(rendered.contains("debug"), "RUST_LOG=debug must override the default: {rendered}");
-    }
-
-    #[test]
-    fn test_rvc_per_module_directive_preserved() {
-        let rendered = with_rust_log(Some("warn,rvc=trace"), || {
-            format!("{}", telemetry::env_filter_or("info"))
-        });
-        assert!(rendered.contains("warn"), "global directive missing: {rendered}");
-        assert!(rendered.contains("rvc=trace"), "per-module directive missing: {rendered}");
-    }
-
-    #[test]
-    fn test_rvc_malformed_rust_log_falls_back_to_info() {
-        let rendered = with_rust_log(Some("rvc=invalidlevel"), || {
-            format!("{}", telemetry::env_filter_or("info"))
-        });
-        assert_eq!(
-            rendered, "info",
-            "malformed RUST_LOG must fall back to info (no panic, no silence): {rendered}"
-        );
-    }
-
-    #[test]
-    fn test_rvc_whitespace_padded_rust_log_honored() {
-        let rendered = with_rust_log(Some("warn, rvc=trace"), || {
-            format!("{}", telemetry::env_filter_or("info"))
-        });
-        assert!(rendered.contains("warn"), "global directive missing: {rendered}");
-        assert!(rendered.contains("rvc=trace"), "padded per-module directive missing: {rendered}");
     }
 }

@@ -957,10 +957,10 @@ Define `SharedBuf` once at test-module scope. Keep only tests that exercise bina
 parsing, `build_tracing_config`, `apply_fork_compatibility_result`.
 
 **Acceptance criteria:**
-- [ ] `main.rs`'s test module holds only binary-local tests; no `telemetry::`-only test remains.
-- [ ] `SharedBuf` defined once. The vacuous test is deleted with a written justification.
-- [ ] Test count: baseline − 1 (the vacuous test), all other movements accounted as ports.
-- [ ] Workspace green.
+- [x] `main.rs`'s test module holds only binary-local tests; no `telemetry::`-only test remains.
+- [x] `SharedBuf` defined once. The vacuous test is deleted with a written justification.
+- [x] Test count: baseline − 1 (the vacuous test), all other movements accounted as ports.
+- [x] Workspace green.
 
 **Risks:** Re-derive line numbers from HEAD-of-Phase-5 — F1 rewrote `main.rs` wholesale.
 
