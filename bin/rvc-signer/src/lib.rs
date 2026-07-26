@@ -32,8 +32,6 @@ pub mod proto {
     }
 }
 
-#[cfg(feature = "dvt")]
-pub use proto::signer::peer_signer_service_client::PeerSignerServiceClient;
 pub use proto::signer::peer_signer_service_server::{PeerSignerService, PeerSignerServiceServer};
 pub use proto::signer::signer_service_server::{SignerService, SignerServiceServer};
 pub use proto::signer::{
@@ -44,7 +42,9 @@ pub use proto::signer::{
 // V2 server exports
 pub use proto::signer_v2::signer_service_server::SignerServiceServer as SignerServiceServerV2;
 
-// V2 PeerSignerService server export (DVT)
+// V2 PeerSignerService client + server (DVT) — RF2-16: client dials v2 only.
+#[cfg(feature = "dvt")]
+pub use proto::signer_v2::peer_signer_service_client::PeerSignerServiceClient;
 #[cfg(feature = "dvt")]
 pub use proto::signer_v2::peer_signer_service_server::{
     PeerSignerService as PeerSignerServiceV2, PeerSignerServiceServer as PeerSignerServiceServerV2,

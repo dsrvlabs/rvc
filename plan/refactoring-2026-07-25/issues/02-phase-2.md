@@ -1311,16 +1311,16 @@ ported, so RF2-17 is blocked. Second, DVT partial-signing requests dial
 5. **GREEN:** the round-trip test passes; existing DVT server-side tests unchanged.
 
 **Acceptance criteria:**
-- [ ] `rg "proto::signer::" bin/rvc-signer/src` returns zero hits (all DVT code on v2).
-- [ ] An end-to-end test drives `GrpcPeerRequester` against a v2 `PeerSignerServiceServerV2` and gets
+- [x] `rg "proto::signer::" bin/rvc-signer/src` returns zero hits (all DVT code on v2).
+- [x] An end-to-end test drives `GrpcPeerRequester` against a v2 `PeerSignerServiceServerV2` and gets
       a valid partial signature — the test that fails with `Unimplemented` before this change.
-- [ ] `PeerRequester::request_partial` carries a typed duty payload; no raw 32-byte signing root
+- [x] `PeerRequester::request_partial` carries a typed duty payload; no raw 32-byte signing root
       crosses the DVT client API.
-- [ ] `cargo build --features dvt` and `cargo test --features dvt` green.
-- [ ] SNI pinning (`dvt_sni_pinning_l1.rs`) and allow-list behaviour unchanged.
-- [ ] **Test-count delta stated and justified:** expected +2 to +4 *newly added* round-trip tests;
+- [x] `cargo build --features dvt` and `cargo test --features dvt` green.
+- [x] SNI pinning (`dvt_sni_pinning_l1.rs`) and allow-list behaviour unchanged.
+- [x] **Test-count delta stated and justified:** expected +2 to +4 *newly added* round-trip tests;
       zero deletions.
-- [ ] Standing invariant green (including `--all-features`).
+- [x] Standing invariant green (including `--all-features`).
 
 **Risks:**
 - This is scope the plan did not list, and it is a behaviour fix inside a deletion phase. It is here

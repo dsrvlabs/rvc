@@ -5,10 +5,13 @@ use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, warn};
 
-use crate::backend::dvt::{PeerRequestError, PeerRequester};
+use crate::backend::dvt::{PartialSignDuty, PeerRequestError, PeerRequester};
 use crate::dvt::allow_list::AllowedPeers;
-use crate::proto::signer::peer_signer_service_client::PeerSignerServiceClient;
-use crate::proto::signer::PartialSignRequest;
+use crate::proto::signer_v2::peer_signer_service_client::PeerSignerServiceClient;
+use crate::proto::signer_v2::{
+    PartialSignAttestationDataRequest, PartialSignBeaconBlockRequest, PartialSignResponse,
+    PartialSignSyncCommitteeRequest,
+};
 use crate::tls::TlsConfig;
 
 #[derive(Error, Debug)]
@@ -106,7 +109,7 @@ pub fn build_peer_connect_infos(
         .collect()
 }
 
-/// gRPC-based peer requester that connects to DVT peers.
+/// gRPC-based peer requester that connects to DVT peers via v2 `PeerSignerService`.
 pub struct GrpcPeerRequester {
     peers: Vec<(String, PeerSignerServiceClient<Channel>)>,
     timeout: Duration,
@@ -194,13 +197,55 @@ impl GrpcPeerRequester {
             .collect()
     }
 
+    /// Dispatch a typed partial-sign RPC for `duty` on `client`.
+    async fn partial_sign_rpc(
+        client: &mut PeerSignerServiceClient<Channel>,
+        duty: &PartialSignDuty,
+        pubkey: &[u8; 48],
+        requester_index: u64,
+    ) -> Result<tonic::Response<PartialSignResponse>, tonic::Status> {
+        match duty {
+            PartialSignDuty::BeaconBlock { fork_info, block_ssz, fork_id } => {
+                let req = PartialSignBeaconBlockRequest {
+                    requester_index,
+                    pubkey: pubkey.to_vec(),
+                    fork_info: Some(fork_info.clone()),
+                    block_ssz: block_ssz.clone(),
+                    fork_id: *fork_id,
+                };
+                client.partial_sign_beacon_block(req).await
+            }
+            PartialSignDuty::AttestationData { fork_info, data, fork_id } => {
+                let req = PartialSignAttestationDataRequest {
+                    requester_index,
+                    pubkey: pubkey.to_vec(),
+                    fork_info: Some(fork_info.clone()),
+                    data: Some(data.clone()),
+                    fork_id: *fork_id,
+                };
+                client.partial_sign_attestation_data(req).await
+            }
+            PartialSignDuty::SyncCommittee { fork_info, slot, beacon_block_root, fork_id } => {
+                let req = PartialSignSyncCommitteeRequest {
+                    requester_index,
+                    pubkey: pubkey.to_vec(),
+                    fork_info: Some(fork_info.clone()),
+                    slot: *slot,
+                    beacon_block_root: beacon_block_root.clone(),
+                    fork_id: *fork_id,
+                };
+                client.partial_sign_sync_committee(req).await
+            }
+        }
+    }
+
     /// Request partial signatures from all connected peers concurrently.
     ///
     /// Returns a vector of `(share_index, partial_signature)` for successful responses.
     /// Peers that fail or timeout are logged and skipped.
     pub async fn request_all_partials(
         &self,
-        signing_root: &[u8; 32],
+        duty: &PartialSignDuty,
         pubkey: &[u8; 48],
         requester_index: u64,
     ) -> Vec<(u64, [u8; 96])> {
@@ -209,20 +254,21 @@ impl GrpcPeerRequester {
         for (addr, client) in &self.peers {
             let addr: String = addr.clone();
             let mut client: PeerSignerServiceClient<Channel> = client.clone();
-            let signing_root = signing_root.to_vec();
-            let pubkey = pubkey.to_vec();
+            let duty = duty.clone();
+            let pubkey = *pubkey;
             let timeout = self.timeout;
 
             handles.spawn(async move {
-                let req = PartialSignRequest { signing_root, pubkey, requester_index };
-
-                let result: Result<
-                    tonic::Response<crate::proto::signer::PartialSignResponse>,
-                    tonic::Status,
-                > = match tokio::time::timeout(timeout, client.partial_sign(req)).await {
-                    Ok(r) => r,
-                    Err(_) => return Err(PeerClientError::Timeout { addr, timeout }),
-                };
+                let result: Result<tonic::Response<PartialSignResponse>, tonic::Status> =
+                    match tokio::time::timeout(
+                        timeout,
+                        Self::partial_sign_rpc(&mut client, &duty, &pubkey, requester_index),
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
+                        Err(_) => return Err(PeerClientError::Timeout { addr, timeout }),
+                    };
 
                 match result {
                     Ok(resp) => {
@@ -264,8 +310,9 @@ impl PeerRequester for GrpcPeerRequester {
     async fn request_partial(
         &self,
         peer_addr: &str,
-        signing_root: &[u8; 32],
+        duty: &PartialSignDuty,
         pubkey: &[u8; 48],
+        requester_index: u64,
     ) -> Result<(u64, [u8; 96]), PeerRequestError> {
         let (_, client) =
             self.peers.iter().find(|(addr, _)| addr == peer_addr).ok_or_else(|| {
@@ -273,16 +320,14 @@ impl PeerRequester for GrpcPeerRequester {
             })?;
 
         let mut client = client.clone();
-        let req = PartialSignRequest {
-            signing_root: signing_root.to_vec(),
-            pubkey: pubkey.to_vec(),
-            requester_index: 0,
-        };
 
-        let result = tokio::time::timeout(self.timeout, client.partial_sign(req))
-            .await
-            .map_err(|_| PeerRequestError::Timeout)?
-            .map_err(|e| PeerRequestError::RequestFailed(format!("RPC failed: {}", e)))?;
+        let result = tokio::time::timeout(
+            self.timeout,
+            Self::partial_sign_rpc(&mut client, duty, pubkey, requester_index),
+        )
+        .await
+        .map_err(|_| PeerRequestError::Timeout)?
+        .map_err(|e| PeerRequestError::RequestFailed(format!("RPC failed: {}", e)))?;
 
         let inner = result.into_inner();
         let sig: [u8; 96] = inner.partial_signature.try_into().map_err(|_| {

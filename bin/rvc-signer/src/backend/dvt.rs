@@ -10,17 +10,35 @@ use super::{SigningBackend, SigningBackendError};
 use crate::dvt::lagrange::{combine_partial_signatures, verify_combined_signature};
 use crate::dvt::types::ShareInfo;
 use crate::metrics::DvtMetrics;
+use crate::proto::signer_v2::{AttestationData, ForkInfo};
 
 const BLS_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
+
+/// Typed duty payload for a DVT peer partial-sign request (v2 `PeerSignerService`).
+///
+/// The v2 peer RPCs compute the signing root server-side from the duty (same
+/// C-2/C-3 fix as the main signing path). A raw 32-byte root must not cross the
+/// DVT client API.
+#[derive(Debug, Clone)]
+pub enum PartialSignDuty {
+    BeaconBlock { fork_info: ForkInfo, block_ssz: Vec<u8>, fork_id: u32 },
+    AttestationData { fork_info: ForkInfo, data: AttestationData, fork_id: u32 },
+    SyncCommittee { fork_info: ForkInfo, slot: u64, beacon_block_root: Vec<u8>, fork_id: u32 },
+}
 
 /// Trait for requesting partial signatures from remote DVT peers.
 #[async_trait]
 pub trait PeerRequester: Send + Sync {
+    /// Request a partial signature for `duty` from `peer_addr`.
+    ///
+    /// `requester_index` is this node's share index; the peer server enforces
+    /// it matches the mTLS client CN's allow-list entry (C-3).
     async fn request_partial(
         &self,
         peer_addr: &str,
-        signing_root: &[u8; 32],
+        duty: &PartialSignDuty,
         pubkey: &[u8; 48],
+        requester_index: u64,
     ) -> Result<(u64, [u8; 96]), PeerRequestError>;
 }
 
@@ -109,19 +127,32 @@ impl DvtSigner {
         let sig = sk.sign(signing_root, BLS_DST, &[]);
         Ok((self.own_index, sig.to_bytes()))
     }
-}
 
-#[async_trait]
-impl SigningBackend for DvtSigner {
+    /// Coordinate a threshold signature: own partial + peer partials for `duty`.
+    ///
+    /// Peers receive the typed duty and derive the same signing root server-side
+    /// (v2 `PeerSignerService`). `signing_root` is used for this node's own
+    /// partial and for combined-signature verification — callers must pass the
+    /// root that matches `duty`.
     #[tracing::instrument(
         name = "signer.dvt.coordinate",
         skip_all,
         fields(threshold, peers_contacted, partials_received, peers_responded, peers_failed,)
     )]
-    async fn sign(
+    pub async fn sign_with_duty(
         &self,
         signing_root: &[u8; 32],
         pubkey: &[u8; 48],
+        duty: &PartialSignDuty,
+    ) -> Result<[u8; 96], SigningBackendError> {
+        self.coordinate(signing_root, pubkey, Some(duty)).await
+    }
+
+    async fn coordinate(
+        &self,
+        signing_root: &[u8; 32],
+        pubkey: &[u8; 48],
+        duty: Option<&PartialSignDuty>,
     ) -> Result<[u8; 96], SigningBackendError> {
         let key_info = self.keys.get(pubkey).ok_or(SigningBackendError::KeyNotFound(*pubkey))?;
 
@@ -138,23 +169,35 @@ impl SigningBackend for DvtSigner {
         let coordination_start = Instant::now();
 
         if let Some(ref requester) = self.peer_requester {
+            let duty = duty.ok_or_else(|| {
+                SigningBackendError::SigningFailed(
+                    "DVT peer partial requests require a typed duty payload \
+                     (call sign_with_duty); the v2 PeerSignerService does not \
+                     accept a raw signing root"
+                        .to_string(),
+                )
+            })?;
+
             let peers_contacted = key_info.peer_addrs.len();
             span.record("peers_contacted", peers_contacted as u64);
 
             let mut join_set = tokio::task::JoinSet::new();
+            let requester_index = self.own_index;
 
             for addr in &key_info.peer_addrs {
                 let requester = Arc::clone(requester);
                 let addr = addr.clone();
-                let root = *signing_root;
+                let duty = duty.clone();
                 let pk = *pubkey;
                 let timeout = self.timeout;
 
                 join_set.spawn(async move {
                     let peer_start = Instant::now();
-                    let result =
-                        tokio::time::timeout(timeout, requester.request_partial(&addr, &root, &pk))
-                            .await;
+                    let result = tokio::time::timeout(
+                        timeout,
+                        requester.request_partial(&addr, &duty, &pk, requester_index),
+                    )
+                    .await;
                     let peer_elapsed = peer_start.elapsed();
                     (addr, result, peer_elapsed)
                 });
@@ -243,6 +286,35 @@ impl SigningBackend for DvtSigner {
 
         Ok(combined)
     }
+}
+
+#[async_trait]
+impl SigningBackend for DvtSigner {
+    /// Standalone / gate path: own partial only (no peer coordination).
+    ///
+    /// Peer-coordinated threshold signing requires a typed duty payload — use
+    /// [`DvtSigner::sign_with_duty`]. Calling this with a peer requester and
+    /// non-empty peer list returns a clear error rather than dialling the
+    /// retired v1 raw-root peer RPC.
+    async fn sign(
+        &self,
+        signing_root: &[u8; 32],
+        pubkey: &[u8; 48],
+    ) -> Result<[u8; 96], SigningBackendError> {
+        if self.peer_requester.is_some() {
+            if let Some(key_info) = self.keys.get(pubkey) {
+                if !key_info.peer_addrs.is_empty() {
+                    return Err(SigningBackendError::SigningFailed(
+                        "DVT peer partial requests require a typed duty payload \
+                         (call sign_with_duty); the v2 PeerSignerService does not \
+                         accept a raw signing root"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        self.coordinate(signing_root, pubkey, None).await
+    }
 
     fn public_keys(&self) -> Vec<[u8; 48]> {
         self.keys.keys().copied().collect()
@@ -326,8 +398,9 @@ mod tests {
             async fn request_partial(
                 &self,
                 peer_addr: &str,
-                _signing_root: &[u8; 32],
+                _duty: &PartialSignDuty,
                 _pubkey: &[u8; 48],
+                _requester_index: u64,
             ) -> Result<(u64, [u8; 96]), PeerRequestError> {
                 self.partials
                     .get(peer_addr)
@@ -344,8 +417,9 @@ mod tests {
             async fn request_partial(
                 &self,
                 _peer_addr: &str,
-                _signing_root: &[u8; 32],
+                _duty: &PartialSignDuty,
                 _pubkey: &[u8; 48],
+                _requester_index: u64,
             ) -> Result<(u64, [u8; 96]), PeerRequestError> {
                 Err(PeerRequestError::RequestFailed("peer down".to_string()))
             }
@@ -355,6 +429,22 @@ mod tests {
             let sk = blst::min_pk::SecretKey::from_bytes(scalar_bytes).unwrap();
             let sig = sk.sign(message, BLS_DST, &[]);
             sig.to_bytes()
+        }
+
+        /// Dummy duty for unit tests that exercise mock peer requesters.
+        /// Content is ignored by mocks; real peers would reject a malformed payload.
+        fn dummy_duty() -> PartialSignDuty {
+            PartialSignDuty::SyncCommittee {
+                fork_info: ForkInfo {
+                    previous_version: vec![0x04, 0x00, 0x00, 0x00],
+                    current_version: vec![0x04, 0x00, 0x00, 0x00],
+                    epoch: 0,
+                    genesis_validators_root: vec![0x00; 32],
+                },
+                slot: 0,
+                beacon_block_root: vec![0xAB; 32],
+                fork_id: 4,
+            }
         }
 
         // ---- RED/GREEN tests ----
@@ -429,7 +519,8 @@ mod tests {
                 Duration::from_secs(5),
             );
 
-            let sig = signer.sign(&signing_root, &pk).await.unwrap();
+            let duty = dummy_duty();
+            let sig = signer.sign_with_duty(&signing_root, &pk, &duty).await.unwrap();
 
             // Verify: combined sig matches direct signing
             let direct_sig = sk.sign(&signing_root);
@@ -465,7 +556,8 @@ mod tests {
                 Duration::from_secs(5),
             );
 
-            let sig = signer.sign(&signing_root, &pk).await.unwrap();
+            let duty = dummy_duty();
+            let sig = signer.sign_with_duty(&signing_root, &pk, &duty).await.unwrap();
             let direct_sig = sk.sign(&signing_root);
             assert_eq!(sig, direct_sig.to_bytes());
         }
@@ -492,7 +584,8 @@ mod tests {
                 Duration::from_secs(5),
             );
 
-            let result = signer.sign(&signing_root, &pk).await;
+            let duty = dummy_duty();
+            let result = signer.sign_with_duty(&signing_root, &pk, &duty).await;
             assert!(result.is_err());
             let err = result.unwrap_err();
             assert!(matches!(err, SigningBackendError::SigningFailed(_)));
@@ -526,9 +619,35 @@ mod tests {
                 Duration::from_secs(5),
             );
 
-            let sig = signer.sign(&signing_root, &pk).await.unwrap();
+            let duty = dummy_duty();
+            let sig = signer.sign_with_duty(&signing_root, &pk, &duty).await.unwrap();
             let direct_sig = sk.sign(&signing_root);
             assert_eq!(sig, direct_sig.to_bytes());
+        }
+
+        #[tokio::test]
+        async fn test_sign_backend_path_requires_duty_when_peers_configured() {
+            // SigningBackend::sign must not dial peers without a typed duty.
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let shares = split_key(&sk, 2, 3);
+            let own_idx = shares[0].0;
+
+            let requester = Arc::new(FailingPeerRequester);
+            let share_info = make_share_info(own_idx, shares[0].1, pk, 2, 3);
+            let signer = DvtSigner::new(
+                vec![share_info],
+                own_idx,
+                vec!["peer1:5000".to_string()],
+                Some(requester),
+                Duration::from_secs(5),
+            );
+
+            let err = signer.sign(&[0u8; 32], &pk).await.unwrap_err();
+            assert!(
+                err.to_string().contains("typed duty"),
+                "error should mention typed duty: {err}"
+            );
         }
 
         #[tokio::test]
@@ -633,7 +752,8 @@ mod tests {
             )
             .with_metrics(dvt_metrics.clone());
 
-            signer.sign(&signing_root, &pk).await.unwrap();
+            let duty = dummy_duty();
+            signer.sign_with_duty(&signing_root, &pk, &duty).await.unwrap();
 
             assert_eq!(
                 dvt_metrics
@@ -688,7 +808,8 @@ mod tests {
             )
             .with_metrics(dvt_metrics.clone());
 
-            let result = signer.sign(&[11u8; 32], &pk).await;
+            let duty = dummy_duty();
+            let result = signer.sign_with_duty(&[11u8; 32], &pk, &duty).await;
             assert!(result.is_err());
 
             assert_eq!(
@@ -714,8 +835,9 @@ mod tests {
                 async fn request_partial(
                     &self,
                     _peer_addr: &str,
-                    _signing_root: &[u8; 32],
+                    _duty: &PartialSignDuty,
                     _pubkey: &[u8; 48],
+                    _requester_index: u64,
                 ) -> Result<(u64, [u8; 96]), PeerRequestError> {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     unreachable!()
@@ -736,7 +858,8 @@ mod tests {
                 Duration::from_millis(50), // very short timeout
             );
 
-            let result = signer.sign(&[0u8; 32], &pk).await;
+            let duty = dummy_duty();
+            let result = signer.sign_with_duty(&[0u8; 32], &pk, &duty).await;
             // Should fail because timeout → only 1 partial, need 2
             assert!(matches!(result, Err(SigningBackendError::SigningFailed(_))));
         }
