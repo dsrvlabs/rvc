@@ -552,9 +552,20 @@ SQLite-backed slashing protection for attestations and blocks:
 - **Block rule** — Double proposal (same slot, different signing root).
 - **`check_and_record_attestation`** / **`check_and_record_block`** — Atomic check-and-record.
 - **Integrity checks** — `PRAGMA integrity_check` at startup, genesis root validation.
-- **Pruning** — Watermark-based pruning for source epoch, target epoch, and block slot.
+- **Pruning** — Watermark-based pruning for source epoch, target epoch, and block slot via
+  `SlashingDb::prune_below_watermarks`, exposed to operators as `rvc slashing prune`
+  (`--slashing-db-path`, `--dry-run`, `--yes`). The prune path refuses to create a fresh
+  empty DB on a missing path (same class of footgun as `--init-slashing-db` without opt-in).
+  The `rvc_slashing_db_prune_total` metric increments on real prunes.
 - **EIP-3076 interchange** — Import/export for keystore migration.
 - **Conformance** — 76 EIP-3076 tests (38 complete + 38 minimal strategy).
+
+**Wire-not-delete (B5 / RF2-12 + RF2-13):** the watermark + prune subsystem is intentionally
+wired rather than deleted. Phase 1 A1 pinned stage-path watermark equality (`<=` blocks at
+the watermark), A2 retargeted conformance + proptests onto `stage_* → commit/discard`, and
+the 38 minimal-strategy EIP-3076 conformance cases depend on watermark maxima projected from
+interchange import (RF2-12). Deleting watermarks would invalidate that oracle and weaken
+minimal-format import safety; RF2-13 completes the operator surface so pruning is reachable.
 
 ### `crates/keymanager-api` — Keymanager REST API
 

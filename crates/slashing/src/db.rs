@@ -1583,6 +1583,48 @@ impl SlashingDb {
         })
     }
 
+    /// Count rows that [`Self::prune_below_watermarks`] would delete, without deleting.
+    ///
+    /// Used by `rvc slashing prune --dry-run`. Same safety gate as prune: errors with
+    /// [`SlashingError::NoWatermarksSet`] when no watermarks are present.
+    pub fn count_below_watermarks(&self) -> Result<PruneStats, SlashingError> {
+        let conn = self.conn.lock();
+
+        let watermark_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM watermarks", [], |row| row.get(0))?;
+
+        if watermark_count == 0 {
+            return Err(SlashingError::NoWatermarksSet);
+        }
+
+        let blocks_deleted: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM blocks WHERE EXISTS (
+                SELECT 1 FROM watermarks w
+                WHERE w.pubkey = blocks.pubkey
+                  AND w.watermark_type = 'block'
+                  AND blocks.slot < w.value
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let attestations_deleted: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM attestations WHERE EXISTS (
+                SELECT 1 FROM watermarks w
+                WHERE w.pubkey = attestations.pubkey
+                  AND w.watermark_type = 'att_target'
+                  AND attestations.target_epoch < w.value
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(PruneStats {
+            attestations_deleted: attestations_deleted as u64,
+            blocks_deleted: blocks_deleted as u64,
+        })
+    }
+
     /// Check file permissions and warn if the slashing DB is group- or world-accessible (Unix only).
     #[cfg(unix)]
     pub fn check_file_permissions(&self) {
@@ -3965,6 +4007,50 @@ mod tests {
         assert_eq!(stats.attestations_deleted, 0);
 
         assert_eq!(db.get_blocks("0x1234").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_count_below_watermarks_matches_prune_without_deleting() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        for slot in [100u64, 200, 300, 400, 500] {
+            db.seed_block("0x1234", slot, None, &TEST_GVR).expect("record");
+        }
+        for (src, tgt) in [(5u64, 10), (10, 20), (20, 30), (30, 40), (40, 50)] {
+            db.seed_attestation("0x1234", src, tgt, None, &TEST_GVR).expect("record");
+        }
+        db.set_block_watermark("0x1234", 300).expect("set");
+        db.set_attestation_watermark("0x1234", 20, 30).expect("set");
+
+        let counted = db.count_below_watermarks().expect("count");
+        assert_eq!(counted.blocks_deleted, 2);
+        assert_eq!(counted.attestations_deleted, 2);
+        assert_eq!(db.get_blocks("0x1234").unwrap().len(), 5);
+        assert_eq!(db.get_attestations("0x1234").unwrap().len(), 5);
+
+        let pruned = db.prune_below_watermarks().expect("prune");
+        assert_eq!(pruned, counted);
+    }
+
+    #[test]
+    fn test_prune_below_watermarks_increments_metric() {
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        db.seed_block("0x1234", 100, None, &TEST_GVR).expect("record");
+        db.seed_block("0x1234", 200, None, &TEST_GVR).expect("record");
+        db.set_block_watermark("0x1234", 150).expect("set");
+
+        let before = metrics::RVC_SLASHING_DB_PRUNE_TOTAL
+            .with_label_values(&[metrics::prune_type::BLOCK])
+            .get();
+        let stats = db.prune_below_watermarks().expect("prune");
+        assert_eq!(stats.blocks_deleted, 1);
+        let after = metrics::RVC_SLASHING_DB_PRUNE_TOTAL
+            .with_label_values(&[metrics::prune_type::BLOCK])
+            .get();
+        assert!(
+            after > before,
+            "rvc_slashing_db_prune_total{{type=block}} must increase: before={before} after={after}"
+        );
     }
 
     #[test]

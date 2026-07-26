@@ -47,7 +47,10 @@ pub enum SlashingError {
     )]
     WatermarkLowered { pubkey: String, watermark_type: String, current: u64, attempted: u64 },
 
-    #[error("no watermarks set: pruning without watermarks would delete all records")]
+    #[error(
+        "no watermarks set — import an EIP-3076 interchange (or set watermarks) before pruning; \
+         pruning without watermarks would delete all records"
+    )]
     NoWatermarksSet,
 
     #[error(

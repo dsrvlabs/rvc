@@ -490,6 +490,40 @@ enum Commands {
         #[arg(long, default_value = "info")]
         log_level: String,
     },
+
+    /// Slashing-protection maintenance (prune, etc.)
+    Slashing {
+        #[command(subcommand)]
+        command: SlashingCommands,
+    },
+}
+
+/// Subcommands under `rvc slashing` (RF2-13 / B5). Kept as a small nested enum so
+/// Phase 5 F3 can relocate it without redesigning the arg surface.
+#[derive(Subcommand)]
+enum SlashingCommands {
+    /// Delete historical slashing-protection rows below per-validator watermarks.
+    ///
+    /// Destructive and irreversible. Prefer `--dry-run` first; a real prune requires `--yes`.
+    /// Refuses to create a fresh empty DB if the path is missing (same class of footgun as
+    /// `--init-slashing-db` without opt-in).
+    Prune {
+        /// Path to an existing slashing protection database
+        #[arg(long)]
+        slashing_db_path: PathBuf,
+
+        /// Report how many rows would be deleted without deleting them
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Confirm irreversible deletion of rows below watermarks
+        #[arg(long, default_value_t = false)]
+        yes: bool,
+
+        /// Log level (trace, debug, info, warn, error)
+        #[arg(long, default_value = "info")]
+        log_level: String,
+    },
 }
 
 #[tokio::main]
@@ -821,6 +855,18 @@ async fn main() -> anyhow::Result<()> {
 
             commands::submit_exit::execute(args).await?;
         }
+        Commands::Slashing { command } => match command {
+            SlashingCommands::Prune { slashing_db_path, dry_run, yes, log_level } => {
+                init_logging(&log_level, telemetry::LogFormat::resolve(None), None, None);
+                // Ensure prune metrics are registered before the handler increments them.
+                metrics::definitions::init_metrics();
+                commands::slashing::execute_prune(commands::slashing::PruneArgs {
+                    slashing_db_path,
+                    dry_run,
+                    yes,
+                })?;
+            }
+        },
     }
 
     Ok(())

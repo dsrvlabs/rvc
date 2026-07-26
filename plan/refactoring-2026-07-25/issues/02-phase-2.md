@@ -1110,16 +1110,16 @@ actually reachable, and record in `ARCHITECTURE.md` why the subsystem was wired 
 6. **GREEN:** the prune metric increments in a scrape after a real prune.
 
 **Acceptance criteria:**
-- [ ] `rvc slashing prune --slashing-db-path <p>` prunes rows below watermarks and reports counts.
-- [ ] **Running prune against a path with no existing DB is a hard error and leaves no file behind**
+- [x] `rvc slashing prune --slashing-db-path <p>` prunes rows below watermarks and reports counts.
+- [x] **Running prune against a path with no existing DB is a hard error and leaves no file behind**
       — named test.
-- [ ] `--dry-run` reports what would be deleted and deletes nothing — named test.
-- [ ] `RVC_SLASHING_DB_PRUNE_TOTAL` is non-zero after a real prune (scrape assertion).
-- [ ] `NoWatermarksSet` produces an actionable operator message.
-- [ ] `ARCHITECTURE.md` records the wire-not-delete decision with the A1/A2 dependency as its stated
+- [x] `--dry-run` reports what would be deleted and deletes nothing — named test.
+- [x] `RVC_SLASHING_DB_PRUNE_TOTAL` is non-zero after a real prune (scrape assertion).
+- [x] `NoWatermarksSet` produces an actionable operator message.
+- [x] `ARCHITECTURE.md` records the wire-not-delete decision with the A1/A2 dependency as its stated
       rationale.
-- [ ] **Test-count delta stated and justified:** expected +4 to +6 *newly added*; zero deletions.
-- [ ] Standing invariant green.
+- [x] **Test-count delta stated and justified:** expected +4 to +6 *newly added*; zero deletions.
+- [x] Standing invariant green.
 
 **Risks:**
 - **A prune that creates a DB is a slashing footgun** of the same class as `--init-slashing-db`; the
