@@ -1,4 +1,6 @@
-//! RF3-14: client and server share one generated type set.
+//! Client and server share one generated type set (RF3-14).
+//!
+//! Formerly `shared_proto_types_rf3_14.rs`.
 //!
 //! Before the shared crate, `bin/rvc-signer` and `crates/grpc-signer` each ran
 //! `tonic_build`, producing structurally identical but distinct Rust types.

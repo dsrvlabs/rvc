@@ -1,5 +1,7 @@
 //! Regression tests for M-5 (ISSUE-3.4): `TruncatedPubkey` in audit logs.
 //!
+//! Formerly `audit_log_m5.rs` (audit issue M-5 / ISSUE-3.4).
+//!
 //! # What M-5 fixes
 //!
 //! Before this fix:

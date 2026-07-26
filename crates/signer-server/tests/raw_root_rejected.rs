@@ -1,13 +1,14 @@
 //! Final assertion test: the v2 signer contract must not accept a raw
 //! `signing_root` from the caller.
 //!
+//! Formerly `no_raw_root_path.rs` (successor of deleted `v1_raw_root_bypass.rs`;
+//! ISSUE-1.6d §"Final assertion test", C-2 / C-3).
+//!
 //! All 10 typed RPCs compute the signing root server-side.  If any RPC were
 //! added that accepted a raw 32-byte `signing_root` from the caller, that
 //! would re-introduce C-2 / C-3 (caller can influence the root).  This test
 //! greps the shared proto source (RF3-14: compiled once in `rvc-signer-proto`)
 //! and asserts no such field exists.
-//!
-//! Per ISSUE-1.6d §"Final assertion test".
 
 #[test]
 fn test_no_v2_rpc_accepts_raw_signing_root() {

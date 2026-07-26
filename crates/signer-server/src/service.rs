@@ -1201,7 +1201,7 @@ mod tests {
     // These tests use `test_pubkey_bytes()` / `MockBackend::with_test_key()` so
     // the gate's BLS pubkey validation and `Signature::from_bytes` succeed.
     // RF2-17: v1 Unimplemented unit tests deleted with the dead v1 trait impl.
-    // Raw-root guard: `tests/no_raw_root_path.rs` greps generated signer.v2.rs.
+    // Raw-root guard: `tests/raw_root_rejected.rs` greps generated signer.v2.rs.
 
     #[tokio::test]
     async fn test_v2_sign_beacon_block_happy_path() {

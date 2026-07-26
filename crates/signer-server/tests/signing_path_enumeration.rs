@@ -33,7 +33,7 @@
 //! Note: cross-checking registry method names against the actual v2 proto service
 //! descriptor via tonic reflection would add heavy build-time overhead.  Instead,
 //! the live-listener service name is introspected via `NamedService` in the
-//! companion `m4_enumeration.rs` (Issue 2.13), and the gate linkage is confirmed
+//! companion `key_enumeration.rs` (Issue 2.13 / former `m4_enumeration.rs`), and the gate linkage is confirmed
 //! via the `gate_method` cross-check below.
 
 // The dep key in Cargo.toml is `signer-registry` (package = "rvc-signer-registry"),

@@ -1,5 +1,7 @@
 //! H-9 regression tests: `--insecure` flag requires env-var double-confirm + loopback gate.
 //!
+//! Formerly `insecure_flag_h9.rs` (audit issue H-9 / ISSUE-2.11).
+//!
 //! Acceptance criteria (ISSUE-2.11 / updated for ISSUE-3.13 GA):
 //! - Gate uses `RVC_SIGNER_ALLOW_INSECURE=true` as the opt-in env var.
 //! - GA default is `Refuse` mode (per NFR-10 / ISSUE-3.13).

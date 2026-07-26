@@ -743,11 +743,11 @@ old names and must not be lost. Relocate `integration_polish.rs`'s binary-spawni
 `tests/cli_startup.rs` using `CARGO_BIN_EXE` (`env!("CARGO_BIN_EXE_rvc-signer")`).
 
 **Acceptance criteria:**
-- [ ] No test file or `cfg(test)` module name references an audit issue ID; every renamed file's `//!`
+- [x] No test file or `cfg(test)` module name references an audit issue ID; every renamed file's `//!`
       doc comment states the original ID.
-- [ ] Binary-spawning tests use `CARGO_BIN_EXE`, not a shelled `cargo build` (this is F2's acceptance
+- [x] Binary-spawning tests use `CARGO_BIN_EXE`, not a shelled `cargo build` (this is F2's acceptance
       criterion too — verify it held).
-- [ ] Test count unchanged. Workspace green.
+- [x] Test count unchanged. Workspace green.
 
 **Risks:** None. Purely nominal.
 

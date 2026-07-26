@@ -73,7 +73,7 @@ mod tests {
     /// Serialise tests in this module that mutate `RVC_SIGNER_ALLOW_INSECURE`.
     /// Without this lock, parallel cargo-test execution can race and flip the
     /// env var out from under another test (review MF-2: same pattern as
-    /// `bin/rvc-signer/tests/insecure_flag_h9.rs::env_lock`).
+    /// `crates/signer-server/tests/insecure_flag_refused.rs::env_lock`).
     fn env_lock() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())

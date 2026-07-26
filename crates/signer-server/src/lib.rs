@@ -9,7 +9,7 @@ pub mod backend;
 pub mod commands;
 pub mod config;
 #[cfg(test)]
-mod cross_transport;
+mod gate_shared_across_transports;
 #[cfg(feature = "dvt")]
 pub mod dvt;
 pub mod error;

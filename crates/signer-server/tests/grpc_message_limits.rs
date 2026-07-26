@@ -1,5 +1,7 @@
 //! Regression tests for M-10: Tonic server concurrency/size/timeout limits.
 //!
+//! Formerly `tonic_limits_m10.rs` (audit issue M-10).
+//!
 //! These tests verify that `hardened_server_builder()` enforces:
 //! - `concurrency_limit_per_connection(32)` — Tower-level handler concurrency cap
 //! - `max_concurrent_streams(Some(64))` — H2-level stream cap (sent to client)

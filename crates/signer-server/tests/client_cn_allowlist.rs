@@ -1,5 +1,8 @@
 //! Regression tests for M-4 (ISSUE-3.4): x509-parser-based CN extraction.
 //!
+//! Formerly `audit_cn_m4.rs` (audit issue M-4 / ISSUE-3.4). Covers client CN
+//! extraction used for allow-list and audit attribution.
+//!
 //! # What M-4 fixes
 //!
 //! The legacy hand-rolled DER scanner returned the **last** CN OID match.

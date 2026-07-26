@@ -1,5 +1,8 @@
 //! PRD M4 — canonical phase-exit enumeration test (Issue 2.13).
 //!
+//! Formerly `m4_enumeration.rs` (PRD M4 / Issue 2.13). Enumerates live-listener
+//! signing paths to prove every slashable path consults the slashing DB.
+//!
 //! # What M4 requires
 //!
 //! > No signing path on `rvc-signer`'s LIVE listener can produce a signature for

@@ -1,5 +1,7 @@
 //! ISSUE-4.6 / L-6: hot-reload opt-in + strict directory mode check.
 //!
+//! Formerly `hot_reload_l6.rs` (audit issue L-6 / ISSUE-4.6).
+//!
 //! These tests verify the policy enforced by the production code paths in
 //! `rvc-signer`:
 //!

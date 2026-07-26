@@ -55,7 +55,7 @@ mod tests {
 
     /// Smoke-test that `hardened_server_builder()` returns a `Server` without
     /// panicking.  The exact builder field values are validated by the
-    /// integration tests in `tests/tonic_limits_m10.rs`.
+    /// integration tests in `tests/grpc_message_limits.rs`.
     #[test]
     fn test_hardened_server_builder_returns_server() {
         let _server = hardened_server_builder();

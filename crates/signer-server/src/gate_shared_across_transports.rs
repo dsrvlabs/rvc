@@ -1,5 +1,7 @@
 //! Cross-transport slashing-serialization test (Issue 3.7).
 //!
+//! Formerly `cross_transport.rs` (opaque `cfg(test)` module name).
+//!
 //! Proves the gate-hoist payoff (FR-26, ADR-003, R2): the ONE shared
 //! `Arc<SigningGate>` — reached via BOTH the gRPC service and the HTTP route —
 //! serializes slashing protection. A block signed through one transport slashes

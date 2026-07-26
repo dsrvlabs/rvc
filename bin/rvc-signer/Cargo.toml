@@ -29,7 +29,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 zeroize.workspace = true
 
 [dev-dependencies]
-# Binary-level startup tests (server_startup / common harness) + main unit tests.
+# Binary-level startup tests (cli_startup / common harness) + main unit tests.
 crypto = { workspace = true, features = ["test-utils"] }
 hex.workspace = true
 libc = "0.2"

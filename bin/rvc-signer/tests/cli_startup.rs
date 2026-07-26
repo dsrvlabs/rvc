@@ -1,5 +1,8 @@
 //! Binary-level startup / dry-run / shutdown tests for `rvc-signer`.
 //!
+//! Formerly `server_startup.rs` (binary-spawning cases from the opaque
+//! `integration_polish.rs` suite; see RF5-18 / H1).
+//!
 //! Uses `env!("CARGO_BIN_EXE_rvc-signer")` (via [`common::bin_path`]) so tests
 //! never nest a cargo invocation. Runs under default features and `--features dvt`.
 

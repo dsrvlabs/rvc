@@ -1,5 +1,7 @@
 //! Regression tests for ISSUE-4.1 / L-1: per-peer SNI pinning in DVT TLS.
 //!
+//! Formerly `dvt_sni_pinning_l1.rs` (audit issue L-1 / ISSUE-4.1).
+//!
 //! # Background
 //!
 //! Before this fix, `GrpcPeerRequester::connect` applied the same
