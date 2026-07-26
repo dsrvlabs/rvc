@@ -654,7 +654,7 @@ where
             if !self.validator_store.is_signing_enabled(&pk_bytes) {
                 warn!(
                     slot,
-                    pubkey = %crypto::logging::TruncatedPubkey::new(&proposer_duty.pubkey),
+                    pubkey = %observability::logging::TruncatedPubkey::new(&proposer_duty.pubkey),
                     "Skipping block proposal: validator is inside the \
                      post-import doppelganger window (D-3)"
                 );

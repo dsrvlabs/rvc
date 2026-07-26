@@ -6,7 +6,6 @@ use tracing::Instrument;
 use url::Url;
 use zeroize::Zeroizing;
 
-use crypto::logging::TruncatedPubkey;
 use crypto::typed_signer::SignContext;
 use crypto::{InsecureGate, InsecureMode};
 use crypto::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
@@ -16,6 +15,7 @@ use eth_types::{
     encode_sync_committee_contribution_ssz, AggregateAndProof, AttestationData, BeaconBlock,
     BlindedBeaconBlock, ContributionAndProof, Epoch, Slot, ValidatorRegistrationV1, VoluntaryExit,
 };
+use observability::logging::TruncatedPubkey;
 
 use crate::proto::signer_v2::signer_service_client::SignerServiceClient as SignerServiceClientV2;
 use crate::proto::signer_v2::{

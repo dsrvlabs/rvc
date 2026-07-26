@@ -22,7 +22,7 @@
 //! ## Redaction is unaffected
 //! Secret redaction happens at the **value** level: a `pubkey` is recorded as an
 //! already-truncated `0x{first10}...{last8}` string (via
-//! `crypto::logging::TruncatedPubkey`) and a URL via `RedactedUrl` *before* it is
+//! `observability::logging::TruncatedPubkey`) and a URL via `RedactedUrl` *before* it is
 //! handed to any layer. JSON serialization of an already-redacted value stays
 //! redacted — selecting JSON is **not** a redaction bypass (proven by a captured
 //! subscriber test, see this module's tests).
@@ -406,7 +406,7 @@ mod tests {
         let full_pubkey =
             "93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a";
         // The already-redacted values that actually get recorded (this is exactly
-        // what `crypto::logging::TruncatedPubkey` / `RedactedUrl` produce at the
+        // what `observability::logging::TruncatedPubkey` / `RedactedUrl` produce at the
         // VALUE level before the field is handed to any layer).
         let redacted_pubkey = "0x93247f2209...611df74a";
         let redacted_url = "http://***:***@beacon.internal:5052/";

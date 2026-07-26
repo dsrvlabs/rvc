@@ -97,7 +97,7 @@ impl<S: AttestationSubmitter> Propagator<S> {
         };
 
         // Late-bind the count onto the span. propagator has no crypto dep, so this uses the
-        // raw record() directly (not crypto::logging::record_debug); the key "count" matches
+        // raw record() directly (not observability::logging::record_debug); the key "count" matches
         // the field::Empty declared on the #[instrument] above so the record lands.
         tracing::Span::current().record("count", total);
 

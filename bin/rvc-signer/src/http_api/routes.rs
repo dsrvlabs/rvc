@@ -20,8 +20,8 @@ use crate::audit;
 
 use tracing::Instrument;
 
-use crypto::logging::fields::{self, Duty};
-use crypto::logging::{new_request_id, record_display, TruncatedPubkey};
+use observability::logging::fields::{self, Duty};
+use observability::logging::{new_request_id, record_display, TruncatedPubkey};
 
 /// `GET /upcheck` — liveness probe (FR-1).
 ///

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use tracing::{error, info, warn};
 
-use crypto::logging::RedactedUrl;
+use observability::logging::RedactedUrl;
 
 use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
 use beacon::{BeaconClient, BeaconClientConfig};

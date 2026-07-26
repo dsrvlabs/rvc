@@ -4,7 +4,7 @@ use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, error, trace, warn, Instrument};
 
-use crypto::logging::RedactedUrl;
+use observability::logging::RedactedUrl;
 
 use eth_types::{ForkSchedule, SignedValidatorRegistration, SignedVoluntaryExit};
 

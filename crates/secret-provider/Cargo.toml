@@ -17,6 +17,7 @@ test-utils = []
 [dependencies]
 async-trait.workspace = true
 crypto.workspace = true
+observability.workspace = true
 eth-types.workspace = true
 lazy_static.workspace = true
 metrics.workspace = true

@@ -18,6 +18,7 @@ test-helpers = []
 [dependencies]
 async-trait.workspace = true
 crypto.workspace = true
+observability.workspace = true
 doppelganger.workspace = true
 eth-types.workspace = true
 hex.workspace = true

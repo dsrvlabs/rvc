@@ -266,13 +266,13 @@ Crates that keep `crypto` for real crypto: `doppelganger` (`PublicKey`/`SecretKe
   call sites with `observability::logging::RedactedUrl`.
 
 **Acceptance criteria.**
-- [ ] No `crypto::logging`, `crypto::hex`, or `crypto::pubkey` path remains in the workspace
+- [x] No `crypto::logging`, `crypto::hex`, or `crypto::pubkey` path remains in the workspace
       (`rg 'crypto::(logging|hex|pubkey)'` returns nothing).
-- [ ] The seven crates listed above have no `crypto` entry in any dependency table.
-- [ ] `cargo tree -p rvc-beacon --edges normal | rg 'blst|scrypt|bip39'` is empty.
-- [ ] `redact_url` is gone from `remote_signer.rs`; `RedactedUrl` is the only redaction path.
-- [ ] Diff contains no logic change (reviewable as import rewrites + Cargo edits + one deletion).
-- [ ] `field_name_conformance` Gate-5 and `no_rvc_prefix` both green.
+- [x] The seven crates listed above have no `crypto` entry in any dependency table.
+- [x] `cargo tree -p rvc-beacon --edges normal | rg 'blst|scrypt|bip39'` is empty.
+- [x] `redact_url` is gone from `remote_signer.rs`; `RedactedUrl` is the only redaction path.
+- [x] Diff contains no logic change (reviewable as import rewrites + Cargo edits + one deletion).
+- [x] `field_name_conformance` Gate-5 and `no_rvc_prefix` both green.
 
 **TDD test plan.**
 - **RED first:** `no_crypto_logging_paths_remain` — a source-scanning test in `architecture-tests`

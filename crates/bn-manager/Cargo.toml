@@ -14,7 +14,7 @@ workspace = true
 
 [dependencies]
 beacon = { workspace = true }
-crypto = { workspace = true }
+observability = { workspace = true }
 eth-types = { workspace = true }
 async-trait = { workspace = true }
 futures = "0.3"

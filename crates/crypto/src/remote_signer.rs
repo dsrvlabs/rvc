@@ -5,14 +5,11 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize, Serializer};
 use tracing::Instrument;
 
-use url::Url;
-
 use super::bls::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
 use super::insecure::{InsecureGate, InsecureMode};
 use super::signer_trait::{Signer, SigningError};
 use super::signing::{compute_domain, compute_signing_root};
 use super::typed_signer::{SignContext, TypedSigner};
-use crate::logging::TruncatedPubkey;
 use eth_types::{
     blinded_body_tree_hash_root, body_tree_hash_root, AggregateAndProof, AttestationData,
     BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock, ContributionAndProof, Epoch, Fork, Root,
@@ -21,6 +18,7 @@ use eth_types::{
     DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
+use observability::logging::{RedactedUrl, TruncatedPubkey};
 
 /// Environment variable that must be set to `"true"` to allow plaintext
 /// `http://` remote-signer URLs.  `https://` URLs always pass without
@@ -49,18 +47,6 @@ pub fn check_remote_signer_url(url: &str, mode: InsecureMode) -> Result<(), Sign
     InsecureGate::with_predicate(REMOTE_SIGNER_INSECURE_ENV_VAR, mode, || true)
         .check()
         .map_err(|e| SigningError::RemoteSignerError(e.to_string()))
-}
-
-fn redact_url(url: &str) -> String {
-    if let Ok(mut parsed) = Url::parse(url) {
-        if parsed.password().is_some() || !parsed.username().is_empty() {
-            let _ = parsed.set_username("***");
-            let _ = parsed.set_password(Some("***"));
-        }
-        parsed.to_string()
-    } else {
-        url.to_string()
-    }
 }
 
 const DEFAULT_TIMEOUT_SECS: u64 = 12;
@@ -580,7 +566,7 @@ impl RemoteSigner {
         let span = tracing::info_span!(
             "sign.remote",
             http.method = "POST",
-            http.url = %redact_url(&log_url),
+            http.url = %RedactedUrl(&log_url),
             http.status_code = tracing::field::Empty,
             signer_type = "remote",
             web3signer_type = request.payload.type_name(),
@@ -1263,9 +1249,9 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_url_hides_credentials() {
+    fn test_redacted_url_hides_credentials() {
         let url = "http://user:pass@example.com:9000/api";
-        let redacted = redact_url(url);
+        let redacted = RedactedUrl(url).to_string();
         assert!(!redacted.contains("user"));
         assert!(!redacted.contains("pass"));
         assert!(redacted.contains("***"));
@@ -1273,16 +1259,16 @@ mod tests {
     }
 
     #[test]
-    fn test_redact_url_preserves_url_without_credentials() {
+    fn test_redacted_url_preserves_url_without_credentials() {
         let url = "http://example.com:9000/api";
-        let redacted = redact_url(url);
+        let redacted = RedactedUrl(url).to_string();
         assert_eq!(redacted, "http://example.com:9000/api");
     }
 
     #[test]
-    fn test_redact_url_handles_invalid_url() {
+    fn test_redacted_url_handles_invalid_url() {
         let url = "not-a-url";
-        let redacted = redact_url(url);
+        let redacted = RedactedUrl(url).to_string();
         assert_eq!(redacted, "not-a-url");
     }
 

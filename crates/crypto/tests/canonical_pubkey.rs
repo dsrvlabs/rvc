@@ -1,6 +1,6 @@
 // RED test for ISSUE-CQ-2.4 (C1).
 //
-//! Cross-crate integration tests for [`rvc_crypto::pubkey::CanonicalPubkey`].
+//! Cross-crate integration tests for [`observability::pubkey::CanonicalPubkey`].
 //!
 //! This file is the publicly-facing test fixture that confirms the helper
 //! collapses every input representation into the single canonical form:
@@ -10,7 +10,7 @@
 //! and `orchestrator` crates can rely on the same normalisation contract without
 //! independent re-implementation.
 
-use rvc_crypto::pubkey::CanonicalPubkey;
+use observability::pubkey::CanonicalPubkey;
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 

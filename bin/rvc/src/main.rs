@@ -1498,7 +1498,7 @@ async fn run_validator(
                     let pk_bytes = sk.public_key().to_bytes();
                     if denylist_for_callback.contains(&pk_bytes) {
                         tracing::info!(
-                            pubkey = %crypto::logging::TruncatedPubkey::new(&format!(
+                            pubkey = %observability::logging::TruncatedPubkey::new(&format!(
                                 "0x{}",
                                 hex::encode(pk_bytes)
                             )),

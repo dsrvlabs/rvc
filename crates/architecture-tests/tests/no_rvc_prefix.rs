@@ -1,7 +1,7 @@
 //! Standing CI gate: no `rvc.`-prefixed span names or field keys in production logging.
 //!
 //! Phase 4 of the structured-logging initiative normalizes the legacy `rvc.` tracing
-//! namespace to the canonical registry (`crypto::logging::fields`) so OTLP dashboards group
+//! namespace to the canonical registry (`observability::logging::fields`) so OTLP dashboards group
 //! on `slot`, not `rvc.slot`. This gate scans production `*.rs` source under `crates/*/src`
 //! and `bin/*/src` and fails if an `rvc.`-prefixed tracing span name or field key appears in
 //! a file that is neither permanently `EXCLUDE`d (non-key fixtures) nor on the temporary
@@ -149,7 +149,7 @@ fn no_rvc_prefixed_keys_outside_allow_lists() {
     assert!(
         offenders.is_empty(),
         "rvc.-prefixed tracing keys found in files not on EXCLUDE/KNOWN_REMAINING.\n\
-         Normalize them to crypto::logging::fields, or (if the `rvc.` is a non-key fixture) \
+         Normalize them to observability::logging::fields, or (if the `rvc.` is a non-key fixture) \
          add the file to EXCLUDE:\n  {}",
         offenders.join("\n  ")
     );

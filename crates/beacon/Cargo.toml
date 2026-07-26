@@ -14,7 +14,7 @@ workspace = true
 
 [dependencies]
 bytes = { workspace = true }
-crypto = { workspace = true }
+observability = { workspace = true }
 eth-types = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }

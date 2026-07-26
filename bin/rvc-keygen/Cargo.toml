@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 crypto.workspace = true
+observability.workspace = true
 eth-types.workspace = true
 clap.workspace = true
 hex.workspace = true

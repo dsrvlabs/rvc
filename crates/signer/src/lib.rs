@@ -28,8 +28,6 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tracing::{debug, error, warn};
 
-use crypto::logging::fields::Duty;
-use crypto::logging::{TruncatedPubkey, TruncatedRoot};
 use crypto::{CompositeSigner, PublicKey, Signature, Signer, SigningError};
 use eth_types::{
     AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
@@ -41,6 +39,8 @@ use metrics::definitions::{
     slashing_result, tx_hold_kind, RVC_ATTESTATIONS_TOTAL, RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS,
     RVC_SIGNING_DURATION_SECONDS, RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
 };
+use observability::logging::fields::Duty;
+use observability::logging::{TruncatedPubkey, TruncatedRoot};
 use slashing::{SlashingDb, SlashingError};
 
 /// Errors that can occur during signing operations.
@@ -336,7 +336,7 @@ impl SignerService {
                 // off (Gate 4): a disabled site never consults the sampler / bumps the
                 // counter. Documented in plan/logging/OPERATOR_GUIDE.md §8.
                 if tracing::enabled!(tracing::Level::TRACE)
-                    && crypto::logging::should_log_sampled(
+                    && observability::logging::should_log_sampled(
                         &ATTESTATION_STAGE_TRACE_CTR,
                         ATTESTATION_STAGE_TRACE_SAMPLE_N,
                     )
@@ -441,7 +441,7 @@ impl SignerService {
         // `slashing_result` actually lands on the instrument span.
         let outcome = inner_result.map_err(|e| {
             if matches!(e, SignerError::SlashingProtectionBlocked(_)) {
-                crypto::logging::record_display(
+                observability::logging::record_display(
                     &tracing::Span::current(),
                     "slashing_result",
                     "blocked",
@@ -450,7 +450,11 @@ impl SignerService {
             e
         })?;
 
-        crypto::logging::record_display(&tracing::Span::current(), "slashing_result", "safe");
+        observability::logging::record_display(
+            &tracing::Span::current(),
+            "slashing_result",
+            "safe",
+        );
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
         RVC_ATTESTATIONS_TOTAL.with_label_values(&["success"]).inc();
@@ -600,7 +604,7 @@ impl SignerService {
 
         let outcome = inner_result.map_err(|e| {
             if matches!(e, SignerError::SlashingProtectionBlocked(_)) {
-                crypto::logging::record_display(
+                observability::logging::record_display(
                     &tracing::Span::current(),
                     "slashing_result",
                     "blocked",
@@ -609,7 +613,11 @@ impl SignerService {
             e
         })?;
 
-        crypto::logging::record_display(&tracing::Span::current(), "slashing_result", "safe");
+        observability::logging::record_display(
+            &tracing::Span::current(),
+            "slashing_result",
+            "safe",
+        );
         let duration = start.elapsed().as_secs_f64();
         RVC_SIGNING_DURATION_SECONDS.with_label_values(&[] as &[&str]).observe(duration);
 

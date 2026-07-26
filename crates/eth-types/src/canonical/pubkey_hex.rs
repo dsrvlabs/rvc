@@ -54,7 +54,7 @@ pub fn parse_pubkey_hex(s: &str) -> Result<PubkeyHex, ParseError> {
 /// (`0x0x` / `0x0X` / `0X0x` / `0X0X`) as [`ParseError::DoublePrefix`].
 ///
 /// This is the single prefix-strip engine for `eth-types`. Policy matches
-/// `crypto::hex::strip_prefix_strict`: at most one leading `0x`/`0X`, mixed
+/// `observability::hex::strip_prefix_strict`: at most one leading `0x`/`0X`, mixed
 /// case accepted, doubled prefixes rejected.
 pub(crate) fn strip_prefix(s: &str) -> Result<&str, ParseError> {
     if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {

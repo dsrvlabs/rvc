@@ -208,7 +208,7 @@ pub fn new_request_id() -> uuid::Uuid {
 /// use std::sync::atomic::AtomicU64;
 /// static CTR: AtomicU64 = AtomicU64::new(0);
 /// if tracing::enabled!(tracing::Level::TRACE)
-///     && crypto::logging::should_log_sampled(&CTR, 16)
+///     && observability::logging::should_log_sampled(&CTR, 16)
 /// {
 ///     tracing::trace!(slot = slot, validator_index = idx, "hot per-validator line");
 /// }

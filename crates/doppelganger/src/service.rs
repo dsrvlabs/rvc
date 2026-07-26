@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use crypto::logging::TruncatedPubkey;
 use eth_types::{Epoch, SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
+use observability::logging::TruncatedPubkey;
 use tracing::{debug, info, warn, Instrument};
 
 use crate::error::DoppelgangerError;
@@ -258,7 +258,7 @@ impl DoppelgangerService {
         // Late-bind the detected count onto the `doppelganger.monitor` span via the kit
         // helper. The field was declared `field::Empty` at span creation, so this record
         // lands (a raw key not declared there would be silently dropped).
-        crypto::logging::record_debug(
+        observability::logging::record_debug(
             &tracing::Span::current(),
             "detected_count",
             detected.len() as u64,
@@ -278,7 +278,7 @@ mod tests {
     use crate::{DoppelgangerError, DoppelgangerStatus};
 
     /// The `doppelganger.monitor` span declares `detected_count = field::Empty` and the run
-    /// late-binds it via `crypto::logging::record_debug`. This proves that record lands —
+    /// late-binds it via `observability::logging::record_debug`. This proves that record lands —
     /// the field name in the helper call MUST match the declared field or it silently
     /// vanishes (the #1 record() foot-gun).
     #[test]
@@ -314,7 +314,7 @@ mod tests {
             let span =
                 tracing::info_span!("doppelganger.monitor", detected_count = tracing::field::Empty);
             let _e = span.enter();
-            crypto::logging::record_debug(&tracing::Span::current(), "detected_count", 3u64);
+            observability::logging::record_debug(&tracing::Span::current(), "detected_count", 3u64);
         });
 
         let recorded = cap.0.lock().unwrap();

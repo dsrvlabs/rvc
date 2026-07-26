@@ -6,7 +6,6 @@ use parking_lot::Mutex;
 
 use async_trait::async_trait;
 use beacon::BeaconClient;
-use crypto::logging::TruncatedPubkey;
 use crypto::{CompositeSigner, Keystore, PublicKey, RemoteSigner, RemoteSignerConfig};
 use doppelganger::{ForwardWindowMachine, SigningEnablement};
 use eth_types::{
@@ -19,6 +18,7 @@ use keymanager_api::traits::{
     ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection,
     ValidatorConfigManager, ValidatorManager, VoluntaryExitManager,
 };
+use observability::logging::TruncatedPubkey;
 use signer::SignerService;
 use slashing::SlashingDb;
 use tokio::sync::watch;

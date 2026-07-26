@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beacon::BeaconClient;
-use crypto::logging::RedactedUrl;
 use futures::future::join_all;
+use observability::logging::RedactedUrl;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 

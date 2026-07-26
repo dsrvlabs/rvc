@@ -15,11 +15,6 @@ mod signing;
 pub mod typed_signer;
 mod voluntary_exit_signing;
 
-// Temporary facade for modules moved to `rvc-observability` in RF3-01.
-// Removed in RF3-02 once all call sites are repointed.
-#[doc(hidden)]
-pub use observability::{hex, logging, pubkey};
-
 pub use aggregation_signing::is_aggregator;
 pub use bls::{
     PublicKey, SecretKey, Signature, PUBLIC_KEY_BYTES_LEN, SECRET_KEY_BYTES_LEN,
@@ -28,11 +23,9 @@ pub use bls::{
 pub use composite_signer::CompositeSigner;
 pub use error::{BlsError, KeyManagerError, KeystoreError};
 pub use eth_types::{DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO};
-pub use hex::{strip_prefix_strict, HexError};
 pub use insecure::{InsecureGate, InsecureGateError, InsecureMode};
 pub use key_manager::{KeyManager, WILDCARD_KEY};
 pub use keystore::{EncryptionKdf, KdfParams, Keystore, Pbkdf2Params, ScryptParams};
-pub use pubkey::CanonicalPubkey;
 pub use remote_signer::{
     build_aggregate_and_proof_request, build_aggregation_slot_request, build_attestation_request,
     build_blinded_block_v2_request, build_block_v2_request, build_contribution_and_proof_request,

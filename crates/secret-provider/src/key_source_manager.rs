@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crypto::logging::TruncatedPubkey;
 use crypto::{KeyManager, Keystore, SecretKey};
+use observability::logging::TruncatedPubkey;
 use tracing::{info, info_span, warn, Instrument};
 
 use crate::metrics::{

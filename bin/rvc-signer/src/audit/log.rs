@@ -6,10 +6,10 @@
 //! - Emits success entries at `info` level.
 //! - Emits error entries at `warn` level.
 //!
-//! `TruncatedPubkey` from `crypto::logging` is re-exported here for use by
+//! `TruncatedPubkey` from `observability::logging` is re-exported here for use by
 //! callers that need a display-safe pubkey string in audit context.
 
-pub use crypto::logging::TruncatedPubkey;
+pub use observability::logging::TruncatedPubkey;
 
 /// Structured audit log entry for a signing request.
 ///

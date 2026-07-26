@@ -1,8 +1,8 @@
 use tracing::trace;
 use tree_hash::TreeHash;
 
-use crate::logging::TruncatedRoot;
 use eth_types::{Domain, DomainType, ForkData, Root, SigningData};
+use observability::logging::TruncatedRoot;
 
 fn hash_tree_root<T: TreeHash>(object: &T) -> Root {
     object.tree_hash_root().0

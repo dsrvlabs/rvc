@@ -14,7 +14,7 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crypto::logging::should_log_sampled;
+use observability::logging::should_log_sampled;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::Layer;

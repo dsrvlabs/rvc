@@ -4,13 +4,13 @@ use tracing::{debug, info, info_span, warn, Instrument};
 
 use beacon::{VersionedAggregateAttestation, VersionedSignedAggregateAndProof};
 use bn_manager::BeaconNodeClient;
-use crypto::logging::TruncatedPubkey;
 use duty_tracker::DutyTracker;
 use eth_types::{
     AggregateAndProof, ElectraAggregateAndProof, ForkName, SignedAggregateAndProof,
     SignedElectraAggregateAndProof, Slot,
 };
 use metrics::definitions::{attestation_status, RVC_AGGREGATIONS_TOTAL};
+use observability::logging::TruncatedPubkey;
 use signer::{is_aggregator, SignerService};
 use tree_hash::TreeHash;
 use validator_store::ValidatorStore;

@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crypto::logging::RedactedUrl;
+use observability::logging::RedactedUrl;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 

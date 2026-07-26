@@ -19,11 +19,11 @@
 //! and pins it for reviewers.
 //!
 //! CQ-2.4 (GREEN phase): The divergence test is replaced with a parity test
-//! asserting that `crypto::CanonicalPubkey` (the single source of truth both
+//! asserting that `observability::CanonicalPubkey` (the single source of truth both
 //! crates now delegate to) produces the expected `0x`-prefixed lowercase form
 //! for every input.  After CQ-2.4 this file stays GREEN forever.
 
-use crypto::pubkey::CanonicalPubkey;
+use observability::pubkey::CanonicalPubkey;
 
 // ── reference implementations (inlined from pre-fix source) ──────────────────
 

@@ -35,6 +35,7 @@
 //! (`rvc-signer-registry`, a dev-only const table with no runtime out-edges, is also pinned.)
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::process::Command;
 
 // ---------------------------------------------------------------------------
@@ -297,5 +298,55 @@ fn architecture_no_cycles() {
         signer_deps.contains(&req_to.to_string()),
         "required edge missing: {req_from} -> {req_to} \
          (Issue 1.5 regression — rvc-signer must depend on rvc-doppelganger)"
+    );
+
+    // ------------------------------------------------------------------
+    // 8. RF3-02: beacon must not take a production edge into rvc-crypto
+    //    (logging/hex/pubkey live in rvc-observability; beacon is the
+    //    low-level HTTP client that previously pulled blst/scrypt/reqwest
+    //    via crypto just to redact a URL).
+    //    Package name is `beacon` (not `rvc-beacon`) per crates/beacon/Cargo.toml.
+    // ------------------------------------------------------------------
+    let beacon_deps = edges.get("beacon").unwrap_or_else(|| {
+        panic!("package 'beacon' not found in workspace metadata");
+    });
+    assert!(
+        !beacon_deps.contains(&"rvc-crypto".to_string()),
+        "RF3-02: forbidden production edge beacon -> rvc-crypto still present; \
+         beacon must depend on rvc-observability only for logging"
+    );
+}
+
+/// RF3-02 named gate: beacon has no production dependency on rvc-crypto.
+///
+/// Implemented as a focused test so the acceptance criterion
+/// `beacon_has_no_crypto_production_edge` is greppable; the body reuses the
+/// same metadata edge map as the standing acyclicity gate above.
+#[test]
+fn beacon_has_no_crypto_production_edge() {
+    let output = Command::new("cargo")
+        .args(["metadata", "--format-version=1", "--no-deps"])
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap())
+        .output()
+        .expect("failed to run cargo metadata");
+    assert!(
+        output.status.success(),
+        "cargo metadata exited non-zero: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("cargo metadata output must be valid JSON");
+    let packages =
+        metadata["packages"].as_array().expect("metadata 'packages' field must be an array");
+    let edges = build_edge_map(packages);
+    let beacon_deps = edges.get("beacon").expect("package 'beacon' must exist");
+    assert!(
+        !beacon_deps.iter().any(|d| d == "rvc-crypto"),
+        "beacon must not depend on rvc-crypto in production; deps={beacon_deps:?}"
+    );
+    // Positive check: the light path is present.
+    assert!(
+        beacon_deps.iter().any(|d| d == "rvc-observability"),
+        "beacon should depend on rvc-observability; deps={beacon_deps:?}"
     );
 }

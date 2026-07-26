@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use crypto::logging::{RedactedUrl, TruncatedPubkey};
+use observability::logging::{RedactedUrl, TruncatedPubkey};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};

@@ -3,9 +3,9 @@ use std::sync::Arc;
 use builder::CircuitBreakerState;
 use tracing::{debug, error, info, warn, Instrument};
 
-use crypto::logging::{TruncatedPubkey, TruncatedRoot};
 use crypto::PublicKey;
 use eth_types::{ForkSchedule, Root, Slot, SLOTS_PER_EPOCH};
+use observability::logging::{TruncatedPubkey, TruncatedRoot};
 use signer::ValidatorSigner;
 use validator_store::ValidatorStore;
 

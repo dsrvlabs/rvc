@@ -11,7 +11,7 @@
 //! The inputs here are not real secrets, but they are the *shape* of values the wrappers
 //! must never emit verbatim (a 96-hex pubkey, a 64-byte-ish root, a `user:pass@` URL).
 
-use rvc_crypto::logging::{
+use observability::logging::{
     fields, new_request_id, record_display, RedactedUrl, TruncatedPubkey, TruncatedRoot,
 };
 

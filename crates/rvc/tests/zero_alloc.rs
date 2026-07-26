@@ -34,7 +34,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use crypto::logging::TruncatedRoot;
+use observability::logging::TruncatedRoot;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::Layer;

@@ -7,7 +7,7 @@
 //! `crates/signer/src/lib.rs` (the per-validator-per-slot attestation-stage trace):
 //!
 //!   if tracing::enabled!(tracing::Level::TRACE)
-//!       && crypto::logging::should_log_sampled(&CTR, N) { tracing::trace!(...); }
+//!       && observability::logging::should_log_sampled(&CTR, N) { tracing::trace!(...); }
 //!
 //! **One test per binary, by design.** Tracing's max-level hint and callsite-interest
 //! cache are PROCESS-global; the disabled half lives in a SEPARATE binary
@@ -16,7 +16,7 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use crypto::logging::should_log_sampled;
+use observability::logging::should_log_sampled;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::Layer;

@@ -22,6 +22,7 @@ beacon.workspace = true
 bn-manager.workspace = true
 block-service.workspace = true
 crypto.workspace = true
+observability.workspace = true
 duty-tracker.workspace = true
 fd-lock.workspace = true
 hex.workspace = true

@@ -18,7 +18,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use crypto::logging::TruncatedRoot;
+use observability::logging::TruncatedRoot;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 

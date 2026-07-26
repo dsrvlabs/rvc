@@ -76,9 +76,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crypto::{logging::TruncatedPubkey, CompositeSigner, PublicKey, Signer, SigningError};
+use crypto::{CompositeSigner, PublicKey, Signer, SigningError};
 use doppelganger::SigningEnablement;
 use eth_types::Root;
+use observability::logging::TruncatedPubkey;
 use slashing::{PubkeyScopedDb, SlashingDb};
 use tracing::{error, warn};
 

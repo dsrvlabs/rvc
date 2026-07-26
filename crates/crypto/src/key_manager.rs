@@ -10,7 +10,7 @@ use tracing::{debug, info, warn};
 use super::bls::{PublicKey, SecretKey, PUBLIC_KEY_BYTES_LEN};
 use super::error::KeyManagerError;
 use super::keystore::Keystore;
-use super::logging::TruncatedPubkey;
+use observability::logging::TruncatedPubkey;
 
 /// Reserved password-map key for the wildcard (global default) password.
 pub const WILDCARD_KEY: &str = "*";

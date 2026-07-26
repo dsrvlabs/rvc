@@ -14,6 +14,7 @@ async-trait.workspace = true
 beacon.workspace = true
 builder.workspace = true
 crypto.workspace = true
+observability.workspace = true
 eth-types.workspace = true
 hex.workspace = true
 serde = { workspace = true, features = ["derive"] }

@@ -60,8 +60,8 @@ use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::{AttestationSlashingViolation, BlockSlashingViolation, SlashingError};
 use crate::SlashingDb;
-use crypto::logging::TruncatedPubkey;
 use eth_types::{Epoch, Root, Slot};
+use observability::logging::TruncatedPubkey;
 
 use std::sync::atomic::Ordering;
 

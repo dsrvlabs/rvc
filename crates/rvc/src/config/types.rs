@@ -5,7 +5,7 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
-use crypto::hex::{strip_prefix_strict, HexError};
+use observability::hex::{strip_prefix_strict, HexError};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use tracing::warn;

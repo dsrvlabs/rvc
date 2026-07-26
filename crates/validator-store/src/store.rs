@@ -2,7 +2,7 @@ use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crypto::logging::TruncatedPubkey;
+use observability::logging::TruncatedPubkey;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, trace, warn};
 

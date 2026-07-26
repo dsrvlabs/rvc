@@ -4,13 +4,13 @@ use tracing::{debug, info, info_span, warn, Instrument};
 
 use beacon::{AttesterDuty, LegacyAttestation, SingleAttestation, VersionedAttestation};
 use bn_manager::BeaconNodeClient;
-use crypto::logging::TruncatedPubkey;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, Slot};
 use metrics::definitions::{
     orchestrator_result, RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
     RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL, RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
 };
+use observability::logging::TruncatedPubkey;
 use propagator::{AttestationSubmitter, Propagator};
 use signer::SignerService;
 use timing::{SlotClock, SLOTS_PER_EPOCH};
@@ -405,7 +405,7 @@ where
             tracing::error!(
                 error = %e,
                 validator_index = %validator_index,
-                pubkey = %crypto::logging::TruncatedPubkey::new(&duty.pubkey),
+                pubkey = %observability::logging::TruncatedPubkey::new(&duty.pubkey),
                 slot,
                 "AttestationData failed sanity check (M-2); dropping duty"
             );

@@ -4,13 +4,13 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use bn_manager::BeaconNodeClient;
-use crypto::logging::TruncatedPubkey;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{
     is_sync_committee_aggregator, subcommittee_index, ContributionAndProof,
     SignedContributionAndProof, Slot, SyncCommitteeDuty,
 };
+use observability::logging::TruncatedPubkey;
 use signer::SignerService;
 use validator_store::ValidatorStore;
 

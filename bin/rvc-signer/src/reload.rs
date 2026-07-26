@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crypto::logging::TruncatedPubkey;
+use observability::logging::TruncatedPubkey;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use zeroize::Zeroizing;

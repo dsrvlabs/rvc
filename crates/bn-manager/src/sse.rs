@@ -158,7 +158,7 @@ pub async fn subscribe_events<F>(
 ) where
     F: Fn(SseEvent) + Send + Sync + 'static,
 {
-    use crypto::logging::RedactedUrl;
+    use observability::logging::RedactedUrl;
     use reqwest_eventsource::{Error as EsError, Event, EventSource};
     use tokio::sync::mpsc::error::TrySendError;
     use tracing::{debug, info, trace, warn};

@@ -12,7 +12,7 @@ workspace = true
 [dependencies]
 async-trait.workspace = true
 axum.workspace = true
-crypto.workspace = true
+observability.workspace = true
 eth-types.workspace = true
 hex.workspace = true
 metrics.workspace = true

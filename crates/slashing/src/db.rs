@@ -45,10 +45,10 @@ use metrics::definitions as metrics;
 
 /// Normalize a pubkey to lowercase with 0x prefix for consistent DB storage/lookup.
 ///
-/// Delegates to [`crypto::pubkey::CanonicalPubkey`] — the single source of
+/// Delegates to [`observability::pubkey::CanonicalPubkey`] — the single source of
 /// truth for pubkey normalisation across all crates (CQ-2.4 / C1).
 pub(crate) fn normalize_pubkey(pubkey: &str) -> String {
-    pubkey.parse::<crypto::pubkey::CanonicalPubkey>().expect("infallible").to_string()
+    pubkey.parse::<observability::pubkey::CanonicalPubkey>().expect("infallible").to_string()
 }
 
 /// SQLite-backed database for storing slashing protection data.

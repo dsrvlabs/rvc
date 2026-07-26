@@ -20,7 +20,7 @@ use tracing::Instrument;
 use tracing::{debug, error, trace, warn};
 use url::Url;
 
-use crypto::logging::RedactedUrl;
+use observability::logging::RedactedUrl;
 
 use crate::sync_status::BnSyncStatus;
 

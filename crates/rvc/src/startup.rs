@@ -11,8 +11,8 @@ use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 use bn_manager::BeaconNodeClient;
-use crypto::hex::{strip_prefix_strict, HexError};
 use fd_lock::RwLock;
+use observability::hex::{strip_prefix_strict, HexError};
 use slashing::SlashingDb;
 use tracing::{error, info, warn};
 

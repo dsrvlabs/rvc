@@ -27,6 +27,7 @@ async-trait.workspace = true
 blst.workspace = true
 clap.workspace = true
 crypto.workspace = true
+observability.workspace = true
 eth-types.workspace = true
 hex.workspace = true
 prost.workspace = true

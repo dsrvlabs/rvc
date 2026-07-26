@@ -118,7 +118,7 @@ impl ForwardWindowMachine {
         // even if `register` is called again at epoch 0 (idempotency wins).
         if current_epoch == 0 {
             tracing::info!(
-                pubkey = %crypto::logging::TruncatedPubkey::new(&pubkey_hex),
+                pubkey = %observability::logging::TruncatedPubkey::new(&pubkey_hex),
                 "doppelganger: pre-genesis (epoch 0) bypass — validator marked Safe without a monitoring window"
             );
             states.insert(pubkey_hex, ValidatorState::Safe);
@@ -172,7 +172,7 @@ impl ForwardWindowMachine {
 
         let end_epoch = current_epoch.saturating_add(self.monitoring_epochs);
         tracing::info!(
-            pubkey = %crypto::logging::TruncatedPubkey::new(&pubkey_hex),
+            pubkey = %observability::logging::TruncatedPubkey::new(&pubkey_hex),
             current_epoch,
             end_epoch,
             "doppelganger: import/register_for_import — forced Pending (no epoch-0 / restart safe-skip)"

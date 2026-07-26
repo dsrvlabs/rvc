@@ -6,7 +6,7 @@
 //! - `audit::log::log_audit` logged the full 96-char BLS pubkey hex.
 //! - `backend::basic::BasicSigner::load` also logged the full pubkey.
 //!
-//! After the fix both log sites use `crypto::logging::TruncatedPubkey` which
+//! After the fix both log sites use `observability::logging::TruncatedPubkey` which
 //! renders as `0x{first-10}…{last-8}` — 23 characters — instead of the full
 //! 98-character hex string.
 //!

@@ -6,8 +6,8 @@ use sha2::{Digest, Sha256};
 use tracing::{debug, info};
 use zeroize::Zeroizing;
 
-use crypto::logging::TruncatedPubkey;
 use crypto::{EncryptionKdf, Keystore};
+use observability::logging::TruncatedPubkey;
 
 use crate::deposit;
 use crate::network;
@@ -354,13 +354,13 @@ mod tests {
 
         let logs = cap.0.lock().unwrap();
         assert!(!logs.contains(TEST_MNEMONIC), "full mnemonic phrase leaked into logs");
-        assert!(!logs.contains("abandon"), "a mnemonic word leaked into logs: {}", &*logs);
+        assert!(!logs.contains("abandon"), "a mnemonic word leaked into logs: {}", *logs);
         assert!(!logs.contains(&seed_hex), "seed hex leaked into logs");
         // Sanity: the breadth WAS captured, so the absence assertions are meaningful.
         assert!(
             logs.contains("derived validator signing key"),
             "expected debug breadth not captured; harness may be inert: {}",
-            &*logs
+            *logs
         );
     }
 

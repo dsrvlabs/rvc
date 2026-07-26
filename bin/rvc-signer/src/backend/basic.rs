@@ -3,8 +3,8 @@ use std::fmt;
 use std::path::Path;
 
 use async_trait::async_trait;
-use crypto::logging::TruncatedPubkey;
 use crypto::{Keystore, SecretKey};
+use observability::logging::TruncatedPubkey;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{info, warn};
 use zeroize::Zeroizing;
