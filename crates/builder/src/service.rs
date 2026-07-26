@@ -979,6 +979,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_batching_delay_between_batches() {
+        // Relocated from bin/rvc tier-4 registration_batching (unique timing cover).
+        let pks: Vec<[u8; 48]> = (0..20).map(|_| gen_pubkey_bytes()).collect();
+        let validators: Vec<ValidatorEntry> =
+            pks.iter().map(|pk| (*pk, true, None, None)).collect();
+        let store = Arc::new(test_store_with_builder_validators(&validators));
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let service = build_service_with_batching(signer, bn.clone(), store, 10, 50);
+
+        let start = std::time::Instant::now();
+        service.register_validators().await.unwrap();
+        let elapsed = start.elapsed();
+
+        let calls = bn.register_calls.lock();
+        assert_eq!(calls.len(), 2, "20 validators / 10 batch = 2 requests");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(40),
+            "should have delay between batches, elapsed: {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
     async fn test_batching_new_defaults_to_zero() {
         let store = ValidatorStore::new(test_fee_recipient(0xff), 30_000_000);
         let service = BuilderService::new(

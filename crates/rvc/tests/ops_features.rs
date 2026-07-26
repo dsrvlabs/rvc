@@ -1,16 +1,9 @@
-//! Tier 3 integration tests: Operational features.
+//! Operational-feature coverage relocated from bin/rvc tier-3 suites.
 //!
-//! Verifies all five Tier 3 operational features work correctly both in
-//! isolation and when composed together:
-//! - FR-1: Proposer nodes (separate BnManager for block proposals)
-//! - FR-2: Broadcast topics (per-topic routing control)
-//! - FR-3: Monitoring push (beaconcha.in metrics endpoint)
-//! - FR-4: Log file rotation (size-based rotation with max file count)
-//! - FR-5: Proposer config URL (remote proposer config with refresh)
-
-// =============================================================================
-// FR-1: Proposer Nodes
-// =============================================================================
+//! Covers proposer-node / broadcast config, monitoring push, logfile config,
+//! and proposer-config URL refresh — all via `rvc::` public surfaces.
+//! Pure bn-manager BroadcastTopics wiring lives in `rvc-bn-manager` tests;
+//! tautological empty-vec / hand-set field asserts were pruned (F17).
 
 mod proposer_nodes {
     use bn_manager::{BnManager, BnManagerConfig};
@@ -33,35 +26,13 @@ mod proposer_nodes {
     }
 
     #[test]
-    fn proposer_pool_separate_from_main_pool() {
-        let config = Config {
-            beacon_url: "http://main-bn:5052".to_string(),
-            proposer_nodes: vec!["http://proposer-bn:5052".to_string()],
-            ..Config::default()
-        };
-
-        let main_endpoints = config.effective_beacon_nodes();
-        let proposer_endpoints = config.proposer_nodes.clone();
-
-        assert_eq!(main_endpoints, vec!["http://main-bn:5052"]);
-        assert_eq!(proposer_endpoints, vec!["http://proposer-bn:5052"]);
-        assert_ne!(main_endpoints, proposer_endpoints, "pools must be separate");
-    }
-
-    #[test]
-    fn empty_proposer_nodes_returns_none() {
-        let config = Config { proposer_nodes: vec![], ..Config::default() };
-        assert!(config.proposer_nodes.is_empty());
-    }
-
-    #[test]
     fn proposer_nodes_from_toml() {
         let toml_str = r#"
-beacon_url = "http://localhost:5052"
-keystore_path = "/tmp/keystores"
-network = "mainnet"
-proposer_nodes = ["http://p1:5052", "http://p2:5052"]
-"#;
+    beacon_url = "http://localhost:5052"
+    keystore_path = "/tmp/keystores"
+    network = "mainnet"
+    proposer_nodes = ["http://p1:5052", "http://p2:5052"]
+    "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.proposer_nodes.len(), 2);
         assert_eq!(config.proposer_nodes[0], "http://p1:5052");
@@ -117,7 +88,7 @@ proposer_nodes = ["http://p1:5052", "http://p2:5052"]
     fn test_block_production_does_not_use_proposer_nodes_zero() {
         let services_src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../crates/rvc/src/bootstrap/services.rs"
+            "/src/bootstrap/services.rs"
         ))
         .expect("read crates/rvc/src/bootstrap/services.rs");
 
@@ -140,17 +111,17 @@ proposer_nodes = ["http://p1:5052", "http://p2:5052"]
     fn test_build_beacon_only_used_by_exit_tooling() {
         let beacon_src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../crates/rvc/src/bootstrap/beacon.rs"
+            "/src/bootstrap/beacon.rs"
         ))
         .expect("read crates/rvc/src/bootstrap/beacon.rs");
         let services_src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../crates/rvc/src/bootstrap/services.rs"
+            "/src/bootstrap/services.rs"
         ))
         .expect("read crates/rvc/src/bootstrap/services.rs");
         let km_src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../crates/rvc/src/keymanager_adapters.rs"
+            "/src/keymanager_adapters.rs"
         ))
         .expect("read crates/rvc/src/keymanager_adapters.rs");
 
@@ -177,12 +148,7 @@ proposer_nodes = ["http://p1:5052", "http://p2:5052"]
     }
 }
 
-// =============================================================================
-// FR-2: Broadcast Topics
-// =============================================================================
-
 mod broadcast_topics {
-    use bn_manager::BroadcastTopics;
     use rvc::config::{BroadcastTopic, Config};
 
     #[test]
@@ -259,11 +225,11 @@ mod broadcast_topics {
     #[test]
     fn broadcast_topics_from_toml() {
         let toml_str = r#"
-beacon_url = "http://localhost:5052"
-keystore_path = "/tmp/keystores"
-network = "mainnet"
-broadcast = ["attestations", "blocks"]
-"#;
+    beacon_url = "http://localhost:5052"
+    keystore_path = "/tmp/keystores"
+    network = "mainnet"
+    broadcast = ["attestations", "blocks"]
+    "#;
         let config: Config = toml::from_str(toml_str).unwrap();
         let topics = config.effective_broadcast_topics();
         assert!(topics.attestations);
@@ -285,37 +251,7 @@ broadcast = ["attestations", "blocks"]
         assert!(!topics.attestations);
         assert!(topics.blocks);
     }
-
-    #[test]
-    fn bn_manager_config_carries_broadcast_topics() {
-        let topics = BroadcastTopics {
-            attestations: true,
-            blocks: false,
-            sync_committee: true,
-            subscriptions: false,
-        };
-        let mut config = bn_manager::BnManagerConfig::new(vec!["http://bn:5052".to_string()]);
-        config.broadcast_topics = topics.clone();
-        assert_eq!(config.broadcast_topics, topics);
-    }
-
-    #[test]
-    fn bn_manager_constructed_with_custom_topics() {
-        let mut config = bn_manager::BnManagerConfig::new(vec!["http://bn:5052".to_string()]);
-        config.broadcast_topics = BroadcastTopics {
-            attestations: false,
-            blocks: true,
-            sync_committee: false,
-            subscriptions: false,
-        };
-        let manager = bn_manager::BnManager::new(config);
-        assert!(manager.is_ok());
-    }
 }
-
-// =============================================================================
-// FR-3: Monitoring Push
-// =============================================================================
 
 mod monitoring {
     use rvc::monitoring::{collect_metrics, MonitoringConfig};
@@ -503,13 +439,13 @@ mod monitoring {
     #[test]
     fn monitoring_config_from_toml() {
         let toml_str = r#"
-beacon_url = "http://localhost:5052"
-keystore_path = "/tmp/keystores"
-network = "mainnet"
-monitoring_endpoint = "https://beaconcha.in/api/v1/client/metrics"
-monitoring_interval = 60
-monitoring_endpoint_insecure = true
-"#;
+    beacon_url = "http://localhost:5052"
+    keystore_path = "/tmp/keystores"
+    network = "mainnet"
+    monitoring_endpoint = "https://beaconcha.in/api/v1/client/metrics"
+    monitoring_interval = 60
+    monitoring_endpoint_insecure = true
+    "#;
         let config: rvc::config::Config = toml::from_str(toml_str).unwrap();
         assert_eq!(
             config.monitoring.endpoint.as_deref(),
@@ -520,75 +456,7 @@ monitoring_endpoint_insecure = true
     }
 }
 
-// =============================================================================
-// FR-4: Log File Rotation
-// =============================================================================
-
-mod log_rotation {
-    use std::fs;
-    use telemetry::FileAppenderConfig;
-    use tracing_subscriber::prelude::*;
-
-    #[test]
-    fn file_layer_created_successfully() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = FileAppenderConfig {
-            directory: dir.path().to_string_lossy().to_string(),
-            filename: "test.log".to_string(),
-            max_size_mb: 1,
-            max_files: 3,
-            compress: false,
-            level: "info".to_string(),
-        };
-
-        let result = telemetry::create_file_layer(&config);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn log_entries_written_to_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = FileAppenderConfig {
-            directory: dir.path().to_string_lossy().to_string(),
-            filename: "rotation-test.log".to_string(),
-            max_size_mb: 1,
-            max_files: 5,
-            compress: false,
-            level: "info".to_string(),
-        };
-
-        let (layer, guard) = telemetry::create_file_layer(&config).unwrap();
-        let subscriber = tracing_subscriber::registry().with(layer);
-
-        tracing::subscriber::with_default(subscriber, || {
-            for i in 0..100 {
-                tracing::info!("log entry number {}", i);
-            }
-        });
-
-        drop(guard);
-        std::thread::sleep(std::time::Duration::from_millis(200));
-
-        let entries: Vec<_> = fs::read_dir(dir.path()).unwrap().filter_map(|e| e.ok()).collect();
-        assert!(!entries.is_empty(), "at least one log file should exist");
-    }
-
-    #[test]
-    fn compression_layer_created() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = FileAppenderConfig {
-            directory: dir.path().to_string_lossy().to_string(),
-            filename: "compress-test.log".to_string(),
-            max_size_mb: 1,
-            max_files: 2,
-            compress: true,
-            level: "debug".to_string(),
-        };
-
-        let result = telemetry::create_file_layer(&config);
-        assert!(result.is_ok());
-    }
-
+mod logfile_config {
     #[test]
     fn logfile_config_defaults() {
         let config = rvc::config::Config::default();
@@ -602,15 +470,15 @@ mod log_rotation {
     #[test]
     fn logfile_config_from_toml() {
         let toml_str = r#"
-beacon_url = "http://localhost:5052"
-keystore_path = "/tmp/keystores"
-network = "mainnet"
-logfile = "/var/log/rvc/rvc.log"
-logfile_max_size = 100
-logfile_max_number = 10
-logfile_compress = true
-logfile_level = "debug"
-"#;
+    beacon_url = "http://localhost:5052"
+    keystore_path = "/tmp/keystores"
+    network = "mainnet"
+    logfile = "/var/log/rvc/rvc.log"
+    logfile_max_size = 100
+    logfile_max_number = 10
+    logfile_compress = true
+    logfile_level = "debug"
+    "#;
         let config: rvc::config::Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.logfile.path.as_ref().unwrap().to_str().unwrap(), "/var/log/rvc/rvc.log");
         assert_eq!(config.logfile.max_size, 100);
@@ -642,10 +510,6 @@ logfile_level = "debug"
         assert_eq!(config.logfile.level.as_deref(), Some("warn"));
     }
 }
-
-// =============================================================================
-// FR-5: Proposer Config URL
-// =============================================================================
 
 mod config_url {
     use rvc::config_url::{
@@ -831,13 +695,13 @@ mod config_url {
     #[test]
     fn config_url_from_toml() {
         let toml_str = r#"
-beacon_url = "http://localhost:5052"
-keystore_path = "/tmp/keystores"
-network = "mainnet"
-proposer_config_url = "https://example.com/proposer-config"
-proposer_config_refresh_interval = 120
-proposer_config_url_insecure = true
-"#;
+    beacon_url = "http://localhost:5052"
+    keystore_path = "/tmp/keystores"
+    network = "mainnet"
+    proposer_config_url = "https://example.com/proposer-config"
+    proposer_config_refresh_interval = 120
+    proposer_config_url_insecure = true
+    "#;
         let config: rvc::config::Config = toml::from_str(toml_str).unwrap();
         assert_eq!(
             config.proposer_config.url.as_deref(),
@@ -847,10 +711,6 @@ proposer_config_url_insecure = true
         assert!(config.proposer_config.url_insecure);
     }
 }
-
-// =============================================================================
-// Composition: features don't conflict when active simultaneously
-// =============================================================================
 
 mod composition {
     use bn_manager::{BnManager, BnManagerConfig};
@@ -969,23 +829,23 @@ mod composition {
     #[test]
     fn toml_roundtrip_with_all_tier3_fields() {
         let toml_str = r#"
-beacon_url = "http://localhost:5052"
-keystore_path = "/tmp/keystores"
-network = "mainnet"
-proposer_nodes = ["http://proposer:5052"]
-broadcast = ["attestations", "blocks"]
-monitoring_endpoint = "https://beaconcha.in/api/v1/client/metrics"
-monitoring_interval = 60
-monitoring_endpoint_insecure = false
-logfile = "/var/log/rvc.log"
-logfile_max_size = 100
-logfile_max_number = 10
-logfile_compress = true
-logfile_level = "debug"
-proposer_config_url = "https://config.example.com/proposer"
-proposer_config_refresh_interval = 120
-proposer_config_url_insecure = false
-"#;
+    beacon_url = "http://localhost:5052"
+    keystore_path = "/tmp/keystores"
+    network = "mainnet"
+    proposer_nodes = ["http://proposer:5052"]
+    broadcast = ["attestations", "blocks"]
+    monitoring_endpoint = "https://beaconcha.in/api/v1/client/metrics"
+    monitoring_interval = 60
+    monitoring_endpoint_insecure = false
+    logfile = "/var/log/rvc.log"
+    logfile_max_size = 100
+    logfile_max_number = 10
+    logfile_compress = true
+    logfile_level = "debug"
+    proposer_config_url = "https://config.example.com/proposer"
+    proposer_config_refresh_interval = 120
+    proposer_config_url_insecure = false
+    "#;
         let config: Config = toml::from_str(toml_str).unwrap();
 
         assert_eq!(config.proposer_nodes, vec!["http://proposer:5052"]);

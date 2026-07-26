@@ -922,12 +922,12 @@ force a binary rebuild to run.
 4. Leave `bin/rvc/tests/` holding only `metrics_bind_l10.rs` and whatever RF6-20 adds.
 
 **Acceptance criteria:**
-- [ ] No file in `bin/rvc/tests/` imports `rvc::`, `bn_manager::`, or `builder::` except through the
+- [x] No file in `bin/rvc/tests/` imports `rvc::`, `bn_manager::`, or `builder::` except through the
       spawned binary.
-- [ ] Move commit is a pure move (test count unchanged); prune commit lists each deleted test with its
+- [x] Move commit is a pure move (test count unchanged); prune commit lists each deleted test with its
       reason (target: the ~4 F17 names, plus any others found — the count is a finding, not a quota).
-- [ ] Aggregate workspace test count == baseline − (pruned count), and the pruned list is enumerated.
-- [ ] Workspace green.
+- [x] Aggregate workspace test count == baseline − (pruned count), and the pruned list is enumerated.
+- [x] Workspace green.
 
 **Risks:** Some tier tests may exercise `builder`+`rvc` together and belong in neither crate alone. Put
 those in `crates/rvc/tests/` (the crate higher in the dependency graph) rather than duplicating.
