@@ -645,7 +645,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "beacon"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "bytes",
  "hex",
@@ -4092,7 +4092,7 @@ dependencies = [
 
 [[package]]
 name = "rvc"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -4144,7 +4144,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-architecture-tests"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "rvc-observability",
  "serde_json",
@@ -4154,7 +4154,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-bin"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "beacon",
@@ -4194,7 +4194,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-block-service"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "beacon",
@@ -4217,7 +4217,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-bn-manager"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "beacon",
@@ -4239,7 +4239,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-builder"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -4257,7 +4257,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-crypto"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "aes",
  "async-trait",
@@ -4298,7 +4298,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-doppelganger"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -4316,7 +4316,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-duty-tracker"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "beacon",
  "rvc-bn-manager",
@@ -4332,7 +4332,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-eth-types"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "ethereum_serde_utils 0.8.0",
  "ethereum_ssz 0.8.3",
@@ -4351,7 +4351,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-grpc-signer"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "hex",
@@ -4374,7 +4374,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-keygen"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4397,7 +4397,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-keymanager-api"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -4428,7 +4428,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-metrics"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "axum 0.7.9",
  "lazy_static",
@@ -4442,7 +4442,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-observability"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "hex",
  "proptest",
@@ -4456,7 +4456,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-secret-provider"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "google-cloud-gax",
@@ -4480,7 +4480,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-signer"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "criterion",
@@ -4502,7 +4502,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-signer-bin"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "clap",
  "hex",
@@ -4522,7 +4522,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-signer-proto"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "prost 0.13.5",
  "tonic 0.12.3",
@@ -4531,11 +4531,11 @@ dependencies = [
 
 [[package]]
 name = "rvc-signer-registry"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "rvc-signer-server"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "async-trait",
  "axum 0.7.9",
@@ -4587,7 +4587,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-slashing"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "hex",
  "libc",
@@ -4608,14 +4608,14 @@ dependencies = [
 
 [[package]]
 name = "rvc-sync-service"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "rvc-telemetry"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "logroller",
@@ -4635,7 +4635,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-test-support"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "rcgen",
  "tokio",
@@ -4645,7 +4645,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-timing"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "rvc-eth-types",
  "thiserror 2.0.18",
@@ -4654,7 +4654,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-validator-store"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "hex",
  "parking_lot",
@@ -4671,7 +4671,7 @@ dependencies = [
 
 [[package]]
 name = "rvc-web3signer-wire"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "hex",
  "rvc-eth-types",
