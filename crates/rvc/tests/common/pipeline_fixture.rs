@@ -199,7 +199,7 @@ impl BeaconBlockClient for NoopBlockBeacon {
 /// Control handle + shared state for the pipeline mock BN.
 ///
 /// Mutable knobs (`set_duty_pubkey`, `set_attestation_data`) update Arc state
-/// read by the [`MockBeaconNodeClient`] handlers built in [`Self::into_client`].
+/// read by the [`MockBeaconNodeClient`] handlers built in [`Self::build_client`].
 pub struct PipelineBeacon {
     duty_pubkey: Arc<Mutex<String>>,
     duty_slots: Arc<Vec<Slot>>,
@@ -235,7 +235,7 @@ impl PipelineBeacon {
     }
 
     /// Build the shared configurable mock wired to this control state.
-    pub fn into_client(&self) -> MockBeaconNodeClient {
+    pub fn build_client(&self) -> MockBeaconNodeClient {
         let duty_pubkey = Arc::clone(&self.duty_pubkey);
         let duty_slots = Arc::clone(&self.duty_slots);
         let att_map = Arc::clone(&self.attestation_data_by_slot);
@@ -420,7 +420,7 @@ fn finish_fixture(
         opts.duty_slots,
         opts.attestation_data_by_slot,
     ));
-    let beacon_client: Arc<dyn BeaconNodeClient> = Arc::new(beacon.into_client());
+    let beacon_client: Arc<dyn BeaconNodeClient> = Arc::new(beacon.build_client());
 
     let duty_tracker =
         Arc::new(DutyTracker::new(Arc::clone(&beacon_client), vec![VALIDATOR_INDEX.to_string()]));

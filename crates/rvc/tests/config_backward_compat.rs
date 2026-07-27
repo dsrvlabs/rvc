@@ -13,7 +13,7 @@ fn production_fixture_path() -> PathBuf {
 }
 
 fn expected_production_config() -> Config {
-    let cfg = Config {
+    Config {
         beacon_url: "http://bn.example:5052".to_string(),
         beacon_nodes: vec![
             "http://bn1.example:5052".to_string(),
@@ -85,8 +85,7 @@ fn expected_production_config() -> Config {
         validator_registration_batch_size: 500,
         validator_registration_batch_delay: 500,
         ..Config::default()
-    };
-    cfg
+    }
 }
 
 /// Assert nested groups match between two configs for moved fields.

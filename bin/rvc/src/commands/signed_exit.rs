@@ -232,10 +232,7 @@ mod tests {
 
         // KeyManager is not Debug; match instead of unwrap_err.
         let err = match take_owned_key_manager(km) {
-            Ok(_) => {
-                assert!(false, "expected ownership error when Arc is shared");
-                return;
-            }
+            Ok(_) => panic!("expected ownership error when Arc is shared"),
             Err(err) => err,
         };
         assert!(
