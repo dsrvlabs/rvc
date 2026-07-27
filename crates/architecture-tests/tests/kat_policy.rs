@@ -131,22 +131,22 @@ const EXEMPTIONS: &[(&str, &str)] = &[
         "block_v2_uses_proposer_domain_and_block_header_root",
     ),
     (
-        "crates/signer-server/src/http_api/routes.rs",
+        "crates/signer-server/src/http_api/routes/tests/sign.rs",
         "attestation_happy_path_signs_the_expected_root",
     ),
     (
-        "crates/signer-server/src/http_api/routes.rs",
+        "crates/signer-server/src/http_api/routes/tests/sign.rs",
         "block_v2_happy_path_signs_the_block_header_root",
     ),
     (
-        "crates/signer-server/src/http_api/routes.rs",
+        "crates/signer-server/src/http_api/routes/tests/sign.rs",
         "electra_v2_frozen_fixture_parses_and_signs_to_eth_types_root",
     ),
     (
-        "crates/signer-server/src/http_api/routes.rs",
+        "crates/signer-server/src/http_api/routes/tests/sign.rs",
         "sync_committee_message_kat_signs_the_block_root",
     ),
-    ("crates/signer-server/tests/no_raw_root_path.rs", "test_no_v2_rpc_accepts_raw_signing_root"),
+    ("crates/signer-server/tests/raw_root_rejected.rs", "test_no_v2_rpc_accepts_raw_signing_root"),
     (
         "crates/slashing/src/db/interchange.rs",
         "test_existing_bare_hex_metadata_matches_canonical_prefixed_root",

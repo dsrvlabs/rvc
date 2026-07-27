@@ -250,7 +250,6 @@ block-beta
     block:domain:8
         SIGNER["signer"]
         DUTY["duty-tracker"]
-        PROP["propagator"]
         TIMING["timing"]
         BLOCK["block-service"]
         SYNC["sync-service"]
@@ -279,14 +278,12 @@ block-beta
     SIGBIN --> CRYPTO
     RVC --> SIGNER
     RVC --> DUTY
-    RVC --> PROP
     RVC --> TIMING
     RVC --> BLOCK
     RVC --> BUILD
     SIGNER --> CRYPTO
     SIGNER --> SLASHING
     DUTY --> BNM
-    PROP --> BNM
     BNM --> BEACON
 
     style binary fill:#4a9eff,color:#fff
@@ -440,7 +437,7 @@ flowchart LR
     GRS -->|add remote signer| CS
 
     BNM --> DT[DutyTracker]
-    BNM --> PROP[Propagator]
+    BNM --> PROP[Propagator<br/>bn-manager::submit]
     BNM --> BUILD[BuilderService]
 
     CS --> SS[SignerService]
@@ -519,6 +516,7 @@ Manages connections to one or more Beacon Nodes with strategy-based selection, h
 
 - **`BeaconNodeClient` trait** — Unified async interface for all BN operations. All domain crates depend on this trait, not on `BeaconClient` directly.
 - **`BnManager`** — Wraps multiple `BeaconClient` instances. Selection strategies: `First` (lowest latency), `Best` (highest-value response for block production), `Broadcast` (submit to all BNs).
+- **`submit` module** — `Propagator` / `AttestationSubmitter` submit signed attestations and aggregate proofs with topic-gated multi-BN broadcast (absorbed from the former `crates/propagator`).
 - **Health scoring** — EMA latency (α=0.3), sliding window error rate, composite score (0.4×latency + 0.6×error).
 - **SSE events** — Head, ChainReorg, FinalizedCheckpoint, Block.
 - **Sync checking** — Monitors `el_offline`, `is_optimistic`, `sync_distance`.
@@ -641,10 +639,6 @@ Fetches and caches attester, proposer, and sync committee duties from the beacon
 - **Proposer duties** — Per-epoch cache, prefetched at epoch start.
 - **Sync committee duties** — Per-sync-committee-period cache (~256 epochs).
 - Depends on `BnManager` via `BeaconNodeClient` trait.
-
-### `crates/propagator` — Message Propagation
-
-Submits signed messages to beacon node(s). Uses `AttestationSubmitter` trait for dependency injection. Supports attestations and aggregate attestation proofs. Depends on `BnManager` for multi-BN broadcast.
 
 ### `crates/timing` — Slot Clock
 

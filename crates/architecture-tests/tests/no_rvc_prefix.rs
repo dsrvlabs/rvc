@@ -20,8 +20,9 @@ const EXCLUDE: &[&str] = &[
     "crates/observability/src/logging.rs",
     // The product's rotating log file is literally named "rvc.log" (a filename, not a key).
     "crates/telemetry/src/file_appender.rs",
-    // Likewise: bin/rvc's only rvc. hit is the default `"rvc.log"` log filename.
-    "bin/rvc/src/main.rs",
+    // Likewise: bin/rvc's only rvc. hit is the default `"rvc.log"` log filename
+    // (lived in main.rs before the RF5 bootstrap extraction moved it to logging.rs).
+    "bin/rvc/src/logging.rs",
 ];
 
 /// Production files still carrying `rvc.`-prefixed tracing keys, pending their normalization

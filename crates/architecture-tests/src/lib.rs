@@ -377,7 +377,6 @@ pub const DOMAIN_PACKAGES: &[&str] = &[
     "rvc-builder",
     "rvc-doppelganger",
     "rvc-duty-tracker",
-    "rvc-propagator",
     "rvc-signer",
     "rvc-signer-server",
     "rvc-sync-service",
