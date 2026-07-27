@@ -232,4 +232,3 @@ async fn test_keymanager_server_import_remote_key_lifecycle() {
     // 5. Verify composite signer no longer has the key
     assert!(!composite.public_keys().contains(&pk));
 }
-

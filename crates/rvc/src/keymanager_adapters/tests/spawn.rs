@@ -182,8 +182,5 @@ fn test_spawn_keymanager_api_warns_on_non_loopback_bind() {
     let deps = spawn_test_deps(dir.path(), None);
     let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
     assert!(!built.addr.ip().is_loopback());
-    assert!(
-        logs_contain("non-loopback address"),
-        "must warn when Keymanager binds non-loopback"
-    );
+    assert!(logs_contain("non-loopback address"), "must warn when Keymanager binds non-loopback");
 }

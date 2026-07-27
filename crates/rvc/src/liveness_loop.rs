@@ -711,10 +711,7 @@ mod tests {
 
         // Refresh pulls index 77 from BN for the pubkey_map key.
         loop_.refresh_indices_for_test().await;
-        assert_eq!(
-            pubkey_index.read().bare_hex_of_index("77"),
-            Some(bare.as_str())
-        );
+        assert_eq!(pubkey_index.read().bare_hex_of_index("77"), Some(bare.as_str()));
 
         // Now observation succeeds for the imported key.
         let end = start + DEFAULT_MONITORING_EPOCHS;

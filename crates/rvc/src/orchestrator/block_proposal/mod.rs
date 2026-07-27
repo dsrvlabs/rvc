@@ -31,12 +31,12 @@
 use tracing::{error, info, warn};
 
 use block_service::BeaconBlockClient;
+use bn_manager::AttestationSubmitter;
 use eth_types::Slot;
 use metrics::definitions::{
     RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL, RVC_BUILDER_CONSECUTIVE_MISSES,
     RVC_BUILDER_EPOCH_MISSES,
 };
-use bn_manager::AttestationSubmitter;
 use timing::SlotClock;
 
 use super::coordinator::DutyOrchestrator;

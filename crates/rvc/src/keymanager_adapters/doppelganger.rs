@@ -252,4 +252,3 @@ pub fn wall_clock_epoch(genesis_time: u64) -> Epoch {
         .as_secs();
     now.saturating_sub(genesis_time) / SECONDS_PER_SLOT / SLOTS_PER_EPOCH
 }
-

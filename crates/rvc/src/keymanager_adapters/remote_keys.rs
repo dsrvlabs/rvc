@@ -40,7 +40,6 @@ impl RemoteKeyManagerAdapter {
             notifier: KeyChangeNotifier::new(pubkey_map, key_gen_tx),
         }
     }
-
 }
 
 impl RemoteKeyManager for RemoteKeyManagerAdapter {
@@ -119,4 +118,3 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
         }
     }
 }
-

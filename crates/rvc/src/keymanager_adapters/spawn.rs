@@ -252,4 +252,3 @@ pub fn spawn_keymanager_api(
 
     Ok(())
 }
-

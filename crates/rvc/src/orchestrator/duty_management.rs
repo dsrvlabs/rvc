@@ -496,7 +496,7 @@ mod tests {
     use eth_types::ForkSchedule;
     use signer::{always_enabled, SignerService};
     use slashing::SlashingDb;
-    
+
     use validator_store::ValidatorStore;
 
     use super::*;

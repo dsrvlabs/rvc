@@ -77,7 +77,7 @@ fn test_delete_keystore_removes_import_meta_sidecar() {
 fn test_scan_and_rearm_gate_rearms_recent_keys() {
     use keymanager_api::gate::DoppelgangerGate;
     use keymanager_api::traits::DoppelgangerMonitor;
-        let dir = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
     let pk: Pubkey = [0xABu8; 48];
 
     // Write a sidecar with import time = now (very recent → still in window)
@@ -102,7 +102,7 @@ fn test_scan_and_rearm_gate_rearms_recent_keys() {
 #[test]
 fn test_scan_and_rearm_gate_skips_expired_keys() {
     use keymanager_api::gate::DoppelgangerGate;
-        let dir = TempDir::new().unwrap();
+    let dir = TempDir::new().unwrap();
     let pk: Pubkey = [0xCDu8; 48];
     let window_secs = 768u64;
 
@@ -345,8 +345,7 @@ async fn test_deleted_keystore_dir_key_not_resurrected_on_restart() {
 
     let dir = TempDir::new().unwrap();
     let filename = format!("{}.json", pubkey_hex(pk));
-    std::fs::write(dir.path().join(&filename), serde_json::to_string(&keystore).unwrap())
-        .unwrap();
+    std::fs::write(dir.path().join(&filename), serde_json::to_string(&keystore).unwrap()).unwrap();
 
     // Boot load into composite + KeyManager
     let mut passwords = HashMap::new();
@@ -365,8 +364,7 @@ async fn test_deleted_keystore_dir_key_not_resurrected_on_restart() {
     assert!(denylist.contains(&pk));
 
     // Operator (or residual file) puts the keystore back — RockLogic pattern
-    std::fs::write(dir.path().join(&filename), serde_json::to_string(&keystore).unwrap())
-        .unwrap();
+    std::fs::write(dir.path().join(&filename), serde_json::to_string(&keystore).unwrap()).unwrap();
 
     // Simulated restart: load_from_directory with denylist must skip the key
     let deny_set = denylist.snapshot();
@@ -472,10 +470,7 @@ fn test_failed_reimport_leaves_denylist_intact() {
 
     assert!(denylist.contains(&pk), "failed import must not clear denylist");
     let reloaded = DeletionDenylist::load(dir.path()).unwrap();
-    assert!(
-        reloaded.contains(&pk),
-        "denylist on disk must still contain key after failed import"
-    );
+    assert!(reloaded.contains(&pk), "denylist on disk must still contain key after failed import");
 }
 
 /// SEC-5 / H-5: correctly-passworded keystore with a truncated IV must
@@ -518,4 +513,3 @@ fn test_keymanager_import_iv_corrupted_keystore_returns_item_error() {
     assert!(adapter.list_keys().is_empty());
     assert!(!adapter.has_key(&sk.public_key().to_bytes()));
 }
-

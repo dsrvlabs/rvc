@@ -8,11 +8,11 @@ pub mod backend;
 #[cfg(feature = "dvt")]
 pub mod commands;
 pub mod config;
-#[cfg(test)]
-mod gate_shared_across_transports;
 #[cfg(feature = "dvt")]
 pub mod dvt;
 pub mod error;
+#[cfg(test)]
+mod gate_shared_across_transports;
 pub(crate) mod grpc_common;
 pub mod grpc_tls;
 pub mod http_api;

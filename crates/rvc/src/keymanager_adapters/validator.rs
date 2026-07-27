@@ -44,4 +44,3 @@ impl ValidatorManager for ValidatorManagerAdapter {
         info!(pubkey = %pubkey_hex, enabled, "Validator enabled state updated");
     }
 }
-

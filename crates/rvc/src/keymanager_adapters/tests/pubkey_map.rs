@@ -28,10 +28,7 @@ fn test_import_updates_shared_pubkey_map_and_notifies() {
 
     adapter.import_keystore(&keystore_json, "testpass").unwrap();
 
-    assert!(
-        pubkey_map.read().contains_key(&pk_bytes),
-        "import must update the shared PubkeyMap"
-    );
+    assert!(pubkey_map.read().contains_key(&pk_bytes), "import must update the shared PubkeyMap");
     assert!(rx.has_changed().unwrap(), "import must notify via key_gen_tx");
     assert_eq!(*rx.borrow(), 1);
 }
@@ -145,8 +142,7 @@ fn test_remote_key_adapter_delete_removes_from_pubkey_map() {
 fn test_generation_counter_increments_on_keystore_delete() {
     let composite = create_empty_composite_signer();
     let dir = TempDir::new().unwrap();
-    let (adapter, _map, rx) =
-        test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
+    let (adapter, _map, rx) = test_keystore_adapter(dir.path().to_path_buf(), composite.clone());
 
     let sk = SecretKey::generate();
     let pk_bytes = sk.public_key().to_bytes();
@@ -164,9 +160,7 @@ fn test_generation_counter_increments_on_remote_key_import() {
     let (adapter, _map, rx) = test_remote_adapter(composite, None);
 
     assert_eq!(*rx.borrow(), 0);
-    adapter
-        .import_remote_key(test_pubkey(1), "https://signer.example.com".to_string())
-        .unwrap();
+    adapter.import_remote_key(test_pubkey(1), "https://signer.example.com".to_string()).unwrap();
     assert_eq!(*rx.borrow(), 1);
 }
 
@@ -217,8 +211,7 @@ fn test_concurrent_delete_same_key() {
 
     let dir = TempDir::new().unwrap();
     let composite = create_empty_composite_signer();
-    let adapter =
-        Arc::new(test_keystore_adapter(dir.path().to_path_buf(), composite.clone()).0);
+    let adapter = Arc::new(test_keystore_adapter(dir.path().to_path_buf(), composite.clone()).0);
 
     // Set up N keys, each will be deleted by two threads simultaneously
     let n = 10;
@@ -274,8 +267,7 @@ fn test_concurrent_import_same_key() {
 
     let dir = TempDir::new().unwrap();
     let composite = create_empty_composite_signer();
-    let adapter =
-        Arc::new(test_keystore_adapter(dir.path().to_path_buf(), composite.clone()).0);
+    let adapter = Arc::new(test_keystore_adapter(dir.path().to_path_buf(), composite.clone()).0);
 
     let sk = SecretKey::generate();
     let password = b"testpass";
@@ -370,4 +362,3 @@ fn test_concurrent_import_delete_same_key() {
         "PubkeyMap membership must match CompositeSigner after concurrent delete/import"
     );
 }
-

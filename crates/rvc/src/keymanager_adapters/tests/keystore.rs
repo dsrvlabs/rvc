@@ -59,4 +59,3 @@ fn test_keystore_manager_tracks_imported_key_in_composite_signer() {
     assert!(!adapter.has_key(&pk_bytes));
     assert!(!composite.public_keys().contains(&pk_bytes));
 }
-

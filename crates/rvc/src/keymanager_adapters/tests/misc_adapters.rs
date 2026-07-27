@@ -198,4 +198,3 @@ fn test_import_with_recent_history_stays_pending() {
     );
     assert!(!machine.is_signing_enabled(&pk));
 }
-

@@ -301,4 +301,3 @@ fn test_config_persistence_concurrent_writes() {
         assert_eq!(gl, 30_000_000 + i as u64 * 1_000_000);
     }
 }
-

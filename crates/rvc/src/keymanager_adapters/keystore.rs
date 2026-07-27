@@ -6,9 +6,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use crypto::{CompositeSigner, Keystore};
-use keymanager_api::traits::{
-    DeleteKeystoreError, ImportKeystoreError, KeystoreManager, Pubkey,
-};
+use keymanager_api::traits::{DeleteKeystoreError, ImportKeystoreError, KeystoreManager, Pubkey};
 use observability::logging::TruncatedPubkey;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
@@ -69,7 +67,6 @@ impl KeystoreManagerAdapter {
         self.denylist = Some(denylist);
         self
     }
-
 }
 
 /// Returns the path for the M-12 import-time metadata sidecar for `pubkey`.
@@ -367,4 +364,3 @@ impl KeystoreManager for KeystoreManagerAdapter {
         Ok(true)
     }
 }
-

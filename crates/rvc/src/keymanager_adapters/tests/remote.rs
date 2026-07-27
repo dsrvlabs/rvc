@@ -150,8 +150,6 @@ fn test_import_remote_key_allowlist_with_port() {
     );
     let pk = test_pubkey(1);
     // host_str() returns the host without port
-    let result =
-        adapter.import_remote_key(pk, "https://signer.example.com:9000/api".to_string());
+    let result = adapter.import_remote_key(pk, "https://signer.example.com:9000/api".to_string());
     assert!(result.is_ok());
 }
-

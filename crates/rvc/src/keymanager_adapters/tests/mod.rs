@@ -7,23 +7,21 @@ use super::{
     ValidatorManagerAdapter, VoluntaryExitManagerAdapter,
 };
 
-use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use beacon::BeaconClient;
-use crypto::{
-    CompositeSigner, KeyManager, Keystore, LocalSigner, SecretKey, Signer,
-};
+use crypto::{CompositeSigner, KeyManager, Keystore, LocalSigner, SecretKey, Signer};
 use doppelganger::{ForwardWindowMachine, MonotonicEpochClock, SigningEnablement};
 use eth_types::{Epoch, ForkSchedule, Root};
 use keymanager_api::error::ApiError;
 use keymanager_api::traits::{
-    DoppelgangerMonitor, ImportKeystoreError, ImportRemoteKeyError,
-    KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection, ValidatorConfigManager,
-    ValidatorManager, VoluntaryExitManager,
+    DoppelgangerMonitor, ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey,
+    RemoteKeyManager, SlashingProtection, ValidatorConfigManager, ValidatorManager,
+    VoluntaryExitManager,
 };
 use signer::{always_enabled, SignerService};
 use slashing::SlashingDb;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::watch;
 use validator_store::ValidatorStore;
@@ -66,13 +64,12 @@ fn test_remote_adapter(
     (adapter, pubkey_map, rx)
 }
 
-
-mod keystore;
-mod remote;
-mod misc_adapters;
-mod server;
-mod pubkey_map;
 mod config;
-mod exit;
 mod denylist;
+mod exit;
+mod keystore;
+mod misc_adapters;
+mod pubkey_map;
+mod remote;
+mod server;
 mod spawn;

@@ -107,4 +107,3 @@ impl VoluntaryExitManager for VoluntaryExitManagerAdapter {
         })
     }
 }
-

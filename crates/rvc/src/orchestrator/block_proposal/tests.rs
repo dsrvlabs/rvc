@@ -15,10 +15,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beacon::{BeaconClient, BeaconClientConfig};
+use bn_manager::Propagator;
 use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
 use duty_tracker::DutyTracker;
 use eth_types::Slot;
-use bn_manager::Propagator;
 use signer::SignerService;
 use slashing::SlashingDb;
 use timing::{MockSlotClock, SLOTS_PER_EPOCH};

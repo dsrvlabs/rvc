@@ -80,8 +80,7 @@ impl SlashingProtection for SlashingProtectionAdapter {
             .map_err(map_slashing_db_error)?;
 
         // Build a canonical hex-string set for fast membership lookup.
-        let requested: std::collections::HashSet<String> =
-            pubkeys.iter().map(pubkey_hex).collect();
+        let requested: std::collections::HashSet<String> = pubkeys.iter().map(pubkey_hex).collect();
 
         // Collect DB records for requested keys.
         let mut filtered_data: Vec<_> = interchange
@@ -113,4 +112,3 @@ impl SlashingProtection for SlashingProtectionAdapter {
             .map_err(|e| SlashingProtectionError::Backend(format!("serialization failed: {e}")))
     }
 }
-

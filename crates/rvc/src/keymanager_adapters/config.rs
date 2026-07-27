@@ -19,10 +19,7 @@ impl ValidatorConfigManagerAdapter {
 
     fn ensure_validator_exists(&self, pubkey: &Pubkey) -> Result<(), ApiError> {
         if !self.validator_store.has_validator(pubkey) {
-            return Err(ApiError::NotFound(format!(
-                "validator {} not found",
-                pubkey_hex(pubkey)
-            )));
+            return Err(ApiError::NotFound(format!("validator {} not found", pubkey_hex(pubkey))));
         }
         Ok(())
     }
@@ -112,4 +109,3 @@ impl ValidatorConfigManager for ValidatorConfigManagerAdapter {
         )
     }
 }
-
