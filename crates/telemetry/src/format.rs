@@ -138,8 +138,12 @@ where
     }
 }
 
-/// The pretty (default) console layer — the exact `fmt::layer()` both binaries
+/// The pretty (default) console layer — the `fmt::layer()` both binaries
 /// built before issue 5.5, parameterized only by its writer.
+///
+/// ANSI styling is enabled only when the process stdout is a terminal, so
+/// piped/redirected console output (journald, docker, test harnesses) stays
+/// free of escape sequences — matching the file appender's `with_ansi(false)`.
 fn fmt_layer_pretty<S, W>(
     make_writer: W,
 ) -> tracing_subscriber::fmt::Layer<S, DefaultFields, Format, W>
@@ -147,7 +151,10 @@ where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
-    tracing_subscriber::fmt::layer().with_writer(make_writer)
+    use std::io::IsTerminal;
+    tracing_subscriber::fmt::layer()
+        .with_ansi(std::io::stdout().is_terminal())
+        .with_writer(make_writer)
 }
 
 /// Local sub-module so the JSON-layer type (`Format<Json>`) need not be named at
